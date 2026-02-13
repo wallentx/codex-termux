@@ -146,6 +146,11 @@ async fn wait_for_python_repl_ready(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
+    if cfg!(target_os = "android") {
+        eprintln!("PTY not supported on Android; skipping pty_python_repl_emits_output_and_exits");
+        return Ok(());
+    }
+
     let Some(python) = find_python() else {
         eprintln!("python not found; skipping pty_python_repl_emits_output_and_exits");
         return Ok(());
@@ -253,6 +258,11 @@ async fn pipe_process_detaches_from_parent_session() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
+    if cfg!(target_os = "android") {
+        eprintln!("PTY not supported on Android; skipping pipe_and_pty_share_interface");
+        return Ok(());
+    }
+
     let env_map: HashMap<String, String> = std::env::vars().collect();
 
     let (pipe_program, pipe_args) = shell_command(&echo_sleep_command("pipe_ok"));
