@@ -151,9 +151,9 @@ jobs:
           # Set up the Android toolchain
           toolchain="${ndk}/toolchains/llvm/prebuilt/linux-x86_64"
 
-          # Use API level 21 for maximum Termux compatibility
-          # (supports Android 5.0+ / Termux on older devices)
-          api_level="21"
+          # Use API level 24 to follow termux packaging convention:
+          # https://github.com/termux/termux-packages/wiki/Building-packages
+          api_level="24"
 
           # Configure Cargo to use the NDK linker
           cargo_target_var="CARGO_TARGET_${target^^}_LINKER"
