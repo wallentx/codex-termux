@@ -100,10 +100,16 @@ fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> 
             path: policy_path.to_path_buf(),
             source,
         })?;
-    file.lock().map_err(|source| AmendError::LockPolicyFile {
-        path: policy_path.to_path_buf(),
-        source,
-    })?;
+    match file.lock() {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(source) => {
+            return Err(AmendError::LockPolicyFile {
+                path: policy_path.to_path_buf(),
+                source,
+            });
+        }
+    }
 
     file.seek(SeekFrom::Start(0))
         .map_err(|source| AmendError::SeekPolicyFile {
