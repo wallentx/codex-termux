@@ -393,6 +393,16 @@ jobs:
       - name: Cargo build
         shell: bash
         run: |
+          set -euo pipefail
+
+          if [[ "${{ matrix.target }}" == 'aarch64-linux-android' ]]; then
+            export CARGO_BUILD_JOBS=2
+            export CARGO_PROFILE_RELEASE_LTO=thin
+            export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
+            cargo build --target ${{ matrix.target }} --release --bin codex
+            exit 0
+          fi
+
           if [[ "${{ contains(matrix.target, 'windows') }}" == 'true' ]]; then
             cargo build --target ${{ matrix.target }} --release --bin codex --bin codex-responses-api-proxy --bin codex-windows-sandbox-setup --bin codex-command-runner
           else
@@ -507,7 +517,9 @@ jobs:
             cp target/${{ matrix.target }}/release/codex-command-runner.exe "$dest/codex-command-runner-${{ matrix.target }}.exe"
           else
             cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
-            cp target/${{ matrix.target }}/release/codex-responses-api-proxy "$dest/codex-responses-api-proxy-${{ matrix.target }}"
+            if [[ -f target/${{ matrix.target }}/release/codex-responses-api-proxy ]]; then
+              cp target/${{ matrix.target }}/release/codex-responses-api-proxy "$dest/codex-responses-api-proxy-${{ matrix.target }}"
+            fi
           fi
 
           if [[ "${{ matrix.target }}" == *linux* && "${{ matrix.target }}" != *android* ]]; then
