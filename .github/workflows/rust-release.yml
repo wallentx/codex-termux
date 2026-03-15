@@ -138,10 +138,8 @@ jobs:
       - select-build-matrix
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      id-token: write
+    permissions: write-all
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: codex-rs
@@ -155,6 +153,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - name: 🧰 Actions Toolbox
+        # This is required for the GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+        with:
+          verbose: true
       - name: Checkout selected source ref
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref != '' }}
         uses: actions/checkout@v6
