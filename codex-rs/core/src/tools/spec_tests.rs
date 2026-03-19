@@ -1690,7 +1690,7 @@ fn test_build_specs_mcp_tools_sorted_by_name() {
 }
 
 #[test]
-fn search_tool_description_includes_only_codex_apps_connector_names() {
+fn search_tool_description_lists_each_codex_apps_connector_once() {
     let model_info = search_capable_model_info();
     let mut features = Features::with_defaults();
     features.enable(Feature::Apps);
@@ -1736,7 +1736,45 @@ fn search_tool_description_includes_only_codex_apps_connector_names() {
                     connector_id: Some("calendar".to_string()),
                     connector_name: Some("Calendar".to_string()),
                     plugin_display_names: Vec::new(),
-                    connector_description: None,
+                    connector_description: Some(
+                        "Plan events and manage your calendar.".to_string(),
+                    ),
+                },
+            ),
+            (
+                "mcp__codex_apps__calendar_list_events".to_string(),
+                ToolInfo {
+                    server_name: crate::mcp::CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                    tool_name: "_list_events".to_string(),
+                    tool_namespace: "mcp__codex_apps__calendar".to_string(),
+                    tool: mcp_tool(
+                        "calendar-list-events",
+                        "List calendar events",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                    connector_id: Some("calendar".to_string()),
+                    connector_name: Some("Calendar".to_string()),
+                    plugin_display_names: Vec::new(),
+                    connector_description: Some(
+                        "Plan events and manage your calendar.".to_string(),
+                    ),
+                },
+            ),
+            (
+                "mcp__codex_apps__gmail_search_threads".to_string(),
+                ToolInfo {
+                    server_name: crate::mcp::CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                    tool_name: "_search_threads".to_string(),
+                    tool_namespace: "mcp__codex_apps__gmail".to_string(),
+                    tool: mcp_tool(
+                        "gmail-search-threads",
+                        "Search email threads",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                    connector_id: Some("gmail".to_string()),
+                    connector_name: Some("Gmail".to_string()),
+                    plugin_display_names: Vec::new(),
+                    connector_description: Some("Find and summarize email threads.".to_string()),
                 },
             ),
             (
@@ -1762,7 +1800,14 @@ fn search_tool_description_includes_only_codex_apps_connector_names() {
         panic!("expected tool_search tool");
     };
     let description = description.as_str();
-    assert!(description.contains("Calendar"));
+    assert!(description.contains("- Calendar: Plan events and manage your calendar."));
+    assert!(description.contains("- Gmail: Find and summarize email threads."));
+    assert_eq!(
+        description
+            .matches("- Calendar: Plan events and manage your calendar.")
+            .count(),
+        1
+    );
     assert!(!description.contains("mcp__rmcp__echo"));
 }
 
@@ -1874,8 +1919,56 @@ fn search_tool_description_handles_no_enabled_apps() {
         panic!("expected tool_search tool");
     };
 
-    assert!(description.contains("(None currently enabled)"));
-    assert!(!description.contains("{{app_names}}"));
+    assert!(description.contains("None currently enabled."));
+    assert!(!description.contains("{{app_descriptions}}"));
+}
+
+#[test]
+fn search_tool_description_falls_back_to_connector_name_without_description() {
+    let model_info = search_capable_model_info();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::Apps);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+
+    let (tools, _) = build_specs(
+        &tools_config,
+        None,
+        Some(HashMap::from([(
+            "mcp__codex_apps__calendar_create_event".to_string(),
+            ToolInfo {
+                server_name: crate::mcp::CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                tool_name: "_create_event".to_string(),
+                tool_namespace: "mcp__codex_apps__calendar".to_string(),
+                tool: mcp_tool(
+                    "calendar_create_event",
+                    "Create calendar event",
+                    serde_json::json!({"type": "object"}),
+                ),
+                connector_id: Some("calendar".to_string()),
+                connector_name: Some("Calendar".to_string()),
+                plugin_display_names: Vec::new(),
+                connector_description: None,
+            },
+        )])),
+        &[],
+    )
+    .build();
+    let search_tool = find_tool(&tools, TOOL_SEARCH_TOOL_NAME);
+    let ToolSpec::ToolSearch { description, .. } = &search_tool.spec else {
+        panic!("expected tool_search tool");
+    };
+
+    assert!(description.contains("- Calendar"));
+    assert!(!description.contains("- Calendar:"));
 }
 
 #[test]
@@ -2004,7 +2097,8 @@ fn tool_suggest_description_lists_discoverable_tools() {
     assert!(description.contains("Sample Plugin"));
     assert!(description.contains("Plan events and schedules."));
     assert!(description.contains("Find and summarize email threads."));
-    assert!(description.contains("id: `sample@test`, type: plugin, action: enable"));
+    assert!(description.contains("id: `sample@test`, type: plugin, action: install"));
+    assert!(description.contains("`action_type`: `install` or `enable`"));
     assert!(
         description.contains("skills; MCP servers: sample-docs; app connectors: connector_sample")
     );
@@ -2533,7 +2627,7 @@ fn code_mode_augments_builtin_tool_descriptions_with_typed_sample() {
 
     assert_eq!(
         description,
-        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: { path: string; }): Promise<unknown>; };\n```"
+        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: { path: string; }): Promise<{ detail: string | null; image_url: string; }>; };\n```"
     );
 }
 
@@ -2599,7 +2693,7 @@ fn code_mode_only_restricts_model_tools_to_exec_tools() {
         "gpt-5.1-codex",
         &features,
         Some(WebSearchMode::Live),
-        &["exec", "exec_wait"],
+        &["exec", "wait"],
     );
 }
 
@@ -2630,7 +2724,7 @@ fn code_mode_only_exec_description_includes_full_nested_tool_details() {
     assert!(!description.contains("Enabled nested tools:"));
     assert!(!description.contains("Nested tool reference:"));
     assert!(description.starts_with(
-        "Use `exec/exec_wait` tool to run all other tools, do not attempt to use any other tools directly"
+        "Use `exec/wait` tool to run all other tools, do not attempt to use any other tools directly"
     ));
     assert!(description.contains("### `update_plan` (`update_plan`)"));
     assert!(description.contains("### `view_image` (`view_image`)"));
@@ -2660,7 +2754,7 @@ fn code_mode_exec_description_omits_nested_tool_details_when_not_code_mode_only(
     };
 
     assert!(!description.starts_with(
-        "Use `exec/exec_wait` tool to run all other tools, do not attempt to use any other tools directly"
+        "Use `exec/wait` tool to run all other tools, do not attempt to use any other tools directly"
     ));
     assert!(!description.contains("### `update_plan` (`update_plan`)"));
     assert!(!description.contains("### `view_image` (`view_image`)"));

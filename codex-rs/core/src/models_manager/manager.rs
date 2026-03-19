@@ -3,6 +3,9 @@ use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::AuthManager;
 use crate::auth::AuthMode;
+use crate::auth::CodexAuth;
+use crate::auth_env_telemetry::AuthEnvTelemetry;
+use crate::auth_env_telemetry::collect_auth_env_telemetry;
 use crate::config::Config;
 use crate::default_client::build_reqwest_client;
 use crate::error::CodexErr;
@@ -11,8 +14,15 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::models_manager::model_info;
+use crate::response_debug_context::extract_response_debug_context;
+use crate::response_debug_context::telemetry_transport_error_message;
+use crate::util::FeedbackRequestTags;
+use crate::util::emit_feedback_request_tags_with_auth_env;
 use codex_api::ModelsClient;
+use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
+use codex_api::TransportError;
+use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
@@ -32,6 +42,98 @@ use tracing::instrument;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const MODELS_ENDPOINT: &str = "/models";
+#[derive(Clone)]
+struct ModelsRequestTelemetry {
+    auth_mode: Option<String>,
+    auth_header_attached: bool,
+    auth_header_name: Option<&'static str>,
+    auth_env: AuthEnvTelemetry,
+}
+
+impl RequestTelemetry for ModelsRequestTelemetry {
+    fn on_request(
+        &self,
+        attempt: u64,
+        status: Option<http::StatusCode>,
+        error: Option<&TransportError>,
+        duration: Duration,
+    ) {
+        let success = status.is_some_and(|code| code.is_success()) && error.is_none();
+        let error_message = error.map(telemetry_transport_error_message);
+        let response_debug = error
+            .map(extract_response_debug_context)
+            .unwrap_or_default();
+        let status = status.map(|status| status.as_u16());
+        tracing::event!(
+            target: "codex_otel.log_only",
+            tracing::Level::INFO,
+            event.name = "codex.api_request",
+            duration_ms = %duration.as_millis(),
+            http.response.status_code = status,
+            success = success,
+            error.message = error_message.as_deref(),
+            attempt = attempt,
+            endpoint = MODELS_ENDPOINT,
+            auth.header_attached = self.auth_header_attached,
+            auth.header_name = self.auth_header_name,
+            auth.env_openai_api_key_present = self.auth_env.openai_api_key_env_present,
+            auth.env_codex_api_key_present = self.auth_env.codex_api_key_env_present,
+            auth.env_codex_api_key_enabled = self.auth_env.codex_api_key_env_enabled,
+            auth.env_provider_key_name = self.auth_env.provider_env_key_name.as_deref(),
+            auth.env_provider_key_present = self.auth_env.provider_env_key_present,
+            auth.env_refresh_token_url_override_present = self.auth_env.refresh_token_url_override_present,
+            auth.request_id = response_debug.request_id.as_deref(),
+            auth.cf_ray = response_debug.cf_ray.as_deref(),
+            auth.error = response_debug.auth_error.as_deref(),
+            auth.error_code = response_debug.auth_error_code.as_deref(),
+            auth.mode = self.auth_mode.as_deref(),
+        );
+        tracing::event!(
+            target: "codex_otel.trace_safe",
+            tracing::Level::INFO,
+            event.name = "codex.api_request",
+            duration_ms = %duration.as_millis(),
+            http.response.status_code = status,
+            success = success,
+            error.message = error_message.as_deref(),
+            attempt = attempt,
+            endpoint = MODELS_ENDPOINT,
+            auth.header_attached = self.auth_header_attached,
+            auth.header_name = self.auth_header_name,
+            auth.env_openai_api_key_present = self.auth_env.openai_api_key_env_present,
+            auth.env_codex_api_key_present = self.auth_env.codex_api_key_env_present,
+            auth.env_codex_api_key_enabled = self.auth_env.codex_api_key_env_enabled,
+            auth.env_provider_key_name = self.auth_env.provider_env_key_name.as_deref(),
+            auth.env_provider_key_present = self.auth_env.provider_env_key_present,
+            auth.env_refresh_token_url_override_present = self.auth_env.refresh_token_url_override_present,
+            auth.request_id = response_debug.request_id.as_deref(),
+            auth.cf_ray = response_debug.cf_ray.as_deref(),
+            auth.error = response_debug.auth_error.as_deref(),
+            auth.error_code = response_debug.auth_error_code.as_deref(),
+            auth.mode = self.auth_mode.as_deref(),
+        );
+        emit_feedback_request_tags_with_auth_env(
+            &FeedbackRequestTags {
+                endpoint: MODELS_ENDPOINT,
+                auth_header_attached: self.auth_header_attached,
+                auth_header_name: self.auth_header_name,
+                auth_mode: self.auth_mode.as_deref(),
+                auth_retry_after_unauthorized: None,
+                auth_recovery_mode: None,
+                auth_recovery_phase: None,
+                auth_connection_reused: None,
+                auth_request_id: response_debug.request_id.as_deref(),
+                auth_cf_ray: response_debug.cf_ray.as_deref(),
+                auth_error: response_debug.auth_error.as_deref(),
+                auth_error_code: response_debug.auth_error_code.as_deref(),
+                auth_recovery_followup_success: None,
+                auth_recovery_followup_status: None,
+            },
+            &self.auth_env,
+        );
+    }
+}
 
 /// Strategy for refreshing available models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +200,7 @@ impl ModelsManager {
             auth_manager,
             model_catalog,
             collaboration_modes_config,
-            ModelProviderInfo::create_openai_provider(/* base_url */ None),
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
         )
     }
 
@@ -330,11 +432,22 @@ impl ModelsManager {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let auth = self.auth_manager.auth().await;
-        let auth_mode = self.auth_manager.auth_mode();
+        let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
         let api_provider = self.provider.to_api_provider(auth_mode)?;
         let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
+        let auth_env = collect_auth_env_telemetry(
+            &self.provider,
+            self.auth_manager.codex_api_key_env_enabled(),
+        );
         let transport = ReqwestTransport::new(build_reqwest_client());
-        let client = ModelsClient::new(transport, api_provider, api_auth);
+        let request_telemetry: Arc<dyn RequestTelemetry> = Arc::new(ModelsRequestTelemetry {
+            auth_mode: auth_mode.map(|mode| TelemetryAuthMode::from(mode).to_string()),
+            auth_header_attached: api_auth.auth_header_attached(),
+            auth_header_name: api_auth.auth_header_name(),
+            auth_env,
+        });
+        let client = ModelsClient::new(transport, api_provider, api_auth)
+            .with_telemetry(Some(request_telemetry));
 
         let client_version = crate::models_manager::client_version_to_whole();
         let (models, etag) = timeout(
@@ -433,7 +546,7 @@ impl ModelsManager {
         Self::new_with_provider(
             codex_home,
             auth_manager,
-            None,
+            /*model_catalog*/ None,
             CollaborationModesConfig::default(),
             provider,
         )

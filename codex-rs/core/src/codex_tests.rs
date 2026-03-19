@@ -39,6 +39,7 @@ use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnCompleteEvent;
+use crate::protocol::TurnStartedEvent;
 use crate::protocol::UserMessageEvent;
 use crate::rollout::policy::EventPersistenceMode;
 use crate::rollout::recorder::RolloutRecorder;
@@ -71,15 +72,13 @@ use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::W3cTraceContext;
+use core_test_support::tracing::install_test_tracing;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TraceId;
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::prelude::*;
 
 use codex_protocol::mcp::CallToolResult as McpCallToolResult;
 use pretty_assertions::assert_eq;
@@ -89,7 +88,6 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Once;
 use std::time::Duration as StdDuration;
 
 #[path = "codex_tests_guardian.rs"]
@@ -140,6 +138,107 @@ fn skill_message(text: &str) -> ResponseItem {
         end_turn: None,
         phase: None,
     }
+}
+
+#[tokio::test]
+async fn regular_turn_emits_turn_started_without_waiting_for_startup_prewarm() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = startup_prewarm_rx.await;
+        Ok(test_model_client_session())
+    });
+
+    sess.set_session_startup_prewarm(
+        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            handle,
+            std::time::Instant::now(),
+            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+        ),
+    )
+    .await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        crate::tasks::RegularTask::new(),
+    )
+    .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("expected turn started event without waiting for startup prewarm")
+        .expect("channel open");
+    assert!(matches!(
+        first.msg,
+        EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) if turn_id == tc.sub_id
+    ));
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = startup_prewarm_rx.await;
+        Ok(test_model_client_session())
+    });
+
+    sess.set_session_startup_prewarm(
+        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            handle,
+            std::time::Instant::now(),
+            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+        ),
+    )
+    .await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        crate::tasks::RegularTask::new(),
+    )
+    .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("expected turn started event without waiting for startup prewarm")
+        .expect("channel open");
+    assert!(matches!(
+        first.msg,
+        EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) if turn_id == tc.sub_id
+    ));
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn aborted event")
+        .expect("channel open");
+    assert!(matches!(
+        second.msg,
+        EventMsg::TurnAborted(crate::protocol::TurnAbortedEvent {
+            turn_id: Some(turn_id),
+            reason: TurnAbortReason::Interrupted,
+        }) if turn_id == tc.sub_id
+    ));
+}
+
+fn test_model_client_session() -> crate::client::ModelClientSession {
+    crate::client::ModelClient::new(
+        None,
+        ThreadId::try_from("00000000-0000-4000-8000-000000000001")
+            .expect("test thread id should be valid"),
+        crate::model_provider_info::ModelProviderInfo::create_openai_provider(
+            /* base_url */ None,
+        ),
+        codex_protocol::protocol::SessionSource::Exec,
+        None,
+        false,
+        false,
+        None,
+    )
+    .new_session()
 }
 
 fn developer_input_texts(items: &[ResponseItem]) -> Vec<&str> {
@@ -1560,6 +1659,7 @@ async fn set_rate_limits_retains_previous_credits() {
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
         inherited_shell_snapshot: None,
+        user_shell_override: None,
     };
 
     let mut state = SessionState::new(session_configuration);
@@ -1657,6 +1757,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
         inherited_shell_snapshot: None,
+        user_shell_override: None,
     };
 
     let mut state = SessionState::new(session_configuration);
@@ -1927,18 +2028,6 @@ fn text_block(s: &str) -> serde_json::Value {
     })
 }
 
-fn init_test_tracing() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let provider = SdkTracerProvider::builder().build();
-        let tracer = provider.tracer("codex-core-tests");
-        let subscriber =
-            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("global tracing subscriber should only be installed once");
-    });
-}
-
 async fn build_test_config(codex_home: &Path) -> Config {
     ConfigBuilder::default()
         .codex_home(codex_home.to_path_buf())
@@ -2012,6 +2101,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
         inherited_shell_snapshot: None,
+        user_shell_override: None,
     }
 }
 
@@ -2061,6 +2151,82 @@ async fn session_configuration_apply_preserves_split_file_system_policy_on_cwd_o
     assert_eq!(
         updated.file_system_sandbox_policy,
         session_configuration.file_system_sandbox_policy
+    );
+}
+
+#[cfg_attr(windows, ignore)]
+#[tokio::test]
+async fn new_default_turn_uses_config_aware_skills_for_role_overrides() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let parent_config = session.get_config().await;
+    let codex_home = parent_config.codex_home.clone();
+    let skill_dir = codex_home.join("skills").join("demo");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(
+        &skill_path,
+        "---\nname: demo-skill\ndescription: demo description\n---\n\n# Body\n",
+    )
+    .expect("write skill");
+
+    let parent_outcome = session
+        .services
+        .skills_manager
+        .skills_for_cwd(&parent_config.cwd, &parent_config, true)
+        .await;
+    let parent_skill = parent_outcome
+        .skills
+        .iter()
+        .find(|skill| skill.name == "demo-skill")
+        .expect("demo skill should be discovered");
+    assert_eq!(parent_outcome.is_skill_enabled(parent_skill), true);
+
+    let role_path = codex_home.join("skills-role.toml");
+    std::fs::write(
+        &role_path,
+        format!(
+            r#"developer_instructions = "Stay focused"
+
+[[skills.config]]
+path = "{}"
+enabled = false
+"#,
+            skill_path.display()
+        ),
+    )
+    .expect("write role config");
+
+    let mut child_config = (*parent_config).clone();
+    child_config.agent_roles.insert(
+        "custom".to_string(),
+        crate::config::AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    crate::agent::role::apply_role_to_config(&mut child_config, Some("custom"))
+        .await
+        .expect("custom role should apply");
+
+    {
+        let mut state = session.state.lock().await;
+        state.session_configuration.original_config_do_not_use = Arc::new(child_config);
+    }
+
+    let child_turn = session
+        .new_default_turn_with_sub_id("role-skill-turn".to_string())
+        .await;
+    let child_skill = child_turn
+        .turn_skills
+        .outcome
+        .skills
+        .iter()
+        .find(|skill| skill.name == "demo-skill")
+        .expect("demo skill should be discovered");
+    assert_eq!(
+        child_turn.turn_skills.outcome.is_skill_enabled(child_skill),
+        false
     );
 }
 
@@ -2166,6 +2332,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
         inherited_shell_snapshot: None,
+        user_shell_override: None,
     };
 
     let (tx_event, _rx_event) = async_channel::unbounded();
@@ -2182,7 +2349,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         Arc::clone(&config),
         auth_manager,
         models_manager,
-        ExecPolicyManager::default(),
+        Arc::new(ExecPolicyManager::default()),
         tx_event,
         agent_status_tx,
         InitialHistory::New,
@@ -2218,7 +2385,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         CollaborationModesConfig::default(),
     ));
     let agent_control = AgentControl::default();
-    let exec_policy = ExecPolicyManager::default();
+    let exec_policy = Arc::new(ExecPolicyManager::default());
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
     let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
     let model_info = ModelsManager::construct_model_info_offline_for_tests(model.as_str(), &config);
@@ -2260,6 +2427,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
         inherited_shell_snapshot: None,
+        user_shell_override: None,
     };
     let per_turn_config = Session::build_per_turn_config(&session_configuration);
     let model_info = ModelsManager::construct_model_info_offline_for_tests(
@@ -2282,6 +2450,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         true,
     ));
     let network_approval = Arc::new(NetworkApprovalService::default());
+    let environment = Arc::new(codex_environment::Environment);
 
     let file_watcher = Arc::new(FileWatcher::noop());
     let services = SessionServices {
@@ -2328,7 +2497,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             session_configuration.provider.clone(),
             session_configuration.session_source.clone(),
             config.model_verbosity,
-            ws_version_from_features(config.as_ref()),
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
@@ -2336,6 +2504,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             config.js_repl_node_path.clone(),
         ),
+        environment: Arc::clone(&environment),
     };
     let js_repl = Arc::new(JsReplHandle::with_node_path(
         config.js_repl_node_path.clone(),
@@ -2355,6 +2524,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         model_info,
         &models_manager,
         None,
+        environment,
         "turn_id".to_string(),
         Arc::clone(&js_repl),
         skills_outcome,
@@ -2370,6 +2540,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         js_repl,
         next_internal_sub_id: AtomicU64::new(0),
@@ -2544,7 +2715,7 @@ async fn submit_with_id_captures_current_span_trace_context() {
         session_loop_termination: completed_session_loop_termination(),
     };
 
-    init_test_tracing();
+    let _trace_test_context = install_test_tracing("codex-core-tests");
 
     let request_parent = W3cTraceContext {
         traceparent: Some("00-00000000000000000000000000000011-0000000000000022-01".into()),
@@ -2580,7 +2751,7 @@ async fn submit_with_id_captures_current_span_trace_context() {
 async fn new_default_turn_captures_current_span_trace_id() {
     let (session, _turn_context) = make_session_and_context().await;
 
-    init_test_tracing();
+    let _trace_test_context = install_test_tracing("codex-core-tests");
 
     let request_parent = W3cTraceContext {
         traceparent: Some("00-00000000000000000000000000000011-0000000000000022-01".into()),
@@ -2615,7 +2786,7 @@ async fn new_default_turn_captures_current_span_trace_id() {
 
 #[test]
 fn submission_dispatch_span_prefers_submission_trace_context() {
-    init_test_tracing();
+    let _trace_test_context = install_test_tracing("codex-core-tests");
 
     let ambient_parent = W3cTraceContext {
         traceparent: Some("00-00000000000000000000000000000033-0000000000000044-01".into()),
@@ -2648,7 +2819,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
 
 #[test]
 fn submission_dispatch_span_uses_debug_for_realtime_audio() {
-    init_test_tracing();
+    let _trace_test_context = install_test_tracing("codex-core-tests");
 
     let dispatch_span = submission_dispatch_span(&Submission {
         id: "sub-1".into(),
@@ -2658,6 +2829,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
                 sample_rate: 16_000,
                 num_channels: 1,
                 samples_per_channel: Some(160),
+                item_id: None,
             },
         }),
         trace: None,
@@ -2730,7 +2902,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
         }
     }
 
-    init_test_tracing();
+    let _trace_test_context = install_test_tracing("codex-core-tests");
 
     let request_parent = W3cTraceContext {
         traceparent: Some("00-00000000000000000000000000000011-0000000000000022-01".into()),
@@ -2873,6 +3045,120 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
         .expect("shutdown waiter");
 }
 
+#[tokio::test]
+async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
+    let (parent_session, parent_turn_context) = make_session_and_context().await;
+    let parent_session = Arc::new(parent_session);
+    let parent_config = Arc::clone(&parent_turn_context.config);
+    let (parent_tx_sub, parent_rx_sub) = async_channel::bounded(4);
+    let (_parent_tx_event, parent_rx_event) = async_channel::unbounded();
+    let (_parent_status_tx, parent_agent_status) = watch::channel(AgentStatus::PendingInit);
+    let parent_session_for_loop = Arc::clone(&parent_session);
+    let parent_session_loop_handle = tokio::spawn(async move {
+        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
+    });
+    let parent_codex = Codex {
+        tx_sub: parent_tx_sub,
+        rx_event: parent_rx_event,
+        agent_status: parent_agent_status,
+        session: Arc::clone(&parent_session),
+        session_loop_termination: session_loop_termination_from_handle(parent_session_loop_handle),
+    };
+
+    let (child_session, _child_turn_context) = make_session_and_context().await;
+    let (child_tx_sub, child_rx_sub) = async_channel::bounded(4);
+    let (_child_tx_event, child_rx_event) = async_channel::unbounded();
+    let (_child_status_tx, child_agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (child_shutdown_tx, child_shutdown_rx) = tokio::sync::oneshot::channel();
+    let child_session_loop_handle = tokio::spawn(async move {
+        let shutdown: Submission = child_rx_sub
+            .recv()
+            .await
+            .expect("child shutdown submission");
+        assert_eq!(shutdown.op, Op::Shutdown);
+        child_shutdown_tx
+            .send(())
+            .expect("child shutdown signal should be delivered");
+    });
+    let child_codex = Codex {
+        tx_sub: child_tx_sub,
+        rx_event: child_rx_event,
+        agent_status: child_agent_status,
+        session: Arc::new(child_session),
+        session_loop_termination: session_loop_termination_from_handle(child_session_loop_handle),
+    };
+    parent_session
+        .guardian_review_session
+        .cache_for_test(child_codex)
+        .await;
+
+    parent_codex
+        .shutdown_and_wait()
+        .await
+        .expect("parent shutdown should succeed");
+
+    child_shutdown_rx
+        .await
+        .expect("guardian subagent should receive a shutdown op");
+}
+
+#[tokio::test]
+async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
+    let (parent_session, parent_turn_context) = make_session_and_context().await;
+    let parent_session = Arc::new(parent_session);
+    let parent_config = Arc::clone(&parent_turn_context.config);
+    let (parent_tx_sub, parent_rx_sub) = async_channel::bounded(4);
+    let (_parent_tx_event, parent_rx_event) = async_channel::unbounded();
+    let (_parent_status_tx, parent_agent_status) = watch::channel(AgentStatus::PendingInit);
+    let parent_session_for_loop = Arc::clone(&parent_session);
+    let parent_session_loop_handle = tokio::spawn(async move {
+        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
+    });
+    let parent_codex = Codex {
+        tx_sub: parent_tx_sub,
+        rx_event: parent_rx_event,
+        agent_status: parent_agent_status,
+        session: Arc::clone(&parent_session),
+        session_loop_termination: session_loop_termination_from_handle(parent_session_loop_handle),
+    };
+
+    let (child_session, _child_turn_context) = make_session_and_context().await;
+    let (child_tx_sub, child_rx_sub) = async_channel::bounded(4);
+    let (_child_tx_event, child_rx_event) = async_channel::unbounded();
+    let (_child_status_tx, child_agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (child_shutdown_tx, child_shutdown_rx) = tokio::sync::oneshot::channel();
+    let child_session_loop_handle = tokio::spawn(async move {
+        let shutdown: Submission = child_rx_sub
+            .recv()
+            .await
+            .expect("child shutdown submission");
+        assert_eq!(shutdown.op, Op::Shutdown);
+        child_shutdown_tx
+            .send(())
+            .expect("child shutdown signal should be delivered");
+    });
+    let child_codex = Codex {
+        tx_sub: child_tx_sub,
+        rx_event: child_rx_event,
+        agent_status: child_agent_status,
+        session: Arc::new(child_session),
+        session_loop_termination: session_loop_termination_from_handle(child_session_loop_handle),
+    };
+    parent_session
+        .guardian_review_session
+        .register_ephemeral_for_test(child_codex)
+        .await;
+
+    parent_codex
+        .shutdown_and_wait()
+        .await
+        .expect("parent shutdown should succeed");
+
+    child_shutdown_rx
+        .await
+        .expect("ephemeral guardian review should receive a shutdown op");
+}
+
 pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     dynamic_tools: Vec<DynamicToolSpec>,
 ) -> (
@@ -2893,7 +3179,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         CollaborationModesConfig::default(),
     ));
     let agent_control = AgentControl::default();
-    let exec_policy = ExecPolicyManager::default();
+    let exec_policy = Arc::new(ExecPolicyManager::default());
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
     let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
     let model_info = ModelsManager::construct_model_info_offline_for_tests(model.as_str(), &config);
@@ -2935,6 +3221,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         dynamic_tools,
         persist_extended_history: false,
         inherited_shell_snapshot: None,
+        user_shell_override: None,
     };
     let per_turn_config = Session::build_per_turn_config(&session_configuration);
     let model_info = ModelsManager::construct_model_info_offline_for_tests(
@@ -2957,6 +3244,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         true,
     ));
     let network_approval = Arc::new(NetworkApprovalService::default());
+    let environment = Arc::new(codex_environment::Environment);
 
     let file_watcher = Arc::new(FileWatcher::noop());
     let services = SessionServices {
@@ -3003,7 +3291,6 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
             session_configuration.provider.clone(),
             session_configuration.session_source.clone(),
             config.model_verbosity,
-            ws_version_from_features(config.as_ref()),
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
@@ -3011,6 +3298,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             config.js_repl_node_path.clone(),
         ),
+        environment: Arc::clone(&environment),
     };
     let js_repl = Arc::new(JsReplHandle::with_node_path(
         config.js_repl_node_path.clone(),
@@ -3030,6 +3318,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         model_info,
         &models_manager,
         None,
+        environment,
         "turn_id".to_string(),
         Arc::clone(&js_repl),
         skills_outcome,
@@ -3045,6 +3334,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         js_repl,
         next_internal_sub_id: AtomicU64::new(0),
@@ -4080,6 +4370,62 @@ async fn steer_input_returns_active_turn_id() {
     assert!(sess.has_pending_input().await);
 }
 
+#[tokio::test]
+async fn prepend_pending_input_keeps_older_tail_ahead_of_newer_input() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let input = vec![UserInput::Text {
+        text: "hello".to_string(),
+        text_elements: Vec::new(),
+    }];
+    sess.spawn_task(
+        Arc::clone(&tc),
+        input,
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let blocked = ResponseInputItem::Message {
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "blocked queued prompt".to_string(),
+        }],
+    };
+    let later = ResponseInputItem::Message {
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "later queued prompt".to_string(),
+        }],
+    };
+    let newer = ResponseInputItem::Message {
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "newer queued prompt".to_string(),
+        }],
+    };
+
+    sess.inject_response_items(vec![blocked.clone(), later.clone()])
+        .await
+        .expect("inject initial pending input into active turn");
+
+    let drained = sess.get_pending_input().await;
+    assert_eq!(drained, vec![blocked, later.clone()]);
+
+    sess.inject_response_items(vec![newer.clone()])
+        .await
+        .expect("inject newer pending input into active turn");
+
+    let mut drained_iter = drained.into_iter();
+    let _blocked = drained_iter.next().expect("blocked prompt should exist");
+    sess.prepend_pending_input(drained_iter.collect())
+        .await
+        .expect("requeue later pending input at the front of the queue");
+
+    assert_eq!(sess.get_pending_input().await, vec![later, newer]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
@@ -4196,7 +4542,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         .expect("tool call present");
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let err = router
-        .dispatch_tool_call(
+        .dispatch_tool_call_with_code_mode_result(
             Arc::clone(&session),
             Arc::clone(&turn_context),
             tracker,
@@ -4204,7 +4550,8 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
             ToolCallSource::Direct,
         )
         .await
-        .expect_err("expected fatal error");
+        .err()
+        .expect("expected fatal error");
 
     match err {
         FunctionCallError::Fatal(message) => {

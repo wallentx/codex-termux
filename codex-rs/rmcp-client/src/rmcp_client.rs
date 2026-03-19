@@ -5,6 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -22,6 +23,7 @@ use reqwest::header::HeaderMap;
 use reqwest::header::WWW_AUTHENTICATE;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
+use rmcp::model::ClientJsonRpcMessage;
 use rmcp::model::ClientNotification;
 use rmcp::model::ClientRequest;
 use rmcp::model::CreateElicitationRequestParams;
@@ -83,14 +85,45 @@ const HEADER_LAST_EVENT_ID: &str = "Last-Event-Id";
 const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
 const NON_JSON_RESPONSE_BODY_PREVIEW_BYTES: usize = 8_192;
 
+fn message_uses_request_scoped_headers(message: &ClientJsonRpcMessage) -> bool {
+    matches!(
+        message,
+        ClientJsonRpcMessage::Request(request)
+            if request.request.method() == "tools/call"
+    )
+}
+
+fn apply_request_scoped_headers(
+    mut request: reqwest::RequestBuilder,
+    request_headers_state: &Arc<StdMutex<Option<HeaderMap>>>,
+) -> reqwest::RequestBuilder {
+    let extra_headers = request_headers_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(extra_headers) = extra_headers {
+        for (name, value) in &extra_headers {
+            request = request.header(name, value.clone());
+        }
+    }
+    request
+}
+
 #[derive(Clone)]
 struct StreamableHttpResponseClient {
     inner: reqwest::Client,
+    request_headers_state: Arc<StdMutex<Option<HeaderMap>>>,
 }
 
 impl StreamableHttpResponseClient {
-    fn new(inner: reqwest::Client) -> Self {
-        Self { inner }
+    fn new(
+        inner: reqwest::Client,
+        request_headers_state: Arc<StdMutex<Option<HeaderMap>>>,
+    ) -> Self {
+        Self {
+            inner,
+            request_headers_state,
+        }
     }
 
     fn reqwest_error(
@@ -132,6 +165,9 @@ impl StreamableHttpClient for StreamableHttpResponseClient {
         }
         if let Some(session_id_value) = session_id.as_ref() {
             request = request.header(HEADER_SESSION_ID, session_id_value.as_ref());
+        }
+        if message_uses_request_scoped_headers(&message) {
+            request = apply_request_scoped_headers(request, &self.request_headers_state);
         }
 
         let response = request
@@ -472,6 +508,7 @@ pub struct RmcpClient {
     transport_recipe: TransportRecipe,
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Mutex<()>,
+    request_headers: Option<Arc<StdMutex<Option<HeaderMap>>>>,
 }
 
 impl RmcpClient {
@@ -489,9 +526,10 @@ impl RmcpClient {
             env_vars: env_vars.to_vec(),
             cwd,
         };
-        let transport = Self::create_pending_transport(&transport_recipe)
-            .await
-            .map_err(io::Error::other)?;
+        let transport =
+            Self::create_pending_transport(&transport_recipe, /*request_headers*/ None)
+                .await
+                .map_err(io::Error::other)?;
 
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
@@ -500,6 +538,7 @@ impl RmcpClient {
             transport_recipe,
             initialize_context: Mutex::new(None),
             session_recovery_lock: Mutex::new(()),
+            request_headers: None,
         })
     }
 
@@ -511,6 +550,7 @@ impl RmcpClient {
         http_headers: Option<HashMap<String, String>>,
         env_http_headers: Option<HashMap<String, String>>,
         store_mode: OAuthCredentialsStoreMode,
+        request_headers: Arc<StdMutex<Option<HeaderMap>>>,
     ) -> Result<Self> {
         let transport_recipe = TransportRecipe::StreamableHttp {
             server_name: server_name.to_string(),
@@ -520,7 +560,9 @@ impl RmcpClient {
             env_http_headers,
             store_mode,
         };
-        let transport = Self::create_pending_transport(&transport_recipe).await?;
+        let transport =
+            Self::create_pending_transport(&transport_recipe, Some(Arc::clone(&request_headers)))
+                .await?;
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
                 transport: Some(transport),
@@ -528,6 +570,7 @@ impl RmcpClient {
             transport_recipe,
             initialize_context: Mutex::new(None),
             session_recovery_lock: Mutex::new(()),
+            request_headers: Some(request_headers),
         })
     }
 
@@ -700,6 +743,7 @@ impl RmcpClient {
         &self,
         name: String,
         arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
         timeout: Option<Duration>,
     ) -> Result<CallToolResult> {
         self.refresh_oauth_if_needed().await;
@@ -712,8 +756,17 @@ impl RmcpClient {
             }
             None => None,
         };
+        let meta = match meta {
+            Some(Value::Object(map)) => Some(rmcp::model::Meta(map)),
+            Some(other) => {
+                return Err(anyhow!(
+                    "MCP tool request _meta must be a JSON object, got {other}"
+                ));
+            }
+            None => None,
+        };
         let rmcp_params = CallToolRequestParams {
-            meta: None,
+            meta,
             name: name.into(),
             arguments,
             task: None,
@@ -734,19 +787,25 @@ impl RmcpClient {
         params: Option<serde_json::Value>,
     ) -> Result<()> {
         self.refresh_oauth_if_needed().await;
-        self.run_service_operation("notifications/custom", None, move |service| {
-            let params = params.clone();
-            async move {
-                service
-                    .send_notification(ClientNotification::CustomNotification(CustomNotification {
-                        method: method.to_string(),
-                        params,
-                        extensions: Extensions::new(),
-                    }))
-                    .await
-            }
-            .boxed()
-        })
+        self.run_service_operation(
+            "notifications/custom",
+            /*timeout*/ None,
+            move |service| {
+                let params = params.clone();
+                async move {
+                    service
+                        .send_notification(ClientNotification::CustomNotification(
+                            CustomNotification {
+                                method: method.to_string(),
+                                params,
+                                extensions: Extensions::new(),
+                            },
+                        ))
+                        .await
+                }
+                .boxed()
+            },
+        )
         .await?;
         self.persist_oauth_tokens().await;
         Ok(())
@@ -759,7 +818,7 @@ impl RmcpClient {
     ) -> Result<ServerResult> {
         self.refresh_oauth_if_needed().await;
         let response = self
-            .run_service_operation("requests/custom", None, move |service| {
+            .run_service_operation("requests/custom", /*timeout*/ None, move |service| {
                 let params = params.clone();
                 async move {
                     service
@@ -814,6 +873,7 @@ impl RmcpClient {
 
     async fn create_pending_transport(
         transport_recipe: &TransportRecipe,
+        request_headers: Option<Arc<StdMutex<Option<HeaderMap>>>>,
     ) -> Result<PendingTransport> {
         match transport_recipe {
             TransportRecipe::Stdio {
@@ -930,7 +990,12 @@ impl RmcpClient {
                                     .auth_header(access_token);
                             let http_client = build_http_client(&default_headers)?;
                             let transport = StreamableHttpClientTransport::with_client(
-                                StreamableHttpResponseClient::new(http_client),
+                                StreamableHttpResponseClient::new(
+                                    http_client,
+                                    request_headers
+                                        .clone()
+                                        .unwrap_or_else(|| Arc::new(StdMutex::new(None))),
+                                ),
                                 http_config,
                             );
                             Ok(PendingTransport::StreamableHttp { transport })
@@ -947,7 +1012,12 @@ impl RmcpClient {
                     let http_client = build_http_client(&default_headers)?;
 
                     let transport = StreamableHttpClientTransport::with_client(
-                        StreamableHttpResponseClient::new(http_client),
+                        StreamableHttpResponseClient::new(
+                            http_client,
+                            request_headers
+                                .clone()
+                                .unwrap_or_else(|| Arc::new(StdMutex::new(None))),
+                        ),
                         http_config,
                     );
                     Ok(PendingTransport::StreamableHttp { transport })
@@ -1095,7 +1165,9 @@ impl RmcpClient {
             .await
             .clone()
             .ok_or_else(|| anyhow!("MCP client cannot recover before initialize succeeds"))?;
-        let pending_transport = Self::create_pending_transport(&self.transport_recipe).await?;
+        let pending_transport =
+            Self::create_pending_transport(&self.transport_recipe, self.request_headers.clone())
+                .await?;
         let (service, oauth_persistor, process_group_guard) = Self::connect_pending_transport(
             pending_transport,
             initialize_context.handler,
@@ -1150,7 +1222,10 @@ async fn create_oauth_transport_and_runtime(
         }
     };
 
-    let auth_client = AuthClient::new(StreamableHttpResponseClient::new(http_client), manager);
+    let auth_client = AuthClient::new(
+        StreamableHttpResponseClient::new(http_client, Arc::new(StdMutex::new(None))),
+        manager,
+    );
     let auth_manager = auth_client.auth_manager.clone();
 
     let transport = StreamableHttpClientTransport::with_client(
