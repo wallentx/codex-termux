@@ -257,11 +257,6 @@ jobs:
           set -euo pipefail
           rustup target add "${{ matrix.target }}"
       - if: ${{ matrix.target == 'aarch64-linux-android' }}
-        name: Install Cargo NDK
-        shell: bash
-        run: |
-          cargo install cargo-ndk
-      - if: ${{ matrix.target == 'aarch64-linux-android' }}
         name: Configure Android build environment
         shell: bash
         run: |
@@ -443,7 +438,7 @@ jobs:
             export CARGO_BUILD_JOBS=2
             export CARGO_PROFILE_RELEASE_LTO=thin
             export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
-            cargo ndk -t arm64-v8a -p 24 build --release --bin codex
+            cargo build --target ${{ matrix.target }} --release --bin codex
             exit 0
           fi
 
