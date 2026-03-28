@@ -141,6 +141,7 @@ mod status_indicator_widget;
 mod streaming;
 mod style;
 mod terminal_palette;
+mod terminal_title;
 mod text_formatting;
 mod theme_picker;
 mod tooltips;
@@ -248,6 +249,8 @@ mod wrapping;
 
 #[cfg(test)]
 pub mod test_backend;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
@@ -282,7 +285,10 @@ async fn start_embedded_app_server(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppServerTarget {
     Embedded,
-    Remote(String),
+    Remote {
+        websocket_url: String,
+        auth_token: Option<String>,
+    },
 }
 
 fn remote_addr_has_explicit_port(addr: &str, parsed: &Url) -> bool {
@@ -314,6 +320,16 @@ fn remote_addr_has_explicit_port(addr: &str, parsed: &Url) -> bool {
     host_and_port == format!("{expected_host}:{explicit_default_port}")
 }
 
+fn websocket_url_supports_auth_token(parsed: &Url) -> bool {
+    match (parsed.scheme(), parsed.host()) {
+        ("wss", Some(_)) => true,
+        ("ws", Some(url::Host::Domain(domain))) => domain.eq_ignore_ascii_case("localhost"),
+        ("ws", Some(url::Host::Ipv4(addr))) => addr.is_loopback(),
+        ("ws", Some(url::Host::Ipv6(addr))) => addr.is_loopback(),
+        _ => false,
+    }
+}
+
 pub fn normalize_remote_addr(addr: &str) -> color_eyre::Result<String> {
     let parsed = match Url::parse(addr) {
         Ok(parsed) => parsed,
@@ -338,9 +354,24 @@ pub fn normalize_remote_addr(addr: &str) -> color_eyre::Result<String> {
     );
 }
 
-async fn connect_remote_app_server(websocket_url: String) -> color_eyre::Result<AppServerClient> {
+fn validate_remote_auth_token_transport(websocket_url: &str) -> color_eyre::Result<()> {
+    let parsed = Url::parse(websocket_url).map_err(color_eyre::Report::new)?;
+    if websocket_url_supports_auth_token(&parsed) {
+        return Ok(());
+    }
+
+    color_eyre::eyre::bail!(
+        "remote auth tokens require `wss://` or loopback `ws://` URLs; got `{websocket_url}`"
+    )
+}
+
+async fn connect_remote_app_server(
+    websocket_url: String,
+    auth_token: Option<String>,
+) -> color_eyre::Result<AppServerClient> {
     let app_server = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
         websocket_url,
+        auth_token,
         client_name: "codex-tui".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
@@ -372,9 +403,10 @@ async fn start_app_server(
         )
         .await
         .map(AppServerClient::InProcess),
-        AppServerTarget::Remote(websocket_url) => {
-            connect_remote_app_server(websocket_url.clone()).await
-        }
+        AppServerTarget::Remote {
+            websocket_url,
+            auth_token,
+        } => connect_remote_app_server(websocket_url.clone(), auth_token.clone()).await,
     }
 }
 
@@ -488,7 +520,10 @@ async fn lookup_session_target_by_name_with_app_server(
                 source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
                 archived: Some(false),
                 cwd: None,
-                search_term: Some(name.to_string()),
+                // Thread names are hydrated after `thread/list` resolves rollout metadata, so
+                // name-based resume must scan the filtered list client-side instead of relying on
+                // the backend search index.
+                search_term: None,
             })
             .await?;
         if let Some(thread) = response
@@ -516,7 +551,7 @@ async fn lookup_session_target_with_app_server(
                 warn!(
                     session = id_or_name,
                     %err,
-                    "Failed to parse session id during app-server TUI lookup"
+                    "Failed to parse session id during TUI lookup"
                 );
                 return Ok(None);
             }
@@ -530,7 +565,7 @@ async fn lookup_session_target_with_app_server(
                 warn!(
                     session = id_or_name,
                     %err,
-                    "thread/read failed during app-server TUI session lookup"
+                    "thread/read failed during TUI session lookup"
                 );
                 Ok(None)
             }
@@ -544,12 +579,14 @@ async fn lookup_latest_session_target_with_app_server(
     app_server: &mut AppServerSession,
     config: &Config,
     cwd_filter: Option<&Path>,
+    include_non_interactive: bool,
 ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
     let response = app_server
         .thread_list(latest_session_lookup_params(
             app_server.is_remote(),
             config,
             cwd_filter,
+            include_non_interactive,
         ))
         .await?;
     Ok(response
@@ -562,6 +599,7 @@ fn latest_session_lookup_params(
     is_remote: bool,
     config: &Config,
     cwd_filter: Option<&Path>,
+    include_non_interactive: bool,
 ) -> ThreadListParams {
     ThreadListParams {
         cursor: None,
@@ -572,7 +610,8 @@ fn latest_session_lookup_params(
         } else {
             Some(vec![config.model_provider_id.clone()])
         },
-        source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
+        source_kinds: (!include_non_interactive)
+            .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
         archived: Some(false),
         cwd: if is_remote {
             None
@@ -588,11 +627,18 @@ pub async fn run_main(
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
     remote: Option<String>,
+    remote_auth_token: Option<String>,
 ) -> std::io::Result<AppExitInfo> {
     let remote_url = remote;
+    if let (Some(websocket_url), Some(_)) = (remote_url.as_deref(), remote_auth_token.as_ref()) {
+        validate_remote_auth_token_transport(websocket_url).map_err(std::io::Error::other)?;
+    }
     let app_server_target = remote_url
         .clone()
-        .map(AppServerTarget::Remote)
+        .map(|websocket_url| AppServerTarget::Remote {
+            websocket_url,
+            auth_token: remote_auth_token.clone(),
+        })
         .unwrap_or(AppServerTarget::Embedded);
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
@@ -738,6 +784,7 @@ pub async fn run_main(
         cwd,
         model_provider: model_provider_override.clone(),
         config_profile: cli.config_profile.clone(),
+        codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
@@ -902,6 +949,7 @@ pub async fn run_main(
         cloud_requirements,
         feedback,
         remote_url,
+        remote_auth_token,
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))
@@ -919,8 +967,9 @@ async fn run_ratatui_app(
     mut cloud_requirements: CloudRequirementsLoader,
     feedback: codex_feedback::CodexFeedback,
     remote_url: Option<String>,
+    remote_auth_token: Option<String>,
 ) -> color_eyre::Result<AppExitInfo> {
-    let remote_mode = matches!(&app_server_target, AppServerTarget::Remote(_));
+    let remote_mode = matches!(&app_server_target, AppServerTarget::Remote { .. });
     color_eyre::install()?;
 
     tooltips::announcement::prewarm();
@@ -938,6 +987,7 @@ async fn run_ratatui_app(
     terminal.clear()?;
 
     let mut tui = Tui::new(terminal);
+    let mut terminal_restore_guard = TerminalRestoreGuard::new();
 
     #[cfg(not(debug_assertions))]
     {
@@ -948,7 +998,7 @@ async fn run_ratatui_app(
             match update_prompt::run_update_prompt_if_needed(&mut tui, &initial_config).await? {
                 UpdatePromptOutcome::Continue => {}
                 UpdatePromptOutcome::RunUpdate(action) => {
-                    crate::tui::restore()?;
+                    terminal_restore_guard.restore()?;
                     return Ok(AppExitInfo {
                         token_usage: codex_protocol::protocol::TokenUsage::default(),
                         thread_id: None,
@@ -1016,7 +1066,7 @@ async fn run_ratatui_app(
         )
         .await?;
         if onboarding_result.should_exit {
-            restore();
+            terminal_restore_guard.restore_silently();
             session_log::log_session_end();
             let _ = tui.terminal.clear();
             return Ok(AppExitInfo {
@@ -1062,7 +1112,7 @@ async fn run_ratatui_app(
 
     let mut missing_session_exit = |id_str: &str, action: &str| {
         error!("Error finding conversation path: {id_str}");
-        restore();
+        terminal_restore_guard.restore_silently();
         session_log::log_session_end();
         let _ = tui.terminal.clear();
         Ok(AppExitInfo {
@@ -1118,6 +1168,7 @@ async fn run_ratatui_app(
             };
             match lookup_latest_session_target_with_app_server(
                 app_server, &config, /*cwd_filter*/ None,
+                /*include_non_interactive*/ false,
             )
             .await?
             {
@@ -1137,7 +1188,7 @@ async fn run_ratatui_app(
             .await?
             {
                 resume_picker::SessionSelection::Exit => {
-                    restore();
+                    terminal_restore_guard.restore_silently();
                     session_log::log_session_end();
                     return Ok(AppExitInfo {
                         token_usage: codex_protocol::protocol::TokenUsage::default(),
@@ -1172,7 +1223,14 @@ async fn run_ratatui_app(
         let Some(app_server) = session_lookup_app_server.as_mut() else {
             unreachable!("session lookup app server should be initialized for --resume --last");
         };
-        match lookup_latest_session_target_with_app_server(app_server, &config, filter_cwd).await? {
+        match lookup_latest_session_target_with_app_server(
+            app_server,
+            &config,
+            filter_cwd,
+            cli.resume_include_non_interactive,
+        )
+        .await?
+        {
             Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
             None => resume_picker::SessionSelection::StartFresh,
         }
@@ -1184,12 +1242,13 @@ async fn run_ratatui_app(
             &mut tui,
             &config,
             cli.resume_show_all,
+            cli.resume_include_non_interactive,
             app_server,
         )
         .await?
         {
             resume_picker::SessionSelection::Exit => {
-                restore();
+                terminal_restore_guard.restore_silently();
                 session_log::log_session_end();
                 return Ok(AppExitInfo {
                     token_usage: codex_protocol::protocol::TokenUsage::default(),
@@ -1220,7 +1279,7 @@ async fn run_ratatui_app(
     let fallback_cwd = match action_and_target_session_if_resume_or_fork {
         Some((action, target_session)) => {
             if remote_mode {
-                Some(current_cwd.clone())
+                Some(current_cwd.to_path_buf())
             } else {
                 match resolve_cwd_for_resume_or_fork(
                     &mut tui,
@@ -1235,7 +1294,7 @@ async fn run_ratatui_app(
                 {
                     ResolveCwdOutcome::Continue(cwd) => cwd,
                     ResolveCwdOutcome::Exit => {
-                        restore();
+                        terminal_restore_guard.restore_silently();
                         session_log::log_session_end();
                         return Ok(AppExitInfo {
                             token_usage: codex_protocol::protocol::TokenUsage::default(),
@@ -1303,7 +1362,7 @@ async fn run_ratatui_app(
     {
         Ok(app_server) => app_server,
         Err(err) => {
-            restore();
+            terminal_restore_guard.restore_silently();
             session_log::log_session_end();
             return Err(err);
         }
@@ -1323,10 +1382,11 @@ async fn run_ratatui_app(
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
         should_prompt_windows_sandbox_nux_at_startup,
         remote_url,
+        remote_auth_token,
     )
     .await;
 
-    restore();
+    terminal_restore_guard.restore_silently();
     // Mark the end of the recorded session.
     session_log::log_session_end();
     // ignore error when collecting usage – report underlying error instead
@@ -1465,6 +1525,38 @@ fn restore() {
         eprintln!(
             "failed to restore terminal. Run `reset` or restart your terminal to recover: {err}"
         );
+    }
+}
+
+struct TerminalRestoreGuard {
+    active: bool,
+}
+
+impl TerminalRestoreGuard {
+    fn new() -> Self {
+        Self { active: true }
+    }
+
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    fn restore(&mut self) -> color_eyre::Result<()> {
+        if self.active {
+            crate::tui::restore()?;
+            self.active = false;
+        }
+        Ok(())
+    }
+
+    fn restore_silently(&mut self) {
+        if self.active {
+            restore();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        self.restore_silently();
     }
 }
 
@@ -1689,6 +1781,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_auth_token_transport_accepts_loopback_ws() {
+        validate_remote_auth_token_transport("ws://127.0.0.1:4500/")
+            .expect("loopback ws should be allowed for auth tokens");
+        validate_remote_auth_token_transport("ws://localhost:4500/")
+            .expect("localhost ws should be allowed for auth tokens");
+        validate_remote_auth_token_transport("ws://[::1]:4500/")
+            .expect("ipv6 loopback ws should be allowed for auth tokens");
+    }
+
+    #[test]
+    fn remote_auth_token_transport_accepts_secure_wss() {
+        validate_remote_auth_token_transport("wss://example.com:443/")
+            .expect("wss should be allowed for auth tokens");
+    }
+
+    #[test]
+    fn remote_auth_token_transport_rejects_non_loopback_ws() {
+        let err = validate_remote_auth_token_transport("ws://example.com:4500/")
+            .expect_err("non-loopback ws should be rejected for auth tokens");
+        assert!(
+            err.to_string()
+                .contains("remote auth tokens require `wss://` or loopback `ws://` URLs")
+        );
+    }
+
     #[tokio::test]
     async fn latest_session_lookup_params_keep_local_filters_for_embedded_sessions()
     -> std::io::Result<()> {
@@ -1696,7 +1814,12 @@ mod tests {
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
 
-        let params = latest_session_lookup_params(false, &config, Some(cwd.as_path()));
+        let params = latest_session_lookup_params(
+            /*is_remote*/ false,
+            &config,
+            Some(cwd.as_path()),
+            /*include_non_interactive*/ false,
+        );
 
         assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
         assert_eq!(params.cwd, Some(cwd.to_string_lossy().to_string()));
@@ -1710,7 +1833,12 @@ mod tests {
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
 
-        let params = latest_session_lookup_params(true, &config, Some(cwd.as_path()));
+        let params = latest_session_lookup_params(
+            /*is_remote*/ true,
+            &config,
+            Some(cwd.as_path()),
+            /*include_non_interactive*/ false,
+        );
 
         assert_eq!(params.model_providers, None);
         assert_eq!(params.cwd, None);
@@ -1722,7 +1850,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
 
-        let cwd = read_session_cwd(&config, ThreadId::new(), None).await;
+        let cwd = read_session_cwd(&config, ThreadId::new(), /*path*/ None).await;
 
         assert_eq!(cwd, None);
         Ok(())
@@ -1734,7 +1862,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(false);
+        config.set_windows_sandbox_enabled(/*value*/ false);
 
         let should_show = should_show_trust_screen(&config);
         assert!(
@@ -1760,6 +1888,67 @@ mod tests {
             .await
             .expect("thread/start should succeed");
         assert!(!response.thread.id.is_empty());
+
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_session_target_by_name_ignores_backend_search_term_mismatch()
+    -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let thread_id = ThreadId::new();
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/02/01")
+            .join(format!("rollout-2025-02-01T10-00-00-{thread_id}.jsonl"));
+        let rollout_dir = rollout_path.parent().expect("rollout parent");
+        std::fs::create_dir_all(rollout_dir)?;
+        std::fs::write(&rollout_path, "")?;
+
+        let state_runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        state_runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let session_cwd = temp_dir.path().join("project");
+        std::fs::create_dir_all(&session_cwd)?;
+        let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-01T10:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            SessionSource::Cli,
+        );
+        builder.cwd = session_cwd;
+        let mut metadata = builder.build(config.model_provider_id.as_str());
+        metadata.title = "Different rollout title".to_string();
+        metadata.first_user_message = Some("preview text".to_string());
+        state_runtime
+            .upsert_thread(&metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        codex_core::append_thread_name(&config.codex_home, thread_id, "saved-session").await?;
+
+        let mut app_server =
+            AppServerSession::new(codex_app_server_client::AppServerClient::InProcess(
+                start_test_embedded_app_server(config).await?,
+            ));
+        let target =
+            lookup_session_target_by_name_with_app_server(&mut app_server, "saved-session").await?;
+        let target = target.expect("name lookup should find the saved thread");
+        assert_eq!(target.path, Some(rollout_path));
+        assert_eq!(target.thread_id, thread_id);
 
         app_server.shutdown().await?;
         Ok(())
@@ -1797,7 +1986,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(true);
+        config.set_windows_sandbox_enabled(/*value*/ true);
 
         let should_show = should_show_trust_screen(&config);
         if cfg!(target_os = "windows") {
@@ -2099,7 +2288,7 @@ trust_level = "untrusted"
         .await
         .map_err(std::io::Error::other)?;
         runtime
-            .mark_backfill_complete(None)
+            .mark_backfill_complete(/*last_watermark*/ None)
             .await
             .map_err(std::io::Error::other)?;
 

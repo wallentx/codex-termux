@@ -1,4 +1,5 @@
 use super::*;
+use codex_plugin::PluginId;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
@@ -127,6 +128,50 @@ fn active_plugin_version_reads_version_directory_name() {
     assert_eq!(
         store.active_plugin_root(&plugin_id).unwrap().as_path(),
         tmp.path().join("plugins/cache/debug/sample-plugin/local")
+    );
+}
+
+#[test]
+fn active_plugin_version_prefers_default_local_version_when_multiple_versions_exist() {
+    let tmp = tempdir().unwrap();
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/0123456789abcdef",
+        "sample-plugin",
+    );
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/local",
+        "sample-plugin",
+    );
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let plugin_id = PluginId::new("sample-plugin".to_string(), "debug".to_string()).unwrap();
+
+    assert_eq!(
+        store.active_plugin_version(&plugin_id),
+        Some("local".to_string())
+    );
+}
+
+#[test]
+fn active_plugin_version_returns_last_sorted_version_when_default_is_missing() {
+    let tmp = tempdir().unwrap();
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/0123456789abcdef",
+        "sample-plugin",
+    );
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/fedcba9876543210",
+        "sample-plugin",
+    );
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let plugin_id = PluginId::new("sample-plugin".to_string(), "debug".to_string()).unwrap();
+
+    assert_eq!(
+        store.active_plugin_version(&plugin_id),
+        Some("fedcba9876543210".to_string())
     );
 }
 

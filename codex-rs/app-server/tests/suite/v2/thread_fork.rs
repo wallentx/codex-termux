@@ -53,7 +53,7 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
         "2025-01-05T12:00:00Z",
         preview,
         Some("mock_provider"),
-        None,
+        /*git_info*/ None,
     )?;
 
     let original_path = codex_home
@@ -123,7 +123,7 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
         "expected forked thread to include one turn"
     );
     let turn = &thread.turns[0];
-    assert_eq!(turn.status, TurnStatus::Completed);
+    assert_eq!(turn.status, TurnStatus::Interrupted);
     assert_eq!(turn.items.len(), 1, "expected user message item");
     match &turn.items[0] {
         ThreadItem::UserMessage { content, .. } => {
@@ -267,7 +267,7 @@ async fn thread_fork_surfaces_cloud_requirements_load_errors() -> Result<()> {
         "2025-01-05T12:00:00Z",
         "Saved user message",
         Some("mock_provider"),
-        None,
+        /*git_info*/ None,
     )?;
 
     let refresh_token_url = format!("{}/oauth/token", server.uri());
@@ -331,7 +331,7 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
         "2025-01-05T12:00:00Z",
         preview,
         Some("mock_provider"),
-        None,
+        /*git_info*/ None,
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;

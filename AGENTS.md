@@ -35,11 +35,12 @@ In the codex-rs folder where the rust code lives:
   - If a file exceeds roughly 800 LoC, add new functionality in a new module instead of extending
     the existing file unless there is a strong documented reason not to.
   - This rule applies especially to high-touch files that already attract unrelated changes, such
-    as `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/bottom_pane/chat_composer.rs`,
-    `codex-rs/tui/src/bottom_pane/footer.rs`, `codex-rs/tui/src/chatwidget.rs`,
-    `codex-rs/tui/src/bottom_pane/mod.rs`, and similarly central orchestration modules.
+    as `codex-rs/tui_app_server/src/app.rs`, `codex-rs/tui_app_server/src/bottom_pane/chat_composer.rs`,
+    `codex-rs/tui_app_server/src/bottom_pane/footer.rs`, `codex-rs/tui_app_server/src/chatwidget.rs`,
+    `codex-rs/tui_app_server/src/bottom_pane/mod.rs`, and similarly central orchestration modules.
   - When extracting code from a large module, move the related tests and module/type docs toward
     the new implementation so the invariants stay close to the code that owns them.
+- When running Rust commands (e.g. `just fix` or `cargo test`) be patient with the command and never try to kill them using the PID. Rust lock can make the execution slow, this is expected.
 
 Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it. Additionally, run the tests:
 
@@ -50,9 +51,22 @@ Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in 
 
 Also run `just argument-comment-lint` to ensure the codebase is clean of comment lint errors.
 
+## The `codex-core` crate
+
+Over time, the `codex-core` crate (defined in `codex-rs/core/`) has become bloated because it is the largest crate, so it is often easier to add something new to `codex-core` rather than refactor out the library code you need so your new code neither takes a dependency on, nor contributes to the size of, `codex-core`.
+
+To that end: **resist adding code to codex-core**!
+
+Particularly when introducing a new concept/feature/API, before adding to `codex-core`, consider whether:
+
+- There is an existing crate other than `codex-core` that is an appropriate place for your new code to live.
+- It is time to introduce a new crate to the Cargo workspace for your new functionality. Refactor existing code as necessary to make this happen.
+
+Likewise, when reviewing code, do not hesitate to push back on PRs that would unnecessarily add code to `codex-core`.
+
 ## TUI style conventions
 
-See `codex-rs/tui/styles.md`.
+See `codex-rs/tui_app_server/styles.md`.
 
 ## TUI code conventions
 

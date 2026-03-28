@@ -4,35 +4,90 @@ use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::vendored_bwrap::exec_vendored_bwrap;
+use codex_sandboxing::find_system_bwrap_in_path;
 use codex_utils_absolute_path::AbsolutePathBuf;
-
-const SYSTEM_BWRAP_PATH: &str = "/usr/bin/bwrap";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BubblewrapLauncher {
-    System(AbsolutePathBuf),
+    System(SystemBwrapLauncher),
     Vendored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemBwrapLauncher {
+    program: AbsolutePathBuf,
+    supports_argv0: bool,
 }
 
 pub(crate) fn exec_bwrap(argv: Vec<String>, preserved_files: Vec<File>) -> ! {
     match preferred_bwrap_launcher() {
-        BubblewrapLauncher::System(program) => exec_system_bwrap(&program, argv, preserved_files),
+        BubblewrapLauncher::System(launcher) => {
+            exec_system_bwrap(&launcher.program, argv, preserved_files)
+        }
         BubblewrapLauncher::Vendored => exec_vendored_bwrap(argv, preserved_files),
     }
 }
 
 fn preferred_bwrap_launcher() -> BubblewrapLauncher {
-    if !Path::new(SYSTEM_BWRAP_PATH).is_file() {
+    static LAUNCHER: OnceLock<BubblewrapLauncher> = OnceLock::new();
+    LAUNCHER
+        .get_or_init(|| match find_system_bwrap_in_path() {
+            Some(path) => preferred_bwrap_launcher_for_path(&path),
+            None => BubblewrapLauncher::Vendored,
+        })
+        .clone()
+}
+
+fn preferred_bwrap_launcher_for_path(system_bwrap_path: &Path) -> BubblewrapLauncher {
+    preferred_bwrap_launcher_for_path_with_probe(system_bwrap_path, system_bwrap_supports_argv0)
+}
+
+fn preferred_bwrap_launcher_for_path_with_probe(
+    system_bwrap_path: &Path,
+    system_bwrap_supports_argv0: impl FnOnce(&Path) -> bool,
+) -> BubblewrapLauncher {
+    if !system_bwrap_path.is_file() {
         return BubblewrapLauncher::Vendored;
     }
 
-    let system_bwrap_path = match AbsolutePathBuf::from_absolute_path(SYSTEM_BWRAP_PATH) {
+    let supports_argv0 = system_bwrap_supports_argv0(system_bwrap_path);
+    let system_bwrap_path = match AbsolutePathBuf::from_absolute_path(system_bwrap_path) {
         Ok(path) => path,
-        Err(err) => panic!("failed to normalize system bubblewrap path {SYSTEM_BWRAP_PATH}: {err}"),
+        Err(err) => panic!(
+            "failed to normalize system bubblewrap path {}: {err}",
+            system_bwrap_path.display()
+        ),
     };
-    BubblewrapLauncher::System(system_bwrap_path)
+    BubblewrapLauncher::System(SystemBwrapLauncher {
+        program: system_bwrap_path,
+        supports_argv0,
+    })
+}
+
+pub(crate) fn preferred_bwrap_supports_argv0() -> bool {
+    match preferred_bwrap_launcher() {
+        BubblewrapLauncher::System(launcher) => launcher.supports_argv0,
+        BubblewrapLauncher::Vendored => true,
+    }
+}
+
+fn system_bwrap_supports_argv0(system_bwrap_path: &Path) -> bool {
+    // bubblewrap added `--argv0` in v0.9.0:
+    // https://github.com/containers/bubblewrap/releases/tag/v0.9.0
+    // Older distro packages (for example Ubuntu 20.04/22.04) ship builds that
+    // reject `--argv0`, so use the system binary's no-argv0 compatibility path
+    // in that case.
+    let output = match Command::new(system_bwrap_path).arg("--help").output() {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stdout.contains("--argv0") || stderr.contains("--argv0")
 }
 
 fn exec_system_bwrap(
@@ -101,6 +156,43 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn prefers_system_bwrap_when_help_lists_argv0() {
+        let fake_bwrap = NamedTempFile::new().expect("temp file");
+        let fake_bwrap_path = fake_bwrap.path();
+        let expected = AbsolutePathBuf::from_absolute_path(fake_bwrap_path).expect("absolute");
+
+        assert_eq!(
+            preferred_bwrap_launcher_for_path_with_probe(fake_bwrap_path, |_| true),
+            BubblewrapLauncher::System(SystemBwrapLauncher {
+                program: expected,
+                supports_argv0: true,
+            })
+        );
+    }
+
+    #[test]
+    fn prefers_system_bwrap_when_system_bwrap_lacks_argv0() {
+        let fake_bwrap = NamedTempFile::new().expect("temp file");
+        let fake_bwrap_path = fake_bwrap.path();
+
+        assert_eq!(
+            preferred_bwrap_launcher_for_path_with_probe(fake_bwrap_path, |_| false),
+            BubblewrapLauncher::System(SystemBwrapLauncher {
+                program: AbsolutePathBuf::from_absolute_path(fake_bwrap_path).expect("absolute"),
+                supports_argv0: false,
+            })
+        );
+    }
+
+    #[test]
+    fn falls_back_to_vendored_when_system_bwrap_is_missing() {
+        assert_eq!(
+            preferred_bwrap_launcher_for_path(Path::new("/definitely/not/a/bwrap")),
+            BubblewrapLauncher::Vendored
+        );
+    }
 
     #[test]
     fn preserved_files_are_made_inheritable_for_system_exec() {

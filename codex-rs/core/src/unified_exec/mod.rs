@@ -12,13 +12,14 @@
 //! Flow at a glance (open process)
 //! 1) Build a small request `{ command, cwd }`.
 //! 2) Orchestrator: approval (bypass/cache/prompt) → select sandbox → run.
-//! 3) Runtime: transform `CommandSpec` -> `ExecRequest` -> spawn PTY.
+//! 3) Runtime: transform `SandboxTransformRequest` -> `ExecRequest` -> spawn PTY.
 //! 4) If denial, orchestrator retries with `SandboxType::None`.
 //! 5) Process handle is returned with streaming output + metadata.
 //!
 //! This keeps policy logic and user interaction centralized while the PTY/process
 //! concerns remain isolated here. The implementation is split between:
 //! - `process.rs`: PTY process lifecycle + output buffering.
+//! - `process_state.rs`: shared exit/failure state for local and remote processes.
 //! - `process_manager.rs`: orchestration (approvals, sandboxing, reuse) and request handling.
 
 use std::collections::HashMap;
@@ -42,6 +43,7 @@ mod errors;
 mod head_tail_buffer;
 mod process;
 mod process_manager;
+mod process_state;
 
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
@@ -167,6 +169,10 @@ pub(crate) fn generate_chunk_id() -> String {
         .collect()
 }
 
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "process_tests.rs"]
+mod process_tests;
 #[cfg(test)]
 #[cfg(unix)]
 #[path = "mod_tests.rs"]

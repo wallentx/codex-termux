@@ -35,19 +35,14 @@ use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
-use codex_core::AuthManager;
-use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
-use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use serde::de::DeserializeOwned;
@@ -73,7 +68,6 @@ pub type RequestResult = std::result::Result<JsonRpcResult, JSONRPCErrorError>;
 pub enum AppServerEvent {
     Lagged { skipped: usize },
     ServerNotification(ServerNotification),
-    LegacyNotification(JSONRPCNotification),
     ServerRequest(ServerRequest),
     Disconnected { message: String },
 }
@@ -85,30 +79,131 @@ impl From<InProcessServerEvent> for AppServerEvent {
             InProcessServerEvent::ServerNotification(notification) => {
                 Self::ServerNotification(notification)
             }
-            InProcessServerEvent::LegacyNotification(notification) => {
-                Self::LegacyNotification(notification)
-            }
             InProcessServerEvent::ServerRequest(request) => Self::ServerRequest(request),
         }
     }
 }
 
 fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
-    // These terminal events drive surface shutdown/completion state. Dropping
-    // them under backpressure can leave exec/TUI waiting forever even though
-    // the underlying turn has already ended.
+    // These transcript and terminal events must remain lossless. Dropping
+    // streamed assistant text or the authoritative completed item can leave
+    // the TUI with permanently corrupted markdown, while dropping completion
+    // notifications can leave surfaces waiting forever.
     match event {
-        InProcessServerEvent::ServerNotification(
-            codex_app_server_protocol::ServerNotification::TurnCompleted(_),
-        ) => true,
-        InProcessServerEvent::LegacyNotification(notification) => matches!(
-            notification
-                .method
-                .strip_prefix("codex/event/")
-                .unwrap_or(&notification.method),
-            "task_complete" | "turn_aborted" | "shutdown_complete"
-        ),
+        InProcessServerEvent::ServerNotification(notification) => {
+            server_notification_requires_delivery(notification)
+        }
         _ => false,
+    }
+}
+
+/// Returns `true` for notifications that must survive backpressure.
+///
+/// Transcript events (`AgentMessageDelta`, `PlanDelta`, reasoning deltas) and
+/// the authoritative `ItemCompleted` / `TurnCompleted` form the lossless tier
+/// of the event stream. Dropping any of these corrupts the visible assistant
+/// output or leaves surfaces waiting for a completion signal that already
+/// fired. Everything else (`CommandExecutionOutputDelta`, progress, etc.) is
+/// best-effort and may be dropped with only cosmetic impact.
+///
+/// Both the in-process and remote transports delegate to this function so the
+/// classification stays in sync.
+pub(crate) fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
+    matches!(
+        notification,
+        ServerNotification::TurnCompleted(_)
+            | ServerNotification::ItemCompleted(_)
+            | ServerNotification::AgentMessageDelta(_)
+            | ServerNotification::PlanDelta(_)
+            | ServerNotification::ReasoningSummaryTextDelta(_)
+            | ServerNotification::ReasoningTextDelta(_)
+    )
+}
+
+/// Outcome of attempting to forward a single event to the consumer channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardEventResult {
+    /// The event was delivered (or intentionally dropped); the stream is healthy.
+    Continue,
+    /// The consumer channel is closed; the caller should stop producing events.
+    DisableStream,
+}
+
+/// Forwards a single in-process event to the consumer, respecting the
+/// lossless/best-effort split.
+///
+/// Lossless events (transcript deltas, item/turn completions) block until the
+/// consumer drains capacity. Best-effort events use `try_send` and increment
+/// `skipped_events` on failure. When a lag marker needs to be flushed before a
+/// lossless event, the flush itself blocks so the marker is never lost.
+///
+/// If a dropped event is a `ServerRequest`, `reject_server_request` is called
+/// so the server does not wait for a response that will never come.
+async fn forward_in_process_event<F>(
+    event_tx: &mpsc::Sender<InProcessServerEvent>,
+    skipped_events: &mut usize,
+    event: InProcessServerEvent,
+    mut reject_server_request: F,
+) -> ForwardEventResult
+where
+    F: FnMut(ServerRequest),
+{
+    if *skipped_events > 0 {
+        if event_requires_delivery(&event) {
+            // Surface lag before the lossless event, but do not let the lag marker itself cause
+            // us to drop the transcript/completion notification the caller is blocked on.
+            if event_tx
+                .send(InProcessServerEvent::Lagged {
+                    skipped: *skipped_events,
+                })
+                .await
+                .is_err()
+            {
+                return ForwardEventResult::DisableStream;
+            }
+            *skipped_events = 0;
+        } else {
+            match event_tx.try_send(InProcessServerEvent::Lagged {
+                skipped: *skipped_events,
+            }) {
+                Ok(()) => {
+                    *skipped_events = 0;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    *skipped_events = skipped_events.saturating_add(1);
+                    warn!("dropping in-process app-server event because consumer queue is full");
+                    if let InProcessServerEvent::ServerRequest(request) = event {
+                        reject_server_request(request);
+                    }
+                    return ForwardEventResult::Continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return ForwardEventResult::DisableStream;
+                }
+            }
+        }
+    }
+
+    if event_requires_delivery(&event) {
+        // Block until the consumer catches up for transcript/completion notifications; this
+        // preserves the visible assistant output even when the queue is otherwise saturated.
+        if event_tx.send(event).await.is_err() {
+            return ForwardEventResult::DisableStream;
+        }
+        return ForwardEventResult::Continue;
+    }
+
+    match event_tx.try_send(event) {
+        Ok(()) => ForwardEventResult::Continue,
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            *skipped_events = skipped_events.saturating_add(1);
+            warn!("dropping in-process app-server event because consumer queue is full");
+            if let InProcessServerEvent::ServerRequest(request) = event {
+                reject_server_request(request);
+            }
+            ForwardEventResult::Continue
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => ForwardEventResult::DisableStream,
     }
 }
 
@@ -160,16 +255,6 @@ impl Error for TypedRequestError {
 }
 
 #[derive(Clone)]
-struct SharedCoreManagers {
-    // Temporary bootstrap escape hatch for embedders that still need direct
-    // core handles during the in-process app-server migration. Once TUI/exec
-    // stop depending on direct manager access, remove this wrapper and keep
-    // manager ownership entirely inside the app-server runtime.
-    auth_manager: Arc<AuthManager>,
-    thread_manager: Arc<ThreadManager>,
-}
-
-#[derive(Clone)]
 pub struct InProcessClientStartArgs {
     /// Resolved argv0 dispatch paths used by command execution internals.
     pub arg0_paths: Arg0DispatchPaths,
@@ -202,30 +287,6 @@ pub struct InProcessClientStartArgs {
 }
 
 impl InProcessClientStartArgs {
-    fn shared_core_managers(&self) -> SharedCoreManagers {
-        let auth_manager = AuthManager::shared(
-            self.config.codex_home.clone(),
-            self.enable_codex_api_key_env,
-            self.config.cli_auth_credentials_store_mode,
-        );
-        let thread_manager = Arc::new(ThreadManager::new(
-            self.config.as_ref(),
-            auth_manager.clone(),
-            self.session_source.clone(),
-            CollaborationModesConfig {
-                default_mode_request_user_input: self
-                    .config
-                    .features
-                    .enabled(Feature::DefaultModeRequestUserInput),
-            },
-        ));
-
-        SharedCoreManagers {
-            auth_manager,
-            thread_manager,
-        }
-    }
-
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
@@ -247,7 +308,7 @@ impl InProcessClientStartArgs {
         }
     }
 
-    fn into_runtime_start_args(self, shared_core: &SharedCoreManagers) -> InProcessStartArgs {
+    fn into_runtime_start_args(self) -> InProcessStartArgs {
         let initialize = self.initialize_params();
         InProcessStartArgs {
             arg0_paths: self.arg0_paths,
@@ -255,8 +316,6 @@ impl InProcessClientStartArgs {
             cli_overrides: self.cli_overrides,
             loader_overrides: self.loader_overrides,
             cloud_requirements: self.cloud_requirements,
-            auth_manager: Some(shared_core.auth_manager.clone()),
-            thread_manager: Some(shared_core.thread_manager.clone()),
             feedback: self.feedback,
             config_warnings: self.config_warnings,
             session_source: self.session_source,
@@ -310,8 +369,6 @@ pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
-    auth_manager: Arc<AuthManager>,
-    thread_manager: Arc<ThreadManager>,
 }
 
 #[derive(Clone)]
@@ -338,9 +395,8 @@ impl InProcessAppServerClient {
     /// with overload error instead of being silently dropped.
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
-        let shared_core = args.shared_core_managers();
         let mut handle =
-            codex_app_server::in_process::start(args.into_runtime_start_args(&shared_core)).await?;
+            codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
@@ -401,84 +457,46 @@ impl InProcessAppServerClient {
                         let Some(event) = event else {
                             break;
                         };
-
-                        if skipped_events > 0 {
-                            if event_requires_delivery(&event) {
-                                // Surface lag before the terminal event, but
-                                // do not let the lag marker itself cause us to
-                                // drop the completion/abort notification that
-                                // the caller is blocked on.
-                                if event_tx
-                                    .send(InProcessServerEvent::Lagged {
-                                        skipped: skipped_events,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    event_stream_enabled = false;
-                                    continue;
-                                }
-                                skipped_events = 0;
-                            } else {
-                                match event_tx.try_send(InProcessServerEvent::Lagged {
-                                    skipped: skipped_events,
-                                }) {
-                                    Ok(()) => {
-                                        skipped_events = 0;
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        skipped_events = skipped_events.saturating_add(1);
-                                        warn!(
-                                            "dropping in-process app-server event because consumer queue is full"
-                                        );
-                                        if let InProcessServerEvent::ServerRequest(request) = event {
-                                            let _ = request_sender.fail_server_request(
-                                                request.id().clone(),
-                                                JSONRPCErrorError {
-                                                    code: -32001,
-                                                    message: "in-process app-server event queue is full".to_string(),
-                                                    data: None,
-                                                },
-                                            );
-                                        }
-                                        continue;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        event_stream_enabled = false;
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-
-                        if event_requires_delivery(&event) {
-                            // Block until the consumer catches up for
-                            // terminal notifications; this preserves the
-                            // completion signal even when the queue is
-                            // otherwise saturated.
-                            if event_tx.send(event).await.is_err() {
-                                event_stream_enabled = false;
+                        if let InProcessServerEvent::ServerRequest(
+                            ServerRequest::ChatgptAuthTokensRefresh { request_id, .. }
+                        ) = &event
+                        {
+                            let send_result = request_sender.fail_server_request(
+                                request_id.clone(),
+                                JSONRPCErrorError {
+                                    code: -32000,
+                                    message: "chatgpt auth token refresh is not supported for in-process app-server clients".to_string(),
+                                    data: None,
+                                },
+                            );
+                            if let Err(err) = send_result {
+                                warn!(
+                                    "failed to reject unsupported chatgpt auth token refresh request: {err}"
+                                );
                             }
                             continue;
                         }
 
-                        match event_tx.try_send(event) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(event)) => {
-                                skipped_events = skipped_events.saturating_add(1);
-                                warn!("dropping in-process app-server event because consumer queue is full");
-                                if let InProcessServerEvent::ServerRequest(request) = event {
-                                    let _ = request_sender.fail_server_request(
-                                        request.id().clone(),
-                                        JSONRPCErrorError {
-                                            code: -32001,
-                                            message: "in-process app-server event queue is full".to_string(),
-                                            data: None,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                        match forward_in_process_event(
+                            &event_tx,
+                            &mut skipped_events,
+                            event,
+                            |request| {
+                                let _ = request_sender.fail_server_request(
+                                    request.id().clone(),
+                                    JSONRPCErrorError {
+                                        code: -32001,
+                                        message: "in-process app-server event queue is full"
+                                            .to_string(),
+                                        data: None,
+                                    },
+                                );
+                            },
+                        )
+                        .await
+                        {
+                            ForwardEventResult::Continue => {}
+                            ForwardEventResult::DisableStream => {
                                 event_stream_enabled = false;
                             }
                         }
@@ -491,19 +509,7 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
-            auth_manager: shared_core.auth_manager,
-            thread_manager: shared_core.thread_manager,
         })
-    }
-
-    /// Temporary bootstrap escape hatch for embedders migrating toward RPC-only usage.
-    pub fn auth_manager(&self) -> Arc<AuthManager> {
-        self.auth_manager.clone()
-    }
-
-    /// Temporary bootstrap escape hatch for embedders migrating toward RPC-only usage.
-    pub fn thread_manager(&self) -> Arc<ThreadManager> {
-        self.thread_manager.clone()
     }
 
     pub fn request_handle(&self) -> InProcessAppServerRequestHandle {
@@ -664,8 +670,6 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
-            auth_manager: _,
-            thread_manager: _,
         } = self;
         let mut worker_handle = worker_handle;
         // Drop the caller-facing receiver before asking the worker to shut
@@ -857,8 +861,6 @@ mod tests {
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::ToolRequestUserInputQuestion;
-    use codex_core::AuthManager;
-    use codex_core::ThreadManager;
     use codex_core::config::ConfigBuilder;
     use futures::SinkExt;
     use futures::StreamExt;
@@ -866,8 +868,11 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::Duration;
     use tokio::time::timeout;
-    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::handshake::server::Request as WebSocketRequest;
+    use tokio_tungstenite::tungstenite::handshake::server::Response as WebSocketResponse;
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
     async fn build_test_config() -> Config {
         match ConfigBuilder::default().build().await {
@@ -912,15 +917,42 @@ mod tests {
             + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        start_test_remote_server_with_auth(/*expected_auth_token*/ None, handler).await
+    }
+
+    async fn start_test_remote_server_with_auth<F, Fut>(
+        expected_auth_token: Option<String>,
+        handler: F,
+    ) -> String
+    where
+        F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("listener address");
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept should succeed");
-            let websocket = accept_async(stream)
-                .await
-                .expect("websocket upgrade should succeed");
+            let websocket = accept_hdr_async(
+                stream,
+                move |request: &WebSocketRequest, response: WebSocketResponse| {
+                    let provided_auth_token = request
+                        .headers()
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let expected_auth_token = expected_auth_token
+                        .as_ref()
+                        .map(|token| format!("Bearer {token}"));
+                    assert_eq!(provided_auth_token, expected_auth_token);
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("websocket upgrade should succeed");
             handler(websocket).await;
         });
         format!("ws://{addr}")
@@ -985,9 +1017,57 @@ mod tests {
             .expect("message should send");
     }
 
+    fn command_execution_output_delta_notification(delta: &str) -> ServerNotification {
+        ServerNotification::CommandExecutionOutputDelta(
+            codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                item_id: "item".to_string(),
+                delta: delta.to_string(),
+            },
+        )
+    }
+
+    fn agent_message_delta_notification(delta: &str) -> ServerNotification {
+        ServerNotification::AgentMessageDelta(
+            codex_app_server_protocol::AgentMessageDeltaNotification {
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                item_id: "item".to_string(),
+                delta: delta.to_string(),
+            },
+        )
+    }
+
+    fn item_completed_notification(text: &str) -> ServerNotification {
+        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            item: codex_app_server_protocol::ThreadItem::AgentMessage {
+                id: "item".to_string(),
+                text: text.to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+        })
+    }
+
+    fn turn_completed_notification() -> ServerNotification {
+        ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
+            thread_id: "thread".to_string(),
+            turn: codex_app_server_protocol::Turn {
+                id: "turn".to_string(),
+                items: Vec::new(),
+                status: codex_app_server_protocol::TurnStatus::Completed,
+                error: None,
+            },
+        })
+    }
+
     fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
             websocket_url,
+            auth_token: None,
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -1052,7 +1132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_thread_manager_tracks_threads_started_via_app_server() {
+    async fn threads_started_via_app_server_are_visible_through_typed_requests() {
         let client = start_test_client(SessionSource::Cli).await;
 
         let response: ThreadStartResponse = client
@@ -1065,24 +1145,27 @@ mod tests {
             })
             .await
             .expect("thread/start should succeed");
-        let created_thread_id = codex_protocol::ThreadId::from_string(&response.thread.id)
-            .expect("thread id should parse");
-        timeout(
-            Duration::from_secs(2),
-            client.thread_manager().get_thread(created_thread_id),
-        )
-        .await
-        .expect("timed out waiting for retained thread manager to observe started thread")
-        .expect("started thread should be visible through the shared thread manager");
-        let thread_ids = client.thread_manager().list_thread_ids().await;
-        assert!(thread_ids.contains(&created_thread_id));
+        let read = client
+            .request_typed::<codex_app_server_protocol::ThreadReadResponse>(
+                ClientRequest::ThreadRead {
+                    request_id: RequestId::Integer(4),
+                    params: codex_app_server_protocol::ThreadReadParams {
+                        thread_id: response.thread.id.clone(),
+                        include_turns: false,
+                    },
+                },
+            )
+            .await
+            .expect("thread/read should return the newly started thread");
+        assert_eq!(read.thread.id, response.thread.id);
 
         client.shutdown().await.expect("shutdown should complete");
     }
 
     #[tokio::test]
     async fn tiny_channel_capacity_still_supports_request_roundtrip() {
-        let client = start_test_client_with_capacity(SessionSource::Exec, 1).await;
+        let client =
+            start_test_client_with_capacity(SessionSource::Exec, /*channel_capacity*/ 1).await;
         let _response: ConfigRequirementsReadResponse = client
             .request_typed(ClientRequest::ConfigRequirementsRead {
                 request_id: RequestId::Integer(1),
@@ -1091,6 +1174,94 @@ mod tests {
             .await
             .expect("typed request should succeed");
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn forward_in_process_event_preserves_transcript_notifications_under_backpressure() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(InProcessServerEvent::ServerNotification(
+                command_execution_output_delta_notification("stdout-1"),
+            ))
+            .await
+            .expect("initial event should enqueue");
+
+        let mut skipped_events = 0usize;
+        let result = forward_in_process_event(
+            &event_tx,
+            &mut skipped_events,
+            InProcessServerEvent::ServerNotification(command_execution_output_delta_notification(
+                "stdout-2",
+            )),
+            |_| {},
+        )
+        .await;
+        assert_eq!(result, ForwardEventResult::Continue);
+        assert_eq!(skipped_events, 1);
+
+        let receive_task = tokio::spawn(async move {
+            let mut events = Vec::new();
+            for _ in 0..5 {
+                events.push(
+                    timeout(Duration::from_secs(2), event_rx.recv())
+                        .await
+                        .expect("event should arrive before timeout")
+                        .expect("event stream should stay open"),
+                );
+            }
+            events
+        });
+
+        for notification in [
+            agent_message_delta_notification("hello"),
+            item_completed_notification("hello"),
+            turn_completed_notification(),
+        ] {
+            let result = forward_in_process_event(
+                &event_tx,
+                &mut skipped_events,
+                InProcessServerEvent::ServerNotification(notification),
+                |_| {},
+            )
+            .await;
+            assert_eq!(result, ForwardEventResult::Continue);
+        }
+        assert_eq!(skipped_events, 0);
+
+        let events = receive_task
+            .await
+            .expect("receiver task should join successfully");
+        assert!(matches!(
+            &events[0],
+            InProcessServerEvent::ServerNotification(
+                ServerNotification::CommandExecutionOutputDelta(notification)
+            ) if notification.delta == "stdout-1"
+        ));
+        assert!(matches!(
+            &events[1],
+            InProcessServerEvent::Lagged { skipped: 1 }
+        ));
+        assert!(matches!(
+            &events[2],
+            InProcessServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
+                notification
+            )) if notification.delta == "hello"
+        ));
+        assert!(matches!(
+            &events[3],
+            InProcessServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                notification
+            )) if matches!(
+                &notification.item,
+                codex_app_server_protocol::ThreadItem::AgentMessage { text, .. } if text == "hello"
+            )
+        ));
+        assert!(matches!(
+            &events[4],
+            InProcessServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                notification
+            )) if notification.turn.status == codex_app_server_protocol::TurnStatus::Completed
+        ));
     }
 
     #[tokio::test]
@@ -1114,6 +1285,7 @@ mod tests {
                 }),
             )
             .await;
+            websocket.close(None).await.expect("close should succeed");
         })
         .await;
         let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -1132,6 +1304,59 @@ mod tests {
         assert_eq!(response.account, None);
 
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_connect_includes_auth_header_when_configured() {
+        let auth_token = "remote-bearer-token".to_string();
+        let websocket_url = start_test_remote_server_with_auth(
+            Some(auth_token.clone()),
+            |mut websocket| async move {
+                expect_remote_initialize(&mut websocket).await;
+                websocket.close(None).await.expect("close should succeed");
+            },
+        )
+        .await;
+        let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            auth_token: Some(auth_token),
+            ..test_remote_connect_args(websocket_url)
+        })
+        .await
+        .expect("remote client should connect");
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_connect_rejects_non_loopback_ws_when_auth_configured() {
+        let result = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url: "ws://example.com:4500".to_string(),
+            auth_token: Some("remote-bearer-token".to_string()),
+            ..test_remote_connect_args("ws://127.0.0.1:1".to_string())
+        })
+        .await;
+        let err = match result {
+            Ok(_) => panic!("non-loopback ws should be rejected before connect"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("remote auth tokens require `wss://` or loopback `ws://` URLs")
+        );
+    }
+
+    #[test]
+    fn remote_auth_token_transport_policy_allows_wss_and_loopback_ws() {
+        assert!(crate::remote::websocket_url_supports_auth_token(
+            &url::Url::parse("wss://example.com:443").expect("wss URL should parse")
+        ));
+        assert!(crate::remote::websocket_url_supports_auth_token(
+            &url::Url::parse("ws://127.0.0.1:4500").expect("loopback ws URL should parse")
+        ));
+        assert!(!crate::remote::websocket_url_supports_auth_token(
+            &url::Url::parse("ws://example.com:4500").expect("non-loopback ws URL should parse")
+        ));
     }
 
     #[tokio::test]
@@ -1254,6 +1479,108 @@ mod tests {
             AppServerEvent::ServerNotification(ServerNotification::AccountUpdated(_))
         ));
 
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_backpressure_preserves_transcript_notifications() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            for notification in [
+                command_execution_output_delta_notification("stdout-1"),
+                command_execution_output_delta_notification("stdout-2"),
+                agent_message_delta_notification("hello"),
+                item_completed_notification("hello"),
+                turn_completed_notification(),
+            ] {
+                write_websocket_message(
+                    &mut websocket,
+                    JSONRPCMessage::Notification(
+                        serde_json::from_value(
+                            serde_json::to_value(notification)
+                                .expect("notification should serialize"),
+                        )
+                        .expect("notification should convert to JSON-RPC"),
+                    ),
+                )
+                .await;
+            }
+            let _ = done_rx.await;
+        })
+        .await;
+        let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            websocket_url,
+            auth_token: None,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: 1,
+        })
+        .await
+        .expect("remote client should connect");
+
+        let first_event = timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("first event should arrive before timeout")
+            .expect("event stream should stay open");
+        assert!(matches!(
+            first_event,
+            AppServerEvent::ServerNotification(ServerNotification::CommandExecutionOutputDelta(
+                notification
+            )) if notification.delta == "stdout-1"
+        ));
+
+        let mut remaining_events = Vec::new();
+        for _ in 0..4 {
+            remaining_events.push(
+                timeout(Duration::from_secs(2), client.next_event())
+                    .await
+                    .expect("event should arrive before timeout")
+                    .expect("event stream should stay open"),
+            );
+        }
+
+        let mut transcript_event_names = Vec::new();
+        for event in &remaining_events {
+            match event {
+                AppServerEvent::Lagged { skipped: 1 } => {}
+                AppServerEvent::ServerNotification(
+                    ServerNotification::CommandExecutionOutputDelta(notification),
+                ) if notification.delta == "stdout-2" => {}
+                AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
+                    notification,
+                )) if notification.delta == "hello" => {
+                    transcript_event_names.push("agent_message_delta");
+                }
+                AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                    notification,
+                )) if matches!(
+                    &notification.item,
+                    codex_app_server_protocol::ThreadItem::AgentMessage { text, .. } if text == "hello"
+                ) =>
+                {
+                    transcript_event_names.push("item_completed");
+                }
+                AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
+                    notification,
+                )) if notification.turn.status
+                    == codex_app_server_protocol::TurnStatus::Completed =>
+                {
+                    transcript_event_names.push("turn_completed");
+                }
+                _ => panic!("unexpected remaining event: {event:?}"),
+            }
+        }
+        assert_eq!(
+            transcript_event_names,
+            vec!["agent_message_delta", "item_completed", "turn_completed"]
+        );
+
+        done_tx
+            .send(())
+            .expect("server completion signal should send");
         client.shutdown().await.expect("shutdown should complete");
     }
 
@@ -1472,22 +1799,6 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::channel(1);
         let worker_handle = tokio::spawn(async {});
-        let config = build_test_config().await;
-        let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
-            false,
-            config.cli_auth_credentials_store_mode,
-        );
-        let thread_manager = Arc::new(ThreadManager::new(
-            &config,
-            auth_manager.clone(),
-            SessionSource::Exec,
-            CollaborationModesConfig {
-                default_mode_request_user_input: config
-                    .features
-                    .enabled(Feature::DefaultModeRequestUserInput),
-            },
-        ));
         event_tx
             .send(InProcessServerEvent::Lagged { skipped: 3 })
             .await
@@ -1498,8 +1809,6 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
-            auth_manager,
-            thread_manager,
         };
 
         let event = timeout(Duration::from_secs(2), client.next_event())
@@ -1514,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn event_requires_delivery_marks_terminal_events() {
+    fn event_requires_delivery_marks_transcript_and_terminal_events() {
         assert!(event_requires_delivery(
             &InProcessServerEvent::ServerNotification(
                 codex_app_server_protocol::ServerNotification::TurnCompleted(
@@ -1531,36 +1840,77 @@ mod tests {
             )
         ));
         assert!(event_requires_delivery(
-            &InProcessServerEvent::LegacyNotification(
-                codex_app_server_protocol::JSONRPCNotification {
-                    method: "codex/event/turn_aborted".to_string(),
-                    params: None,
-                }
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::AgentMessageDelta(
+                    codex_app_server_protocol::AgentMessageDeltaNotification {
+                        thread_id: "thread".to_string(),
+                        turn_id: "turn".to_string(),
+                        item_id: "item".to_string(),
+                        delta: "hello".to_string(),
+                    }
+                )
+            )
+        ));
+        assert!(event_requires_delivery(
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::ItemCompleted(
+                    codex_app_server_protocol::ItemCompletedNotification {
+                        thread_id: "thread".to_string(),
+                        turn_id: "turn".to_string(),
+                        item: codex_app_server_protocol::ThreadItem::AgentMessage {
+                            id: "item".to_string(),
+                            text: "hello".to_string(),
+                            phase: None,
+                            memory_citation: None,
+                        },
+                    }
+                )
             )
         ));
         assert!(!event_requires_delivery(&InProcessServerEvent::Lagged {
             skipped: 1
         }));
+        assert!(!event_requires_delivery(
+            &InProcessServerEvent::ServerNotification(
+                codex_app_server_protocol::ServerNotification::CommandExecutionOutputDelta(
+                    codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                        thread_id: "thread".to_string(),
+                        turn_id: "turn".to_string(),
+                        item_id: "item".to_string(),
+                        delta: "stdout".to_string(),
+                    }
+                )
+            )
+        ));
     }
 
     #[tokio::test]
-    async fn accessors_expose_retained_shared_managers() {
-        let client = start_test_client(SessionSource::Cli).await;
+    async fn runtime_start_args_leave_manager_bootstrap_to_app_server() {
+        let config = Arc::new(build_test_config().await);
 
-        assert!(
-            Arc::ptr_eq(&client.auth_manager(), &client.auth_manager()),
-            "auth_manager accessor should clone the retained shared manager"
-        );
-        assert!(
-            Arc::ptr_eq(&client.thread_manager(), &client.thread_manager()),
-            "thread_manager accessor should clone the retained shared manager"
-        );
+        let runtime_args = InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Exec,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        }
+        .into_runtime_start_args();
 
-        client.shutdown().await.expect("shutdown should complete");
+        assert_eq!(runtime_args.config, config);
     }
 
     #[tokio::test]
-    async fn shutdown_completes_promptly_with_retained_shared_managers() {
+    async fn shutdown_completes_promptly_without_retained_managers() {
         let client = start_test_client(SessionSource::Cli).await;
 
         timeout(Duration::from_secs(1), client.shutdown())

@@ -56,7 +56,7 @@ fn parses_user_message_with_text_and_two_images() {
 #[test]
 fn skips_local_image_label_text() {
     let image_url = "data:image/png;base64,abc".to_string();
-    let label = codex_protocol::models::local_image_open_tag_text(1);
+    let label = codex_protocol::models::local_image_open_tag_text(/*label_number*/ 1);
     let user_text = "Please review this image.".to_string();
 
     let item = ResponseItem::Message {
@@ -92,6 +92,43 @@ fn skips_local_image_label_text() {
             assert_eq!(user.content, expected_content);
         }
         other => panic!("expected TurnItem::UserMessage, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_assistant_message_input_text_for_backward_compatibility() {
+    let item = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue"
+                .to_string(),
+        }],
+        end_turn: None,
+        phase: None,
+    };
+
+    let turn_item = parse_turn_item(&item).expect("expected assistant message turn item");
+
+    match turn_item {
+        TurnItem::AgentMessage(message) => {
+            let rendered = message
+                .content
+                .into_iter()
+                .map(|content| {
+                    let AgentMessageContent::Text { text } = content;
+                    text
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rendered,
+                vec![
+                    "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue"
+                        .to_string()
+                ]
+            );
+        }
+        other => panic!("expected TurnItem::AgentMessage, got {other:?}"),
     }
 }
 

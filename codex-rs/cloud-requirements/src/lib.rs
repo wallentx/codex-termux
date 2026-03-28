@@ -327,11 +327,11 @@ impl CloudRequirementsService {
         let Some(auth) = self.auth_manager.auth().await else {
             return Ok(None);
         };
+        let Some(plan_type) = auth.account_plan_type() else {
+            return Ok(None);
+        };
         if !auth.is_chatgpt_auth()
-            || !matches!(
-                auth.account_plan_type(),
-                Some(PlanType::Business | PlanType::Enterprise)
-            )
+            || !(plan_type.is_business_like() || matches!(plan_type, PlanType::Enterprise))
         {
             return Ok(None);
         }
@@ -547,11 +547,11 @@ impl CloudRequirementsService {
         let Some(auth) = self.auth_manager.auth().await else {
             return false;
         };
+        let Some(plan_type) = auth.account_plan_type() else {
+            return false;
+        };
         if !auth.is_chatgpt_auth()
-            || !matches!(
-                auth.account_plan_type(),
-                Some(PlanType::Business | PlanType::Enterprise)
-            )
+            || !(plan_type.is_business_like() || matches!(plan_type, PlanType::Enterprise))
         {
             return false;
         }
@@ -848,7 +848,7 @@ mod tests {
         write_auth_json(tmp.path(), auth_json).expect("write auth");
         Arc::new(AuthManager::new(
             tmp.path().to_path_buf(),
-            false,
+            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
         ))
     }
@@ -872,7 +872,7 @@ mod tests {
         .expect("write auth");
         Arc::new(AuthManager::new(
             tmp.path().to_path_buf(),
-            false,
+            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
         ))
     }
@@ -884,13 +884,32 @@ mod tests {
         access_token: &str,
         refresh_token: &str,
     ) -> serde_json::Value {
+        chatgpt_auth_json_with_last_refresh(
+            plan_type,
+            chatgpt_user_id,
+            account_id,
+            access_token,
+            refresh_token,
+            "2025-01-01T00:00:00Z",
+        )
+    }
+
+    fn chatgpt_auth_json_with_last_refresh(
+        plan_type: &str,
+        chatgpt_user_id: Option<&str>,
+        account_id: Option<&str>,
+        access_token: &str,
+        refresh_token: &str,
+        last_refresh: &str,
+    ) -> serde_json::Value {
         chatgpt_auth_json_with_mode(
             plan_type,
             chatgpt_user_id,
             account_id,
             access_token,
             refresh_token,
-            None,
+            last_refresh,
+            /*auth_mode*/ None,
         )
     }
 
@@ -900,6 +919,7 @@ mod tests {
         account_id: Option<&str>,
         access_token: &str,
         refresh_token: &str,
+        last_refresh: &str,
         auth_mode: Option<&str>,
     ) -> serde_json::Value {
         let header = json!({ "alg": "none", "typ": "JWT" });
@@ -925,7 +945,7 @@ mod tests {
                 "refresh_token": refresh_token,
                 "account_id": account_id,
             },
-            "last_refresh": "2025-01-01T00:00:00Z",
+            "last_refresh": last_refresh,
         });
         if let Some(auth_mode) = auth_mode {
             auth_json["auth_mode"] = serde_json::Value::String(auth_mode.to_string());
@@ -960,7 +980,7 @@ mod tests {
         ManagedAuthContext {
             manager: Arc::new(AuthManager::new(
                 home.path().to_path_buf(),
-                false,
+                /*enable_codex_api_key_env*/ false,
                 AuthCredentialsStoreMode::File,
             )),
             _home: home,
@@ -1106,6 +1126,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_cloud_requirements_skips_team_like_usage_based_plan() {
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("self_serve_business_usage_based"),
+            Arc::new(StaticFetcher {
+                contents: Some("allowed_approval_policies = [\"never\"]".to_string()),
+            }),
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+        assert_eq!(service.fetch().await, Ok(None));
+    }
+
+    #[tokio::test]
     async fn fetch_cloud_requirements_allows_business_plan() {
         let codex_home = tempdir().expect("tempdir");
         let service = CloudRequirementsService::new(
@@ -1134,8 +1168,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_cloud_requirements_allows_business_like_usage_based_plan() {
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("enterprise_cbp_usage_based"),
+            Arc::new(StaticFetcher {
+                contents: Some("allowed_approval_policies = [\"never\"]".to_string()),
+            }),
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+        assert_eq!(
+            service.fetch().await,
+            Ok(Some(ConfigRequirementsToml {
+                allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_sandbox_modes: None,
+                allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
+                feature_requirements: None,
+                mcp_servers: None,
+                apps: None,
+                rules: None,
+                enforce_residency: None,
+                network: None,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cloud_requirements_allows_hc_plan_as_enterprise() {
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("hc"),
+            Arc::new(StaticFetcher {
+                contents: Some("allowed_approval_policies = [\"never\"]".to_string()),
+            }),
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+        assert_eq!(
+            service.fetch().await,
+            Ok(Some(ConfigRequirementsToml {
+                allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_sandbox_modes: None,
+                allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
+                feature_requirements: None,
+                mcp_servers: None,
+                apps: None,
+                rules: None,
+                enforce_residency: None,
+                network: None,
+            }))
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_cloud_requirements_handles_missing_contents() {
-        let result = parse_for_fetch(None);
+        let result = parse_for_fetch(/*contents*/ None);
         assert!(result.is_none());
     }
 
@@ -1262,24 +1352,43 @@ enabled = false
 
     #[tokio::test]
     async fn fetch_cloud_requirements_recovers_after_unauthorized_reload() {
-        let auth = managed_auth_context(
-            "business",
-            Some("user-12345"),
-            Some("account-12345"),
-            "stale-access-token",
-            "test-refresh-token",
-        );
+        let auth_home = tempdir().expect("tempdir");
         write_auth_json(
-            auth._home.path(),
-            chatgpt_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
+                "business",
+                Some("user-12345"),
+                Some("account-12345"),
+                "stale-access-token",
+                "test-refresh-token",
+                // Keep auth "fresh" so the first request hits unauthorized recovery
+                // instead of AuthManager::auth() proactively reloading from disk.
+                "3025-01-01T00:00:00Z",
+            ),
+        )
+        .expect("write initial auth");
+        let auth_manager = Arc::new(AuthManager::new(
+            auth_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+        ));
+
+        write_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
                 "business",
                 Some("user-12345"),
                 Some("account-12345"),
                 "fresh-access-token",
                 "test-refresh-token",
+                "3025-01-01T00:00:00Z",
             ),
         )
         .expect("write refreshed auth");
+        let auth = ManagedAuthContext {
+            _home: auth_home,
+            manager: auth_manager,
+        };
 
         let fetcher = Arc::new(TokenFetcher {
             expected_token: "fresh-access-token".to_string(),
@@ -1314,24 +1423,41 @@ enabled = false
 
     #[tokio::test]
     async fn fetch_cloud_requirements_recovers_after_unauthorized_reload_updates_cache_identity() {
-        let auth = managed_auth_context(
-            "business",
-            Some("user-12345"),
-            Some("account-12345"),
-            "stale-access-token",
-            "test-refresh-token",
-        );
+        let auth_home = tempdir().expect("tempdir");
         write_auth_json(
-            auth._home.path(),
-            chatgpt_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
+                "business",
+                Some("user-12345"),
+                Some("account-12345"),
+                "stale-access-token",
+                "test-refresh-token",
+                "3025-01-01T00:00:00Z",
+            ),
+        )
+        .expect("write initial auth");
+        let auth_manager = Arc::new(AuthManager::new(
+            auth_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+        ));
+
+        write_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
                 "business",
                 Some("user-99999"),
                 Some("account-12345"),
                 "fresh-access-token",
                 "test-refresh-token",
+                "3025-01-01T00:00:00Z",
             ),
         )
         .expect("write refreshed auth");
+        let auth = ManagedAuthContext {
+            _home: auth_home,
+            manager: auth_manager,
+        };
 
         let fetcher = Arc::new(TokenFetcher {
             expected_token: "fresh-access-token".to_string(),
@@ -1432,13 +1558,14 @@ enabled = false
                 Some("account-12345"),
                 "test-access-token",
                 "test-refresh-token",
+                "2025-01-01T00:00:00Z",
                 Some("chatgptAuthTokens"),
             ),
         )
         .expect("write auth");
         let auth_manager = Arc::new(AuthManager::new(
             auth_home.path().to_path_buf(),
-            false,
+            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
         ));
 
@@ -1530,7 +1657,11 @@ enabled = false
     async fn fetch_cloud_requirements_writes_cache_when_identity_is_incomplete() {
         let codex_home = tempdir().expect("tempdir");
         let service = CloudRequirementsService::new(
-            auth_manager_with_plan_and_identity("business", None, Some("account-12345")),
+            auth_manager_with_plan_and_identity(
+                "business",
+                /*chatgpt_user_id*/ None,
+                Some("account-12345"),
+            ),
             Arc::new(StaticFetcher {
                 contents: Some("allowed_approval_policies = [\"never\"]".to_string()),
             }),
@@ -1582,7 +1713,11 @@ enabled = false
             "allowed_approval_policies = [\"on-request\"]".to_string(),
         ))]));
         let service = CloudRequirementsService::new(
-            auth_manager_with_plan_and_identity("business", None, Some("account-12345")),
+            auth_manager_with_plan_and_identity(
+                "business",
+                /*chatgpt_user_id*/ None,
+                Some("account-12345"),
+            ),
             fetcher.clone(),
             codex_home.path().to_path_buf(),
             CLOUD_REQUIREMENTS_TIMEOUT,

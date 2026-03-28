@@ -86,25 +86,22 @@ impl PendingAppServerRequests {
             ServerRequest::DynamicToolCall { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
                     request_id: request_id.clone(),
-                    message: "Dynamic tool calls are not available in app-server TUI yet."
-                        .to_string(),
+                    message: "Dynamic tool calls are not available in TUI yet.".to_string(),
                 })
             }
             ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
             ServerRequest::ApplyPatchApproval { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
                     request_id: request_id.clone(),
-                    message:
-                        "Legacy patch approval requests are not available in app-server TUI yet."
-                            .to_string(),
+                    message: "Legacy patch approval requests are not available in TUI yet."
+                        .to_string(),
                 })
             }
             ServerRequest::ExecCommandApproval { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
                     request_id: request_id.clone(),
-                    message:
-                        "Legacy command approval requests are not available in app-server TUI yet."
-                            .to_string(),
+                    message: "Legacy command approval requests are not available in TUI yet."
+                        .to_string(),
                 })
             }
         }
@@ -318,7 +315,6 @@ mod tests {
                 cwd: None,
                 command_actions: None,
                 additional_permissions: None,
-                skill_metadata: None,
                 proposed_execpolicy_amendment: None,
                 proposed_network_policy_amendments: None,
                 available_decisions: None,
@@ -497,7 +493,7 @@ mod tests {
         assert_eq!(unsupported.request_id, AppServerRequestId::Integer(99));
         assert_eq!(
             unsupported.message,
-            "Dynamic tool calls are not available in app-server TUI yet."
+            "Dynamic tool calls are not available in TUI yet."
         );
     }
 

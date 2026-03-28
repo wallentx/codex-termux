@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -8,15 +9,18 @@ use std::sync::atomic::Ordering;
 use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_message_processor::CodexMessageProcessorArgs;
 use crate::config_api::ConfigApi;
+use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::external_agent_config_api::ExternalAgentConfigApi;
 use crate::fs_api::FsApi;
+use crate::fs_watch::FsWatchManager;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
 use crate::transport::AppServerTransport;
 use async_trait::async_trait;
+use codex_app_server_protocol::AppListUpdatedNotification;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshParams;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshReason;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
@@ -28,6 +32,7 @@ use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::ExperimentalApi;
+use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigImportParams;
 use codex_app_server_protocol::FsCopyParams;
@@ -36,6 +41,8 @@ use codex_app_server_protocol::FsGetMetadataParams;
 use codex_app_server_protocol::FsReadDirectoryParams;
 use codex_app_server_protocol::FsReadFileParams;
 use codex_app_server_protocol::FsRemoveParams;
+use codex_app_server_protocol::FsUnwatchParams;
+use codex_app_server_protocol::FsWatchParams;
 use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCError;
@@ -47,6 +54,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
+use codex_chatgpt::connectors;
 use codex_core::AnalyticsEventsClient;
 use codex_core::AuthManager;
 use codex_core::ThreadManager;
@@ -60,6 +68,7 @@ use codex_core::default_client::get_codex_user_agent;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_login::auth::ExternalAuthRefreshContext;
@@ -79,7 +88,7 @@ use toml::Value as TomlValue;
 use tracing::Instrument;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
-const TUI_APP_SERVER_CLIENT_NAME: &str = "codex-tui";
+const TUI_CLIENT_NAME: &str = "codex-tui";
 
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
@@ -152,6 +161,7 @@ pub(crate) struct MessageProcessor {
     external_agent_config_api: ExternalAgentConfigApi,
     fs_api: FsApi,
     auth_manager: Arc<AuthManager>,
+    fs_watch_manager: FsWatchManager,
     config: Arc<Config>,
     config_warnings: Arc<Vec<ConfigWarningNotification>>,
 }
@@ -169,11 +179,10 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) arg0_paths: Arg0DispatchPaths,
     pub(crate) config: Arc<Config>,
+    pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) cli_overrides: Vec<(String, TomlValue)>,
     pub(crate) loader_overrides: LoaderOverrides,
     pub(crate) cloud_requirements: CloudRequirementsLoader,
-    pub(crate) auth_manager: Option<Arc<AuthManager>>,
-    pub(crate) thread_manager: Option<Arc<ThreadManager>>,
     pub(crate) feedback: CodexFeedback,
     pub(crate) log_db: Option<LogDbLayer>,
     pub(crate) config_warnings: Vec<ConfigWarningNotification>,
@@ -189,49 +198,47 @@ impl MessageProcessor {
             outgoing,
             arg0_paths,
             config,
+            environment_manager,
             cli_overrides,
             loader_overrides,
             cloud_requirements,
-            auth_manager,
-            thread_manager,
             feedback,
             log_db,
             config_warnings,
             session_source,
             enable_codex_api_key_env,
         } = args;
-        let (auth_manager, thread_manager) = match (auth_manager, thread_manager) {
-            (Some(auth_manager), Some(thread_manager)) => (auth_manager, thread_manager),
-            (None, None) => {
-                let auth_manager = AuthManager::shared(
-                    config.codex_home.clone(),
-                    enable_codex_api_key_env,
-                    config.cli_auth_credentials_store_mode,
-                );
-                let thread_manager = Arc::new(ThreadManager::new(
-                    config.as_ref(),
-                    auth_manager.clone(),
-                    session_source,
-                    CollaborationModesConfig {
-                        default_mode_request_user_input: config
-                            .features
-                            .enabled(Feature::DefaultModeRequestUserInput),
-                    },
-                ));
-                (auth_manager, thread_manager)
-            }
-            _ => panic!("MessageProcessorArgs must provide both auth_manager and thread_manager"),
-        };
+        let auth_manager = AuthManager::shared(
+            config.codex_home.clone(),
+            enable_codex_api_key_env,
+            config.cli_auth_credentials_store_mode,
+        );
+        let thread_manager = Arc::new(ThreadManager::new(
+            config.as_ref(),
+            auth_manager.clone(),
+            session_source,
+            CollaborationModesConfig {
+                default_mode_request_user_input: config
+                    .features
+                    .enabled(Feature::DefaultModeRequestUserInput),
+            },
+            environment_manager,
+        ));
         auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
         auth_manager.set_external_auth_refresher(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
         }));
-        let analytics_events_client =
-            AnalyticsEventsClient::new(Arc::clone(&config), Arc::clone(&auth_manager));
+        let analytics_events_client = AnalyticsEventsClient::new(
+            Arc::clone(&auth_manager),
+            config.chatgpt_base_url.trim_end_matches('/').to_string(),
+            config.analytics_enabled,
+        );
         thread_manager
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
 
+        let cli_overrides = Arc::new(RwLock::new(cli_overrides));
+        let runtime_feature_enablement = Arc::new(RwLock::new(BTreeMap::new()));
         let cloud_requirements = Arc::new(RwLock::new(cloud_requirements));
         let codex_message_processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
             auth_manager: auth_manager.clone(),
@@ -240,6 +247,7 @@ impl MessageProcessor {
             arg0_paths,
             config: Arc::clone(&config),
             cli_overrides: cli_overrides.clone(),
+            runtime_feature_enablement: runtime_feature_enablement.clone(),
             cloud_requirements: cloud_requirements.clone(),
             feedback,
             log_db,
@@ -252,6 +260,7 @@ impl MessageProcessor {
         let config_api = ConfigApi::new(
             config.codex_home.clone(),
             cli_overrides,
+            runtime_feature_enablement,
             loader_overrides,
             cloud_requirements,
             thread_manager,
@@ -259,6 +268,7 @@ impl MessageProcessor {
         );
         let external_agent_config_api = ExternalAgentConfigApi::new(config.codex_home.clone());
         let fs_api = FsApi::default();
+        let fs_watch_manager = FsWatchManager::new(outgoing.clone());
 
         Self {
             outgoing,
@@ -267,6 +277,7 @@ impl MessageProcessor {
             external_agent_config_api,
             fs_api,
             auth_manager,
+            fs_watch_manager,
             config,
             config_warnings: Arc::new(config_warnings),
         }
@@ -462,6 +473,10 @@ impl MessageProcessor {
         self.codex_message_processor.drain_background_tasks().await;
     }
 
+    pub(crate) async fn cancel_active_login(&self) {
+        self.codex_message_processor.cancel_active_login().await;
+    }
+
     pub(crate) async fn clear_all_thread_listeners(&self) {
         self.codex_message_processor
             .clear_all_thread_listeners()
@@ -474,6 +489,7 @@ impl MessageProcessor {
 
     pub(crate) async fn connection_closed(&mut self, connection_id: ConnectionId) {
         self.outgoing.connection_closed(connection_id).await;
+        self.fs_watch_manager.connection_closed(connection_id).await;
         self.codex_message_processor
             .connection_closed(connection_id)
             .await;
@@ -553,9 +569,9 @@ impl MessageProcessor {
                 } = params.client_info;
                 session.app_server_client_name = Some(name.clone());
                 session.client_version = Some(version.clone());
-                let originator = if name == TUI_APP_SERVER_CLIENT_NAME {
-                    // TODO: Remove this temporary workaround once app-server clients no longer
-                    // need to retain the legacy TUI `codex_cli_rs` originator behavior.
+                let originator = if name == TUI_CLIENT_NAME {
+                    // TODO: Remove this temporary workaround once the TUI no longer
+                    // needs to retain the `codex_cli_rs` originator behavior.
                     DEFAULT_ORIGINATOR.to_string()
                 } else {
                     name.clone()
@@ -590,8 +606,21 @@ impl MessageProcessor {
                 }
 
                 let user_agent = get_codex_user_agent();
+                let codex_home = match self.config.codex_home.clone().try_into() {
+                    Ok(codex_home) => codex_home,
+                    Err(err) => {
+                        let error = JSONRPCErrorError {
+                            code: INTERNAL_ERROR_CODE,
+                            message: format!("Invalid CODEX_HOME: {err}"),
+                            data: None,
+                        };
+                        self.outgoing.send_error(connection_request_id, error).await;
+                        return;
+                    }
+                };
                 let response = InitializeResponse {
                     user_agent,
+                    codex_home,
                     platform_family: std::env::consts::FAMILY.to_string(),
                     platform_os: std::env::consts::OS.to_string(),
                 };
@@ -686,6 +715,16 @@ impl MessageProcessor {
                 )
                 .await;
             }
+            ClientRequest::ExperimentalFeatureEnablementSet { request_id, params } => {
+                self.handle_experimental_feature_enablement_set(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
             ClientRequest::ConfigRequirementsRead {
                 request_id,
                 params: _,
@@ -766,6 +805,28 @@ impl MessageProcessor {
                 )
                 .await;
             }
+            ClientRequest::FsWatch { request_id, params } => {
+                self.handle_fs_watch(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    connection_id,
+                    params,
+                )
+                .await;
+            }
+            ClientRequest::FsUnwatch { request_id, params } => {
+                self.handle_fs_unwatch(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    connection_id,
+                    params,
+                )
+                .await;
+            }
             other => {
                 // Box the delegated future so this wrapper's async state machine does not
                 // inline the full `CodexMessageProcessor::process_request` future, which
@@ -812,7 +873,104 @@ impl MessageProcessor {
         request_id: ConnectionRequestId,
         params: ConfigBatchWriteParams,
     ) {
-        match self.config_api.batch_write(params).await {
+        self.handle_config_mutation_result(request_id, self.config_api.batch_write(params).await)
+            .await;
+    }
+
+    async fn handle_experimental_feature_enablement_set(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ExperimentalFeatureEnablementSetParams,
+    ) {
+        let should_refresh_apps_list = params.enablement.get("apps").copied() == Some(true);
+        match self
+            .config_api
+            .set_experimental_feature_enablement(params)
+            .await
+        {
+            Ok(response) => {
+                self.codex_message_processor.clear_plugin_related_caches();
+                self.codex_message_processor
+                    .maybe_start_plugin_startup_tasks_for_latest_config()
+                    .await;
+                self.outgoing.send_response(request_id, response).await;
+                if should_refresh_apps_list {
+                    self.refresh_apps_list_after_experimental_feature_enablement_set()
+                        .await;
+                }
+            }
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn refresh_apps_list_after_experimental_feature_enablement_set(&self) {
+        let config = match self
+            .config_api
+            .load_latest_config(/*fallback_cwd*/ None)
+            .await
+        {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to load config for apps list refresh after experimental feature enablement: {}",
+                    error.message
+                );
+                return;
+            }
+        };
+        if !config.features.apps_enabled(Some(&self.auth_manager)).await {
+            return;
+        }
+
+        let outgoing = Arc::clone(&self.outgoing);
+        tokio::spawn(async move {
+            let (all_connectors_result, accessible_connectors_result) = tokio::join!(
+                connectors::list_all_connectors_with_options(&config, /*force_refetch*/ true),
+                connectors::list_accessible_connectors_from_mcp_tools_with_options(
+                    &config, /*force_refetch*/ true,
+                ),
+            );
+            let all_connectors = match all_connectors_result {
+                Ok(connectors) => connectors,
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to force-refresh directory apps after experimental feature enablement: {err:#}"
+                    );
+                    return;
+                }
+            };
+            let accessible_connectors = match accessible_connectors_result {
+                Ok(connectors) => connectors,
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to force-refresh accessible apps after experimental feature enablement: {err:#}"
+                    );
+                    return;
+                }
+            };
+
+            let data = connectors::with_app_enabled_state(
+                connectors::merge_connectors_with_accessible(
+                    all_connectors,
+                    accessible_connectors,
+                    /*all_connectors_loaded*/ true,
+                ),
+                &config,
+            );
+            outgoing
+                .send_server_notification(ServerNotification::AppListUpdated(
+                    AppListUpdatedNotification { data },
+                ))
+                .await;
+        });
+    }
+
+    async fn handle_config_mutation_result<T: serde::Serialize>(
+        &self,
+        request_id: ConnectionRequestId,
+        result: std::result::Result<T, JSONRPCErrorError>,
+    ) {
+        match result {
             Ok(response) => {
                 self.codex_message_processor.clear_plugin_related_caches();
                 self.codex_message_processor
@@ -913,6 +1071,30 @@ impl MessageProcessor {
 
     async fn handle_fs_copy(&self, request_id: ConnectionRequestId, params: FsCopyParams) {
         match self.fs_api.copy(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_watch(
+        &self,
+        request_id: ConnectionRequestId,
+        connection_id: ConnectionId,
+        params: FsWatchParams,
+    ) {
+        match self.fs_watch_manager.watch(connection_id, params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_unwatch(
+        &self,
+        request_id: ConnectionRequestId,
+        connection_id: ConnectionId,
+        params: FsUnwatchParams,
+    ) {
+        match self.fs_watch_manager.unwatch(connection_id, params).await {
             Ok(response) => self.outgoing.send_response(request_id, response).await,
             Err(error) => self.outgoing.send_error(request_id, error).await,
         }

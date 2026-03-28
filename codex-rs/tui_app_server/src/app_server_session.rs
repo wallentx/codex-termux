@@ -1,9 +1,15 @@
+use crate::bottom_pane::FeedbackAudience;
+use crate::status::StatusAccountDisplay;
+use crate::status::plan_type_display_name;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ConfigBatchWriteParams;
+use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
@@ -26,6 +32,8 @@ use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
@@ -79,9 +87,6 @@ use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-use crate::bottom_pane::FeedbackAudience;
-use crate::status::StatusAccountDisplay;
 
 pub(crate) struct AppServerBootstrap {
     pub(crate) account_auth_mode: Option<AuthMode>,
@@ -177,16 +182,6 @@ impl AppServerSession {
             })
             .await
             .wrap_err("model/list failed during TUI bootstrap")?;
-        let rate_limit_request_id = self.next_request_id();
-        let rate_limits: GetAccountRateLimitsResponse = self
-            .client
-            .request_typed(ClientRequest::GetAccountRateLimits {
-                request_id: rate_limit_request_id,
-                params: None,
-            })
-            .await
-            .wrap_err("account/rateLimits/read failed during TUI bootstrap")?;
-
         let available_models = models
             .data
             .into_iter()
@@ -234,7 +229,7 @@ impl AppServerSession {
                     Some(TelemetryAuthMode::Chatgpt),
                     Some(StatusAccountDisplay::ChatGpt {
                         email: Some(email),
-                        plan: Some(title_case(format!("{plan_type:?}").as_str())),
+                        plan: Some(plan_type_display_name(plan_type)),
                     }),
                     Some(plan_type),
                     feedback_audience,
@@ -251,6 +246,25 @@ impl AppServerSession {
                 false,
             ),
         };
+        let rate_limit_snapshots = if account.requires_openai_auth && has_chatgpt_account {
+            let rate_limit_request_id = self.next_request_id();
+            match self
+                .client
+                .request_typed(ClientRequest::GetAccountRateLimits {
+                    request_id: rate_limit_request_id,
+                    params: None,
+                })
+                .await
+            {
+                Ok(rate_limits) => app_server_rate_limit_snapshots_to_core(rate_limits),
+                Err(err) => {
+                    tracing::warn!("account/rateLimits/read failed during TUI bootstrap: {err}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         Ok(AppServerBootstrap {
             account_auth_mode,
@@ -262,7 +276,7 @@ impl AppServerSession {
             feedback_audience,
             has_chatgpt_account,
             available_models,
-            rate_limit_snapshots: app_server_rate_limit_snapshots_to_core(rate_limits),
+            rate_limit_snapshots,
         })
     }
 
@@ -343,6 +357,22 @@ impl AppServerSession {
             .wrap_err("thread/list failed during TUI session lookup")
     }
 
+    /// Lists thread ids that the app server currently holds in memory.
+    ///
+    /// Used by `App::backfill_loaded_subagent_threads` to discover subagent threads that were
+    /// spawned before the TUI connected. The caller then fetches full metadata per thread via
+    /// `thread_read` and walks the spawn tree.
+    pub(crate) async fn thread_loaded_list(
+        &mut self,
+        params: ThreadLoadedListParams,
+    ) -> Result<ThreadLoadedListResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadLoadedList { request_id, params })
+            .await
+            .wrap_err("failed to list loaded threads from app server")
+    }
+
     pub(crate) async fn thread_read(
         &mut self,
         thread_id: ThreadId,
@@ -401,7 +431,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("turn/start failed in app-server TUI")
+            .wrap_err("turn/start failed in TUI")
     }
 
     pub(crate) async fn turn_interrupt(
@@ -420,7 +450,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("turn/interrupt failed in app-server TUI")?;
+            .wrap_err("turn/interrupt failed in TUI")?;
         Ok(())
     }
 
@@ -429,7 +459,7 @@ impl AppServerSession {
         thread_id: ThreadId,
         turn_id: String,
         items: Vec<codex_protocol::user_input::UserInput>,
-    ) -> Result<TurnSteerResponse> {
+    ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
         let request_id = self.next_request_id();
         self.client
             .request_typed(ClientRequest::TurnSteer {
@@ -441,7 +471,6 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("turn/steer failed in app-server TUI")
     }
 
     pub(crate) async fn thread_set_name(
@@ -460,7 +489,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/name/set failed in app-server TUI")?;
+            .wrap_err("thread/name/set failed in TUI")?;
         Ok(())
     }
 
@@ -475,7 +504,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/unsubscribe failed in app-server TUI")?;
+            .wrap_err("thread/unsubscribe failed in TUI")?;
         Ok(())
     }
 
@@ -490,7 +519,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/compact/start failed in app-server TUI")?;
+            .wrap_err("thread/compact/start failed in TUI")?;
         Ok(())
     }
 
@@ -510,7 +539,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/shellCommand failed in app-server TUI")?;
+            .wrap_err("thread/shellCommand failed in TUI")?;
         Ok(())
     }
 
@@ -528,7 +557,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/backgroundTerminals/clean failed in app-server TUI")?;
+            .wrap_err("thread/backgroundTerminals/clean failed in TUI")?;
         Ok(())
     }
 
@@ -547,7 +576,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/rollback failed in app-server TUI")
+            .wrap_err("thread/rollback failed in TUI")
     }
 
     pub(crate) async fn review_start(
@@ -566,7 +595,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("review/start failed in app-server TUI")
+            .wrap_err("review/start failed in TUI")
     }
 
     pub(crate) async fn skills_list(
@@ -577,7 +606,25 @@ impl AppServerSession {
         self.client
             .request_typed(ClientRequest::SkillsList { request_id, params })
             .await
-            .wrap_err("skills/list failed in app-server TUI")
+            .wrap_err("skills/list failed in TUI")
+    }
+
+    pub(crate) async fn reload_user_config(&mut self) -> Result<()> {
+        let request_id = self.next_request_id();
+        let _: ConfigWriteResponse = self
+            .client
+            .request_typed(ClientRequest::ConfigBatchWrite {
+                request_id,
+                params: ConfigBatchWriteParams {
+                    edits: Vec::new(),
+                    file_path: None,
+                    expected_version: None,
+                    reload_user_config: true,
+                },
+            })
+            .await
+            .wrap_err("config/batchWrite failed while reloading user config in TUI")?;
+        Ok(())
     }
 
     pub(crate) async fn thread_realtime_start(
@@ -597,7 +644,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/realtime/start failed in app-server TUI")?;
+            .wrap_err("thread/realtime/start failed in TUI")?;
         Ok(())
     }
 
@@ -617,7 +664,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/realtime/appendAudio failed in app-server TUI")?;
+            .wrap_err("thread/realtime/appendAudio failed in TUI")?;
         Ok(())
     }
 
@@ -637,7 +684,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/realtime/appendText failed in app-server TUI")?;
+            .wrap_err("thread/realtime/appendText failed in TUI")?;
         Ok(())
     }
 
@@ -652,7 +699,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("thread/realtime/stop failed in app-server TUI")?;
+            .wrap_err("thread/realtime/stop failed in TUI")?;
         Ok(())
     }
 
@@ -687,19 +734,6 @@ impl AppServerSession {
     }
 }
 
-fn title_case(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    let rest = chars.as_str().to_ascii_lowercase();
-    first.to_uppercase().collect::<String>() + &rest
-}
-
 pub(crate) fn status_account_display_from_auth_mode(
     auth_mode: Option<AuthMode>,
     plan_type: Option<codex_protocol::account::PlanType>,
@@ -709,7 +743,7 @@ pub(crate) fn status_account_display_from_auth_mode(
         Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens) => {
             Some(StatusAccountDisplay::ChatGpt {
                 email: None,
-                plan: plan_type.map(|plan_type| title_case(format!("{plan_type:?}").as_str())),
+                plan: plan_type.map(plan_type_display_name),
             })
         }
         None => None,
@@ -1201,15 +1235,15 @@ mod tests {
         let session = thread_session_state_from_thread_response(
             &thread_id.to_string(),
             Some("restore".to_string()),
-            None,
+            /*rollout_path*/ None,
             "gpt-5.4".to_string(),
             "openai".to_string(),
-            None,
+            /*service_tier*/ None,
             AskForApproval::Never,
             codex_protocol::config_types::ApprovalsReviewer::User,
             SandboxPolicy::new_read_only_policy(),
             PathBuf::from("/tmp/project"),
-            None,
+            /*reasoning_effort*/ None,
             &config,
         )
         .await
@@ -1217,5 +1251,32 @@ mod tests {
 
         assert_ne!(session.history_log_id, 0);
         assert_eq!(session.history_entry_count, 2);
+    }
+
+    #[test]
+    fn status_account_display_from_auth_mode_uses_remapped_plan_labels() {
+        let business = status_account_display_from_auth_mode(
+            Some(AuthMode::Chatgpt),
+            Some(codex_protocol::account::PlanType::EnterpriseCbpUsageBased),
+        );
+        assert!(matches!(
+            business,
+            Some(StatusAccountDisplay::ChatGpt {
+                email: None,
+                plan: Some(ref plan),
+            }) if plan == "Enterprise"
+        ));
+
+        let team = status_account_display_from_auth_mode(
+            Some(AuthMode::Chatgpt),
+            Some(codex_protocol::account::PlanType::SelfServeBusinessUsageBased),
+        );
+        assert!(matches!(
+            team,
+            Some(StatusAccountDisplay::ChatGpt {
+                email: None,
+                plan: Some(ref plan),
+            }) if plan == "Business"
+        ));
     }
 }

@@ -13,6 +13,10 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const GENERATED_DIR: &str = "generated";
+const POST_TOOL_USE_INPUT_FIXTURE: &str = "post-tool-use.command.input.schema.json";
+const POST_TOOL_USE_OUTPUT_FIXTURE: &str = "post-tool-use.command.output.schema.json";
+const PRE_TOOL_USE_INPUT_FIXTURE: &str = "pre-tool-use.command.input.schema.json";
+const PRE_TOOL_USE_OUTPUT_FIXTURE: &str = "pre-tool-use.command.output.schema.json";
 const SESSION_START_INPUT_FIXTURE: &str = "session-start.command.input.schema.json";
 const SESSION_START_OUTPUT_FIXTURE: &str = "session-start.command.output.schema.json";
 const USER_PROMPT_SUBMIT_INPUT_FIXTURE: &str = "user-prompt-submit.command.input.schema.json";
@@ -63,12 +67,146 @@ pub(crate) struct HookUniversalOutputWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub(crate) enum HookEventNameWire {
+    #[serde(rename = "PreToolUse")]
+    PreToolUse,
+    #[serde(rename = "PostToolUse")]
+    PostToolUse,
     #[serde(rename = "SessionStart")]
     SessionStart,
     #[serde(rename = "UserPromptSubmit")]
     UserPromptSubmit,
     #[serde(rename = "Stop")]
     Stop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "pre-tool-use.command.output")]
+pub(crate) struct PreToolUseCommandOutputWire {
+    #[serde(flatten)]
+    pub universal: HookUniversalOutputWire,
+    #[serde(default)]
+    pub decision: Option<PreToolUseDecisionWire>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub hook_specific_output: Option<PreToolUseHookSpecificOutputWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "post-tool-use.command.output")]
+pub(crate) struct PostToolUseCommandOutputWire {
+    #[serde(flatten)]
+    pub universal: HookUniversalOutputWire,
+    #[serde(default)]
+    pub decision: Option<BlockDecisionWire>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub hook_specific_output: Option<PostToolUseHookSpecificOutputWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PostToolUseHookSpecificOutputWire {
+    pub hook_event_name: HookEventNameWire,
+    #[serde(default)]
+    pub additional_context: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "updatedMCPToolOutput")]
+    pub updated_mcp_tool_output: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreToolUseHookSpecificOutputWire {
+    pub hook_event_name: HookEventNameWire,
+    #[serde(default)]
+    pub permission_decision: Option<PreToolUsePermissionDecisionWire>,
+    #[serde(default)]
+    pub permission_decision_reason: Option<String>,
+    #[serde(default)]
+    pub updated_input: Option<Value>,
+    #[serde(default)]
+    pub additional_context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub(crate) enum PreToolUsePermissionDecisionWire {
+    #[serde(rename = "allow")]
+    Allow,
+    #[serde(rename = "deny")]
+    Deny,
+    #[serde(rename = "ask")]
+    Ask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub(crate) enum PreToolUseDecisionWire {
+    #[serde(rename = "approve")]
+    Approve,
+    #[serde(rename = "block")]
+    Block,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreToolUseToolInput {
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "pre-tool-use.command.input")]
+pub(crate) struct PreToolUseCommandInput {
+    pub session_id: String,
+    /// Codex extension: expose the active turn id to internal turn-scoped hooks.
+    pub turn_id: String,
+    pub transcript_path: NullableString,
+    pub cwd: String,
+    #[schemars(schema_with = "pre_tool_use_hook_event_name_schema")]
+    pub hook_event_name: String,
+    pub model: String,
+    #[schemars(schema_with = "permission_mode_schema")]
+    pub permission_mode: String,
+    #[schemars(schema_with = "pre_tool_use_tool_name_schema")]
+    pub tool_name: String,
+    pub tool_input: PreToolUseToolInput,
+    pub tool_use_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PostToolUseToolInput {
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "post-tool-use.command.input")]
+pub(crate) struct PostToolUseCommandInput {
+    pub session_id: String,
+    /// Codex extension: expose the active turn id to internal turn-scoped hooks.
+    pub turn_id: String,
+    pub transcript_path: NullableString,
+    pub cwd: String,
+    #[schemars(schema_with = "post_tool_use_hook_event_name_schema")]
+    pub hook_event_name: String,
+    pub model: String,
+    #[schemars(schema_with = "permission_mode_schema")]
+    pub permission_mode: String,
+    #[schemars(schema_with = "post_tool_use_tool_name_schema")]
+    pub tool_name: String,
+    pub tool_input: PostToolUseToolInput,
+    pub tool_response: Value,
+    pub tool_use_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -213,6 +351,22 @@ pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
     ensure_empty_dir(&generated_dir)?;
 
     write_schema(
+        &generated_dir.join(POST_TOOL_USE_INPUT_FIXTURE),
+        schema_json::<PostToolUseCommandInput>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(POST_TOOL_USE_OUTPUT_FIXTURE),
+        schema_json::<PostToolUseCommandOutputWire>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(PRE_TOOL_USE_INPUT_FIXTURE),
+        schema_json::<PreToolUseCommandInput>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(PRE_TOOL_USE_OUTPUT_FIXTURE),
+        schema_json::<PreToolUseCommandOutputWire>()?,
+    )?;
+    write_schema(
         &generated_dir.join(SESSION_START_INPUT_FIXTURE),
         schema_json::<SessionStartCommandInput>()?,
     )?;
@@ -295,6 +449,22 @@ fn session_start_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_const_schema("SessionStart")
 }
 
+fn post_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_const_schema("PostToolUse")
+}
+
+fn post_tool_use_tool_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_const_schema("Bash")
+}
+
+fn pre_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_const_schema("PreToolUse")
+}
+
+fn pre_tool_use_tool_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_const_schema("Bash")
+}
+
 fn user_prompt_submit_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_const_schema("UserPromptSubmit")
 }
@@ -346,6 +516,12 @@ fn default_continue() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::POST_TOOL_USE_INPUT_FIXTURE;
+    use super::POST_TOOL_USE_OUTPUT_FIXTURE;
+    use super::PRE_TOOL_USE_INPUT_FIXTURE;
+    use super::PRE_TOOL_USE_OUTPUT_FIXTURE;
+    use super::PostToolUseCommandInput;
+    use super::PreToolUseCommandInput;
     use super::SESSION_START_INPUT_FIXTURE;
     use super::SESSION_START_OUTPUT_FIXTURE;
     use super::STOP_INPUT_FIXTURE;
@@ -362,6 +538,18 @@ mod tests {
 
     fn expected_fixture(name: &str) -> &'static str {
         match name {
+            POST_TOOL_USE_INPUT_FIXTURE => {
+                include_str!("../schema/generated/post-tool-use.command.input.schema.json")
+            }
+            POST_TOOL_USE_OUTPUT_FIXTURE => {
+                include_str!("../schema/generated/post-tool-use.command.output.schema.json")
+            }
+            PRE_TOOL_USE_INPUT_FIXTURE => {
+                include_str!("../schema/generated/pre-tool-use.command.input.schema.json")
+            }
+            PRE_TOOL_USE_OUTPUT_FIXTURE => {
+                include_str!("../schema/generated/pre-tool-use.command.output.schema.json")
+            }
             SESSION_START_INPUT_FIXTURE => {
                 include_str!("../schema/generated/session-start.command.input.schema.json")
             }
@@ -395,6 +583,10 @@ mod tests {
         write_schema_fixtures(&schema_root).expect("write generated hook schemas");
 
         for fixture in [
+            POST_TOOL_USE_INPUT_FIXTURE,
+            POST_TOOL_USE_OUTPUT_FIXTURE,
+            PRE_TOOL_USE_INPUT_FIXTURE,
+            PRE_TOOL_USE_OUTPUT_FIXTURE,
             SESSION_START_INPUT_FIXTURE,
             SESSION_START_OUTPUT_FIXTURE,
             USER_PROMPT_SUBMIT_INPUT_FIXTURE,
@@ -414,6 +606,15 @@ mod tests {
     fn turn_scoped_hook_inputs_include_codex_turn_id_extension() {
         // Codex intentionally diverges from Claude's public hook docs here so
         // internal hook consumers can key off the active turn.
+        let pre_tool_use: Value = serde_json::from_slice(
+            &schema_json::<PreToolUseCommandInput>().expect("serialize pre tool use input schema"),
+        )
+        .expect("parse pre tool use input schema");
+        let post_tool_use: Value = serde_json::from_slice(
+            &schema_json::<PostToolUseCommandInput>()
+                .expect("serialize post tool use input schema"),
+        )
+        .expect("parse post tool use input schema");
         let user_prompt_submit: Value = serde_json::from_slice(
             &schema_json::<UserPromptSubmitCommandInput>()
                 .expect("serialize user prompt submit input schema"),
@@ -424,7 +625,7 @@ mod tests {
         )
         .expect("parse stop input schema");
 
-        for schema in [&user_prompt_submit, &stop] {
+        for schema in [&pre_tool_use, &post_tool_use, &user_prompt_submit, &stop] {
             assert_eq!(schema["properties"]["turn_id"]["type"], "string");
             assert!(
                 schema["required"]

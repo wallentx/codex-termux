@@ -1037,7 +1037,10 @@ mod tests {
         })];
 
         runtime
-            .apply_rollout_items(&builder, &items, None, None)
+            .apply_rollout_items(
+                &builder, &items, /*new_thread_memory_mode*/ None,
+                /*updated_at_override*/ None,
+            )
             .await
             .expect("apply_rollout_items should succeed");
 
@@ -1089,14 +1092,17 @@ mod tests {
                 memory_mode: None,
             },
             git: Some(GitInfo {
-                commit_hash: Some("rollout-sha".to_string()),
+                commit_hash: Some(codex_git_utils::GitSha::new("rollout-sha")),
                 branch: Some("rollout-branch".to_string()),
                 repository_url: Some("git@example.com:openai/codex.git".to_string()),
             }),
         })];
 
         runtime
-            .apply_rollout_items(&builder, &items, None, None)
+            .apply_rollout_items(
+                &builder, &items, /*new_thread_memory_mode*/ None,
+                /*updated_at_override*/ None,
+            )
             .await
             .expect("apply_rollout_items should succeed");
 
@@ -1329,7 +1335,12 @@ mod tests {
             DateTime::<Utc>::from_timestamp(1_700_001_234, 0).expect("timestamp");
 
         runtime
-            .apply_rollout_items(&builder, &items, None, Some(override_updated_at))
+            .apply_rollout_items(
+                &builder,
+                &items,
+                /*new_thread_memory_mode*/ None,
+                Some(override_updated_at),
+            )
             .await
             .expect("apply_rollout_items should succeed");
 

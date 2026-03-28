@@ -244,6 +244,81 @@ fn deserialize_server_config_with_tool_filters() {
 }
 
 #[test]
+fn deserialize_ignores_unknown_server_fields() {
+    let cfg: McpServerConfig = toml::from_str(
+        r#"
+            command = "echo"
+            trust_level = "trusted"
+        "#,
+    )
+    .expect("should ignore unknown server fields");
+
+    assert_eq!(
+        cfg,
+        McpServerConfig {
+            transport: McpServerTransportConfig::Stdio {
+                command: "echo".to_string(),
+                args: vec![],
+                env: None,
+                env_vars: Vec::new(),
+                cwd: None,
+            },
+            enabled: true,
+            required: false,
+            disabled_reason: None,
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            scopes: None,
+            oauth_resource: None,
+            tools: HashMap::new(),
+        }
+    );
+}
+
+#[test]
+fn deserialize_skill_config_with_name_selector() {
+    let cfg: SkillConfig = toml::from_str(
+        r#"
+            name = "github:yeet"
+            enabled = false
+        "#,
+    )
+    .expect("should deserialize skill config with name selector");
+
+    assert_eq!(cfg.name.as_deref(), Some("github:yeet"));
+    assert_eq!(cfg.path, None);
+    assert!(!cfg.enabled);
+}
+
+#[test]
+fn deserialize_skill_config_with_path_selector() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let skill_path = tempdir.path().join("skills").join("demo").join("SKILL.md");
+    let cfg: SkillConfig = toml::from_str(&format!(
+        r#"
+            path = {path:?}
+            enabled = false
+        "#,
+        path = skill_path.display().to_string(),
+    ))
+    .expect("should deserialize skill config with path selector");
+
+    assert_eq!(
+        cfg,
+        SkillConfig {
+            path: Some(
+                AbsolutePathBuf::from_absolute_path(&skill_path)
+                    .expect("skill path should be absolute"),
+            ),
+            name: None,
+            enabled: false,
+        }
+    );
+}
+
+#[test]
 fn deserialize_rejects_command_and_url() {
     toml::from_str::<McpServerConfig>(
         r#"

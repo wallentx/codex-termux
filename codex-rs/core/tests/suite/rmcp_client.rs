@@ -108,6 +108,7 @@ async fn stdio_server_round_trip() -> anyhow::Result<()> {
                     disabled_tools: None,
                     scopes: None,
                     oauth_resource: None,
+                    tools: HashMap::new(),
                 },
             );
             config
@@ -129,6 +130,7 @@ async fn stdio_server_round_trip() -> anyhow::Result<()> {
             final_output_json_schema: None,
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: session_model,
             effort: None,
@@ -252,6 +254,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
                     disabled_tools: None,
                     scopes: None,
                     oauth_resource: None,
+                    tools: HashMap::new(),
                 },
             );
             config
@@ -298,6 +301,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
             final_output_json_schema: None,
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: session_model,
             effort: None,
@@ -411,7 +415,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 availability_nux: None,
                 apply_patch_tool_type: None,
                 web_search_tool_type: Default::default(),
-                truncation_policy: TruncationPolicyConfig::bytes(10_000),
+                truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
                 supports_parallel_tool_calls: false,
                 supports_image_detail_original: false,
                 context_window: Some(272_000),
@@ -474,6 +478,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                     disabled_tools: None,
                     scopes: None,
                     oauth_resource: None,
+                    tools: HashMap::new(),
                 },
             );
             config
@@ -501,6 +506,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
             final_output_json_schema: None,
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: text_only_model_slug.to_string(),
             effort: None,
@@ -594,6 +600,7 @@ async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
                     disabled_tools: None,
                     scopes: None,
                     oauth_resource: None,
+                    tools: HashMap::new(),
                 },
             );
             config
@@ -615,6 +622,7 @@ async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
             final_output_json_schema: None,
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: session_model,
             effort: None,
@@ -755,6 +763,7 @@ async fn streamable_http_tool_call_round_trip() -> anyhow::Result<()> {
                     disabled_tools: None,
                     scopes: None,
                     oauth_resource: None,
+                    tools: HashMap::new(),
                 },
             );
             config
@@ -776,6 +785,7 @@ async fn streamable_http_tool_call_round_trip() -> anyhow::Result<()> {
             final_output_json_schema: None,
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: session_model,
             effort: None,
@@ -976,6 +986,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
                     disabled_tools: None,
                     scopes: None,
                     oauth_resource: None,
+                    tools: HashMap::new(),
                 },
             );
             config
@@ -1022,6 +1033,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
             final_output_json_schema: None,
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: session_model,
             effort: None,

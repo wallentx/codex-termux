@@ -92,7 +92,7 @@ fn test_model_info(
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
@@ -126,6 +126,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
@@ -162,6 +163,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: next_model.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -221,6 +223,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
@@ -257,6 +260,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: next_model.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -304,7 +308,7 @@ async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
 
     test.submit_turn_with_service_tier("fast turn", Some(ServiceTier::Fast))
         .await?;
-    test.submit_turn_with_service_tier("standard turn", None)
+    test.submit_turn_with_service_tier("standard turn", /*service_tier*/ None)
         .await?;
 
     let requests = resp_mock.requests();
@@ -398,6 +402,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -418,6 +423,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: text_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -492,7 +498,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_image_generation_call("ig_123", "completed", "lobster", "Zm9v"),
-                ev_completed_with_tokens("resp-1", 10),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 10),
             ]),
             sse_completed("resp-2"),
         ],
@@ -525,6 +531,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -545,6 +552,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -622,7 +630,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_image_generation_call("ig_123", "completed", "lobster", "Zm9v"),
-                ev_completed_with_tokens("resp-1", 10),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 10),
             ]),
             sse_completed("resp-2"),
         ],
@@ -655,6 +663,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -675,6 +684,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: text_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -754,7 +764,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_image_generation_call("ig_rollback", "completed", "lobster", "Zm9v"),
-                ev_completed_with_tokens("resp-1", 10),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 10),
             ]),
             sse_completed("resp-2"),
         ],
@@ -787,6 +797,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -815,6 +826,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -896,7 +908,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(large_context_window),
@@ -923,11 +935,11 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_completed_with_tokens("resp-1", 100),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 100),
             ]),
             sse(vec![
                 ev_response_created("resp-2"),
-                ev_completed_with_tokens("resp-2", 120),
+                ev_completed_with_tokens("resp-2", /*total_tokens*/ 120),
             ]),
         ],
     )
@@ -969,6 +981,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: large_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
@@ -1027,6 +1040,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: smaller_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,

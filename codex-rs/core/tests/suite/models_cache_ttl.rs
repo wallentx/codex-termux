@@ -44,7 +44,7 @@ const DIFFERENT_VERSION_MODEL: &str = "codex-test-different-version";
 async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     let server = MockServer::start().await;
 
-    let remote_model = test_remote_model(REMOTE_MODEL, 1);
+    let remote_model = test_remote_model(REMOTE_MODEL, /*priority*/ 1);
     let models_mock = responses::mount_models_once_with_etag(
         &server,
         ModelsResponse {
@@ -96,6 +96,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: test.session_configured.model.clone(),
             effort: None,
@@ -137,11 +138,11 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uses_cache_when_version_matches() -> Result<()> {
     let server = MockServer::start().await;
-    let cached_model = test_remote_model(VERSIONED_MODEL, 1);
+    let cached_model = test_remote_model(VERSIONED_MODEL, /*priority*/ 1);
     let models_mock = responses::mount_models_once(
         &server,
         ModelsResponse {
-            models: vec![test_remote_model("remote", 2)],
+            models: vec![test_remote_model("remote", /*priority*/ 2)],
         },
     )
     .await;
@@ -184,11 +185,11 @@ async fn uses_cache_when_version_matches() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refreshes_when_cache_version_missing() -> Result<()> {
     let server = MockServer::start().await;
-    let cached_model = test_remote_model(MISSING_VERSION_MODEL, 1);
+    let cached_model = test_remote_model(MISSING_VERSION_MODEL, /*priority*/ 1);
     let models_mock = responses::mount_models_once(
         &server,
         ModelsResponse {
-            models: vec![test_remote_model("remote-missing", 2)],
+            models: vec![test_remote_model("remote-missing", /*priority*/ 2)],
         },
     )
     .await;
@@ -231,9 +232,9 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refreshes_when_cache_version_differs() -> Result<()> {
     let server = MockServer::start().await;
-    let cached_model = test_remote_model(DIFFERENT_VERSION_MODEL, 1);
+    let cached_model = test_remote_model(DIFFERENT_VERSION_MODEL, /*priority*/ 1);
     let models_response = ModelsResponse {
-        models: vec![test_remote_model("remote-different", 2)],
+        models: vec![test_remote_model("remote-different", /*priority*/ 2)],
     };
     let mut models_mocks = Vec::new();
     for _ in 0..3 {
@@ -343,7 +344,7 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),

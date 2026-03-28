@@ -86,10 +86,6 @@ pub struct Cli {
     #[arg(long = "color", value_enum, default_value_t = Color::Auto)]
     pub color: Color,
 
-    /// Force cursor-based progress updates in exec mode.
-    #[arg(long = "progress-cursor", default_value_t = false)]
-    pub progress_cursor: bool,
-
     /// Print events to stdout as JSONL.
     #[arg(
         long = "json",
@@ -109,7 +105,8 @@ pub struct Cli {
     pub last_message_file: Option<PathBuf>,
 
     /// Initial instructions for the agent. If not provided as an argument (or
-    /// if `-` is used), instructions are read from stdin.
+    /// if `-` is used), instructions are read from stdin. If stdin is piped and
+    /// a prompt is also provided, stdin is appended as a `<stdin>` block.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
 }

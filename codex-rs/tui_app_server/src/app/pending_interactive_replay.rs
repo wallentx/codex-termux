@@ -627,7 +627,6 @@ mod tests {
                 cwd: Some(PathBuf::from("/tmp")),
                 command_actions: None,
                 additional_permissions: None,
-                skill_metadata: None,
                 proposed_execpolicy_amendment: None,
                 proposed_network_policy_amendments: None,
                 available_decisions: None,
@@ -696,7 +695,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_keeps_pending_request_user_input() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         let request = request_user_input_request("call-1", "turn-1");
 
         store.push_request(request);
@@ -712,7 +711,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_resolved_request_user_input_after_user_answer() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(request_user_input_request("call-1", "turn-1"));
 
         store.note_outbound_op(&Op::UserInputAnswer {
@@ -731,7 +730,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_resolved_request_user_input_after_server_resolution() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(request_user_input_request("call-1", "turn-1"));
 
         store.push_notification(request_resolved(AppServerRequestId::Integer(1)));
@@ -750,7 +749,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_resolved_exec_approval_after_outbound_approval_id() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(exec_approval_request(
             "call-1",
             Some("approval-1"),
@@ -772,7 +771,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_resolved_exec_approval_after_server_resolution() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(exec_approval_request(
             "call-1",
             Some("approval-1"),
@@ -797,7 +796,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_answered_request_user_input_for_multi_prompt_turn() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(request_user_input_request("call-1", "turn-1"));
 
         store.note_outbound_op(&Op::UserInputAnswer {
@@ -820,7 +819,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_keeps_newer_request_user_input_pending_when_same_turn_has_queue() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(request_user_input_request("call-1", "turn-1"));
         store.push_request(request_user_input_request("call-2", "turn-1"));
 
@@ -842,7 +841,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_resolved_patch_approval_after_outbound_approval() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(patch_approval_request("call-1", "turn-1"));
 
         store.note_outbound_op(&Op::PatchApproval {
@@ -859,7 +858,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_pending_approvals_when_turn_completes() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(exec_approval_request(
             "exec-call-1",
             Some("approval-1"),
@@ -880,7 +879,7 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_resolved_elicitation_after_outbound_resolution() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         let request_id = codex_protocol::mcp::RequestId::String("request-1".to_string());
         store.push_request(elicitation_request("server-1", "request-1", "turn-1"));
 
@@ -901,10 +900,12 @@ mod tests {
 
     #[test]
     fn thread_event_store_reports_pending_thread_approvals() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         assert_eq!(store.has_pending_thread_approvals(), false);
 
-        store.push_request(exec_approval_request("call-1", None, "turn-1"));
+        store.push_request(exec_approval_request(
+            "call-1", /*approval_id*/ None, "turn-1",
+        ));
 
         assert_eq!(store.has_pending_thread_approvals(), true);
 
@@ -919,7 +920,7 @@ mod tests {
 
     #[test]
     fn request_user_input_does_not_count_as_pending_thread_approval() {
-        let mut store = ThreadEventStore::new(8);
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
         store.push_request(request_user_input_request("call-1", "turn-1"));
 
         assert_eq!(store.has_pending_thread_approvals(), false);
@@ -927,8 +928,10 @@ mod tests {
 
     #[test]
     fn thread_event_snapshot_drops_pending_requests_when_thread_closes() {
-        let mut store = ThreadEventStore::new(8);
-        store.push_request(exec_approval_request("call-1", None, "turn-1"));
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.push_request(exec_approval_request(
+            "call-1", /*approval_id*/ None, "turn-1",
+        ));
         store.push_notification(thread_closed());
 
         assert!(store.snapshot().events.iter().all(|event| {

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use codex_core::config::set_project_trust_level;
-use codex_core::git_info::resolve_root_git_project_for_trust;
+use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_protocol::config_types::TrustLevel;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -214,7 +214,8 @@ mod tests {
             error: None,
         };
 
-        let mut terminal = Terminal::new(VT100Backend::new(70, 14)).expect("terminal");
+        let mut terminal =
+            Terminal::new(VT100Backend::new(/*width*/ 70, /*height*/ 14)).expect("terminal");
         terminal
             .draw(|f| (&widget).render_ref(f.area(), f.buffer_mut()))
             .expect("draw");

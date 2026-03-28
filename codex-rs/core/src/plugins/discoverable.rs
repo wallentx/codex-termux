@@ -16,10 +16,9 @@ const TOOL_SUGGEST_DISCOVERABLE_PLUGIN_ALLOWLIST: &[&str] = &[
     "slack@openai-curated",
     "gmail@openai-curated",
     "google-calendar@openai-curated",
-    "google-docs@openai-curated",
     "google-drive@openai-curated",
-    "google-sheets@openai-curated",
-    "google-slides@openai-curated",
+    "linear@openai-curated",
+    "figma@openai-curated",
 ];
 
 pub(crate) fn list_tool_suggest_discoverable_plugins(
@@ -39,7 +38,8 @@ pub(crate) fn list_tool_suggest_discoverable_plugins(
         .collect::<HashSet<_>>();
     let marketplaces = plugins_manager
         .list_marketplaces_for_config(config, &[])
-        .context("failed to list plugin marketplaces for tool suggestions")?;
+        .context("failed to list plugin marketplaces for tool suggestions")?
+        .marketplaces;
     let Some(curated_marketplace) = marketplaces
         .into_iter()
         .find(|marketplace| marketplace.name == OPENAI_CURATED_MARKETPLACE_NAME)

@@ -4,15 +4,11 @@ Module: runtimes
 Concrete ToolRuntime implementations for specific tools. Each runtime stays
 small and focused and reuses the orchestrator for approvals + sandbox + retry.
 */
-use crate::exec::ExecCapturePolicy;
-use crate::exec::ExecExpiration;
 use crate::path_utils;
-use crate::sandboxing::CommandSpec;
-use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
-use crate::skills::SkillMetadata;
 use crate::tools::sandboxing::ToolError;
 use codex_protocol::models::PermissionProfile;
+use codex_sandboxing::SandboxCommand;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -20,38 +16,23 @@ pub mod apply_patch;
 pub mod shell;
 pub mod unified_exec;
 
-#[derive(Debug, Clone)]
-pub(crate) struct ExecveSessionApproval {
-    /// If this execve session approval is associated with a skill script, this
-    /// field contains metadata about the skill.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub skill: Option<SkillMetadata>,
-}
-
-/// Shared helper to construct a CommandSpec from a tokenized command line.
+/// Shared helper to construct sandbox transform inputs from a tokenized command line.
 /// Validates that at least a program is present.
-pub(crate) fn build_command_spec(
+pub(crate) fn build_sandbox_command(
     command: &[String],
     cwd: &Path,
     env: &HashMap<String, String>,
-    expiration: ExecExpiration,
-    sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<PermissionProfile>,
-    justification: Option<String>,
-) -> Result<CommandSpec, ToolError> {
+) -> Result<SandboxCommand, ToolError> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| ToolError::Rejected("command args are empty".to_string()))?;
-    Ok(CommandSpec {
-        program: program.clone(),
+    Ok(SandboxCommand {
+        program: program.clone().into(),
         args: args.to_vec(),
         cwd: cwd.to_path_buf(),
         env: env.clone(),
-        expiration,
-        capture_policy: ExecCapturePolicy::ShellTool,
-        sandbox_permissions,
         additional_permissions,
-        justification,
     })
 }
 
