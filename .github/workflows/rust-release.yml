@@ -203,8 +203,8 @@ jobs:
         id: cache-android-ndk
         uses: actions/cache@v5
         with:
-          path: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
-          key: android-ndk-27.0.12077973-${{ runner.os }}
+          path: ${{ env.ANDROID_HOME }}/ndk/28.0.12674087
+          key: android-ndk-28.0.12674087-${{ runner.os }}
 
       - name: Install Android NDK
         if: ${{ matrix.target == 'aarch64-linux-android' && steps.cache-android-ndk.outputs.cache-hit != 'true' }}
@@ -214,13 +214,13 @@ jobs:
           echo "Installing Android NDK..."
           # Install Android NDK using sdkmanager
           yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973"
+          sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "ndk;28.0.12674087"
       - name: Set Android NDK env
         if: ${{ matrix.target == 'aarch64-linux-android' }}
         shell: bash
         run: |
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> "$GITHUB_ENV"
-          echo "NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/28.0.12674087" >> "$GITHUB_ENV"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/28.0.12674087" >> "$GITHUB_ENV"
       - name: Install Linux bwrap build dependencies
         if: ${{ runner.os == 'Linux' && matrix.target != 'aarch64-linux-android' }}
         shell: bash
