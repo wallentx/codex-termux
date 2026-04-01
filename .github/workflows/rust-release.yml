@@ -203,8 +203,8 @@ jobs:
         id: cache-android-ndk
         uses: actions/cache@v5
         with:
-          path: ${{ env.ANDROID_HOME }}/ndk/28.0.12674087
-          key: android-ndk-28.0.12674087-${{ runner.os }}
+          path: ${{ env.ANDROID_HOME }}/ndk/29.0.13113456
+          key: android-ndk-29.0.13113456-${{ runner.os }}
 
       - name: Install Android NDK
         if: ${{ matrix.target == 'aarch64-linux-android' && steps.cache-android-ndk.outputs.cache-hit != 'true' }}
@@ -214,13 +214,13 @@ jobs:
           echo "Installing Android NDK..."
           # Install Android NDK using sdkmanager
           yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "ndk;28.0.12674087"
+          sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager "ndk;29.0.13113456"
       - name: Set Android NDK env
         if: ${{ matrix.target == 'aarch64-linux-android' }}
         shell: bash
         run: |
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/28.0.12674087" >> "$GITHUB_ENV"
-          echo "NDK_HOME=${ANDROID_HOME}/ndk/28.0.12674087" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/29.0.13113456" >> "$GITHUB_ENV"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/29.0.13113456" >> "$GITHUB_ENV"
       - name: Install Linux bwrap build dependencies
         if: ${{ runner.os == 'Linux' && matrix.target != 'aarch64-linux-android' }}
         shell: bash
@@ -292,10 +292,9 @@ jobs:
           echo "${toolchain}/bin" >> "$GITHUB_PATH"
 
           # Provide C++ ABI (exceptions, RTTI, vtables) missing from libc++_static pulled in by oboe-sys
-          # Also pass --tls-segment-align=64 to satisfy Bionic's ARM64 TLS alignment requirement
           rustflags_var="CARGO_TARGET_${target^^}_RUSTFLAGS"
           rustflags_var="${rustflags_var//-/_}"
-          echo "${rustflags_var}=-C link-arg=-lc++abi -C link-arg=-Wl,--tls-segment-align=64" >> "$GITHUB_ENV"
+          echo "${rustflags_var}=-C link-arg=-lc++abi" >> "$GITHUB_ENV"
 
 
           # Configure for vendored OpenSSL build
