@@ -294,7 +294,7 @@ jobs:
           # Provide C++ ABI (exceptions, RTTI, vtables) missing from libc++_static pulled in by oboe-sys
           rustflags_var="CARGO_TARGET_${target^^}_RUSTFLAGS"
           rustflags_var="${rustflags_var//-/_}"
-          echo "${rustflags_var}=-C link-arg=-lc++abi" >> "$GITHUB_ENV"
+          echo "${rustflags_var}=-C link-arg=-lc++abi -C link-arg=-Wl,-z,max-page-size=65536" >> "$GITHUB_ENV"
 
 
           # Configure for vendored OpenSSL build
