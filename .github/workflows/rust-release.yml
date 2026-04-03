@@ -341,6 +341,28 @@ jobs:
           echo "RUSTY_V8_ARCHIVE=${archive}" >> "$GITHUB_ENV"
           echo "RUSTY_V8_SRC_BINDING_PATH=${binding_path}" >> "$GITHUB_ENV"
 
+      - if: ${{ matrix.target == 'aarch64-linux-android' }}
+        name: Install termux-elf-cleaner
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="v3.0.1"
+          src_dir="${RUNNER_TEMP}/termux-elf-cleaner-src"
+          build_dir="${RUNNER_TEMP}/termux-elf-cleaner-build"
+          bin_dir="${RUNNER_TEMP}/termux-elf-cleaner-bin"
+
+          rm -rf "${src_dir}" "${build_dir}" "${bin_dir}"
+          mkdir -p "${src_dir}" "${build_dir}" "${bin_dir}"
+
+          curl -fsSL "https://github.com/termux/termux-elf-cleaner/archive/refs/tags/${version}.tar.gz" \
+            | tar -xzf - --strip-components=1 -C "${src_dir}"
+
+          cmake -S "${src_dir}" -B "${build_dir}" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "${build_dir}" --parallel
+
+          install "${build_dir}/termux-elf-cleaner" "${bin_dir}/termux-elf-cleaner"
+          echo "${bin_dir}" >> "$GITHUB_PATH"
+
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Use hermetic Cargo home (musl)
         shell: bash
@@ -452,6 +474,18 @@ jobs:
         if: ${{ matrix.target == 'aarch64-linux-android' }}
         shell: bash
         run: sccache --show-stats || true
+
+      - if: ${{ matrix.target == 'aarch64-linux-android' }}
+        name: Normalize Android ELF for Termux
+        shell: bash
+        run: |
+          set -euo pipefail
+          for binary in codex codex-responses-api-proxy; do
+            binary_path="target/${{ matrix.target }}/release/${binary}"
+            if [[ -f "${binary_path}" ]]; then
+              termux-elf-cleaner --api-level 24 "${binary_path}"
+            fi
+          done
 
       - if: ${{ contains(matrix.target, 'linux') && !contains(matrix.target, 'android') && github.repository_owner == 'openai' }}
         name: Cosign Linux artifacts
