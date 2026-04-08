@@ -148,6 +148,13 @@ pub async fn append_entry(text: &str, conversation_id: &ThreadId, config: &Confi
                     return Ok(());
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
+                Err(std::fs::TryLockError::Error(err)) if err.kind() == std::io::ErrorKind::Unsupported => {
+                    history_file.seek(SeekFrom::End(0))?;
+                    history_file.write_all(line.as_bytes())?;
+                    history_file.flush()?;
+                    enforce_history_limit(&mut history_file, history_max_bytes)?;
+                    return Ok(());
+                }
                     std::thread::sleep(RETRY_SLEEP);
                 }
                 Err(e) => return Err(e.into()),
@@ -372,6 +379,28 @@ fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<Histo
                         }
                     };
 
+            Err(std::fs::TryLockError::Error(err)) if err.kind() == std::io::ErrorKind::Unsupported => {
+                let reader = BufReader::new(&file);
+                for (idx, line_res) in reader.lines().enumerate() {
+                    let line = match line_res {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to read line from history file");
+                            return None;
+                        }
+                    };
+                    if idx == offset {
+                        match serde_json::from_str::<HistoryEntry>(&line) {
+                            Ok(entry) => return Some(entry),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to parse history entry");
+                                return None;
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
                     if idx == offset {
                         match serde_json::from_str::<HistoryEntry>(&line) {
                             Ok(entry) => return Some(entry),

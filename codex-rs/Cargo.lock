@@ -1926,6 +1926,7 @@ dependencies = [
  "image",
  "indexmap 2.13.0",
  "insta",
+ "keyring",
  "libc",
  "maplit",
  "notify",
