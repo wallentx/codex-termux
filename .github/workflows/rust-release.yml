@@ -484,6 +484,10 @@ jobs:
             binary_path="target/${{ matrix.target }}/release/${binary}"
             if [[ -f "${binary_path}" ]]; then
               termux-elf-cleaner --api-level 24 "${binary_path}"
+              if [[ "${binary}" == "codex" ]]; then
+                # Patch PT_TLS (0x7) to PT_NULL (0x0) at offset 400 to bypass Bionic alignment checks.
+                printf '\x00\x00\x00\x00' | dd of="${binary_path}" bs=1 seek=400 count=4 conv=notrunc
+              fi
             fi
           done
 
@@ -590,7 +594,12 @@ jobs:
             cp target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe "$dest/codex-windows-sandbox-setup-${{ matrix.target }}.exe"
             cp target/${{ matrix.target }}/release/codex-command-runner.exe "$dest/codex-command-runner-${{ matrix.target }}.exe"
           else
-            cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
+            # For Android, we want the binary to be named just 'codex' in the archive.
+            if [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
+              cp target/${{ matrix.target }}/release/codex "$dest/codex"
+            else
+              cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
+            fi
             if [[ -f target/${{ matrix.target }}/release/codex-responses-api-proxy ]]; then
               cp target/${{ matrix.target }}/release/codex-responses-api-proxy "$dest/codex-responses-api-proxy-${{ matrix.target }}"
             fi
@@ -650,7 +659,12 @@ jobs:
             fi
 
             # Create per-binary tar.gz
-            tar -C "$dest" -czf "$dest/${base}.tar.gz" "$base"
+            # For Android, we want the archive to have the target suffix even though the binary is just 'codex'.
+            archive_name="${base}"
+            if [[ "${{ matrix.target }}" == "aarch64-linux-android" && "${base}" == "codex" ]]; then
+              archive_name="codex-${{ matrix.target }}"
+            fi
+            tar -C "$dest" -czf "$dest/${archive_name}.tar.gz" "$base"
 
             # Create zip archive for Windows binaries
             # Must run from inside the dest dir so 7z won't
@@ -688,7 +702,12 @@ jobs:
             if [[ "${keep_originals}" == false ]]; then
               zstd_args+=(--rm)
             fi
-            zstd "${zstd_args[@]}" "$dest/$base"
+            
+            if [[ "${archive_name}" != "${base}" ]]; then
+              zstd "${zstd_args[@]}" "$dest/$base" -o "$dest/${archive_name}.zst"
+            else
+              zstd "${zstd_args[@]}" "$dest/$base"
+            fi
           done
 
       - uses: actions/upload-artifact@v6
