@@ -242,7 +242,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Set up sccache (Android)
         if: ${{ matrix.target == 'aarch64-linux-android' }}
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@main
       - name: Enable sccache (Android)
         if: ${{ matrix.target == 'aarch64-linux-android' }}
         shell: bash
