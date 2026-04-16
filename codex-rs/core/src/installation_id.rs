@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Result;
 use std::io::Seek;
@@ -29,7 +30,11 @@ pub(crate) async fn resolve_installation_id(codex_home: &Path) -> Result<String>
         }
 
         let mut file = options.open(&path)?;
-        file.lock()?;
+        if let Err(err) = file.lock()
+            && err.kind() != ErrorKind::Unsupported
+        {
+            return Err(err);
+        }
 
         #[cfg(unix)]
         {
