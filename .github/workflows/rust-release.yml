@@ -7,6 +7,9 @@
 
 name: rust-release
 on:
+  pull_request:
+    branches:
+      - "release/**"
   push:
     tags:
       - "rust-v*.*.*"
@@ -70,7 +73,7 @@ jobs:
           echo "::endgroup::"
 
   select-build-matrix:
-    if: always() && (github.event_name == 'workflow_dispatch' || needs.tag-check.result == 'success')
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || needs.tag-check.result == 'success')
     needs: tag-check
     runs-on: ubuntu-latest
     outputs:
@@ -102,7 +105,9 @@ jobs:
             matrix="$(jq -c '[.[] | select(.runner | startswith("macos") | not)]' <<< "${matrix}")"
           fi
 
-          if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${BUILD_TARGET}" && "${BUILD_TARGET}" != "all" ]]; then
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            matrix="$(jq -c '[.[] | select(.target == "aarch64-linux-android")]' <<< "${matrix}")"
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${BUILD_TARGET}" && "${BUILD_TARGET}" != "all" ]]; then
             matrix="$(jq -c --arg build_target "${BUILD_TARGET}" '[.[] | select(.target == $build_target)]' <<< "${matrix}")"
           fi
 
@@ -113,7 +118,20 @@ jobs:
 
           echo "matrix={\"include\":${matrix}}" >> "$GITHUB_OUTPUT"
 
-          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            metadata=".github/termux-release.json"
+            if [[ ! -f "${metadata}" ]]; then
+              echo "${metadata} is required for release train PR builds" >&2
+              exit 1
+            fi
+            upstream_tag="$(jq -r '.upstream_tag // empty' "${metadata}")"
+            if [[ -z "${upstream_tag}" || "${upstream_tag}" != rust-v* ]]; then
+              echo "Unable to determine upstream rust tag from ${metadata}" >&2
+              exit 1
+            fi
+            build_version="${upstream_tag#rust-v}"
+            echo "build_version=${build_version}" >> "$GITHUB_OUTPUT"
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             latest_release_tag="$(
               GH_TOKEN="${{ github.token }}" gh api repos/openai/codex/releases/latest --jq '.tag_name'
             )"
@@ -131,7 +149,7 @@ jobs:
   build:
     if: >-
       always() &&
-      (github.event_name == 'workflow_dispatch' || needs.tag-check.result == 'success') &&
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || needs.tag-check.result == 'success') &&
       needs.select-build-matrix.result == 'success'
     needs:
       - tag-check
@@ -182,8 +200,8 @@ jobs:
           tar --exclude='.github' -C __source__ -cf - . | tar -xf -
           rm -rf __source__
 
-      - name: Apply workflow dispatch build version
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Apply selected build version
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
@@ -727,9 +745,21 @@ jobs:
             fi
           done
 
+      - name: Add Termux release metadata
+        if: ${{ github.event_name == 'pull_request' && matrix.target == 'aarch64-linux-android' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="dist/${{ matrix.target }}"
+          cp "${GITHUB_WORKSPACE}/.github/termux-release.json" "${dest}/termux-release.json"
+          (
+            cd "${dest}"
+            sha256sum * > SHA256SUMS
+          )
+
       - uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.target }}
+          name: ${{ github.event_name == 'pull_request' && format('termux-android-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || matrix.target }}
           # Upload the per-binary .zst files as well as the new .tar.gz
           # equivalents we generated in the previous step.
           path: |

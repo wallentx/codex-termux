@@ -1,0 +1,266 @@
+name: termux-release-watch
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Specific upstream rust tag to process, for example rust-v0.122.0-alpha.7"
+        required: false
+        type: string
+        default: ""
+      reviewer:
+        description: "GitHub username to request as reviewer"
+        required: false
+        type: string
+        default: "wallentx"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: termux-release-watch
+  cancel-in-progress: false
+
+jobs:
+  create-release-pr:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REVIEWER: ${{ inputs.reviewer || 'wallentx' }}
+      UPSTREAM_REPO: openai/codex
+      PATCH_BRANCH: wallentx/termux-target
+    steps:
+      - name: Checkout automation branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --prune origin main "${PATCH_BRANCH}"
+          git fetch --prune --tags upstream
+
+      - name: Select upstream release
+        id: upstream
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${REQUESTED_TAG}" ]]; then
+            release_json="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${REQUESTED_TAG}")"
+          else
+            releases="$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=50")"
+            release_json="$(
+              jq -c '
+                [.[] | select(.draft == false and (.tag_name | startswith("rust-v")))]
+                | sort_by(.published_at)
+                | reverse
+                | .[]
+              ' <<< "${releases}" | while IFS= read -r candidate; do
+                tag="$(jq -r '.tag_name' <<< "${candidate}")"
+                if gh release view "${tag}-termux" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+                  continue
+                fi
+                printf '%s\n' "${candidate}"
+                break
+              done
+            )"
+          fi
+
+          if [[ -z "${release_json}" ]]; then
+            echo "No upstream release or prerelease needs a Termux mirror."
+            echo "selected=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream_tag="$(jq -r '.tag_name' <<< "${release_json}")"
+          upstream_name="$(jq -r '.name // .tag_name' <<< "${release_json}")"
+          upstream_body="$(jq -r '.body // ""' <<< "${release_json}")"
+          upstream_html_url="$(jq -r '.html_url' <<< "${release_json}")"
+          upstream_prerelease="$(jq -r '.prerelease' <<< "${release_json}")"
+          upstream_target="$(jq -r '.target_commitish // ""' <<< "${release_json}")"
+          upstream_id="$(jq -r '.id' <<< "${release_json}")"
+          version="${upstream_tag#rust-v}"
+          release_train="${version%%-*}"
+          release_branch="release/${release_train}"
+          work_branch="release-work/${release_train}/${upstream_tag}"
+          termux_tag="${upstream_tag}-termux"
+
+          if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "${termux_tag} already exists; nothing to do."
+            echo "selected=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "selected=true"
+            echo "upstream_tag=${upstream_tag}"
+            echo "upstream_name=${upstream_name}"
+            echo "upstream_html_url=${upstream_html_url}"
+            echo "upstream_prerelease=${upstream_prerelease}"
+            echo "upstream_target=${upstream_target}"
+            echo "upstream_id=${upstream_id}"
+            echo "release_train=${release_train}"
+            echo "release_branch=${release_branch}"
+            echo "work_branch=${work_branch}"
+            echo "termux_tag=${termux_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "body<<EOF"
+            printf '%s\n' "${upstream_body}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release train PR
+        if: steps.upstream.outputs.selected == 'true'
+        id: pr
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+          UPSTREAM_NAME: ${{ steps.upstream.outputs.upstream_name }}
+          UPSTREAM_HTML_URL: ${{ steps.upstream.outputs.upstream_html_url }}
+          UPSTREAM_PRERELEASE: ${{ steps.upstream.outputs.upstream_prerelease }}
+          UPSTREAM_TARGET: ${{ steps.upstream.outputs.upstream_target }}
+          UPSTREAM_ID: ${{ steps.upstream.outputs.upstream_id }}
+          RELEASE_TRAIN: ${{ steps.upstream.outputs.release_train }}
+          RELEASE_BRANCH: ${{ steps.upstream.outputs.release_branch }}
+          WORK_BRANCH: ${{ steps.upstream.outputs.work_branch }}
+          TERMUX_TAG: ${{ steps.upstream.outputs.termux_tag }}
+          UPSTREAM_BODY: ${{ steps.upstream.outputs.body }}
+        run: |
+          set -euo pipefail
+          workflow_seed_dir="${RUNNER_TEMP}/termux-release-workflows"
+          mkdir -p "${workflow_seed_dir}"
+          cp .github/workflows/rust-release.yml "${workflow_seed_dir}/rust-release.yml"
+          cp .github/workflows/termux-release-checkpoint.yml "${workflow_seed_dir}/termux-release-checkpoint.yml"
+          cp .github/workflows/termux-release-promote.yml "${workflow_seed_dir}/termux-release-promote.yml"
+
+          seed_release_workflows() {
+            mkdir -p .github/workflows
+            cp "${workflow_seed_dir}/rust-release.yml" .github/workflows/rust-release.yml
+            cp "${workflow_seed_dir}/termux-release-checkpoint.yml" .github/workflows/termux-release-checkpoint.yml
+            cp "${workflow_seed_dir}/termux-release-promote.yml" .github/workflows/termux-release-promote.yml
+          }
+
+          if gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --head "${WORK_BRANCH}" \
+            --state open \
+            --json number \
+            --jq 'length' | grep -qx '1'; then
+            echo "An open PR already exists for ${WORK_BRANCH}."
+            exit 0
+          fi
+
+          release_branch_exists=false
+          if git ls-remote --exit-code --heads origin "${RELEASE_BRANCH}" >/dev/null 2>&1; then
+            release_branch_exists=true
+          fi
+
+          if [[ "${release_branch_exists}" == false ]]; then
+            git checkout -B "${RELEASE_BRANCH}" "refs/tags/${UPSTREAM_TAG}"
+            seed_release_workflows
+            git add \
+              .github/workflows/rust-release.yml \
+              .github/workflows/termux-release-checkpoint.yml \
+              .github/workflows/termux-release-promote.yml
+            if ! git diff --cached --quiet; then
+              git commit -m "Seed Termux release automation"
+            fi
+            git push origin "${RELEASE_BRANCH}"
+          fi
+
+          git fetch origin "${RELEASE_BRANCH}"
+          git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
+          seed_release_workflows
+
+          if [[ "${release_branch_exists}" == false ]]; then
+            git diff --binary "origin/main...origin/${PATCH_BRANCH}" -- . ":(exclude).github" > "${RUNNER_TEMP}/termux.patch"
+            if [[ -s "${RUNNER_TEMP}/termux.patch" ]]; then
+              git apply --3way "${RUNNER_TEMP}/termux.patch"
+            fi
+          else
+            git merge --no-ff --no-edit "refs/tags/${UPSTREAM_TAG}"
+          fi
+          seed_release_workflows
+
+          mkdir -p .github
+          jq -n \
+            --arg upstream_repo "${UPSTREAM_REPO}" \
+            --arg upstream_tag "${UPSTREAM_TAG}" \
+            --arg upstream_name "${UPSTREAM_NAME}" \
+            --arg upstream_html_url "${UPSTREAM_HTML_URL}" \
+            --arg upstream_target "${UPSTREAM_TARGET}" \
+            --arg upstream_release_id "${UPSTREAM_ID}" \
+            --arg release_train "${RELEASE_TRAIN}" \
+            --arg release_branch "${RELEASE_BRANCH}" \
+            --arg work_branch "${WORK_BRANCH}" \
+            --arg patch_branch "${PATCH_BRANCH}" \
+            --arg patch_source_sha "$(git rev-parse "origin/${PATCH_BRANCH}")" \
+            --arg termux_tag "${TERMUX_TAG}" \
+            --argjson upstream_prerelease "${UPSTREAM_PRERELEASE}" \
+            '{
+              upstream_repo: $upstream_repo,
+              upstream_tag: $upstream_tag,
+              upstream_name: $upstream_name,
+              upstream_html_url: $upstream_html_url,
+              upstream_target: $upstream_target,
+              upstream_release_id: $upstream_release_id,
+              upstream_prerelease: $upstream_prerelease,
+              release_train: $release_train,
+              release_branch: $release_branch,
+              work_branch: $work_branch,
+              patch_branch: $patch_branch,
+              patch_source_sha: $patch_source_sha,
+              termux_tag: $termux_tag
+            }' > .github/termux-release.json
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to propose for ${UPSTREAM_TAG}."
+            exit 0
+          fi
+
+          git commit -m "Prepare Termux ${UPSTREAM_TAG}"
+          git push --force-with-lease origin "${WORK_BRANCH}"
+
+          body_path="${RUNNER_TEMP}/termux-release-pr.md"
+          {
+            echo "## Termux release train"
+            echo
+            echo "- Upstream release: ${UPSTREAM_HTML_URL}"
+            echo "- Upstream tag: \`${UPSTREAM_TAG}\`"
+            echo "- Termux release tag: \`${TERMUX_TAG}\`"
+            echo "- Release train branch: \`${RELEASE_BRANCH}\`"
+            echo "- Patch source: \`${PATCH_BRANCH}\`"
+            echo
+            echo "Merging this PR is the manual approval gate. The PR build uploads the Android artifact to test; after merge, the promotion workflow attaches that exact artifact to \`${TERMUX_TAG}\`."
+            echo
+            echo "## Upstream notes"
+            echo
+            printf '%s\n' "${UPSTREAM_BODY}"
+          } > "${body_path}"
+
+          pr_url="$(
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${RELEASE_BRANCH}" \
+              --head "${WORK_BRANCH}" \
+              --draft \
+              --title "Termux ${UPSTREAM_TAG}" \
+              --body-file "${body_path}"
+          )"
+          gh pr edit "${pr_url}" --add-reviewer "${REVIEWER}" || true
+          gh pr edit "${pr_url}" --add-label "termux-release" --add-label "release-train" || true
+          echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
