@@ -38,10 +38,6 @@ fn setsid_available() -> bool {
         .unwrap_or(false)
 }
 
-fn pty_supported() -> bool {
-    crate::pty::conpty_supported()
-}
-
 fn shell_command(program: &str) -> (String, Vec<String>) {
     if cfg!(windows) {
         let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
@@ -344,11 +340,6 @@ async fn wait_for_process_exit(pid: i32, timeout_ms: u64) -> anyhow::Result<bool
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
-    if !pty_supported() {
-        eprintln!("PTY not supported; skipping pty_python_repl_emits_output_and_exits");
-        return Ok(());
-    }
-
     let Some(python) = find_python() else {
         eprintln!("python not found; skipping pty_python_repl_emits_output_and_exits");
         return Ok(());
@@ -492,11 +483,6 @@ async fn pipe_process_detaches_from_parent_session() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
-    if !pty_supported() {
-        eprintln!("PTY not supported; skipping pipe_and_pty_share_interface");
-        return Ok(());
-    }
-
     let env_map: HashMap<String, String> = std::env::vars().collect();
 
     let (pipe_program, pipe_args) = shell_command(&echo_sleep_command("pipe_ok"));
@@ -643,13 +629,6 @@ async fn pipe_terminate_aborts_detached_readers() -> anyhow::Result<()> {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_terminate_kills_background_children_in_same_process_group() -> anyhow::Result<()> {
-    if !pty_supported() {
-        eprintln!(
-            "PTY not supported; skipping pty_terminate_kills_background_children_in_same_process_group"
-        );
-        return Ok(());
-    }
-
     let env_map: HashMap<String, String> = std::env::vars().collect();
     let marker = "__codex_bg_pid:";
     let script = format!("sleep 1000 & bg=$!; echo {marker}$bg; wait");
@@ -699,11 +678,6 @@ async fn pty_spawn_can_preserve_inherited_fds() -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
 
-    if !pty_supported() {
-        eprintln!("PTY not supported; skipping pty_spawn_can_preserve_inherited_fds");
-        return Ok(());
-    }
-
     let mut fds = [0; 2];
     let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if result != 0 {
@@ -749,13 +723,6 @@ async fn pty_spawn_can_preserve_inherited_fds() -> anyhow::Result<()> {
 async fn pty_preserving_inherited_fds_keeps_python_repl_running() -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
-
-    if !pty_supported() {
-        eprintln!(
-            "PTY not supported; skipping pty_preserving_inherited_fds_keeps_python_repl_running"
-        );
-        return Ok(());
-    }
 
     let Some(python) = find_python() else {
         eprintln!(
@@ -835,11 +802,6 @@ async fn pty_spawn_with_inherited_fds_reports_exec_failures() -> anyhow::Result<
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
 
-    if !pty_supported() {
-        eprintln!("PTY not supported; skipping pty_spawn_with_inherited_fds_reports_exec_failures");
-        return Ok(());
-    }
-
     let mut fds = [0; 2];
     let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if result != 0 {
@@ -887,11 +849,6 @@ async fn pty_spawn_with_inherited_fds_reports_exec_failures() -> anyhow::Result<
 async fn pty_spawn_with_inherited_fds_supports_resize() -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
-
-    if !pty_supported() {
-        eprintln!("PTY not supported; skipping pty_spawn_with_inherited_fds_supports_resize");
-        return Ok(());
-    }
 
     let mut fds = [0; 2];
     let result = unsafe { libc::pipe(fds.as_mut_ptr()) };

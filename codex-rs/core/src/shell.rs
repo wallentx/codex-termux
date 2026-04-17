@@ -162,6 +162,20 @@ fn file_exists(path: &PathBuf) -> Option<PathBuf> {
     }
 }
 
+#[cfg(target_os = "android")]
+fn termux_bin_path(binary_name: &str) -> Option<PathBuf> {
+    let prefix = std::env::var_os("PREFIX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/usr"));
+    let path = prefix.join("bin").join(binary_name);
+    file_exists(&path)
+}
+
+#[cfg(not(target_os = "android"))]
+fn termux_bin_path(_binary_name: &str) -> Option<PathBuf> {
+    None
+}
+
 fn get_shell_path(
     shell_type: ShellType,
     provided_path: Option<&PathBuf>,
@@ -187,6 +201,10 @@ fn get_shell_path(
         return Some(path);
     }
 
+    if let Some(path) = termux_bin_path(binary_name) {
+        return Some(path);
+    }
+
     for path in fallback_paths {
         //check exists
         if let Some(path) = file_exists(&PathBuf::from(path)) {
@@ -197,7 +215,7 @@ fn get_shell_path(
     None
 }
 
-const ZSH_FALLBACK_PATHS: &[&str] = &["/data/data/com.termux/files/usr/bin/zsh", "/bin/zsh"];
+const ZSH_FALLBACK_PATHS: &[&str] = &["/bin/zsh"];
 
 fn get_zsh_shell(path: Option<&PathBuf>) -> Option<Shell> {
     let shell_path = get_shell_path(ShellType::Zsh, path, "zsh", ZSH_FALLBACK_PATHS);
@@ -209,7 +227,7 @@ fn get_zsh_shell(path: Option<&PathBuf>) -> Option<Shell> {
     })
 }
 
-const BASH_FALLBACK_PATHS: &[&str] = &["/data/data/com.termux/files/usr/bin/bash", "/bin/bash"];
+const BASH_FALLBACK_PATHS: &[&str] = &["/bin/bash"];
 
 fn get_bash_shell(path: Option<&PathBuf>) -> Option<Shell> {
     let shell_path = get_shell_path(ShellType::Bash, path, "bash", BASH_FALLBACK_PATHS);
@@ -221,11 +239,7 @@ fn get_bash_shell(path: Option<&PathBuf>) -> Option<Shell> {
     })
 }
 
-const SH_FALLBACK_PATHS: &[&str] = &[
-    "/data/data/com.termux/files/usr/bin/sh",
-    "/system/bin/sh",
-    "/bin/sh",
-];
+const SH_FALLBACK_PATHS: &[&str] = &["/system/bin/sh", "/bin/sh"];
 
 fn get_sh_shell(path: Option<&PathBuf>) -> Option<Shell> {
     let shell_path = get_shell_path(ShellType::Sh, path, "sh", SH_FALLBACK_PATHS);
@@ -291,7 +305,7 @@ fn ultimate_fallback_shell() -> Shell {
     } else {
         Shell {
             shell_type: ShellType::Sh,
-            shell_path: PathBuf::from("/bin/sh"),
+            shell_path: termux_bin_path("sh").unwrap_or_else(|| PathBuf::from("/bin/sh")),
             shell_snapshot: empty_shell_snapshot_receiver(),
         }
     }

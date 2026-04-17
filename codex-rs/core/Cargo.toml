@@ -63,6 +63,7 @@ codex-thread-store = { workspace = true }
 codex-tools = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-cache = { workspace = true }
+codex-utils-file-lock = { workspace = true }
 codex-utils-image = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 codex-utils-output-truncation = { workspace = true }
@@ -138,7 +139,6 @@ openssl-sys = { workspace = true, features = ["vendored"] }
 # Build OpenSSL from source for Android builds.
 [target.aarch64-linux-android.dependencies]
 openssl-sys = { workspace = true, features = ["vendored"] }
-keyring = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.52", features = [

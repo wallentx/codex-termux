@@ -4,17 +4,16 @@ This directory wires the `v8` crate to exact-version Bazel inputs.
 Bazel consumer builds use:
 
 - upstream `denoland/rusty_v8` release archives on Windows
-- `wallentx/rusty_v8` release assets for `aarch64-linux-android`
 - source-built V8 archives on Darwin, GNU Linux, and musl Linux
 - `openai/codex` release assets for published musl release pairs
 
 Cargo builds still use prebuilt `rusty_v8` archives by default. Only Bazel
 overrides `RUSTY_V8_ARCHIVE`/`RUSTY_V8_SRC_BINDING_PATH` in `MODULE.bazel` to
-select the repo-managed archive/binding pair for its consumer builds.
+select source-built local archives for its consumer builds.
 
 Current pinned versions:
 
-- Rust crate: `v8 = =146.9.0`
+- Rust crate: `v8 = =146.4.0`
 - Embedded upstream V8 source for musl release builds: `14.6.202.9`
 
 When bumping the Rust crate version, keep the checked-in checksum manifest and

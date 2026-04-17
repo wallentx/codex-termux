@@ -1612,6 +1612,7 @@ dependencies = [
  "codex-sandboxing",
  "codex-shell-escalation",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "codex-utils-home-dir",
  "dotenvy",
  "tempfile",
@@ -1956,6 +1957,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-cache",
  "codex-utils-cargo-bin",
+ "codex-utils-file-lock",
  "codex-utils-home-dir",
  "codex-utils-image",
  "codex-utils-output-truncation",
@@ -1983,7 +1985,6 @@ dependencies = [
  "image",
  "indexmap 2.13.0",
  "insta",
- "keyring",
  "libc",
  "maplit",
  "notify",
@@ -2179,6 +2180,7 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "multimap",
  "pretty_assertions",
  "serde",
@@ -3083,6 +3085,10 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-elapsed"
+version = "0.0.0"
+
+[[package]]
+name = "codex-utils-file-lock"
 version = "0.0.0"
 
 [[package]]

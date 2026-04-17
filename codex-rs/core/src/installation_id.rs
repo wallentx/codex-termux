@@ -1,5 +1,4 @@
 use std::fs::OpenOptions;
-use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Result;
 use std::io::Seek;
@@ -12,6 +11,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_file_lock::lock_exclusive_optional;
 use tokio::fs;
 use uuid::Uuid;
 
@@ -30,11 +30,7 @@ pub(crate) async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Res
         }
 
         let mut file = options.open(&path)?;
-        if let Err(err) = file.lock()
-            && err.kind() != ErrorKind::Unsupported
-        {
-            return Err(err);
-        }
+        let _lock_outcome = lock_exclusive_optional(&file)?;
 
         #[cfg(unix)]
         {

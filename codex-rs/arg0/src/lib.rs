@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+use codex_utils_file_lock::TryFileLockOutcome;
+use codex_utils_file_lock::try_lock_exclusive_optional;
 use codex_utils_home_dir::find_codex_home;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -309,12 +311,12 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
-    let lock_file = match lock_file.try_lock() {
-        Ok(()) => Some(lock_file),
-        Err(std::fs::TryLockError::Error(err)) if err.kind() == std::io::ErrorKind::Unsupported => {
-            None
+    let lock_file = match try_lock_exclusive_optional(&lock_file)? {
+        TryFileLockOutcome::Acquired => Some(lock_file),
+        TryFileLockOutcome::Unsupported => None,
+        TryFileLockOutcome::WouldBlock => {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
         }
-        Err(err) => return Err(err.into()),
     };
 
     for filename in &[
@@ -434,13 +436,9 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
         Err(err) => return Err(err),
     };
 
-    match lock_file.try_lock() {
-        Ok(()) => Ok(Some(lock_file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(err)) if err.kind() == std::io::ErrorKind::Unsupported => {
-            Ok(None)
-        }
-        Err(err) => Err(err.into()),
+    match try_lock_exclusive_optional(&lock_file)? {
+        TryFileLockOutcome::Acquired => Ok(Some(lock_file)),
+        TryFileLockOutcome::WouldBlock | TryFileLockOutcome::Unsupported => Ok(None),
     }
 }
 
@@ -474,7 +472,7 @@ mod tests {
         let alias_path = temp_dir.path().join("codex-linux-sandbox");
         let path_entry = Arg0PathEntryGuard::new(
             temp_dir,
-            lock_file,
+            Some(lock_file),
             Arg0DispatchPaths {
                 codex_self_exe: Some(PathBuf::from("/usr/bin/codex")),
                 codex_linux_sandbox_exe: Some(alias_path.clone()),
@@ -507,14 +505,12 @@ mod tests {
         let dir = root.path().join("locked");
         fs::create_dir(&dir)?;
         let lock_file = create_lock(&dir)?;
-        match lock_file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::Error(err))
-                if err.kind() == std::io::ErrorKind::Unsupported =>
-            {
-                return Ok(());
+        match try_lock_exclusive_optional(&lock_file)? {
+            TryFileLockOutcome::Acquired => {}
+            TryFileLockOutcome::Unsupported => return Ok(()),
+            TryFileLockOutcome::WouldBlock => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            Err(err) => return Err(err.into()),
         }
 
         janitor_cleanup(root.path())?;
@@ -529,14 +525,12 @@ mod tests {
         let dir = root.path().join("stale");
         fs::create_dir(&dir)?;
         let lock_file = create_lock(&dir)?;
-        let lock_supported = match lock_file.try_lock() {
-            Ok(()) => true,
-            Err(std::fs::TryLockError::Error(err))
-                if err.kind() == std::io::ErrorKind::Unsupported =>
-            {
-                false
+        let lock_supported = match try_lock_exclusive_optional(&lock_file)? {
+            TryFileLockOutcome::Acquired => true,
+            TryFileLockOutcome::Unsupported => false,
+            TryFileLockOutcome::WouldBlock => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            Err(err) => return Err(err.into()),
         };
 
         janitor_cleanup(root.path())?;
