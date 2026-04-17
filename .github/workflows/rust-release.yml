@@ -146,6 +146,7 @@ jobs:
     env:
       CODEX_BWRAP_ENABLE_FFI: ${{ contains(matrix.target, 'unknown-linux') && '1' || '0' }}
       CODEX_BUILD_VERSION: ${{ needs.select-build-matrix.outputs.build_version }}
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     strategy:
       fail-fast: false
@@ -250,7 +251,8 @@ jobs:
           set -euo pipefail
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_VERSION=android-release-${{ matrix.target }}" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=5G" >> "$GITHUB_ENV"
       - name: Ensure Rust target is installed
         shell: bash
         run: |
@@ -487,7 +489,7 @@ jobs:
       - name: sccache stats (Android)
         if: ${{ matrix.target == 'aarch64-linux-android' }}
         shell: bash
-        run: sccache --show-stats || true
+        run: ${SCCACHE_PATH:-sccache} --show-stats || true
 
       - if: ${{ matrix.target == 'aarch64-linux-android' }}
         name: Normalize Android ELF for Termux
