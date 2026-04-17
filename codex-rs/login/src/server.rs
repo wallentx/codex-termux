@@ -146,7 +146,8 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     };
     let server = Arc::new(server);
 
-    let redirect_uri = format!("http://localhost:{actual_port}/auth/callback");
+    let redirect_host = loopback_redirect_host();
+    let redirect_uri = format!("http://{redirect_host}:{actual_port}/auth/callback");
     let auth_url = build_authorize_url(
         &opts.issuer,
         &opts.client_id,
@@ -571,6 +572,14 @@ fn bind_server(port: u16) -> io::Result<Server> {
     }
 }
 
+fn loopback_redirect_host() -> &'static str {
+    if cfg!(target_os = "android") {
+        "127.0.0.1"
+    } else {
+        "localhost"
+    }
+}
+
 /// Tokens returned by the OAuth authorization-code exchange.
 pub(crate) struct ExchangedTokens {
     pub id_token: String,
@@ -831,10 +840,11 @@ fn compose_success_url(port: u16, issuer: &str, id_token: &str, access_token: &s
     ];
     let qs = params
         .drain(..)
-        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(&v)))
+        .map(|(k, v)| format!("{k}={}", urlencoding::encode(&v)))
         .collect::<Vec<_>>()
         .join("&");
-    format!("http://localhost:{port}/success?{qs}")
+    let redirect_host = loopback_redirect_host();
+    format!("http://{redirect_host}:{port}/success?{qs}")
 }
 
 fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::Value> {
