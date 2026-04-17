@@ -54,7 +54,6 @@ use tracing::warn;
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
-const LOGIN_DEBUG_ENV_VAR: &str = "CODEX_LOGIN_DEBUG";
 static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(include_str!("assets/error.html"))
         .unwrap_or_else(|err| panic!("login error page template must parse: {err}"))
@@ -161,17 +160,6 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         &state,
         opts.forced_chatgpt_workspace_id.as_deref(),
     );
-    if let Some(debug_summary) = login_debug_summary(&opts.issuer, &opts.client_id, &redirect_uri) {
-        let debug_summary = format!(
-            "{debug_summary}; {}; actual_port={actual_port}; open_browser={}; forced_workspace={}",
-            login_pkce_debug_summary(&pkce, ""),
-            opts.open_browser,
-            opts.forced_chatgpt_workspace_id.is_some()
-        );
-        eprintln!("Codex login debug: {debug_summary}");
-        info!(debug_summary, "oauth login debug enabled");
-    }
-
     if opts.open_browser {
         let _ = webbrowser::open(&auth_url);
     }
@@ -312,12 +300,6 @@ async fn process_request(
             let has_state = params.get("state").is_some_and(|state| !state.is_empty());
             let has_error = params.get("error").is_some_and(|error| !error.is_empty());
             let state_valid = params.get("state").map(String::as_str) == Some(state);
-            let callback_debug =
-                login_callback_debug_summary(&path, &params, state, state_valid, pkce);
-            if let Some(callback_debug) = callback_debug.as_ref() {
-                eprintln!("Codex login callback debug: {callback_debug}");
-                info!(callback_debug, "oauth callback debug");
-            }
             info!(
                 path = %path,
                 has_code,
@@ -454,20 +436,7 @@ async fn process_request(
                 Err(err) => {
                     finish_login_callback_failure(callback_state, &code_hash);
                     eprintln!("Token exchange error: {err}");
-                    let debug_description =
-                        login_debug_summary(&opts.issuer, &opts.client_id, redirect_uri).map(
-                            |debug| {
-                                format!(
-                                    "{debug}; {}; {}; token_exchange_error={err}",
-                                    callback_debug.unwrap_or_default(),
-                                    login_pkce_debug_summary(pkce, &code)
-                                )
-                            },
-                        );
-                    error!(
-                        debug_description = debug_description.as_deref().unwrap_or("disabled"),
-                        "login callback token exchange failed"
-                    );
+                    error!("login callback token exchange failed");
                     login_error_response(
                         &format!("Token exchange failed: {err}"),
                         io::ErrorKind::Other,
@@ -653,36 +622,6 @@ fn bind_server(port: u16) -> io::Result<Server> {
     }
 }
 
-fn login_debug_enabled() -> bool {
-    std::env::var(LOGIN_DEBUG_ENV_VAR)
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-}
-
-fn login_debug_summary(issuer: &str, client_id: &str, redirect_uri: &str) -> Option<String> {
-    if !login_debug_enabled() {
-        return None;
-    }
-
-    let originator = originator().value;
-    let issuer = sanitize_url_for_logging(issuer);
-    let target_os = std::env::consts::OS;
-    Some(format!(
-        "issuer={issuer}; client_id={client_id}; redirect_uri={redirect_uri}; originator={originator}; target_os={target_os}"
-    ))
-}
-
-fn login_pkce_debug_summary(pkce: &PkceCodes, code: &str) -> String {
-    let digest = Sha256::digest(pkce.code_verifier.as_bytes());
-    let computed_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    let pkce_challenge_matches = computed_challenge == pkce.code_challenge;
-    format!(
-        "code_len={}; verifier_len={}; challenge_len={}; pkce_challenge_matches={pkce_challenge_matches}",
-        code.len(),
-        pkce.code_verifier.len(),
-        pkce.code_challenge.len()
-    )
-}
-
 enum LoginCallbackStart {
     Proceed,
     Redirect(String),
@@ -765,84 +704,6 @@ fn login_processing_response() -> HandledRequest {
         response.add_header(header);
     }
     HandledRequest::Response(response)
-}
-
-fn login_callback_debug_summary(
-    path: &str,
-    params: &std::collections::HashMap<String, String>,
-    expected_state: &str,
-    state_valid: bool,
-    pkce: &PkceCodes,
-) -> Option<String> {
-    if !login_debug_enabled() {
-        return None;
-    }
-
-    let mut query_keys = params.keys().map(String::as_str).collect::<Vec<_>>();
-    query_keys.sort_unstable();
-    let query_keys = query_keys.join(",");
-    let code_len = params.get("code").map_or(0, String::len);
-    let state_len = params.get("state").map_or(0, String::len);
-    let error_code = params
-        .get("error")
-        .map(|value| sanitize_debug_value(value))
-        .unwrap_or_else(|| "none".to_string());
-    Some(format!(
-        "callback_path={path}; query_keys={query_keys}; code_len={code_len}; state_len={state_len}; expected_state_len={}; state_valid={state_valid}; error={error_code}; {}",
-        expected_state.len(),
-        login_pkce_debug_summary(pkce, "")
-    ))
-}
-
-fn login_token_response_debug(
-    status: reqwest::StatusCode,
-    headers: &reqwest::header::HeaderMap,
-) -> String {
-    let mut parts = vec![
-        format!("token_status={status}"),
-        "token_client=bare_reqwest_custom_ca".to_string(),
-    ];
-    for name in [
-        "content-type",
-        "x-request-id",
-        "request-id",
-        "cf-ray",
-        "openai-processing-ms",
-        "www-authenticate",
-    ] {
-        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
-            parts.push(format!("{name}={}", sanitize_debug_value(value)));
-        }
-    }
-    parts.join("; ")
-}
-
-fn login_token_body_debug(body: &str) -> String {
-    let trimmed = body.trim();
-    let parsed = serde_json::from_str::<JsonValue>(trimmed).ok();
-    let body_kind = if parsed.is_some() {
-        "json"
-    } else if trimmed.is_empty() {
-        "empty"
-    } else {
-        "text"
-    };
-    format!(
-        "token_body_len={}; token_body_kind={body_kind}; token_body_preview={}",
-        body.len(),
-        sanitize_debug_value(trimmed)
-    )
-}
-
-fn sanitize_debug_value(value: &str) -> String {
-    let trimmed = value.trim().replace(['\r', '\n'], " ");
-    let mut chars = trimmed.chars();
-    let preview = chars.by_ref().take(160).collect::<String>();
-    if chars.next().is_some() {
-        format!("{preview}...")
-    } else {
-        preview
-    }
 }
 
 /// Tokens returned by the OAuth authorization-code exchange.
@@ -1004,26 +865,17 @@ pub(crate) async fn exchange_code_for_tokens(
 
     let status = resp.status();
     if !status.is_success() {
-        let response_debug = login_token_response_debug(status, resp.headers());
         let body = resp.text().await.map_err(io::Error::other)?;
         let detail = parse_token_endpoint_error(&body);
-        let body_debug = login_token_body_debug(&body);
-        let debug_detail = login_debug_enabled()
-            .then(|| format!("{response_debug}; {body_debug}"))
-            .unwrap_or_default();
         warn!(
             %status,
             error_code = detail.error_code.as_deref().unwrap_or("unknown"),
             error_message = detail.error_message.as_deref().unwrap_or("unknown"),
-            debug_detail,
             "oauth token exchange returned non-success status"
         );
-        let message = if debug_detail.is_empty() {
-            format!("token endpoint returned status {status}: {detail}")
-        } else {
-            format!("token endpoint returned status {status}: {detail}; {debug_detail}")
-        };
-        return Err(io::Error::other(message));
+        return Err(io::Error::other(format!(
+            "token endpoint returned status {status}: {detail}"
+        )));
     }
 
     let tokens: TokenResponse = resp.json().await.map_err(io::Error::other)?;
