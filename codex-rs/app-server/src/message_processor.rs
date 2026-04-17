@@ -75,6 +75,7 @@ use codex_login::auth::ExternalAuth;
 use codex_login::auth::ExternalAuthRefreshContext;
 use codex_login::auth::ExternalAuthRefreshReason;
 use codex_login::auth::ExternalAuthTokens;
+use codex_login::default_client::DEFAULT_ORIGINATOR;
 use codex_login::default_client::SetOriginatorError;
 use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
@@ -94,6 +95,7 @@ use toml::Value as TomlValue;
 use tracing::Instrument;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+const TUI_CLIENT_NAME: &str = "codex-tui";
 
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
@@ -636,7 +638,11 @@ impl MessageProcessor {
                     .await;
                 return;
             }
-            let originator = name.clone();
+            let originator = if name == TUI_CLIENT_NAME {
+                DEFAULT_ORIGINATOR.to_string()
+            } else {
+                name.clone()
+            };
             let user_agent_suffix = format!("{name}; {version}");
             let codex_home = self.config.codex_home.clone();
             if session
