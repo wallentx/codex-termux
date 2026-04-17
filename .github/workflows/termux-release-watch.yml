@@ -17,9 +17,18 @@ on:
         default: "wallentx"
 
 permissions:
-  actions: write
-  contents: write
-  pull-requests: write
+  actions: read
+  attestations: read
+  checks: read
+  contents: read
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  statuses: read
 
 concurrency:
   group: termux-release-watch
@@ -28,6 +37,10 @@ concurrency:
 jobs:
   create-release-pr:
     runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
       REVIEWER: ${{ inputs.reviewer || 'wallentx' }}
@@ -137,7 +150,6 @@ jobs:
         id: pr
         shell: bash
         env:
-          AUTOMATION_REF: ${{ github.ref_name }}
           UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
           UPSTREAM_NAME: ${{ steps.upstream.outputs.upstream_name }}
           UPSTREAM_HTML_URL: ${{ steps.upstream.outputs.upstream_html_url }}
@@ -257,9 +269,4 @@ jobs:
           )"
           gh pr edit "${pr_url}" --add-reviewer "${REVIEWER}" || true
           gh pr edit "${pr_url}" --add-label "termux-release" --add-label "release-train" || true
-          gh workflow run rust-release.yml \
-            --repo "${GITHUB_REPOSITORY}" \
-            --ref "${AUTOMATION_REF}" \
-            -f source_ref="${WORK_BRANCH}" \
-            -f build_target=aarch64-linux-android
           echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"

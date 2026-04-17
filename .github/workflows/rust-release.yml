@@ -37,6 +37,20 @@ on:
           - x86_64-pc-windows-msvc
           - aarch64-pc-windows-msvc
 
+permissions:
+  actions: read
+  attestations: read
+  checks: read
+  contents: read
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  statuses: read
+
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
@@ -343,6 +357,7 @@ jobs:
       - if: ${{ matrix.target == 'aarch64-linux-android' }}
         name: Configure Android rusty_v8 artifact overrides
         env:
+          GH_TOKEN: ${{ github.token }}
           TARGET: ${{ matrix.target }}
         shell: bash
         run: |
@@ -371,12 +386,15 @@ jobs:
             echo "Unable to resolve v8 version from Cargo.lock" >&2
             exit 1
           fi
-          base_url="https://github.com/wallentx/rusty_v8/releases/download/v${version}"
-          archive="${base_url}/librusty_v8_release_${TARGET}.a.gz"
           binding_dir="${RUNNER_TEMP}/rusty_v8"
+          archive="${binding_dir}/librusty_v8_release_${TARGET}.a.gz"
           binding_path="${binding_dir}/src_binding_release_${TARGET}.rs"
           mkdir -p "${binding_dir}"
-          curl -fsSL "${base_url}/src_binding_release_${TARGET}.rs" -o "${binding_path}"
+          gh release download "v${version}" \
+            --repo wallentx/rusty_v8 \
+            --dir "${binding_dir}" \
+            --pattern "librusty_v8_release_${TARGET}.a.gz" \
+            --pattern "src_binding_release_${TARGET}.rs"
           echo "RUSTY_V8_ARCHIVE=${archive}" >> "$GITHUB_ENV"
           echo "RUSTY_V8_SRC_BINDING_PATH=${binding_path}" >> "$GITHUB_ENV"
 

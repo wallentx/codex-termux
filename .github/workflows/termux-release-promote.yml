@@ -6,9 +6,18 @@ on:
       - "release/**"
 
 permissions:
-  contents: write
   actions: read
+  attestations: read
+  checks: read
+  contents: read
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
   pull-requests: read
+  repository-projects: read
+  statuses: read
 
 concurrency:
   group: termux-release-promote-${{ github.ref_name }}
@@ -18,6 +27,10 @@ jobs:
   promote:
     runs-on: ubuntu-24.04
     if: ${{ !contains(github.event.head_commit.message, 'Seed Termux release automation') }}
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
