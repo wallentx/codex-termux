@@ -279,12 +279,15 @@ pub struct FileWatcher {
 impl FileWatcher {
     /// Creates a live filesystem watcher and starts its background event loop
     /// on the current Tokio runtime.
+    #[cfg(target_os = "android")]
     pub fn new() -> notify::Result<Self> {
-        #[cfg(target_os = "android")]
-        {
-            return Ok(Self::noop());
-        }
+        Ok(Self::noop())
+    }
 
+    /// Creates a live filesystem watcher and starts its background event loop
+    /// on the current Tokio runtime.
+    #[cfg(not(target_os = "android"))]
+    pub fn new() -> notify::Result<Self> {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         let raw_tx_clone = raw_tx;
         let watcher = notify::recommended_watcher(move |res| {
