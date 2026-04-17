@@ -60,21 +60,24 @@ jobs:
             release_json="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${REQUESTED_TAG}")"
           else
             releases="$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=50")"
-            release_json="$(
+            mapfile -t candidates < <(
               jq -c '
                 [.[] | select(.draft == false and (.tag_name | startswith("rust-v")))]
                 | sort_by(.published_at)
                 | reverse
                 | .[]
-              ' <<< "${releases}" | while IFS= read -r candidate; do
-                tag="$(jq -r '.tag_name' <<< "${candidate}")"
-                if gh release view "${tag}-termux" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-                  continue
-                fi
-                printf '%s\n' "${candidate}"
-                break
-              done
-            )"
+              ' <<< "${releases}"
+            )
+
+            release_json=""
+            for candidate in "${candidates[@]}"; do
+              tag="$(jq -r '.tag_name' <<< "${candidate}")"
+              if gh release view "${tag}-termux" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+                continue
+              fi
+              release_json="${candidate}"
+              break
+            done
           fi
 
           if [[ -z "${release_json}" ]]; then
