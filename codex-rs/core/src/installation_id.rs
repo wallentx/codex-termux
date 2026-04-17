@@ -11,6 +11,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_file_lock::lock_exclusive_optional;
 use tokio::fs;
 use uuid::Uuid;
 
@@ -29,7 +30,7 @@ pub(crate) async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Res
         }
 
         let mut file = options.open(&path)?;
-        file.lock()?;
+        let _lock_outcome = lock_exclusive_optional(&file)?;
 
         #[cfg(unix)]
         {
