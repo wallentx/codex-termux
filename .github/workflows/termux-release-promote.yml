@@ -81,13 +81,23 @@ jobs:
             ' <<< "${prs}"
           )"
           if [[ -z "${pr_json}" ]]; then
+            pr_json="$(
+              gh pr list \
+                --repo "${GITHUB_REPOSITORY}" \
+                --base "${GITHUB_REF_NAME}" \
+                --state merged \
+                --json number,headRefOid,headRefName,mergeCommit \
+                --jq "[.[] | select(.mergeCommit.oid == \"${GITHUB_SHA}\")] | sort_by(.number) | reverse | .[0] // empty"
+            )"
+          fi
+          if [[ -z "${pr_json}" ]]; then
             echo "Unable to find merged PR for ${GITHUB_SHA} into ${GITHUB_REF_NAME}" >&2
             exit 1
           fi
 
           pr_number="$(jq -r '.number' <<< "${pr_json}")"
-          head_sha="$(jq -r '.head.sha' <<< "${pr_json}")"
-          head_ref="$(jq -r '.head.ref' <<< "${pr_json}")"
+          head_sha="$(jq -r '.headRefOid // .head.sha' <<< "${pr_json}")"
+          head_ref="$(jq -r '.headRefName // .head.ref' <<< "${pr_json}")"
           artifact_name="termux-android-pr-${pr_number}-${head_sha}"
           {
             echo "number=${pr_number}"
@@ -100,32 +110,48 @@ jobs:
         if: steps.metadata.outputs.promote == 'true'
         shell: bash
         env:
-          ARTIFACT_NAME: ${{ steps.pr.outputs.artifact_name }}
+          PR_ARTIFACT_NAME: ${{ steps.pr.outputs.artifact_name }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
           set -euo pipefail
-          run_id="$(
+          find_run_id() {
+            local event="$1"
             gh api \
               --method GET \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/rust-release.yml/runs" \
-              -f event=pull_request \
+              -f event="${event}" \
               -f status=success \
               -f head_sha="${HEAD_SHA}" \
               --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0].id // empty'
-          )"
-          if [[ -z "${run_id}" ]]; then
-            echo "No successful rust-release PR workflow run found for ${HEAD_SHA}" >&2
-            exit 1
-          fi
+          }
 
-          artifact_id="$(
+          find_artifact_id() {
+            local run_id="$1"
+            local artifact_name="$2"
             gh api \
               "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
-              --jq ".artifacts[] | select(.name == \"${ARTIFACT_NAME}\") | .id" \
+              --jq ".artifacts[] | select(.name == \"${artifact_name}\") | .id" \
               | head -n 1
-          )"
+          }
+
+          artifact_name="${PR_ARTIFACT_NAME}"
+          run_id="$(find_run_id pull_request)"
+          artifact_id=""
+          if [[ -n "${run_id}" ]]; then
+            artifact_id="$(find_artifact_id "${run_id}" "${artifact_name}")"
+          fi
+
           if [[ -z "${artifact_id}" ]]; then
-            echo "Artifact ${ARTIFACT_NAME} not found on workflow run ${run_id}" >&2
+            artifact_name="aarch64-linux-android"
+            run_id="$(find_run_id workflow_dispatch)"
+            if [[ -n "${run_id}" ]]; then
+              artifact_id="$(find_artifact_id "${run_id}" "${artifact_name}")"
+            fi
+          fi
+
+          if [[ -z "${run_id}" || -z "${artifact_id}" ]]; then
+            echo "No successful rust-release artifact found for ${HEAD_SHA}" >&2
+            echo "Expected either pull_request artifact ${PR_ARTIFACT_NAME} or workflow_dispatch artifact aarch64-linux-android." >&2
             exit 1
           fi
 

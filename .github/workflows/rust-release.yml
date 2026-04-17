@@ -746,15 +746,19 @@ jobs:
           done
 
       - name: Add Termux release metadata
-        if: ${{ github.event_name == 'pull_request' && matrix.target == 'aarch64-linux-android' }}
+        if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && matrix.target == 'aarch64-linux-android' }}
         shell: bash
         run: |
           set -euo pipefail
+          if [[ ! -f "${GITHUB_WORKSPACE}/.github/termux-release.json" ]]; then
+            echo "No Termux release metadata found; skipping metadata attachment."
+            exit 0
+          fi
           dest="dist/${{ matrix.target }}"
           cp "${GITHUB_WORKSPACE}/.github/termux-release.json" "${dest}/termux-release.json"
           (
             cd "${dest}"
-            sha256sum * > SHA256SUMS
+            sha256sum ./* > SHA256SUMS
           )
 
       - uses: actions/upload-artifact@v6

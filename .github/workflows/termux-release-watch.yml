@@ -17,6 +17,7 @@ on:
         default: "wallentx"
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -248,7 +249,7 @@ jobs:
             echo "- Release train branch: \`${RELEASE_BRANCH}\`"
             echo "- Patch source: \`${PATCH_BRANCH}\`"
             echo
-            echo "Merging this PR is the manual approval gate. The PR build uploads the Android artifact to test; after merge, the promotion workflow attaches that exact artifact to \`${TERMUX_TAG}\`."
+            echo "Merging this PR is the manual approval gate. The release build workflow uploads the Android artifact to test; after merge, the promotion workflow attaches that exact artifact to \`${TERMUX_TAG}\`."
             echo
             echo "## Upstream notes"
             echo
@@ -266,4 +267,9 @@ jobs:
           )"
           gh pr edit "${pr_url}" --add-reviewer "${REVIEWER}" || true
           gh pr edit "${pr_url}" --add-label "termux-release" --add-label "release-train" || true
+          gh workflow run rust-release.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${WORK_BRANCH}" \
+            -f source_ref="${WORK_BRANCH}" \
+            -f build_target=aarch64-linux-android
           echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
