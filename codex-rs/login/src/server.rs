@@ -50,6 +50,7 @@ use tracing::warn;
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
+const LOGIN_DEBUG_ENV_VAR: &str = "CODEX_LOGIN_DEBUG";
 static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(include_str!("assets/error.html"))
         .unwrap_or_else(|err| panic!("login error page template must parse: {err}"))
@@ -146,8 +147,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     };
     let server = Arc::new(server);
 
-    let redirect_host = loopback_redirect_host();
-    let redirect_uri = format!("http://{redirect_host}:{actual_port}/auth/callback");
+    let redirect_uri = format!("http://localhost:{actual_port}/auth/callback");
     let auth_url = build_authorize_url(
         &opts.issuer,
         &opts.client_id,
@@ -156,6 +156,10 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         &state,
         opts.forced_chatgpt_workspace_id.as_deref(),
     );
+    if let Some(debug_summary) = login_debug_summary(&opts.issuer, &opts.client_id, &redirect_uri) {
+        eprintln!("Codex login debug: {debug_summary}");
+        info!(debug_summary, "oauth login debug enabled");
+    }
 
     if opts.open_browser {
         let _ = webbrowser::open(&auth_url);
@@ -386,12 +390,18 @@ async fn process_request(
                 }
                 Err(err) => {
                     eprintln!("Token exchange error: {err}");
-                    error!("login callback token exchange failed");
+                    let debug_description =
+                        login_debug_summary(&opts.issuer, &opts.client_id, redirect_uri)
+                            .map(|debug| format!("{debug}; token_exchange_error={err}"));
+                    error!(
+                        debug_description = debug_description.as_deref().unwrap_or("disabled"),
+                        "login callback token exchange failed"
+                    );
                     login_error_response(
                         &format!("Token exchange failed: {err}"),
                         io::ErrorKind::Other,
                         Some("token_exchange_failed"),
-                        /*error_description*/ None,
+                        debug_description.as_deref(),
                     )
                 }
             }
@@ -572,12 +582,22 @@ fn bind_server(port: u16) -> io::Result<Server> {
     }
 }
 
-fn loopback_redirect_host() -> &'static str {
-    if cfg!(target_os = "android") {
-        "127.0.0.1"
-    } else {
-        "localhost"
+fn login_debug_enabled() -> bool {
+    std::env::var(LOGIN_DEBUG_ENV_VAR)
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+fn login_debug_summary(issuer: &str, client_id: &str, redirect_uri: &str) -> Option<String> {
+    if !login_debug_enabled() {
+        return None;
     }
+
+    let originator = originator().value;
+    let issuer = sanitize_url_for_logging(issuer);
+    let target_os = std::env::consts::OS;
+    Some(format!(
+        "issuer={issuer}; client_id={client_id}; redirect_uri={redirect_uri}; originator={originator}; target_os={target_os}"
+    ))
 }
 
 /// Tokens returned by the OAuth authorization-code exchange.
@@ -843,8 +863,7 @@ fn compose_success_url(port: u16, issuer: &str, id_token: &str, access_token: &s
         .map(|(k, v)| format!("{k}={}", urlencoding::encode(&v)))
         .collect::<Vec<_>>()
         .join("&");
-    let redirect_host = loopback_redirect_host();
-    format!("http://{redirect_host}:{port}/success?{qs}")
+    format!("http://localhost:{port}/success?{qs}")
 }
 
 fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::Value> {
