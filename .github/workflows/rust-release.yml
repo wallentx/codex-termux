@@ -760,7 +760,7 @@ jobs:
             if [[ "${keep_originals}" == false ]]; then
               zstd_args+=(--rm)
             fi
-            
+
             if [[ "${archive_name}" != "${base}" ]]; then
               zstd "${zstd_args[@]}" "$dest/$base" -o "$dest/${archive_name}.zst"
             else

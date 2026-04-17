@@ -181,10 +181,6 @@ jobs:
 
           if [[ "${release_branch_exists}" == false ]]; then
             git checkout -B "${RELEASE_BRANCH}" "refs/tags/${UPSTREAM_TAG}"
-            git rm -r --ignore-unmatch .github/workflows
-            if ! git diff --cached --quiet; then
-              git commit -m "Remove workflow files from Termux release branch"
-            fi
             git push origin "${RELEASE_BRANCH}"
           fi
 
@@ -192,14 +188,13 @@ jobs:
           git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
 
           if [[ "${release_branch_exists}" == false ]]; then
-            git diff --binary "origin/main...origin/${PATCH_BRANCH}" -- . ":(exclude).github" > "${RUNNER_TEMP}/termux.patch"
+            git diff --binary "origin/main...origin/${PATCH_BRANCH}" > "${RUNNER_TEMP}/termux.patch"
             if [[ -s "${RUNNER_TEMP}/termux.patch" ]]; then
               git apply --3way "${RUNNER_TEMP}/termux.patch"
             fi
           else
             git merge --no-ff --no-edit "refs/tags/${UPSTREAM_TAG}"
           fi
-          git rm -r --ignore-unmatch .github/workflows
 
           mkdir -p .github
           jq -n \
