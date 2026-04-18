@@ -238,7 +238,13 @@ jobs:
           seed_release_workflows
 
           if [[ "${release_branch_exists}" == false ]]; then
-            git diff --binary "origin/main...origin/${PATCH_BRANCH}" > "${RUNNER_TEMP}/termux.patch"
+            git diff --binary "origin/main...origin/${PATCH_BRANCH}" \
+              -- . \
+              ':!.github/workflows/rust-release.yml' \
+              ':!.github/workflows/shell-tool-mcp.yml' \
+              ':!.github/workflows/termux-release-checkpoint.yml' \
+              ':!.github/workflows/termux-release-promote.yml' \
+              > "${RUNNER_TEMP}/termux.patch"
             if [[ -s "${RUNNER_TEMP}/termux.patch" ]]; then
               git apply --3way "${RUNNER_TEMP}/termux.patch"
             fi

@@ -790,13 +790,69 @@ jobs:
             sha256sum ./* > SHA256SUMS
           )
 
-      - uses: actions/upload-artifact@v6
+      - id: upload-artifact
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ github.event_name == 'pull_request' && format('termux-android-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || matrix.target }}
           # Upload the per-binary .zst files as well as the new .tar.gz
           # equivalents we generated in the previous step.
           path: |
             codex-rs/dist/${{ matrix.target }}/*
+
+      - name: Comment Termux artifact download link
+        if: ${{ github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/') && matrix.target == 'aarch64-linux-android' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_ID: ${{ steps.upload-artifact.outputs.artifact-id }}
+          ARTIFACT_NAME: ${{ github.event_name == 'pull_request' && format('termux-android-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || matrix.target }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ARTIFACT_ID}" ]]; then
+            echo "upload-artifact did not return an artifact id" >&2
+            exit 1
+          fi
+
+          marker="<!-- termux-android-artifact -->"
+          artifact_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts/${ARTIFACT_ID}"
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body_path="${RUNNER_TEMP}/termux-artifact-comment.md"
+          {
+            echo "${marker}"
+            echo "Termux Android artifact ready for testing:"
+            echo
+            echo "- Artifact: [${ARTIFACT_NAME}](${artifact_url})"
+            echo "- Workflow run: [${GITHUB_RUN_ID}](${run_url})"
+            echo
+            echo "You must be signed in to GitHub with repository access to download Actions artifacts."
+          } > "${body_path}"
+
+          existing_comment_id="$(
+            gh pr view "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json comments \
+              --jq ".comments | map(select(.author.is_bot == true and (.body | contains(\"${marker}\")))) | .[-1].id // \"\""
+          )"
+          if [[ -n "${existing_comment_id}" ]]; then
+            gh api graphql \
+              -f query='
+                mutation($id: ID!, $body: String!) {
+                  updateIssueComment(input: {id: $id, body: $body}) {
+                    issueComment {
+                      id
+                    }
+                  }
+                }
+              ' \
+              -f id="${existing_comment_id}" \
+              -f body="$(cat "${body_path}")" \
+              >/dev/null
+          else
+            gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body-file "${body_path}"
+          fi
+
+          gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-label binary-ready
 
   shell-tool-mcp:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository_owner == 'openai'
