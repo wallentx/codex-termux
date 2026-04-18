@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use codex_utils_file_lock::lock_exclusive_optional;
+
 use crate::decision::Decision;
 use crate::rule::NetworkRuleProtocol;
 use crate::rule::normalize_network_rule_host;
@@ -154,10 +156,11 @@ fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> 
             path: policy_path.to_path_buf(),
             source,
         })?;
-    file.lock().map_err(|source| AmendError::LockPolicyFile {
-        path: policy_path.to_path_buf(),
-        source,
-    })?;
+    let _lock_outcome =
+        lock_exclusive_optional(&file).map_err(|source| AmendError::LockPolicyFile {
+            path: policy_path.to_path_buf(),
+            source,
+        })?;
 
     file.seek(SeekFrom::Start(0))
         .map_err(|source| AmendError::SeekPolicyFile {
