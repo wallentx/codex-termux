@@ -4,6 +4,27 @@ on:
   push:
     branches:
       - "release/**"
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: "Release branch to promote, for example release/0.122.0"
+        required: true
+        type: string
+      release_sha:
+        description: "Release branch commit SHA to promote. Defaults to the branch head."
+        required: false
+        default: ""
+        type: string
+      pr_number:
+        description: "Merged PR number to promote. Optional; normally discovered automatically."
+        required: false
+        default: ""
+        type: string
+      pr_head_sha:
+        description: "Merged PR head SHA. Required only when pr_number is set."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
@@ -20,13 +41,13 @@ permissions:
   statuses: read
 
 concurrency:
-  group: termux-release-promote-${{ github.ref_name }}
+  group: termux-release-promote-${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   promote:
     runs-on: ubuntu-24.04
-    if: ${{ !contains(github.event.head_commit.message, 'Seed Termux release automation') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, 'Seed Termux release automation') }}
     permissions:
       actions: read
       contents: write
@@ -42,6 +63,8 @@ jobs:
       - name: Checkout release branch
         uses: actions/checkout@v6
         with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.ref }}
           token: ${{ steps.app-token.outputs.token }}
 
       - name: 🧰 Actions Toolbox
@@ -49,6 +72,32 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Resolve release ref
+        id: release-ref
+        shell: bash
+        env:
+          INPUT_RELEASE_BRANCH: ${{ inputs.release_branch }}
+          INPUT_RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            release_branch="${INPUT_RELEASE_BRANCH}"
+            if [[ -n "${INPUT_RELEASE_SHA}" ]]; then
+              git checkout --detach "${INPUT_RELEASE_SHA}"
+              release_sha="${INPUT_RELEASE_SHA}"
+            else
+              release_sha="$(git rev-parse HEAD)"
+            fi
+          else
+            release_branch="${GITHUB_REF_NAME}"
+            release_sha="${GITHUB_SHA}"
+          fi
+
+          {
+            echo "branch=${release_branch}"
+            echo "sha=${release_sha}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Read release metadata
         id: metadata
@@ -65,6 +114,7 @@ jobs:
           fi
 
           upstream_tag="$(jq -r '.upstream_tag // empty' "${metadata}")"
+          upstream_name="$(jq -r '.upstream_name // .upstream_tag // empty' "${metadata}")"
           termux_tag="$(jq -r '.termux_tag // empty' "${metadata}")"
           upstream_prerelease="$(jq -r '.upstream_prerelease // true' "${metadata}")"
           upstream_html_url="$(jq -r '.upstream_html_url // ""' "${metadata}")"
@@ -83,6 +133,7 @@ jobs:
           {
             echo "promote=true"
             echo "upstream_tag=${upstream_tag}"
+            echo "upstream_name=${upstream_name}"
             echo "termux_tag=${termux_tag}"
             echo "upstream_prerelease=${upstream_prerelease}"
             echo "upstream_html_url=${upstream_html_url}"
@@ -95,15 +146,38 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_BRANCH: ${{ steps.release-ref.outputs.branch }}
+          RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
         run: |
           set -euo pipefail
+          if [[ -n "${INPUT_PR_NUMBER}" || -n "${INPUT_PR_HEAD_SHA}" ]]; then
+            if [[ -z "${INPUT_PR_NUMBER}" || -z "${INPUT_PR_HEAD_SHA}" ]]; then
+              echo "workflow_dispatch inputs pr_number and pr_head_sha must be provided together." >&2
+              exit 1
+            fi
+
+            pr_number="${INPUT_PR_NUMBER}"
+            head_sha="${INPUT_PR_HEAD_SHA}"
+            head_ref=""
+            artifact_name="termux-android-pr-${pr_number}-${head_sha}"
+            {
+              echo "number=${pr_number}"
+              echo "head_sha=${head_sha}"
+              echo "head_ref=${head_ref}"
+              echo "artifact_name=${artifact_name}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           prs="$(
             gh api \
               -H "Accept: application/vnd.github+json" \
-              "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls"
+              "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/pulls"
           )"
           pr_json="$(
-            jq -c --arg base "${GITHUB_REF_NAME}" '
+            jq -c --arg base "${RELEASE_BRANCH}" '
               [.[] | select(.merged_at != null and .base.ref == $base)]
               | sort_by(.number)
               | reverse
@@ -114,14 +188,15 @@ jobs:
             pr_json="$(
               gh pr list \
                 --repo "${GITHUB_REPOSITORY}" \
-                --base "${GITHUB_REF_NAME}" \
+                --base "${RELEASE_BRANCH}" \
                 --state merged \
+                --limit 100 \
                 --json number,headRefOid,headRefName,mergeCommit \
-                --jq "[.[] | select(.mergeCommit.oid == \"${GITHUB_SHA}\")] | sort_by(.number) | reverse | .[0] // empty"
+                --jq "[.[] | select(.mergeCommit.oid == \"${RELEASE_SHA}\")] | sort_by(.number) | reverse | .[0] // empty"
             )"
           fi
           if [[ -z "${pr_json}" ]]; then
-            echo "Unable to find merged PR for ${GITHUB_SHA} into ${GITHUB_REF_NAME}" >&2
+            echo "Unable to find merged PR for ${RELEASE_SHA} into ${RELEASE_BRANCH}" >&2
             exit 1
           fi
 
@@ -161,8 +236,7 @@ jobs:
             local artifact_name="$2"
             gh api \
               "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
-              --jq ".artifacts[] | select(.name == \"${artifact_name}\") | .id" \
-              | head -n 1
+              --jq ".artifacts | map(select(.name == \"${artifact_name}\")) | .[0].id // empty"
           }
 
           artifact_name="${PR_ARTIFACT_NAME}"
@@ -187,9 +261,7 @@ jobs:
           fi
 
           mkdir -p promoted
-          gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
-            --output "${RUNNER_TEMP}/artifact.zip"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "${RUNNER_TEMP}/artifact.zip"
           unzip -q "${RUNNER_TEMP}/artifact.zip" -d promoted
           ls -la promoted
           if [[ -f promoted/SHA256SUMS ]]; then
@@ -202,12 +274,14 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           UPSTREAM_TAG: ${{ steps.metadata.outputs.upstream_tag }}
+          UPSTREAM_NAME: ${{ steps.metadata.outputs.upstream_name }}
           TERMUX_TAG: ${{ steps.metadata.outputs.termux_tag }}
           UPSTREAM_PRERELEASE: ${{ steps.metadata.outputs.upstream_prerelease }}
           UPSTREAM_HTML_URL: ${{ steps.metadata.outputs.upstream_html_url }}
           RELEASE_TRAIN: ${{ steps.metadata.outputs.release_train }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
         run: |
           set -euo pipefail
           body_path="${RUNNER_TEMP}/release-body.md"
@@ -222,14 +296,16 @@ jobs:
             echo "This release promotes the exact Android artifact built by the PR check."
           } > "${body_path}"
 
-          git tag "${TERMUX_TAG}" "${GITHUB_SHA}"
-          git push origin "${TERMUX_TAG}"
+          release_title="${UPSTREAM_NAME}"
+          if [[ -z "${release_title}" || "${release_title}" == "null" ]]; then
+            release_title="${TERMUX_TAG}"
+          fi
 
           release_args=(
             gh release create "${TERMUX_TAG}"
             --repo "${GITHUB_REPOSITORY}"
-            --target "${GITHUB_SHA}"
-            --title "${TERMUX_TAG}"
+            --target "${RELEASE_SHA}"
+            --title "${release_title}"
             --notes-file "${body_path}"
           )
           if [[ "${UPSTREAM_PRERELEASE}" == "true" ]]; then
