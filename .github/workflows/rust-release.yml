@@ -99,6 +99,12 @@ jobs:
       matrix: ${{ steps.select.outputs.matrix }}
       build_version: ${{ steps.select.outputs.build_version }}
     steps:
+      - uses: actions/checkout@v6
+      - name: 🧰 Actions Toolbox
+        # This is required for the GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
       - id: select
         shell: bash
         env:
