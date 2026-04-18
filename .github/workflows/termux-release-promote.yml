@@ -31,21 +31,30 @@ jobs:
       actions: read
       contents: write
       pull-requests: read
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Checkout release branch
         uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: 🧰 Actions Toolbox
         # This is required for the GitHub CLI
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         uses: wallentx/gh-actions/composite/actions-toolbox@main
 
       - name: Read release metadata
         id: metadata
         shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           metadata=".github/termux-release.json"
@@ -84,6 +93,8 @@ jobs:
         if: steps.metadata.outputs.promote == 'true'
         id: pr
         shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           prs="$(
@@ -129,6 +140,7 @@ jobs:
         if: steps.metadata.outputs.promote == 'true'
         shell: bash
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_ARTIFACT_NAME: ${{ steps.pr.outputs.artifact_name }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
@@ -188,6 +200,7 @@ jobs:
         if: steps.metadata.outputs.promote == 'true'
         shell: bash
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           UPSTREAM_TAG: ${{ steps.metadata.outputs.upstream_tag }}
           TERMUX_TAG: ${{ steps.metadata.outputs.termux_tag }}
           UPSTREAM_PRERELEASE: ${{ steps.metadata.outputs.upstream_prerelease }}

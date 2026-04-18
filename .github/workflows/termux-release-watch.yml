@@ -42,24 +42,33 @@ jobs:
       contents: write
       pull-requests: write
     env:
-      GH_TOKEN: ${{ github.token }}
       REVIEWER: ${{ inputs.reviewer || 'wallentx' }}
       UPSTREAM_REPO: openai/codex
       PATCH_BRANCH: wallentx/termux-target
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Checkout automation branch
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: 🧰 Actions Toolbox
         # This is required for the GitHub CLI
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         uses: wallentx/gh-actions/composite/actions-toolbox@main
 
       - name: Configure git
         shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -72,6 +81,7 @@ jobs:
         id: upstream
         shell: bash
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
         run: |
           set -euo pipefail
@@ -150,6 +160,7 @@ jobs:
         id: pr
         shell: bash
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
           UPSTREAM_NAME: ${{ steps.upstream.outputs.upstream_name }}
           UPSTREAM_HTML_URL: ${{ steps.upstream.outputs.upstream_html_url }}
