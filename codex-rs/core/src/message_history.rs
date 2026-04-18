@@ -38,6 +38,8 @@ use crate::config::Config;
 use codex_config::types::HistoryPersistence;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_file_lock::TryFileLockOutcome;
+use codex_utils_file_lock::TryLockDirOutcome;
+use codex_utils_file_lock::try_acquire_sibling_lock_dir;
 use codex_utils_file_lock::try_lock_exclusive_optional;
 use codex_utils_file_lock::try_lock_shared_optional;
 
@@ -138,7 +140,7 @@ pub async fn append_entry(text: &str, conversation_id: &ThreadId, config: &Confi
         // Retry a few times to avoid indefinite blocking when contended.
         for _ in 0..MAX_RETRIES {
             match try_lock_exclusive_optional(&history_file)? {
-                TryFileLockOutcome::Acquired | TryFileLockOutcome::Unsupported => {
+                TryFileLockOutcome::Acquired => {
                     // While holding the exclusive lock, write the full line.
                     // We do not open the file with `append(true)` on Windows, so ensure the
                     // cursor is positioned at the end before writing.
@@ -148,6 +150,16 @@ pub async fn append_entry(text: &str, conversation_id: &ThreadId, config: &Confi
                     enforce_history_limit(&mut history_file, history_max_bytes)?;
                     return Ok(());
                 }
+                TryFileLockOutcome::Unsupported => match try_acquire_sibling_lock_dir(&path)? {
+                    TryLockDirOutcome::Acquired(_guard) => {
+                        history_file.seek(SeekFrom::End(0))?;
+                        history_file.write_all(line.as_bytes())?;
+                        history_file.flush()?;
+                        enforce_history_limit(&mut history_file, history_max_bytes)?;
+                        return Ok(());
+                    }
+                    TryLockDirOutcome::WouldBlock => std::thread::sleep(RETRY_SLEEP),
+                },
                 TryFileLockOutcome::WouldBlock => std::thread::sleep(RETRY_SLEEP),
             }
         }
@@ -328,9 +340,6 @@ async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
 }
 
 fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<HistoryEntry> {
-    use std::io::BufRead;
-    use std::io::BufReader;
-
     let file: File = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -357,29 +366,17 @@ fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<Histo
     // Retry a few times to avoid indefinite blocking.
     for _ in 0..MAX_RETRIES {
         match try_lock_shared_optional(&file) {
-            Ok(TryFileLockOutcome::Acquired | TryFileLockOutcome::Unsupported) => {
-                let reader = BufReader::new(&file);
-                for (idx, line_res) in reader.lines().enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to read line from history file");
-                            return None;
-                        }
-                    };
-                    if idx == offset {
-                        match serde_json::from_str::<HistoryEntry>(&line) {
-                            Ok(entry) => return Some(entry),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to parse history entry");
-                                return None;
-                            }
-                        }
-                    }
+            Ok(TryFileLockOutcome::Acquired) => return read_history_entry_from_file(&file, offset),
+            Ok(TryFileLockOutcome::Unsupported) => match try_acquire_sibling_lock_dir(path) {
+                Ok(TryLockDirOutcome::Acquired(_guard)) => {
+                    return read_history_entry_from_file(&file, offset);
                 }
-                // Not found at requested offset.
-                return None;
-            }
+                Ok(TryLockDirOutcome::WouldBlock) => std::thread::sleep(RETRY_SLEEP),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to lock history file");
+                    return None;
+                }
+            },
             Ok(TryFileLockOutcome::WouldBlock) => {
                 std::thread::sleep(RETRY_SLEEP);
             }
@@ -387,6 +384,30 @@ fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<Histo
                 tracing::warn!(error = %e, "failed to acquire shared lock on history file");
                 return None;
             }
+        }
+    }
+
+    None
+}
+
+fn read_history_entry_from_file(file: &File, offset: usize) -> Option<HistoryEntry> {
+    let reader = BufReader::new(file);
+    for (idx, line_res) in reader.lines().enumerate() {
+        let line = match line_res {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read line from history file");
+                return None;
+            }
+        };
+        if idx == offset {
+            return match serde_json::from_str::<HistoryEntry>(&line) {
+                Ok(entry) => Some(entry),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse history entry");
+                    None
+                }
+            };
         }
     }
 
