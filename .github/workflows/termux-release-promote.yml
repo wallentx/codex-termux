@@ -267,6 +267,10 @@ jobs:
           if [[ -f promoted/SHA256SUMS ]]; then
             (cd promoted && sha256sum -c SHA256SUMS)
           fi
+          if [[ ! -f promoted/codex-aarch64-linux-android.tar.gz ]]; then
+            echo "Expected promoted/codex-aarch64-linux-android.tar.gz in the downloaded artifact." >&2
+            exit 1
+          fi
 
       - name: Create mirrored Termux release
         if: steps.metadata.outputs.promote == 'true'
@@ -311,5 +315,5 @@ jobs:
           if [[ "${UPSTREAM_PRERELEASE}" == "true" ]]; then
             release_args+=(--prerelease)
           fi
-          release_args+=(promoted/*)
+          release_args+=("promoted/codex-aarch64-linux-android.tar.gz#codex-termux")
           "${release_args[@]}"
