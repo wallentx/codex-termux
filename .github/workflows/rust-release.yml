@@ -816,7 +816,7 @@ jobs:
 
           marker="<!-- termux-android-artifact -->"
           artifact_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts/${ARTIFACT_ID}"
-          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GH_WORKFLOW_URL:-https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}}"
           body_path="${RUNNER_TEMP}/termux-artifact-comment.md"
           {
             echo "${marker}"
@@ -852,6 +852,11 @@ jobs:
             gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body-file "${body_path}"
           fi
 
+          gh label create binary-ready \
+            --repo "${GITHUB_REPOSITORY}" \
+            --color 0e8a16 \
+            --description "Android binary is ready for testing" \
+            --force
           gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-label binary-ready
 
   shell-tool-mcp:

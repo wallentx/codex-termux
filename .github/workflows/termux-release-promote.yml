@@ -171,30 +171,15 @@ jobs:
             exit 0
           fi
 
-          prs="$(
-            gh api \
-              -H "Accept: application/vnd.github+json" \
-              "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/pulls"
-          )"
           pr_json="$(
-            jq -c --arg base "${RELEASE_BRANCH}" '
-              [.[] | select(.merged_at != null and .base.ref == $base)]
-              | sort_by(.number)
-              | reverse
-              | .[0] // empty
-            ' <<< "${prs}"
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${RELEASE_BRANCH}" \
+              --state merged \
+              --limit 100 \
+              --json number,headRefOid,headRefName,mergeCommit \
+              --jq "[.[] | select(.mergeCommit.oid == \"${RELEASE_SHA}\")] | sort_by(.number) | reverse | .[0] // empty"
           )"
-          if [[ -z "${pr_json}" ]]; then
-            pr_json="$(
-              gh pr list \
-                --repo "${GITHUB_REPOSITORY}" \
-                --base "${RELEASE_BRANCH}" \
-                --state merged \
-                --limit 100 \
-                --json number,headRefOid,headRefName,mergeCommit \
-                --jq "[.[] | select(.mergeCommit.oid == \"${RELEASE_SHA}\")] | sort_by(.number) | reverse | .[0] // empty"
-            )"
-          fi
           if [[ -z "${pr_json}" ]]; then
             echo "Unable to find merged PR for ${RELEASE_SHA} into ${RELEASE_BRANCH}" >&2
             exit 1
@@ -222,47 +207,38 @@ jobs:
           set -euo pipefail
           find_run_id() {
             local event="$1"
-            gh api \
-              --method GET \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/rust-release.yml/runs" \
-              -f event="${event}" \
-              -f status=success \
-              -f head_sha="${HEAD_SHA}" \
-              --jq '.workflow_runs | sort_by(.created_at) | reverse | .[0].id // empty'
-          }
-
-          find_artifact_id() {
-            local run_id="$1"
-            local artifact_name="$2"
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
-              --jq ".artifacts | map(select(.name == \"${artifact_name}\")) | .[0].id // empty"
+            gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow rust-release.yml \
+              --event "${event}" \
+              --status success \
+              --commit "${HEAD_SHA}" \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty'
           }
 
           artifact_name="${PR_ARTIFACT_NAME}"
           run_id="$(find_run_id pull_request)"
-          artifact_id=""
-          if [[ -n "${run_id}" ]]; then
-            artifact_id="$(find_artifact_id "${run_id}" "${artifact_name}")"
-          fi
-
-          if [[ -z "${artifact_id}" ]]; then
+          mkdir -p promoted
+          if [[ -n "${run_id}" ]] && gh run download "${run_id}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "${artifact_name}" \
+            --dir promoted; then
+            :
+          else
             artifact_name="aarch64-linux-android"
             run_id="$(find_run_id workflow_dispatch)"
-            if [[ -n "${run_id}" ]]; then
-              artifact_id="$(find_artifact_id "${run_id}" "${artifact_name}")"
+            if [[ -z "${run_id}" ]]; then
+              echo "No successful rust-release run found for ${HEAD_SHA}" >&2
+              exit 1
             fi
+            gh run download "${run_id}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name "${artifact_name}" \
+              --dir promoted
           fi
 
-          if [[ -z "${run_id}" || -z "${artifact_id}" ]]; then
-            echo "No successful rust-release artifact found for ${HEAD_SHA}" >&2
-            echo "Expected either pull_request artifact ${PR_ARTIFACT_NAME} or workflow_dispatch artifact aarch64-linux-android." >&2
-            exit 1
-          fi
-
-          mkdir -p promoted
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "${RUNNER_TEMP}/artifact.zip"
-          unzip -q "${RUNNER_TEMP}/artifact.zip" -d promoted
           ls -la promoted
           if [[ -f promoted/SHA256SUMS ]]; then
             (cd promoted && sha256sum -c SHA256SUMS)

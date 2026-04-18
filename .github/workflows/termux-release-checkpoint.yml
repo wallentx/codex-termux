@@ -29,6 +29,7 @@ jobs:
     if: ${{ !contains(github.event.head_commit.message, 'Seed Termux release automation') }}
     permissions:
       contents: write
+      issues: write
       pull-requests: write
     env:
       DESTINATION_BRANCH: wallentx/termux-target
@@ -77,12 +78,15 @@ jobs:
           dest_slug="${DESTINATION_BRANCH//\//_}"
           checkpoint_branch="checkpoint/${dest_slug}_from_${source_slug}_${short_sha}"
 
-          if gh pr list \
-            --repo "${GITHUB_REPOSITORY}" \
-            --head "${checkpoint_branch}" \
-            --state open \
-            --json number \
-            --jq 'length' | grep -qx '1'; then
+          existing_pr_number="$(
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --head "${checkpoint_branch}" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [[ -n "${existing_pr_number}" ]]; then
             echo "An open checkpoint PR already exists for ${checkpoint_branch}."
             exit 0
           fi
@@ -146,4 +150,6 @@ jobs:
               --body-file "${body_path}"
           )"
           gh pr edit "${pr_url}" --add-reviewer "${REVIEWER}" || true
-          gh pr edit "${pr_url}" --add-label "checkpoint" --add-label "termux-release" || true
+          gh label create checkpoint --color c5def5 --description "Checkpoint merge" --force
+          gh label create termux-release --color 0e8a16 --description "Termux release automation" --force
+          gh pr edit "${pr_url}" --add-label "checkpoint" --add-label "termux-release"
