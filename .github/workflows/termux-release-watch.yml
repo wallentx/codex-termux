@@ -126,7 +126,7 @@ jobs:
           version="${upstream_tag#rust-v}"
           release_train="${version%%-*}"
           release_branch="release/${release_train}"
-          work_branch="release-work/${release_train}/${upstream_tag}"
+          work_branch="upstream/${upstream_tag}"
           termux_tag="${upstream_tag}-termux"
 
           if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
@@ -174,6 +174,20 @@ jobs:
           UPSTREAM_BODY: ${{ steps.upstream.outputs.body }}
         run: |
           set -euo pipefail
+          workflow_seed_dir="${RUNNER_TEMP}/termux-release-workflows"
+          mkdir -p "${workflow_seed_dir}"
+          cp .github/workflows/rust-release.yml "${workflow_seed_dir}/rust-release.yml"
+          cp .github/workflows/shell-tool-mcp.yml "${workflow_seed_dir}/shell-tool-mcp.yml"
+          cp .github/workflows/termux-release-checkpoint.yml "${workflow_seed_dir}/termux-release-checkpoint.yml"
+          cp .github/workflows/termux-release-promote.yml "${workflow_seed_dir}/termux-release-promote.yml"
+
+          seed_release_workflows() {
+            mkdir -p .github/workflows
+            cp "${workflow_seed_dir}/rust-release.yml" .github/workflows/rust-release.yml
+            cp "${workflow_seed_dir}/shell-tool-mcp.yml" .github/workflows/shell-tool-mcp.yml
+            cp "${workflow_seed_dir}/termux-release-checkpoint.yml" .github/workflows/termux-release-checkpoint.yml
+            cp "${workflow_seed_dir}/termux-release-promote.yml" .github/workflows/termux-release-promote.yml
+          }
 
           if gh pr list \
             --repo "${GITHUB_REPOSITORY}" \
@@ -192,11 +206,21 @@ jobs:
 
           if [[ "${release_branch_exists}" == false ]]; then
             git checkout -B "${RELEASE_BRANCH}" "refs/tags/${UPSTREAM_TAG}"
+            seed_release_workflows
+            git add \
+              .github/workflows/rust-release.yml \
+              .github/workflows/shell-tool-mcp.yml \
+              .github/workflows/termux-release-checkpoint.yml \
+              .github/workflows/termux-release-promote.yml
+            if ! git diff --cached --quiet; then
+              git commit -m "Seed Termux release automation"
+            fi
             git push origin "${RELEASE_BRANCH}"
           fi
 
           git fetch origin "${RELEASE_BRANCH}"
           git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
+          seed_release_workflows
 
           if [[ "${release_branch_exists}" == false ]]; then
             git diff --binary "origin/main...origin/${PATCH_BRANCH}" > "${RUNNER_TEMP}/termux.patch"
@@ -206,6 +230,7 @@ jobs:
           else
             git merge --no-ff --no-edit "refs/tags/${UPSTREAM_TAG}"
           fi
+          seed_release_workflows
 
           mkdir -p .github
           jq -n \
