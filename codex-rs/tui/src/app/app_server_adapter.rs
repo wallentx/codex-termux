@@ -380,6 +380,9 @@ fn server_notification_thread_target(
         ServerNotification::FileChangeOutputDelta(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::FileChangePatchUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ServerRequestResolved(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -782,6 +785,7 @@ fn append_terminal_turn_events(events: &mut Vec<Event>, turn: &Turn, include_fai
                 last_agent_message: None,
                 completed_at: turn.completed_at,
                 duration_ms: turn.duration_ms,
+                time_to_first_token_ms: None,
             }),
         }),
         TurnStatus::Interrupted => events.push(Event {
@@ -813,6 +817,7 @@ fn append_terminal_turn_events(events: &mut Vec<Event>, turn: &Turn, include_fai
                     last_agent_message: None,
                     completed_at: turn.completed_at,
                     duration_ms: turn.duration_ms,
+                    time_to_first_token_ms: None,
                 }),
             });
         }

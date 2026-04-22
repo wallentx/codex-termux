@@ -132,8 +132,8 @@ pub enum Feature {
     Sqlite,
     /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
-    /// Enable the Telepathy sidecar for passive screen-context memories.
-    Telepathy,
+    /// Enable the Chronicle sidecar for passive screen-context memories.
+    Chronicle,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
@@ -156,6 +156,8 @@ pub enum Feature {
     ToolSuggest,
     /// Enable plugins.
     Plugins,
+    /// Temporary internal-only flag for PS-backed remote plugin catalog development.
+    RemotePlugin,
     /// Show the startup prompt for migrating external agent config into Codex.
     ExternalMigration,
     /// Allow the model to invoke the built-in image generation tool.
@@ -193,12 +195,12 @@ pub enum Feature {
     TuiAppServer,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
+    /// Enable workspace-specific owner nudge copy and prompts in the TUI.
+    WorkspaceOwnerUsageNudge,
     /// Legacy rollout flag for Responses API WebSocket transport experiments.
     ResponsesWebsockets,
     /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
     ResponsesWebsocketsV2,
-    /// Use the agent identity registration flow for ChatGPT-authenticated sessions.
-    UseAgentIdentity,
     /// Enable workspace dependency support.
     WorkspaceDependencies,
 }
@@ -709,8 +711,8 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::Telepathy,
-        key: "telepathy",
+        id: Feature::Chronicle,
+        key: "chronicle",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -847,6 +849,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::RemotePlugin,
+        key: "remote_plugin",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ExternalMigration,
         key: "external_migration",
         stage: Stage::Experimental {
@@ -969,6 +977,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::WorkspaceOwnerUsageNudge,
+        key: "workspace_owner_usage_nudge",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ResponsesWebsockets,
         key: "responses_websockets",
         stage: Stage::Removed,
@@ -978,12 +992,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::ResponsesWebsocketsV2,
         key: "responses_websockets_v2",
         stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::UseAgentIdentity,
-        key: "use_agent_identity",
-        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {

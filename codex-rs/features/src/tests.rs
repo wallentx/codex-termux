@@ -226,12 +226,6 @@ fn remote_control_is_under_development() {
 }
 
 #[test]
-fn use_agent_identity_is_under_development() {
-    assert_eq!(Feature::UseAgentIdentity.stage(), Stage::UnderDevelopment);
-    assert_eq!(Feature::UseAgentIdentity.default_enabled(), false);
-}
-
-#[test]
 fn workspace_dependencies_is_stable_and_enabled_by_default() {
     assert_eq!(Feature::WorkspaceDependencies.stage(), Stage::Stable);
     assert_eq!(Feature::WorkspaceDependencies.default_enabled(), true);
@@ -239,6 +233,14 @@ fn workspace_dependencies_is_stable_and_enabled_by_default() {
         feature_for_key("workspace_dependencies"),
         Some(Feature::WorkspaceDependencies)
     );
+}
+
+#[test]
+fn telepathy_is_legacy_alias_for_chronicle() {
+    assert_eq!(Feature::Chronicle.stage(), Stage::UnderDevelopment);
+    assert_eq!(Feature::Chronicle.default_enabled(), false);
+    assert_eq!(feature_for_key("chronicle"), Some(Feature::Chronicle));
+    assert_eq!(feature_for_key("telepathy"), Some(Feature::Chronicle));
 }
 
 #[test]

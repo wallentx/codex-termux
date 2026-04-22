@@ -344,6 +344,9 @@
             "child_agents_md": {
               "type": "boolean"
             },
+            "chronicle": {
+              "type": "boolean"
+            },
             "code_mode": {
               "type": "boolean"
             },
@@ -449,6 +452,9 @@
             "remote_models": {
               "type": "boolean"
             },
+            "remote_plugin": {
+              "type": "boolean"
+            },
             "request_permissions": {
               "type": "boolean"
             },
@@ -518,9 +524,6 @@
             "unified_exec": {
               "type": "boolean"
             },
-            "use_agent_identity": {
-              "type": "boolean"
-            },
             "use_legacy_landlock": {
               "type": "boolean"
             },
@@ -537,6 +540,9 @@
               "type": "boolean"
             },
             "workspace_dependencies": {
+              "type": "boolean"
+            },
+            "workspace_owner_usage_nudge": {
               "type": "boolean"
             }
           },
@@ -876,6 +882,28 @@
       ],
       "type": "string"
     },
+    "McpServerEnvVar": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "McpServerToolConfig": {
       "additionalProperties": false,
       "description": "Per-tool approval settings for a single MCP server tool.",
@@ -999,6 +1027,21 @@
       ],
       "type": "object"
     },
+    "ModelProviderAwsAuthInfo": {
+      "additionalProperties": false,
+      "description": "AWS SigV4 auth configuration for a model provider.",
+      "properties": {
+        "profile": {
+          "description": "AWS profile name to use. When unset, the AWS SDK default chain decides.",
+          "type": "string"
+        },
+        "region": {
+          "description": "AWS region to use for provider-specific endpoints.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "ModelProviderInfo": {
       "additionalProperties": false,
       "description": "Serializable representation of a provider definition.",
@@ -1010,6 +1053,14 @@
             }
           ],
           "description": "Command-backed bearer-token configuration for this provider."
+        },
+        "aws": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelProviderAwsAuthInfo"
+            }
+          ],
+          "description": "AWS SigV4 auth configuration for this provider."
         },
         "base_url": {
           "description": "Base URL for the provider's OpenAI-compatible API.",
@@ -1042,6 +1093,7 @@
           "type": "object"
         },
         "name": {
+          "default": "",
           "description": "Friendly display name.",
           "type": "string"
         },
@@ -1096,9 +1148,6 @@
           "description": "Which wire protocol this provider expects."
         }
       },
-      "required": [
-        "name"
-      ],
       "type": "object"
     },
     "MultiAgentV2ConfigToml": {
@@ -1570,7 +1619,7 @@
         "env_vars": {
           "default": null,
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/McpServerEnvVar"
           },
           "type": "array"
         },
@@ -1880,6 +1929,10 @@
             "$ref": "#/definitions/SkillConfig"
           },
           "type": "array"
+        },
+        "include_instructions": {
+          "description": "Whether turns receive the automatic skills instructions block.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -2267,6 +2320,10 @@
       "description": "Experimental / do not use. Replaces the synthesized realtime startup context appended to websocket session instructions. An empty string disables startup context injection entirely.",
       "type": "string"
     },
+    "experimental_thread_store_endpoint": {
+      "description": "Experimental / do not use. When set, app-server uses a remote thread store at this endpoint instead of the local filesystem/SQLite store.",
+      "type": "string"
+    },
     "experimental_use_freeform_apply_patch": {
       "type": "boolean"
     },
@@ -2288,6 +2345,9 @@
           "type": "boolean"
         },
         "child_agents_md": {
+          "type": "boolean"
+        },
+        "chronicle": {
           "type": "boolean"
         },
         "code_mode": {
@@ -2395,6 +2455,9 @@
         "remote_models": {
           "type": "boolean"
         },
+        "remote_plugin": {
+          "type": "boolean"
+        },
         "request_permissions": {
           "type": "boolean"
         },
@@ -2464,9 +2527,6 @@
         "unified_exec": {
           "type": "boolean"
         },
-        "use_agent_identity": {
-          "type": "boolean"
-        },
         "use_legacy_landlock": {
           "type": "boolean"
         },
@@ -2483,6 +2543,9 @@
           "type": "boolean"
         },
         "workspace_dependencies": {
+          "type": "boolean"
+        },
+        "workspace_owner_usage_nudge": {
           "type": "boolean"
         }
       },
