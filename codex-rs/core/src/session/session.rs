@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::ConstraintError;
 use tokio::sync::Semaphore;
 
 /// Context for an initialized model agent
@@ -139,13 +140,6 @@ impl SessionConfiguration {
         if let Some(approvals_reviewer) = updates.approvals_reviewer {
             next_configuration.approvals_reviewer = approvals_reviewer;
         }
-        let mut sandbox_policy_changed = false;
-        if let Some(sandbox_policy) = updates.sandbox_policy.clone() {
-            next_configuration.sandbox_policy.set(sandbox_policy)?;
-            next_configuration.network_sandbox_policy =
-                NetworkSandboxPolicy::from(next_configuration.sandbox_policy.get());
-            sandbox_policy_changed = true;
-        }
         if let Some(windows_sandbox_level) = updates.windows_sandbox_level {
             next_configuration.windows_sandbox_level = windows_sandbox_level;
         }
@@ -166,13 +160,53 @@ impl SessionConfiguration {
 
         let cwd_changed = absolute_cwd.as_path() != self.cwd.as_path();
         next_configuration.cwd = absolute_cwd;
-        if sandbox_policy_changed {
+
+        if let Some(permission_profile) = updates.permission_profile.clone() {
+            let sandbox_policy = permission_profile
+                .to_legacy_sandbox_policy(&next_configuration.cwd)
+                .map_err(|err| ConstraintError::InvalidValue {
+                    field_name: "permission_profile",
+                    candidate: format!("{permission_profile:?}"),
+                    allowed: format!(
+                        "permission profiles that can be represented by the active sandbox constraints: {err}"
+                    ),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                })?;
+            next_configuration.sandbox_policy.set(sandbox_policy)?;
+            let (mut file_system_sandbox_policy, network_sandbox_policy) =
+                permission_profile.to_runtime_permissions();
+            if file_system_sandbox_policy.glob_scan_max_depth.is_none() {
+                file_system_sandbox_policy.glob_scan_max_depth =
+                    self.file_system_sandbox_policy.glob_scan_max_depth;
+            }
+            for deny_entry in self
+                .file_system_sandbox_policy
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.access == codex_protocol::permissions::FileSystemAccessMode::None
+                })
+            {
+                if !file_system_sandbox_policy
+                    .entries
+                    .iter()
+                    .any(|entry| entry == deny_entry)
+                {
+                    file_system_sandbox_policy.entries.push(deny_entry.clone());
+                }
+            }
+            next_configuration.file_system_sandbox_policy = file_system_sandbox_policy;
+            next_configuration.network_sandbox_policy = network_sandbox_policy;
+        } else if let Some(sandbox_policy) = updates.sandbox_policy.clone() {
+            next_configuration.sandbox_policy.set(sandbox_policy)?;
             next_configuration.file_system_sandbox_policy =
                 FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
                     next_configuration.sandbox_policy.get(),
                     &next_configuration.cwd,
                     &self.file_system_sandbox_policy,
                 );
+            next_configuration.network_sandbox_policy =
+                NetworkSandboxPolicy::from(next_configuration.sandbox_policy.get());
         } else if cwd_changed && file_system_policy_matches_legacy {
             // Preserve richer split policies across cwd-only updates; only
             // rederive when the session is already using the legacy bridge.
@@ -198,6 +232,7 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) approval_policy: Option<AskForApproval>,
     pub(crate) approvals_reviewer: Option<ApprovalsReviewer>,
     pub(crate) sandbox_policy: Option<SandboxPolicy>,
+    pub(crate) permission_profile: Option<PermissionProfile>,
     pub(crate) windows_sandbox_level: Option<WindowsSandboxLevel>,
     pub(crate) collaboration_mode: Option<CollaborationMode>,
     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
@@ -237,6 +272,7 @@ impl Session {
         agent_control: AgentControl,
         environment_manager: Arc<EnvironmentManager>,
         analytics_events_client: Option<AnalyticsEventsClient>,
+        inherited_rollout_trace: RolloutTraceRecorder,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -373,6 +409,38 @@ impl Session {
         let rollout_path = rollout_recorder
             .as_ref()
             .map(|rec| rec.rollout_path().to_path_buf());
+        let trace_agent_path = session_configuration
+            .session_source
+            .get_agent_path()
+            .unwrap_or_else(codex_protocol::AgentPath::root);
+        let trace_task_name =
+            (!trace_agent_path.is_root()).then(|| trace_agent_path.name().to_string());
+        let trace_metadata = ThreadStartedTraceMetadata {
+            thread_id: conversation_id.to_string(),
+            agent_path: trace_agent_path.to_string(),
+            task_name: trace_task_name,
+            nickname: session_configuration.session_source.get_nickname(),
+            agent_role: session_configuration.session_source.get_agent_role(),
+            session_source: session_configuration.session_source.clone(),
+            cwd: session_configuration.cwd.to_path_buf(),
+            rollout_path: rollout_path.clone(),
+            model: session_configuration.collaboration_mode.model().to_string(),
+            provider_name: config.model_provider_id.clone(),
+            approval_policy: session_configuration.approval_policy.value().to_string(),
+            sandbox_policy: format!("{:?}", session_configuration.sandbox_policy.get()),
+        };
+        let rollout_trace = if matches!(
+            session_configuration.session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) {
+            // Spawned child threads are part of their root rollout tree. If
+            // the parent had no trace recorder, do not create an orphan child
+            // bundle that looks like an independent rollout.
+            inherited_rollout_trace
+        } else {
+            RolloutTraceRecorder::create_root_or_disabled(conversation_id)
+        };
+        rollout_trace.record_thread_started(trace_metadata);
 
         let mut post_session_configured_events = Vec::<Event>::new();
 
@@ -652,6 +720,7 @@ impl Session {
             analytics_events_client,
             hooks,
             rollout: Mutex::new(rollout_recorder),
+            rollout_trace,
             user_shell: Arc::new(default_shell),
             shell_snapshot_tx,
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
@@ -661,6 +730,8 @@ impl Session {
             models_manager: Arc::clone(&models_manager),
             tool_approvals: Mutex::new(ApprovalStore::default()),
             guardian_rejections: Mutex::new(HashMap::new()),
+            guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
+            runtime_handle: tokio::runtime::Handle::current(),
             skills_manager,
             plugins_manager: Arc::clone(&plugins_manager),
             mcp_manager: Arc::clone(&mcp_manager),
