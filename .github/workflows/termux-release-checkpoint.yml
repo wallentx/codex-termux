@@ -4,6 +4,28 @@ on:
   push:
     branches:
       - "release/**"
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Release branch to checkpoint from, for example release/0.123.0"
+        required: false
+        type: string
+        default: ""
+      source_sha:
+        description: "Specific source commit SHA to checkpoint; defaults to the source branch tip"
+        required: false
+        type: string
+        default: ""
+      destination_branch:
+        description: "Destination patch branch to receive the checkpoint PR"
+        required: false
+        type: string
+        default: "wallentx/termux-target"
+      reviewer:
+        description: "GitHub username to request as reviewer"
+        required: false
+        type: string
+        default: "wallentx"
 
 permissions:
   actions: read
@@ -20,21 +42,23 @@ permissions:
   statuses: read
 
 concurrency:
-  group: termux-release-checkpoint-${{ github.ref_name }}
+  group: termux-release-checkpoint-${{ inputs.source_branch || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   checkpoint:
     runs-on: ubuntu-24.04
-    if: ${{ !contains(github.event.head_commit.message, 'Seed Termux release automation') }}
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, 'Seed Termux release automation') }}
     permissions:
       contents: write
       issues: write
       pull-requests: write
     env:
       GH_REPO: ${{ github.repository }}
-      DESTINATION_BRANCH: wallentx/termux-target
-      REVIEWER: wallentx
+      DESTINATION_BRANCH: ${{ inputs.destination_branch || 'wallentx/termux-target' }}
+      REVIEWER: ${{ inputs.reviewer || 'wallentx' }}
+      REQUESTED_SOURCE_BRANCH: ${{ inputs.source_branch }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -47,6 +71,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_branch || github.ref_name }}
           token: ${{ steps.app-token.outputs.token }}
 
       - name: 🧰 Actions Toolbox
@@ -63,19 +88,28 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch --prune origin "${DESTINATION_BRANCH}" "${GITHUB_REF_NAME}"
+          source_branch="${REQUESTED_SOURCE_BRANCH:-${GITHUB_REF_NAME}}"
+          git fetch --prune origin "${DESTINATION_BRANCH}" "${source_branch}"
 
       - name: Create checkpoint PR
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          SOURCE_BRANCH: ${{ github.ref_name }}
-          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          short_sha="${SOURCE_SHA:0:12}"
-          source_slug="${SOURCE_BRANCH//\//_}"
+          source_branch="${REQUESTED_SOURCE_BRANCH:-${GITHUB_REF_NAME}}"
+          source_sha="${REQUESTED_SOURCE_SHA}"
+          if [[ -z "${source_sha}" ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" == "push" && "${source_branch}" == "${GITHUB_REF_NAME}" ]]; then
+              source_sha="${GITHUB_SHA}"
+            else
+              source_sha="$(git rev-parse "origin/${source_branch}")"
+            fi
+          fi
+
+          short_sha="${source_sha:0:12}"
+          source_slug="${source_branch//\//_}"
           dest_slug="${DESTINATION_BRANCH//\//_}"
           checkpoint_branch="checkpoint/${dest_slug}_from_${source_slug}_${short_sha}"
           merge_conflicted=false
@@ -96,7 +130,7 @@ jobs:
 
           git checkout -B "${checkpoint_branch}" "origin/${DESTINATION_BRANCH}"
 
-          if ! git merge --no-ff --no-edit "${SOURCE_SHA}"; then
+          if ! git merge --no-ff --no-edit "${source_sha}"; then
             merge_conflicted=true
             conflict_summary="$(
               git diff --name-only --diff-filter=U | sed 's/^/- `&`/'
@@ -105,7 +139,7 @@ jobs:
             if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
               git merge --abort
             fi
-            git checkout -B "${checkpoint_branch}" "${SOURCE_SHA}"
+            git checkout -B "${checkpoint_branch}" "${source_sha}"
           fi
 
           if git cat-file -e "origin/${DESTINATION_BRANCH}:.github" 2>/dev/null; then
@@ -123,7 +157,7 @@ jobs:
           if ! git diff --quiet || ! git diff --cached --quiet; then
             git add -A .github
             if [[ "${merge_conflicted}" == "true" ]]; then
-              git commit -m "checkpoint: prepare ${SOURCE_BRANCH} for ${DESTINATION_BRANCH}"
+              git commit -m "checkpoint: prepare ${source_branch} for ${DESTINATION_BRANCH}"
             else
               git commit --amend --no-edit
             fi
@@ -137,15 +171,15 @@ jobs:
           git push --force-with-lease origin "${checkpoint_branch}"
 
           remaining="$(
-            git log --first-parent --pretty=format:%H "${SOURCE_SHA}..origin/${SOURCE_BRANCH}" | wc -w
+            git log --first-parent --pretty=format:%H "${source_sha}..origin/${source_branch}" | wc -w
           )"
 
           body_path="${RUNNER_TEMP}/termux-checkpoint-pr.md"
           {
             echo "## Termux release checkpoint"
             echo
-            echo "- Source branch: \`${SOURCE_BRANCH}\`"
-            echo "- Source hash: \`${SOURCE_SHA}\`"
+            echo "- Source branch: \`${source_branch}\`"
+            echo "- Source hash: \`${source_sha}\`"
             echo "- Destination branch: \`${DESTINATION_BRANCH}\`"
             echo "- Remaining first-parent commits on source: ${remaining}"
             echo
@@ -172,7 +206,7 @@ jobs:
               --repo "${GITHUB_REPOSITORY}" \
               --base "${DESTINATION_BRANCH}" \
               --head "${checkpoint_branch}" \
-              --title "checkpoint: into ${DESTINATION_BRANCH} from ${SOURCE_BRANCH} @ ${short_sha}" \
+              --title "checkpoint: into ${DESTINATION_BRANCH} from ${source_branch} @ ${short_sha}" \
               --body-file "${body_path}"
           )"
           gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-reviewer "${REVIEWER}" || true
