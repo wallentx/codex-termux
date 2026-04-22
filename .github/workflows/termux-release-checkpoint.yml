@@ -1,0 +1,155 @@
+name: termux-release-checkpoint
+
+on:
+  push:
+    branches:
+      - "release/**"
+
+permissions:
+  actions: read
+  attestations: read
+  checks: read
+  contents: read
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  statuses: read
+
+concurrency:
+  group: termux-release-checkpoint-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  checkpoint:
+    runs-on: ubuntu-24.04
+    if: ${{ !contains(github.event.head_commit.message, 'Seed Termux release automation') }}
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    env:
+      DESTINATION_BRANCH: wallentx/termux-target
+      REVIEWER: wallentx
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout release branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: 🧰 Actions Toolbox
+        # This is required for the GitHub CLI
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Configure git
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --prune origin "${DESTINATION_BRANCH}" "${GITHUB_REF_NAME}"
+
+      - name: Create checkpoint PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          short_sha="${SOURCE_SHA:0:12}"
+          source_slug="${SOURCE_BRANCH//\//_}"
+          dest_slug="${DESTINATION_BRANCH//\//_}"
+          checkpoint_branch="checkpoint/${dest_slug}_from_${source_slug}_${short_sha}"
+
+          existing_pr_number="$(
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --head "${checkpoint_branch}" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [[ -n "${existing_pr_number}" ]]; then
+            echo "An open checkpoint PR already exists for ${checkpoint_branch}."
+            exit 0
+          fi
+
+          git checkout -B "${checkpoint_branch}" "origin/${DESTINATION_BRANCH}"
+
+          if ! git merge --no-ff --no-edit "${SOURCE_SHA}"; then
+            echo "Automatic checkpoint merge failed." >&2
+            echo "Resolve manually by merging ${SOURCE_SHA} from ${SOURCE_BRANCH} into ${DESTINATION_BRANCH}." >&2
+            exit 1
+          fi
+
+          if git cat-file -e "origin/${DESTINATION_BRANCH}:.github" 2>/dev/null; then
+            git restore --source="origin/${DESTINATION_BRANCH}" --staged --worktree -- .github
+            mapfile -t added_github_paths < <(
+              git diff --name-only --diff-filter=A "origin/${DESTINATION_BRANCH}" -- .github
+            )
+            if ((${#added_github_paths[@]})); then
+              git rm -f -- "${added_github_paths[@]}"
+            fi
+          else
+            git rm -r --ignore-unmatch .github
+          fi
+
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            git add -A .github
+            git commit --amend --no-edit
+          fi
+
+          if git diff --quiet "origin/${DESTINATION_BRANCH}" HEAD; then
+            echo "Checkpoint merge produced no destination changes after release-only files were restored."
+            exit 0
+          fi
+
+          git push --force-with-lease origin "${checkpoint_branch}"
+
+          remaining="$(
+            git log --first-parent --pretty=format:%H "${SOURCE_SHA}..origin/${SOURCE_BRANCH}" | wc -w
+          )"
+
+          body_path="${RUNNER_TEMP}/termux-checkpoint-pr.md"
+          {
+            echo "## Termux release checkpoint"
+            echo
+            echo "- Source branch: \`${SOURCE_BRANCH}\`"
+            echo "- Source hash: \`${SOURCE_SHA}\`"
+            echo "- Destination branch: \`${DESTINATION_BRANCH}\`"
+            echo "- Remaining first-parent commits on source: ${remaining}"
+            echo
+            echo "This PR carries release-train conflict fixes and follow-up changes back into the reusable Termux patch branch."
+            echo
+            echo "Release-only workflow files and metadata under \`.github\` were restored to the destination branch versions before opening this PR."
+          } > "${body_path}"
+
+          pr_url="$(
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${DESTINATION_BRANCH}" \
+              --head "${checkpoint_branch}" \
+              --title "checkpoint: into ${DESTINATION_BRANCH} from ${SOURCE_BRANCH} @ ${short_sha}" \
+              --body-file "${body_path}"
+          )"
+          gh pr edit "${pr_url}" --add-reviewer "${REVIEWER}" || true
+          gh label create checkpoint --color c5def5 --description "Checkpoint merge" --force
+          gh label create termux-release --color 0e8a16 --description "Termux release automation" --force
+          gh pr edit "${pr_url}" --add-label "checkpoint" --add-label "termux-release"
