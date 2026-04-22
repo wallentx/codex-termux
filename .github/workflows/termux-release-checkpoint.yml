@@ -32,6 +32,7 @@ jobs:
       issues: write
       pull-requests: write
     env:
+      GH_REPO: ${{ github.repository }}
       DESTINATION_BRANCH: wallentx/termux-target
       REVIEWER: wallentx
     steps:
@@ -149,7 +150,7 @@ jobs:
               --title "checkpoint: into ${DESTINATION_BRANCH} from ${SOURCE_BRANCH} @ ${short_sha}" \
               --body-file "${body_path}"
           )"
-          gh pr edit "${pr_url}" --add-reviewer "${REVIEWER}" || true
-          gh label create checkpoint --color c5def5 --description "Checkpoint merge" --force
-          gh label create termux-release --color 0e8a16 --description "Termux release automation" --force
-          gh pr edit "${pr_url}" --add-label "checkpoint" --add-label "termux-release"
+          gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-reviewer "${REVIEWER}" || true
+          gh label create checkpoint --repo "${GITHUB_REPOSITORY}" --color c5def5 --description "Checkpoint merge" --force
+          gh label create termux-release --repo "${GITHUB_REPOSITORY}" --color 0e8a16 --description "Termux release automation" --force
+          gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-label "checkpoint" --add-label "termux-release"

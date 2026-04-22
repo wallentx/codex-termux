@@ -53,6 +53,7 @@ jobs:
     permissions:
       contents: read
     env:
+      GH_REPO: ${{ github.repository }}
       UPSTREAM_REPO: openai/codex
     steps:
       - name: Generate GitHub App token
@@ -221,6 +222,7 @@ jobs:
       issues: write
       pull-requests: write
     env:
+      GH_REPO: ${{ github.repository }}
       REVIEWER: ${{ inputs.reviewer || 'wallentx' }}
       UPSTREAM_REPO: openai/codex
       PATCH_BRANCH: wallentx/termux-target
@@ -418,8 +420,8 @@ jobs:
               --title "${pr_title}" \
               --body-file "${body_path}"
           )"
-          gh pr edit "${pr_url}" --add-reviewer "${REVIEWER}" || true
-          gh label create termux-release --color 0e8a16 --description "Termux release automation" --force
-          gh label create release-train --color 1d76db --description "Release train PR" --force
-          gh pr edit "${pr_url}" --add-label "termux-release" --add-label "release-train"
+          gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-reviewer "${REVIEWER}" || true
+          gh label create termux-release --repo "${GITHUB_REPOSITORY}" --color 0e8a16 --description "Termux release automation" --force
+          gh label create release-train --repo "${GITHUB_REPOSITORY}" --color 1d76db --description "Release train PR" --force
+          gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-label "termux-release" --add-label "release-train"
           echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"

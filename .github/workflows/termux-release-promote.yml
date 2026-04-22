@@ -52,6 +52,8 @@ jobs:
       actions: read
       contents: write
       pull-requests: read
+    env:
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Generate GitHub App token
         id: app-token
