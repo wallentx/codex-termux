@@ -12,14 +12,18 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+#[cfg(any(test, not(target_os = "android")))]
 use notify::Event;
+#[cfg(any(test, not(target_os = "android")))]
 use notify::EventKind;
 use notify::RecommendedWatcher;
 use notify::RecursiveMode;
 use notify::Watcher;
+#[cfg(any(test, not(target_os = "android")))]
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
+#[cfg(any(test, not(target_os = "android")))]
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
@@ -52,6 +56,7 @@ struct WatchState {
 
 struct SubscriberState {
     watched_paths: HashMap<SubscriberWatchKey, SubscriberWatchState>,
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     tx: WatchSender,
 }
 
@@ -133,6 +138,7 @@ impl Receiver {
 }
 
 impl WatchSender {
+    #[cfg(any(test, not(target_os = "android")))]
     async fn add_changed_paths(&self, paths: &[PathBuf]) {
         if paths.is_empty() {
             return;
@@ -333,6 +339,14 @@ pub struct FileWatcher {
 impl FileWatcher {
     /// Creates a live filesystem watcher and starts its background event loop
     /// on the current Tokio runtime.
+    #[cfg(target_os = "android")]
+    pub fn new() -> notify::Result<Self> {
+        Ok(Self::noop())
+    }
+
+    /// Creates a live filesystem watcher and starts its background event loop
+    /// on the current Tokio runtime.
+    #[cfg(not(target_os = "android"))]
     pub fn new() -> notify::Result<Self> {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         let raw_tx_clone = raw_tx;
@@ -563,7 +577,6 @@ impl FileWatcher {
         }
         guard.watched_paths.insert(path.to_path_buf(), next_mode);
     }
-
     fn apply_actual_watch_move<'a>(
         path_ref_counts: &mut HashMap<PathBuf, PathWatchCounts>,
         old_actual: WatchPath,
@@ -599,6 +612,7 @@ impl FileWatcher {
 
     // Bridge `notify`'s callback-based events into the Tokio runtime and
     // notify the matching subscribers.
+    #[cfg(any(test, not(target_os = "android")))]
     fn spawn_event_loop(&self, mut raw_rx: mpsc::UnboundedReceiver<notify::Result<Event>>) {
         if let Ok(handle) = Handle::try_current() {
             let state = Arc::clone(&self.state);
@@ -628,6 +642,7 @@ impl FileWatcher {
         }
     }
 
+    #[cfg(any(test, not(target_os = "android")))]
     async fn notify_subscribers(
         state: &RwLock<WatchState>,
         inner: Option<&Arc<Mutex<FileWatcherInner>>>,
@@ -715,6 +730,7 @@ impl FileWatcher {
     }
 }
 
+#[cfg(any(test, not(target_os = "android")))]
 fn is_mutating_event(event: &Event) -> bool {
     matches!(
         event.kind,
