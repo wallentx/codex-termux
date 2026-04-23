@@ -162,6 +162,20 @@ fn file_exists(path: &PathBuf) -> Option<PathBuf> {
     }
 }
 
+#[cfg(target_os = "android")]
+fn termux_bin_path(binary_name: &str) -> Option<PathBuf> {
+    let prefix = std::env::var_os("PREFIX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/usr"));
+    let path = prefix.join("bin").join(binary_name);
+    file_exists(&path)
+}
+
+#[cfg(not(target_os = "android"))]
+fn termux_bin_path(_binary_name: &str) -> Option<PathBuf> {
+    None
+}
+
 fn get_shell_path(
     shell_type: ShellType,
     provided_path: Option<&PathBuf>,
@@ -184,6 +198,10 @@ fn get_shell_path(
     }
 
     if let Ok(path) = which::which(binary_name) {
+        return Some(path);
+    }
+
+    if let Some(path) = termux_bin_path(binary_name) {
         return Some(path);
     }
 
@@ -221,7 +239,7 @@ fn get_bash_shell(path: Option<&PathBuf>) -> Option<Shell> {
     })
 }
 
-const SH_FALLBACK_PATHS: &[&str] = &["/bin/sh"];
+const SH_FALLBACK_PATHS: &[&str] = &["/system/bin/sh", "/bin/sh"];
 
 fn get_sh_shell(path: Option<&PathBuf>) -> Option<Shell> {
     let shell_path = get_shell_path(ShellType::Sh, path, "sh", SH_FALLBACK_PATHS);
@@ -287,7 +305,7 @@ fn ultimate_fallback_shell() -> Shell {
     } else {
         Shell {
             shell_type: ShellType::Sh,
-            shell_path: PathBuf::from("/bin/sh"),
+            shell_path: termux_bin_path("sh").unwrap_or_else(|| PathBuf::from("/bin/sh")),
             shell_snapshot: empty_shell_snapshot_receiver(),
         }
     }
