@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+use codex_utils_file_lock::TryFileLockOutcome;
+use codex_utils_file_lock::try_lock_exclusive_optional;
 use codex_utils_home_dir::find_codex_home;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -33,12 +35,12 @@ pub struct Arg0DispatchPaths {
 /// Keeps the per-session PATH entry alive and locked for the process lifetime.
 pub struct Arg0PathEntryGuard {
     _temp_dir: TempDir,
-    _lock_file: File,
+    _lock_file: Option<File>,
     paths: Arg0DispatchPaths,
 }
 
 impl Arg0PathEntryGuard {
-    fn new(temp_dir: TempDir, lock_file: File, paths: Arg0DispatchPaths) -> Self {
+    fn new(temp_dir: TempDir, lock_file: Option<File>, paths: Arg0DispatchPaths) -> Self {
         Self {
             _temp_dir: temp_dir,
             _lock_file: lock_file,
@@ -185,22 +187,39 @@ where
     // Regular invocation – create a Tokio runtime and execute the provided
     // async entry-point.
     let runtime = build_runtime()?;
-    runtime.block_on(async move {
-        let current_exe = std::env::current_exe().ok();
-        let paths = Arg0DispatchPaths {
-            codex_self_exe: current_exe.clone(),
-            codex_linux_sandbox_exe: if cfg!(target_os = "linux") {
-                linux_sandbox_exe_path(path_entry_guard.as_ref(), current_exe)
-            } else {
-                None
-            },
-            main_execve_wrapper_exe: path_entry_guard
-                .as_ref()
-                .and_then(|path_entry| path_entry.paths().main_execve_wrapper_exe.clone()),
-        };
+    runtime.block_on(run_main_with_arg0_guard(
+        path_entry_guard,
+        std::env::current_exe().ok(),
+        main_fn,
+    ))
+}
 
-        main_fn(paths).await
-    })
+async fn run_main_with_arg0_guard<F, Fut>(
+    path_entry_guard: Option<Arg0PathEntryGuard>,
+    current_exe: Option<PathBuf>,
+    main_fn: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(Arg0DispatchPaths) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let paths = Arg0DispatchPaths {
+        codex_self_exe: current_exe.clone(),
+        codex_linux_sandbox_exe: if cfg!(target_os = "linux") {
+            linux_sandbox_exe_path(path_entry_guard.as_ref(), current_exe)
+        } else {
+            None
+        },
+        main_execve_wrapper_exe: path_entry_guard
+            .as_ref()
+            .and_then(|path_entry| path_entry.paths().main_execve_wrapper_exe.clone()),
+    };
+
+    let result = main_fn(paths).await;
+    // Keep the arg0 tempdir guard alive until the async entry point finishes;
+    // runtime paths above can point at aliases inside that directory.
+    drop(path_entry_guard);
+    result
 }
 
 fn linux_sandbox_exe_path(
@@ -309,7 +328,13 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
-    lock_file.try_lock()?;
+    let lock_file = match try_lock_exclusive_optional(&lock_file)? {
+        TryFileLockOutcome::Acquired => Some(lock_file),
+        TryFileLockOutcome::Unsupported => None,
+        TryFileLockOutcome::WouldBlock => {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+    };
 
     for filename in &[
         APPLY_PATCH_ARG0,
@@ -428,10 +453,9 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
         Err(err) => return Err(err),
     };
 
-    match lock_file.try_lock() {
-        Ok(()) => Ok(Some(lock_file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(err) => Err(err.into()),
+    match try_lock_exclusive_optional(&lock_file)? {
+        TryFileLockOutcome::Acquired => Ok(Some(lock_file)),
+        TryFileLockOutcome::WouldBlock | TryFileLockOutcome::Unsupported => Ok(None),
     }
 }
 
@@ -442,6 +466,10 @@ mod tests {
     use super::LOCK_FILENAME;
     use super::janitor_cleanup;
     use super::linux_sandbox_exe_path;
+    #[cfg(unix)]
+    use super::run_main_with_arg0_guard;
+    #[cfg(unix)]
+    use anyhow::ensure;
     use std::fs;
     use std::fs::File;
     use std::path::Path;
@@ -465,7 +493,7 @@ mod tests {
         let alias_path = temp_dir.path().join("codex-linux-sandbox");
         let path_entry = Arg0PathEntryGuard::new(
             temp_dir,
-            lock_file,
+            Some(lock_file),
             Arg0DispatchPaths {
                 codex_self_exe: Some(PathBuf::from("/usr/bin/codex")),
                 codex_linux_sandbox_exe: Some(alias_path.clone()),
@@ -478,6 +506,49 @@ mod tests {
             Some(alias_path),
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_main_with_arg0_guard_keeps_aliases_alive_until_main_returns() -> anyhow::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let alias_path = temp_dir.path().join("codex-helper-alias");
+        fs::write(&alias_path, b"")?;
+        let lock_file = create_lock(temp_dir.path())?;
+        let path_entry = Arg0PathEntryGuard::new(
+            temp_dir,
+            lock_file,
+            Arg0DispatchPaths {
+                codex_self_exe: Some(PathBuf::from("/usr/bin/codex")),
+                codex_linux_sandbox_exe: Some(alias_path.clone()),
+                main_execve_wrapper_exe: Some(alias_path),
+            },
+        );
+
+        super::build_runtime()?.block_on(run_main_with_arg0_guard(
+            /*path_entry_guard*/ Some(path_entry),
+            Some(PathBuf::from("/usr/bin/codex")),
+            |paths| async move {
+                let alias_path = paths
+                    .codex_linux_sandbox_exe
+                    .or(paths.main_execve_wrapper_exe)
+                    .expect("unix dispatch should create at least one alias path");
+                ensure!(
+                    alias_path.exists(),
+                    "alias path disappeared before main future was polled: {}",
+                    alias_path.display()
+                );
+
+                tokio::task::yield_now().await;
+
+                ensure!(
+                    alias_path.exists(),
+                    "alias path disappeared while main future was running: {}",
+                    alias_path.display()
+                );
+                Ok(())
+            },
+        ))
     }
 
     #[test]
@@ -498,7 +569,13 @@ mod tests {
         let dir = root.path().join("locked");
         fs::create_dir(&dir)?;
         let lock_file = create_lock(&dir)?;
-        lock_file.try_lock()?;
+        match try_lock_exclusive_optional(&lock_file)? {
+            TryFileLockOutcome::Acquired => {}
+            TryFileLockOutcome::Unsupported => return Ok(()),
+            TryFileLockOutcome::WouldBlock => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+        }
 
         janitor_cleanup(root.path())?;
 
@@ -511,11 +588,22 @@ mod tests {
         let root = tempfile::tempdir()?;
         let dir = root.path().join("stale");
         fs::create_dir(&dir)?;
-        create_lock(&dir)?;
+        let lock_file = create_lock(&dir)?;
+        let lock_supported = match try_lock_exclusive_optional(&lock_file)? {
+            TryFileLockOutcome::Acquired => true,
+            TryFileLockOutcome::Unsupported => false,
+            TryFileLockOutcome::WouldBlock => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+        };
 
         janitor_cleanup(root.path())?;
 
-        assert!(!dir.exists());
+        if lock_supported {
+            assert!(!dir.exists());
+        } else {
+            assert!(dir.exists());
+        }
         Ok(())
     }
 }

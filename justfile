@@ -1,6 +1,8 @@
 set working-directory := "codex-rs"
 set positional-arguments
 
+rust_min_stack := "8388608" # 8 MiB
+
 # Display help
 help:
     just -l
@@ -49,7 +51,7 @@ install:
 # Prefer this for routine local runs. Workspace crate features are banned, so
 # there should be no need to add `--all-features`.
 test:
-    cargo nextest run --no-fail-fast
+    RUST_MIN_STACK={{ rust_min_stack }} cargo nextest run --no-fail-fast
 
 # Build and run Codex from source using Bazel.
 # Note we have to use the combination of `[no-cd]` and `--run_under="cd $PWD &&"`
@@ -111,6 +113,11 @@ argument-comment-lint *args:
 [no-cd]
 argument-comment-lint-from-source *args:
     {{ justfile_directory() }}/tools/argument-comment-lint/run.py "$@"
+
+# Audit advisory file locks that may need Termux Unsupported handling.
+[no-cd]
+termux-lock-audit *args:
+    {{ justfile_directory() }}/scripts/termux-lock-audit.sh "$@"
 
 # Tail logs from the state SQLite database
 log *args:
