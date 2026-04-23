@@ -1,0 +1,297 @@
+name: termux-release-promote
+
+on:
+  push:
+    branches:
+      - "release/**"
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: "Release branch to promote, for example release/0.122.0"
+        required: true
+        type: string
+      release_sha:
+        description: "Release branch commit SHA to promote. Defaults to the branch head."
+        required: false
+        default: ""
+        type: string
+      pr_number:
+        description: "Merged PR number to promote. Optional; normally discovered automatically."
+        required: false
+        default: ""
+        type: string
+      pr_head_sha:
+        description: "Merged PR head SHA. Required only when pr_number is set."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+  attestations: read
+  checks: read
+  contents: read
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  statuses: read
+
+concurrency:
+  group: termux-release-promote-${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, 'Seed Termux release automation') }}
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout release branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.ref }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: 🧰 Actions Toolbox
+        # This is required for the GitHub CLI
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Resolve release ref
+        id: release-ref
+        shell: bash
+        env:
+          INPUT_RELEASE_BRANCH: ${{ inputs.release_branch }}
+          INPUT_RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            release_branch="${INPUT_RELEASE_BRANCH}"
+            if [[ -n "${INPUT_RELEASE_SHA}" ]]; then
+              git checkout --detach "${INPUT_RELEASE_SHA}"
+              release_sha="${INPUT_RELEASE_SHA}"
+            else
+              release_sha="$(git rev-parse HEAD)"
+            fi
+          else
+            release_branch="${GITHUB_REF_NAME}"
+            release_sha="${GITHUB_SHA}"
+          fi
+
+          {
+            echo "branch=${release_branch}"
+            echo "sha=${release_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read release metadata
+        id: metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          metadata=".github/termux-release.json"
+          if [[ ! -f "${metadata}" ]]; then
+            echo "No ${metadata}; this push is not a Termux release promotion."
+            echo "promote=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream_tag="$(jq -r '.upstream_tag // empty' "${metadata}")"
+          upstream_name="$(jq -r '.upstream_name // .upstream_tag // empty' "${metadata}")"
+          termux_tag="$(jq -r '.termux_tag // empty' "${metadata}")"
+          upstream_prerelease="$(jq -r '.upstream_prerelease // true' "${metadata}")"
+          upstream_html_url="$(jq -r '.upstream_html_url // ""' "${metadata}")"
+          release_train="$(jq -r '.release_train // ""' "${metadata}")"
+          if [[ -z "${upstream_tag}" || -z "${termux_tag}" ]]; then
+            echo "Missing upstream_tag or termux_tag in ${metadata}" >&2
+            exit 1
+          fi
+
+          if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "${termux_tag} already exists; skipping promotion."
+            echo "promote=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "promote=true"
+            echo "upstream_tag=${upstream_tag}"
+            echo "upstream_name=${upstream_name}"
+            echo "termux_tag=${termux_tag}"
+            echo "upstream_prerelease=${upstream_prerelease}"
+            echo "upstream_html_url=${upstream_html_url}"
+            echo "release_train=${release_train}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Locate merged pull request
+        if: steps.metadata.outputs.promote == 'true'
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_BRANCH: ${{ steps.release-ref.outputs.branch }}
+          RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_PR_NUMBER}" || -n "${INPUT_PR_HEAD_SHA}" ]]; then
+            if [[ -z "${INPUT_PR_NUMBER}" || -z "${INPUT_PR_HEAD_SHA}" ]]; then
+              echo "workflow_dispatch inputs pr_number and pr_head_sha must be provided together." >&2
+              exit 1
+            fi
+
+            pr_number="${INPUT_PR_NUMBER}"
+            head_sha="${INPUT_PR_HEAD_SHA}"
+            head_ref=""
+            artifact_name="termux-android-pr-${pr_number}-${head_sha}"
+            {
+              echo "number=${pr_number}"
+              echo "head_sha=${head_sha}"
+              echo "head_ref=${head_ref}"
+              echo "artifact_name=${artifact_name}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pr_json="$(
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${RELEASE_BRANCH}" \
+              --state merged \
+              --limit 100 \
+              --json number,headRefOid,headRefName,mergeCommit \
+              --jq "[.[] | select(.mergeCommit.oid == \"${RELEASE_SHA}\")] | sort_by(.number) | reverse | .[0] // empty"
+          )"
+          if [[ -z "${pr_json}" ]]; then
+            echo "Unable to find merged PR for ${RELEASE_SHA} into ${RELEASE_BRANCH}" >&2
+            exit 1
+          fi
+
+          pr_number="$(jq -r '.number' <<< "${pr_json}")"
+          head_sha="$(jq -r '.headRefOid // .head.sha' <<< "${pr_json}")"
+          head_ref="$(jq -r '.headRefName // .head.ref' <<< "${pr_json}")"
+          artifact_name="termux-android-pr-${pr_number}-${head_sha}"
+          {
+            echo "number=${pr_number}"
+            echo "head_sha=${head_sha}"
+            echo "head_ref=${head_ref}"
+            echo "artifact_name=${artifact_name}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download promoted PR artifact
+        if: steps.metadata.outputs.promote == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_ARTIFACT_NAME: ${{ steps.pr.outputs.artifact_name }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          find_run_id() {
+            local event="$1"
+            gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow rust-release.yml \
+              --event "${event}" \
+              --status success \
+              --commit "${HEAD_SHA}" \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty'
+          }
+
+          artifact_name="${PR_ARTIFACT_NAME}"
+          run_id="$(find_run_id pull_request)"
+          mkdir -p promoted
+          if [[ -n "${run_id}" ]] && gh run download "${run_id}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "${artifact_name}" \
+            --dir promoted; then
+            :
+          else
+            artifact_name="aarch64-linux-android"
+            run_id="$(find_run_id workflow_dispatch)"
+            if [[ -z "${run_id}" ]]; then
+              echo "No successful rust-release run found for ${HEAD_SHA}" >&2
+              exit 1
+            fi
+            gh run download "${run_id}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name "${artifact_name}" \
+              --dir promoted
+          fi
+
+          ls -la promoted
+          if [[ -f promoted/SHA256SUMS ]]; then
+            (cd promoted && sha256sum -c SHA256SUMS)
+          fi
+          if [[ ! -f promoted/codex-aarch64-linux-android.tar.gz ]]; then
+            echo "Expected promoted/codex-aarch64-linux-android.tar.gz in the downloaded artifact." >&2
+            exit 1
+          fi
+
+      - name: Create mirrored Termux release
+        if: steps.metadata.outputs.promote == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          UPSTREAM_TAG: ${{ steps.metadata.outputs.upstream_tag }}
+          UPSTREAM_NAME: ${{ steps.metadata.outputs.upstream_name }}
+          TERMUX_TAG: ${{ steps.metadata.outputs.termux_tag }}
+          UPSTREAM_PRERELEASE: ${{ steps.metadata.outputs.upstream_prerelease }}
+          UPSTREAM_HTML_URL: ${{ steps.metadata.outputs.upstream_html_url }}
+          RELEASE_TRAIN: ${{ steps.metadata.outputs.release_train }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
+        run: |
+          set -euo pipefail
+          body_path="${RUNNER_TEMP}/release-body.md"
+          {
+            echo "Termux Android build for ${UPSTREAM_TAG}."
+            echo
+            echo "- Upstream release: ${UPSTREAM_HTML_URL}"
+            echo "- Release train: \`${RELEASE_TRAIN}\`"
+            echo "- Promoted PR: #${PR_NUMBER}"
+            echo "- Promoted PR head SHA: \`${HEAD_SHA}\`"
+            echo
+            echo "This release promotes the exact Android artifact built by the PR check."
+          } > "${body_path}"
+
+          release_title="${UPSTREAM_NAME}"
+          if [[ -z "${release_title}" || "${release_title}" == "null" ]]; then
+            release_title="${TERMUX_TAG}"
+          fi
+
+          release_args=(
+            gh release create "${TERMUX_TAG}"
+            --repo "${GITHUB_REPOSITORY}"
+            --target "${RELEASE_SHA}"
+            --title "${release_title}"
+            --notes-file "${body_path}"
+          )
+          if [[ "${UPSTREAM_PRERELEASE}" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          release_args+=("promoted/codex-aarch64-linux-android.tar.gz#codex-termux")
+          "${release_args[@]}"
