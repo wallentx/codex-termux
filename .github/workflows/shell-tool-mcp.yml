@@ -447,6 +447,7 @@ jobs:
           path: dist/npm
 
       - name: Publish to npm
+        if: github.repository == 'openai/codex'
         env:
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
           VERSION: ${{ needs.metadata.outputs.version }}
