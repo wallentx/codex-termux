@@ -184,7 +184,7 @@ jobs:
         id: deployment
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
           TERMUX_TAG: ${{ steps.metadata.outputs.termux_tag }}
         run: |
@@ -206,7 +206,7 @@ jobs:
         if: steps.metadata.outputs.deploy == 'true'
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
         run: |
           set -euo pipefail
@@ -509,7 +509,7 @@ jobs:
         if: steps.metadata.outputs.deploy == 'true'
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
           TERMUX_TAG: ${{ steps.metadata.outputs.termux_tag }}
         run: |
@@ -529,7 +529,7 @@ jobs:
         if: failure() && steps.deployment.outputs.id != ''
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
         run: |
           set -euo pipefail
