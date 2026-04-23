@@ -21,6 +21,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -39,11 +40,14 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_utils_template::Template;
 use rand::RngCore;
 use serde_json::Value as JsonValue;
+use sha2::Digest;
+use sha2::Sha256;
 use tiny_http::Header;
 use tiny_http::Request;
 use tiny_http::Response;
 use tiny_http::Server;
 use tiny_http::StatusCode;
+use tokio::time::sleep;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -145,6 +149,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         }
     };
     let server = Arc::new(server);
+    let callback_state = Arc::new(Mutex::new(LoginCallbackState::default()));
 
     let redirect_uri = format!("http://localhost:{actual_port}/auth/callback");
     let auth_url = build_authorize_url(
@@ -155,7 +160,6 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         &state,
         opts.forced_chatgpt_workspace_id.as_deref(),
     );
-
     if opts.open_browser {
         let _ = webbrowser::open(&auth_url);
     }
@@ -195,7 +199,16 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
 
                         let url_raw = req.url().to_string();
                         let response =
-                            process_request(&url_raw, &opts, &redirect_uri, &pkce, actual_port, &state).await;
+                            process_request(
+                                &url_raw,
+                                &opts,
+                                &redirect_uri,
+                                &pkce,
+                                actual_port,
+                                &state,
+                                &callback_state,
+                            )
+                            .await;
 
                         let exit_result = match response {
                             HandledRequest::Response(response) => {
@@ -253,6 +266,12 @@ enum HandledRequest {
     },
 }
 
+#[derive(Default)]
+struct LoginCallbackState {
+    active_code_hash: Option<String>,
+    success_url: Option<String>,
+}
+
 async fn process_request(
     url_raw: &str,
     opts: &ServerOptions,
@@ -260,6 +279,7 @@ async fn process_request(
     pkce: &PkceCodes,
     actual_port: u16,
     state: &str,
+    callback_state: &Arc<Mutex<LoginCallbackState>>,
 ) -> HandledRequest {
     let parsed_url = match url::Url::parse(&format!("http://localhost{url_raw}")) {
         Ok(u) => u,
@@ -327,6 +347,35 @@ async fn process_request(
                     );
                 }
             };
+            let code_hash = login_code_hash(&code);
+            match begin_login_callback(callback_state, &code_hash) {
+                LoginCallbackStart::Proceed => {}
+                LoginCallbackStart::Redirect(success_url) => {
+                    if let Ok(header) =
+                        tiny_http::Header::from_bytes(&b"Location"[..], success_url.as_bytes())
+                    {
+                        return HandledRequest::RedirectWithHeader(header);
+                    }
+                    return login_error_response(
+                        "Sign-in completed but redirecting back to Codex failed.",
+                        io::ErrorKind::Other,
+                        Some("redirect_failed"),
+                        /*error_description*/ None,
+                    );
+                }
+                LoginCallbackStart::AlreadyInProgress => {
+                    if let Some(success_url) =
+                        wait_for_login_callback_success(callback_state, &code_hash).await
+                    {
+                        if let Ok(header) =
+                            tiny_http::Header::from_bytes(&b"Location"[..], success_url.as_bytes())
+                        {
+                            return HandledRequest::RedirectWithHeader(header);
+                        }
+                    }
+                    return login_processing_response();
+                }
+            }
 
             match exchange_code_for_tokens(&opts.issuer, &opts.client_id, redirect_uri, pkce, &code)
                 .await
@@ -373,6 +422,7 @@ async fn process_request(
                         &tokens.id_token,
                         &tokens.access_token,
                     );
+                    finish_login_callback_success(callback_state, &code_hash, &success_url);
                     match tiny_http::Header::from_bytes(&b"Location"[..], success_url.as_bytes()) {
                         Ok(header) => HandledRequest::RedirectWithHeader(header),
                         Err(_) => login_error_response(
@@ -384,6 +434,7 @@ async fn process_request(
                     }
                 }
                 Err(err) => {
+                    finish_login_callback_failure(callback_state, &code_hash);
                     eprintln!("Token exchange error: {err}");
                     error!("login callback token exchange failed");
                     login_error_response(
@@ -569,6 +620,90 @@ fn bind_server(port: u16) -> io::Result<Server> {
             }
         }
     }
+}
+
+enum LoginCallbackStart {
+    Proceed,
+    Redirect(String),
+    AlreadyInProgress,
+}
+
+fn begin_login_callback(
+    callback_state: &Mutex<LoginCallbackState>,
+    code_hash: &str,
+) -> LoginCallbackStart {
+    let mut state = callback_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.active_code_hash.as_deref() == Some(code_hash) {
+        if let Some(success_url) = state.success_url.clone() {
+            return LoginCallbackStart::Redirect(success_url);
+        }
+        return LoginCallbackStart::AlreadyInProgress;
+    }
+
+    state.active_code_hash = Some(code_hash.to_string());
+    state.success_url = None;
+    LoginCallbackStart::Proceed
+}
+
+fn finish_login_callback_success(
+    callback_state: &Mutex<LoginCallbackState>,
+    code_hash: &str,
+    success_url: &str,
+) {
+    let mut state = callback_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.active_code_hash.as_deref() == Some(code_hash) {
+        state.success_url = Some(success_url.to_string());
+    }
+}
+
+fn finish_login_callback_failure(callback_state: &Mutex<LoginCallbackState>, code_hash: &str) {
+    let mut state = callback_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.active_code_hash.as_deref() == Some(code_hash) {
+        state.active_code_hash = None;
+        state.success_url = None;
+    }
+}
+
+async fn wait_for_login_callback_success(
+    callback_state: &Mutex<LoginCallbackState>,
+    code_hash: &str,
+) -> Option<String> {
+    for _ in 0..50 {
+        {
+            let state = callback_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.active_code_hash.as_deref() == Some(code_hash)
+                && let Some(success_url) = state.success_url.clone()
+            {
+                return Some(success_url);
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+fn login_code_hash(code: &str) -> String {
+    let digest = Sha256::digest(code.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn login_processing_response() -> HandledRequest {
+    let mut response =
+        Response::from_string("Codex sign-in is already being completed. Return to Codex.")
+            .with_status_code(202);
+    if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], &b"text/plain; charset=utf-8"[..])
+    {
+        response.add_header(header);
+    }
+    HandledRequest::Response(response)
 }
 
 /// Tokens returned by the OAuth authorization-code exchange.
@@ -831,7 +966,7 @@ fn compose_success_url(port: u16, issuer: &str, id_token: &str, access_token: &s
     ];
     let qs = params
         .drain(..)
-        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(&v)))
+        .map(|(k, v)| format!("{k}={}", urlencoding::encode(&v)))
         .collect::<Vec<_>>()
         .join("&");
     format!("http://localhost:{port}/success?{qs}")
