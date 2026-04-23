@@ -255,7 +255,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
-          git fetch --prune origin main "${PATCH_BRANCH}"
+          git fetch --prune origin "${PATCH_BRANCH}"
           git fetch --prune --tags upstream
 
       - name: Create or update release train PR
@@ -303,6 +303,48 @@ jobs:
           reset_for_fallback_checkout() {
             git reset --hard "origin/${RELEASE_BRANCH}"
             git clean -fd .github/workflows
+          }
+
+          workspace_version_from_ref() {
+            local ref="$1"
+            git show "${ref}:codex-rs/Cargo.toml" | awk '
+              /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+              /^\[/ { in_workspace_package = 0 }
+              in_workspace_package && /^version = / {
+                gsub(/^version = "/, "")
+                gsub(/"$/, "")
+                print
+                exit
+              }
+            '
+          }
+
+          normalize_patch_branch_version() {
+            local normalized_ref="$1"
+            local upstream_version
+
+            upstream_version="$(workspace_version_from_ref "refs/tags/${UPSTREAM_TAG}")"
+            if [[ -z "${upstream_version}" ]]; then
+              echo "Unable to read workspace package version from refs/tags/${UPSTREAM_TAG}" >&2
+              exit 1
+            fi
+
+            git checkout -B "${normalized_ref}" "origin/${PATCH_BRANCH}"
+            if [[ ! -f codex-rs/Cargo.toml ]]; then
+              echo "codex-rs/Cargo.toml is missing from ${PATCH_BRANCH}" >&2
+              exit 1
+            fi
+
+            UPSTREAM_WORKSPACE_VERSION="${upstream_version}" perl -0pi -e '
+              my $version = $ENV{"UPSTREAM_WORKSPACE_VERSION"};
+              s/(\[workspace\.package\]\n(?:(?!^\[).*\n)*?version = ")[^"]+(")/$1$version$2/m
+                or die "workspace.package version not found\n";
+            ' codex-rs/Cargo.toml
+
+            if ! git diff --quiet -- codex-rs/Cargo.toml; then
+              git add codex-rs/Cargo.toml
+              git commit -m "Normalize Termux patch workspace version"
+            fi
           }
 
           existing_prs="$(
@@ -354,7 +396,13 @@ jobs:
           seed_release_branch_workflows
 
           if [[ "${release_branch_exists}" == false ]]; then
-            git diff --binary "origin/main...origin/${PATCH_BRANCH}" \
+            normalized_patch_ref="termux-patch-normalized/${UPSTREAM_TAG}"
+            normalize_patch_branch_version "${normalized_patch_ref}"
+            git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
+            seed_release_branch_workflows
+
+            echo "Creating Termux patch from refs/tags/${UPSTREAM_TAG} to ${normalized_patch_ref}."
+            git diff --binary "refs/tags/${UPSTREAM_TAG}..${normalized_patch_ref}" \
               -- . \
               ':!.github/workflows/rust-release.yml' \
               ':!.github/workflows/shell-tool-mcp.yml' \
