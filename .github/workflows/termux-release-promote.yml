@@ -114,7 +114,12 @@ jobs:
           upstream_tag="$(jq -r '.upstream_tag // empty' "${metadata}")"
           upstream_name="$(jq -r '.upstream_name // .upstream_tag // empty' "${metadata}")"
           termux_tag="$(jq -r '.termux_tag // empty' "${metadata}")"
-          upstream_prerelease="$(jq -r '.upstream_prerelease // true' "${metadata}")"
+          upstream_version="${upstream_tag#rust-v}"
+          upstream_version="${upstream_version%-termux}"
+          upstream_prerelease=false
+          if [[ "${upstream_version}" == *-* ]]; then
+            upstream_prerelease=true
+          fi
           upstream_html_url="$(jq -r '.upstream_html_url // ""' "${metadata}")"
           release_train="$(jq -r '.release_train // ""' "${metadata}")"
           if [[ -z "${upstream_tag}" || -z "${termux_tag}" ]]; then
