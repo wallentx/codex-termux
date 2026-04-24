@@ -1,4 +1,3 @@
-use crate::agent::control::SpawnAgentOptions;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::status::is_final;
@@ -6,7 +5,6 @@ use crate::config::Config;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -631,25 +629,16 @@ async fn run_agent_job_loop(
                 let thread_id = match session
                     .services
                     .agent_control
-                    .spawn_agent_with_metadata(
+                    .spawn_agent(
                         options.spawn_config.clone(),
                         items.into(),
                         Some(SessionSource::SubAgent(SubAgentSource::Other(format!(
                             "agent_job:{job_id}"
                         )))),
-                        SpawnAgentOptions {
-                            environments: Some(
-                                turn.environments
-                                    .iter()
-                                    .map(TurnEnvironment::selection)
-                                    .collect(),
-                            ),
-                            ..Default::default()
-                        },
                     )
                     .await
                 {
-                    Ok(spawned_agent) => spawned_agent.thread_id,
+                    Ok(thread_id) => thread_id,
                     Err(CodexErr::AgentLimitReached { .. }) => {
                         db.mark_agent_job_item_pending(
                             job_id.as_str(),

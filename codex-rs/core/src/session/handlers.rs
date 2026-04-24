@@ -27,6 +27,8 @@ use codex_features::Feature;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::review_prompts::resolve_review_request;
+use crate::rollout::RolloutRecorder;
+use crate::rollout::read_session_meta_line;
 use crate::tasks::CompactTask;
 use crate::tasks::UndoTask;
 use crate::tasks::UserShellCommandMode;
@@ -127,13 +129,12 @@ pub(super) async fn user_input_or_turn_inner(
     op: Op,
     mirror_user_text_to_realtime: Option<()>,
 ) {
-    let (items, updates, responsesapi_client_metadata) = match op {
+    let (items, updates, responsesapi_client_metadata, environments) = match op {
         Op::UserTurn {
             cwd,
             approval_policy,
             approvals_reviewer,
             sandbox_policy,
-            permission_profile,
             model,
             effort,
             summary,
@@ -161,18 +162,18 @@ pub(super) async fn user_input_or_turn_inner(
                     approval_policy: Some(approval_policy),
                     approvals_reviewer,
                     sandbox_policy: Some(sandbox_policy),
-                    permission_profile,
+                    permission_profile: None,
                     windows_sandbox_level: None,
                     collaboration_mode,
                     reasoning_summary: summary,
                     service_tier,
                     final_output_json_schema: Some(final_output_json_schema),
-                    environments,
                     personality,
                     app_server_client_name: None,
                     app_server_client_version: None,
                 },
                 None,
+                environments,
             )
         }
         Op::UserInputWithTurnContext {
@@ -217,12 +218,12 @@ pub(super) async fn user_input_or_turn_inner(
                     reasoning_summary: summary,
                     service_tier,
                     final_output_json_schema: Some(final_output_json_schema),
-                    environments,
                     personality,
                     app_server_client_name: None,
                     app_server_client_version: None,
                 },
                 responsesapi_client_metadata,
+                environments,
             )
         }
         Op::UserInput {
@@ -234,15 +235,18 @@ pub(super) async fn user_input_or_turn_inner(
             items,
             SessionSettingsUpdate {
                 final_output_json_schema: Some(final_output_json_schema),
-                environments,
                 ..Default::default()
             },
             responsesapi_client_metadata,
+            environments,
         ),
         _ => unreachable!(),
     };
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
+    let Ok(current_context) = sess
+        .new_turn_with_sub_id(sub_id.clone(), updates, environments)
+        .await
+    else {
         // new_turn_with_sub_id already emits the error event.
         return;
     };
@@ -540,12 +544,7 @@ pub async fn list_mcp_tools(sess: &Session, config: &Arc<Config>, sub_id: String
         .await;
     let snapshot = collect_mcp_snapshot_from_manager(
         &mcp_connection_manager,
-        compute_auth_statuses(
-            mcp_servers.iter(),
-            config.mcp_oauth_credentials_store_mode,
-            auth.as_ref(),
-        )
-        .await,
+        compute_auth_statuses(mcp_servers.iter(), config.mcp_oauth_credentials_store_mode).await,
     )
     .await;
     let event = Event {
@@ -758,25 +757,36 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     }
 
     let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-    let live_thread = match sess.live_thread_for_persistence("rollback thread") {
-        Ok(live_thread) => live_thread,
-        Err(_) => {
+    let rollout_path = {
+        let recorder = {
+            let guard = sess.services.rollout.lock().await;
+            guard.clone()
+        };
+        let Some(recorder) = recorder else {
             sess.send_event_raw(Event {
                 id: turn_context.sub_id.clone(),
                 msg: EventMsg::Error(ErrorEvent {
-                    message: "thread rollback requires persisted thread history".to_string(),
+                    message: "thread rollback requires a persisted rollout path".to_string(),
                     codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
                 }),
             })
             .await;
             return;
-        }
+        };
+        recorder.rollout_path().to_path_buf()
     };
-    if let Err(err) = live_thread.flush().await {
+    if let Some(recorder) = {
+        let guard = sess.services.rollout.lock().await;
+        guard.clone()
+    } && let Err(err) = recorder.flush().await
+    {
         sess.send_event_raw(Event {
             id: turn_context.sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
-                message: format!("failed to flush thread persistence for rollback replay: {err}"),
+                message: format!(
+                    "failed to flush rollout `{}` for rollback replay: {err}",
+                    rollout_path.display()
+                ),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
             }),
         })
@@ -784,13 +794,16 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         return;
     }
 
-    let stored_history = match live_thread.load_history(/*include_archived*/ false).await {
+    let initial_history = match RolloutRecorder::get_rollout_history(rollout_path.as_path()).await {
         Ok(history) => history,
         Err(err) => {
             sess.send_event_raw(Event {
                 id: turn_context.sub_id.clone(),
                 msg: EventMsg::Error(ErrorEvent {
-                    message: format!("failed to load thread history for rollback replay: {err}"),
+                    message: format!(
+                        "failed to load rollout `{}` for rollback replay: {err}",
+                        rollout_path.display()
+                    ),
                     codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
                 }),
             })
@@ -801,8 +814,8 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
 
     let rollback_event = ThreadRolledBackEvent { num_turns };
     let rollback_msg = EventMsg::ThreadRolledBack(rollback_event.clone());
-    let replay_items = stored_history
-        .items
+    let replay_items = initial_history
+        .get_rollout_items()
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
@@ -837,12 +850,14 @@ async fn persist_thread_name_update(
 ) -> anyhow::Result<EventMsg> {
     let msg = EventMsg::ThreadNameUpdated(event);
     let item = RolloutItem::EventMsg(msg.clone());
-    let live_thread = sess.live_thread_for_persistence("rename thread")?;
-    live_thread.persist().await?;
-    live_thread
-        .append_items(std::slice::from_ref(&item))
-        .await?;
-    live_thread.flush().await?;
+    let recorder = {
+        let guard = sess.services.rollout.lock().await;
+        guard.clone()
+    }
+    .ok_or_else(|| anyhow::anyhow!("Session persistence is disabled; cannot rename thread."))?;
+    recorder.persist().await?;
+    recorder.record_items(std::slice::from_ref(&item)).await?;
+    recorder.flush().await?;
     Ok(msg)
 }
 
@@ -850,13 +865,36 @@ pub(super) async fn persist_thread_memory_mode_update(
     sess: &Arc<Session>,
     mode: ThreadMemoryMode,
 ) -> anyhow::Result<()> {
-    let live_thread = sess.live_thread_for_persistence("update thread memory mode")?;
-    live_thread.persist().await?;
-    live_thread.flush().await?;
-    live_thread
-        .update_memory_mode(mode, /*include_archived*/ false)
-        .await?;
-    live_thread.flush().await?;
+    let recorder = {
+        let guard = sess.services.rollout.lock().await;
+        guard.clone()
+    }
+    .ok_or_else(|| {
+        anyhow::anyhow!("Session persistence is disabled; cannot update thread memory mode.")
+    })?;
+    recorder.persist().await?;
+    recorder.flush().await?;
+
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    let mut session_meta = read_session_meta_line(rollout_path.as_path()).await?;
+    if session_meta.meta.id != sess.conversation_id {
+        anyhow::bail!(
+            "rollout session metadata id mismatch: expected {}, found {}",
+            sess.conversation_id,
+            session_meta.meta.id
+        );
+    }
+    session_meta.meta.memory_mode = Some(
+        match mode {
+            ThreadMemoryMode::Enabled => "enabled",
+            ThreadMemoryMode::Disabled => "disabled",
+        }
+        .to_string(),
+    );
+
+    let item = RolloutItem::SessionMeta(session_meta);
+    recorder.record_items(std::slice::from_ref(&item)).await?;
+    recorder.flush().await?;
     Ok(())
 }
 
@@ -958,16 +996,20 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         &[],
     );
 
-    // Gracefully flush and shutdown thread persistence on session end so tests
-    // that inspect durable state do not race with the background writer.
-    if let Some(live_thread) = sess.live_thread()
-        && let Err(e) = live_thread.shutdown().await
+    // Gracefully flush and shutdown rollout recorder on session end so tests
+    // that inspect the rollout file do not race with the background writer.
+    let recorder_opt = {
+        let mut guard = sess.services.rollout.lock().await;
+        guard.take()
+    };
+    if let Some(rec) = recorder_opt
+        && let Err(e) = rec.shutdown().await
     {
-        warn!("failed to shutdown thread persistence: {e}");
+        warn!("failed to shutdown rollout recorder: {e}");
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
-                message: "Failed to shutdown thread persistence".to_string(),
+                message: "Failed to shutdown rollout recorder".to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
             }),
         };
@@ -979,9 +1021,6 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         msg: EventMsg::ShutdownComplete,
     };
     sess.send_event_raw(event).await;
-    sess.services
-        .rollout_thread_trace
-        .record_ended(codex_rollout_trace::RolloutStatus::Completed);
     true
 }
 

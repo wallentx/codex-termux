@@ -8,7 +8,6 @@ use std::time::Instant;
 
 use anyhow::Context;
 use async_channel::unbounded;
-use codex_api::SharedAuthProvider;
 pub use codex_app_server_protocol::AppBranding;
 pub use codex_app_server_protocol::AppInfo;
 pub use codex_app_server_protocol::AppMetadata;
@@ -17,6 +16,7 @@ use codex_connectors::DirectoryListResponse;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::EnvironmentManagerArgs;
 use codex_exec_server::ExecServerRuntimePaths;
+use codex_login::token_data::TokenData;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_tools::DiscoverableTool;
 use rmcp::model::ToolAnnotations;
@@ -253,12 +253,8 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
         });
     }
 
-    let auth_status_entries = compute_auth_statuses(
-        mcp_servers.iter(),
-        config.mcp_oauth_credentials_store_mode,
-        auth.as_ref(),
-    )
-    .await;
+    let auth_status_entries =
+        compute_auth_statuses(mcp_servers.iter(), config.mcp_oauth_credentials_store_mode).await;
 
     let (tx_event, rx_event) = unbounded();
     drop(rx_event);
@@ -279,7 +275,6 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
         config.codex_home.to_path_buf(),
         codex_apps_tools_cache_key(auth.as_ref()),
         ToolPluginProvenance::default(),
-        auth.as_ref(),
     )
     .await;
 
@@ -356,9 +351,16 @@ fn accessible_connectors_cache_key(
     config: &Config,
     auth: Option<&CodexAuth>,
 ) -> AccessibleConnectorsCacheKey {
-    let account_id = auth.and_then(CodexAuth::get_account_id);
-    let chatgpt_user_id = auth.and_then(CodexAuth::get_chatgpt_user_id);
-    let is_workspace_account = auth.is_some_and(CodexAuth::is_workspace_account);
+    let token_data: Option<TokenData> = auth.and_then(|auth| auth.get_token_data().ok());
+    let account_id = token_data
+        .as_ref()
+        .and_then(|token_data| token_data.account_id.clone());
+    let chatgpt_user_id = token_data
+        .as_ref()
+        .and_then(|token_data| token_data.id_token.chatgpt_user_id.clone());
+    let is_workspace_account = token_data
+        .as_ref()
+        .is_some_and(|token_data| token_data.id_token.is_workspace_account());
     AccessibleConnectorsCacheKey {
         chatgpt_base_url: config.chatgpt_base_url.clone(),
         account_id,
@@ -429,29 +431,31 @@ async fn list_directory_connectors_for_tool_suggest_with_auth(
         return Ok(Vec::new());
     }
 
-    let loaded_auth;
-    let auth = if let Some(auth) = auth {
-        Some(auth)
+    let token_data = if let Some(auth) = auth {
+        auth.get_token_data().ok()
     } else {
         let auth_manager =
             AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
-        loaded_auth = auth_manager.auth().await;
-        loaded_auth.as_ref()
+        auth_manager
+            .auth()
+            .await
+            .and_then(|auth| auth.get_token_data().ok())
     };
-    let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) else {
+    let Some(token_data) = token_data else {
         return Ok(Vec::new());
     };
 
-    let account_id = match auth.get_account_id() {
+    let account_id = match token_data.account_id.as_deref() {
         Some(account_id) if !account_id.is_empty() => account_id,
         _ => return Ok(Vec::new()),
     };
-    let auth_provider = codex_model_provider::auth_provider_from_auth(auth);
-    let is_workspace_account = auth.is_workspace_account();
+    let access_token = token_data.access_token.clone();
+    let account_id = account_id.to_string();
+    let is_workspace_account = token_data.id_token.is_workspace_account();
     let cache_key = AllConnectorsCacheKey::new(
         config.chatgpt_base_url.clone(),
         Some(account_id.clone()),
-        auth.get_chatgpt_user_id(),
+        token_data.id_token.chatgpt_user_id.clone(),
         is_workspace_account,
     );
 
@@ -460,12 +464,14 @@ async fn list_directory_connectors_for_tool_suggest_with_auth(
         is_workspace_account,
         /*force_refetch*/ false,
         |path| {
-            let auth_provider = auth_provider.clone();
+            let access_token = access_token.clone();
+            let account_id = account_id.clone();
             async move {
-                chatgpt_get_request_with_auth_provider::<DirectoryListResponse>(
+                chatgpt_get_request_with_token::<DirectoryListResponse>(
                     config,
                     path,
-                    auth_provider,
+                    access_token.as_str(),
+                    account_id.as_str(),
                 )
                 .await
             }
@@ -474,16 +480,18 @@ async fn list_directory_connectors_for_tool_suggest_with_auth(
     .await
 }
 
-async fn chatgpt_get_request_with_auth_provider<T: DeserializeOwned>(
+async fn chatgpt_get_request_with_token<T: DeserializeOwned>(
     config: &Config,
     path: String,
-    auth_provider: SharedAuthProvider,
+    access_token: &str,
+    account_id: &str,
 ) -> anyhow::Result<T> {
     let client = create_client();
     let url = format!("{}{}", config.chatgpt_base_url, path);
     let response = client
         .get(&url)
-        .headers(auth_provider.to_auth_headers())
+        .bearer_auth(access_token)
+        .header("chatgpt-account-id", account_id)
         .header("Content-Type", "application/json")
         .timeout(DIRECTORY_CONNECTORS_TIMEOUT)
         .send()

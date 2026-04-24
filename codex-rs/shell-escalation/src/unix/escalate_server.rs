@@ -922,7 +922,7 @@ mod tests {
             server,
             Arc::new(DeterministicEscalationPolicy {
                 decision: EscalationDecision::escalate(EscalationExecution::Permissions(
-                    EscalationPermissions::AdditionalPermissionProfile(PermissionProfile {
+                    EscalationPermissions::PermissionProfile(PermissionProfile {
                         network: Some(NetworkPermissions {
                             enabled: Some(true),
                         }),
@@ -931,14 +931,12 @@ mod tests {
                 )),
             }),
             Arc::new(PermissionAssertingShellCommandExecutor {
-                expected_permissions: EscalationPermissions::AdditionalPermissionProfile(
-                    PermissionProfile {
-                        network: Some(NetworkPermissions {
-                            enabled: Some(true),
-                        }),
-                        ..Default::default()
-                    },
-                ),
+                expected_permissions: EscalationPermissions::PermissionProfile(PermissionProfile {
+                    network: Some(NetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                    ..Default::default()
+                }),
             }),
             CancellationToken::new(),
             CancellationToken::new(),

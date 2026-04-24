@@ -122,11 +122,6 @@ runs:
           }
         }
 
-    - name: Compute cache-stable Windows Bazel PATH
-      if: runner.os == 'Windows'
-      shell: pwsh
-      run: ./.github/scripts/compute-bazel-windows-path.ps1
-
     - name: Enable Git long paths (Windows)
       if: runner.os == 'Windows'
       shell: pwsh

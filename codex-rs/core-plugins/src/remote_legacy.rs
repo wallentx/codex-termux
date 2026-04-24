@@ -123,17 +123,23 @@ pub async fn fetch_remote_plugin_status(
     let Some(auth) = auth else {
         return Err(RemotePluginFetchError::AuthRequired);
     };
-    if !auth.uses_codex_backend() {
+    if !auth.is_chatgpt_auth() {
         return Err(RemotePluginFetchError::UnsupportedAuthMode);
     }
 
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/plugins/list");
     let client = build_reqwest_client();
-    let request = client
+    let token = auth
+        .get_token()
+        .map_err(RemotePluginFetchError::AuthToken)?;
+    let mut request = client
         .get(&url)
         .timeout(REMOTE_PLUGIN_FETCH_TIMEOUT)
-        .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers());
+        .bearer_auth(token);
+    if let Some(account_id) = auth.get_account_id() {
+        request = request.header("chatgpt-account-id", account_id);
+    }
 
     let response = request
         .send()
@@ -170,9 +176,14 @@ pub async fn fetch_remote_featured_plugin_ids(
         )])
         .timeout(REMOTE_FEATURED_PLUGIN_FETCH_TIMEOUT);
 
-    if let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) {
-        request =
-            request.headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers());
+    if let Some(auth) = auth.filter(|auth| auth.is_chatgpt_auth()) {
+        let token = auth
+            .get_token()
+            .map_err(RemotePluginFetchError::AuthToken)?;
+        request = request.bearer_auth(token);
+        if let Some(account_id) = auth.get_account_id() {
+            request = request.header("chatgpt-account-id", account_id);
+        }
     }
 
     let response = request
@@ -212,13 +223,11 @@ pub async fn uninstall_remote_plugin(
     Ok(())
 }
 
-fn ensure_codex_backend_auth(
-    auth: Option<&CodexAuth>,
-) -> Result<&CodexAuth, RemotePluginMutationError> {
+fn ensure_chatgpt_auth(auth: Option<&CodexAuth>) -> Result<&CodexAuth, RemotePluginMutationError> {
     let Some(auth) = auth else {
         return Err(RemotePluginMutationError::AuthRequired);
     };
-    if !auth.uses_codex_backend() {
+    if !auth.is_chatgpt_auth() {
         return Err(RemotePluginMutationError::UnsupportedAuthMode);
     }
     Ok(auth)
@@ -234,13 +243,19 @@ async fn post_remote_plugin_mutation(
     plugin_id: &str,
     action: &str,
 ) -> Result<RemotePluginMutationResponse, RemotePluginMutationError> {
-    let auth = ensure_codex_backend_auth(auth)?;
+    let auth = ensure_chatgpt_auth(auth)?;
     let url = remote_plugin_mutation_url(config, plugin_id, action)?;
     let client = build_reqwest_client();
-    let request = client
+    let token = auth
+        .get_token()
+        .map_err(RemotePluginMutationError::AuthToken)?;
+    let mut request = client
         .post(url.clone())
         .timeout(REMOTE_PLUGIN_MUTATION_TIMEOUT)
-        .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers());
+        .bearer_auth(token);
+    if let Some(account_id) = auth.get_account_id() {
+        request = request.header("chatgpt-account-id", account_id);
+    }
 
     let response = request
         .send()

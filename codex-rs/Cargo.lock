@@ -1773,7 +1773,6 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-git-utils",
  "codex-login",
- "codex-model-provider",
  "codex-plugin",
  "codex-protocol",
  "codex-utils-absolute-path",
@@ -1841,7 +1840,6 @@ dependencies = [
  "chrono",
  "clap",
  "codex-analytics",
- "codex-api",
  "codex-app-server-protocol",
  "codex-arg0",
  "codex-backend-client",
@@ -1858,7 +1856,6 @@ dependencies = [
  "codex-git-utils",
  "codex-login",
  "codex-mcp",
- "codex-model-provider",
  "codex-model-provider-info",
  "codex-models-manager",
  "codex-otel",
@@ -1870,7 +1867,6 @@ dependencies = [
  "codex-state",
  "codex-thread-store",
  "codex-tools",
- "codex-uds",
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
  "codex-utils-cli",
@@ -2012,6 +2008,7 @@ dependencies = [
  "codex-sandboxing",
  "codex-shell-escalation",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "codex-utils-home-dir",
  "dotenvy",
  "tempfile",
@@ -2048,11 +2045,9 @@ name = "codex-backend-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "codex-api",
  "codex-backend-openapi-models",
  "codex-client",
  "codex-login",
- "codex-model-provider",
  "codex-protocol",
  "pretty_assertions",
  "reqwest",
@@ -2076,11 +2071,11 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-app-server-protocol",
+ "codex-config",
  "codex-connectors",
  "codex-core",
  "codex-git-utils",
  "codex-login",
- "codex-model-provider",
  "codex-utils-cargo-bin",
  "codex-utils-cli",
  "pretty_assertions",
@@ -2108,7 +2103,6 @@ dependencies = [
  "codex-cloud-tasks",
  "codex-config",
  "codex-core",
- "codex-core-plugins",
  "codex-exec",
  "codex-exec-server",
  "codex-execpolicy",
@@ -2121,7 +2115,6 @@ dependencies = [
  "codex-protocol",
  "codex-responses-api-proxy",
  "codex-rmcp-client",
- "codex-rollout-trace",
  "codex-sandboxing",
  "codex-state",
  "codex-stdio-to-uds",
@@ -2209,6 +2202,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "codex-client",
@@ -2217,7 +2211,6 @@ dependencies = [
  "codex-core",
  "codex-git-utils",
  "codex-login",
- "codex-model-provider",
  "codex-tui",
  "codex-utils-cli",
  "crossterm",
@@ -2242,7 +2235,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "codex-api",
  "codex-backend-client",
  "codex-git-utils",
  "serde",
@@ -2301,7 +2293,6 @@ dependencies = [
  "libc",
  "multimap",
  "pretty_assertions",
- "prost 0.14.3",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -2310,12 +2301,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "toml 0.9.11+spec-1.1.0",
  "toml_edit 0.24.0+spec-1.1.0",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
  "tracing",
  "wildmatch",
  "winapi-util",
@@ -2388,6 +2375,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-cache",
  "codex-utils-cargo-bin",
+ "codex-utils-file-lock",
  "codex-utils-home-dir",
  "codex-utils-image",
  "codex-utils-output-truncation",
@@ -2452,6 +2440,7 @@ dependencies = [
  "whoami",
  "windows-sys 0.52.0",
  "wiremock",
+ "zip 2.4.2",
  "zstd 0.13.3",
 ]
 
@@ -2459,7 +2448,6 @@ dependencies = [
 name = "codex-core-plugins"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "chrono",
  "codex-app-server-protocol",
  "codex-config",
@@ -2467,14 +2455,11 @@ dependencies = [
  "codex-exec-server",
  "codex-git-utils",
  "codex-login",
- "codex-model-provider",
- "codex-otel",
  "codex-plugin",
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-plugins",
  "dirs",
- "libc",
  "pretty_assertions",
  "reqwest",
  "serde",
@@ -2485,8 +2470,6 @@ dependencies = [
  "toml 0.9.11+spec-1.1.0",
  "tracing",
  "url",
- "wiremock",
- "zip 2.4.2",
 ]
 
 [[package]]
@@ -2499,7 +2482,6 @@ dependencies = [
  "codex-config",
  "codex-exec-server",
  "codex-login",
- "codex-model-provider",
  "codex-otel",
  "codex-protocol",
  "codex-skills",
@@ -2536,7 +2518,6 @@ dependencies = [
 name = "codex-device-key"
 version = "0.0.0"
 dependencies = [
- "async-trait",
  "base64 0.22.1",
  "p256",
  "pretty_assertions",
@@ -2544,7 +2525,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
  "url",
 ]
 
@@ -2633,6 +2613,7 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "multimap",
  "pretty_assertions",
  "serde",
@@ -2860,12 +2841,10 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-channel",
- "codex-api",
  "codex-async-utils",
  "codex-config",
  "codex-exec-server",
  "codex-login",
- "codex-model-provider",
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
@@ -2925,23 +2904,14 @@ name = "codex-model-provider"
 version = "0.0.0"
 dependencies = [
  "async-trait",
- "codex-agent-identity",
  "codex-api",
  "codex-aws-auth",
  "codex-client",
- "codex-feedback",
  "codex-login",
  "codex-model-provider-info",
- "codex-models-manager",
- "codex-otel",
  "codex-protocol",
- "codex-response-debug-context",
  "http 1.4.0",
  "pretty_assertions",
- "serde_json",
- "tokio",
- "tracing",
- "wiremock",
 ]
 
 [[package]]
@@ -2965,21 +2935,32 @@ dependencies = [
 name = "codex-models-manager"
 version = "0.0.0"
 dependencies = [
- "async-trait",
+ "base64 0.22.1",
  "chrono",
+ "codex-api",
  "codex-app-server-protocol",
  "codex-collaboration-mode-templates",
+ "codex-config",
+ "codex-feedback",
  "codex-login",
+ "codex-model-provider",
+ "codex-model-provider-info",
  "codex-otel",
  "codex-protocol",
+ "codex-response-debug-context",
+ "codex-utils-absolute-path",
  "codex-utils-output-truncation",
  "codex-utils-template",
+ "core_test_support",
+ "http 1.4.0",
  "pretty_assertions",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -3165,7 +3146,6 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
- "codex-api",
  "codex-client",
  "codex-config",
  "codex-exec-server",
@@ -3225,7 +3205,6 @@ name = "codex-rollout-trace"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "codex-code-mode",
  "codex-protocol",
  "pretty_assertions",
  "serde",
@@ -3399,7 +3378,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
- "tracing",
  "uuid",
 ]
 
@@ -3439,7 +3417,6 @@ dependencies = [
  "codex-cloud-requirements",
  "codex-config",
  "codex-connectors",
- "codex-core-plugins",
  "codex-core-skills",
  "codex-exec-server",
  "codex-features",
@@ -3589,6 +3566,10 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-elapsed"
+version = "0.0.0"
+
+[[package]]
+name = "codex-utils-file-lock"
 version = "0.0.0"
 
 [[package]]
@@ -13340,9 +13321,9 @@ dependencies = [
 
 [[package]]
 name = "v8"
-version = "146.4.0"
+version = "146.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d97bcac5cdc5a195a4813f1855a6bc658f240452aac36caa12fd6c6f16026ab1"
+checksum = "59b21777080203cb33828681f177e53402fa2927a1e2d17adead072b0c26b401"
 dependencies = [
  "bindgen",
  "bitflags 2.10.0",

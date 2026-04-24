@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_api::SharedAuthProvider;
 use codex_client::build_reqwest_client_with_custom_ca;
 use codex_config::types::McpServerEnvVar;
 use codex_exec_server::HttpClient;
@@ -109,7 +108,6 @@ enum TransportRecipe {
         env_http_headers: Option<HashMap<String, String>>,
         store_mode: OAuthCredentialsStoreMode,
         http_client: Arc<dyn HttpClient>,
-        auth_provider: Option<SharedAuthProvider>,
     },
 }
 
@@ -308,7 +306,6 @@ impl RmcpClient {
         env_http_headers: Option<HashMap<String, String>>,
         store_mode: OAuthCredentialsStoreMode,
         http_client: Arc<dyn HttpClient>,
-        auth_provider: Option<SharedAuthProvider>,
     ) -> Result<Self> {
         let transport_recipe = TransportRecipe::StreamableHttp {
             server_name: server_name.to_string(),
@@ -318,7 +315,6 @@ impl RmcpClient {
             env_http_headers,
             store_mode,
             http_client,
-            auth_provider,
         };
         let transport = Self::create_pending_transport(&transport_recipe).await?;
         Ok(Self {
@@ -671,25 +667,22 @@ impl RmcpClient {
                 env_http_headers,
                 store_mode,
                 http_client,
-                auth_provider,
             } => {
                 let default_headers =
                     build_default_headers(http_headers.clone(), env_http_headers.clone())?;
 
-                let initial_oauth_tokens = if bearer_token.is_none()
-                    && auth_provider.is_none()
-                    && !default_headers.contains_key(AUTHORIZATION)
-                {
-                    match load_oauth_tokens(server_name, url, *store_mode) {
-                        Ok(tokens) => tokens,
-                        Err(err) => {
-                            warn!("failed to read tokens for server `{server_name}`: {err}");
-                            None
+                let initial_oauth_tokens =
+                    if bearer_token.is_none() && !default_headers.contains_key(AUTHORIZATION) {
+                        match load_oauth_tokens(server_name, url, *store_mode) {
+                            Ok(tokens) => tokens,
+                            Err(err) => {
+                                warn!("failed to read tokens for server `{server_name}`: {err}");
+                                None
+                            }
                         }
-                    }
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
 
                 if let Some(initial_tokens) = initial_oauth_tokens.clone() {
                     match create_oauth_transport_and_runtime(
@@ -729,7 +722,6 @@ impl RmcpClient {
                                 StreamableHttpClientAdapter::new(
                                     Arc::clone(http_client),
                                     default_headers,
-                                    /*auth_provider*/ None,
                                 ),
                                 http_config,
                             );
@@ -745,11 +737,7 @@ impl RmcpClient {
                     }
 
                     let transport = StreamableHttpClientTransport::with_client(
-                        StreamableHttpClientAdapter::new(
-                            Arc::clone(http_client),
-                            default_headers,
-                            auth_provider.clone(),
-                        ),
+                        StreamableHttpClientAdapter::new(Arc::clone(http_client), default_headers),
                         http_config,
                     );
                     Ok(PendingTransport::StreamableHttp { transport })
@@ -970,7 +958,7 @@ async fn create_oauth_transport_and_runtime(
     };
 
     let auth_client = AuthClient::new(
-        StreamableHttpClientAdapter::new(http_client, default_headers, /*auth_provider*/ None),
+        StreamableHttpClientAdapter::new(http_client, default_headers),
         manager,
     );
     let auth_manager = auth_client.auth_manager.clone();
