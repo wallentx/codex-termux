@@ -21,10 +21,9 @@ pub use unix::EscalationSession;
 pub use unix::ExecParams;
 #[cfg(unix)]
 pub use unix::ExecResult;
-#[cfg(unix)]
-pub use unix::Permissions;
-#[cfg(unix)]
 pub use unix::PreparedExec;
+#[cfg(unix)]
+pub use unix::ResolvedPermissionProfile;
 #[cfg(unix)]
 pub use unix::ShellCommandExecutor;
 #[cfg(unix)]
