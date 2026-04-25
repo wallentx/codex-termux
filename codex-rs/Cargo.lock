@@ -2388,6 +2388,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-cache",
  "codex-utils-cargo-bin",
+ "codex-utils-file-lock",
  "codex-utils-home-dir",
  "codex-utils-image",
  "codex-utils-output-truncation",
