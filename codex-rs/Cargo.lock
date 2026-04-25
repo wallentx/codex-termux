@@ -2633,6 +2633,7 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "multimap",
  "pretty_assertions",
  "serde",
