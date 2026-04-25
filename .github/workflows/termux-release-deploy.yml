@@ -151,6 +151,7 @@ jobs:
             upstream_prerelease=true
           fi
           upstream_html_url="$(jq -r '.upstream_html_url // ""' "${metadata}")"
+          upstream_repo="$(jq -r '.upstream_repo // "openai/codex"' "${metadata}")"
           release_train="$(jq -r '.release_train // ""' "${metadata}")"
           if [[ -z "${upstream_tag}" || -z "${termux_tag}" ]]; then
             echo "Missing upstream_tag or termux_tag in ${metadata}" >&2
@@ -179,6 +180,7 @@ jobs:
             echo "termux_tag=${termux_tag}"
             echo "upstream_prerelease=${upstream_prerelease}"
             echo "upstream_html_url=${upstream_html_url}"
+            echo "upstream_repo=${upstream_repo}"
             echo "release_train=${release_train}"
             echo "release_exists=${release_exists}"
             echo "asset_exists=${asset_exists}"
@@ -338,6 +340,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           UPSTREAM_TAG: ${{ steps.metadata.outputs.upstream_tag }}
+          UPSTREAM_REPO: ${{ steps.metadata.outputs.upstream_repo }}
           UPSTREAM_NAME: ${{ steps.metadata.outputs.upstream_name }}
           TERMUX_TAG: ${{ steps.metadata.outputs.termux_tag }}
           UPSTREAM_PRERELEASE: ${{ steps.metadata.outputs.upstream_prerelease }}
@@ -350,6 +353,48 @@ jobs:
         run: |
           set -euo pipefail
           body_path="${RUNNER_TEMP}/release-body.md"
+          upstream_body_path="${RUNNER_TEMP}/upstream-release-body.md"
+          upstream_body_without_changelog_path="${RUNNER_TEMP}/upstream-release-body-without-changelog.md"
+          if gh release view "${UPSTREAM_TAG}" \
+            --repo "${UPSTREAM_REPO}" \
+            --json body \
+            --jq '.body // ""' > "${upstream_body_path}"; then
+            awk '
+              function heading_level(line, text) {
+                if (match(line, /^(#{1,6})[[:space:]]+(.+)$/, parts)) {
+                  text = tolower(parts[2])
+                  sub(/[[:space:]]+#+[[:space:]]*$/, "", text)
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", text)
+                  if (text == "changelog" || text == "change log") {
+                    return length(parts[1])
+                  }
+                }
+                return 0
+              }
+
+              {
+                if (!skip) {
+                  level = heading_level($0)
+                  if (level > 0) {
+                    skip = 1
+                    skip_level = level
+                    next
+                  }
+                  print
+                  next
+                }
+
+                if (match($0, /^(#{1,6})[[:space:]]+/, parts) && length(parts[1]) <= skip_level) {
+                  skip = 0
+                  print
+                }
+              }
+            ' "${upstream_body_path}" > "${upstream_body_without_changelog_path}"
+          else
+            echo "::warning title=Upstream release notes unavailable::Could not read ${UPSTREAM_REPO} release ${UPSTREAM_TAG}."
+            : > "${upstream_body_without_changelog_path}"
+          fi
+
           {
             echo "Termux Android build for ${UPSTREAM_TAG}."
             echo
@@ -357,9 +402,15 @@ jobs:
             echo "- Release train: \`${RELEASE_TRAIN}\`"
             echo "- Promoted PR: #${PR_NUMBER}"
             echo "- Promoted PR head SHA: \`${HEAD_SHA}\`"
-            echo
-            echo "This release promotes the exact Android artifact built by the PR check."
           } > "${body_path}"
+          if [[ -s "${upstream_body_without_changelog_path}" ]]; then
+            {
+              echo
+              echo "## Upstream release notes"
+              echo
+              cat "${upstream_body_without_changelog_path}"
+            } >> "${body_path}"
+          fi
 
           release_title="${UPSTREAM_NAME}"
           if [[ -z "${release_title}" || "${release_title}" == "null" ]]; then
