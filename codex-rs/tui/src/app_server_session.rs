@@ -154,7 +154,7 @@ pub(crate) struct ThreadSessionState {
     pub(crate) sandbox_policy: SandboxPolicy,
     /// Canonical active permissions when available. Consumers should prefer
     /// this over `sandbox_policy`; `None` means the session only has a legacy
-    /// sandbox projection.
+    /// sandbox projection or represents an external sandbox.
     pub(crate) permission_profile: Option<PermissionProfile>,
     pub(crate) cwd: AbsolutePathBuf,
     pub(crate) instruction_source_paths: Vec<AbsolutePathBuf>,
@@ -272,9 +272,6 @@ impl AppServerSession {
                     feedback_audience,
                     true,
                 )
-            }
-            Some(Account::AmazonBedrock {}) => {
-                (None, None, None, None, FeedbackAudience::External, false)
             }
             None => (None, None, None, None, FeedbackAudience::External, false),
         };
@@ -529,7 +526,6 @@ impl AppServerSession {
         approval_policy: AskForApproval,
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
         sandbox_policy: SandboxPolicy,
-        permission_profile: Option<PermissionProfile>,
         model: String,
         effort: Option<codex_protocol::openai_models::ReasoningEffort>,
         summary: Option<codex_protocol::config_types::ReasoningSummary>,
@@ -539,11 +535,13 @@ impl AppServerSession {
         output_schema: Option<serde_json::Value>,
     ) -> Result<TurnStartResponse> {
         let request_id = self.next_request_id();
-        let (sandbox_policy, permission_profile) = turn_start_permission_overrides(
-            self.thread_params_mode(),
-            sandbox_policy,
-            permission_profile,
-        );
+        let sandbox_policy = if self.is_remote()
+            || matches!(sandbox_policy, SandboxPolicy::ExternalSandbox { .. })
+        {
+            Some(sandbox_policy.into())
+        } else {
+            None
+        };
         self.client
             .request_typed(ClientRequest::TurnStart {
                 request_id,
@@ -555,8 +553,11 @@ impl AppServerSession {
                     cwd: Some(cwd),
                     approval_policy: Some(approval_policy.into()),
                     approvals_reviewer: Some(approvals_reviewer.into()),
+                    // Embedded sessions already installed their full profile
+                    // at thread start/resume/fork. Avoid sending a lossy
+                    // legacy projection until user turns carry profiles.
                     sandbox_policy,
-                    permission_profile,
+                    permission_profile: None,
                     model: Some(model),
                     service_tier,
                     effort,
@@ -1045,23 +1046,6 @@ fn sandbox_mode_from_policy(
     }
 }
 
-fn turn_start_permission_overrides(
-    mode: ThreadParamsMode,
-    sandbox_policy: SandboxPolicy,
-    permission_profile: Option<PermissionProfile>,
-) -> (
-    Option<codex_app_server_protocol::SandboxPolicy>,
-    Option<codex_app_server_protocol::PermissionProfile>,
-) {
-    match (mode, permission_profile) {
-        (ThreadParamsMode::Embedded, Some(permission_profile)) => {
-            (None, Some(permission_profile.into()))
-        }
-        (ThreadParamsMode::Embedded, None) => (None, None),
-        (ThreadParamsMode::Remote, _) => (Some(sandbox_policy.into()), None),
-    }
-}
-
 fn permission_profile_override_from_config(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
@@ -1070,7 +1054,14 @@ fn permission_profile_override_from_config(
         return None;
     }
 
-    Some(config.permissions.permission_profile().into())
+    if matches!(
+        config.permissions.sandbox_policy.get(),
+        SandboxPolicy::ExternalSandbox { .. }
+    ) {
+        None
+    } else {
+        Some(config.permissions.permission_profile().into())
+    }
 }
 
 fn thread_start_params_from_config(
@@ -1539,55 +1530,6 @@ mod tests {
         assert_eq!(fork.permission_profile, None);
     }
 
-    #[test]
-    fn turn_start_permission_overrides_send_profiles_only_for_embedded_runtime_overrides() {
-        let workspace_write = SandboxPolicy::new_workspace_write_policy();
-        let workspace_write_profile =
-            PermissionProfile::from_legacy_sandbox_policy(&workspace_write);
-
-        let (sandbox, profile) = turn_start_permission_overrides(
-            ThreadParamsMode::Embedded,
-            workspace_write.clone(),
-            Some(workspace_write_profile.clone()),
-        );
-        assert_eq!(sandbox, None);
-        assert_eq!(profile, Some(workspace_write_profile.into()));
-
-        let (sandbox, profile) = turn_start_permission_overrides(
-            ThreadParamsMode::Embedded,
-            workspace_write.clone(),
-            /*permission_profile*/ None,
-        );
-        assert_eq!(sandbox, None);
-        assert_eq!(profile, None);
-
-        let (sandbox, profile) = turn_start_permission_overrides(
-            ThreadParamsMode::Remote,
-            workspace_write.clone(),
-            Some(PermissionProfile::from_legacy_sandbox_policy(
-                &workspace_write,
-            )),
-        );
-        assert_eq!(sandbox, Some(workspace_write.into()));
-        assert_eq!(profile, None);
-
-        let external_sandbox = SandboxPolicy::ExternalSandbox {
-            network_access: codex_protocol::protocol::NetworkAccess::Restricted,
-        };
-        let (sandbox, profile) = turn_start_permission_overrides(
-            ThreadParamsMode::Embedded,
-            external_sandbox.clone(),
-            Some(PermissionProfile::from_legacy_sandbox_policy(
-                &external_sandbox,
-            )),
-        );
-        assert_eq!(sandbox, None);
-        assert_eq!(
-            profile,
-            Some(PermissionProfile::from_legacy_sandbox_policy(&external_sandbox).into())
-        );
-    }
-
     #[tokio::test]
     async fn thread_fork_params_forward_instruction_overrides() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1669,6 +1611,7 @@ mod tests {
             permission_profile: Some(
                 codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
                     &codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
+                    &test_path_buf("/tmp/project"),
                 )
                 .into(),
             ),
@@ -1717,6 +1660,7 @@ mod tests {
             SandboxPolicy::new_read_only_policy(),
             Some(PermissionProfile::from_legacy_sandbox_policy(
                 &SandboxPolicy::new_read_only_policy(),
+                std::path::Path::new("/tmp/project"),
             )),
             test_path_buf("/tmp/project").abs(),
             Vec::new(),
@@ -1750,6 +1694,7 @@ mod tests {
             SandboxPolicy::new_read_only_policy(),
             Some(PermissionProfile::from_legacy_sandbox_policy(
                 &SandboxPolicy::new_read_only_policy(),
+                std::path::Path::new("/tmp/project"),
             )),
             test_path_buf("/tmp/project").abs(),
             Vec::new(),

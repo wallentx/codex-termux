@@ -427,7 +427,6 @@ mod phase2 {
     use chrono::Duration as ChronoDuration;
     use chrono::Utc;
     use codex_config::Constrained;
-    use codex_config::types::McpServerConfig;
     use codex_features::Feature;
     use codex_login::CodexAuth;
     use codex_protocol::AgentPath;
@@ -441,7 +440,6 @@ mod phase2 {
     use codex_state::Phase2JobClaimOutcome;
     use codex_state::Stage1Output;
     use codex_state::ThreadMetadataBuilder;
-    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -472,10 +470,6 @@ mod phase2 {
 
     impl DispatchHarness {
         async fn new() -> Self {
-            Self::new_with_config(|_| {}).await
-        }
-
-        async fn new_with_config(configure: impl FnOnce(&mut Config)) -> Self {
             let codex_home = tempfile::tempdir().expect("create temp codex home");
             let mut config = test_config().await;
             config.codex_home =
@@ -484,7 +478,6 @@ mod phase2 {
             config.cwd = config.codex_home.clone();
             config.permissions.file_system_sandbox_policy = FileSystemSandboxPolicy::unrestricted();
             config.permissions.network_sandbox_policy = NetworkSandboxPolicy::Enabled;
-            configure(&mut config);
             let config = Arc::new(config);
 
             let state_db = codex_state::StateRuntime::init(
@@ -649,24 +642,7 @@ mod phase2 {
 
     #[tokio::test]
     async fn dispatch_reclaims_stale_global_lock_and_starts_consolidation() {
-        let harness = DispatchHarness::new_with_config(|config| {
-            let server: McpServerConfig =
-                toml::from_str("command = \"docs-server\"").expect("deserialize MCP server");
-            config
-                .mcp_servers
-                .set(HashMap::from([("docs".to_string(), server)]))
-                .expect("parent MCP servers are configurable");
-            config
-                .features
-                .enable(Feature::Apps)
-                .expect("apps feature is configurable");
-            config
-                .features
-                .enable(Feature::Plugins)
-                .expect("plugins feature is configurable");
-            config.include_apps_instructions = true;
-        })
-        .await;
+        let harness = DispatchHarness::new().await;
         harness.seed_stage1_output(Utc::now().timestamp()).await;
 
         let stale_claim = harness
@@ -742,7 +718,7 @@ mod phase2 {
         let turn_context = subagent.codex.session.new_default_turn().await;
         pretty_assertions::assert_eq!(
             turn_context.file_system_sandbox_policy,
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+            FileSystemSandboxPolicy::from_legacy_sandbox_policy(
                 &config_snapshot.sandbox_policy,
                 config_snapshot.cwd.as_path(),
             ),
@@ -774,33 +750,6 @@ mod phase2 {
         assert!(
             !turn_context.features.enabled(Feature::MemoryTool),
             "consolidation subagent should have the memories feature disabled"
-        );
-        assert!(
-            turn_context.config.mcp_servers.get().is_empty(),
-            "consolidation subagent should not inherit configured MCP servers"
-        );
-        assert!(
-            !subagent
-                .codex
-                .session
-                .services
-                .mcp_connection_manager
-                .read()
-                .await
-                .has_servers(),
-            "consolidation subagent should not initialize MCP servers"
-        );
-        assert!(
-            !turn_context.features.enabled(Feature::Apps),
-            "consolidation subagent should not expose app-backed MCP"
-        );
-        assert!(
-            !turn_context.features.enabled(Feature::Plugins),
-            "consolidation subagent should not expose plugin-backed MCP"
-        );
-        assert!(
-            !turn_context.config.include_apps_instructions,
-            "consolidation subagent should not include apps instructions"
         );
         assert!(
             !turn_context.config.memories.generate_memories,

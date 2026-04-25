@@ -61,7 +61,6 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
-use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
@@ -1644,10 +1643,7 @@ async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<
         auto_review.approvals_reviewer
     );
     assert_eq!(app.runtime_approval_policy_override, None);
-    assert_eq!(
-        app.runtime_sandbox_policy_override,
-        Some(auto_review.sandbox_policy.clone())
-    );
+    assert_eq!(app.runtime_sandbox_policy_override, None);
     assert_eq!(
         op_rx.try_recv(),
         Ok(Op::OverrideTurnContext {
@@ -2218,6 +2214,7 @@ async fn inactive_thread_approval_bubbles_into_active_view() -> Result<()> {
                 sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
                 permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
                     &SandboxPolicy::new_workspace_write_policy(),
+                    std::path::Path::new("/tmp/agent"),
                 )),
                 rollout_path: Some(test_path_buf("/tmp/agent-rollout.jsonl")),
                 ..test_thread_session(agent_thread_id, test_path_buf("/tmp/agent"))
@@ -2380,6 +2377,7 @@ async fn side_defers_subagent_approval_overlay_until_side_exits() -> Result<()> 
                 sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
                 permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
                     &SandboxPolicy::new_workspace_write_policy(),
+                    std::path::Path::new("/tmp/agent"),
                 )),
                 rollout_path: Some(test_path_buf("/tmp/agent-rollout.jsonl")),
                 ..test_thread_session(agent_thread_id, test_path_buf("/tmp/agent"))
@@ -2475,7 +2473,7 @@ async fn inactive_thread_exec_approval_preserves_context() {
     );
     assert_eq!(
         additional_permissions,
-        Some(CoreAdditionalPermissionProfile {
+        Some(PermissionProfile {
             network: Some(NetworkPermissions {
                 enabled: Some(true),
             }),
@@ -2605,6 +2603,7 @@ async fn inactive_thread_approval_badge_clears_after_turn_completion_notificatio
                 sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
                 permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
                     &SandboxPolicy::new_workspace_write_policy(),
+                    std::path::Path::new("/tmp/agent"),
                 )),
                 rollout_path: Some(test_path_buf("/tmp/agent-rollout.jsonl")),
                 ..test_thread_session(agent_thread_id, test_path_buf("/tmp/agent"))
@@ -2661,6 +2660,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
         sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
         permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
             &SandboxPolicy::new_workspace_write_policy(),
+            std::path::Path::new("/tmp/main"),
         )),
         ..test_thread_session(main_thread_id, test_path_buf("/tmp/main"))
     };
@@ -2776,6 +2776,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
         sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
         permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
             &SandboxPolicy::new_workspace_write_policy(),
+            std::path::Path::new("/tmp/main"),
         )),
         ..test_thread_session(main_thread_id, test_path_buf("/tmp/main"))
     };
@@ -2847,6 +2848,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
         sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
         permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
             &SandboxPolicy::new_workspace_write_policy(),
+            std::path::Path::new("/tmp/main"),
         )),
         ..test_thread_session(main_thread_id, test_path_buf("/tmp/main"))
     };
@@ -3748,6 +3750,7 @@ fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState 
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
             &SandboxPolicy::new_read_only_policy(),
+            cwd.as_path(),
         )),
         cwd: cwd.abs(),
         instruction_source_paths: Vec::new(),

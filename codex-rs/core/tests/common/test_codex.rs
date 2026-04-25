@@ -663,7 +663,6 @@ impl TestCodex {
                 approval_policy,
                 approvals_reviewer: None,
                 sandbox_policy,
-                permission_profile: None,
                 model: session_model,
                 effort: None,
                 summary: None,

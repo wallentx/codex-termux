@@ -98,7 +98,6 @@ pub(crate) async fn create_client(base_url: &str) -> anyhow::Result<RmcpClient> 
         /*env_http_headers*/ None,
         OAuthCredentialsStoreMode::File,
         Environment::default_for_tests().get_http_client(),
-        /*auth_provider*/ None,
     )
     .await?;
 
@@ -136,7 +135,6 @@ pub(crate) async fn create_remote_client(
         /*env_http_headers*/ None,
         OAuthCredentialsStoreMode::File,
         Arc::new(http_client),
-        /*auth_provider*/ None,
     )
     .await?;
 

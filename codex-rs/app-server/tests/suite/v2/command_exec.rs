@@ -256,18 +256,17 @@ async fn command_exec_permission_profile_cwd_uses_command_cwd() -> Result<()> {
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let mut permission_profile = root_read_only_permission_profile();
-    let PermissionProfile::Managed { file_system, .. } = &mut permission_profile else {
-        panic!("root read-only helper should use managed permissions");
-    };
-    let PermissionProfileFileSystemPermissions::Restricted { entries, .. } = file_system else {
-        panic!("root read-only helper should use restricted filesystem permissions");
-    };
-    entries.push(FileSystemSandboxEntry {
-        path: FileSystemPath::Special {
-            value: FileSystemSpecialPath::CurrentWorkingDirectory,
-        },
-        access: FileSystemAccessMode::Write,
-    });
+    permission_profile
+        .file_system
+        .as_mut()
+        .expect("root read-only helper should include filesystem permissions")
+        .entries
+        .push(FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::CurrentWorkingDirectory,
+            },
+            access: FileSystemAccessMode::Write,
+        });
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -1062,9 +1061,11 @@ fn decode_delta_notification(
 }
 
 fn root_read_only_permission_profile() -> PermissionProfile {
-    PermissionProfile::Managed {
-        network: PermissionProfileNetworkPermissions { enabled: false },
-        file_system: PermissionProfileFileSystemPermissions::Restricted {
+    PermissionProfile {
+        network: Some(PermissionProfileNetworkPermissions {
+            enabled: Some(false),
+        }),
+        file_system: Some(PermissionProfileFileSystemPermissions {
             entries: vec![FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
                     value: FileSystemSpecialPath::Root,
@@ -1072,7 +1073,7 @@ fn root_read_only_permission_profile() -> PermissionProfile {
                 access: FileSystemAccessMode::Read,
             }],
             glob_scan_max_depth: None,
-        },
+        }),
     }
 }
 

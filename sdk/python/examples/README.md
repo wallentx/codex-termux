@@ -15,8 +15,10 @@ All examples intentionally use only public SDK exports from `codex_app_server`.
 Recommended setup (from `sdk/python`):
 
 ```bash
-uv sync
+python -m venv .venv
 source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e .
 ```
 
 When running examples from this repo checkout, the SDK source uses the local

@@ -305,6 +305,7 @@ mod tests {
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: Some(PermissionProfile::from_legacy_sandbox_policy(
                 &SandboxPolicy::new_read_only_policy(),
+                cwd.as_path(),
             )),
             cwd: cwd.abs(),
             instruction_source_paths: Vec::new(),

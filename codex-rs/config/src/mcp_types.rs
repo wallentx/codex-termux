@@ -176,11 +176,7 @@ pub struct McpServerConfig {
     pub tools: HashMap<String, McpServerToolConfig>,
 }
 
-/// Raw MCP config shape used for deserialization and supported-field JSON
-/// Schema generation.
-///
-/// Fields that are accepted only to produce targeted validation errors should
-/// be skipped in the generated schema.
+/// Raw MCP config shape used for deserialization and JSON Schema generation.
 ///
 /// Keep `TryFrom<RawMcpServerConfig> for McpServerConfig` exhaustively
 /// destructuring this struct so new TOML fields cannot be added here without
@@ -204,7 +200,6 @@ pub struct RawMcpServerConfig {
 
     // streamable_http
     pub url: Option<String>,
-    #[schemars(skip)]
     pub bearer_token: Option<String>,
     pub bearer_token_env_var: Option<String>,
 

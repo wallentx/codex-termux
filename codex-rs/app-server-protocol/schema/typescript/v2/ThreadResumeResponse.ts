@@ -26,6 +26,8 @@ approvalsReviewer: ApprovalsReviewer,
  */
 sandbox: SandboxPolicy,
 /**
- * Canonical active permissions view for this thread.
+ * Canonical active permissions view for this thread when representable.
+ * This is `null` for external sandbox policies because external
+ * enforcement cannot be round-tripped as a `PermissionProfile`.
  */
 permissionProfile: PermissionProfile | null, reasoningEffort: ReasoningEffort | null, };

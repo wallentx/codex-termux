@@ -517,10 +517,10 @@ pub(crate) fn parse_guardian_assessment(text: Option<&str>) -> anyhow::Result<Gu
         .filter(|rationale| !rationale.trim().is_empty())
         .unwrap_or_else(|| match outcome {
             super::GuardianAssessmentOutcome::Allow => {
-                "Auto-review returned a low-risk allow decision.".to_string()
+                "Guardian returned a low-risk allow decision.".to_string()
             }
             super::GuardianAssessmentOutcome::Deny => {
-                "Auto-review returned a deny decision without a rationale.".to_string()
+                "Guardian returned a deny decision without a rationale.".to_string()
             }
         });
 

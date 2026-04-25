@@ -38,7 +38,7 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
-use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxablePreference;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
@@ -61,7 +61,7 @@ pub struct UnifiedExecRequest {
     pub network: Option<NetworkProxy>,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
-    pub additional_permissions: Option<AdditionalPermissionProfile>,
+    pub additional_permissions: Option<PermissionProfile>,
     #[cfg(unix)]
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
@@ -76,7 +76,7 @@ pub struct UnifiedExecApprovalKey {
     pub cwd: AbsolutePathBuf,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
-    pub additional_permissions: Option<AdditionalPermissionProfile>,
+    pub additional_permissions: Option<PermissionProfile>,
 }
 
 /// Runtime adapter that keeps policy and sandbox orchestration on the

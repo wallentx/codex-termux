@@ -77,6 +77,7 @@ use codex_login::auth::ExternalAuth;
 use codex_login::auth::ExternalAuthRefreshContext;
 use codex_login::auth::ExternalAuthRefreshReason;
 use codex_login::auth::ExternalAuthTokens;
+use codex_login::default_client::DEFAULT_ORIGINATOR;
 use codex_login::default_client::SetOriginatorError;
 use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
@@ -95,6 +96,7 @@ use tokio::time::timeout;
 use tracing::Instrument;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+const TUI_CLIENT_NAME: &str = "codex-tui";
 
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
@@ -325,8 +327,7 @@ impl MessageProcessor {
             thread_manager.clone(),
             analytics_events_client.clone(),
         );
-        let device_key_api =
-            DeviceKeyApi::new(config.sqlite_home.clone(), config.model_provider_id.clone());
+        let device_key_api = DeviceKeyApi::default();
         let external_agent_config_api =
             ExternalAgentConfigApi::new(config.codex_home.to_path_buf());
         let fs_api = FsApi::new(
@@ -363,7 +364,7 @@ impl MessageProcessor {
         self: &Arc<Self>,
         connection_id: ConnectionId,
         request: JSONRPCRequest,
-        transport: &AppServerTransport,
+        transport: AppServerTransport,
         session: Arc<ConnectionSessionState>,
     ) {
         let request_method = request.method.as_str();
@@ -651,7 +652,11 @@ impl MessageProcessor {
                     .await;
                 return;
             }
-            let originator = name.clone();
+            let originator = if name == TUI_CLIENT_NAME {
+                DEFAULT_ORIGINATOR.to_string()
+            } else {
+                name.clone()
+            };
             let user_agent_suffix = format!("{name}; {version}");
             let codex_home = self.config.codex_home.clone();
             if session
@@ -883,7 +888,8 @@ impl MessageProcessor {
                     },
                     params,
                     device_key_requests_allowed,
-                );
+                )
+                .await;
             }
             ClientRequest::DeviceKeyPublic { request_id, params } => {
                 self.handle_device_key_public(
@@ -893,7 +899,8 @@ impl MessageProcessor {
                     },
                     params,
                     device_key_requests_allowed,
-                );
+                )
+                .await;
             }
             ClientRequest::DeviceKeySign { request_id, params } => {
                 self.handle_device_key_sign(
@@ -903,7 +910,8 @@ impl MessageProcessor {
                     },
                     params,
                     device_key_requests_allowed,
-                );
+                )
+                .await;
             }
             ClientRequest::FsReadFile { request_id, params } => {
                 self.handle_fs_read_file(
@@ -1076,7 +1084,7 @@ impl MessageProcessor {
         let auth = self.auth_manager.auth().await;
         if !config.features.apps_enabled_for_auth(
             auth.as_ref()
-                .is_some_and(codex_login::CodexAuth::uses_codex_backend),
+                .is_some_and(codex_login::CodexAuth::is_chatgpt_auth),
         ) {
             return;
         }
@@ -1171,81 +1179,96 @@ impl MessageProcessor {
         }
     }
 
-    fn handle_device_key_create(
+    async fn handle_device_key_create(
         &self,
         request_id: ConnectionRequestId,
         params: DeviceKeyCreateParams,
         device_key_requests_allowed: bool,
     ) {
-        self.spawn_device_key_request(
-            request_id,
-            "device/key/create",
-            device_key_requests_allowed,
-            move |device_key_api| async move { device_key_api.create(params).await },
-        );
+        if self
+            .reject_device_key_request_over_remote_transport(
+                request_id.clone(),
+                "device/key/create",
+                device_key_requests_allowed,
+            )
+            .await
+        {
+            return;
+        }
+
+        match self.device_key_api.create(params) {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
     }
 
-    fn handle_device_key_public(
+    async fn handle_device_key_public(
         &self,
         request_id: ConnectionRequestId,
         params: DeviceKeyPublicParams,
         device_key_requests_allowed: bool,
     ) {
-        self.spawn_device_key_request(
-            request_id,
-            "device/key/public",
-            device_key_requests_allowed,
-            move |device_key_api| async move { device_key_api.public(params).await },
-        );
+        if self
+            .reject_device_key_request_over_remote_transport(
+                request_id.clone(),
+                "device/key/public",
+                device_key_requests_allowed,
+            )
+            .await
+        {
+            return;
+        }
+
+        match self.device_key_api.public(params) {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
     }
 
-    fn handle_device_key_sign(
+    async fn handle_device_key_sign(
         &self,
         request_id: ConnectionRequestId,
         params: DeviceKeySignParams,
         device_key_requests_allowed: bool,
     ) {
-        self.spawn_device_key_request(
-            request_id,
-            "device/key/sign",
-            device_key_requests_allowed,
-            move |device_key_api| async move { device_key_api.sign(params).await },
-        );
+        if self
+            .reject_device_key_request_over_remote_transport(
+                request_id.clone(),
+                "device/key/sign",
+                device_key_requests_allowed,
+            )
+            .await
+        {
+            return;
+        }
+
+        match self.device_key_api.sign(params) {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
     }
 
-    fn spawn_device_key_request<R, F, Fut>(
+    async fn reject_device_key_request_over_remote_transport(
         &self,
         request_id: ConnectionRequestId,
-        method: &'static str,
+        method: &str,
         device_key_requests_allowed: bool,
-        run_request: F,
-    ) where
-        R: serde::Serialize + Send + 'static,
-        F: FnOnce(DeviceKeyApi) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<R, JSONRPCErrorError>> + Send + 'static,
-    {
-        let device_key_api = self.device_key_api.clone();
-        let outgoing = Arc::clone(&self.outgoing);
-        tokio::spawn(async move {
-            if !device_key_requests_allowed {
-                outgoing
-                    .send_error(
-                        request_id,
-                        JSONRPCErrorError {
-                            code: INVALID_REQUEST_ERROR_CODE,
-                            message: format!("{method} is not available over remote transports"),
-                            data: None,
-                        },
-                    )
-                    .await;
-                return;
-            }
+    ) -> bool {
+        if device_key_requests_allowed {
+            return false;
+        }
 
-            match run_request(device_key_api).await {
-                Ok(response) => outgoing.send_response(request_id, response).await,
-                Err(error) => outgoing.send_error(request_id, error).await,
-            }
-        });
+        self.outgoing
+            .send_error(
+                request_id,
+                JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message: format!("{method} is not available over remote transports"),
+                    data: None,
+                },
+            )
+            .await;
+        true
     }
 
     async fn handle_external_agent_config_detect(

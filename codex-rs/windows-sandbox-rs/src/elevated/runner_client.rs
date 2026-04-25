@@ -52,6 +52,7 @@ impl RunnerTransport {
     }
 
     pub(crate) fn read_spawn_ready(&mut self) -> Result<()> {
+        wait_for_complete_frame(&self.pipe_read, RUNNER_SPAWN_READY_TIMEOUT)?;
         let msg = read_frame(&mut self.pipe_read)?
             .ok_or_else(|| anyhow::anyhow!("runner pipe closed before spawn_ready"))?;
         match msg.message {
@@ -61,11 +62,6 @@ impl RunnerTransport {
                 "expected spawn_ready from runner, got {other:?}"
             )),
         }
-    }
-
-    pub(crate) fn read_spawn_ready_with_timeout(&mut self) -> Result<()> {
-        wait_for_complete_frame(&self.pipe_read, RUNNER_SPAWN_READY_TIMEOUT)?;
-        self.read_spawn_ready()
     }
 
     pub(crate) fn into_files(self) -> (File, File) {
@@ -138,11 +134,10 @@ pub(crate) fn spawn_runner_transport(
         }
         return Err(anyhow::anyhow!("CreateProcessWithLogonW failed: {err}"));
     }
-    let expected_runner_pid = pi.dwProcessId;
 
     let connect_result = (|| -> Result<()> {
-        connect_pipe(h_pipe_in, expected_runner_pid)?;
-        connect_pipe(h_pipe_out, expected_runner_pid)?;
+        connect_pipe(h_pipe_in)?;
+        connect_pipe(h_pipe_out)?;
         Ok(())
     })();
 

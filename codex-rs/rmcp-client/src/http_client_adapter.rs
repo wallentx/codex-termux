@@ -11,7 +11,6 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use codex_api::SharedAuthProvider;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::HttpClient;
 use codex_exec_server::HttpHeader;
@@ -44,7 +43,6 @@ const NON_JSON_RESPONSE_BODY_PREVIEW_BYTES: usize = 8_192;
 pub(crate) struct StreamableHttpClientAdapter {
     http_client: Arc<dyn HttpClient>,
     default_headers: HeaderMap,
-    auth_provider: Option<SharedAuthProvider>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,15 +56,10 @@ pub(crate) enum StreamableHttpClientAdapterError {
 }
 
 impl StreamableHttpClientAdapter {
-    pub(crate) fn new(
-        http_client: Arc<dyn HttpClient>,
-        default_headers: HeaderMap,
-        auth_provider: Option<SharedAuthProvider>,
-    ) -> Self {
+    pub(crate) fn new(http_client: Arc<dyn HttpClient>, default_headers: HeaderMap) -> Self {
         Self {
             http_client,
             default_headers,
-            auth_provider,
         }
     }
 }
@@ -82,7 +75,6 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         auth_token: Option<String>,
     ) -> std::result::Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let mut headers = self.default_headers.clone();
-        self.add_auth_headers(&mut headers);
         insert_header(
             &mut headers,
             ACCEPT,
@@ -179,7 +171,6 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         auth_token: Option<String>,
     ) -> std::result::Result<(), StreamableHttpError<Self::Error>> {
         let mut headers = self.default_headers.clone();
-        self.add_auth_headers(&mut headers);
         if let Some(auth_token) = auth_token {
             insert_header(
                 &mut headers,
@@ -232,7 +223,6 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         StreamableHttpError<Self::Error>,
     > {
         let mut headers = self.default_headers.clone();
-        self.add_auth_headers(&mut headers);
         insert_header(
             &mut headers,
             ACCEPT,
@@ -304,14 +294,6 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         }
 
         Ok(sse_stream_from_body(body_stream))
-    }
-}
-
-impl StreamableHttpClientAdapter {
-    fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        if let Some(auth_provider) = &self.auth_provider {
-            headers.extend(auth_provider.to_auth_headers());
-        }
     }
 }
 

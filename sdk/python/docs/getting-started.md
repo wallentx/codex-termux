@@ -10,14 +10,12 @@ From repo root:
 
 ```bash
 cd sdk/python
-uv sync
-source .venv/bin/activate
+python -m pip install -e .
 ```
 
 Requirements:
 
 - Python `>=3.10`
-- uv
 - installed `openai-codex-cli-bin` runtime package, or an explicit `codex_bin` override
 - local Codex auth/session configured
 

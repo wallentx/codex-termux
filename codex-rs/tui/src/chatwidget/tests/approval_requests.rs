@@ -133,7 +133,7 @@ fn app_server_exec_approval_request_preserves_permissions_context() {
     );
     assert_eq!(
         request.additional_permissions,
-        Some(codex_protocol::models::AdditionalPermissionProfile {
+        Some(PermissionProfile {
             network: Some(NetworkPermissions {
                 enabled: Some(true),
             }),

@@ -68,7 +68,7 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
     };
     append_error_log(format!("startup: base_url={base_url} path_style={style}"));
 
-    let auth_manager = util::load_auth_manager(Some(base_url.clone())).await;
+    let auth_manager = util::load_auth_manager().await;
     let auth = match auth_manager.as_ref() {
         Some(manager) => manager.auth().await,
         None => None,
@@ -87,17 +87,23 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
         append_error_log(format!("auth: mode=ChatGPT account_id={acc}"));
     }
 
-    if !auth.uses_codex_backend() {
-        eprintln!(
-            "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
-        );
-        std::process::exit(1);
-    }
+    let token = match auth.get_token() {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!(
+                "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
+            );
+            std::process::exit(1);
+        }
+    };
 
-    let auth_provider = codex_model_provider::auth_provider_from_auth(&auth);
-    http = http.with_auth_provider(auth_provider);
-    if let Some(acc) = auth.get_account_id() {
+    http = http.with_bearer_token(token.clone());
+    if let Some(acc) = auth
+        .get_account_id()
+        .or_else(|| util::extract_chatgpt_account_id(&token))
+    {
         append_error_log(format!("auth: set ChatGPT-Account-Id header: {acc}"));
+        http = http.with_chatgpt_account_id(acc);
     }
 
     Ok(BackendContext {

@@ -1,6 +1,6 @@
-use crate::models::AdditionalPermissionProfile;
 use crate::models::FileSystemPermissions;
 use crate::models::NetworkPermissions;
+use crate::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -28,7 +28,7 @@ impl RequestPermissionProfile {
     }
 }
 
-impl From<RequestPermissionProfile> for AdditionalPermissionProfile {
+impl From<RequestPermissionProfile> for PermissionProfile {
     fn from(value: RequestPermissionProfile) -> Self {
         Self {
             network: value.network,
@@ -37,8 +37,8 @@ impl From<RequestPermissionProfile> for AdditionalPermissionProfile {
     }
 }
 
-impl From<AdditionalPermissionProfile> for RequestPermissionProfile {
-    fn from(value: AdditionalPermissionProfile) -> Self {
+impl From<PermissionProfile> for RequestPermissionProfile {
+    fn from(value: PermissionProfile) -> Self {
         Self {
             network: value.network,
             file_system: value.file_system,
