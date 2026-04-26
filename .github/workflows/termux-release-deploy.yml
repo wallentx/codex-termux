@@ -477,16 +477,45 @@ jobs:
           git checkout -B "${checkpoint_branch}" "origin/${DESTINATION_BRANCH}"
 
           if ! git merge --no-ff --no-edit "${SOURCE_SHA}"; then
+            is_release_only_checkpoint_path() {
+              case "$1" in
+                .github/workflows/rust-release.yml|\
+                .github/workflows/shell-tool-mcp.yml|\
+                .github/workflows/termux-release-checkpoint.yml|\
+                .github/workflows/termux-release-deploy.yml|\
+                .github/workflows/termux-release-promote.yml|\
+                .github/termux-release.json)
+                  return 0
+                  ;;
+                *)
+                  return 1
+                  ;;
+              esac
+            }
+
             mapfile -t conflicted_paths < <(git diff --name-only --diff-filter=U)
-            if [[ "${#conflicted_paths[@]}" -eq 1 && "${conflicted_paths[0]}" == "codex-rs/Cargo.toml" ]]; then
+            for conflicted_path in "${conflicted_paths[@]}"; do
+              if is_release_only_checkpoint_path "${conflicted_path}"; then
+                echo "Auto-resolving release-only checkpoint conflict in ${conflicted_path} by keeping ${DESTINATION_BRANCH}."
+                git checkout --ours -- "${conflicted_path}"
+                git add "${conflicted_path}"
+              fi
+            done
+
+            mapfile -t remaining_conflicts < <(git diff --name-only --diff-filter=U)
+            if [[ "${#remaining_conflicts[@]}" -eq 1 && "${remaining_conflicts[0]}" == "codex-rs/Cargo.toml" ]]; then
               echo "Auto-resolving recurring codex-rs/Cargo.toml checkpoint conflict by keeping ${SOURCE_BRANCH}."
               git checkout --theirs -- codex-rs/Cargo.toml
               git add codex-rs/Cargo.toml
+            fi
+
+            mapfile -t remaining_conflicts < <(git diff --name-only --diff-filter=U)
+            if [[ "${#remaining_conflicts[@]}" -eq 0 ]]; then
               git commit --no-edit
             else
               merge_conflicted=true
               conflict_summary="$(
-                printf '%s\n' "${conflicted_paths[@]}" | sed 's/^/- `&`/'
+                printf '%s\n' "${remaining_conflicts[@]}" | sed 's/^/- `&`/'
               )"
               echo "Automatic checkpoint merge failed; creating a manual-resolution PR instead." >&2
               if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
