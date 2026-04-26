@@ -1833,12 +1833,25 @@ impl ChatWidget {
     }
 
     fn flush_answer_stream_with_separator(&mut self) {
-        if let Some(mut controller) = self.stream_controller.take()
-            && let Some(cell) = controller.finalize()
-        {
-            self.add_boxed_history(cell);
+        let had_stream_controller = self.stream_controller.is_some();
+        if let Some(mut controller) = self.stream_controller.take() {
+            let (cell, source) = controller.finalize();
+            if let Some(cell) = cell {
+                self.add_boxed_history(cell);
+            }
+            // Consolidate the run of streaming AgentMessageCells into a single AgentMarkdownCell
+            // that can re-render from source on resize.
+            if let Some(source) = source {
+                self.app_event_tx.send(AppEvent::ConsolidateAgentMessage {
+                    source,
+                    cwd: self.config.cwd.to_path_buf(),
+                });
+            }
         }
         self.adaptive_chunking.reset();
+        if had_stream_controller && self.stream_controllers_idle() {
+            self.app_event_tx.send(AppEvent::StopCommitAnimation);
+        }
     }
 
     fn stream_controllers_idle(&self) -> bool {
@@ -2419,7 +2432,7 @@ impl ChatWidget {
 
         if self.plan_stream_controller.is_none() {
             self.plan_stream_controller = Some(PlanStreamController::new(
-                self.last_rendered_width.get().map(|w| w.saturating_sub(4)),
+                self.current_stream_width(/*reserved_cols*/ 4),
                 &self.config.cwd,
             ));
         }
@@ -2449,18 +2462,25 @@ impl ChatWidget {
         self.plan_delta_buffer.clear();
         self.plan_item_active = false;
         self.saw_plan_item_this_turn = true;
-        let finalized_streamed_cell =
+        let (finalized_streamed_cell, consolidated_plan_source) =
             if let Some(mut controller) = self.plan_stream_controller.take() {
                 controller.finalize()
             } else {
-                None
+                (None, None)
             };
         if let Some(cell) = finalized_streamed_cell {
             self.add_boxed_history(cell);
             // TODO: Replace streamed output with the final plan item text if plan streaming is
             // removed or if we need to reconcile mismatches between streamed and final content.
+            if let Some(source) = consolidated_plan_source {
+                self.app_event_tx
+                    .send(AppEvent::ConsolidateProposedPlan(source));
+            }
         } else if !plan_text.is_empty() {
             self.add_to_history(history_cell::new_proposed_plan(plan_text, &self.config.cwd));
+        } else if let Some(source) = consolidated_plan_source {
+            self.app_event_tx
+                .send(AppEvent::ConsolidateProposedPlan(source));
         }
         if should_restore_after_stream {
             self.pending_status_indicator_restore = true;
@@ -2577,10 +2597,15 @@ impl ChatWidget {
         self.saw_copy_source_this_turn = false;
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
-        if let Some(mut controller) = self.plan_stream_controller.take()
-            && let Some(cell) = controller.finalize()
-        {
-            self.add_boxed_history(cell);
+        if let Some(mut controller) = self.plan_stream_controller.take() {
+            let (cell, source) = controller.finalize();
+            if let Some(cell) = cell {
+                self.add_boxed_history(cell);
+            }
+            if let Some(source) = source {
+                self.app_event_tx
+                    .send(AppEvent::ConsolidateProposedPlan(source));
+            }
         }
         self.flush_unified_exec_wait_streak();
         if !from_replay {
@@ -4720,7 +4745,7 @@ impl ChatWidget {
                 self.needs_final_message_separator = false;
             }
             self.stream_controller = Some(StreamController::new(
-                self.last_rendered_width.get().map(|w| w.saturating_sub(2)),
+                self.current_stream_width(/*reserved_cols*/ 2),
                 &self.config.cwd,
             ));
         }
@@ -10840,6 +10865,52 @@ impl ChatWidget {
         self.bottom_pane.is_task_running() || self.is_review_mode
     }
 
+    /// Return the markdown body width available to an active stream.
+    ///
+    /// Streaming controllers render only the message body, while history cells add bullets,
+    /// gutters, or plan padding around that body. Callers pass the reserved columns for that
+    /// wrapper so live output uses the same width that finalized cells will use during reflow.
+    fn current_stream_width(&self, reserved_cols: usize) -> Option<usize> {
+        self.last_rendered_width.get().and_then(|width| {
+            if width == 0 {
+                None
+            } else {
+                Some(crate::width::usable_content_width(width, reserved_cols).unwrap_or(1))
+            }
+        })
+    }
+
+    /// Update resize-sensitive chat widget state after the terminal width changes.
+    ///
+    /// The app calls this even when terminal resize reflow is disabled so live stream wrapping
+    /// remains consistent with the current viewport. Finalized transcript rebuilding stays gated at
+    /// the app layer.
+    pub(crate) fn on_terminal_resize(&mut self, width: u16) {
+        let had_rendered_width = self.last_rendered_width.get().is_some();
+        self.last_rendered_width.set(Some(width as usize));
+        let stream_width = self.current_stream_width(/*reserved_cols*/ 2);
+        let plan_stream_width = self.current_stream_width(/*reserved_cols*/ 4);
+        if let Some(controller) = self.stream_controller.as_mut() {
+            controller.set_width(stream_width);
+        }
+        if let Some(controller) = self.plan_stream_controller.as_mut() {
+            controller.set_width(plan_stream_width);
+        }
+        if !had_rendered_width {
+            self.request_redraw();
+        }
+    }
+
+    /// Whether an agent message stream is active (not a plan stream).
+    pub(crate) fn has_active_agent_stream(&self) -> bool {
+        self.stream_controller.is_some()
+    }
+
+    /// Whether a proposed-plan stream is active.
+    pub(crate) fn has_active_plan_stream(&self) -> bool {
+        self.plan_stream_controller.is_some()
+    }
+
     fn is_plan_streaming_in_tui(&self) -> bool {
         self.plan_stream_controller.is_some()
     }
@@ -10966,6 +11037,7 @@ impl ChatWidget {
         T: Into<AppCommand>,
     {
         let op: AppCommand = op.into();
+        self.prepare_local_op_submission(&op);
         if op.is_review() && !self.bottom_pane.is_task_running() {
             self.bottom_pane.set_task_running(/*running*/ true);
         }
@@ -10982,6 +11054,20 @@ impl ChatWidget {
             }
         }
         true
+    }
+
+    pub(crate) fn prepare_local_op_submission(&mut self, op: &AppCommand) {
+        if matches!(op.view(), crate::app_command::AppCommandView::Interrupt)
+            && self.agent_turn_running
+        {
+            if let Some(controller) = self.stream_controller.as_mut() {
+                controller.clear_queue();
+            }
+            if let Some(controller) = self.plan_stream_controller.as_mut() {
+                controller.clear_queue();
+            }
+            self.request_redraw();
+        }
     }
 
     #[cfg(test)]
@@ -11115,6 +11201,7 @@ impl ChatWidget {
         self.config.config_layer_stack = config.config_layer_stack.clone();
         self.config.realtime = config.realtime.clone();
         self.config.memories = config.memories.clone();
+        self.config.terminal_resize_reflow = config.terminal_resize_reflow;
     }
 
     pub(crate) fn open_review_popup(&mut self) {
