@@ -41,12 +41,12 @@ use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
-use codex_config::CloudRequirementsLoader;
-use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_config::RemoteThreadConfigLoader;
 use codex_config::ThreadConfigLoader;
 use codex_core::config::Config;
+use codex_core::config_loader::CloudRequirementsLoader;
+use codex_core::config_loader::LoaderOverrides;
 pub use codex_exec_server::EnvironmentManager;
 pub use codex_exec_server::EnvironmentManagerArgs;
 pub use codex_exec_server::ExecServerRuntimePaths;
@@ -97,6 +97,10 @@ pub mod legacy_core {
 
     pub mod personality_migration {
         pub use codex_core::personality_migration::*;
+    }
+
+    pub mod plugins {
+        pub use codex_core::plugins::PluginsManager;
     }
 
     pub mod review_format {
@@ -300,15 +304,7 @@ impl fmt::Display for TypedRequestError {
                 write!(f, "{method} transport error: {source}")
             }
             Self::Server { method, source } => {
-                write!(
-                    f,
-                    "{method} failed: {} (code {})",
-                    source.message, source.code
-                )?;
-                if let Some(data) = source.data.as_ref() {
-                    write!(f, ", data: {data}")?;
-                }
-                Ok(())
+                write!(f, "{method} failed: {}", source.message)
             }
             Self::Deserialize { method, source } => {
                 write!(f, "{method} response decode error: {source}")
@@ -1401,55 +1397,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_typed_request_accepts_large_single_frame_response() {
-        let padding = "x".repeat((17 << 20) + 1024);
-        let websocket_url = start_test_remote_server(move |mut websocket| async move {
-            expect_remote_initialize(&mut websocket).await;
-            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
-            else {
-                panic!("expected account/read request");
-            };
-            assert_eq!(request.method, "account/read");
-            write_websocket_message(
-                &mut websocket,
-                JSONRPCMessage::Response(JSONRPCResponse {
-                    id: request.id,
-                    result: serde_json::json!({
-                        "account": null,
-                        "requiresOpenaiAuth": false,
-                        "padding": padding,
-                    }),
-                }),
-            )
-            .await;
-            websocket.close(None).await.expect("close should succeed");
-        })
-        .await;
-        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
-            .await
-            .expect("remote client should connect");
-
-        let response: GetAccountResponse = client
-            .request_typed(ClientRequest::GetAccount {
-                request_id: RequestId::Integer(1),
-                params: codex_app_server_protocol::GetAccountParams {
-                    refresh_token: false,
-                },
-            })
-            .await
-            .expect("large typed request should succeed");
-        assert_eq!(
-            response,
-            GetAccountResponse {
-                account: None,
-                requires_openai_auth: false,
-            }
-        );
-
-        client.shutdown().await.expect("shutdown should complete");
-    }
-
-    #[tokio::test]
     async fn remote_connect_includes_auth_header_when_configured() {
         let auth_token = "remote-bearer-token".to_string();
         let websocket_url = start_test_remote_server_with_auth(
@@ -1923,15 +1870,11 @@ mod tests {
             method: "thread/read".to_string(),
             source: JSONRPCErrorError {
                 code: -32603,
-                data: Some(serde_json::json!({"detail": "config lock mismatch"})),
+                data: None,
                 message: "internal".to_string(),
             },
         };
         assert_eq!(std::error::Error::source(&server).is_some(), false);
-        assert_eq!(
-            server.to_string(),
-            "thread/read failed: internal (code -32603), data: {\"detail\":\"config lock mismatch\"}"
-        );
 
         let deserialize = TypedRequestError::Deserialize {
             method: "thread/start".to_string(),
@@ -2037,17 +1980,14 @@ mod tests {
     #[tokio::test]
     async fn runtime_start_args_forward_environment_manager() {
         let config = Arc::new(build_test_config().await);
-        let environment_manager = Arc::new(
-            EnvironmentManager::create_for_tests(
-                Some("ws://127.0.0.1:8765".to_string()),
-                ExecServerRuntimePaths::new(
-                    std::env::current_exe().expect("current exe"),
-                    /*codex_linux_sandbox_exe*/ None,
-                )
-                .expect("runtime paths"),
+        let environment_manager = Arc::new(EnvironmentManager::new(EnvironmentManagerArgs {
+            exec_server_url: Some("ws://127.0.0.1:8765".to_string()),
+            local_runtime_paths: ExecServerRuntimePaths::new(
+                std::env::current_exe().expect("current exe"),
+                /*codex_linux_sandbox_exe*/ None,
             )
-            .await,
-        );
+            .expect("runtime paths"),
+        }));
 
         let runtime_args = InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),

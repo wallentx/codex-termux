@@ -541,14 +541,7 @@ impl WebSocketTestServer {
 
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
-        let mut task = self.task;
-        if tokio::time::timeout(Duration::from_secs(10), &mut task)
-            .await
-            .is_err()
-        {
-            task.abort();
-            let _ = task.await;
-        }
+        let _ = self.task.await;
     }
 }
 
@@ -686,6 +679,7 @@ pub fn user_message_item(text: &str) -> ResponseItem {
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
+        end_turn: None,
         phase: None,
     }
 }

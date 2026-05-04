@@ -37,7 +37,6 @@ use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAuthStatusParams;
 use codex_app_server_protocol::GetConversationSummaryParams;
-use codex_app_server_protocol::HooksListParams;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
@@ -55,11 +54,9 @@ use codex_app_server_protocol::McpResourceReadParams;
 use codex_app_server_protocol::McpServerToolCallParams;
 use codex_app_server_protocol::MockExperimentalMethodParams;
 use codex_app_server_protocol::ModelListParams;
-use codex_app_server_protocol::ModelProviderCapabilitiesReadParams;
 use codex_app_server_protocol::PluginInstallParams;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginReadParams;
-use codex_app_server_protocol::PluginSkillReadParams;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewStartParams;
@@ -109,42 +106,19 @@ pub struct McpProcess {
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
-pub const DISABLE_PLUGIN_STARTUP_TASKS_ARG: &str = "--disable-plugin-startup-tasks-for-tests";
 const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
 
 impl McpProcess {
     pub async fn new(codex_home: &Path) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args(codex_home, &[], &[DISABLE_PLUGIN_STARTUP_TASKS_ARG]).await
+        Self::new_with_env_and_args(codex_home, &[], &[]).await
     }
 
     pub async fn new_without_managed_config(codex_home: &Path) -> anyhow::Result<Self> {
         Self::new_with_env(codex_home, &[(DISABLE_MANAGED_CONFIG_ENV_VAR, Some("1"))]).await
     }
 
-    pub async fn new_without_managed_config_with_env(
-        codex_home: &Path,
-        env_overrides: &[(&str, Option<&str>)],
-    ) -> anyhow::Result<Self> {
-        let mut all_env_overrides = vec![(DISABLE_MANAGED_CONFIG_ENV_VAR, Some("1"))];
-        all_env_overrides.extend_from_slice(env_overrides);
-        Self::new_with_env(codex_home, &all_env_overrides).await
-    }
-
-    pub async fn new_with_plugin_startup_tasks(codex_home: &Path) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args(codex_home, &[], &[]).await
-    }
-
-    pub async fn new_with_env_and_plugin_startup_tasks(
-        codex_home: &Path,
-        env_overrides: &[(&str, Option<&str>)],
-    ) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args(codex_home, env_overrides, &[]).await
-    }
-
     pub async fn new_with_args(codex_home: &Path, args: &[&str]) -> anyhow::Result<Self> {
-        let mut all_args = vec![DISABLE_PLUGIN_STARTUP_TASKS_ARG];
-        all_args.extend_from_slice(args);
-        Self::new_with_env_and_args(codex_home, &[], &all_args).await
+        Self::new_with_env_and_args(codex_home, &[], args).await
     }
 
     /// Creates a new MCP process, allowing tests to override or remove
@@ -156,12 +130,7 @@ impl McpProcess {
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
     ) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args(
-            codex_home,
-            env_overrides,
-            &[DISABLE_PLUGIN_STARTUP_TASKS_ARG],
-        )
-        .await
+        Self::new_with_env_and_args(codex_home, env_overrides, &[]).await
     }
 
     async fn new_with_env_and_args(
@@ -178,7 +147,7 @@ impl McpProcess {
         cmd.stderr(Stdio::piped());
         cmd.current_dir(codex_home);
         cmd.env("CODEX_HOME", codex_home);
-        cmd.env("RUST_LOG", "warn");
+        cmd.env("RUST_LOG", "info");
         // Keep integration tests isolated from host managed configuration.
         cmd.env(
             "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
@@ -527,16 +496,6 @@ impl McpProcess {
         self.send_request("model/list", params).await
     }
 
-    /// Send a `modelProvider/capabilities/read` JSON-RPC request.
-    pub async fn send_model_provider_capabilities_read_request(
-        &mut self,
-        params: ModelProviderCapabilitiesReadParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("modelProvider/capabilities/read", params)
-            .await
-    }
-
     /// Send an `experimentalFeature/list` JSON-RPC request.
     pub async fn send_experimental_feature_list_request(
         &mut self,
@@ -587,15 +546,6 @@ impl McpProcess {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("skills/list", params).await
-    }
-
-    /// Send a `hooks/list` JSON-RPC request.
-    pub async fn send_hooks_list_request(
-        &mut self,
-        params: HooksListParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("hooks/list", params).await
     }
 
     /// Send a `marketplace/add` JSON-RPC request.
@@ -659,15 +609,6 @@ impl McpProcess {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("plugin/read", params).await
-    }
-
-    /// Send a `plugin/skill/read` JSON-RPC request.
-    pub async fn send_plugin_skill_read_request(
-        &mut self,
-        params: PluginSkillReadParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("plugin/skill/read", params).await
     }
 
     /// Send an `mcpServerStatus/list` JSON-RPC request.

@@ -1,14 +1,11 @@
 use super::*;
 use crate::sandboxing::SandboxPermissions;
 use codex_network_proxy::BlockedRequestArgs;
-use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use core_test_support::PathBufExt;
 use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
-use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn pending_approvals_are_deduped_per_host_protocol_and_port() {
@@ -188,19 +185,14 @@ fn only_never_policy_disables_network_approval_flow() {
 
 #[test]
 fn network_approval_flow_is_limited_to_restricted_sandbox_modes() {
-    assert!(permission_profile_allows_network_approval_flow(
-        &PermissionProfile::from_legacy_sandbox_policy(&SandboxPolicy::new_read_only_policy())
+    assert!(sandbox_policy_allows_network_approval_flow(
+        &SandboxPolicy::new_read_only_policy()
     ));
-    assert!(permission_profile_allows_network_approval_flow(
-        &PermissionProfile::from_legacy_sandbox_policy(&SandboxPolicy::new_workspace_write_policy())
+    assert!(sandbox_policy_allows_network_approval_flow(
+        &SandboxPolicy::new_workspace_write_policy()
     ));
-    assert!(!permission_profile_allows_network_approval_flow(
-        &PermissionProfile::Disabled
-    ));
-    assert!(!permission_profile_allows_network_approval_flow(
-        &PermissionProfile::External {
-            network: NetworkSandboxPolicy::Restricted,
-        }
+    assert!(!sandbox_policy_allows_network_approval_flow(
+        &SandboxPolicy::DangerFullAccess
     ));
 }
 
@@ -221,8 +213,7 @@ fn denied_blocked_request(host: &str) -> BlockedRequest {
 async fn register_call_with_default_shell_trigger(
     service: &NetworkApprovalService,
     registration_id: &str,
-) -> CancellationToken {
-    let cancellation_token = CancellationToken::new();
+) {
     service
         .register_call(
             registration_id.to_string(),
@@ -238,10 +229,8 @@ async fn register_call_with_default_shell_trigger(
                 tty: None,
             },
             "curl https://example.com".to_string(),
-            cancellation_token.clone(),
         )
         .await;
-    cancellation_token
 }
 
 #[tokio::test]
@@ -264,7 +253,6 @@ async fn active_call_preserves_triggering_command_context() {
             "turn-1".to_string(),
             expected.clone(),
             "curl https://example.com".to_string(),
-            CancellationToken::new(),
         )
         .await;
 
@@ -280,14 +268,12 @@ async fn active_call_preserves_triggering_command_context() {
 #[tokio::test]
 async fn record_blocked_request_sets_policy_outcome_for_owner_call() {
     let service = NetworkApprovalService::default();
-    let cancellation_token =
-        register_call_with_default_shell_trigger(&service, "registration-1").await;
+    register_call_with_default_shell_trigger(&service, "registration-1").await;
 
     service
         .record_blocked_request(denied_blocked_request("example.com"))
         .await;
 
-    assert!(cancellation_token.is_cancelled());
     assert_eq!(
             service.take_call_outcome("registration-1").await,
             Some(NetworkApprovalOutcome::DeniedByPolicy(
@@ -312,76 +298,6 @@ async fn blocked_request_policy_does_not_override_user_denial_outcome() {
         service.take_call_outcome("registration-1").await,
         Some(NetworkApprovalOutcome::DeniedByUser)
     );
-}
-
-#[tokio::test]
-async fn finish_call_returns_denial_and_unregisters_active_call() {
-    let service = NetworkApprovalService::default();
-    register_call_with_default_shell_trigger(&service, "registration-1").await;
-
-    service
-        .record_call_outcome(
-            "registration-1",
-            NetworkApprovalOutcome::DeniedByPolicy("network denied".to_string()),
-        )
-        .await;
-
-    let err = service
-        .finish_call("registration-1")
-        .await
-        .expect_err("denial should be returned");
-
-    assert!(matches!(err, ToolError::Rejected(message) if message == "network denied"));
-    assert!(service.resolve_single_active_call().await.is_none());
-    assert_eq!(service.take_call_outcome("registration-1").await, None);
-}
-
-#[tokio::test]
-async fn deferred_finish_reuses_denial_result_after_first_consumer() {
-    let service = NetworkApprovalService::default();
-    let cancellation_token =
-        register_call_with_default_shell_trigger(&service, "registration-1").await;
-    let deferred = DeferredNetworkApproval {
-        registration_id: "registration-1".to_string(),
-        cancellation_token,
-        finish_outcome: Arc::new(OnceCell::new()),
-    };
-    service
-        .record_call_outcome(
-            "registration-1",
-            NetworkApprovalOutcome::DeniedByPolicy("network denied".to_string()),
-        )
-        .await;
-
-    let first = deferred
-        .finish(&service)
-        .await
-        .expect_err("first consumer should see denial");
-    let second = deferred
-        .finish(&service)
-        .await
-        .expect_err("second consumer should reuse denial");
-
-    assert!(matches!(first, ToolError::Rejected(message) if message == "network denied"));
-    assert!(matches!(second, ToolError::Rejected(message) if message == "network denied"));
-}
-
-#[tokio::test]
-async fn record_call_outcome_ignores_inactive_call() {
-    let service = NetworkApprovalService::default();
-    let cancellation_token =
-        register_call_with_default_shell_trigger(&service, "registration-1").await;
-    service.unregister_call("registration-1").await;
-
-    service
-        .record_call_outcome(
-            "registration-1",
-            NetworkApprovalOutcome::DeniedByPolicy("network denied".to_string()),
-        )
-        .await;
-
-    assert!(!cancellation_token.is_cancelled());
-    assert_eq!(service.take_call_outcome("registration-1").await, None);
 }
 
 #[tokio::test]

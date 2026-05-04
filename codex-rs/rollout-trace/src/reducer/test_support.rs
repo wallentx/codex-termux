@@ -146,7 +146,6 @@ pub(crate) fn append_inference_completion(
     writer.append(RawTraceEventPayload::InferenceCompleted {
         inference_call_id: inference_call_id.to_string(),
         response_id: Some(response_id.to_string()),
-        upstream_request_id: None,
         response_payload,
     })?;
     Ok(())
@@ -185,7 +184,6 @@ pub(crate) fn append_completed_inference(
         RawTraceEventPayload::InferenceCompleted {
             inference_call_id: inference_id.to_string(),
             response_id: Some(format!("resp-{inference_id}")),
-            upstream_request_id: None,
             response_payload: response,
         },
     )?;

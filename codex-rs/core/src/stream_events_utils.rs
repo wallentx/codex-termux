@@ -11,13 +11,13 @@ use tokio_util::sync::CancellationToken;
 use crate::context::ContextualUserFragment;
 use crate::context::ImageGenerationInstructions;
 use crate::function_tool::FunctionCallError;
+use crate::memories::citations::parse_memory_citation;
+use crate::memories::citations::thread_ids_from_memory_citation;
 use crate::parse_turn_item;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
-use codex_memories_read::citations::parse_memory_citation;
-use codex_memories_read::citations::thread_ids_from_memory_citation;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -255,14 +255,14 @@ pub(crate) async fn handle_output_item_done(
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {
-            let turn_item = handle_non_tool_response_item(
+            if let Some(turn_item) = handle_non_tool_response_item(
                 ctx.sess.as_ref(),
                 ctx.turn_context.as_ref(),
                 &item,
                 plan_mode,
             )
-            .await;
-            if let Some(turn_item) = turn_item {
+            .await
+            {
                 if previously_active_item.is_none() {
                     let mut started_item = turn_item.clone();
                     if let TurnItem::ImageGeneration(item) = &mut started_item {
