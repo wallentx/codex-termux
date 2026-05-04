@@ -122,51 +122,24 @@ impl App {
             return;
         }
 
-        if self.keymap.app.toggle_vim_mode.is_pressed(key_event) {
-            self.chat_widget.toggle_vim_mode_and_notify();
-            return;
-        }
-
-        if self.keymap.app.open_transcript.is_pressed(key_event) {
-            // Enter alternate screen and set viewport to full size.
-            let _ = tui.enter_alt_screen();
-            self.overlay = Some(Overlay::new_transcript(
-                self.transcript_cells.clone(),
-                self.keymap.pager.clone(),
-            ));
-            tui.frame_requester().schedule_frame();
-            return;
-        }
-
-        if self.keymap.app.open_external_editor.is_pressed(key_event) {
-            // Only launch the external editor if there is no overlay and the bottom pane is not in use.
-            // Note that it can be launched while a task is running to enable editing while the previous turn is ongoing.
-            if self.overlay.is_none()
-                && self.chat_widget.can_launch_external_editor()
-                && self.chat_widget.external_editor_state() == ExternalEditorState::Closed
-            {
-                self.request_external_editor_launch(tui);
-            }
-            return;
-        }
-
-        if matches!(key_event.code, KeyCode::Esc)
-            && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        {
-            // Esc primes/advances backtracking only in normal (not working) mode
-            // with the composer focused and empty. In any other state, forward
-            // Esc so the active UI (e.g. status indicator, modals, popups)
-            // handles it.
-            if self.should_handle_backtrack_esc(key_event) {
-                self.handle_backtrack_esc_key(tui);
-            } else {
-                self.chat_widget.handle_key_event(key_event);
-            }
-            return;
-        }
-
         match key_event {
-            _ if self.keymap.app.clear_terminal.is_pressed(key_event) => {
+            KeyEvent {
+                code: KeyCode::Char('t'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                // Enter alternate screen and set viewport to full size.
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
                 if !self.chat_widget.can_run_ctrl_l_clear_now() {
                     return;
                 }
@@ -178,6 +151,38 @@ impl App {
                     self.reset_app_ui_state_after_clear();
                     self.queue_clear_ui_header(tui);
                     tui.frame_requester().schedule_frame();
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                // Only launch the external editor if there is no overlay and the bottom pane is not in use.
+                // Note that it can be launched while a task is running to enable editing while the previous turn is ongoing.
+                if self.overlay.is_none()
+                    && self.chat_widget.can_launch_external_editor()
+                    && self.chat_widget.external_editor_state() == ExternalEditorState::Closed
+                {
+                    self.request_external_editor_launch(tui);
+                }
+            }
+            // Esc primes/advances backtracking only in normal (not working) mode
+            // with the composer focused and empty. In any other state, forward
+            // Esc so the active UI (e.g. status indicator, modals, popups)
+            // handles it.
+            KeyEvent {
+                code: KeyCode::Esc,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                if self.chat_widget.is_normal_backtrack_mode()
+                    && self.chat_widget.composer_is_empty()
+                {
+                    self.handle_backtrack_esc_key(tui);
+                } else {
+                    self.chat_widget.handle_key_event(key_event);
                 }
             }
             // Enter confirms backtrack when primed + count > 0. Otherwise pass to widget.
@@ -209,12 +214,6 @@ impl App {
                 self.chat_widget.handle_key_event(key_event);
             }
         };
-    }
-
-    pub(super) fn should_handle_backtrack_esc(&self, key_event: KeyEvent) -> bool {
-        self.chat_widget.is_normal_backtrack_mode()
-            && self.chat_widget.composer_is_empty()
-            && !self.chat_widget.should_handle_vim_insert_escape(key_event)
     }
 
     pub(super) fn refresh_status_line(&mut self) {

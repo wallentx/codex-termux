@@ -1,7 +1,6 @@
 use super::ConnectionSessionState;
 use super::MessageProcessor;
 use super::MessageProcessorArgs;
-use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -28,10 +27,10 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
-use codex_config::CloudRequirementsLoader;
-use codex_config::LoaderOverrides;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
+use codex_core::config_loader::CloudRequirementsLoader;
+use codex_core::config_loader::LoaderOverrides;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
@@ -128,7 +127,7 @@ impl TracingHarness {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
         let codex_home = TempDir::new()?;
         let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
-        let (processor, outgoing_rx) = build_test_processor(config).await;
+        let (processor, outgoing_rx) = build_test_processor(config);
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -258,15 +257,16 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
         .await?)
 }
 
-async fn build_test_processor(
+fn build_test_processor(
     config: Arc<Config>,
 ) -> (
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
+    let outgoing = Arc::new(OutgoingMessageSender::new(outgoing_tx));
     let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false);
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
@@ -275,15 +275,8 @@ async fn build_test_processor(
         Arg0DispatchPaths::default(),
         Arc::new(codex_config::NoopThreadConfigLoader),
     );
-    let analytics_events_client =
-        analytics_events_client_from_config(Arc::clone(&auth_manager), config.as_ref());
-    let outgoing = Arc::new(OutgoingMessageSender::new(
-        outgoing_tx,
-        analytics_events_client.clone(),
-    ));
     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
         outgoing,
-        analytics_events_client,
         arg0_paths: Arg0DispatchPaths::default(),
         config,
         config_manager,
@@ -295,7 +288,6 @@ async fn build_test_processor(
         auth_manager,
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
-        plugin_startup_tasks: crate::PluginStartupTasks::Start,
     }));
     (processor, outgoing_rx)
 }
@@ -761,7 +753,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                     cwd: None,
                     approval_policy: None,
                     sandbox_policy: None,
-                    permissions: None,
+                    permission_profile: None,
                     approvals_reviewer: None,
                     model: None,
                     service_tier: None,

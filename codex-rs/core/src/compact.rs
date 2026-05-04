@@ -18,6 +18,7 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
+use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -165,6 +166,8 @@ async fn run_compact_task_inner_impl(
         turn_context.truncation_policy,
     );
 
+    let mut truncated_count = 0usize;
+
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut client_session = sess.services.model_client.new_session();
@@ -196,6 +199,15 @@ async fn run_compact_task_inner_impl(
 
         match attempt_result {
             Ok(()) => {
+                if truncated_count > 0 {
+                    sess.notify_background_event(
+                        turn_context.as_ref(),
+                        format!(
+                            "Trimmed {truncated_count} older thread item(s) before compacting so the prompt fits the model context window."
+                        ),
+                    )
+                    .await;
+                }
                 break;
             }
             Err(CodexErr::Interrupted) => {
@@ -208,6 +220,7 @@ async fn run_compact_task_inner_impl(
                         "Context window exceeded while compacting; removing oldest history item. Error: {e}"
                     );
                     history.remove_first_item();
+                    truncated_count += 1;
                     retries = 0;
                     continue;
                 }
@@ -253,6 +266,12 @@ async fn run_compact_task_inner_impl(
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
+    let ghost_snapshots: Vec<ResponseItem> = history_items
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+        .cloned()
+        .collect();
+    new_history.extend(ghost_snapshots);
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
@@ -276,6 +295,7 @@ async fn run_compact_task_inner_impl(
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
+    enabled: bool,
     thread_id: String,
     turn_id: String,
     trigger: CompactionTrigger,
@@ -296,8 +316,10 @@ impl CompactionAnalyticsAttempt {
         implementation: CompactionImplementation,
         phase: CompactionPhase,
     ) -> Self {
+        let enabled = sess.enabled(Feature::GeneralAnalytics);
         let active_context_tokens_before = sess.get_total_token_usage().await;
         Self {
+            enabled,
             thread_id: sess.conversation_id.to_string(),
             turn_id: turn_context.sub_id.clone(),
             trigger,
@@ -316,6 +338,9 @@ impl CompactionAnalyticsAttempt {
         status: CompactionStatus,
         error: Option<String>,
     ) {
+        if !self.enabled {
+            return;
+        }
         let active_context_tokens_after = sess.get_total_token_usage().await;
         sess.services
             .analytics_events_client
@@ -484,6 +509,7 @@ fn build_compacted_history_with_limit(
             content: vec![ContentItem::InputText {
                 text: message.clone(),
             }],
+            end_turn: None,
             phase: None,
         });
     }
@@ -498,6 +524,7 @@ fn build_compacted_history_with_limit(
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText { text: summary_text }],
+        end_turn: None,
         phase: None,
     });
 

@@ -138,6 +138,217 @@
         }
       ]
     },
+    "FileSystemAccessMode": {
+      "enum": [
+        "read",
+        "write",
+        "none"
+      ],
+      "type": "string"
+    },
+    "FileSystemPath": {
+      "oneOf": [
+        {
+          "properties": {
+            "path": {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            },
+            "type": {
+              "enum": [
+                "path"
+              ],
+              "title": "PathFileSystemPathType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "type"
+          ],
+          "title": "PathFileSystemPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "glob_pattern"
+              ],
+              "title": "GlobPatternFileSystemPathType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern",
+            "type"
+          ],
+          "title": "GlobPatternFileSystemPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "special"
+              ],
+              "title": "SpecialFileSystemPathType",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/definitions/FileSystemSpecialPath"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "title": "SpecialFileSystemPath",
+          "type": "object"
+        }
+      ]
+    },
+    "FileSystemSandboxEntry": {
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/FileSystemAccessMode"
+        },
+        "path": {
+          "$ref": "#/definitions/FileSystemPath"
+        }
+      },
+      "required": [
+        "access",
+        "path"
+      ],
+      "type": "object"
+    },
+    "FileSystemSpecialPath": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "root"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "RootFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "minimal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "MinimalFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "current_working_directory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "CurrentWorkingDirectoryFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "project_roots"
+              ],
+              "type": "string"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "KindFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "tmpdir"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "TmpdirFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "slash_tmp"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "SlashTmpFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "FunctionCallOutputBody": {
       "anyOf": [
         {
@@ -205,6 +416,38 @@
           "type": "object"
         }
       ]
+    },
+    "GhostCommit": {
+      "description": "Details of a ghost commit created from a repository state.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preexisting_untracked_dirs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "preexisting_untracked_files": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "preexisting_untracked_dirs",
+        "preexisting_untracked_files"
+      ],
+      "type": "object"
     },
     "ImageDetail": {
       "enum": [
@@ -298,64 +541,134 @@
         }
       ]
     },
-    "PermissionProfileModificationParams": {
+    "PermissionProfile": {
       "oneOf": [
         {
-          "description": "Additional concrete directory that should be writable.",
+          "description": "Codex owns sandbox construction for this profile.",
           "properties": {
-            "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+            "fileSystem": {
+              "$ref": "#/definitions/PermissionProfileFileSystemPermissions"
+            },
+            "network": {
+              "$ref": "#/definitions/PermissionProfileNetworkPermissions"
             },
             "type": {
               "enum": [
-                "additionalWritableRoot"
+                "managed"
               ],
-              "title": "AdditionalWritableRootPermissionProfileModificationParamsType",
+              "title": "ManagedPermissionProfileType",
               "type": "string"
             }
           },
           "required": [
-            "path",
+            "fileSystem",
+            "network",
             "type"
           ],
-          "title": "AdditionalWritableRootPermissionProfileModificationParams",
+          "title": "ManagedPermissionProfile",
+          "type": "object"
+        },
+        {
+          "description": "Do not apply an outer sandbox.",
+          "properties": {
+            "type": {
+              "enum": [
+                "disabled"
+              ],
+              "title": "DisabledPermissionProfileType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "DisabledPermissionProfile",
+          "type": "object"
+        },
+        {
+          "description": "Filesystem isolation is enforced by an external caller.",
+          "properties": {
+            "network": {
+              "$ref": "#/definitions/PermissionProfileNetworkPermissions"
+            },
+            "type": {
+              "enum": [
+                "external"
+              ],
+              "title": "ExternalPermissionProfileType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "network",
+            "type"
+          ],
+          "title": "ExternalPermissionProfile",
           "type": "object"
         }
       ]
     },
-    "PermissionProfileSelectionParams": {
+    "PermissionProfileFileSystemPermissions": {
       "oneOf": [
         {
-          "description": "Select a named built-in or user-defined profile and optionally apply bounded modifications that Codex knows how to validate.",
           "properties": {
-            "id": {
-              "type": "string"
-            },
-            "modifications": {
+            "entries": {
               "items": {
-                "$ref": "#/definitions/PermissionProfileModificationParams"
+                "$ref": "#/definitions/FileSystemSandboxEntry"
               },
+              "type": "array"
+            },
+            "globScanMaxDepth": {
+              "format": "uint",
+              "minimum": 1.0,
               "type": [
-                "array",
+                "integer",
                 "null"
               ]
             },
             "type": {
               "enum": [
-                "profile"
+                "restricted"
               ],
-              "title": "ProfilePermissionProfileSelectionParamsType",
+              "title": "RestrictedPermissionProfileFileSystemPermissionsType",
               "type": "string"
             }
           },
           "required": [
-            "id",
+            "entries",
             "type"
           ],
-          "title": "ProfilePermissionProfileSelectionParams",
+          "title": "RestrictedPermissionProfileFileSystemPermissions",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unrestricted"
+              ],
+              "title": "UnrestrictedPermissionProfileFileSystemPermissionsType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "UnrestrictedPermissionProfileFileSystemPermissions",
           "type": "object"
         }
       ]
+    },
+    "PermissionProfileNetworkPermissions": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
     },
     "Personality": {
       "enum": [
@@ -442,6 +755,12 @@
                 "$ref": "#/definitions/ContentItem"
               },
               "type": "array"
+            },
+            "end_turn": {
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "id": {
               "type": [
@@ -844,6 +1163,26 @@
         },
         {
           "properties": {
+            "ghost_commit": {
+              "$ref": "#/definitions/GhostCommit"
+            },
+            "type": {
+              "enum": [
+                "ghost_snapshot"
+              ],
+              "title": "GhostSnapshotResponseItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "ghost_commit",
+            "type"
+          ],
+          "title": "GhostSnapshotResponseItem",
+          "type": "object"
+        },
+        {
+          "properties": {
             "encrypted_content": {
               "type": "string"
             },
@@ -1045,6 +1384,10 @@
         "null"
       ]
     },
+    "excludeTurns": {
+      "description": "When true, return only thread metadata and live-resume state without populating `thread.turns`. This is useful when the client plans to call `thread/turns/list` immediately after resuming.",
+      "type": "boolean"
+    },
     "model": {
       "description": "Configuration overrides for the resumed thread, if any.",
       "type": [
@@ -1057,6 +1400,17 @@
         "string",
         "null"
       ]
+    },
+    "permissionProfile": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PermissionProfile"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Full permissions override for the resumed thread. Cannot be combined with `sandbox`."
     },
     "personality": {
       "anyOf": [

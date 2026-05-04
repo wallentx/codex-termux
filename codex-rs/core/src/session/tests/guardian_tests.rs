@@ -1,6 +1,8 @@
 use super::*;
 use crate::compact::InitialContextInjection;
-use crate::environment_selection::ResolvedTurnEnvironments;
+use crate::config_loader::ConfigLayerEntry;
+use crate::config_loader::ConfigRequirements;
+use crate::config_loader::ConfigRequirementsToml;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecPolicyManager;
@@ -11,9 +13,6 @@ use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_app_server_protocol::ConfigLayerSource;
-use codex_config::ConfigLayerEntry;
-use codex_config::ConfigRequirements;
-use codex_config::ConfigRequirementsToml;
 use codex_exec_server::EnvironmentManager;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
@@ -26,6 +25,8 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
@@ -273,7 +274,17 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
         .features
         .enable(Feature::ExecPermissionApprovals)
         .expect("test setup should allow enabling request permissions");
-    turn_context_raw.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    turn_context_raw
+        .sandbox_policy
+        .set(SandboxPolicy::DangerFullAccess)
+        .expect("test setup should allow updating sandbox policy");
+    // This test is about request-permissions validation, not managed sandbox
+    // policy enforcement. Widen the derived sandbox policies directly so the
+    // command runs without depending on a platform sandbox binary.
+    turn_context_raw.file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from(turn_context_raw.sandbox_policy.get());
+    turn_context_raw.network_sandbox_policy =
+        NetworkSandboxPolicy::from(turn_context_raw.sandbox_policy.get());
     let mut config = (*turn_context_raw.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
     let config = Arc::new(config);
@@ -418,7 +429,14 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_policy_skip() {
         .approval_policy
         .set(AskForApproval::OnFailure)
         .expect("test setup should allow updating approval policy");
-    turn_context_raw.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    turn_context_raw
+        .sandbox_policy
+        .set(SandboxPolicy::DangerFullAccess)
+        .expect("test setup should allow updating sandbox policy");
+    turn_context_raw.file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from(turn_context_raw.sandbox_policy.get());
+    turn_context_raw.network_sandbox_policy =
+        NetworkSandboxPolicy::from(turn_context_raw.sandbox_policy.get());
     let mut config = (*turn_context_raw.config).clone();
     config.approvals_reviewer = ApprovalsReviewer::User;
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
@@ -553,6 +571,7 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
                 content: vec![ContentItem::InputText {
                     text: "stale developer message".to_string(),
                 }],
+                end_turn: None,
                 phase: None,
             },
             ResponseItem::Message {
@@ -561,6 +580,7 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
                 content: vec![ContentItem::InputText {
                     text: "summary".to_string(),
                 }],
+                end_turn: None,
                 phase: None,
             },
         ],
@@ -730,7 +750,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_watcher = Arc::new(SkillsWatcher::noop());
     let thread_store = Arc::new(codex_thread_store::LocalThreadStore::new(
-        codex_thread_store::LocalThreadStoreConfig::from_config(&config),
+        codex_rollout::RolloutConfig::from_view(&config),
     ));
 
     let CodexSpawnOk { codex, .. } = Codex::spawn(CodexSpawnArgs {
@@ -755,9 +775,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
-        environment_selections: ResolvedTurnEnvironments {
-            turn_environments: Vec::new(),
-        },
+        environments: Vec::new(),
         analytics_events_client: None,
         thread_store,
     })

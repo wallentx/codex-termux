@@ -55,7 +55,9 @@ fn test_exec_request(
     env: HashMap<String, String>,
 ) -> ExecRequest {
     let windows_sandbox_private_desktop = false;
-    let permission_profile = turn.permission_profile();
+    let sandbox_policy = turn.sandbox_policy.get().clone();
+    let file_system_sandbox_policy = turn.file_system_sandbox_policy.clone();
+    let network_sandbox_policy = turn.network_sandbox_policy;
     let network = None;
     let arg0 = None;
     ExecRequest::new(
@@ -68,7 +70,9 @@ fn test_exec_request(
         SandboxType::None,
         turn.windows_sandbox_level,
         windows_sandbox_private_desktop,
-        permission_profile,
+        sandbox_policy,
+        file_system_sandbox_policy,
+        network_sandbox_policy,
         arg0,
     )
 }
@@ -96,10 +100,7 @@ async fn exec_command_with_tty(
                 &request,
                 tty,
                 Box::new(NoopSpawnLifecycle),
-                turn.primary_environment()
-                    .expect("turn environment")
-                    .environment
-                    .as_ref(),
+                turn.environment.as_ref().expect("turn environment"),
             )
             .await?,
     );
@@ -114,7 +115,7 @@ async fn exec_command_with_tty(
             process_id,
             hook_command: cmd.to_string(),
             tty,
-            network_approval: None,
+            network_approval_id: None,
             session: Arc::downgrade(session),
             last_used: started_at,
         };
@@ -594,7 +595,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
 
     let remote_test_env = remote_test_env().await?;
     let (_, mut turn) = make_session_and_context().await;
-    turn.environments[0].environment = Arc::new(remote_test_env.environment().clone());
+    turn.environment = Some(Arc::new(remote_test_env.environment().clone()));
 
     let request = test_exec_request(
         &turn,
@@ -612,10 +613,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
             Box::new(TestSpawnLifecycle {
                 inherited_fds: vec![42],
             }),
-            turn.primary_environment()
-                .expect("turn environment")
-                .environment
-                .as_ref(),
+            turn.environment.as_ref().expect("turn environment"),
         )
         .await
         .expect_err("expected inherited fd rejection");

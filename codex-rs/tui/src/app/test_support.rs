@@ -24,7 +24,7 @@ pub(super) async fn make_test_app() -> App {
         cli_kv_overrides: Vec::new(),
         harness_overrides: ConfigOverrides::default(),
         runtime_approval_policy_override: None,
-        runtime_permission_profile_override: None,
+        runtime_sandbox_policy_override: None,
         file_search,
         transcript_cells: Vec::new(),
         overlay: None,
@@ -33,7 +33,6 @@ pub(super) async fn make_test_app() -> App {
         transcript_reflow: TranscriptReflowState::default(),
         initial_history_replay_buffer: None,
         enhanced_keys_supported: false,
-        keymap: crate::keymap::RuntimeKeymap::defaults(),
         commit_anim_running: Arc::new(AtomicBool::new(false)),
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -59,7 +58,6 @@ pub(super) async fn make_test_app() -> App {
         pending_primary_events: VecDeque::new(),
         pending_app_server_requests: PendingAppServerRequests::default(),
         pending_plugin_enabled_writes: HashMap::new(),
-        pending_hook_enabled_writes: HashMap::new(),
     }
 }
 
@@ -75,8 +73,7 @@ fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
         "test_originator".to_string(),
         /*log_user_prompts*/ false,
         "test".to_string(),
-        serde_json::from_value(serde_json::json!("cli"))
-            .expect("cli session source should deserialize"),
+        SessionSource::Cli,
     )
 }
 

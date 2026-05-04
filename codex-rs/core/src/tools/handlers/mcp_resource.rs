@@ -3,10 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use codex_protocol::items::McpToolCallError;
-use codex_protocol::items::McpToolCallItem;
-use codex_protocol::items::McpToolCallStatus;
-use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use rmcp::model::ListResourceTemplatesResult;
@@ -29,7 +25,10 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpInvocation;
+use codex_protocol::protocol::McpToolCallBeginEvent;
+use codex_protocol::protocol::McpToolCallEndEvent;
 
 pub struct McpResourceHandler;
 
@@ -565,23 +564,16 @@ async fn emit_tool_call_begin(
     call_id: &str,
     invocation: McpInvocation,
 ) {
-    let McpInvocation {
-        server,
-        tool,
-        arguments,
-    } = invocation;
-    let item = TurnItem::McpToolCall(McpToolCallItem {
-        id: call_id.to_string(),
-        server,
-        tool,
-        arguments: arguments.unwrap_or(Value::Null),
-        mcp_app_resource_uri: None,
-        status: McpToolCallStatus::InProgress,
-        result: None,
-        error: None,
-        duration: None,
-    });
-    session.emit_turn_item_started(turn, &item).await;
+    session
+        .send_event(
+            turn,
+            EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
+                call_id: call_id.to_string(),
+                invocation,
+                mcp_app_resource_uri: None,
+            }),
+        )
+        .await;
 }
 
 async fn emit_tool_call_end(
@@ -592,34 +584,18 @@ async fn emit_tool_call_end(
     duration: Duration,
     result: Result<CallToolResult, String>,
 ) {
-    let (status, result, error) = match result {
-        Ok(result) if result.is_error.unwrap_or(false) => {
-            (McpToolCallStatus::Failed, Some(result), None)
-        }
-        Ok(result) => (McpToolCallStatus::Completed, Some(result), None),
-        Err(message) => (
-            McpToolCallStatus::Failed,
-            None,
-            Some(McpToolCallError { message }),
-        ),
-    };
-    let McpInvocation {
-        server,
-        tool,
-        arguments,
-    } = invocation;
-    let item = TurnItem::McpToolCall(McpToolCallItem {
-        id: call_id.to_string(),
-        server,
-        tool,
-        arguments: arguments.unwrap_or(Value::Null),
-        mcp_app_resource_uri: None,
-        status,
-        result,
-        error,
-        duration: Some(duration),
-    });
-    session.emit_turn_item_completed(turn, item).await;
+    session
+        .send_event(
+            turn,
+            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+                call_id: call_id.to_string(),
+                invocation,
+                mcp_app_resource_uri: None,
+                duration,
+                result,
+            }),
+        )
+        .await;
 }
 
 fn normalize_optional_string(input: Option<String>) -> Option<String> {

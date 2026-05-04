@@ -177,6 +177,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "hello from response item".to_string(),
             }],
+            end_turn: None,
             phase: None,
         });
 

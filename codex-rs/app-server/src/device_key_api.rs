@@ -1,5 +1,5 @@
-use crate::error_code::internal_error;
-use crate::error_code::invalid_request;
+use crate::error_code::INTERNAL_ERROR_CODE;
+use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -302,13 +302,16 @@ fn protection_class_from_store(
 }
 
 fn map_device_key_error(error: DeviceKeyError) -> JSONRPCErrorError {
-    match &error {
+    let code = match error {
         DeviceKeyError::DegradedProtectionNotAllowed { .. }
         | DeviceKeyError::HardwareBackedKeysUnavailable
         | DeviceKeyError::KeyNotFound
-        | DeviceKeyError::InvalidPayload(_) => invalid_request(error.to_string()),
-        DeviceKeyError::Platform(_) | DeviceKeyError::Crypto(_) => {
-            internal_error(error.to_string())
-        }
+        | DeviceKeyError::InvalidPayload(_) => INVALID_REQUEST_ERROR_CODE,
+        DeviceKeyError::Platform(_) | DeviceKeyError::Crypto(_) => INTERNAL_ERROR_CODE,
+    };
+    JSONRPCErrorError {
+        code,
+        message: error.to_string(),
+        data: None,
     }
 }
