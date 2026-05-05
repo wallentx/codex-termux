@@ -8,9 +8,13 @@ use tokio::sync::watch;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
+#[cfg(test)]
 use tokio::io::AsyncBufReadExt;
+#[cfg(test)]
 use tokio::io::AsyncWriteExt;
+#[cfg(test)]
 use tokio::io::BufReader;
+#[cfg(test)]
 use tokio::io::BufWriter;
 
 pub(crate) const CHANNEL_CAPACITY: usize = 128;
@@ -30,6 +34,7 @@ pub(crate) struct JsonRpcConnection {
 }
 
 impl JsonRpcConnection {
+    #[cfg(test)]
     pub(crate) fn from_stdio<R, W>(reader: R, writer: W, connection_label: String) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -293,6 +298,7 @@ async fn send_malformed_message(
         .await;
 }
 
+#[cfg(test)]
 async fn write_jsonrpc_line_message<W>(
     writer: &mut BufWriter<W>,
     message: &JSONRPCMessage,

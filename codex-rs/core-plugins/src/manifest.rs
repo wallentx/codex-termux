@@ -1,4 +1,3 @@
-use codex_config::HooksFile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_plugins::find_plugin_manifest_path;
 use serde::Deserialize;
@@ -27,8 +26,6 @@ struct RawPluginManifest {
     #[serde(default)]
     apps: Option<String>,
     #[serde(default)]
-    hooks: Option<RawPluginManifestHooks>,
-    #[serde(default)]
     interface: Option<RawPluginManifestInterface>,
 }
 
@@ -46,13 +43,6 @@ pub struct PluginManifestPaths {
     pub skills: Option<AbsolutePathBuf>,
     pub mcp_servers: Option<AbsolutePathBuf>,
     pub apps: Option<AbsolutePathBuf>,
-    pub hooks: Option<PluginManifestHooks>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PluginManifestHooks {
-    Paths(Vec<AbsolutePathBuf>),
-    Inline(Vec<HooksFile>),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -124,16 +114,6 @@ enum RawPluginManifestDefaultPromptEntry {
     Invalid(JsonValue),
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RawPluginManifestHooks {
-    Path(String),
-    Paths(Vec<String>),
-    Inline(HooksFile),
-    InlineList(Vec<HooksFile>),
-    Invalid(JsonValue),
-}
-
 pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
     let manifest_path = find_plugin_manifest_path(plugin_root)?;
     let contents = fs::read_to_string(&manifest_path).ok()?;
@@ -146,7 +126,6 @@ pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
                 skills,
                 mcp_servers,
                 apps,
-                hooks,
                 interface,
             } = manifest;
             let name = plugin_root
@@ -240,7 +219,6 @@ pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
                         mcp_servers.as_deref(),
                     ),
                     apps: resolve_manifest_path(plugin_root, "apps", apps.as_deref()),
-                    hooks: resolve_manifest_hooks(plugin_root, hooks),
                 },
                 interface,
             })
@@ -249,36 +227,6 @@ pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
             tracing::warn!(
                 path = %manifest_path.display(),
                 "failed to parse plugin manifest: {err}"
-            );
-            None
-        }
-    }
-}
-
-fn resolve_manifest_hooks(
-    plugin_root: &Path,
-    hooks: Option<RawPluginManifestHooks>,
-) -> Option<PluginManifestHooks> {
-    match hooks? {
-        RawPluginManifestHooks::Path(path) => {
-            resolve_manifest_path(plugin_root, "hooks", Some(&path))
-                .map(|path| PluginManifestHooks::Paths(vec![path]))
-        }
-        RawPluginManifestHooks::Paths(paths) => {
-            let hooks = paths
-                .iter()
-                .filter_map(|path| resolve_manifest_path(plugin_root, "hooks", Some(path)))
-                .collect::<Vec<_>>();
-            (!hooks.is_empty()).then_some(PluginManifestHooks::Paths(hooks))
-        }
-        RawPluginManifestHooks::Inline(hooks) => Some(PluginManifestHooks::Inline(vec![hooks])),
-        RawPluginManifestHooks::InlineList(hooks) => {
-            (!hooks.is_empty()).then_some(PluginManifestHooks::Inline(hooks))
-        }
-        RawPluginManifestHooks::Invalid(value) => {
-            tracing::warn!(
-                "ignoring hooks: expected a string, string array, object, or object array; found {}",
-                json_value_type(&value)
             );
             None
         }

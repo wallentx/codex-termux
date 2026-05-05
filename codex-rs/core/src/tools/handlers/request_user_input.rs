@@ -5,14 +5,14 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use codex_protocol::config_types::ModeKind;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_tools::REQUEST_USER_INPUT_TOOL_NAME;
 use codex_tools::normalize_request_user_input_args;
 use codex_tools::request_user_input_unavailable_message;
 
 pub struct RequestUserInputHandler {
-    pub available_modes: Vec<ModeKind>,
+    pub default_mode_request_user_input: bool,
 }
 
 impl ToolHandler for RequestUserInputHandler {
@@ -40,14 +40,16 @@ impl ToolHandler for RequestUserInputHandler {
             }
         };
 
-        if turn.session_source.is_non_root_agent() {
+        if matches!(turn.session_source, SessionSource::SubAgent(_)) {
             return Err(FunctionCallError::RespondToModel(
                 "request_user_input can only be used by the root thread".to_string(),
             ));
         }
 
         let mode = session.collaboration_mode().await.mode;
-        if let Some(message) = request_user_input_unavailable_message(mode, &self.available_modes) {
+        if let Some(message) =
+            request_user_input_unavailable_message(mode, self.default_mode_request_user_input)
+        {
             return Err(FunctionCallError::RespondToModel(message));
         }
 

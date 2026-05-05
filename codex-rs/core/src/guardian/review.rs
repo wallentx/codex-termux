@@ -6,6 +6,7 @@ use codex_analytics::GuardianReviewDecision;
 use codex_analytics::GuardianReviewFailureReason;
 use codex_analytics::GuardianReviewTerminalStatus;
 use codex_analytics::GuardianReviewTrackContext;
+use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -160,9 +161,13 @@ pub(crate) fn is_guardian_reviewer_source(
 
 fn track_guardian_review(
     session: &Session,
+    turn: &TurnContext,
     tracking: &GuardianReviewTrackContext,
     result: GuardianReviewAnalyticsResult,
 ) {
+    if !turn.config.features.enabled(Feature::GeneralAnalytics) {
+        return;
+    }
     session
         .services
         .analytics_events_client
@@ -274,6 +279,7 @@ async fn run_guardian_review(
     {
         track_guardian_review(
             session.as_ref(),
+            turn.as_ref(),
             &review_tracking,
             GuardianReviewAnalyticsResult {
                 decision: GuardianReviewDecision::Aborted,
@@ -319,6 +325,7 @@ async fn run_guardian_review(
             let approved = matches!(assessment.outcome, GuardianAssessmentOutcome::Allow);
             track_guardian_review(
                 session.as_ref(),
+                turn.as_ref(),
                 &review_tracking,
                 GuardianReviewAnalyticsResult {
                     decision: if approved {
@@ -349,6 +356,7 @@ async fn run_guardian_review(
                         .to_string();
                 track_guardian_review(
                     session.as_ref(),
+                    turn.as_ref(),
                     &review_tracking,
                     GuardianReviewAnalyticsResult {
                         decision: GuardianReviewDecision::Denied,
@@ -387,6 +395,7 @@ async fn run_guardian_review(
             GuardianReviewError::Cancelled => {
                 track_guardian_review(
                     session.as_ref(),
+                    turn.as_ref(),
                     &review_tracking,
                     GuardianReviewAnalyticsResult {
                         decision: GuardianReviewDecision::Aborted,
@@ -428,6 +437,7 @@ async fn run_guardian_review(
                 let rationale = format!("Automatic approval review failed: {message}");
                 track_guardian_review(
                     session.as_ref(),
+                    turn.as_ref(),
                     &review_tracking,
                     GuardianReviewAnalyticsResult {
                         decision: GuardianReviewDecision::Denied,

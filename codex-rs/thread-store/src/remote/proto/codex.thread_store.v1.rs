@@ -22,8 +22,6 @@ pub struct CreateThreadRequest {
     pub dynamic_tools_json: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(enumeration = "ThreadEventPersistenceMode", tag = "6")]
     pub event_persistence_mode: i32,
-    #[prost(string, tag = "7")]
-    pub metadata_json: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResumeThreadRequest {
@@ -39,8 +37,6 @@ pub struct ResumeThreadRequest {
     pub include_archived: bool,
     #[prost(enumeration = "ThreadEventPersistenceMode", tag = "6")]
     pub event_persistence_mode: i32,
-    #[prost(string, tag = "7")]
-    pub metadata_json: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AppendThreadItemsRequest {
