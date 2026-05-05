@@ -3,12 +3,9 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
-use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
-use codex_protocol::items::FileChangeItem;
-use codex_protocol::items::TurnItem;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandBeginEvent;
@@ -16,6 +13,8 @@ use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::FileChange;
+use codex_protocol::protocol::PatchApplyBeginEvent;
+use codex_protocol::protocol::PatchApplyEndEvent;
 use codex_protocol::protocol::PatchApplyStatus;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_shell_command::parse_command::parse_command;
@@ -78,7 +77,6 @@ pub(crate) async fn emit_exec_command_begin(
                 call_id: ctx.call_id.to_string(),
                 process_id: process_id.map(str::to_owned),
                 turn_id: ctx.turn.sub_id.clone(),
-                started_at_ms: now_unix_timestamp_ms(),
                 command: command.to_vec(),
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.to_vec(),
@@ -185,15 +183,13 @@ impl ToolEmitter {
                     guard.on_patch_begin(changes);
                 }
                 ctx.session
-                    .emit_turn_item_started(
+                    .send_event(
                         ctx.turn,
-                        &TurnItem::FileChange(FileChangeItem {
-                            id: ctx.call_id.to_string(),
+                        EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+                            call_id: ctx.call_id.to_string(),
+                            turn_id: ctx.turn.sub_id.clone(),
+                            auto_approved: *auto_approved,
                             changes: changes.clone(),
-                            status: None,
-                            auto_approved: Some(*auto_approved),
-                            stdout: None,
-                            stderr: None,
                         }),
                     )
                     .await;
@@ -204,6 +200,7 @@ impl ToolEmitter {
                     changes.clone(),
                     output.stdout.text.clone(),
                     output.stderr.text.clone(),
+                    output.exit_code == 0,
                     if output.exit_code == 0 {
                         PatchApplyStatus::Completed
                     } else {
@@ -221,6 +218,7 @@ impl ToolEmitter {
                     changes.clone(),
                     output.stdout.text.clone(),
                     output.stderr.text.clone(),
+                    output.exit_code == 0,
                     if output.exit_code == 0 {
                         PatchApplyStatus::Completed
                     } else {
@@ -238,6 +236,7 @@ impl ToolEmitter {
                     changes.clone(),
                     String::new(),
                     (*message).to_string(),
+                    /*success*/ false,
                     PatchApplyStatus::Failed,
                 )
                 .await;
@@ -251,6 +250,7 @@ impl ToolEmitter {
                     changes.clone(),
                     String::new(),
                     (*message).to_string(),
+                    /*success*/ false,
                     PatchApplyStatus::Declined,
                 )
                 .await;
@@ -474,7 +474,6 @@ async fn emit_exec_end(
                 call_id: ctx.call_id.to_string(),
                 process_id: exec_input.process_id.map(str::to_owned),
                 turn_id: ctx.turn.sub_id.clone(),
-                completed_at_ms: now_unix_timestamp_ms(),
                 command: exec_input.command.to_vec(),
                 cwd: exec_input.cwd.clone(),
                 parsed_cmd: exec_input.parsed_cmd.to_vec(),
@@ -497,18 +496,20 @@ async fn emit_patch_end(
     changes: HashMap<PathBuf, FileChange>,
     stdout: String,
     stderr: String,
+    success: bool,
     status: PatchApplyStatus,
 ) {
     ctx.session
-        .emit_turn_item_completed(
+        .send_event(
             ctx.turn,
-            TurnItem::FileChange(FileChangeItem {
-                id: ctx.call_id.to_string(),
+            EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+                call_id: ctx.call_id.to_string(),
+                turn_id: ctx.turn.sub_id.clone(),
+                stdout,
+                stderr,
+                success,
                 changes,
-                status: Some(status),
-                auto_approved: None,
-                stdout: Some(stdout),
-                stderr: Some(stderr),
+                status,
             }),
         )
         .await;

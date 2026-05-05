@@ -18,10 +18,8 @@ use strum_macros::EnumString;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
-use crate::bottom_pane::ACTION_REQUIRED_PREVIEW_PREFIX;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::bottom_pane_view::BottomPaneView;
-use crate::bottom_pane::build_action_required_title_text;
 use crate::bottom_pane::multi_select_picker::MultiSelectItem;
 use crate::bottom_pane::multi_select_picker::MultiSelectPicker;
 use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewData;
@@ -43,8 +41,7 @@ pub(crate) enum TerminalTitleItem {
     Project,
     /// Current working directory path.
     CurrentDir,
-    /// Terminal-title activity indicator while active.
-    #[strum(to_string = "activity", serialize = "spinner")]
+    /// Animated task spinner while active.
     Spinner,
     /// Compact runtime run-state text.
     #[strum(to_string = "run-state", serialize = "status")]
@@ -91,7 +88,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::Project => "Project name (falls back to current directory name)",
             TerminalTitleItem::CurrentDir => "Current working directory",
             TerminalTitleItem::Spinner => {
-                "Spinner while working, action-required message while blocked."
+                "Animated task spinner (omitted while idle or when animations are off)"
             }
             TerminalTitleItem::Status => {
                 "Compact session run-state text (Ready, Working, Thinking)"
@@ -157,8 +154,8 @@ impl TerminalTitleItem {
 
     /// Returns the separator to place before this item in a rendered title.
     ///
-    /// The activity indicator gets a plain space on either side so it reads as
-    /// `my-project <activity> Working` rather than `my-project | <activity> | Working`.
+    /// The spinner gets a plain space on either side so it reads as
+    /// `my-project <spinner> Working` rather than `my-project | <spinner> | Working`.
     /// All other adjacent items are joined with ` | `.
     pub(crate) fn separator_from_previous(self, previous: Option<Self>) -> &'static str {
         match previous {
@@ -177,25 +174,17 @@ pub(crate) fn preview_line_for_title_items(
     items: &[TerminalTitleItem],
     preview_data: &StatusSurfacePreviewData,
 ) -> Option<Line<'static>> {
-    if items.contains(&TerminalTitleItem::Spinner) {
-        let preview = build_action_required_title_text(
-            ACTION_REQUIRED_PREVIEW_PREFIX,
-            items.iter().copied(),
-            &[],
-            |item| {
-                item.preview_item()
-                    .and_then(|preview_item| preview_data.value_for(preview_item))
-                    .map(str::to_owned)
-            },
-        );
-        return Some(Line::from(preview));
-    }
-
     let mut previous = None;
     let preview = items
         .iter()
         .copied()
         .fold(String::new(), |mut preview, item| {
+            if item == TerminalTitleItem::Spinner {
+                preview.push_str(item.separator_from_previous(previous));
+                preview.push('⠋');
+                previous = Some(item);
+                return preview;
+            }
             let Some(value) = item
                 .preview_item()
                 .and_then(|preview_item| preview_data.value_for(preview_item))
@@ -315,8 +304,6 @@ impl TerminalTitleSetupView {
             name: item.to_string(),
             description: Some(item.description().to_string()),
             enabled,
-            orderable: true,
-            section_break_after: false,
         }
     }
 }
@@ -382,7 +369,7 @@ mod tests {
         let tx = AppEventSender::new(tx_raw);
         let selected = [
             "project-name".to_string(),
-            "activity".to_string(),
+            "spinner".to_string(),
             "run-state".to_string(),
             "thread-title".to_string(),
         ];
@@ -397,7 +384,7 @@ mod tests {
     #[test]
     fn parse_terminal_title_items_preserves_order() {
         let items = parse_terminal_title_items(
-            ["project-name", "activity", "run-state", "thread-title"].into_iter(),
+            ["project-name", "spinner", "run-state", "thread-title"].into_iter(),
         );
         assert_eq!(
             items,
@@ -414,19 +401,6 @@ mod tests {
     fn parse_terminal_title_items_rejects_invalid_ids() {
         let items = parse_terminal_title_items(["project", "not-a-title-item"].into_iter());
         assert_eq!(items, None);
-    }
-
-    #[test]
-    fn activity_is_canonical_and_accepts_spinner_legacy_id() {
-        assert_eq!(TerminalTitleItem::Spinner.to_string(), "activity");
-        assert_eq!(
-            "activity".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Spinner)
-        );
-        assert_eq!(
-            "spinner".parse::<TerminalTitleItem>(),
-            Ok(TerminalTitleItem::Spinner)
-        );
     }
 
     #[test]
@@ -502,7 +476,7 @@ mod tests {
                 "context-used",
                 "five-hour-limit",
                 "git-branch",
-                "activity",
+                "spinner",
                 "current-dir",
                 "project-name",
                 "model",

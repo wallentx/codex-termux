@@ -1,38 +1,15 @@
-use crate::store::PLUGINS_CACHE_DIR;
-use crate::store::PluginStore;
-use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::PluginAuthPolicy;
-use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginInterface;
 use codex_app_server_protocol::SkillInterface;
 use codex_login::CodexAuth;
 use codex_login::default_client::build_reqwest_client;
-use codex_plugin::PluginId;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use reqwest::RequestBuilder;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
-use std::fs;
-use std::path::PathBuf;
 use std::time::Duration;
-use url::Url;
-
-mod remote_installed_plugin_sync;
-mod share;
-
-pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncError;
-pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncOutcome;
-pub use remote_installed_plugin_sync::RemotePluginCacheMutationGuard;
-pub use remote_installed_plugin_sync::mark_remote_plugin_cache_mutation_in_flight;
-pub use remote_installed_plugin_sync::maybe_start_remote_installed_plugin_bundle_sync;
-pub use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once;
-pub use share::RemotePluginShareSaveResult;
-pub use share::delete_remote_plugin_share;
-pub use share::list_remote_plugin_shares;
-pub use share::save_remote_plugin_share;
 
 pub const REMOTE_GLOBAL_MARKETPLACE_NAME: &str = "chatgpt-global";
 pub const REMOTE_WORKSPACE_MARKETPLACE_NAME: &str = "chatgpt-workspace";
@@ -42,7 +19,6 @@ pub const REMOTE_WORKSPACE_MARKETPLACE_DISPLAY_NAME: &str = "ChatGPT Workspace P
 const REMOTE_PLUGIN_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_PLUGIN_LIST_PAGE_LIMIT: u32 = 200;
 const MAX_REMOTE_DEFAULT_PROMPT_LEN: usize = 128;
-const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePluginServiceConfig {
@@ -57,14 +33,6 @@ pub struct RemoteMarketplace {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RemoteInstalledPlugin {
-    pub marketplace_name: String,
-    pub id: String,
-    pub name: String,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct RemotePluginSummary {
     pub id: String,
     pub name: String,
@@ -72,15 +40,7 @@ pub struct RemotePluginSummary {
     pub enabled: bool,
     pub install_policy: PluginInstallPolicy,
     pub auth_policy: PluginAuthPolicy,
-    pub availability: PluginAvailability,
     pub interface: Option<PluginInterface>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RemotePluginShareSummary {
-    pub summary: RemotePluginSummary,
-    pub share_url: Option<String>,
-    pub local_plugin_path: Option<AbsolutePathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,8 +49,6 @@ pub struct RemotePluginDetail {
     pub marketplace_display_name: String,
     pub summary: RemotePluginSummary,
     pub description: Option<String>,
-    pub release_version: Option<String>,
-    pub bundle_download_url: Option<String>,
     pub skills: Vec<RemotePluginSkill>,
     pub app_ids: Vec<String>,
 }
@@ -102,32 +60,6 @@ pub struct RemotePluginSkill {
     pub short_description: Option<String>,
     pub interface: Option<SkillInterface>,
     pub enabled: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RemotePluginSkillDetail {
-    pub contents: Option<String>,
-}
-
-pub fn is_valid_remote_plugin_id(plugin_id: &str) -> bool {
-    !plugin_id.is_empty()
-        && plugin_id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '~')
-}
-
-pub fn validate_remote_plugin_id(plugin_id: &str) -> Result<(), JSONRPCErrorError> {
-    if !is_valid_remote_plugin_id(plugin_id) {
-        return Err(JSONRPCErrorError {
-            code: INVALID_REQUEST_ERROR_CODE,
-            message:
-                "invalid remote plugin id: only ASCII letters, digits, `_`, `-`, and `~` are allowed"
-                    .to_string(),
-            data: None,
-        });
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,60 +96,31 @@ pub enum RemotePluginCatalogError {
         source: serde_json::Error,
     },
 
-    #[error("invalid remote plugin catalog base URL: {0}")]
-    InvalidBaseUrl(#[source] url::ParseError),
-
-    #[error("invalid remote plugin catalog base URL path")]
-    InvalidBaseUrlPath,
-
     #[error("remote marketplace `{marketplace_name}` is not supported")]
     UnknownMarketplace { marketplace_name: String },
 
     #[error(
-        "remote plugin mutation returned unexpected plugin id: expected `{expected}`, got `{actual}`"
+        "remote plugin `{plugin_id}` belongs to marketplace `{actual_marketplace_name}`, not `{expected_marketplace_name}`"
+    )]
+    MarketplaceMismatch {
+        plugin_id: String,
+        expected_marketplace_name: String,
+        actual_marketplace_name: String,
+    },
+
+    #[error(
+        "remote plugin install returned unexpected plugin id: expected `{expected}`, got `{actual}`"
     )]
     UnexpectedPluginId { expected: String, actual: String },
 
     #[error(
-        "remote plugin skill response returned unexpected skill name: expected `{expected}`, got `{actual}`"
-    )]
-    UnexpectedSkillName { expected: String, actual: String },
-
-    #[error(
-        "remote plugin mutation returned unexpected enabled state for `{plugin_id}`: expected {expected_enabled}, got {actual_enabled}"
+        "remote plugin install returned unexpected enabled state for `{plugin_id}`: expected {expected_enabled}, got {actual_enabled}"
     )]
     UnexpectedEnabledState {
         plugin_id: String,
         expected_enabled: bool,
         actual_enabled: bool,
     },
-
-    #[error("invalid plugin path `{path}`: {reason}")]
-    InvalidPluginPath { path: PathBuf, reason: String },
-
-    #[error("failed to archive plugin at `{path}`: {source}")]
-    Archive {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to join plugin archive task: {0}")]
-    ArchiveJoin(#[source] tokio::task::JoinError),
-
-    #[error(
-        "plugin archive would be {bytes} bytes, exceeding the maximum upload size of {max_bytes} bytes"
-    )]
-    ArchiveTooLarge { bytes: usize, max_bytes: usize },
-
-    #[error("workspace plugin upload response did not include an etag")]
-    MissingUploadEtag,
-
-    #[error("{0}")]
-    UnexpectedResponse(String),
-
-    #[error("{0}")]
-    CacheRemove(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
@@ -265,16 +168,23 @@ impl RemotePluginScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct RemotePluginPagination {
+    #[serde(alias = "nextPageToken")]
     next_page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct RemotePluginSkillInterfaceResponse {
+    #[serde(alias = "displayName")]
     display_name: Option<String>,
+    #[serde(alias = "shortDescription")]
     short_description: Option<String>,
+    #[serde(alias = "brandColor")]
     brand_color: Option<String>,
+    #[serde(alias = "defaultPrompt")]
     default_prompt: Option<String>,
+    #[serde(alias = "iconSmallUrl")]
     icon_small_url: Option<String>,
+    #[serde(alias = "iconLargeUrl")]
     icon_large_url: Option<String>,
 }
 
@@ -286,40 +196,42 @@ struct RemotePluginSkillResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct RemotePluginSkillDetailResponse {
-    plugin_id: String,
-    name: String,
-    skill_md_contents: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct RemotePluginReleaseInterfaceResponse {
+    #[serde(alias = "shortDescription")]
     short_description: Option<String>,
+    #[serde(alias = "longDescription")]
     long_description: Option<String>,
+    #[serde(alias = "developerName")]
     developer_name: Option<String>,
     category: Option<String>,
     #[serde(default)]
     capabilities: Vec<String>,
+    #[serde(alias = "websiteUrl")]
     website_url: Option<String>,
+    #[serde(alias = "privacyPolicyUrl")]
     privacy_policy_url: Option<String>,
+    #[serde(alias = "termsOfServiceUrl")]
     terms_of_service_url: Option<String>,
+    #[serde(alias = "brandColor")]
     brand_color: Option<String>,
+    #[serde(alias = "defaultPrompt")]
     default_prompt: Option<String>,
+    #[serde(alias = "composerIconUrl")]
     composer_icon_url: Option<String>,
+    #[serde(alias = "logoUrl")]
     logo_url: Option<String>,
     #[serde(default)]
+    #[serde(alias = "screenshotUrls")]
     screenshot_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct RemotePluginReleaseResponse {
-    #[serde(default)]
-    version: Option<String>,
+    #[serde(alias = "displayName")]
     display_name: String,
     description: String,
     #[serde(default)]
-    bundle_download_url: Option<String>,
-    #[serde(default)]
+    #[serde(alias = "appIds")]
     app_ids: Vec<String>,
     interface: RemotePluginReleaseInterfaceResponse,
     #[serde(default)]
@@ -331,12 +243,10 @@ struct RemotePluginDirectoryItem {
     id: String,
     name: String,
     scope: RemotePluginScope,
-    #[serde(default)]
-    share_url: Option<String>,
+    #[serde(alias = "installationPolicy")]
     installation_policy: PluginInstallPolicy,
+    #[serde(alias = "authenticationPolicy")]
     authentication_policy: PluginAuthPolicy,
-    #[serde(rename = "status", default)]
-    availability: PluginAvailability,
     release: RemotePluginReleaseResponse,
 }
 
@@ -346,6 +256,7 @@ struct RemotePluginInstalledItem {
     plugin: RemotePluginDirectoryItem,
     enabled: bool,
     #[serde(default)]
+    #[serde(alias = "disabledSkillNames")]
     disabled_skill_names: Vec<String>,
 }
 
@@ -362,7 +273,7 @@ struct RemotePluginInstalledResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct RemotePluginMutationResponse {
+struct RemotePluginInstallResponse {
     id: String,
     enabled: bool,
 }
@@ -465,133 +376,28 @@ pub async fn fetch_remote_marketplaces(
     Ok(marketplaces)
 }
 
-pub async fn fetch_remote_installed_plugins(
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-) -> Result<Vec<RemoteInstalledPlugin>, RemotePluginCatalogError> {
-    let auth = ensure_chatgpt_auth(auth)?;
-    let global = async {
-        let scope = RemotePluginScope::Global;
-        let installed_plugins = fetch_installed_plugins_for_scope(config, auth, scope).await?;
-        Ok::<_, RemotePluginCatalogError>((scope, installed_plugins))
-    };
-    let workspace = async {
-        let scope = RemotePluginScope::Workspace;
-        let installed_plugins = fetch_installed_plugins_for_scope(config, auth, scope).await?;
-        Ok::<_, RemotePluginCatalogError>((scope, installed_plugins))
-    };
-
-    let (global, workspace) = tokio::try_join!(global, workspace)?;
-    let mut installed_plugins = [global, workspace]
-        .into_iter()
-        .flat_map(|(scope, plugins)| {
-            plugins
-                .into_iter()
-                .map(move |plugin| remote_installed_plugin_to_info(scope, &plugin))
-        })
-        .collect::<Vec<_>>();
-    installed_plugins.sort_by(|left, right| {
-        left.marketplace_name
-            .cmp(&right.marketplace_name)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(installed_plugins)
-}
-
 pub async fn fetch_remote_plugin_detail(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
     marketplace_name: &str,
     plugin_id: &str,
 ) -> Result<RemotePluginDetail, RemotePluginCatalogError> {
-    fetch_remote_plugin_detail_with_download_url_option(
-        config,
-        auth,
-        marketplace_name,
-        plugin_id,
-        /*include_download_urls*/ false,
-    )
-    .await
-}
-
-pub async fn fetch_remote_plugin_detail_with_download_urls(
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-    marketplace_name: &str,
-    plugin_id: &str,
-) -> Result<RemotePluginDetail, RemotePluginCatalogError> {
-    fetch_remote_plugin_detail_with_download_url_option(
-        config,
-        auth,
-        marketplace_name,
-        plugin_id,
-        /*include_download_urls*/ true,
-    )
-    .await
-}
-
-pub async fn fetch_remote_plugin_skill_detail(
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-    marketplace_name: &str,
-    plugin_id: &str,
-    skill_name: &str,
-) -> Result<RemotePluginSkillDetail, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
-    if RemotePluginScope::from_marketplace_name(marketplace_name).is_none() {
-        return Err(RemotePluginCatalogError::UnknownMarketplace {
+    let scope = RemotePluginScope::from_marketplace_name(marketplace_name).ok_or_else(|| {
+        RemotePluginCatalogError::UnknownMarketplace {
             marketplace_name: marketplace_name.to_string(),
+        }
+    })?;
+    let plugin = fetch_plugin_detail(config, auth, plugin_id).await?;
+    let actual_marketplace_name = plugin.scope.marketplace_name();
+    if actual_marketplace_name != marketplace_name {
+        return Err(RemotePluginCatalogError::MarketplaceMismatch {
+            plugin_id: plugin_id.to_string(),
+            expected_marketplace_name: marketplace_name.to_string(),
+            actual_marketplace_name: actual_marketplace_name.to_string(),
         });
     }
 
-    let url = remote_plugin_skill_detail_url(config, plugin_id, skill_name)?;
-    let client = build_reqwest_client();
-    let request = authenticated_request(client.get(&url), auth)?;
-    let response: RemotePluginSkillDetailResponse = send_and_decode(request, &url).await?;
-    if response.plugin_id != plugin_id {
-        return Err(RemotePluginCatalogError::UnexpectedPluginId {
-            expected: plugin_id.to_string(),
-            actual: response.plugin_id,
-        });
-    }
-    if response.name != skill_name {
-        return Err(RemotePluginCatalogError::UnexpectedSkillName {
-            expected: skill_name.to_string(),
-            actual: response.name,
-        });
-    }
-
-    Ok(RemotePluginSkillDetail {
-        contents: response.skill_md_contents,
-    })
-}
-
-async fn fetch_remote_plugin_detail_with_download_url_option(
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-    _marketplace_name: &str,
-    plugin_id: &str,
-    include_download_urls: bool,
-) -> Result<RemotePluginDetail, RemotePluginCatalogError> {
-    let auth = ensure_chatgpt_auth(auth)?;
-    let plugin = fetch_plugin_detail(config, auth, plugin_id, include_download_urls).await?;
-    let scope = plugin.scope;
-    let marketplace_name = scope.marketplace_name().to_string();
-    // Remote plugin IDs uniquely identify remote plugins, so the caller-provided
-    // marketplace name is not validated here. The backend detail response is the
-    // source of truth for the plugin's actual scope/marketplace.
-
-    build_remote_plugin_detail(config, auth, scope, marketplace_name, plugin_id, plugin).await
-}
-
-async fn build_remote_plugin_detail(
-    config: &RemotePluginServiceConfig,
-    auth: &CodexAuth,
-    scope: RemotePluginScope,
-    marketplace_name: String,
-    plugin_id: &str,
-    plugin: RemotePluginDirectoryItem,
-) -> Result<RemotePluginDetail, RemotePluginCatalogError> {
     let installed_plugin = fetch_installed_plugins_for_scope(config, auth, scope)
         .await?
         .into_iter()
@@ -623,12 +429,10 @@ async fn build_remote_plugin_detail(
         .collect();
 
     Ok(RemotePluginDetail {
-        marketplace_name,
+        marketplace_name: marketplace_name.to_string(),
         marketplace_display_name: scope.marketplace_display_name().to_string(),
         summary: build_remote_plugin_summary(&plugin, installed_plugin.as_ref()),
         description: non_empty_string(Some(&plugin.release.description)),
-        release_version: plugin.release.version,
-        bundle_download_url: plugin.release.bundle_download_url,
         skills,
         app_ids: plugin.release.app_ids,
     })
@@ -637,18 +441,21 @@ async fn build_remote_plugin_detail(
 pub async fn install_remote_plugin(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
-    _marketplace_name: &str,
+    marketplace_name: &str,
     plugin_id: &str,
 ) -> Result<(), RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
-    // Remote plugin IDs uniquely identify remote plugins, so the caller-provided
-    // marketplace name is not validated before sending the install mutation.
+    if RemotePluginScope::from_marketplace_name(marketplace_name).is_none() {
+        return Err(RemotePluginCatalogError::UnknownMarketplace {
+            marketplace_name: marketplace_name.to_string(),
+        });
+    }
 
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/ps/plugins/{plugin_id}/install");
     let client = build_reqwest_client();
     let request = authenticated_request(client.post(&url), auth)?;
-    let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
+    let response: RemotePluginInstallResponse = send_and_decode(request, &url).await?;
     if response.id != plugin_id {
         return Err(RemotePluginCatalogError::UnexpectedPluginId {
             expected: plugin_id.to_string(),
@@ -666,98 +473,6 @@ pub async fn install_remote_plugin(
     Ok(())
 }
 
-pub async fn uninstall_remote_plugin(
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-    codex_home: PathBuf,
-    plugin_id: &str,
-) -> Result<(), RemotePluginCatalogError> {
-    let auth = ensure_chatgpt_auth(auth)?;
-    let plugin = fetch_plugin_detail(
-        config, auth, plugin_id, /*include_download_urls*/ false,
-    )
-    .await?;
-    let marketplace_name = plugin.scope.marketplace_name().to_string();
-    let plugin_name = plugin.name;
-
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/plugins/{plugin_id}/uninstall");
-    let client = build_reqwest_client();
-    let request = authenticated_request(client.post(&url), auth)?;
-    let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
-    if response.id != plugin_id {
-        return Err(RemotePluginCatalogError::UnexpectedPluginId {
-            expected: plugin_id.to_string(),
-            actual: response.id,
-        });
-    }
-    if response.enabled {
-        return Err(RemotePluginCatalogError::UnexpectedEnabledState {
-            plugin_id: plugin_id.to_string(),
-            expected_enabled: false,
-            actual_enabled: response.enabled,
-        });
-    }
-
-    let legacy_plugin_id = plugin_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        remove_remote_plugin_cache(codex_home, marketplace_name, plugin_name, legacy_plugin_id)
-    })
-    .await
-    .map_err(|err| {
-        RemotePluginCatalogError::CacheRemove(format!(
-            "failed to join remote plugin cache removal task: {err}"
-        ))
-    })?
-    .map_err(RemotePluginCatalogError::CacheRemove)?;
-
-    Ok(())
-}
-
-fn remove_remote_plugin_cache(
-    codex_home: PathBuf,
-    marketplace_name: String,
-    plugin_name: String,
-    legacy_plugin_id: String,
-) -> Result<(), String> {
-    let store = PluginStore::try_new(codex_home.clone())
-        .map_err(|err| format!("failed to resolve remote plugin cache root: {err}"))?;
-    let plugin_id =
-        PluginId::new(plugin_name.clone(), marketplace_name.clone()).map_err(|err| {
-            format!(
-                "invalid remote plugin cache id for `{plugin_name}` in `{marketplace_name}`: {err}"
-            )
-        })?;
-    let plugin_cache_root = store.plugin_base_root(&plugin_id);
-    store.uninstall(&plugin_id).map_err(|err| {
-        format!(
-            "failed to remove remote plugin cache entry {}: {err}",
-            plugin_cache_root.display()
-        )
-    })?;
-
-    let legacy_remote_plugin_cache_root = codex_home
-        .join(PLUGINS_CACHE_DIR)
-        .join(marketplace_name)
-        .join(legacy_plugin_id);
-    if legacy_remote_plugin_cache_root != plugin_cache_root.as_path()
-        && legacy_remote_plugin_cache_root.exists()
-    {
-        let result = if legacy_remote_plugin_cache_root.is_dir() {
-            fs::remove_dir_all(&legacy_remote_plugin_cache_root)
-        } else {
-            fs::remove_file(&legacy_remote_plugin_cache_root)
-        };
-        result.map_err(|err| {
-            format!(
-                "failed to remove remote plugin cache entry {}: {err}",
-                legacy_remote_plugin_cache_root.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
 fn build_remote_plugin_summary(
     plugin: &RemotePluginDirectoryItem,
     installed_plugin: Option<&RemotePluginInstalledItem>,
@@ -769,24 +484,7 @@ fn build_remote_plugin_summary(
         enabled: installed_plugin.is_some_and(|plugin| plugin.enabled),
         install_policy: plugin.installation_policy,
         auth_policy: plugin.authentication_policy,
-        availability: plugin.availability,
         interface: remote_plugin_interface_to_info(plugin),
-    }
-}
-
-fn remote_installed_plugin_to_info(
-    scope: RemotePluginScope,
-    installed_plugin: &RemotePluginInstalledItem,
-) -> RemoteInstalledPlugin {
-    let plugin = &installed_plugin.plugin;
-    // Remote per-skill disabled state (`disabled_skill_names`) is intentionally
-    // not projected into skills/list yet; local skills.config remains the
-    // supported source for skill enablement.
-    RemoteInstalledPlugin {
-        marketplace_name: scope.marketplace_name().to_string(),
-        id: plugin.id.clone(),
-        name: plugin.name.clone(),
-        enabled: installed_plugin.enabled,
     }
 }
 
@@ -900,29 +598,11 @@ async fn fetch_installed_plugins_for_scope(
     auth: &CodexAuth,
     scope: RemotePluginScope,
 ) -> Result<Vec<RemotePluginInstalledItem>, RemotePluginCatalogError> {
-    fetch_installed_plugins_for_scope_with_download_url(
-        config, auth, scope, /*include_download_urls*/ false,
-    )
-    .await
-}
-
-async fn fetch_installed_plugins_for_scope_with_download_url(
-    config: &RemotePluginServiceConfig,
-    auth: &CodexAuth,
-    scope: RemotePluginScope,
-    include_download_urls: bool,
-) -> Result<Vec<RemotePluginInstalledItem>, RemotePluginCatalogError> {
     let mut plugins = Vec::new();
     let mut page_token = None;
     loop {
-        let response = get_remote_plugin_installed_page(
-            config,
-            auth,
-            scope,
-            page_token.as_deref(),
-            include_download_urls,
-        )
-        .await?;
+        let response =
+            get_remote_plugin_installed_page(config, auth, scope, page_token.as_deref()).await?;
         plugins.extend(response.plugins);
         let Some(next_page_token) = response.pagination.next_page_token else {
             break;
@@ -955,16 +635,12 @@ async fn get_remote_plugin_installed_page(
     auth: &CodexAuth,
     scope: RemotePluginScope,
     page_token: Option<&str>,
-    include_download_urls: bool,
 ) -> Result<RemotePluginInstalledResponse, RemotePluginCatalogError> {
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/ps/plugins/installed");
     let client = build_reqwest_client();
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("scope", scope.api_value())]);
-    if include_download_urls {
-        request = request.query(&[("includeDownloadUrls", true)]);
-    }
     if let Some(page_token) = page_token {
         request = request.query(&[("pageToken", page_token)]);
     }
@@ -975,37 +651,12 @@ async fn fetch_plugin_detail(
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     plugin_id: &str,
-    include_download_urls: bool,
 ) -> Result<RemotePluginDirectoryItem, RemotePluginCatalogError> {
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/ps/plugins/{plugin_id}");
     let client = build_reqwest_client();
-    let mut request = authenticated_request(client.get(&url), auth)?;
-    if include_download_urls {
-        request = request.query(&[("includeDownloadUrls", true)]);
-    }
+    let request = authenticated_request(client.get(&url), auth)?;
     send_and_decode(request, &url).await
-}
-
-fn remote_plugin_skill_detail_url(
-    config: &RemotePluginServiceConfig,
-    plugin_id: &str,
-    skill_name: &str,
-) -> Result<String, RemotePluginCatalogError> {
-    let mut url = Url::parse(config.chatgpt_base_url.trim_end_matches('/'))
-        .map_err(RemotePluginCatalogError::InvalidBaseUrl)?;
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|()| RemotePluginCatalogError::InvalidBaseUrlPath)?;
-        segments.pop_if_empty();
-        segments.push("ps");
-        segments.push("plugins");
-        segments.push(plugin_id);
-        segments.push("skills");
-        segments.push(skill_name);
-    }
-    Ok(url.to_string())
 }
 
 fn ensure_chatgpt_auth(auth: Option<&CodexAuth>) -> Result<&CodexAuth, RemotePluginCatalogError> {

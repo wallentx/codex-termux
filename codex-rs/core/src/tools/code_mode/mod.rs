@@ -3,6 +3,7 @@ mod response_adapter;
 mod wait_handler;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,7 +62,7 @@ pub(crate) struct CodeModeService {
 }
 
 impl CodeModeService {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(_js_repl_node_path: Option<PathBuf>) -> Self {
         Self {
             inner: codex_code_mode::CodeModeService::new(),
         }

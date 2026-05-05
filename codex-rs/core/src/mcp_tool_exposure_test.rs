@@ -9,7 +9,7 @@ use codex_mcp::ToolInfo;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_tools::ToolsConfig;
 use codex_tools::ToolsConfigParams;
@@ -58,7 +58,7 @@ fn make_mcp_tool(
         server_name: server_name.to_string(),
         callable_name: tool_name.to_string(),
         callable_namespace: tool_namespace,
-        namespace_description: None,
+        server_instructions: None,
         tool: Tool {
             name: tool_name.to_string().into(),
             title: None,
@@ -73,6 +73,7 @@ fn make_mcp_tool(
         connector_id: connector_id.map(str::to_string),
         connector_name: connector_name.map(str::to_string),
         plugin_display_names: Vec::new(),
+        connector_description: None,
     }
 }
 
@@ -103,7 +104,7 @@ async fn tools_config_for_mcp_tool_exposure(search_tool: bool) -> ToolsConfig {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     tools_config.search_tool = search_tool;
