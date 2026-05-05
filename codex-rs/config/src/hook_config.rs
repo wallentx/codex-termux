@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -11,20 +10,6 @@ use serde::Serialize;
 pub struct HooksFile {
     #[serde(default)]
     pub hooks: HookEventsToml,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct HooksToml {
-    #[serde(flatten)]
-    pub events: HookEventsToml,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub state: BTreeMap<String, HookStateToml>,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct HookStateToml {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -392,7 +392,7 @@ mod tests {
             server_name: server_name.to_string(),
             callable_name: tool_name.to_string(),
             callable_namespace: format!("mcp__{server_name}__"),
-            namespace_description: None,
+            server_instructions: None,
             tool: Tool {
                 name: tool_name.to_string().into(),
                 title: None,
@@ -411,6 +411,7 @@ mod tests {
             connector_id: None,
             connector_name: None,
             plugin_display_names: Vec::new(),
+            connector_description: None,
         }
     }
 
