@@ -4,15 +4,16 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
+use codex_rollout::RolloutConfig;
 use uuid::Uuid;
 
-use super::LocalThreadStoreConfig;
-
-pub(super) fn test_config(codex_home: &Path) -> LocalThreadStoreConfig {
-    LocalThreadStoreConfig {
+pub(super) fn test_config(codex_home: &Path) -> RolloutConfig {
+    RolloutConfig {
         codex_home: codex_home.to_path_buf(),
         sqlite_home: codex_home.to_path_buf(),
-        default_model_provider_id: "test-provider".to_string(),
+        cwd: codex_home.to_path_buf(),
+        model_provider_id: "test-provider".to_string(),
+        generate_memories: true,
     }
 }
 
