@@ -1,7 +1,8 @@
 pub(crate) mod agent_jobs;
 pub(crate) mod apply_patch;
 mod dynamic;
-mod goal;
+mod js_repl;
+mod list_dir;
 mod mcp;
 mod mcp_resource;
 pub(crate) mod multi_agents;
@@ -9,11 +10,11 @@ pub(crate) mod multi_agents_common;
 pub(crate) mod multi_agents_v2;
 mod plan;
 mod request_permissions;
-mod request_plugin_install;
 mod request_user_input;
 mod shell;
 mod test_sync;
 mod tool_search;
+mod tool_suggest;
 mod unavailable_tool;
 pub(crate) mod unified_exec;
 mod view_image;
@@ -36,17 +37,19 @@ pub use apply_patch::ApplyPatchHandler;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 pub use dynamic::DynamicToolHandler;
-pub use goal::GoalHandler;
+pub use js_repl::JsReplHandler;
+pub use js_repl::JsReplResetHandler;
+pub use list_dir::ListDirHandler;
 pub use mcp::McpHandler;
 pub use mcp_resource::McpResourceHandler;
 pub use plan::PlanHandler;
 pub use request_permissions::RequestPermissionsHandler;
-pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
 pub use shell::ShellCommandHandler;
 pub use shell::ShellHandler;
 pub use test_sync::TestSyncHandler;
 pub use tool_search::ToolSearchHandler;
+pub use tool_suggest::ToolSuggestHandler;
 pub use unavailable_tool::UnavailableToolHandler;
 pub(crate) use unavailable_tool::unavailable_tool_message;
 pub use unified_exec::UnifiedExecHandler;
@@ -352,7 +355,7 @@ mod tests {
                 entries: vec![
                     FileSystemSandboxEntry {
                         path: FileSystemPath::Special {
-                            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                            value: FileSystemSpecialPath::CurrentWorkingDirectory,
                         },
                         access: FileSystemAccessMode::Write,
                     },

@@ -19,7 +19,6 @@ chrono = { workspace = true }
 codex-protocol = { workspace = true }
 crypto_box = { workspace = true }
 ed25519-dalek = { workspace = true }
-jsonwebtoken = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }

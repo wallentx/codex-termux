@@ -37,7 +37,6 @@ use tokio::sync::Mutex;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
 mod errors;
@@ -151,7 +150,7 @@ struct ProcessEntry {
     process_id: i32,
     hook_command: String,
     tty: bool,
-    network_approval: Option<DeferredNetworkApproval>,
+    network_approval_id: Option<String>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }
