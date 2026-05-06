@@ -1,4 +1,3 @@
-use crate::context_manager::truncate_function_output_payload;
 use crate::original_image_detail::sanitize_original_image_detail;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -34,6 +33,7 @@ pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolCallSource {
     Direct,
+    JsRepl,
     CodeMode {
         /// Runtime cell that issued the nested tool request.
         cell_id: String,
@@ -143,7 +143,6 @@ pub struct McpToolOutput {
     pub tool_input: JsonValue,
     pub wall_time: Duration,
     pub original_image_detail_supported: bool,
-    pub truncation_policy: TruncationPolicy,
 }
 
 impl ToolOutput for McpToolOutput {
@@ -201,13 +200,7 @@ impl McpToolOutput {
             }
         }
 
-        // This is the context-injection form, so keep it aligned with the
-        // function-call output truncation that conversation history already
-        // applies. Code-mode consumers still get the raw `CallToolResult`.
-        //
-        // The text is serialized again inside the Responses payload, so allow
-        // a small buffer for JSON escaping and wrapper overhead.
-        truncate_function_output_payload(&payload, self.truncation_policy * 1.2)
+        payload
     }
 }
 

@@ -12,7 +12,6 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
-use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,19 +26,6 @@ pub enum ThreadEventPersistenceMode {
     Extended,
 }
 
-/// Thread-scoped metadata used when opening live persistence.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadPersistenceMetadata {
-    /// Effective working directory for environment-backed threads.
-    ///
-    /// `None` means the thread has no filesystem/environment context.
-    pub cwd: Option<PathBuf>,
-    /// Model provider associated with the thread.
-    pub model_provider: String,
-    /// Memory mode associated with the live thread.
-    pub memory_mode: MemoryMode,
-}
-
 /// Parameters required to create a persisted thread.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateThreadParams {
@@ -49,14 +35,10 @@ pub struct CreateThreadParams {
     pub forked_from_id: Option<ThreadId>,
     /// Runtime source for the thread.
     pub source: SessionSource,
-    /// Optional analytics source classification for this thread.
-    pub thread_source: Option<ThreadSource>,
     /// Base instructions persisted in session metadata.
     pub base_instructions: BaseInstructions,
     /// Dynamic tools available to the thread at startup.
     pub dynamic_tools: Vec<DynamicToolSpec>,
-    /// Metadata captured for the newly created thread.
-    pub metadata: ThreadPersistenceMetadata,
     /// Whether persistence should include the extended event surface.
     pub event_persistence_mode: ThreadEventPersistenceMode,
 }
@@ -72,8 +54,6 @@ pub struct ResumeThreadParams {
     pub history: Option<Vec<RolloutItem>>,
     /// Whether archived threads may be reopened.
     pub include_archived: bool,
-    /// Metadata for future writes appended to the resumed live thread.
-    pub metadata: ThreadPersistenceMetadata,
     /// Whether persistence should include the extended event surface.
     pub event_persistence_mode: ThreadEventPersistenceMode,
 }
@@ -110,17 +90,6 @@ pub struct StoredThreadHistory {
 pub struct ReadThreadParams {
     /// Thread id to read.
     pub thread_id: ThreadId,
-    /// Whether archived threads are eligible.
-    pub include_archived: bool,
-    /// Whether persisted rollout items should be included in the response.
-    pub include_history: bool,
-}
-
-/// Parameters for reading a local rollout-backed thread by path.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadThreadByRolloutPathParams {
-    /// Local rollout JSONL path to read.
-    pub rollout_path: PathBuf,
     /// Whether archived threads are eligible.
     pub include_archived: bool,
     /// Whether persisted rollout items should be included in the response.
@@ -214,8 +183,6 @@ pub struct StoredThread {
     pub cli_version: String,
     /// Runtime source for the thread.
     pub source: SessionSource,
-    /// Optional analytics source classification for this thread.
-    pub thread_source: Option<ThreadSource>,
     /// Optional random nickname for thread-spawn sub-agents.
     pub agent_nickname: Option<String>,
     /// Optional role for thread-spawn sub-agents.

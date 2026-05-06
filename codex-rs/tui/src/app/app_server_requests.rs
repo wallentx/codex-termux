@@ -1,38 +1,20 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
-use super::App;
 use crate::app_command::AppCommand;
+use crate::app_command::AppCommandView;
 use crate::app_server_approval_conversions::granted_permission_profile_from_request;
-use crate::app_server_session::AppServerSession;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
-use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ServerRequest;
-
-impl App {
-    pub(super) async fn reject_app_server_request(
-        &self,
-        app_server_client: &AppServerSession,
-        request_id: AppServerRequestId,
-        reason: String,
-    ) -> std::result::Result<(), String> {
-        app_server_client
-            .reject_server_request(
-                request_id,
-                JSONRPCErrorError {
-                    code: -32000,
-                    message: reason,
-                    data: None,
-                },
-            )
-            .await
-            .map_err(|err| format!("failed to reject app-server request: {err}"))
-    }
-}
+use codex_app_server_protocol::ToolRequestUserInputResponse;
+use codex_protocol::mcp::RequestId as McpRequestId;
+use codex_protocol::protocol::ReviewDecision;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AppServerRequestResolution {
@@ -62,7 +44,7 @@ pub(crate) enum ResolvedAppServerRequest {
     },
     McpElicitation {
         server_name: String,
-        request_id: AppServerRequestId,
+        request_id: McpRequestId,
     },
 }
 
@@ -72,7 +54,7 @@ pub(super) struct PendingAppServerRequests {
     file_change_approvals: HashMap<String, AppServerRequestId>,
     permissions_approvals: HashMap<String, AppServerRequestId>,
     user_inputs: HashMap<String, VecDeque<PendingUserInputRequest>>,
-    mcp_requests: HashMap<McpRequestKey, AppServerRequestId>,
+    mcp_requests: HashMap<McpLegacyRequestKey, AppServerRequestId>,
 }
 
 impl PendingAppServerRequests {
@@ -119,9 +101,9 @@ impl PendingAppServerRequests {
             }
             ServerRequest::McpServerElicitationRequest { request_id, params } => {
                 self.mcp_requests.insert(
-                    McpRequestKey {
+                    McpLegacyRequestKey {
                         server_name: params.server_name.clone(),
-                        request_id: request_id.clone(),
+                        request_id: app_server_request_id_to_mcp_request_id(request_id),
                     },
                     request_id.clone(),
                 );
@@ -159,32 +141,30 @@ impl PendingAppServerRequests {
         T: Into<AppCommand>,
     {
         let op: AppCommand = op.into();
-        let resolution = match &op {
-            AppCommand::ExecApproval { id, decision, .. } => self
+        let resolution = match op.view() {
+            AppCommandView::ExecApproval { id, decision, .. } => self
                 .exec_approvals
                 .remove(id)
                 .map(|request_id| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
                         result: serde_json::to_value(CommandExecutionRequestApprovalResponse {
-                            decision: decision.clone(),
+                            decision: decision.clone().into(),
                         })
                         .map_err(|err| {
-                            format!(
-                                "failed to serialize command execution approval response: {err}"
-                            )
+                            format!("failed to serialize command execution approval response: {err}")
                         })?,
                     })
                 })
                 .transpose()?,
-            AppCommand::PatchApproval { id, decision } => self
+            AppCommandView::PatchApproval { id, decision } => self
                 .file_change_approvals
                 .remove(id)
                 .map(|request_id| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
                         result: serde_json::to_value(FileChangeRequestApprovalResponse {
-                            decision: decision.clone(),
+                            decision: file_change_decision(decision)?,
                         })
                         .map_err(|err| {
                             format!("failed to serialize file change approval response: {err}")
@@ -192,7 +172,7 @@ impl PendingAppServerRequests {
                     })
                 })
                 .transpose()?,
-            AppCommand::RequestPermissionsResponse { id, response } => self
+            AppCommandView::RequestPermissionsResponse { id, response } => self
                 .permissions_approvals
                 .remove(id)
                 .map(|request_id| {
@@ -211,18 +191,30 @@ impl PendingAppServerRequests {
                     })
                 })
                 .transpose()?,
-            AppCommand::UserInputAnswer { id, response } => self
+            AppCommandView::UserInputAnswer { id, response } => self
                 .pop_user_input_request_for_turn(id)
                 .map(|pending| {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id: pending.request_id,
-                        result: serde_json::to_value(response).map_err(|err| {
+                        result: serde_json::to_value(
+                            serde_json::from_value::<ToolRequestUserInputResponse>(
+                                serde_json::to_value(response).map_err(|err| {
+                                    format!("failed to encode request_user_input response: {err}")
+                                })?,
+                            )
+                            .map_err(|err| {
+                                format!(
+                                    "failed to decode request_user_input response for app-server: {err}"
+                                )
+                            })?,
+                        )
+                        .map_err(|err| {
                             format!("failed to serialize request_user_input response: {err}")
                         })?,
                     })
                 })
                 .transpose()?,
-            AppCommand::ResolveElicitation {
+            AppCommandView::ResolveElicitation {
                 server_name,
                 request_id,
                 decision,
@@ -230,7 +222,7 @@ impl PendingAppServerRequests {
                 meta,
             } => self
                 .mcp_requests
-                .remove(&McpRequestKey {
+                .remove(&McpLegacyRequestKey {
                     server_name: server_name.to_string(),
                     request_id: request_id.clone(),
                 })
@@ -238,7 +230,17 @@ impl PendingAppServerRequests {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
                         result: serde_json::to_value(McpServerElicitationRequestResponse {
-                            action: *decision,
+                            action: match decision {
+                                codex_protocol::approvals::ElicitationAction::Accept => {
+                                    McpServerElicitationAction::Accept
+                                }
+                                codex_protocol::approvals::ElicitationAction::Decline => {
+                                    McpServerElicitationAction::Decline
+                                }
+                                codex_protocol::approvals::ElicitationAction::Cancel => {
+                                    McpServerElicitationAction::Cancel
+                                }
+                            },
                             content: content.clone(),
                             meta: meta.clone(),
                         })
@@ -381,25 +383,44 @@ struct PendingUserInputRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct McpRequestKey {
+struct McpLegacyRequestKey {
     server_name: String,
-    request_id: AppServerRequestId,
+    request_id: McpRequestId,
+}
+
+fn app_server_request_id_to_mcp_request_id(request_id: &AppServerRequestId) -> McpRequestId {
+    match request_id {
+        AppServerRequestId::String(value) => McpRequestId::String(value.clone()),
+        AppServerRequestId::Integer(value) => McpRequestId::Integer(*value),
+    }
+}
+
+fn file_change_decision(decision: &ReviewDecision) -> Result<FileChangeApprovalDecision, String> {
+    match decision {
+        ReviewDecision::Approved => Ok(FileChangeApprovalDecision::Accept),
+        ReviewDecision::ApprovedForSession => Ok(FileChangeApprovalDecision::AcceptForSession),
+        ReviewDecision::Denied => Ok(FileChangeApprovalDecision::Decline),
+        ReviewDecision::TimedOut => Ok(FileChangeApprovalDecision::Decline),
+        ReviewDecision::Abort => Ok(FileChangeApprovalDecision::Cancel),
+        ReviewDecision::ApprovedExecpolicyAmendment { .. } => {
+            Err("execpolicy amendment is not a valid file change approval decision".to_string())
+        }
+        ReviewDecision::NetworkPolicyAmendment { .. } => {
+            Err("network policy amendment is not a valid file change approval decision".to_string())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::PendingAppServerRequests;
     use super::ResolvedAppServerRequest;
-    use crate::app_command::AppCommand as Op;
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
-    use codex_app_server_protocol::CommandExecutionApprovalDecision;
     use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
-    use codex_app_server_protocol::FileChangeApprovalDecision;
     use codex_app_server_protocol::FileChangeRequestApprovalParams;
     use codex_app_server_protocol::McpElicitationObjectType;
     use codex_app_server_protocol::McpElicitationSchema;
-    use codex_app_server_protocol::McpServerElicitationAction;
     use codex_app_server_protocol::McpServerElicitationRequest;
     use codex_app_server_protocol::McpServerElicitationRequestParams;
     use codex_app_server_protocol::PermissionGrantScope;
@@ -410,8 +431,13 @@ mod tests {
     use codex_app_server_protocol::ToolRequestUserInputAnswer;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::ToolRequestUserInputResponse;
+    use codex_protocol::approvals::ElicitationAction;
+    use codex_protocol::approvals::ExecPolicyAmendment;
+    use codex_protocol::mcp::RequestId as McpRequestId;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
+    use codex_protocol::protocol::Op;
+    use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::request_permissions::RequestPermissionProfile;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
@@ -448,7 +474,7 @@ mod tests {
             .take_resolution(&Op::ExecApproval {
                 id: "approval-1".to_string(),
                 turn_id: None,
-                decision: CommandExecutionApprovalDecision::Accept,
+                decision: ReviewDecision::Approved,
             })
             .expect("resolution should serialize")
             .expect("request should be pending");
@@ -560,10 +586,10 @@ mod tests {
         let user_input = pending
             .take_resolution(&Op::UserInputAnswer {
                 id: "turn-2".to_string(),
-                response: ToolRequestUserInputResponse {
+                response: codex_protocol::request_user_input::RequestUserInputResponse {
                     answers: std::iter::once((
                         "question".to_string(),
-                        ToolRequestUserInputAnswer {
+                        codex_protocol::request_user_input::RequestUserInputAnswer {
                             answers: vec!["yes".to_string()],
                         },
                     ))
@@ -617,8 +643,8 @@ mod tests {
         let resolution = pending
             .take_resolution(&Op::ResolveElicitation {
                 server_name: "example".to_string(),
-                request_id: AppServerRequestId::Integer(12),
-                decision: McpServerElicitationAction::Accept,
+                request_id: McpRequestId::Integer(12),
+                decision: ElicitationAction::Accept,
                 content: Some(json!({ "answer": "yes" })),
                 meta: Some(json!({ "source": "tui" })),
             })
@@ -677,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_patch_approval_through_app_server_request_id() {
+    fn rejects_invalid_patch_decisions_for_file_change_requests() {
         let mut pending = PendingAppServerRequests::default();
         assert_eq!(
             pending.note_server_request(&ServerRequest::FileChangeRequestApproval {
@@ -693,16 +719,22 @@ mod tests {
             None
         );
 
-        let resolution = pending
+        let error = pending
             .take_resolution(&Op::PatchApproval {
                 id: "patch-1".to_string(),
-                decision: FileChangeApprovalDecision::Cancel,
+                decision: ReviewDecision::ApprovedExecpolicyAmendment {
+                    proposed_execpolicy_amendment: ExecPolicyAmendment::new(vec![
+                        "echo".to_string(),
+                        "hi".to_string(),
+                    ]),
+                },
             })
-            .expect("resolution should serialize")
-            .expect("request should be pending");
+            .expect_err("invalid patch decision should fail");
 
-        assert_eq!(resolution.request_id, AppServerRequestId::Integer(13));
-        assert_eq!(resolution.result, json!({ "decision": "cancel" }));
+        assert_eq!(
+            error,
+            "execpolicy amendment is not a valid file change approval decision"
+        );
     }
 
     #[test]
@@ -771,7 +803,7 @@ mod tests {
             pending.resolve_notification(&AppServerRequestId::Integer(12)),
             Some(ResolvedAppServerRequest::McpElicitation {
                 server_name: "example".to_string(),
-                request_id: AppServerRequestId::Integer(12),
+                request_id: McpRequestId::Integer(12),
             })
         );
     }
@@ -812,7 +844,7 @@ mod tests {
             });
         }
 
-        let response = ToolRequestUserInputResponse {
+        let response = codex_protocol::request_user_input::RequestUserInputResponse {
             answers: HashMap::new(),
         };
         let first_response = pending
