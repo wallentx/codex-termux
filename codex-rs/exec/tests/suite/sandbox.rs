@@ -24,7 +24,8 @@ async fn spawn_command_under_sandbox(
     use codex_core::exec::build_exec_request;
     use codex_core::sandboxing::SandboxPermissions;
     use codex_protocol::config_types::WindowsSandboxLevel;
-    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use std::process::Stdio;
 
     let codex_linux_sandbox_exe = None;
@@ -42,7 +43,9 @@ async fn spawn_command_under_sandbox(
             justification: None,
             arg0: None,
         },
-        &PermissionProfile::from_legacy_sandbox_policy(sandbox_policy),
+        sandbox_policy,
+        &FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, sandbox_cwd),
+        NetworkSandboxPolicy::from(sandbox_policy),
         sandbox_cwd,
         &codex_linux_sandbox_exe,
         /*use_legacy_landlock*/ false,
@@ -89,16 +92,13 @@ async fn spawn_command_under_sandbox(
     env: HashMap<String, String>,
 ) -> std::io::Result<Child> {
     use codex_core::spawn_command_under_linux_sandbox;
-    use codex_protocol::models::PermissionProfile;
-
     let codex_linux_sandbox_exe = core_test_support::find_codex_linux_sandbox_exe()
         .map_err(|err| io::Error::new(io::ErrorKind::NotFound, err))?;
-    let permission_profile = PermissionProfile::from_legacy_sandbox_policy(sandbox_policy);
     spawn_command_under_linux_sandbox(
         codex_linux_sandbox_exe,
         command,
         command_cwd,
-        &permission_profile,
+        sandbox_policy,
         sandbox_cwd,
         /*use_legacy_landlock*/ false,
         stdio_policy,
@@ -182,6 +182,7 @@ async fn python_multiprocessing_lock_works_under_sandbox() {
 
     let policy = SandboxPolicy::WorkspaceWrite {
         writable_roots,
+        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: false,
         exclude_slash_tmp: false,
@@ -296,6 +297,7 @@ async fn sandbox_distinguishes_command_and_policy_cwds() {
     // is under a writable root.
     let policy = SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![],
+        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: true,
         exclude_slash_tmp: true,
@@ -377,6 +379,7 @@ async fn sandbox_blocks_first_time_dot_codex_creation() {
     let config_toml = dot_codex.join("config.toml");
     let policy = SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![],
+        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: true,
         exclude_slash_tmp: true,

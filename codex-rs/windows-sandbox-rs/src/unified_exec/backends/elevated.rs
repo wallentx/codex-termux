@@ -59,13 +59,11 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated(
     let sandbox_creds = elevated.sandbox_creds.clone();
     let logs_base_dir = elevated.common.logs_base_dir.clone();
     let transport = tokio::task::spawn_blocking(move || -> Result<_> {
-        spawn_runner_transport(
-            &codex_home,
-            &cwd,
-            &sandbox_creds,
-            logs_base_dir.as_deref(),
-            spawn_request,
-        )
+        let mut transport =
+            spawn_runner_transport(&codex_home, &cwd, &sandbox_creds, logs_base_dir.as_deref())?;
+        transport.send_spawn_request(spawn_request)?;
+        transport.read_spawn_ready()?;
+        Ok(transport)
     })
     .await
     .map_err(|err| anyhow::anyhow!("runner handshake task failed: {err}"))??;

@@ -17,10 +17,6 @@ concurrency:
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 jobs:
   test:
-    # PRs use a fast Windows cross-compiled test leg for pre-merge signal.
-    # Post-merge pushes to main also run the native Windows test job below for
-    # broader Windows signal without putting PR latency back on the critical
-    # path. Cargo CI owns V8/code-mode test coverage for now.
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -44,16 +40,13 @@ jobs:
           # - os: ubuntu-24.04-arm
           #   target: aarch64-unknown-linux-gnu
 
-          # Windows fast path: build the windows-gnullvm binaries with Linux
-          # RBE, then run the resulting Windows tests on the Windows runner.
-          # Cargo CI preserves V8/code-mode coverage while Bazel CI keeps broad
-          # non-code-mode signal.
+          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-gnullvm
     runs-on: ${{ matrix.os }}
 
     # Configure a human readable name for each job
-    name: Bazel test on ${{ matrix.os }} for ${{ matrix.target }}
+    name: Local Bazel build on ${{ matrix.os }} for ${{ matrix.target }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -70,7 +63,6 @@ jobs:
         uses: ./.github/actions/prepare-bazel-ci
         with:
           target: ${{ matrix.target }}
-          cache-scope: bazel-${{ github.job }}
           install-test-prereqs: "true"
       - name: Check MODULE.bazel.lock is up to date
         if: matrix.os == 'ubuntu-24.04' && matrix.target == 'x86_64-unknown-linux-gnu'
@@ -88,16 +80,11 @@ jobs:
             # path. V8 consumers under `//codex-rs/...` still participate
             # transitively through `//...`.
             -//third_party/v8:all
-            # V8-backed code-mode tests are covered by Cargo CI. Bazel CI
-            # cross-compiles in several legs, and those tests are not stable in
-            # that setup yet.
-            -//codex-rs/code-mode:code-mode-unit-tests
-            -//codex-rs/v8-poc:v8-poc-unit-tests
           )
 
           bazel_wrapper_args=(
-            --print-failed-action-summary
             --print-failed-test-logs
+            --use-node-test-env
           )
           bazel_test_args=(
             test
@@ -106,10 +93,8 @@ jobs:
             --build_metadata=COMMIT_SHA=${GITHUB_SHA}
           )
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            bazel_wrapper_args+=(
-              --windows-cross-compile
-              --remote-download-toplevel
-            )
+            bazel_wrapper_args+=(--windows-msvc-host-platform)
+            bazel_test_args+=(--jobs=8)
           fi
 
           ./.github/scripts/run-bazel-ci.sh \
@@ -128,88 +113,15 @@ jobs:
           path: ${{ runner.temp }}/bazel-execution-logs
           if-no-files-found: ignore
 
-      # Save the job-scoped Bazel repository cache after cache misses. Keep the
+      # Save the Bazel repository cache after every non-cancelled run. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
-          key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
-
-  test-windows-native-main:
-    # Native Windows Bazel tests are slower and frequently approach the
-    # 30-minute PR budget. Run this only for post-merge commits to main and give
-    # it a larger timeout.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    timeout-minutes: 40
-    runs-on: windows-latest
-    name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm (native main)
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Prepare Bazel CI
-        id: prepare_bazel
-        uses: ./.github/actions/prepare-bazel-ci
-        with:
-          target: x86_64-pc-windows-gnullvm
-          cache-scope: bazel-${{ github.job }}
-          install-test-prereqs: "true"
-
-      - name: bazel test //...
-        env:
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-        shell: bash
-        run: |
-          bazel_targets=(
-            //...
-            # Keep standalone V8 library targets out of the ordinary Bazel CI
-            # path. V8 consumers under `//codex-rs/...` still participate
-            # transitively through `//...`.
-            -//third_party/v8:all
-            # Keep this aligned with the main Bazel job. The native Windows
-            # job preserves broad post-merge coverage, but code-mode/V8 tests
-            # are covered by Cargo CI rather than Bazel for now.
-            -//codex-rs/code-mode:code-mode-unit-tests
-            -//codex-rs/v8-poc:v8-poc-unit-tests
-          )
-
-          bazel_test_args=(
-            test
-            --test_tag_filters=-argument-comment-lint
-            --test_verbose_timeout_warnings
-            --build_metadata=COMMIT_SHA=${GITHUB_SHA}
-            --build_metadata=TAG_windows_native_main=true
-          )
-
-          ./.github/scripts/run-bazel-ci.sh \
-            --print-failed-action-summary \
-            --print-failed-test-logs \
-            -- \
-            "${bazel_test_args[@]}" \
-            -- \
-            "${bazel_targets[@]}"
-
-      - name: Upload Bazel execution logs
         if: always() && !cancelled()
         continue-on-error: true
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-        with:
-          name: bazel-execution-logs-test-windows-native-x86_64-pc-windows-gnullvm
-          path: ${{ runner.temp }}/bazel-execution-logs
-          if-no-files-found: ignore
-
-      # Save the job-scoped Bazel repository cache after cache misses. Keep the
-      # upload non-fatal so cache service issues never fail the job itself.
-      - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
-        continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
-          key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
+          key: bazel-cache-${{ matrix.target }}-${{ hashFiles('MODULE.bazel', 'codex-rs/Cargo.lock', 'codex-rs/Cargo.toml') }}
 
   clippy:
     timeout-minutes: 30
@@ -238,7 +150,6 @@ jobs:
         uses: ./.github/actions/prepare-bazel-ci
         with:
           target: ${{ matrix.target }}
-          cache-scope: bazel-${{ github.job }}
 
       - name: bazel build --config=clippy lint targets
         env:
@@ -250,33 +161,20 @@ jobs:
             --build_metadata=COMMIT_SHA=${GITHUB_SHA}
             --build_metadata=TAG_job=clippy
           )
-          bazel_wrapper_args=()
-          bazel_target_list_args=()
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            # Keep this aligned with the fast Windows Bazel test job: use
-            # Linux RBE for clippy build actions while targeting Windows
-            # gnullvm. Fork/community PRs without the BuildBuddy secret fall
-            # back inside `run-bazel-ci.sh` to the previous local Windows MSVC
-            # host-platform shape.
-            bazel_wrapper_args+=(--windows-cross-compile)
-            bazel_target_list_args+=(--windows-cross-compile)
-            if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
-              # The fork fallback can see incompatible explicit Windows-cross
-              # internal test binaries in the generated target list. Preserve
-              # the old local-fallback behavior there.
-              bazel_clippy_args+=(--skip_incompatible_explicit_targets)
-            fi
+            # Some explicit targets pulled in through //codex-rs/... are
+            # intentionally incompatible with `//:local_windows`, but the lint
+            # aspect still traverses their compatible Rust deps.
+            bazel_clippy_args+=(--skip_incompatible_explicit_targets)
           fi
 
-          bazel_target_lines="$(./scripts/list-bazel-clippy-targets.sh "${bazel_target_list_args[@]}")"
+          bazel_target_lines="$(./scripts/list-bazel-clippy-targets.sh)"
           bazel_targets=()
           while IFS= read -r target; do
             bazel_targets+=("${target}")
           done <<< "${bazel_target_lines}"
 
           ./.github/scripts/run-bazel-ci.sh \
-            --print-failed-action-summary \
-            "${bazel_wrapper_args[@]}" \
             -- \
             build \
             "${bazel_clippy_args[@]}" \
@@ -292,15 +190,15 @@ jobs:
           path: ${{ runner.temp }}/bazel-execution-logs
           if-no-files-found: ignore
 
-      # Save the job-scoped Bazel repository cache after cache misses. Keep the
+      # Save the Bazel repository cache after every non-cancelled run. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        if: always() && !cancelled()
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
-          key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
+          key: bazel-cache-${{ matrix.target }}-${{ hashFiles('MODULE.bazel', 'codex-rs/Cargo.lock', 'codex-rs/Cargo.toml') }}
 
   verify-release-build:
     timeout-minutes: 30
@@ -325,7 +223,6 @@ jobs:
         uses: ./.github/actions/prepare-bazel-ci
         with:
           target: ${{ matrix.target }}
-          cache-scope: bazel-${{ github.job }}
 
       - name: bazel build verify-release-build targets
         env:
@@ -340,12 +237,7 @@ jobs:
           # Rust debug assertions explicitly.
           bazel_wrapper_args=()
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            # This is build-only signal, so use the same Linux-RBE
-            # cross-compile path as the fast Windows test and clippy jobs.
-            # Fork/community PRs without the BuildBuddy secret fall back
-            # inside `run-bazel-ci.sh` to the previous local Windows MSVC
-            # host-platform shape.
-            bazel_wrapper_args+=(--windows-cross-compile)
+            bazel_wrapper_args+=(--windows-msvc-host-platform)
           fi
 
           bazel_build_args=(
@@ -380,12 +272,12 @@ jobs:
           path: ${{ runner.temp }}/bazel-execution-logs
           if-no-files-found: ignore
 
-      # Save the job-scoped Bazel repository cache after cache misses. Keep the
+      # Save the Bazel repository cache after every non-cancelled run. Keep the
       # upload non-fatal so cache service issues never fail the job itself.
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.prepare_bazel.outputs.repository-cache-hit != 'true'
+        if: always() && !cancelled()
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: ${{ steps.prepare_bazel.outputs.repository-cache-path }}
-          key: ${{ steps.prepare_bazel.outputs.repository-cache-key }}
+          key: bazel-cache-${{ matrix.target }}-${{ hashFiles('MODULE.bazel', 'codex-rs/Cargo.lock', 'codex-rs/Cargo.toml') }}
