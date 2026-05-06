@@ -10,26 +10,21 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolHandlerKind {
+    AgentJobs,
     ApplyPatch,
     CloseAgentV1,
     CloseAgentV2,
     CodeModeExecute,
     CodeModeWait,
-    ContainerExec,
-    CreateGoal,
     DynamicTool,
-    ExecCommand,
     FollowupTaskV2,
-    GetGoal,
+    JsRepl,
+    JsReplReset,
     ListAgentsV2,
-    ListMcpResourceTemplates,
-    ListMcpResources,
-    LocalShell,
+    ListDir,
     Mcp,
+    McpResource,
     Plan,
-    ReadMcpResource,
-    ReportAgentJobResult,
-    RequestPluginInstall,
     RequestPermissions,
     RequestUserInput,
     ResumeAgentV1,
@@ -37,16 +32,15 @@ pub enum ToolHandlerKind {
     SendMessageV2,
     Shell,
     ShellCommand,
-    SpawnAgentsOnCsv,
     SpawnAgentV1,
     SpawnAgentV2,
     TestSync,
     ToolSearch,
-    UpdateGoal,
+    ToolSuggest,
+    UnifiedExec,
     ViewImage,
     WaitAgentV1,
     WaitAgentV2,
-    WriteStdin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +86,7 @@ pub struct ToolRegistryPlanDeferredTool<'a> {
     pub name: ToolName,
     pub server_name: &'a str,
     pub connector_name: Option<&'a str>,
-    pub description: Option<&'a str>,
+    pub connector_description: Option<&'a str>,
 }
 
 impl ToolRegistryPlan {

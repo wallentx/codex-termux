@@ -11,13 +11,13 @@ use tokio_util::sync::CancellationToken;
 use crate::context::ContextualUserFragment;
 use crate::context::ImageGenerationInstructions;
 use crate::function_tool::FunctionCallError;
+use crate::memories::citations::parse_memory_citation;
+use crate::memories::citations::thread_ids_from_memory_citation;
 use crate::parse_turn_item;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
-use codex_memories_read::citations::parse_memory_citation;
-use codex_memories_read::citations::thread_ids_from_memory_citation;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -139,7 +139,7 @@ pub(crate) async fn record_completed_response_item(
     }
     mark_thread_memory_mode_polluted_if_external_context(sess, turn_context, item).await;
     let has_memory_citation =
-        record_stage1_output_usage_and_detect_memory_citation(sess.state_db(), item).await;
+        record_stage1_output_usage_and_detect_memory_citation(turn_context, item).await;
     if has_memory_citation {
         sess.record_memory_citation_for_turn(&turn_context.sub_id)
             .await;
@@ -174,7 +174,7 @@ pub(crate) async fn mark_thread_memory_mode_polluted_if_external_context(
 }
 
 async fn record_stage1_output_usage_and_detect_memory_citation(
-    state_db_ctx: Option<state_db::StateDbHandle>,
+    turn_context: &TurnContext,
     item: &ResponseItem,
 ) -> bool {
     let Some(raw_text) = raw_assistant_output_text_from_item(item) else {
@@ -190,7 +190,7 @@ async fn record_stage1_output_usage_and_detect_memory_citation(
         return true;
     }
 
-    if let Some(db) = state_db_ctx {
+    if let Some(db) = state_db::get_state_db(turn_context.config.as_ref()).await {
         let _ = db.record_stage1_output_usage(&thread_ids).await;
     }
     true
@@ -255,14 +255,14 @@ pub(crate) async fn handle_output_item_done(
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {
-            let turn_item = handle_non_tool_response_item(
+            if let Some(turn_item) = handle_non_tool_response_item(
                 ctx.sess.as_ref(),
                 ctx.turn_context.as_ref(),
                 &item,
                 plan_mode,
             )
-            .await;
-            if let Some(turn_item) = turn_item {
+            .await
+            {
                 if previously_active_item.is_none() {
                     let mut started_item = turn_item.clone();
                     if let TurnItem::ImageGeneration(item) = &mut started_item {
