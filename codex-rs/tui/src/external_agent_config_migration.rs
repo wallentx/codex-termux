@@ -799,7 +799,6 @@ mod tests {
                     plugin_names: vec!["warehouse".to_string()],
                 },
             ],
-            ..Default::default()
         }
     }
 
