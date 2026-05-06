@@ -9,10 +9,6 @@ pub(crate) struct Handler;
 impl ToolHandler for Handler {
     type Output = FunctionToolOutput;
 
-    fn tool_name(&self) -> ToolName {
-        ToolName::plain("send_message")
-    }
-
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
@@ -29,6 +25,7 @@ impl ToolHandler for Handler {
             MessageDeliveryMode::QueueOnly,
             args.target,
             args.message,
+            /*interrupt*/ false,
         )
         .await
     }

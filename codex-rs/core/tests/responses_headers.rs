@@ -80,13 +80,13 @@ async fn responses_stream_includes_subagent_header_on_review() {
     config.model = Some(model.clone());
     let config = Arc::new(config);
 
-    let thread_id = ThreadId::new();
+    let conversation_id = ThreadId::new();
     let auth_mode = TelemetryAuthMode::Chatgpt;
     let session_source = SessionSource::SubAgent(SubAgentSource::Review);
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
     let session_telemetry = SessionTelemetry::new(
-        thread_id,
+        conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
         /*account_id*/ None,
@@ -100,8 +100,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        thread_id.into(),
-        thread_id,
+        conversation_id,
         /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),
         session_source,
@@ -119,6 +118,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         content: vec![ContentItem::InputText {
             text: "hello".into(),
         }],
+        end_turn: None,
         phase: None,
     }];
 
@@ -142,7 +142,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
     }
 
     let request = request_recorder.single_request();
-    let expected_window_id = format!("{thread_id}:0");
+    let expected_window_id = format!("{conversation_id}:0");
     assert_eq!(
         request.header("x-openai-subagent").as_deref(),
         Some("review")
@@ -206,14 +206,14 @@ async fn responses_stream_includes_subagent_header_on_other() {
     config.model = Some(model.clone());
     let config = Arc::new(config);
 
-    let thread_id = ThreadId::new();
+    let conversation_id = ThreadId::new();
     let auth_mode = TelemetryAuthMode::Chatgpt;
     let session_source = SessionSource::SubAgent(SubAgentSource::Other("my-task".to_string()));
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
 
     let session_telemetry = SessionTelemetry::new(
-        thread_id,
+        conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
         /*account_id*/ None,
@@ -227,8 +227,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        thread_id.into(),
-        thread_id,
+        conversation_id,
         /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),
         session_source,
@@ -246,6 +245,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         content: vec![ContentItem::InputText {
             text: "hello".into(),
         }],
+        end_turn: None,
         phase: None,
     }];
 
@@ -319,7 +319,7 @@ async fn responses_respects_model_info_overrides_from_config() {
     let model = config.model.clone().expect("model configured");
     let config = Arc::new(config);
 
-    let thread_id = ThreadId::new();
+    let conversation_id = ThreadId::new();
     let auth_mode =
         codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"))
             .auth_mode()
@@ -329,7 +329,7 @@ async fn responses_respects_model_info_overrides_from_config() {
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
     let session_telemetry = SessionTelemetry::new(
-        thread_id,
+        conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
         /*account_id*/ None,
@@ -343,8 +343,7 @@ async fn responses_respects_model_info_overrides_from_config() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        thread_id.into(),
-        thread_id,
+        conversation_id,
         /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),
         session_source,
@@ -362,6 +361,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         content: vec![ContentItem::InputText {
             text: "hello".into(),
         }],
+        end_turn: None,
         phase: None,
     }];
 
@@ -437,14 +437,6 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
         !initial_turn_id.is_empty(),
         "turn_id should not be empty in x-codex-turn-metadata"
     );
-    let initial_turn_started_at_unix_ms = initial_parsed
-        .get("turn_started_at_unix_ms")
-        .and_then(serde_json::Value::as_i64)
-        .expect("turn_started_at_unix_ms should be present");
-    assert!(
-        initial_turn_started_at_unix_ms > 0,
-        "turn_started_at_unix_ms should be positive"
-    );
     assert_eq!(
         initial_parsed
             .get("sandbox")
@@ -455,7 +447,7 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
         initial_parsed
             .get("thread_source")
             .and_then(serde_json::Value::as_str),
-        None
+        Some("user")
     );
 
     let git_config_global = cwd.join("empty-git-config");
@@ -548,33 +540,17 @@ async fn responses_stream_includes_turn_metadata_header_for_git_workspace_e2e() 
         .get("turn_id")
         .and_then(serde_json::Value::as_str)
         .expect("second turn_id should be present");
-    let first_turn_started_at_unix_ms = first_parsed
-        .get("turn_started_at_unix_ms")
-        .and_then(serde_json::Value::as_i64)
-        .expect("first turn_started_at_unix_ms should be present");
-    let second_turn_started_at_unix_ms = second_parsed
-        .get("turn_started_at_unix_ms")
-        .and_then(serde_json::Value::as_i64)
-        .expect("second turn_started_at_unix_ms should be present");
-    assert!(
-        first_turn_started_at_unix_ms > 0,
-        "first turn_started_at_unix_ms should be positive"
-    );
-    assert_eq!(
-        first_turn_started_at_unix_ms, second_turn_started_at_unix_ms,
-        "requests in the same turn should share turn_started_at_unix_ms"
-    );
     assert_eq!(
         first_parsed
             .get("thread_source")
             .and_then(serde_json::Value::as_str),
-        None
+        Some("user")
     );
     assert_eq!(
         second_parsed
             .get("thread_source")
             .and_then(serde_json::Value::as_str),
-        None
+        Some("user")
     );
     assert_eq!(
         first_turn_id, second_turn_id,

@@ -6,10 +6,6 @@ pub(crate) struct Handler;
 impl ToolHandler for Handler {
     type Output = ListAgentsResult;
 
-    fn tool_name(&self) -> ToolName {
-        ToolName::plain("list_agents")
-    }
-
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
