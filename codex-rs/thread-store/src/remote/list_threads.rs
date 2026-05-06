@@ -140,7 +140,6 @@ mod tests {
                         kind: proto::SessionSourceKind::Cli.into(),
                         ..Default::default()
                     }),
-                    thread_source: Some("user".to_string()),
                     git_info: Some(proto::GitInfo {
                         sha: Some("abc123".to_string()),
                         branch: Some("main".to_string()),
@@ -251,7 +250,6 @@ mod tests {
                 sub_agent_role: Some("explorer".to_string()),
                 ..Default::default()
             }),
-            thread_source: Some("subagent".to_string()),
             git_info: Some(proto::GitInfo {
                 sha: Some("abc123".to_string()),
                 branch: Some("main".to_string()),

@@ -61,10 +61,9 @@ use codex_login::default_client::originator;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillScope;
-use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use sha1::Digest;
 use std::collections::HashMap;
@@ -75,7 +74,8 @@ pub(crate) struct AnalyticsReducer {
     requests: HashMap<(u64, RequestId), RequestState>,
     turns: HashMap<String, TurnState>,
     connections: HashMap<u64, ConnectionState>,
-    threads: HashMap<String, ThreadAnalyticsState>,
+    thread_connections: HashMap<String, u64>,
+    thread_metadata: HashMap<String, ThreadMetadataState>,
 }
 
 struct ConnectionState {
@@ -83,72 +83,9 @@ struct ConnectionState {
     runtime: CodexRuntimeMetadata,
 }
 
-#[derive(Default)]
-struct ThreadAnalyticsState {
-    connection_id: Option<u64>,
-    metadata: Option<ThreadMetadataState>,
-}
-
-#[derive(Clone, Copy)]
-struct AnalyticsDropSite<'a> {
-    event_name: &'static str,
-    thread_id: &'a str,
-    turn_id: Option<&'a str>,
-    review_id: Option<&'a str>,
-    item_id: Option<&'a str>,
-}
-
-impl<'a> AnalyticsDropSite<'a> {
-    fn guardian(input: &'a GuardianReviewEventParams) -> Self {
-        Self {
-            event_name: "guardian",
-            thread_id: &input.thread_id,
-            turn_id: Some(&input.turn_id),
-            review_id: Some(&input.review_id),
-            item_id: None,
-        }
-    }
-
-    fn compaction(input: &'a CodexCompactionEvent) -> Self {
-        Self {
-            event_name: "compaction",
-            thread_id: &input.thread_id,
-            turn_id: Some(&input.turn_id),
-            review_id: None,
-            item_id: None,
-        }
-    }
-
-    fn turn_steer(thread_id: &'a str) -> Self {
-        Self {
-            event_name: "turn steer",
-            thread_id,
-            turn_id: None,
-            review_id: None,
-            item_id: None,
-        }
-    }
-
-    fn turn(thread_id: &'a str, turn_id: &'a str) -> Self {
-        Self {
-            event_name: "turn",
-            thread_id,
-            turn_id: Some(turn_id),
-            review_id: None,
-            item_id: None,
-        }
-    }
-}
-
-enum MissingAnalyticsContext {
-    ThreadConnection,
-    Connection { connection_id: u64 },
-    ThreadMetadata,
-}
-
 #[derive(Clone)]
 struct ThreadMetadataState {
-    thread_source: Option<ThreadSource>,
+    thread_source: Option<&'static str>,
     initialization_mode: ThreadInitializationMode,
     subagent_source: Option<String>,
     parent_thread_id: Option<String>,
@@ -157,7 +94,6 @@ struct ThreadMetadataState {
 impl ThreadMetadataState {
     fn from_thread_metadata(
         session_source: &SessionSource,
-        thread_source: Option<ThreadSource>,
         initialization_mode: ThreadInitializationMode,
     ) -> Self {
         let (subagent_source, parent_thread_id) = match session_source {
@@ -170,11 +106,10 @@ impl ThreadMetadataState {
             | SessionSource::Exec
             | SessionSource::Mcp
             | SessionSource::Custom(_)
-            | SessionSource::Internal(_)
             | SessionSource::Unknown => (None, None),
         };
         Self {
-            thread_source,
+            thread_source: session_source.thread_source_name(),
             initialization_mode,
             subagent_source,
             parent_thread_id,
@@ -236,21 +171,18 @@ impl AnalyticsReducer {
                     rpc_transport,
                 );
             }
-            AnalyticsFact::ClientRequest {
+            AnalyticsFact::Request {
                 connection_id,
                 request_id,
                 request,
             } => {
                 self.ingest_request(connection_id, request_id, *request);
             }
-            AnalyticsFact::ClientResponse {
+            AnalyticsFact::Response {
                 connection_id,
-                request_id,
                 response,
             } => {
-                if let Some(response) = response.into_client_response(request_id) {
-                    self.ingest_response(connection_id, response, out);
-                }
+                self.ingest_response(connection_id, *response, out);
             }
             AnalyticsFact::ErrorResponse {
                 connection_id,
@@ -263,13 +195,6 @@ impl AnalyticsReducer {
             AnalyticsFact::Notification(notification) => {
                 self.ingest_notification(*notification, out);
             }
-            AnalyticsFact::ServerRequest {
-                connection_id: _connection_id,
-                request: _request,
-            } => {}
-            AnalyticsFact::ServerResponse {
-                response: _response,
-            } => {}
             AnalyticsFact::Custom(input) => match input {
                 CustomAnalyticsFact::SubAgentThreadStarted(input) => {
                     self.ingest_subagent_thread_started(input, out);
@@ -338,26 +263,6 @@ impl AnalyticsReducer {
         input: SubAgentThreadStartedInput,
         out: &mut Vec<TrackEventRequest>,
     ) {
-        let parent_thread_id = input
-            .parent_thread_id
-            .clone()
-            .or_else(|| subagent_parent_thread_id(&input.subagent_source));
-        let parent_connection_id = parent_thread_id
-            .as_ref()
-            .and_then(|parent_thread_id| self.threads.get(parent_thread_id))
-            .and_then(|thread| thread.connection_id);
-        let thread_state = self.threads.entry(input.thread_id.clone()).or_default();
-        thread_state
-            .metadata
-            .get_or_insert_with(|| ThreadMetadataState {
-                thread_source: Some(ThreadSource::Subagent),
-                initialization_mode: ThreadInitializationMode::New,
-                subagent_source: Some(subagent_source_name(&input.subagent_source)),
-                parent_thread_id,
-            });
-        if thread_state.connection_id.is_none() {
-            thread_state.connection_id = parent_connection_id;
-        }
         out.push(TrackEventRequest::ThreadInitialized(
             subagent_thread_started_event_request(input),
         ));
@@ -368,9 +273,23 @@ impl AnalyticsReducer {
         input: GuardianReviewEventParams,
         out: &mut Vec<TrackEventRequest>,
     ) {
-        let Some(connection_state) =
-            self.thread_connection_or_warn(AnalyticsDropSite::guardian(&input))
-        else {
+        let Some(connection_id) = self.thread_connections.get(&input.thread_id) else {
+            tracing::warn!(
+                thread_id = %input.thread_id,
+                turn_id = %input.turn_id,
+                review_id = %input.review_id,
+                "dropping guardian analytics event: missing thread connection metadata"
+            );
+            return;
+        };
+        let Some(connection_state) = self.connections.get(connection_id) else {
+            tracing::warn!(
+                thread_id = %input.thread_id,
+                turn_id = %input.turn_id,
+                review_id = %input.review_id,
+                connection_id,
+                "dropping guardian analytics event: missing connection metadata"
+            );
             return;
         };
         out.push(TrackEventRequest::GuardianReview(Box::new(
@@ -498,13 +417,11 @@ impl AnalyticsReducer {
                     skill_name: invocation.skill_name.clone(),
                     event_params: SkillInvocationEventParams {
                         thread_id: Some(tracking.thread_id.clone()),
-                        turn_id: Some(tracking.turn_id.clone()),
                         invoke_type: Some(invocation.invocation_type),
                         model_slug: Some(tracking.model_slug.clone()),
                         product_client_id: Some(originator().value),
                         repo_url,
                         skill_scope: Some(skill_scope.to_string()),
-                        plugin_id: invocation.plugin_id,
                     },
                 },
             ));
@@ -751,23 +668,17 @@ impl AnalyticsReducer {
         initialization_mode: ThreadInitializationMode,
         out: &mut Vec<TrackEventRequest>,
     ) {
-        let session_source: SessionSource = thread.source.into();
+        let thread_source: SessionSource = thread.source.into();
         let thread_id = thread.id;
         let Some(connection_state) = self.connections.get(&connection_id) else {
             return;
         };
-        let thread_metadata = ThreadMetadataState::from_thread_metadata(
-            &session_source,
-            thread.thread_source.map(Into::into),
-            initialization_mode,
-        );
-        self.threads.insert(
-            thread_id.clone(),
-            ThreadAnalyticsState {
-                connection_id: Some(connection_id),
-                metadata: Some(thread_metadata.clone()),
-            },
-        );
+        let thread_metadata =
+            ThreadMetadataState::from_thread_metadata(&thread_source, initialization_mode);
+        self.thread_connections
+            .insert(thread_id.clone(), connection_id);
+        self.thread_metadata
+            .insert(thread_id.clone(), thread_metadata.clone());
         out.push(TrackEventRequest::ThreadInitialized(
             ThreadInitializedEvent {
                 event_type: "codex_thread_initialized",
@@ -788,9 +699,29 @@ impl AnalyticsReducer {
     }
 
     fn ingest_compaction(&mut self, input: CodexCompactionEvent, out: &mut Vec<TrackEventRequest>) {
-        let Some((connection_state, thread_metadata)) =
-            self.thread_context_or_warn(AnalyticsDropSite::compaction(&input))
-        else {
+        let Some(connection_id) = self.thread_connections.get(&input.thread_id) else {
+            tracing::warn!(
+                thread_id = %input.thread_id,
+                turn_id = %input.turn_id,
+                "dropping compaction analytics event: missing thread connection metadata"
+            );
+            return;
+        };
+        let Some(connection_state) = self.connections.get(connection_id) else {
+            tracing::warn!(
+                thread_id = %input.thread_id,
+                turn_id = %input.turn_id,
+                connection_id,
+                "dropping compaction analytics event: missing connection metadata"
+            );
+            return;
+        };
+        let Some(thread_metadata) = self.thread_metadata.get(&input.thread_id) else {
+            tracing::warn!(
+                thread_id = %input.thread_id,
+                turn_id = %input.turn_id,
+                "dropping compaction analytics event: missing thread lifecycle metadata"
+            );
             return;
         };
         out.push(TrackEventRequest::Compaction(Box::new(
@@ -845,13 +776,11 @@ impl AnalyticsReducer {
         let Some(connection_state) = self.connections.get(&connection_id) else {
             return;
         };
-        let drop_site = AnalyticsDropSite::turn_steer(&pending_request.thread_id);
-        let Some(thread_metadata) = self
-            .threads
-            .get(drop_site.thread_id)
-            .and_then(|thread| thread.metadata.as_ref())
-        else {
-            warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadMetadata);
+        let Some(thread_metadata) = self.thread_metadata.get(&pending_request.thread_id) else {
+            tracing::warn!(
+                thread_id = %pending_request.thread_id,
+                "dropping turn steer analytics event: missing thread lifecycle metadata"
+            );
             return;
         };
         out.push(TrackEventRequest::TurnSteer(CodexTurnSteerEventRequest {
@@ -862,7 +791,7 @@ impl AnalyticsReducer {
                 accepted_turn_id,
                 app_server_client: connection_state.app_server_client.clone(),
                 runtime: connection_state.runtime.clone(),
-                thread_source: thread_metadata.thread_source,
+                thread_source: thread_metadata.thread_source.map(str::to_string),
                 subagent_source: thread_metadata.subagent_source.clone(),
                 parent_thread_id: thread_metadata.parent_thread_id.clone(),
                 num_input_images: pending_request.num_input_images,
@@ -884,34 +813,42 @@ impl AnalyticsReducer {
         {
             return;
         }
+        let connection_metadata = turn_state
+            .connection_id
+            .and_then(|connection_id| self.connections.get(&connection_id))
+            .map(|connection_state| {
+                (
+                    connection_state.app_server_client.clone(),
+                    connection_state.runtime.clone(),
+                )
+            });
+        let Some((app_server_client, runtime)) = connection_metadata else {
+            if let Some(connection_id) = turn_state.connection_id {
+                tracing::warn!(
+                    turn_id,
+                    connection_id,
+                    "dropping turn analytics event: missing connection metadata"
+                );
+            }
+            return;
+        };
         let Some(thread_id) = turn_state.thread_id.as_ref() else {
             return;
         };
-        let Some(connection_id) = turn_state.connection_id else {
-            return;
-        };
-        let Some(connection_state) = self.connections.get(&connection_id) else {
-            warn_missing_analytics_context(
-                &AnalyticsDropSite::turn(thread_id, turn_id),
-                MissingAnalyticsContext::Connection { connection_id },
+        let Some(thread_metadata) = self.thread_metadata.get(thread_id) else {
+            tracing::warn!(
+                thread_id,
+                turn_id,
+                "dropping turn analytics event: missing thread lifecycle metadata"
             );
-            return;
-        };
-        let drop_site = AnalyticsDropSite::turn(thread_id, turn_id);
-        let Some(thread_metadata) = self
-            .threads
-            .get(drop_site.thread_id)
-            .and_then(|thread| thread.metadata.as_ref())
-        else {
-            warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadMetadata);
             return;
         };
         out.push(TrackEventRequest::TurnEvent(Box::new(
             CodexTurnEventRequest {
                 event_type: "codex_turn_event",
                 event_params: codex_turn_event_params(
-                    connection_state.app_server_client.clone(),
-                    connection_state.runtime.clone(),
+                    app_server_client,
+                    runtime,
                     turn_id.to_string(),
                     turn_state,
                     thread_metadata,
@@ -920,67 +857,6 @@ impl AnalyticsReducer {
         )));
         self.turns.remove(turn_id);
     }
-
-    fn thread_connection_or_warn(
-        &self,
-        drop_site: AnalyticsDropSite<'_>,
-    ) -> Option<&ConnectionState> {
-        let Some(thread_state) = self.threads.get(drop_site.thread_id) else {
-            warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
-            return None;
-        };
-        let Some(connection_id) = thread_state.connection_id else {
-            warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadConnection);
-            return None;
-        };
-        let Some(connection_state) = self.connections.get(&connection_id) else {
-            warn_missing_analytics_context(
-                &drop_site,
-                MissingAnalyticsContext::Connection { connection_id },
-            );
-            return None;
-        };
-        Some(connection_state)
-    }
-
-    fn thread_context_or_warn(
-        &self,
-        drop_site: AnalyticsDropSite<'_>,
-    ) -> Option<(&ConnectionState, &ThreadMetadataState)> {
-        let connection_state = self.thread_connection_or_warn(drop_site)?;
-        let Some(thread_metadata) = self
-            .threads
-            .get(drop_site.thread_id)
-            .and_then(|thread| thread.metadata.as_ref())
-        else {
-            warn_missing_analytics_context(&drop_site, MissingAnalyticsContext::ThreadMetadata);
-            return None;
-        };
-        Some((connection_state, thread_metadata))
-    }
-}
-
-fn warn_missing_analytics_context(
-    drop_site: &AnalyticsDropSite<'_>,
-    missing: MissingAnalyticsContext,
-) {
-    let (missing_context, connection_id) = match missing {
-        MissingAnalyticsContext::ThreadConnection => ("thread_connection", None),
-        MissingAnalyticsContext::Connection { connection_id } => {
-            ("connection", Some(connection_id))
-        }
-        MissingAnalyticsContext::ThreadMetadata => ("thread_metadata", None),
-    };
-    tracing::warn!(
-        thread_id = %drop_site.thread_id,
-        turn_id = ?drop_site.turn_id,
-        review_id = ?drop_site.review_id,
-        item_id = ?drop_site.item_id,
-        missing_context,
-        connection_id,
-        "dropping {} analytics event: missing analytics context",
-        drop_site.event_name
-    );
 }
 
 fn codex_turn_event_params(
@@ -1008,8 +884,7 @@ fn codex_turn_event_params(
         session_source: _session_source,
         model,
         model_provider,
-        permission_profile,
-        permission_profile_cwd,
+        sandbox_policy,
         reasoning_effort,
         reasoning_summary,
         service_tier,
@@ -1028,16 +903,13 @@ fn codex_turn_event_params(
         runtime,
         submission_type,
         ephemeral,
-        thread_source: thread_metadata.thread_source,
+        thread_source: thread_metadata.thread_source.map(str::to_string),
         initialization_mode: thread_metadata.initialization_mode,
         subagent_source: thread_metadata.subagent_source.clone(),
         parent_thread_id: thread_metadata.parent_thread_id.clone(),
         model: Some(model),
         model_provider,
-        sandbox_policy: Some(sandbox_policy_mode(
-            &permission_profile,
-            permission_profile_cwd.as_path(),
-        )),
+        sandbox_policy: Some(sandbox_policy_mode(&sandbox_policy)),
         reasoning_effort: reasoning_effort.map(|value| value.to_string()),
         reasoning_summary: reasoning_summary_mode(reasoning_summary),
         service_tier: service_tier
@@ -1082,27 +954,12 @@ fn codex_turn_event_params(
     }
 }
 
-fn sandbox_policy_mode(permission_profile: &PermissionProfile, cwd: &Path) -> &'static str {
-    match permission_profile {
-        PermissionProfile::Disabled => "full_access",
-        PermissionProfile::External { .. } => "external_sandbox",
-        PermissionProfile::Managed { .. } => {
-            let file_system_policy = permission_profile.file_system_sandbox_policy();
-            if file_system_policy.has_full_disk_write_access() {
-                if permission_profile.network_sandbox_policy().is_enabled() {
-                    "full_access"
-                } else {
-                    "external_sandbox"
-                }
-            } else if file_system_policy
-                .get_writable_roots_with_cwd(cwd)
-                .is_empty()
-            {
-                "read_only"
-            } else {
-                "workspace_write"
-            }
-        }
+fn sandbox_policy_mode(sandbox_policy: &SandboxPolicy) -> &'static str {
+    match sandbox_policy {
+        SandboxPolicy::DangerFullAccess => "full_access",
+        SandboxPolicy::ReadOnly { .. } => "read_only",
+        SandboxPolicy::WorkspaceWrite { .. } => "workspace_write",
+        SandboxPolicy::ExternalSandbox { .. } => "external_sandbox",
     }
 }
 
@@ -1191,27 +1048,5 @@ pub(crate) fn normalize_path_for_skill_id(
                 .replace('\\', "/")
         }
         _ => resolved_path.to_string_lossy().replace('\\', "/"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_protocol::models::SandboxEnforcement;
-    use codex_protocol::permissions::FileSystemSandboxPolicy;
-    use codex_protocol::permissions::NetworkSandboxPolicy;
-
-    #[test]
-    fn managed_full_disk_with_restricted_network_reports_external_sandbox() {
-        let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
-            SandboxEnforcement::Managed,
-            &FileSystemSandboxPolicy::unrestricted(),
-            NetworkSandboxPolicy::Restricted,
-        );
-
-        assert_eq!(
-            sandbox_policy_mode(&permission_profile, Path::new("/")),
-            "external_sandbox"
-        );
     }
 }

@@ -5,10 +5,10 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
 use core_test_support::responses;
@@ -82,10 +82,7 @@ async fn tool_call_output_configured_limit_chars_type() -> Result<()> {
     .await;
 
     fixture
-        .submit_turn_with_permission_profile(
-            "trigger big shell output",
-            PermissionProfile::Disabled,
-        )
+        .submit_turn_with_policy("trigger big shell output", SandboxPolicy::DangerFullAccess)
         .await?;
 
     // Inspect what we sent back to the model; it should contain a truncated
@@ -159,10 +156,7 @@ async fn tool_call_output_exceeds_limit_truncated_chars_limit() -> Result<()> {
     .await;
 
     fixture
-        .submit_turn_with_permission_profile(
-            "trigger big shell output",
-            PermissionProfile::Disabled,
-        )
+        .submit_turn_with_policy("trigger big shell output", SandboxPolicy::DangerFullAccess)
         .await?;
 
     // Inspect what we sent back to the model; it should contain a truncated
@@ -235,10 +229,7 @@ async fn tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> {
     .await;
 
     fixture
-        .submit_turn_with_permission_profile(
-            "trigger big shell output",
-            PermissionProfile::Disabled,
-        )
+        .submit_turn_with_policy("trigger big shell output", SandboxPolicy::DangerFullAccess)
         .await?;
 
     // Inspect what we sent back to the model; it should contain a truncated
@@ -312,10 +303,7 @@ async fn tool_call_output_truncated_only_once() -> Result<()> {
     .await;
 
     fixture
-        .submit_turn_with_permission_profile(
-            "trigger big shell output",
-            PermissionProfile::Disabled,
-        )
+        .submit_turn_with_policy("trigger big shell output", SandboxPolicy::DangerFullAccess)
         .await?;
 
     let output = mock2
@@ -411,9 +399,9 @@ async fn mcp_tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> 
     let fixture = builder.build(&server).await?;
 
     fixture
-        .submit_turn_with_permission_profile(
+        .submit_turn_with_policy(
             "call the rmcp echo tool with a very large message",
-            PermissionProfile::read_only(),
+            SandboxPolicy::new_read_only_policy(),
         )
         .await?;
 
@@ -508,8 +496,6 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
     });
     let fixture = builder.build(&server).await?;
     let session_model = fixture.session_configured.model.clone();
-    let permission_profile = PermissionProfile::read_only();
-    let sandbox_policy = permission_profile.to_legacy_sandbox_policy(fixture.cwd.path())?;
 
     fixture
         .codex
@@ -523,8 +509,8 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile: Some(permission_profile),
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -591,7 +577,7 @@ async fn token_policy_marker_reports_tokens() -> Result<()> {
     .await;
 
     fixture
-        .submit_turn_with_permission_profile("run the shell tool", PermissionProfile::Disabled)
+        .submit_turn_with_policy("run the shell tool", SandboxPolicy::DangerFullAccess)
         .await?;
 
     let output = done_mock
@@ -642,7 +628,7 @@ async fn byte_policy_marker_reports_bytes() -> Result<()> {
     .await;
 
     fixture
-        .submit_turn_with_permission_profile("run the shell tool", PermissionProfile::Disabled)
+        .submit_turn_with_policy("run the shell tool", SandboxPolicy::DangerFullAccess)
         .await?;
 
     let output = done_mock
@@ -694,9 +680,9 @@ async fn shell_command_output_not_truncated_with_custom_limit() -> Result<()> {
     .await;
 
     fixture
-        .submit_turn_with_permission_profile(
+        .submit_turn_with_policy(
             "run big output without truncation",
-            PermissionProfile::Disabled,
+            SandboxPolicy::DangerFullAccess,
         )
         .await?;
 
@@ -791,9 +777,9 @@ async fn mcp_tool_call_output_not_truncated_with_custom_limit() -> Result<()> {
     let fixture = builder.build(&server).await?;
 
     fixture
-        .submit_turn_with_permission_profile(
+        .submit_turn_with_policy(
             "call the rmcp echo tool with a very large message",
-            PermissionProfile::read_only(),
+            SandboxPolicy::new_read_only_policy(),
         )
         .await?;
 

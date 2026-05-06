@@ -3,14 +3,13 @@ use std::sync::Arc;
 
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::ThreadManager;
-use codex_core::agent_graph_store_from_state_db;
 use codex_core::config::Config;
-use codex_core::init_state_db_from_config;
-use codex_core::thread_store_from_config;
 use codex_exec_server::EnvironmentManager;
+use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
+use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
@@ -50,38 +49,36 @@ pub(crate) struct MessageProcessor {
 impl MessageProcessor {
     /// Create a new `MessageProcessor`, retaining a handle to the outgoing
     /// `Sender` so handlers can enqueue messages to be written to stdout.
-    pub(crate) async fn new(
+    pub(crate) fn new(
         outgoing: OutgoingMessageSender,
         arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
         environment_manager: Arc<EnvironmentManager>,
-    ) -> Option<Self> {
+    ) -> Self {
         let outgoing = Arc::new(outgoing);
         let auth_manager = AuthManager::shared_from_config(
             config.as_ref(),
             /*enable_codex_api_key_env*/ false,
-        )
-        .await;
-        let state_db = init_state_db_from_config(config.as_ref()).await?;
-        let thread_store = thread_store_from_config(config.as_ref(), state_db.clone());
-        let agent_graph_store = agent_graph_store_from_state_db(state_db.clone());
+        );
         let thread_manager = Arc::new(ThreadManager::new(
             config.as_ref(),
             auth_manager,
             SessionSource::Mcp,
+            CollaborationModesConfig {
+                default_mode_request_user_input: config
+                    .features
+                    .enabled(Feature::DefaultModeRequestUserInput),
+            },
             environment_manager,
             /*analytics_events_client*/ None,
-            state_db,
-            thread_store,
-            agent_graph_store,
         ));
-        Some(Self {
+        Self {
             outgoing,
             initialized: false,
             arg0_paths,
             thread_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
-        })
+        }
     }
 
     pub(crate) async fn process_request(&mut self, request: JsonRpcRequest<ClientRequest>) {
