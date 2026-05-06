@@ -517,6 +517,9 @@ pub struct Config {
     /// Start the composer in Vim mode (`Normal`) by default.
     pub tui_vim_mode_default: bool,
 
+    /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
+    pub tui_raw_output_mode: bool,
+
     /// Start the TUI in the specified collaboration mode (plan/default).
 
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
@@ -3146,6 +3149,11 @@ impl Config {
                 .tui
                 .as_ref()
                 .map(|t| t.vim_mode_default)
+                .unwrap_or(false),
+            tui_raw_output_mode: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.raw_output_mode)
                 .unwrap_or(false),
             tui_alternate_screen: cfg
                 .tui
