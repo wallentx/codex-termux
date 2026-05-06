@@ -8,7 +8,6 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::items::TurnItem;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
@@ -18,6 +17,7 @@ use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
@@ -28,7 +28,6 @@ use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::mount_models_once;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
-use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use std::path::PathBuf;
@@ -71,30 +70,6 @@ const POST_AUTO_USER_MSG: &str = "post auto follow-up";
 const PRETURN_CONTEXT_DIFF_CWD: &str = "/tmp/PRETURN_CONTEXT_DIFF_CWD";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
-
-fn disabled_permission_user_turn(text: impl Into<String>, cwd: PathBuf, model: String) -> Op {
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
-    Op::UserTurn {
-        environments: None,
-        items: vec![UserInput::Text {
-            text: text.into(),
-            text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        cwd,
-        approval_policy: AskForApproval::Never,
-        approvals_reviewer: None,
-        sandbox_policy,
-        permission_profile,
-        model,
-        effort: None,
-        summary: None,
-        service_tier: None,
-        collaboration_mode: None,
-        personality: None,
-    }
-}
 
 fn auto_summary(summary: &str) -> String {
     summary.to_string()
@@ -1640,6 +1615,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: remote_summary.to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         codex_protocol::models::ResponseItem::Compaction {
@@ -1700,11 +1676,25 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
 
     resumed
         .codex
-        .submit(disabled_permission_user_turn(
-            follow_up_user,
-            resumed.cwd.path().to_path_buf(),
-            resumed.session_configured.model.clone(),
-        ))
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: follow_up_user.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: resumed.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: resumed.session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await
         .unwrap();
 
@@ -1779,11 +1769,25 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     let test = builder.build(&server).await.expect("build test codex");
 
     test.codex
-        .submit(disabled_permission_user_turn(
-            "before switch",
-            test.cwd.path().to_path_buf(),
-            previous_model.to_string(),
-        ))
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "before switch".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: previous_model.to_string(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await
         .expect("submit first user turn");
     wait_for_event(&test.codex, |event| {
@@ -1792,11 +1796,25 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     .await;
 
     test.codex
-        .submit(disabled_permission_user_turn(
-            "after switch",
-            test.cwd.path().to_path_buf(),
-            next_model.to_string(),
-        ))
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "after switch".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: next_model.to_string(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await
         .expect("submit second user turn");
     assert_compaction_uses_turn_lifecycle_id(&test.codex).await;
@@ -1891,11 +1909,25 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 
     initial
         .codex
-        .submit(disabled_permission_user_turn(
-            "before resume",
-            initial.cwd.path().to_path_buf(),
-            previous_model.to_string(),
-        ))
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "before resume".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: initial.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: previous_model.to_string(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await
         .expect("submit pre-resume turn");
     wait_for_event(&initial.codex, |event| {
@@ -1928,11 +1960,25 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 
     resumed
         .codex
-        .submit(disabled_permission_user_turn(
-            "after resume",
-            resumed.cwd.path().to_path_buf(),
-            next_model.to_string(),
-        ))
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "after resume".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: resumed.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: next_model.to_string(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await
         .expect("submit resumed user turn");
     assert_compaction_uses_turn_lifecycle_id(&resumed.codex).await;
@@ -2149,6 +2195,16 @@ async fn manual_compact_retries_after_context_window_error() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.unwrap();
+    let EventMsg::BackgroundEvent(event) =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::BackgroundEvent(_))).await
+    else {
+        panic!("expected background event after compact retry");
+    };
+    assert!(
+        event.message.contains("Trimmed 1 older thread item"),
+        "background event should mention trimmed item count: {}",
+        event.message
+    );
     let warning_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
     let EventMsg::Warning(WarningEvent { message }) = warning_event else {
         panic!("expected warning event after compact retry");
@@ -2805,6 +2861,7 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: "REMOTE_COMPACT_SUMMARY".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         codex_protocol::models::ResponseItem::Compaction {
@@ -2928,6 +2985,7 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: "REMOTE_COMPACT_SUMMARY".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         codex_protocol::models::ResponseItem::Compaction {
@@ -3140,11 +3198,25 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
         .expect("build codex");
 
     test.codex
-        .submit(disabled_permission_user_turn(
-            "BEFORE_SWITCH_USER",
-            test.cwd.path().to_path_buf(),
-            previous_model.to_string(),
-        ))
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "BEFORE_SWITCH_USER".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: previous_model.to_string(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await
         .expect("submit first user turn");
     wait_for_event(&test.codex, |event| {
@@ -3153,11 +3225,25 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
     .await;
 
     test.codex
-        .submit(disabled_permission_user_turn(
-            "AFTER_SWITCH_USER",
-            test.cwd.path().to_path_buf(),
-            next_model.to_string(),
-        ))
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "AFTER_SWITCH_USER".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: next_model.to_string(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await
         .expect("submit second user turn");
     wait_for_event(&test.codex, |event| {

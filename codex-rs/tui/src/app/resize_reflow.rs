@@ -26,7 +26,6 @@ use super::App;
 use super::InitialHistoryReplayBuffer;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
-use crate::insert_history::HistoryLineWrapPolicy;
 use crate::transcript_reflow::TRANSCRIPT_REFLOW_DEBOUNCE;
 use crate::tui;
 
@@ -76,8 +75,7 @@ impl App {
         cell: &dyn HistoryCell,
         width: u16,
     ) -> Vec<Line<'static>> {
-        let mut display =
-            cell.display_lines_for_mode(width, self.chat_widget.history_render_mode());
+        let mut display = cell.display_lines(width);
         if !display.is_empty() && !cell.is_stream_continuation() {
             if self.has_emitted_history_lines {
                 display.insert(0, Line::from(""));
@@ -101,7 +99,7 @@ impl App {
         if self.overlay.is_some() {
             self.deferred_history_lines.extend(display);
         } else {
-            tui.insert_history_lines_with_wrap_policy(display, self.history_line_wrap_policy());
+            tui.insert_history_lines(display);
         }
     }
 
@@ -121,23 +119,6 @@ impl App {
         }
     }
 
-    /// Start retaining a thread-switch transcript replay without rendering each historical cell.
-    ///
-    /// Thread switches already rebuild `transcript_cells` from source. When a row cap exists, we can
-    /// defer terminal writes until the replay is complete and reuse the resize-reflow tail renderer
-    /// so only the rows the terminal would retain are formatted and inserted.
-    pub(super) fn begin_thread_switch_history_replay_buffer(&mut self) {
-        if self.terminal_resize_reflow_enabled()
-            && self.resize_reflow_max_rows().is_some()
-            && self.overlay.is_none()
-        {
-            self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
-                retained_lines: VecDeque::new(),
-                render_from_transcript_tail: true,
-            });
-        }
-    }
-
     /// Flush retained initial resume replay rows into terminal scrollback.
     ///
     /// The buffer stores display lines, not cells, because the cap is measured in terminal rows.
@@ -149,18 +130,11 @@ impl App {
         };
 
         if buffer.retained_lines.is_empty() {
-            if buffer.render_from_transcript_tail {
-                let width = tui.terminal.last_known_screen_size.width;
-                let reflowed_lines = self.render_transcript_lines_for_reflow(width).lines;
-                if !reflowed_lines.is_empty() {
-                    tui.insert_history_lines(reflowed_lines);
-                }
-            }
             return;
         }
 
         let retained_lines = buffer.retained_lines.into_iter().collect::<Vec<_>>();
-        tui.insert_history_lines_with_wrap_policy(retained_lines, self.history_line_wrap_policy());
+        tui.insert_history_lines(retained_lines);
     }
 
     pub(super) fn insert_history_cell_lines_with_initial_replay_buffer(
@@ -169,14 +143,6 @@ impl App {
         cell: &dyn HistoryCell,
         width: u16,
     ) {
-        if self
-            .initial_history_replay_buffer
-            .as_ref()
-            .is_some_and(|buffer| buffer.render_from_transcript_tail)
-        {
-            return;
-        }
-
         let display = self.display_lines_for_history_insert(cell, width);
 
         if display.is_empty() {
@@ -190,16 +156,8 @@ impl App {
             } else if self.overlay.is_some() {
                 self.deferred_history_lines.extend(display);
             } else {
-                tui.insert_history_lines_with_wrap_policy(display, self.history_line_wrap_policy());
+                tui.insert_history_lines(display);
             }
-        }
-    }
-
-    pub(crate) fn history_line_wrap_policy(&self) -> HistoryLineWrapPolicy {
-        if self.chat_widget.raw_output_mode() {
-            HistoryLineWrapPolicy::Terminal
-        } else {
-            HistoryLineWrapPolicy::PreWrap
         }
     }
 
@@ -418,7 +376,7 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn reflow_transcript_now(&mut self, tui: &mut tui::Tui) -> Result<u16> {
+    fn reflow_transcript_now(&mut self, tui: &mut tui::Tui) -> Result<u16> {
         let width = tui.terminal.size()?.width;
         if self.transcript_cells.is_empty() {
             // Drop any queued pre-resize/pre-consolidation inserts before rebuilding from cells.
@@ -436,10 +394,7 @@ impl App {
 
         self.deferred_history_lines.clear();
         if !reflowed_lines.is_empty() {
-            tui.insert_history_lines_with_wrap_policy(
-                reflowed_lines,
-                self.history_line_wrap_policy(),
-            );
+            tui.insert_history_lines(reflowed_lines);
         }
 
         Ok(width)
@@ -461,7 +416,7 @@ impl App {
         while start > 0 {
             start -= 1;
             let cell = self.transcript_cells[start].clone();
-            let lines = cell.display_lines_for_mode(width, self.chat_widget.history_render_mode());
+            let lines = cell.display_lines(width);
             rendered_rows += lines.len();
             cell_displays.push_front(ReflowCellDisplay {
                 lines,
@@ -481,7 +436,7 @@ impl App {
             start -= 1;
             let cell = self.transcript_cells[start].clone();
             cell_displays.push_front(ReflowCellDisplay {
-                lines: cell.display_lines_for_mode(width, self.chat_widget.history_render_mode()),
+                lines: cell.display_lines(width),
                 is_stream_continuation: cell.is_stream_continuation(),
             });
         }

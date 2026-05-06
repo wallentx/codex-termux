@@ -25,6 +25,7 @@ impl ToolHandler for Handler {
             MessageDeliveryMode::QueueOnly,
             args.target,
             args.message,
+            /*interrupt*/ false,
         )
         .await
     }
