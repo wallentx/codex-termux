@@ -2,15 +2,11 @@
 members = [
     "aws-auth",
     "analytics",
-    "agent-graph-store",
     "agent-identity",
     "backend-client",
-    "builtin-mcps",
-    "bwrap",
     "ansi-escape",
     "async-utils",
     "app-server",
-    "app-server-transport",
     "app-server-client",
     "app-server-protocol",
     "app-server-test-client",
@@ -30,22 +26,19 @@ members = [
     "collaboration-mode-templates",
     "connectors",
     "config",
+    "device-key",
     "shell-command",
     "shell-escalation",
     "skills",
     "core",
-    "core-api",
     "core-plugins",
     "core-skills",
     "hooks",
     "secrets",
     "exec",
-    "file-system",
     "exec-server",
     "execpolicy",
     "execpolicy-legacy",
-    "external-agent-migration",
-    "external-agent-sessions",
     "keyring-store",
     "file-search",
     "linux-sandbox",
@@ -53,9 +46,6 @@ members = [
     "login",
     "codex-mcp",
     "mcp-server",
-    "memories/mcp",
-    "memories/read",
-    "memories/write",
     "model-provider-info",
     "models-manager",
     "network-proxy",
@@ -76,6 +66,7 @@ members = [
     "v8-poc",
     "utils/absolute-path",
     "utils/cargo-bin",
+    "utils/file-lock",
     "git-utils",
     "utils/cache",
     "utils/image",
@@ -102,7 +93,6 @@ members = [
     "state",
     "terminal-detection",
     "test-binary-support",
-    "thread-manager-sample",
     "thread-store",
     "uds",
     "codex-experimental-api-macros",
@@ -113,6 +103,7 @@ resolver = "2"
 
 [workspace.package]
 version = "0.130.0-alpha.1"
+
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -124,13 +115,11 @@ license = "Apache-2.0"
 # Internal
 app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
-codex-agent-graph-store = { path = "agent-graph-store" }
 codex-agent-identity = { path = "agent-identity" }
 codex-ansi-escape = { path = "ansi-escape" }
 codex-api = { path = "codex-api" }
 codex-aws-auth = { path = "aws-auth" }
 codex-app-server = { path = "app-server" }
-codex-app-server-transport = { path = "app-server-transport" }
 codex-app-server-client = { path = "app-server-client" }
 codex-app-server-protocol = { path = "app-server-protocol" }
 codex-app-server-test-client = { path = "app-server-test-client" }
@@ -138,7 +127,6 @@ codex-apply-patch = { path = "apply-patch" }
 codex-arg0 = { path = "arg0" }
 codex-async-utils = { path = "async-utils" }
 codex-backend-client = { path = "backend-client" }
-codex-builtin-mcps = { path = "builtin-mcps" }
 codex-chatgpt = { path = "chatgpt" }
 codex-cli = { path = "cli" }
 codex-client = { path = "codex-client" }
@@ -150,15 +138,12 @@ codex-code-mode = { path = "code-mode" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
 codex-core = { path = "core" }
-codex-core-api = { path = "core-api" }
 codex-core-plugins = { path = "core-plugins" }
 codex-core-skills = { path = "core-skills" }
+codex-device-key = { path = "device-key" }
 codex-exec = { path = "exec" }
-codex-file-system = { path = "file-system" }
 codex-exec-server = { path = "exec-server" }
 codex-execpolicy = { path = "execpolicy" }
-codex-external-agent-migration = { path = "external-agent-migration" }
-codex-external-agent-sessions = { path = "external-agent-sessions" }
 codex-experimental-api-macros = { path = "codex-experimental-api-macros" }
 codex-features = { path = "features" }
 codex-feedback = { path = "feedback" }
@@ -170,10 +155,6 @@ codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
-codex-message-history = { path = "message-history" }
-codex-memories-mcp = { path = "memories/mcp" }
-codex-memories-read = { path = "memories/read" }
-codex-memories-write = { path = "memories/write" }
 codex-mcp = { path = "codex-mcp" }
 codex-mcp-server = { path = "mcp-server" }
 codex-model-provider-info = { path = "model-provider-info" }
@@ -210,6 +191,7 @@ codex-utils-cache = { path = "utils/cache" }
 codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }
 codex-utils-elapsed = { path = "utils/elapsed" }
+codex-utils-file-lock = { path = "utils/file-lock" }
 codex-utils-fuzzy-match = { path = "utils/fuzzy-match" }
 codex-utils-home-dir = { path = "utils/home-dir" }
 codex-utils-image = { path = "utils/image" }
@@ -275,7 +257,6 @@ encoding_rs = "0.8.35"
 env-flags = "0.1.1"
 env_logger = "0.11.9"
 eventsource-stream = "0.2.3"
-flate2 = "1.1.8"
 futures = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
 gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
@@ -317,6 +298,7 @@ os_info = "3.12.0"
 owo-colors = "4.3.0"
 path-absolutize = "3.1.1"
 pathdiff = "0.2"
+p256 = "0.13.2"
 portable-pty = "0.9.0"
 predicates = "3"
 pretty_assertions = "1.4.1"
@@ -325,10 +307,6 @@ quick-xml = "0.38.4"
 rand = "0.9"
 ratatui = "0.29.0"
 ratatui-macros = "0.6.0"
-rcgen = { version = "0.14.7", default-features = false, features = [
-    "aws_lc_rs",
-    "pem",
-] }
 regex = "1.12.3"
 regex-lite = "0.1.8"
 reqwest = { version = "0.12", features = ["cookies"] }
@@ -371,7 +349,6 @@ strum_macros = "0.28.0"
 supports-color = "3.0.2"
 syntect = "5"
 sys-locale = "0.3.2"
-tar = { version = "=0.4.45", default-features = false }
 tempfile = "3.23.0"
 test-log = "0.2.19"
 textwrap = "0.16.2"
@@ -405,7 +382,7 @@ unicode-width = "0.2"
 url = "2"
 urlencoding = "2.1"
 uuid = "1"
-v8 = "=146.4.0"
+v8 = "=146.9.0"
 vt100 = "0.16.2"
 walkdir = "2.5.0"
 webbrowser = "1.0"
@@ -463,8 +440,6 @@ unwrap_used = "deny"
 # silence the false positive here instead of deleting a real dependency.
 [workspace.metadata.cargo-shear]
 ignored = [
-    "codex-agent-graph-store",
-    "codex-memories-mcp",
     "icu_provider",
     "openssl-sys",
     "codex-utils-readiness",

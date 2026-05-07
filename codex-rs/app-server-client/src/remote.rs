@@ -45,18 +45,16 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::warn;
 use url::Url;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
-const REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
 
 #[derive(Debug, Clone)]
 pub struct RemoteAppServerConnectArgs {
@@ -172,32 +170,20 @@ impl RemoteAppServerClient {
             request.headers_mut().insert(AUTHORIZATION, header_value);
         }
         ensure_rustls_crypto_provider();
-        // Remote resume responses can legitimately carry large thread histories.
-        // Keep a bounded cap, but raise it above tungstenite's 16 MiB frame default.
-        let websocket_config = WebSocketConfig::default()
-            .max_frame_size(Some(REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE))
-            .max_message_size(Some(REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE));
-        let stream = timeout(
-            CONNECT_TIMEOUT,
-            connect_async_with_config(
-                request,
-                Some(websocket_config),
-                /*disable_nagle*/ false,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            IoError::new(
-                ErrorKind::TimedOut,
-                format!("timed out connecting to remote app server at `{websocket_url}`"),
-            )
-        })?
-        .map(|(stream, _response)| stream)
-        .map_err(|err| {
-            IoError::other(format!(
-                "failed to connect to remote app server at `{websocket_url}`: {err}"
-            ))
-        })?;
+        let stream = timeout(CONNECT_TIMEOUT, connect_async(request))
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::TimedOut,
+                    format!("timed out connecting to remote app server at `{websocket_url}`"),
+                )
+            })?
+            .map(|(stream, _response)| stream)
+            .map_err(|err| {
+                IoError::other(format!(
+                    "failed to connect to remote app server at `{websocket_url}`: {err}"
+                ))
+            })?;
         let mut stream = stream;
         let pending_events = initialize_remote_connection(
             &mut stream,
@@ -212,7 +198,6 @@ impl RemoteAppServerClient {
         let worker_handle = tokio::spawn(async move {
             let mut pending_requests =
                 HashMap::<RequestId, oneshot::Sender<IoResult<RequestResult>>>::new();
-            let mut worker_exit_error: Option<(ErrorKind, String)> = None;
             loop {
                 tokio::select! {
                     command = command_rx.recv() => {
@@ -239,19 +224,17 @@ impl RemoteAppServerClient {
                                 .await
                                 {
                                     let err_message = err.to_string();
-                                    let message = format!(
-                                        "remote app server at `{websocket_url}` write failed: {err_message}"
-                                    );
                                     if let Some(response_tx) = pending_requests.remove(&request_id) {
                                         let _ = response_tx.send(Err(err));
                                     }
                                     let _ = deliver_event(
                                         &event_tx,
                                         AppServerEvent::Disconnected {
-                                            message: message.clone(),
+                                            message: format!(
+                                                "remote app server at `{websocket_url}` write failed: {err_message}"
+                                            ),
                                         },
                                     );
-                                    worker_exit_error = Some((ErrorKind::BrokenPipe, message));
                                     break;
                                 }
                             }
@@ -368,34 +351,28 @@ impl RemoteAppServerClient {
                                                 .await
                                                 {
                                                     let err_message = reject_err.to_string();
-                                                    let message = format!(
-                                                        "remote app server at `{websocket_url}` write failed: {err_message}"
-                                                    );
                                                     let _ = deliver_event(
                                                         &event_tx,
                                                         AppServerEvent::Disconnected {
-                                                            message: message.clone(),
+                                                            message: format!(
+                                                                "remote app server at `{websocket_url}` write failed: {err_message}"
+                                                            ),
                                                         },
                                                     );
-                                                    worker_exit_error =
-                                                        Some((ErrorKind::BrokenPipe, message));
                                                     break;
                                                 }
                                             }
                                         }
                                     }
                                     Err(err) => {
-                                        let message = format!(
-                                            "remote app server at `{websocket_url}` sent invalid JSON-RPC: {err}"
-                                        );
                                         let _ = deliver_event(
                                             &event_tx,
                                             AppServerEvent::Disconnected {
-                                                message: message.clone(),
+                                                message: format!(
+                                                    "remote app server at `{websocket_url}` sent invalid JSON-RPC: {err}"
+                                                ),
                                             },
                                         );
-                                        worker_exit_error =
-                                            Some((ErrorKind::InvalidData, message));
                                         break;
                                     }
                                 }
@@ -406,19 +383,14 @@ impl RemoteAppServerClient {
                                     .map(|frame| frame.reason.to_string())
                                     .filter(|reason| !reason.is_empty())
                                     .unwrap_or_else(|| "connection closed".to_string());
-                                let message = format!(
-                                    "remote app server at `{websocket_url}` disconnected: {reason}"
-                                );
                                 let _ = deliver_event(
                                     &event_tx,
                                     AppServerEvent::Disconnected {
-                                        message: message.clone(),
+                                        message: format!(
+                                            "remote app server at `{websocket_url}` disconnected: {reason}"
+                                        ),
                                     },
                                 );
-                                worker_exit_error = Some((
-                                    ErrorKind::ConnectionAborted,
-                                    message,
-                                ));
                                 break;
                             }
                             Some(Ok(Message::Binary(_)))
@@ -426,29 +398,25 @@ impl RemoteAppServerClient {
                             | Some(Ok(Message::Pong(_)))
                             | Some(Ok(Message::Frame(_))) => {}
                             Some(Err(err)) => {
-                                let message = format!(
-                                    "remote app server at `{websocket_url}` transport failed: {err}"
-                                );
                                 let _ = deliver_event(
                                     &event_tx,
                                     AppServerEvent::Disconnected {
-                                        message: message.clone(),
+                                        message: format!(
+                                            "remote app server at `{websocket_url}` transport failed: {err}"
+                                        ),
                                     },
                                 );
-                                worker_exit_error = Some((ErrorKind::InvalidData, message));
                                 break;
                             }
                             None => {
-                                let message = format!(
-                                    "remote app server at `{websocket_url}` closed the connection"
-                                );
                                 let _ = deliver_event(
                                     &event_tx,
                                     AppServerEvent::Disconnected {
-                                        message: message.clone(),
+                                        message: format!(
+                                            "remote app server at `{websocket_url}` closed the connection"
+                                        ),
                                     },
                                 );
-                                worker_exit_error = Some((ErrorKind::UnexpectedEof, message));
                                 break;
                             }
                         }
@@ -456,14 +424,12 @@ impl RemoteAppServerClient {
                 }
             }
 
-            let (err_kind, err_message) = worker_exit_error.unwrap_or_else(|| {
-                (
-                    ErrorKind::BrokenPipe,
-                    "remote app-server worker channel is closed".to_string(),
-                )
-            });
+            let err = IoError::new(
+                ErrorKind::BrokenPipe,
+                "remote app-server worker channel is closed",
+            );
             for (_, response_tx) in pending_requests {
-                let _ = response_tx.send(Err(IoError::new(err_kind, err_message.clone())));
+                let _ = response_tx.send(Err(IoError::new(err.kind(), err.to_string())));
             }
         });
 

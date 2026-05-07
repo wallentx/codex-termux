@@ -16,7 +16,8 @@ use crate::slash_command::SlashCommand;
 
 // Hide alias commands in the default popup list so each unique action appears once.
 // `quit` is an alias of `exit`, so we skip `quit` here.
-const ALIAS_COMMANDS: &[SlashCommand] = &[SlashCommand::Quit];
+// `approvals` is an alias of `permissions`.
+const ALIAS_COMMANDS: &[SlashCommand] = &[SlashCommand::Quit, SlashCommand::Approvals];
 const COMMAND_COLUMN_WIDTH: ColumnWidthConfig = ColumnWidthConfig::new(
     ColumnWidthMode::AutoAllRows,
     /*name_column_width*/ None,
@@ -40,7 +41,6 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) connectors_enabled: bool,
     pub(crate) plugins_command_enabled: bool,
     pub(crate) fast_command_enabled: bool,
-    pub(crate) goal_command_enabled: bool,
     pub(crate) personality_command_enabled: bool,
     pub(crate) realtime_conversation_enabled: bool,
     pub(crate) audio_device_selection_enabled: bool,
@@ -55,7 +55,6 @@ impl From<CommandPopupFlags> for slash_commands::BuiltinCommandFlags {
             connectors_enabled: value.connectors_enabled,
             plugins_command_enabled: value.plugins_command_enabled,
             fast_command_enabled: value.fast_command_enabled,
-            goal_command_enabled: value.goal_command_enabled,
             personality_command_enabled: value.personality_command_enabled,
             realtime_conversation_enabled: value.realtime_conversation_enabled,
             audio_device_selection_enabled: value.audio_device_selection_enabled,
@@ -371,7 +370,6 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
-            goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
@@ -393,7 +391,6 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
-            goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
@@ -415,7 +412,6 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
-            goal_command_enabled: false,
             personality_command_enabled: false,
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
@@ -444,7 +440,6 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
-            goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
@@ -466,7 +461,6 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
-            goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: true,
             audio_device_selection_enabled: false,

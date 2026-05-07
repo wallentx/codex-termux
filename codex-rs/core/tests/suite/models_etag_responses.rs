@@ -6,11 +6,11 @@ use std::time::Duration;
 use anyhow::Result;
 use codex_features::Feature;
 use codex_login::CodexAuth;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -21,7 +21,6 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
-use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use wiremock::MockServer;
@@ -62,9 +61,6 @@ async fn refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch
     let codex = Arc::clone(&test.codex);
     let cwd = Arc::clone(&test.cwd);
     let session_model = test.session_configured.model.clone();
-    let cwd_path = cwd.path().to_path_buf();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
 
     assert_eq!(spawn_models_mock.requests().len(), 1);
     assert_eq!(spawn_models_mock.single_request_path(), "/v1/models");
@@ -111,11 +107,11 @@ async fn refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: cwd_path,
+            cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
