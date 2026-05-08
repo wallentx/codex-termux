@@ -583,7 +583,7 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     );
 
     let mut tools_by_server = HashMap::<String, HashMap<String, Tool>>::new();
-    for (_qualified_name, tool_info) in tools {
+    for tool_info in tools {
         let raw_tool_name = tool_info.tool.name.to_string();
         let Some(tool) = protocol_tool_from_rmcp_tool(&raw_tool_name, &tool_info.tool) else {
             continue;
