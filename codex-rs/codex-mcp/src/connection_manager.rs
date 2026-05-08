@@ -34,7 +34,7 @@ use crate::server::EffectiveMcpServer;
 use crate::server::McpServerMetadata;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
-use crate::tools::qualify_tools;
+use crate::tools::normalize_tools_for_model;
 use crate::tools::tool_with_model_visible_input_schema;
 use anyhow::Context;
 use anyhow::Result;
@@ -363,10 +363,9 @@ impl McpConnectionManager {
         failures
     }
 
-    /// Returns a single map that contains all tools. Each key is the
-    /// fully-qualified name for the tool.
+    /// Returns all tools with model-visible names normalized.
     #[instrument(level = "trace", skip_all)]
-    pub async fn list_all_tools(&self) -> HashMap<String, ToolInfo> {
+    pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
         let mut tools = Vec::new();
         for managed_client in self.clients.values() {
             let Some(server_tools) = managed_client.listed_tools().await else {
@@ -374,15 +373,15 @@ impl McpConnectionManager {
             };
             tools.extend(server_tools);
         }
-        qualify_tools(tools)
+        normalize_tools_for_model(tools)
     }
 
     /// Force-refresh codex apps tools by bypassing the in-process cache.
     ///
     /// On success, the refreshed tools replace the cache contents and the
-    /// latest filtered tool map is returned directly to the caller. On
+    /// latest filtered tools are returned directly to the caller. On
     /// failure, the existing cache remains unchanged.
-    pub async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<HashMap<String, ToolInfo>> {
+    pub async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<Vec<ToolInfo>> {
         let managed_client = self
             .clients
             .get(CODEX_APPS_MCP_SERVER_NAME)
@@ -425,7 +424,7 @@ impl McpConnectionManager {
                 tool.tool = tool_with_model_visible_input_schema(&tool.tool);
                 tool
             });
-        Ok(qualify_tools(tools))
+        Ok(normalize_tools_for_model(tools))
     }
 
     /// Returns a single map that contains all resources. Each key is the
@@ -664,7 +663,7 @@ impl McpConnectionManager {
     pub async fn resolve_tool_info(&self, tool_name: &ToolName) -> Option<ToolInfo> {
         let all_tools = self.list_all_tools().await;
         all_tools
-            .into_values()
+            .into_iter()
             .find(|tool| tool.canonical_tool_name() == *tool_name)
     }
 
