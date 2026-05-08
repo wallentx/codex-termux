@@ -196,10 +196,10 @@ pub(crate) async fn run_turn(
         {
             Ok(mcp_tools) => mcp_tools,
             Err(_) if turn_context.apps_enabled() => return None,
-            Err(_) => HashMap::new(),
+            Err(_) => Vec::new(),
         }
     } else {
-        HashMap::new()
+        Vec::new()
     };
     let available_connectors = if turn_context.apps_enabled() {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
@@ -1253,7 +1253,7 @@ pub(crate) async fn built_tools(
         let exposed_tool_names = mcp_tools
             .iter()
             .chain(deferred_mcp_tools.iter())
-            .flat_map(|tools| tools.keys().map(String::as_str))
+            .flat_map(|tools| tools.iter().map(codex_mcp::ToolInfo::canonical_tool_name))
             .collect::<HashSet<_>>();
         collect_unavailable_called_tools(input, &exposed_tool_names)
     } else {
