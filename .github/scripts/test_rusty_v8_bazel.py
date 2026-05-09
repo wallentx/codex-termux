@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import gzip
+import tempfile
 import textwrap
 import unittest
+from pathlib import Path
+from unittest.mock import Mock
+from unittest.mock import patch
 
+import rusty_v8_bazel
 import rusty_v8_module_bazel
 
 
@@ -120,6 +126,51 @@ class RustyV8BazelTest(unittest.TestCase):
                 checksums,
                 "146.4.0",
             )
+
+    @patch("rusty_v8_bazel.resolved_v8_crate_version", return_value="146.4.0")
+    @patch("rusty_v8_bazel.subprocess.run")
+    def test_stage_android_release_pair_stages_cargo_source_outputs(
+        self,
+        run: Mock,
+        _resolved_version: Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            stage_root = temp_path / "stage"
+            output_dir = temp_path / "dist"
+            stage_root.mkdir()
+
+            def fake_run(*_args: object, **kwargs: object) -> Mock:
+                env = kwargs["env"]
+                self.assertIsInstance(env, dict)
+                build_dir = (
+                    Path(env["CARGO_TARGET_DIR"])
+                    / "aarch64-linux-android"
+                    / "release"
+                    / "gn_out"
+                )
+                (build_dir / "obj").mkdir(parents=True)
+                (build_dir / "obj" / "librusty_v8.a").write_bytes(b"archive")
+                (build_dir / "src_binding.rs").write_text(
+                    "// binding\n",
+                    encoding="utf-8",
+                )
+                return Mock(returncode=0)
+
+            run.side_effect = fake_run
+            with patch("rusty_v8_bazel.tempfile.mkdtemp", return_value=str(stage_root)):
+                rusty_v8_bazel.stage_android_release_pair(
+                    "aarch64-linux-android",
+                    output_dir,
+                )
+
+            archive = output_dir / "librusty_v8_release_aarch64-linux-android.a.gz"
+            binding = output_dir / "src_binding_release_aarch64-linux-android.rs"
+            checksums = output_dir / "rusty_v8_release_aarch64-linux-android.sha256"
+            self.assertEqual(b"archive", gzip.decompress(archive.read_bytes()))
+            self.assertEqual("// binding\n", binding.read_text(encoding="utf-8"))
+            self.assertIn(archive.name, checksums.read_text(encoding="utf-8"))
+            self.assertIn(binding.name, checksums.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

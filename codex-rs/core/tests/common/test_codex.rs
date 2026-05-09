@@ -363,13 +363,21 @@ impl TestCodexBuilder {
             .exec_server_url
             .clone()
             .or_else(|| test_env.exec_server_url().map(str::to_owned));
+        #[cfg(target_os = "linux")]
+        let codex_linux_sandbox_exe = Some(
+            crate::find_codex_linux_sandbox_exe()
+                .context("should find binary for codex-linux-sandbox")?,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let codex_linux_sandbox_exe = None;
+        let local_runtime_paths = codex_exec_server::ExecServerRuntimePaths::new(
+            std::env::current_exe()?,
+            codex_linux_sandbox_exe,
+        )?;
         let environment_manager = Arc::new(codex_exec_server::EnvironmentManager::new(
             codex_exec_server::EnvironmentManagerArgs {
                 exec_server_url,
-                local_runtime_paths: codex_exec_server::ExecServerRuntimePaths::new(
-                    std::env::current_exe()?,
-                    /*codex_linux_sandbox_exe*/ None,
-                )?,
+                local_runtime_paths,
             },
         ));
         let file_system = test_env.environment().get_filesystem();

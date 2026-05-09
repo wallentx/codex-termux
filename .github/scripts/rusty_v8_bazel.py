@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -179,6 +180,36 @@ def staged_archive_name(target: str, source_path: Path) -> str:
     return f"librusty_v8_release_{target}.a.gz"
 
 
+def staged_binding_name(target: str) -> str:
+    return f"src_binding_release_{target}.rs"
+
+
+def staged_checksums_name(target: str) -> str:
+    return f"rusty_v8_release_{target}.sha256"
+
+
+def write_gzip_archive(source_archive: Path, staged_library: Path) -> None:
+    with source_archive.open("rb") as src, staged_library.open("wb") as dst:
+        with gzip.GzipFile(
+            filename="",
+            mode="wb",
+            fileobj=dst,
+            compresslevel=6,
+            mtime=0,
+        ) as gz:
+            shutil.copyfileobj(src, gz)
+
+
+def write_checksums(paths: list[Path], checksums_path: Path) -> None:
+    with checksums_path.open("w", encoding="utf-8") as checksums:
+        for path in paths:
+            digest = hashlib.sha256()
+            with path.open("rb") as artifact:
+                for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            checksums.write(f"{digest.hexdigest()}  {path.name}\n")
+
+
 def is_musl_archive_target(target: str, source_path: Path) -> bool:
     return target.endswith("-unknown-linux-musl") and source_path.suffix == ".a"
 
@@ -252,33 +283,90 @@ def stage_release_pair(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     staged_library = output_dir / staged_archive_name(target, lib_path)
-    staged_binding = output_dir / f"src_binding_release_{target}.rs"
+    staged_binding = output_dir / staged_binding_name(target)
     source_archive = (
         merged_musl_archive(platform, lib_path, compilation_mode)
         if is_musl_archive_target(target, lib_path)
         else lib_path
     )
 
-    with source_archive.open("rb") as src, staged_library.open("wb") as dst:
-        with gzip.GzipFile(
-            filename="",
-            mode="wb",
-            fileobj=dst,
-            compresslevel=6,
-            mtime=0,
-        ) as gz:
-            shutil.copyfileobj(src, gz)
-
+    write_gzip_archive(source_archive, staged_library)
     shutil.copyfile(binding_path, staged_binding)
 
-    staged_checksums = output_dir / f"rusty_v8_release_{target}.sha256"
-    with staged_checksums.open("w", encoding="utf-8") as checksums:
-        for path in [staged_library, staged_binding]:
-            digest = hashlib.sha256()
-            with path.open("rb") as artifact:
-                for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            checksums.write(f"{digest.hexdigest()}  {path.name}\n")
+    staged_checksums = output_dir / staged_checksums_name(target)
+    write_checksums([staged_library, staged_binding], staged_checksums)
+
+    print(staged_library)
+    print(staged_binding)
+    print(staged_checksums)
+
+
+def stage_android_release_pair(target: str, output_dir: Path) -> None:
+    if target != "aarch64-linux-android":
+        raise SystemExit(f"unsupported Android rusty_v8 target: {target}")
+
+    version = resolved_v8_crate_version()
+    temp_dir = Path(tempfile.mkdtemp(prefix="rusty-v8-android-stage-"))
+    target_dir = temp_dir / "target"
+    manifest_path = temp_dir / "Cargo.toml"
+    src_dir = temp_dir / "src"
+    src_dir.mkdir()
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "[package]",
+                'name = "rusty-v8-android-stage"',
+                'version = "0.0.0"',
+                'edition = "2021"',
+                "",
+                "[dependencies]",
+                f'v8 = "={version}"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (src_dir / "lib.rs").write_text(
+        "#![allow(dead_code)]\n\npub fn link_v8() {}\n",
+        encoding="utf-8",
+    )
+
+    env = {
+        **os.environ,
+        "CARGO_TARGET_DIR": str(target_dir),
+        "V8_FROM_SOURCE": "1",
+    }
+    subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--manifest-path",
+            str(manifest_path),
+            "--release",
+            "--target",
+            target,
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
+
+    build_dir = target_dir / target / "release" / "gn_out"
+    archive_path = build_dir / "obj" / "librusty_v8.a"
+    binding_path = build_dir / "src_binding.rs"
+    if not archive_path.exists():
+        raise SystemExit(f"missing Android rusty_v8 archive: {archive_path}")
+    if not binding_path.exists():
+        raise SystemExit(f"missing Android rusty_v8 binding: {binding_path}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staged_library = output_dir / staged_archive_name(target, archive_path)
+    staged_binding = output_dir / staged_binding_name(target)
+    staged_checksums = output_dir / staged_checksums_name(target)
+
+    write_gzip_archive(archive_path, staged_library)
+    shutil.copyfile(binding_path, staged_binding)
+    write_checksums([staged_library, staged_binding], staged_checksums)
 
     print(staged_library)
     print(staged_binding)
@@ -298,6 +386,12 @@ def parse_args() -> argparse.Namespace:
         default="fastbuild",
         choices=["fastbuild", "opt", "dbg"],
     )
+
+    stage_android_release_pair_parser = subparsers.add_parser(
+        "stage-android-release-pair"
+    )
+    stage_android_release_pair_parser.add_argument("--target", required=True)
+    stage_android_release_pair_parser.add_argument("--output-dir", required=True)
 
     subparsers.add_parser("resolved-v8-crate-version")
 
@@ -330,6 +424,12 @@ def main() -> int:
             target=args.target,
             output_dir=Path(args.output_dir),
             compilation_mode=args.compilation_mode,
+        )
+        return 0
+    if args.command == "stage-android-release-pair":
+        stage_android_release_pair(
+            target=args.target,
+            output_dir=Path(args.output_dir),
         )
         return 0
     if args.command == "resolved-v8-crate-version":

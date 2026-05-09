@@ -8,11 +8,24 @@ use std::path::Path;
 use crate::markdown_render::COLON_LOCATION_SUFFIX_RE;
 use crate::markdown_render::HASH_LOCATION_SUFFIX_RE;
 use crate::markdown_render::render_markdown_text;
+use crate::markdown_render::render_markdown_text_with_width;
 use crate::markdown_render::render_markdown_text_with_width_and_cwd;
 use insta::assert_snapshot;
 
 fn render_markdown_text_for_cwd(input: &str, cwd: &Path) -> Text<'static> {
     render_markdown_text_with_width_and_cwd(input, /*width*/ None, Some(cwd))
+}
+
+fn plain_lines(text: &Text<'_>) -> Vec<String> {
+    text.lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.clone())
+                .collect::<String>()
+        })
+        .collect()
 }
 
 #[test]
@@ -1126,6 +1139,53 @@ fn code_block_inside_unordered_list_item_multiple_lines() {
         })
         .collect();
     assert_eq!(lines, vec!["- Item", "", "  first", "  second"]);
+}
+
+#[test]
+fn list_item_after_code_block_keeps_blank_separator() {
+    let md = "1. First:\n\n   ```rust\n   fn first() {}\n   ```\n\n2. Second:\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec!["1. First:", "", "   fn first() {}", "", "2. Second:"]
+    );
+    assert_snapshot!(
+        "list_item_after_code_block_keeps_blank_separator",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn outer_list_item_after_nested_code_block_keeps_blank_separator() {
+    let md = "1. First:\n   - Nested:\n\n     ```rust\n     fn first() {}\n     ```\n\n2. Second:\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec![
+            "1. First:",
+            "    - Nested:",
+            "",
+            "      fn first() {}",
+            "",
+            "2. Second:",
+        ]
+    );
+}
+
+#[test]
+fn list_item_after_simple_item_stays_compact() {
+    let md = "1. First\n\n2. Second\n";
+    let text = render_markdown_text(md);
+    assert_eq!(plain_lines(&text), vec!["1. First", "2. Second"]);
+}
+
+#[test]
+fn mixed_url_markdown_wraps_prose_without_splitting_words_snapshot() {
+    let md = "This paragraph keeps **strikethrough** intact near a [link](https://example.com/path) while enough surrounding prose forces wrapping.";
+    let text = render_markdown_text_with_width(md, Some(/*width*/ 48));
+    assert_snapshot!(plain_lines(&text).join("\n"));
 }
 
 #[test]

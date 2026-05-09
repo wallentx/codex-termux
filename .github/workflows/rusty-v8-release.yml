@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       publish:
-        description: Publish the staged musl artifacts to a GitHub release.
+        description: Publish the staged artifacts to a GitHub release.
         required: false
         default: true
         type: boolean
@@ -73,19 +73,60 @@ jobs:
           - runner: ubuntu-24.04-arm
             platform: linux_arm64_musl
             target: aarch64-unknown-linux-musl
+          - runner: ubuntu-24.04
+            platform: android_arm64
+            target: aarch64-linux-android
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Bazel
+        if: ${{ matrix.target != 'aarch64-linux-android' }}
         uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+        if: ${{ matrix.target == 'aarch64-linux-android' }}
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.12"
 
+      - name: Install Android source build dependencies
+        if: ${{ matrix.target == 'aarch64-linux-android' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            git \
+            libglib2.0-dev \
+            ninja-build \
+            pkg-config \
+            unzip \
+            wget \
+            xz-utils
+
+          if ! command -v clang-19 >/dev/null 2>&1; then
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh 19
+          fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            clang-19 \
+            libclang-19-dev \
+            lld-19
+
+          echo "CLANG_BASE_PATH=/usr/lib/llvm-19" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
+
       - name: Build Bazel V8 release pair
+        if: ${{ matrix.target != 'aarch64-linux-android' }}
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
           PLATFORM: ${{ matrix.platform }}
@@ -128,13 +169,20 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ "${TARGET}" == "aarch64-linux-android" ]]; then
+            python3 .github/scripts/rusty_v8_bazel.py stage-android-release-pair \
+              --target "${TARGET}" \
+              --output-dir "dist/${TARGET}"
+            exit 0
+          fi
+
           python3 .github/scripts/rusty_v8_bazel.py stage-release-pair \
             --platform "${PLATFORM}" \
             --target "${TARGET}" \
             --compilation-mode opt \
             --output-dir "dist/${TARGET}"
 
-      - name: Upload staged musl artifacts
+      - name: Upload staged artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: rusty-v8-${{ needs.metadata.outputs.v8_version }}-${{ matrix.target }}
@@ -170,7 +218,7 @@ jobs:
           set -euo pipefail
 
           if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
-            echo "Release tag ${RELEASE_TAG} already exists; musl artifact tags are immutable." >&2
+            echo "Release tag ${RELEASE_TAG} already exists; artifact tags are immutable." >&2
             exit 1
           fi
 
