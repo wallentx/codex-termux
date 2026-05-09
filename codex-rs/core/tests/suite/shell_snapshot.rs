@@ -1,11 +1,11 @@
 use anyhow::Result;
 use codex_features::Feature;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -15,7 +15,6 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
-use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
@@ -155,8 +154,6 @@ async fn run_snapshot_command_with_options(
     let codex_home = test.home.path().to_path_buf();
     let session_model = test.session_configured.model.clone();
     let cwd = test.cwd_path().to_path_buf();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
 
     codex
         .submit(Op::UserTurn {
@@ -169,8 +166,8 @@ async fn run_snapshot_command_with_options(
             cwd,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -250,8 +247,6 @@ async fn run_shell_command_snapshot_with_options(
     let codex_home = test.home.path().to_path_buf();
     let session_model = test.session_configured.model.clone();
     let cwd = test.cwd_path().to_path_buf();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
 
     codex
         .submit(Op::UserTurn {
@@ -264,8 +259,8 @@ async fn run_shell_command_snapshot_with_options(
             cwd,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -326,8 +321,6 @@ async fn run_tool_turn_on_harness(
     let codex = test.codex.clone();
     let session_model = test.session_configured.model.clone();
     let cwd = test.cwd_path().to_path_buf();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
     codex
         .submit(Op::UserTurn {
             environments: None,
@@ -339,8 +332,8 @@ async fn run_tool_turn_on_harness(
             cwd,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -565,8 +558,6 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
     mount_sse_sequence(harness.server(), responses).await;
 
     let model = test.session_configured.model.clone();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
     codex
         .submit(Op::UserTurn {
             environments: None,
@@ -578,8 +569,8 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
             cwd: cwd.clone(),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model,
             effort: None,
             summary: None,
