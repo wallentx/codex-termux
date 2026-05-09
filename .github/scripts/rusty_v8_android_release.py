@@ -25,8 +25,8 @@ ANDROID_GN_PYDEPS_FILES = [
 ]
 
 ANDROID_EXTRA_GN_ARGS = [
-    'default_android_ndk_root="//third_party/android_ndk"',
-    'default_android_ndk_version="r26c"',
+    'android_ndk_root="//third_party/android_ndk"',
+    'android_ndk_version="r26c"',
 ]
 
 
