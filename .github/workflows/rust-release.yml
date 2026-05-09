@@ -405,9 +405,11 @@ jobs:
           binding_dir="${RUNNER_TEMP}/rusty_v8"
           archive="${binding_dir}/librusty_v8_release_${TARGET}.a.gz"
           binding_path="${binding_dir}/src_binding_release_${TARGET}.rs"
+          release_tag="rusty-v8-v${version}"
           mkdir -p "${binding_dir}"
-          gh release download "v${version}" \
-            --repo wallentx/rusty_v8 \
+          echo "Downloading Android rusty_v8 artifacts from ${GITHUB_REPOSITORY}@${release_tag}"
+          gh release download "${release_tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --dir "${binding_dir}" \
             --pattern "librusty_v8_release_${TARGET}.a.gz" \
             --pattern "src_binding_release_${TARGET}.rs"

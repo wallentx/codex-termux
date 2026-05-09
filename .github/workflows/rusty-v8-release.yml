@@ -1,0 +1,173 @@
+name: rusty-v8-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Branch, tag, or SHA containing the Codex source tree to build.
+        required: true
+        type: string
+      release_tag:
+        description: Optional release tag. Defaults to rusty-v8-v<resolved_v8_version>.
+        required: false
+        type: string
+      publish:
+        description: Publish the staged Android artifacts to a GitHub release.
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}::${{ inputs.release_tag || inputs.release_ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.release_tag }}
+      v8_version: ${{ steps.v8_version.outputs.version }}
+
+    steps:
+      - name: Check out source ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_ref }}
+          path: source
+
+      - name: Check out workflow tools
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          path: workflow
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Resolve exact v8 crate version
+        id: v8_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 workflow/.github/scripts/rusty_v8_android_release.py resolved-v8-crate-version --repo-root source)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release tag
+        id: release_tag
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          V8_VERSION: ${{ steps.v8_version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="${RELEASE_TAG_INPUT}"
+          if [[ -z "${release_tag}" ]]; then
+            release_tag="rusty-v8-v${V8_VERSION}"
+          fi
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    name: Build aarch64-linux-android
+    needs: metadata
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_ref }}
+          path: source
+
+      - name: Check out workflow tools
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          path: workflow
+
+      - uses: dtolnay/rust-toolchain@1.93
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Android source build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            git \
+            libglib2.0-dev \
+            ninja-build \
+            pkg-config \
+            unzip \
+            wget \
+            xz-utils
+
+          if ! command -v clang-19 >/dev/null 2>&1; then
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh 19
+          fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            clang-19 \
+            libclang-19-dev \
+            lld-19
+
+          echo "CLANG_BASE_PATH=/usr/lib/llvm-19" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
+
+      - name: Stage Android release pair
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 workflow/.github/scripts/rusty_v8_android_release.py stage-android-release-pair \
+            --repo-root source \
+            --target aarch64-linux-android \
+            --output-dir dist/aarch64-linux-android
+
+      - name: Upload staged Android artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: rusty-v8-${{ needs.metadata.outputs.v8_version }}-aarch64-linux-android
+          path: dist/aarch64-linux-android/*
+
+  publish-release:
+    if: ${{ inputs.publish }}
+    needs:
+      - metadata
+      - build-android
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+
+      - name: Publish Android artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.metadata.outputs.release_tag }}
+          name: ${{ needs.metadata.outputs.release_tag }}
+          files: dist/**
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          prerelease: true
