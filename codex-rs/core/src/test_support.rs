@@ -52,14 +52,14 @@ pub fn auth_manager_from_auth_with_home(auth: CodexAuth, codex_home: PathBuf) ->
     AuthManager::from_auth_for_testing_with_home(auth, codex_home)
 }
 
-pub async fn thread_manager_with_models_provider(
+pub fn thread_manager_with_models_provider(
     auth: CodexAuth,
     provider: ModelProviderInfo,
 ) -> ThreadManager {
-    ThreadManager::with_models_provider_for_tests(auth, provider).await
+    ThreadManager::with_models_provider_for_tests(auth, provider)
 }
 
-pub async fn thread_manager_with_models_provider_and_home(
+pub fn thread_manager_with_models_provider_and_home(
     auth: CodexAuth,
     provider: ModelProviderInfo,
     codex_home: PathBuf,
@@ -71,7 +71,6 @@ pub async fn thread_manager_with_models_provider_and_home(
         codex_home,
         environment_manager,
     )
-    .await
 }
 
 pub async fn start_thread_with_user_shell_override(
@@ -107,7 +106,11 @@ pub fn models_manager_with_provider(
     provider: ModelProviderInfo,
 ) -> SharedModelsManager {
     let provider = create_model_provider(provider, Some(auth_manager));
-    provider.models_manager(codex_home, /*config_model_catalog*/ None)
+    provider.models_manager(
+        codex_home,
+        /*config_model_catalog*/ None,
+        Default::default(),
+    )
 }
 
 pub fn get_model_offline(model: Option<&str>) -> String {
@@ -123,5 +126,7 @@ pub fn all_model_presets() -> &'static Vec<ModelPreset> {
 }
 
 pub fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
-    collaboration_mode_presets::builtin_collaboration_mode_presets()
+    collaboration_mode_presets::builtin_collaboration_mode_presets(
+        collaboration_mode_presets::CollaborationModesConfig::default(),
+    )
 }

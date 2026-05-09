@@ -17,11 +17,9 @@ pub(super) async fn unarchive_thread(
     params: ArchiveThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
-    let state_db = store.state_db();
     let archived_path = find_archived_thread_path_by_id_str(
         store.config.codex_home.as_path(),
         &thread_id.to_string(),
-        Some(state_db.as_ref()),
     )
     .await
     .map_err(|err| ThreadStoreError::InvalidRequest {
@@ -73,10 +71,11 @@ pub(super) async fn unarchive_thread(
         message: format!("failed to update unarchived thread timestamp: {err}"),
     })?;
 
-    let _ = store
-        .state_db()
-        .mark_unarchived(thread_id, restored_path.as_path())
-        .await;
+    if let Some(ctx) = codex_rollout::state_db::get_state_db(&store.config).await {
+        let _ = ctx
+            .mark_unarchived(thread_id, restored_path.as_path())
+            .await;
+    }
 
     let item = read_thread_item_from_rollout(restored_path.clone())
         .await
@@ -89,7 +88,7 @@ pub(super) async fn unarchive_thread(
     stored_thread_from_rollout_item(
         item,
         /*archived*/ false,
-        store.config.default_model_provider_id.as_str(),
+        store.config.model_provider_id.as_str(),
     )
     .ok_or_else(|| ThreadStoreError::Internal {
         message: format!(
@@ -111,15 +110,13 @@ mod tests {
     use super::*;
     use crate::ThreadStore;
     use crate::local::LocalThreadStore;
-    use crate::local::test_support::init_test_state_db;
     use crate::local::test_support::test_config;
-    use crate::local::test_support::test_store;
     use crate::local::test_support::write_archived_session_file;
 
     #[tokio::test]
     async fn unarchive_thread_restores_rollout_and_returns_updated_thread() {
         let home = TempDir::new().expect("temp dir");
-        let store = test_store(home.path()).await;
+        let store = LocalThreadStore::new(test_config(home.path()));
         let uuid = Uuid::from_u128(203);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let archived_path = write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid)
@@ -150,22 +147,31 @@ mod tests {
     async fn unarchive_thread_updates_sqlite_metadata_when_present() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
-        let runtime = init_test_state_db(&config).await;
-        let store = LocalThreadStore::new(config.clone(), runtime.clone());
+        let store = LocalThreadStore::new(config.clone());
         let uuid = Uuid::from_u128(204);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let archived_path = write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid)
             .expect("archived session file");
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .expect("backfill should be complete");
         let mut builder = codex_state::ThreadMetadataBuilder::new(
             thread_id,
             archived_path.clone(),
             Utc::now(),
             SessionSource::Cli,
         );
-        builder.model_provider = Some(config.default_model_provider_id.clone());
+        builder.model_provider = Some(config.model_provider_id.clone());
         builder.cwd = home.path().to_path_buf();
         builder.cli_version = Some("test_version".to_string());
-        let mut metadata = builder.build(config.default_model_provider_id.as_str());
+        let mut metadata = builder.build(config.model_provider_id.as_str());
         metadata.archived_at = Some(metadata.updated_at);
         runtime
             .upsert_thread(&metadata)

@@ -17,7 +17,6 @@ workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 clap = { workspace = true, features = ["derive"] }
-codex-process-hardening = { workspace = true }
 codex-protocol = { workspace = true }
 codex-sandboxing = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
@@ -27,10 +26,10 @@ libc = { workspace = true }
 seccompiler = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 url = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+codex-config = { workspace = true }
 codex-core = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
@@ -41,3 +40,7 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "signal",
 ] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

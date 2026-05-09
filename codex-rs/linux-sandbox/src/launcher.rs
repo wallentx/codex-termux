@@ -1,24 +1,20 @@
-use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use crate::bundled_bwrap;
-use crate::bundled_bwrap::BundledBwrapLauncher;
-use crate::exec_util::argv_to_cstrings;
-use crate::exec_util::make_files_inheritable;
+use crate::vendored_bwrap::exec_vendored_bwrap;
 use codex_sandboxing::find_system_bwrap_in_path;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BubblewrapLauncher {
     System(SystemBwrapLauncher),
-    Bundled(BundledBwrapLauncher),
-    Unavailable,
+    Vendored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,64 +23,38 @@ struct SystemBwrapLauncher {
     supports_argv0: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SystemBwrapCapabilities {
-    supports_argv0: bool,
-    supports_perms: bool,
-}
-
 pub(crate) fn exec_bwrap(argv: Vec<String>, preserved_files: Vec<File>) -> ! {
     match preferred_bwrap_launcher() {
         BubblewrapLauncher::System(launcher) => {
             exec_system_bwrap(&launcher.program, argv, preserved_files)
         }
-        BubblewrapLauncher::Bundled(launcher) => launcher.exec(argv, preserved_files),
-        BubblewrapLauncher::Unavailable => {
-            panic!(
-                "bubblewrap is unavailable: no system bwrap was found on PATH and no bundled \
-                 codex-resources/bwrap binary was found next to the Codex executable"
-            )
-        }
+        BubblewrapLauncher::Vendored => exec_vendored_bwrap(argv, preserved_files),
     }
 }
 
 fn preferred_bwrap_launcher() -> BubblewrapLauncher {
     static LAUNCHER: OnceLock<BubblewrapLauncher> = OnceLock::new();
     LAUNCHER
-        .get_or_init(|| {
-            if let Some(path) = find_system_bwrap_in_path()
-                && let Some(launcher) = system_bwrap_launcher_for_path(&path)
-            {
-                return BubblewrapLauncher::System(launcher);
-            }
-
-            match bundled_bwrap::launcher() {
-                Some(launcher) => BubblewrapLauncher::Bundled(launcher),
-                None => BubblewrapLauncher::Unavailable,
-            }
+        .get_or_init(|| match find_system_bwrap_in_path() {
+            Some(path) => preferred_bwrap_launcher_for_path(&path),
+            None => BubblewrapLauncher::Vendored,
         })
         .clone()
 }
 
-fn system_bwrap_launcher_for_path(system_bwrap_path: &Path) -> Option<SystemBwrapLauncher> {
-    system_bwrap_launcher_for_path_with_probe(system_bwrap_path, system_bwrap_capabilities)
+fn preferred_bwrap_launcher_for_path(system_bwrap_path: &Path) -> BubblewrapLauncher {
+    preferred_bwrap_launcher_for_path_with_probe(system_bwrap_path, system_bwrap_supports_argv0)
 }
 
-fn system_bwrap_launcher_for_path_with_probe(
+fn preferred_bwrap_launcher_for_path_with_probe(
     system_bwrap_path: &Path,
-    system_bwrap_capabilities: impl FnOnce(&Path) -> Option<SystemBwrapCapabilities>,
-) -> Option<SystemBwrapLauncher> {
+    system_bwrap_supports_argv0: impl FnOnce(&Path) -> bool,
+) -> BubblewrapLauncher {
     if !system_bwrap_path.is_file() {
-        return None;
+        return BubblewrapLauncher::Vendored;
     }
 
-    let Some(SystemBwrapCapabilities {
-        supports_argv0,
-        supports_perms: true,
-    }) = system_bwrap_capabilities(system_bwrap_path)
-    else {
-        return None;
-    };
+    let supports_argv0 = system_bwrap_supports_argv0(system_bwrap_path);
     let system_bwrap_path = match AbsolutePathBuf::from_absolute_path(system_bwrap_path) {
         Ok(path) => path,
         Err(err) => panic!(
@@ -92,7 +62,7 @@ fn system_bwrap_launcher_for_path_with_probe(
             system_bwrap_path.display()
         ),
     };
-    Some(SystemBwrapLauncher {
+    BubblewrapLauncher::System(SystemBwrapLauncher {
         program: system_bwrap_path,
         supports_argv0,
     })
@@ -101,11 +71,11 @@ fn system_bwrap_launcher_for_path_with_probe(
 pub(crate) fn preferred_bwrap_supports_argv0() -> bool {
     match preferred_bwrap_launcher() {
         BubblewrapLauncher::System(launcher) => launcher.supports_argv0,
-        BubblewrapLauncher::Bundled(_) | BubblewrapLauncher::Unavailable => true,
+        BubblewrapLauncher::Vendored => true,
     }
 }
 
-fn system_bwrap_capabilities(system_bwrap_path: &Path) -> Option<SystemBwrapCapabilities> {
+fn system_bwrap_supports_argv0(system_bwrap_path: &Path) -> bool {
     // bubblewrap added `--argv0` in v0.9.0:
     // https://github.com/containers/bubblewrap/releases/tag/v0.9.0
     // Older distro packages (for example Ubuntu 20.04/22.04) ship builds that
@@ -113,14 +83,11 @@ fn system_bwrap_capabilities(system_bwrap_path: &Path) -> Option<SystemBwrapCapa
     // in that case.
     let output = match Command::new(system_bwrap_path).arg("--help").output() {
         Ok(output) => output,
-        Err(_) => return None,
+        Err(_) => return false,
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Some(SystemBwrapCapabilities {
-        supports_argv0: stdout.contains("--argv0") || stderr.contains("--argv0"),
-        supports_perms: stdout.contains("--perms") || stderr.contains("--perms"),
-    })
+    stdout.contains("--argv0") || stderr.contains("--argv0")
 }
 
 fn exec_system_bwrap(
@@ -135,11 +102,7 @@ fn exec_system_bwrap(
     let program = CString::new(program.as_path().as_os_str().as_bytes())
         .unwrap_or_else(|err| panic!("invalid system bubblewrap path: {err}"));
     let cstrings = argv_to_cstrings(&argv);
-    let mut argv_ptrs: Vec<*const c_char> = cstrings
-        .iter()
-        .map(CString::as_c_str)
-        .map(CStr::as_ptr)
-        .collect();
+    let mut argv_ptrs: Vec<*const c_char> = cstrings.iter().map(|arg| arg.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
 
     // SAFETY: `program` and every entry in `argv_ptrs` are valid C strings for
@@ -149,6 +112,43 @@ fn exec_system_bwrap(
     }
     let err = std::io::Error::last_os_error();
     panic!("failed to exec system bubblewrap {program_path}: {err}");
+}
+
+fn argv_to_cstrings(argv: &[String]) -> Vec<CString> {
+    let mut cstrings: Vec<CString> = Vec::with_capacity(argv.len());
+    for arg in argv {
+        match CString::new(arg.as_str()) {
+            Ok(value) => cstrings.push(value),
+            Err(err) => panic!("failed to convert argv to CString: {err}"),
+        }
+    }
+    cstrings
+}
+
+fn make_files_inheritable(files: &[File]) {
+    for file in files {
+        clear_cloexec(file.as_raw_fd());
+    }
+}
+
+fn clear_cloexec(fd: libc::c_int) {
+    // SAFETY: `fd` is an owned descriptor kept alive by `files`.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        let err = std::io::Error::last_os_error();
+        panic!("failed to read fd flags for preserved bubblewrap file descriptor {fd}: {err}");
+    }
+    let cleared_flags = flags & !libc::FD_CLOEXEC;
+    if cleared_flags == flags {
+        return;
+    }
+
+    // SAFETY: `fd` is valid and we are only clearing FD_CLOEXEC.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, cleared_flags) };
+    if result < 0 {
+        let err = std::io::Error::last_os_error();
+        panic!("failed to clear CLOEXEC for preserved bubblewrap file descriptor {fd}: {err}");
+    }
 }
 
 #[cfg(test)]
@@ -164,13 +164,8 @@ mod tests {
         let expected = AbsolutePathBuf::from_absolute_path(fake_bwrap_path).expect("absolute");
 
         assert_eq!(
-            system_bwrap_launcher_for_path_with_probe(fake_bwrap_path, |_| {
-                Some(SystemBwrapCapabilities {
-                    supports_argv0: true,
-                    supports_perms: true,
-                })
-            }),
-            Some(SystemBwrapLauncher {
+            preferred_bwrap_launcher_for_path_with_probe(fake_bwrap_path, |_| true),
+            BubblewrapLauncher::System(SystemBwrapLauncher {
                 program: expected,
                 supports_argv0: true,
             })
@@ -183,13 +178,8 @@ mod tests {
         let fake_bwrap_path = fake_bwrap.path();
 
         assert_eq!(
-            system_bwrap_launcher_for_path_with_probe(fake_bwrap_path, |_| {
-                Some(SystemBwrapCapabilities {
-                    supports_argv0: false,
-                    supports_perms: true,
-                })
-            }),
-            Some(SystemBwrapLauncher {
+            preferred_bwrap_launcher_for_path_with_probe(fake_bwrap_path, |_| false),
+            BubblewrapLauncher::System(SystemBwrapLauncher {
                 program: AbsolutePathBuf::from_absolute_path(fake_bwrap_path).expect("absolute"),
                 supports_argv0: false,
             })
@@ -197,25 +187,40 @@ mod tests {
     }
 
     #[test]
-    fn ignores_system_bwrap_when_system_bwrap_lacks_perms() {
-        let fake_bwrap = NamedTempFile::new().expect("temp file");
-
+    fn falls_back_to_vendored_when_system_bwrap_is_missing() {
         assert_eq!(
-            system_bwrap_launcher_for_path_with_probe(fake_bwrap.path(), |_| {
-                Some(SystemBwrapCapabilities {
-                    supports_argv0: false,
-                    supports_perms: false,
-                })
-            }),
-            None
+            preferred_bwrap_launcher_for_path(Path::new("/definitely/not/a/bwrap")),
+            BubblewrapLauncher::Vendored
         );
     }
 
     #[test]
-    fn ignores_system_bwrap_when_system_bwrap_is_missing() {
-        assert_eq!(
-            system_bwrap_launcher_for_path(Path::new("/definitely/not/a/bwrap")),
-            None
-        );
+    fn preserved_files_are_made_inheritable_for_system_exec() {
+        let file = NamedTempFile::new().expect("temp file");
+        set_cloexec(file.as_file().as_raw_fd());
+
+        make_files_inheritable(std::slice::from_ref(file.as_file()));
+
+        assert_eq!(fd_flags(file.as_file().as_raw_fd()) & libc::FD_CLOEXEC, 0);
+    }
+
+    fn set_cloexec(fd: libc::c_int) {
+        let flags = fd_flags(fd);
+        // SAFETY: `fd` is valid for the duration of the test.
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            panic!("failed to set CLOEXEC for test fd {fd}: {err}");
+        }
+    }
+
+    fn fd_flags(fd: libc::c_int) -> libc::c_int {
+        // SAFETY: `fd` is valid for the duration of the test.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            let err = std::io::Error::last_os_error();
+            panic!("failed to read fd flags for test fd {fd}: {err}");
+        }
+        flags
     }
 }

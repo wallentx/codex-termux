@@ -63,10 +63,8 @@ def bazel_output_files(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> list[Path]:
     expression = "set(" + " ".join(labels) + ")"
-    bazel_configs = bazel_configs or []
     result = subprocess.run(
         [
             "bazel",
@@ -74,7 +72,6 @@ def bazel_output_files(
             "-c",
             compilation_mode,
             f"--platforms=@llvm//platforms:{platform}",
-            *[f"--config={config}" for config in bazel_configs],
             "--output=files",
             expression,
         ],
@@ -90,9 +87,7 @@ def bazel_build(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> None:
-    bazel_configs = bazel_configs or []
     subprocess.run(
         [
             "bazel",
@@ -100,7 +95,6 @@ def bazel_build(
             "-c",
             compilation_mode,
             f"--platforms=@llvm//platforms:{platform}",
-            *[f"--config={config}" for config in bazel_configs],
             *labels,
         ],
         cwd=ROOT,
@@ -112,14 +106,13 @@ def ensure_bazel_output_files(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> list[Path]:
-    outputs = bazel_output_files(platform, labels, compilation_mode, bazel_configs)
+    outputs = bazel_output_files(platform, labels, compilation_mode)
     if all(path.exists() for path in outputs):
         return outputs
 
-    bazel_build(platform, labels, compilation_mode, bazel_configs)
-    outputs = bazel_output_files(platform, labels, compilation_mode, bazel_configs)
+    bazel_build(platform, labels, compilation_mode)
+    outputs = bazel_output_files(platform, labels, compilation_mode)
     missing = [str(path) for path in outputs if not path.exists()]
     if missing:
         raise SystemExit(f"missing built outputs for {labels}: {missing}")
@@ -194,9 +187,8 @@ def single_bazel_output_file(
     platform: str,
     label: str,
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> Path:
-    outputs = ensure_bazel_output_files(platform, [label], compilation_mode, bazel_configs)
+    outputs = ensure_bazel_output_files(platform, [label], compilation_mode)
     if len(outputs) != 1:
         raise SystemExit(f"expected exactly one output for {label}, found {outputs}")
     return outputs[0]
@@ -206,17 +198,11 @@ def merged_musl_archive(
     platform: str,
     lib_path: Path,
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> Path:
-    llvm_ar = single_bazel_output_file(platform, LLVM_AR_LABEL, compilation_mode, bazel_configs)
-    llvm_ranlib = single_bazel_output_file(
-        platform,
-        LLVM_RANLIB_LABEL,
-        compilation_mode,
-        bazel_configs,
-    )
+    llvm_ar = single_bazel_output_file(platform, LLVM_AR_LABEL, compilation_mode)
+    llvm_ranlib = single_bazel_output_file(platform, LLVM_RANLIB_LABEL, compilation_mode)
     runtime_archives = [
-        single_bazel_output_file(platform, label, compilation_mode, bazel_configs)
+        single_bazel_output_file(platform, label, compilation_mode)
         for label in MUSL_RUNTIME_ARCHIVE_LABELS
     ]
 
@@ -247,13 +233,11 @@ def stage_release_pair(
     target: str,
     output_dir: Path,
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> None:
     outputs = ensure_bazel_output_files(
         platform,
         [release_pair_label(target)],
         compilation_mode,
-        bazel_configs,
     )
 
     try:
@@ -270,7 +254,7 @@ def stage_release_pair(
     staged_library = output_dir / staged_archive_name(target, lib_path)
     staged_binding = output_dir / f"src_binding_release_{target}.rs"
     source_archive = (
-        merged_musl_archive(platform, lib_path, compilation_mode, bazel_configs)
+        merged_musl_archive(platform, lib_path, compilation_mode)
         if is_musl_archive_target(target, lib_path)
         else lib_path
     )
@@ -310,12 +294,6 @@ def parse_args() -> argparse.Namespace:
     stage_release_pair_parser.add_argument("--target", required=True)
     stage_release_pair_parser.add_argument("--output-dir", required=True)
     stage_release_pair_parser.add_argument(
-        "--bazel-config",
-        action="append",
-        default=[],
-        dest="bazel_configs",
-    )
-    stage_release_pair_parser.add_argument(
         "--compilation-mode",
         default="fastbuild",
         choices=["fastbuild", "opt", "dbg"],
@@ -352,7 +330,6 @@ def main() -> int:
             target=args.target,
             output_dir=Path(args.output_dir),
             compilation_mode=args.compilation_mode,
-            bazel_configs=args.bazel_configs,
         )
         return 0
     if args.command == "resolved-v8-crate-version":

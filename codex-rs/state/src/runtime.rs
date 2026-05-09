@@ -20,7 +20,6 @@ use crate::apply_rollout_item;
 use crate::migrations::runtime_logs_migrator;
 use crate::migrations::runtime_state_migrator;
 use crate::model::AgentJobRow;
-use crate::model::ThreadGoalRow;
 use crate::model::ThreadRow;
 use crate::model::anchor_from_item;
 use crate::model::datetime_to_epoch_millis;
@@ -59,7 +58,6 @@ mod backfill;
 mod device_key;
 #[cfg(test)]
 mod device_key_tests;
-mod goals;
 mod logs;
 mod memories;
 mod remote_control;
@@ -68,9 +66,6 @@ mod test_support;
 mod threads;
 
 pub use device_key::DeviceKeyBindingRecord;
-pub use goals::ThreadGoalAccountingMode;
-pub use goals::ThreadGoalAccountingOutcome;
-pub use goals::ThreadGoalUpdate;
 pub use remote_control::RemoteControlEnrollmentRecord;
 pub use threads::ThreadFilterOptions;
 
@@ -172,15 +167,28 @@ fn base_sqlite_options(path: &Path) -> SqliteConnectOptions {
 }
 
 async fn open_state_sqlite(path: &Path, migrator: &Migrator) -> anyhow::Result<SqlitePool> {
-    // New state DBs should use incremental auto-vacuum, but retrofitting an
-    // existing DB requires a full VACUUM. Do not attempt that during process
-    // startup: it is maintenance work that can contend with foreground writers.
     let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
         .await?;
     migrator.run(&pool).await?;
+    let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+        .fetch_one(&pool)
+        .await?;
+    if auto_vacuum != SqliteAutoVacuum::Incremental as i64 {
+        // Existing state DBs need one non-transactional `VACUUM` before
+        // SQLite persists `auto_vacuum = INCREMENTAL` in the database header.
+        sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(&pool)
+            .await?;
+        // We do it on best effort. If the lock can't be acquired, it will be done at next run.
+        let _ = sqlx::query("VACUUM").execute(&pool).await;
+    }
+    // We do it on best effort. If the lock can't be acquired, it will be done at next run.
+    let _ = sqlx::query("PRAGMA incremental_vacuum")
+        .execute(&pool)
+        .await;
     Ok(pool)
 }
 
