@@ -234,6 +234,61 @@ def copy_chromium_rust_vendor(vendored_source: Path, rusty_v8_source_root: Path)
     shutil.copytree(source_vendor_dir, dest_vendor_dir)
 
 
+def patch_android_v8_source(vendored_source: Path) -> None:
+    stdlib_header = (
+        vendored_source / "third_party" / "libc++" / "src" / "include" / "stdlib.h"
+    )
+    if not stdlib_header.exists():
+        raise SystemExit(f"missing libc++ stdlib header: {stdlib_header}")
+
+    text = stdlib_header.read_text(encoding="utf-8")
+    replacements = [
+        (
+            "inline _LIBCPP_HIDE_FROM_ABI ldiv_t div(long __x, long __y) _NOEXCEPT { return ::ldiv(__x, __y); }\n",
+            "#if !defined(__ANDROID__)\n"
+            "inline _LIBCPP_HIDE_FROM_ABI ldiv_t div(long __x, long __y) _NOEXCEPT { return ::ldiv(__x, __y); }\n"
+            "#endif\n",
+        ),
+        (
+            "inline _LIBCPP_HIDE_FROM_ABI lldiv_t div(long long __x, long long __y) _NOEXCEPT { return ::lldiv(__x, __y); }\n",
+            "#if !defined(__ANDROID__)\n"
+            "inline _LIBCPP_HIDE_FROM_ABI lldiv_t div(long long __x, long long __y) _NOEXCEPT { return ::lldiv(__x, __y); }\n"
+            "#endif\n",
+        ),
+    ]
+    for old, new in replacements:
+        if old not in text:
+            raise SystemExit(
+                f"missing expected libc++ Android patch target in {stdlib_header}"
+            )
+        text = text.replace(old, new, 1)
+    stdlib_header.write_text(text, encoding="utf-8")
+
+    abort_message = (
+        vendored_source
+        / "third_party"
+        / "libc++abi"
+        / "src"
+        / "src"
+        / "abort_message.cpp"
+    )
+    if not abort_message.exists():
+        raise SystemExit(f"missing libc++abi abort_message source: {abort_message}")
+
+    text = abort_message.read_text(encoding="utf-8")
+    if "#include <stdio.h>" not in text:
+        text = text.replace(
+            "#include <stdarg.h>\n",
+            "#include <stdarg.h>\n#include <stdio.h>\n",
+        )
+    if "#include <stdlib.h>" not in text:
+        text = text.replace(
+            "#include <stdio.h>\n",
+            "#include <stdio.h>\n#include <stdlib.h>\n",
+        )
+    abort_message.write_text(text, encoding="utf-8")
+
+
 def vendor_android_v8_crate_source(
     version: str, temp_dir: Path, env: dict[str, str], rusty_v8_source_root: Path
 ) -> Path:
@@ -426,6 +481,7 @@ def stage_android_release_pair(
         env,
         rusty_v8_source_root,
     )
+    patch_android_v8_source(vendored_source)
     install_android_v8_host_sysroot(vendored_source, env)
     with manifest_path.open("a", encoding="utf-8") as manifest:
         manifest.write(

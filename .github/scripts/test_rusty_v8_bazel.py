@@ -141,6 +141,22 @@ class RustyV8BazelTest(unittest.TestCase):
             cargo_home = temp_path / "cargo-home"
             rusty_v8_source = temp_path / "rusty-v8-source"
             crate_source = cargo_home / "registry" / "src" / "index" / "v8-146.4.0"
+            crate_stdlib = (
+                crate_source
+                / "third_party"
+                / "libc++"
+                / "src"
+                / "include"
+                / "stdlib.h"
+            )
+            crate_abort_message = (
+                crate_source
+                / "third_party"
+                / "libc++abi"
+                / "src"
+                / "src"
+                / "abort_message.cpp"
+            )
             source_vendor_crate = (
                 rusty_v8_source
                 / "third_party"
@@ -150,8 +166,22 @@ class RustyV8BazelTest(unittest.TestCase):
                 / "icu_calendar_data-v2"
             )
             stage_root.mkdir()
-            crate_source.mkdir(parents=True)
+            crate_stdlib.parent.mkdir(parents=True)
+            crate_abort_message.parent.mkdir(parents=True)
             source_vendor_crate.mkdir(parents=True)
+            crate_stdlib.write_text(
+                textwrap.dedent(
+                    """\
+                    inline _LIBCPP_HIDE_FROM_ABI ldiv_t div(long __x, long __y) _NOEXCEPT { return ::ldiv(__x, __y); }
+                    inline _LIBCPP_HIDE_FROM_ABI lldiv_t div(long long __x, long long __y) _NOEXCEPT { return ::lldiv(__x, __y); }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            crate_abort_message.write_text(
+                "#include <stdarg.h>\nvoid abort_message() {}\n",
+                encoding="utf-8",
+            )
             (source_vendor_crate / "build.rs").write_text(
                 "// vendor build\n",
                 encoding="utf-8",
@@ -212,12 +242,47 @@ class RustyV8BazelTest(unittest.TestCase):
                 / "icu_calendar_data-v2"
                 / "build.rs"
             )
+            vendored_stdlib = (
+                stage_root
+                / "v8-146.4.0"
+                / "third_party"
+                / "libc++"
+                / "src"
+                / "include"
+                / "stdlib.h"
+            )
+            vendored_abort_message = (
+                stage_root
+                / "v8-146.4.0"
+                / "third_party"
+                / "libc++abi"
+                / "src"
+                / "src"
+                / "abort_message.cpp"
+            )
             self.assertEqual(b"archive", gzip.decompress(archive.read_bytes()))
             self.assertEqual("// binding\n", binding.read_text(encoding="utf-8"))
             self.assertTrue(vendored_pydeps.exists())
             self.assertEqual(
                 "// vendor build\n",
                 vendored_rust_build.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "#if !defined(__ANDROID__)\n"
+                "inline _LIBCPP_HIDE_FROM_ABI ldiv_t div(long __x, long __y)",
+                vendored_stdlib.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "#if !defined(__ANDROID__)\n"
+                "inline _LIBCPP_HIDE_FROM_ABI lldiv_t div(long long __x, long long __y)",
+                vendored_stdlib.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                "#include <stdarg.h>\n"
+                "#include <stdio.h>\n"
+                "#include <stdlib.h>\n"
+                "void abort_message() {}\n",
+                vendored_abort_message.read_text(encoding="utf-8"),
             )
             self.assertIn(archive.name, checksums.read_text(encoding="utf-8"))
             self.assertIn(binding.name, checksums.read_text(encoding="utf-8"))
