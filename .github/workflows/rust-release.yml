@@ -215,10 +215,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "Using source ref: ${{ inputs.source_ref }}"
-          shopt -s dotglob extglob
 
           # Keep workflow/actions from the dispatch ref while replacing all other files.
-          rm -rf -- !(.git|.github|__source__)
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name .git \
+            ! -name .github \
+            ! -name __source__ \
+            -exec rm -rf -- {} +
           tar --exclude='.github' -C __source__ -cf - . | tar -xf -
           rm -rf __source__
 
