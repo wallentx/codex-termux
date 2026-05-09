@@ -147,7 +147,7 @@ class RustyV8BazelTest(unittest.TestCase):
                 args = _args[0]
                 env = kwargs["env"]
                 self.assertIsInstance(env, dict)
-                if args[1] == "fetch":
+                if args[0] != "cargo" or args[1] == "fetch":
                     return Mock(returncode=0)
 
                 build_dir = (

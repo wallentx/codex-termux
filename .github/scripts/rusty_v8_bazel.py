@@ -241,6 +241,25 @@ def vendor_android_v8_crate_source(
     return vendored_source
 
 
+def install_android_v8_host_sysroot(vendored_source: Path, env: dict[str, str]) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            str(
+                vendored_source
+                / "build"
+                / "linux"
+                / "sysroot_scripts"
+                / "install-sysroot.py"
+            ),
+            "--arch=amd64",
+        ],
+        cwd=vendored_source,
+        env=env,
+        check=True,
+    )
+
+
 def is_musl_archive_target(target: str, source_path: Path) -> bool:
     return target.endswith("-unknown-linux-musl") and source_path.suffix == ".a"
 
@@ -381,6 +400,7 @@ def stage_android_release_pair(target: str, output_dir: Path) -> None:
         check=True,
     )
     vendored_source = vendor_android_v8_crate_source(version, temp_dir, env)
+    install_android_v8_host_sysroot(vendored_source, env)
     with manifest_path.open("a", encoding="utf-8") as manifest:
         manifest.write(
             "\n".join(
