@@ -232,7 +232,7 @@ fn parse_completed(
                             }
                         }
                     }
-                } else if output_parser::looks_like_json(&run_result.stdout) {
+                } else if trimmed_stdout.starts_with('{') || trimmed_stdout.starts_with('[') {
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,

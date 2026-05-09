@@ -7,7 +7,6 @@ use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::ListThreadsParams;
 use crate::LoadThreadHistoryParams;
-use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
@@ -19,7 +18,8 @@ use crate::UpdateThreadMetadataParams;
 /// Storage-neutral thread persistence boundary.
 #[async_trait]
 pub trait ThreadStore: Any + Send + Sync {
-    /// Return this store as [`Any`] for implementation-owned escape hatches.
+    /// Return this store as [`Any`] so callers at API boundaries can reject requests that only
+    /// make sense for a concrete store implementation.
     fn as_any(&self) -> &dyn Any;
 
     /// Creates a new live thread.
@@ -55,14 +55,6 @@ pub trait ThreadStore: Any + Send + Sync {
 
     /// Reads a thread summary and optionally its persisted history.
     async fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreResult<StoredThread>;
-
-    /// Reads a rollout-backed thread by path when the store supports path-addressed lookups.
-    ///
-    /// Deprecated: new callers should use [`ThreadStore::read_thread`] instead.
-    async fn read_thread_by_rollout_path(
-        &self,
-        params: ReadThreadByRolloutPathParams,
-    ) -> ThreadStoreResult<StoredThread>;
 
     /// Lists stored threads matching the supplied filters.
     async fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreResult<ThreadPage>;

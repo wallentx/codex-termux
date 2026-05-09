@@ -13,8 +13,6 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
-anyhow = { workspace = true }
-codex-analytics = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-config = { workspace = true }
 codex-core-skills = { workspace = true }
@@ -29,11 +27,9 @@ codex-utils-absolute-path = { workspace = true }
 codex-utils-plugins = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
-flate2 = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tar = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "rt", "time"] }
@@ -43,6 +39,7 @@ url = { workspace = true }
 zip = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 libc = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
