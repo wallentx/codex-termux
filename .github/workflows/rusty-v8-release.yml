@@ -122,7 +122,6 @@ jobs:
             libclang-19-dev \
             lld-19
 
-          echo "CLANG_BASE_PATH=/usr/lib/llvm-19" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
 
       - name: Build Bazel V8 release pair
