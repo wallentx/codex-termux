@@ -22,6 +22,8 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch_spec::ApplyPatchToolArgs;
+use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
+use crate::tools::handlers::apply_patch_spec::create_apply_patch_json_tool;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::orchestrator::ToolOrchestrator;
@@ -41,6 +43,7 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
@@ -48,11 +51,30 @@ use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
 use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
 
-pub struct ApplyPatchHandler;
+pub struct ApplyPatchHandler {
+    options: ApplyPatchToolType,
+}
+
+impl Default for ApplyPatchHandler {
+    fn default() -> Self {
+        Self {
+            options: ApplyPatchToolType::Freeform,
+        }
+    }
+}
+
+impl ApplyPatchHandler {
+    pub(crate) fn new(apply_patch_tool_type: ApplyPatchToolType) -> Self {
+        Self {
+            options: apply_patch_tool_type,
+        }
+    }
+}
 
 #[derive(Default)]
 struct ApplyPatchArgumentDiffConsumer {
@@ -297,6 +319,13 @@ impl ToolHandler for ApplyPatchHandler {
         ToolName::plain("apply_patch")
     }
 
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(match self.options {
+            ApplyPatchToolType::Freeform => create_apply_patch_freeform_tool(),
+            ApplyPatchToolType::Function => create_apply_patch_json_tool(),
+        })
+    }
+
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
@@ -425,7 +454,7 @@ impl ToolHandler for ApplyPatchHandler {
                             session: session.clone(),
                             turn: turn.clone(),
                             call_id: call_id.clone(),
-                            tool_name: tool_name.display(),
+                            tool_name: tool_name.clone(),
                         };
                         let out = orchestrator
                             .run(
@@ -537,7 +566,7 @@ pub(crate) async fn intercept_apply_patch(
                         session: session.clone(),
                         turn: turn.clone(),
                         call_id: call_id.to_string(),
-                        tool_name: tool_name.to_string(),
+                        tool_name: ToolName::plain(tool_name),
                     };
                     let out = orchestrator
                         .run(

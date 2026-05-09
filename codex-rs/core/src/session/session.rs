@@ -370,6 +370,7 @@ impl Session {
         analytics_events_client: Option<AnalyticsEventsClient>,
         thread_store: Arc<dyn ThreadStore>,
         parent_rollout_thread_trace: ThreadTraceContext,
+        attestation_provider: Option<Arc<dyn AttestationProvider>>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -717,7 +718,7 @@ impl Session {
                 tx
             };
             let thread_name =
-                thread_title_from_state_db(state_db_ctx.as_ref(), &config.codex_home, thread_id)
+                thread_title_from_thread_store(live_thread_init.as_ref(), &thread_store, thread_id)
                     .instrument(info_span!(
                         "session_init.thread_name_lookup",
                         otel.name = "session_init.thread_name_lookup",
@@ -852,6 +853,7 @@ impl Session {
                 state_db: state_db_ctx.clone(),
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
+                attestation_provider: attestation_provider.clone(),
                 model_client: ModelClient::new(
                     Some(Arc::clone(&auth_manager)),
                     session_id,
@@ -863,6 +865,7 @@ impl Session {
                     config.features.enabled(Feature::EnableRequestCompression),
                     config.features.enabled(Feature::RuntimeMetrics),
                     Self::build_model_client_beta_features_header(config.as_ref()),
+                    attestation_provider,
                 ),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(),
                 environment_manager,

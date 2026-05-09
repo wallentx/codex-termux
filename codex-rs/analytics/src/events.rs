@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::facts::AcceptedLineFingerprint;
 use crate::facts::AppInvocation;
 use crate::facts::CodexCompactionEvent;
 use crate::facts::CompactionImplementation;
@@ -18,6 +19,7 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
 use crate::facts::TurnSubmissionType;
+use crate::now_unix_millis;
 use crate::now_unix_seconds;
 use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::CommandExecutionSource;
@@ -70,6 +72,7 @@ pub(crate) enum TrackEventRequest {
     CollabAgentToolCall(CodexCollabAgentToolCallEventRequest),
     WebSearch(CodexWebSearchEventRequest),
     ImageGeneration(CodexImageGenerationEventRequest),
+    AcceptedLineFingerprints(Box<CodexAcceptedLineFingerprintsEventRequest>),
     #[allow(dead_code)]
     ReviewEvent(CodexReviewEventRequest),
     PluginUsed(CodexPluginUsedEventRequest),
@@ -77,6 +80,32 @@ pub(crate) enum TrackEventRequest {
     PluginUninstalled(CodexPluginEventRequest),
     PluginEnabled(CodexPluginEventRequest),
     PluginDisabled(CodexPluginEventRequest),
+}
+
+impl TrackEventRequest {
+    pub(crate) fn should_send_in_isolated_request(&self) -> bool {
+        matches!(self, Self::AcceptedLineFingerprints(_))
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexAcceptedLineFingerprintsEventParams {
+    pub(crate) event_type: &'static str,
+    pub(crate) turn_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) product_surface: Option<String>,
+    pub(crate) model_slug: Option<String>,
+    pub(crate) completed_at: u64,
+    pub(crate) repo_hash: Option<String>,
+    pub(crate) accepted_added_lines: u64,
+    pub(crate) accepted_deleted_lines: u64,
+    pub(crate) line_fingerprints: Vec<AcceptedLineFingerprint>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexAcceptedLineFingerprintsEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexAcceptedLineFingerprintsEventParams,
 }
 
 #[derive(Serialize)]
@@ -261,7 +290,7 @@ pub struct GuardianReviewTrackContext {
     approval_request_source: GuardianApprovalRequestSource,
     reviewed_action: GuardianReviewedAction,
     review_timeout_ms: u64,
-    started_at: u64,
+    pub started_at_ms: u64,
     started_instant: Instant,
 }
 
@@ -283,7 +312,7 @@ impl GuardianReviewTrackContext {
             approval_request_source,
             reviewed_action,
             review_timeout_ms,
-            started_at: now_unix_seconds(),
+            started_at_ms: now_unix_millis(),
             started_instant: Instant::now(),
         }
     }
@@ -316,7 +345,7 @@ impl GuardianReviewTrackContext {
             tool_call_count: None,
             time_to_first_token_ms: result.time_to_first_token_ms,
             completion_latency_ms: Some(self.started_instant.elapsed().as_millis() as u64),
-            started_at: self.started_at,
+            started_at: self.started_at_ms / 1_000,
             completed_at: Some(now_unix_seconds()),
             input_tokens: result.token_usage.as_ref().map(|usage| usage.input_tokens),
             cached_input_tokens: result

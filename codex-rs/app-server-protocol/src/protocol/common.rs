@@ -581,6 +581,13 @@ client_request_definitions! {
         serialization: None,
         response: v2::ThreadTurnsListResponse,
     },
+    #[experimental("thread/turns/items/list")]
+    ThreadTurnsItemsList => "thread/turns/items/list" {
+        params: v2::ThreadTurnsItemsListParams,
+        // Explicitly concurrent: this primarily reads append-only rollout storage.
+        serialization: None,
+        response: v2::ThreadTurnsItemsListResponse,
+    },
     /// Append raw Responses API items to the thread history without starting a user turn.
     ThreadInjectItems => "thread/inject_items" {
         params: v2::ThreadInjectItemsParams,
@@ -1305,6 +1312,12 @@ server_request_definitions! {
         response: v2::ChatgptAuthTokensRefreshResponse,
     },
 
+    /// Generate a fresh upstream attestation result on demand.
+    AttestationGenerate => "attestation/generate" {
+        params: v2::AttestationGenerateParams,
+        response: v2::AttestationGenerateResponse,
+    },
+
     /// DEPRECATED APIs below
     /// Request to approve a patch.
     /// This request is used for Turns started via the legacy APIs (i.e. SendUserTurn, SendUserMessage).
@@ -1649,7 +1662,6 @@ mod tests {
             params: v2::SkillsListParams {
                 cwds: Vec::new(),
                 force_reload: false,
-                per_cwd_extra_user_roots: None,
             },
         };
         assert_eq!(
@@ -1843,9 +1855,22 @@ mod tests {
                 cursor: None,
                 limit: None,
                 sort_direction: None,
+                items_view: None,
             },
         };
         assert_eq!(thread_turns_list.serialization_scope(), None);
+
+        let thread_turns_items_list = ClientRequest::ThreadTurnsItemsList {
+            request_id: request_id(),
+            params: v2::ThreadTurnsItemsListParams {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                cursor: None,
+                limit: None,
+                sort_direction: None,
+            },
+        };
+        assert_eq!(thread_turns_items_list.serialization_scope(), None);
 
         let mcp_resource_read = ClientRequest::McpResourceRead {
             request_id: request_id(),
@@ -1891,6 +1916,7 @@ mod tests {
                 },
                 capabilities: Some(v1::InitializeCapabilities {
                     experimental_api: true,
+                    request_attestation: true,
                     opt_out_notification_methods: Some(vec![
                         "thread/started".to_string(),
                         "item/agentMessage/delta".to_string(),
@@ -1911,6 +1937,7 @@ mod tests {
                     },
                     "capabilities": {
                         "experimentalApi": true,
+                        "requestAttestation": true,
                         "optOutNotificationMethods": [
                             "thread/started",
                             "item/agentMessage/delta"
@@ -1936,6 +1963,7 @@ mod tests {
                 },
                 "capabilities": {
                     "experimentalApi": true,
+                    "requestAttestation": true,
                     "optOutNotificationMethods": [
                         "thread/started",
                         "item/agentMessage/delta"
@@ -1956,6 +1984,7 @@ mod tests {
                     },
                     capabilities: Some(v1::InitializeCapabilities {
                         experimental_api: true,
+                        request_attestation: true,
                         opt_out_notification_methods: Some(vec![
                             "thread/started".to_string(),
                             "item/agentMessage/delta".to_string(),
@@ -2069,6 +2098,28 @@ mod tests {
             }),
             serde_json::to_value(&request)?,
         );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_attestation_generate_request() -> Result<()> {
+        let params = v2::AttestationGenerateParams {};
+        let request = ServerRequest::AttestationGenerate {
+            request_id: RequestId::Integer(9),
+            params: params.clone(),
+        };
+        assert_eq!(
+            json!({
+                "method": "attestation/generate",
+                "id": 9,
+                "params": {}
+            }),
+            serde_json::to_value(&request)?,
+        );
+
+        let payload = ServerRequestPayload::AttestationGenerate(params);
+        assert_eq!(request.id(), &RequestId::Integer(9));
+        assert_eq!(payload.request_with_id(RequestId::Integer(9)), request);
         Ok(())
     }
 
@@ -2947,6 +2998,7 @@ mod tests {
             thread_id: "thr_123".to_string(),
             turn_id: "turn_123".to_string(),
             item_id: "call_123".to_string(),
+            started_at_ms: 0,
             approval_id: None,
             reason: None,
             network_approval_context: None,
