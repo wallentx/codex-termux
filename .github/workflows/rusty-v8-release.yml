@@ -3,6 +3,11 @@ name: rusty-v8-release
 on:
   workflow_dispatch:
     inputs:
+      source_repository:
+        description: Repository containing the Codex source tree to build.
+        required: false
+        default: openai/codex
+        type: string
       release_ref:
         description: Branch, tag, or SHA containing the Codex source tree to build.
         required: true
@@ -18,7 +23,7 @@ on:
         type: boolean
 
 concurrency:
-  group: ${{ github.workflow }}::${{ inputs.release_tag || inputs.release_ref }}
+  group: ${{ github.workflow }}::${{ inputs.source_repository }}::${{ inputs.release_tag || inputs.release_ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,6 +39,7 @@ jobs:
       - name: Check out source ref
         uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.source_repository }}
           ref: ${{ inputs.release_ref }}
           path: source
 
@@ -83,6 +89,7 @@ jobs:
       - name: Check out source ref
         uses: actions/checkout@v6
         with:
+          repository: ${{ inputs.source_repository }}
           ref: ${{ inputs.release_ref }}
           path: source
 
