@@ -28,6 +28,10 @@ ANDROID_EXTRA_GN_ARGS = [
     'android_ndk_root="//third_party/android_ndk"',
     'android_ndk_version="r26c"',
 ]
+ANDROID_BINDGEN_CLANG_ARGS = [
+    "--target=aarch64-linux-android29",
+    "--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
+]
 
 
 def resolved_v8_crate_version(repo_root: Path) -> str:
@@ -168,6 +172,16 @@ def add_android_extra_gn_args(env: dict[str, str]) -> None:
         env["EXTRA_GN_ARGS"] = " ".join(extra_args)
 
 
+def add_android_bindgen_clang_args(env: dict[str, str], target: str) -> None:
+    key = f"BINDGEN_EXTRA_CLANG_ARGS_{target.replace('-', '_')}"
+    bindgen_args = [env[key]] if env.get(key) else []
+    existing = env.get(key, "")
+    for arg in ANDROID_BINDGEN_CLANG_ARGS:
+        if arg not in existing:
+            bindgen_args.append(arg)
+    env[key] = " ".join(bindgen_args)
+
+
 def vendor_android_v8_crate_source(
     version: str, temp_dir: Path, env: dict[str, str], rusty_v8_source_root: Path
 ) -> Path:
@@ -249,6 +263,7 @@ def stage_android_release_pair(
         "V8_FROM_SOURCE": "1",
     }
     add_android_extra_gn_args(env)
+    add_android_bindgen_clang_args(env, target)
     subprocess.run(
         [
             "cargo",
