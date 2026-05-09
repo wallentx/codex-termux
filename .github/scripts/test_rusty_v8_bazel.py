@@ -149,6 +149,7 @@ class RustyV8BazelTest(unittest.TestCase):
                 / "include"
                 / "stdlib.h"
             )
+            crate_build_rs = crate_source / "build.rs"
             crate_abort_message = (
                 crate_source
                 / "third_party"
@@ -182,6 +183,10 @@ class RustyV8BazelTest(unittest.TestCase):
                 "#include <stdarg.h>\nvoid abort_message() {}\n",
                 encoding="utf-8",
             )
+            crate_build_rs.write_text(
+                'fn main() {\n  } else if target_os == "linux" {\n}\n',
+                encoding="utf-8",
+            )
             (source_vendor_crate / "build.rs").write_text(
                 "// vendor build\n",
                 encoding="utf-8",
@@ -201,14 +206,6 @@ class RustyV8BazelTest(unittest.TestCase):
                 self.assertIn(
                     'android_ndk_version="r26c"',
                     env["EXTRA_GN_ARGS"],
-                )
-                self.assertIn(
-                    "--target=aarch64-linux-android29",
-                    env["BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"],
-                )
-                self.assertIn(
-                    "--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
-                    env["BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"],
                 )
                 build_dir = (
                     Path(env["CARGO_TARGET_DIR"])
@@ -276,6 +273,7 @@ class RustyV8BazelTest(unittest.TestCase):
                 / "src"
                 / "abort_message.cpp"
             )
+            vendored_build_rs = stage_root / "v8-146.4.0" / "build.rs"
             self.assertEqual(b"archive", gzip.decompress(archive.read_bytes()))
             self.assertEqual("// binding\n", binding.read_text(encoding="utf-8"))
             self.assertTrue(vendored_pydeps.exists())
@@ -299,6 +297,13 @@ class RustyV8BazelTest(unittest.TestCase):
                 "#include <stdlib.h>\n"
                 "void abort_message() {}\n",
                 vendored_abort_message.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                '  } else if target_os == "android" {\n'
+                '    clang_args.push("--target=aarch64-linux-android29".to_string());\n'
+                '    clang_args.push("--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot".to_string());\n'
+                '  } else if target_os == "linux" {\n',
+                vendored_build_rs.read_text(encoding="utf-8"),
             )
             self.assertIn(archive.name, checksums.read_text(encoding="utf-8"))
             self.assertIn(binding.name, checksums.read_text(encoding="utf-8"))

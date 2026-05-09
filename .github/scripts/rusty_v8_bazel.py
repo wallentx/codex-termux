@@ -43,10 +43,6 @@ ANDROID_EXTRA_GN_ARGS = [
     'android_ndk_root="//third_party/android_ndk"',
     'android_ndk_version="r26c"',
 ]
-ANDROID_BINDGEN_CLANG_ARGS = [
-    "--target=aarch64-linux-android29",
-    "--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
-]
 
 
 def bazel_execroot() -> Path:
@@ -297,6 +293,22 @@ def patch_android_v8_source(vendored_source: Path) -> None:
         )
     abort_message.write_text(text, encoding="utf-8")
 
+    build_rs = vendored_source / "build.rs"
+    if not build_rs.exists():
+        raise SystemExit(f"missing v8 build script: {build_rs}")
+
+    text = build_rs.read_text(encoding="utf-8")
+    old = '  } else if target_os == "linux" {\n'
+    new = (
+        '  } else if target_os == "android" {\n'
+        '    clang_args.push("--target=aarch64-linux-android29".to_string());\n'
+        '    clang_args.push("--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot".to_string());\n'
+        '  } else if target_os == "linux" {\n'
+    )
+    if old not in text:
+        raise SystemExit(f"missing expected Android bindgen patch target in {build_rs}")
+    build_rs.write_text(text.replace(old, new, 1), encoding="utf-8")
+
 
 def add_android_extra_gn_args(env: dict[str, str]) -> None:
     existing = " ".join(
@@ -309,16 +321,6 @@ def add_android_extra_gn_args(env: dict[str, str]) -> None:
             extra_args.append(arg)
     if extra_args:
         env["EXTRA_GN_ARGS"] = " ".join(extra_args)
-
-
-def add_android_bindgen_clang_args(env: dict[str, str], target: str) -> None:
-    key = f"BINDGEN_EXTRA_CLANG_ARGS_{target.replace('-', '_')}"
-    bindgen_args = [env[key]] if env.get(key) else []
-    existing = env.get(key, "")
-    for arg in ANDROID_BINDGEN_CLANG_ARGS:
-        if arg not in existing:
-            bindgen_args.append(arg)
-    env[key] = " ".join(bindgen_args)
 
 
 def vendor_android_v8_crate_source(
@@ -495,7 +497,6 @@ def stage_android_release_pair(
         "V8_FROM_SOURCE": "1",
     }
     add_android_extra_gn_args(env)
-    add_android_bindgen_clang_args(env, target)
     subprocess.run(
         [
             "cargo",
