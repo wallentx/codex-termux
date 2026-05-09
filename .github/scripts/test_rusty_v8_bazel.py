@@ -194,6 +194,14 @@ class RustyV8BazelTest(unittest.TestCase):
                 if args[0] != "cargo" or args[1] == "fetch":
                     return Mock(returncode=0)
 
+                self.assertIn(
+                    'default_android_ndk_root="//third_party/android_ndk"',
+                    env["EXTRA_GN_ARGS"],
+                )
+                self.assertIn(
+                    'default_android_ndk_version="r26c"',
+                    env["EXTRA_GN_ARGS"],
+                )
                 build_dir = (
                     Path(env["CARGO_TARGET_DIR"])
                     / "aarch64-linux-android"

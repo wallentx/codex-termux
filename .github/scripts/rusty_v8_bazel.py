@@ -39,6 +39,11 @@ ANDROID_GN_PYDEPS_FILES = [
     "build/android/resource_sizes.pydeps",
 ]
 
+ANDROID_EXTRA_GN_ARGS = [
+    'default_android_ndk_root="//third_party/android_ndk"',
+    'default_android_ndk_version="r26c"',
+]
+
 
 def bazel_execroot() -> Path:
     result = subprocess.run(
@@ -289,6 +294,19 @@ def patch_android_v8_source(vendored_source: Path) -> None:
     abort_message.write_text(text, encoding="utf-8")
 
 
+def add_android_extra_gn_args(env: dict[str, str]) -> None:
+    existing = " ".join(
+        value for value in (env.get("GN_ARGS", ""), env.get("EXTRA_GN_ARGS", "")) if value
+    )
+    extra_args = [env["EXTRA_GN_ARGS"]] if env.get("EXTRA_GN_ARGS") else []
+    for arg in ANDROID_EXTRA_GN_ARGS:
+        key = arg.split("=", 1)[0]
+        if f"{key}=" not in existing:
+            extra_args.append(arg)
+    if extra_args:
+        env["EXTRA_GN_ARGS"] = " ".join(extra_args)
+
+
 def vendor_android_v8_crate_source(
     version: str, temp_dir: Path, env: dict[str, str], rusty_v8_source_root: Path
 ) -> Path:
@@ -462,6 +480,7 @@ def stage_android_release_pair(
         "CARGO_TARGET_DIR": str(target_dir),
         "V8_FROM_SOURCE": "1",
     }
+    add_android_extra_gn_args(env)
     subprocess.run(
         [
             "cargo",
