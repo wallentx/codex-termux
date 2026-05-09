@@ -4,6 +4,7 @@ use crate::models::PermissionProfile;
 use crate::parse_command::ParsedCommand;
 use crate::protocol::FileChange;
 use crate::protocol::ReviewDecision;
+use crate::protocol::SandboxPolicy;
 use crate::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
@@ -15,9 +16,13 @@ use std::path::PathBuf;
 use ts_rs::TS;
 
 /// Fully resolved permissions for rerunning an intercepted child process.
+///
+/// `permission_profile` is the canonical permission model. `sandbox_policy`
+/// remains as the legacy adapter for sandbox backends that still require it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPermissionProfile {
     pub permission_profile: PermissionProfile,
+    pub sandbox_policy: SandboxPolicy,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -187,12 +192,6 @@ pub struct GuardianAssessmentEvent {
     /// Uses `#[serde(default)]` for backwards compatibility.
     #[serde(default)]
     pub turn_id: String,
-    #[serde(default)]
-    #[ts(type = "number")]
-    pub started_at_ms: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "number")]
-    pub completed_at_ms: Option<i64>,
     pub status: GuardianAssessmentStatus,
     /// Coarse risk label. Omitted while the assessment is in progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,8 +228,6 @@ pub struct ExecApprovalRequestEvent {
     /// Uses `#[serde(default)]` for backwards compatibility.
     #[serde(default)]
     pub turn_id: String,
-    #[ts(type = "number")]
-    pub started_at_ms: i64,
     /// The command to be executed.
     pub command: Vec<String>,
     /// The command's working directory.
@@ -378,8 +375,6 @@ pub struct ApplyPatchApprovalRequestEvent {
     /// Uses `#[serde(default)]` for backwards compatibility with older senders.
     #[serde(default)]
     pub turn_id: String,
-    #[ts(type = "number")]
-    pub started_at_ms: i64,
     pub changes: HashMap<PathBuf, FileChange>,
     /// Optional explanatory reason (e.g. request for extra write access).
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -190,7 +190,7 @@ fn parse_completed(
                         }
                     }
                 // Preserve plain-text context support without treating malformed JSON as context.
-                } else if output_parser::looks_like_json(&run_result.stdout) {
+                } else if trimmed_stdout.starts_with('{') || trimmed_stdout.starts_with('[') {
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
@@ -356,6 +356,7 @@ mod tests {
     fn handler() -> ConfiguredHandler {
         ConfiguredHandler {
             event_name: HookEventName::SessionStart,
+            is_managed: false,
             matcher: None,
             command: "echo hook".to_string(),
             timeout_sec: 600,
@@ -363,7 +364,6 @@ mod tests {
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source: codex_protocol::protocol::HookSource::User,
             display_order: 0,
-            env: std::collections::HashMap::new(),
         }
     }
 

@@ -47,30 +47,6 @@ resolve_runfile() {
 workspace_root_marker="$(resolve_runfile "__WORKSPACE_ROOT_MARKER__")"
 workspace_root="$(dirname "$(dirname "$(dirname "${workspace_root_marker}")")")"
 test_bin="$(resolve_runfile "__TEST_BIN__")"
-RUNFILE_ENV_ARGS=()
-
-__RUNFILE_ENV_EXPORTS__
-
-run_test_bin() {
-  if (( ${#RUNFILE_ENV_ARGS[@]} > 0 )); then
-    env "${RUNFILE_ENV_ARGS[@]}" "${test_bin}" "$@"
-  else
-    "${test_bin}" "$@"
-  fi
-}
-
-exec_test_bin() {
-  if (( ${#RUNFILE_ENV_ARGS[@]} > 0 )); then
-    exec env "${RUNFILE_ENV_ARGS[@]}" "${test_bin}" "$@"
-  else
-    exec "${test_bin}" "$@"
-  fi
-}
-
-libtest_args=("$@")
-if [[ ${#libtest_args[@]} -eq 0 && -n "${TESTBRIDGE_TEST_ONLY:-}" ]]; then
-  libtest_args+=("${TESTBRIDGE_TEST_ONLY}")
-fi
 
 test_shard_index() {
   local test_name="$1"
@@ -91,58 +67,35 @@ test_shard_index() {
   echo $(( hash % TOTAL_SHARDS ))
 }
 
-run_selected_libtest() {
+run_sharded_libtest() {
   if [[ -n "${TEST_SHARD_STATUS_FILE:-}" && "${TEST_TOTAL_SHARDS:-0}" != "0" ]]; then
     touch "${TEST_SHARD_STATUS_FILE}"
   fi
 
   # Extra libtest args are usually ad-hoc local filters. Preserve those exactly
   # rather than combining them with generated exact filters.
-  if [[ ${#libtest_args[@]} -gt 0 ]]; then
-    exec_test_bin "${libtest_args[@]}"
+  if [[ $# -gt 0 ]]; then
+    exec "${test_bin}" "$@"
   fi
 
-  local has_shards=0
-  if [[ -n "${TOTAL_SHARDS}" && "${TOTAL_SHARDS}" != "0" ]]; then
-    has_shards=1
-  fi
-
-  if [[ "${has_shards}" == "1" && -z "${SHARD_INDEX}" ]]; then
+  if [[ -z "${SHARD_INDEX}" ]]; then
     echo "TEST_SHARD_INDEX or RULES_RUST_TEST_SHARD_INDEX must be set when sharding is enabled" >&2
     exit 1
   fi
 
   local list_output
   local test_list
-  list_output="$(run_test_bin --list --format terse)"
+  list_output="$("${test_bin}" --list --format terse)"
   test_list="$(printf '%s\n' "${list_output}" | grep ': test$' | sed 's/: test$//' | LC_ALL=C sort || true)"
 
   if [[ -z "${test_list}" ]]; then
     exit 0
   fi
 
-  local skip_filters="${CODEX_BAZEL_TEST_SKIP_FILTERS:-}"
-
   local shard_tests=()
   local test_name
   while IFS= read -r test_name; do
-    local skip=0
-    if [[ -n "${skip_filters}" ]]; then
-      local filter
-      local old_ifs="${IFS}"
-      IFS=','
-      for filter in ${skip_filters}; do
-        if [[ -n "${filter}" && "${test_name}" == *"${filter}"* ]]; then
-          skip=1
-          break
-        fi
-      done
-      IFS="${old_ifs}"
-    fi
-    if [[ "${skip}" == "1" ]]; then
-      continue
-    fi
-    if [[ "${has_shards}" == "0" || $(test_shard_index "${test_name}") == "${SHARD_INDEX}" ]]; then
+    if (( $(test_shard_index "${test_name}") == SHARD_INDEX )); then
       shard_tests+=("${test_name}")
     fi
   done <<< "${test_list}"
@@ -151,19 +104,16 @@ run_selected_libtest() {
     exit 0
   fi
 
-  exec_test_bin "${shard_tests[@]}" --exact
+  exec "${test_bin}" "${shard_tests[@]}" --exact
 }
 
-__WORKSPACE_ROOT_SETUP__
+export INSTA_WORKSPACE_ROOT="${workspace_root}"
+cd "${workspace_root}"
 
 TOTAL_SHARDS="${RULES_RUST_TEST_TOTAL_SHARDS:-${TEST_TOTAL_SHARDS:-}}"
 SHARD_INDEX="${RULES_RUST_TEST_SHARD_INDEX:-${TEST_SHARD_INDEX:-}}"
-if [[ -n "${CODEX_BAZEL_TEST_SKIP_FILTERS:-}" || ( -n "${TOTAL_SHARDS}" && "${TOTAL_SHARDS}" != "0" ) ]]; then
-  run_selected_libtest
+if [[ -n "${TOTAL_SHARDS}" && "${TOTAL_SHARDS}" != "0" ]]; then
+  run_sharded_libtest "$@"
 fi
 
-if [[ ${#libtest_args[@]} -gt 0 ]]; then
-  exec_test_bin "${libtest_args[@]}"
-else
-  exec_test_bin
-fi
+exec "${test_bin}" "$@"

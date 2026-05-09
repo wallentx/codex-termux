@@ -3,7 +3,6 @@ use std::future::Future;
 use std::io::IsTerminal;
 use std::io::Result;
 use std::io::Stdout;
-use std::io::Write;
 use std::io::stdin;
 use std::io::stdout;
 use std::panic;
@@ -15,15 +14,16 @@ use std::time::Duration;
 
 use crossterm::Command;
 use crossterm::SynchronizedUpdate;
-use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyboardEnhancementFlags;
+use crossterm::event::PopKeyboardEnhancementFlags;
+use crossterm::event::PushKeyboardEnhancementFlags;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
-#[cfg(not(unix))]
 use crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
@@ -41,7 +41,6 @@ use tokio_stream::Stream;
 pub use self::frame_requester::FrameRequester;
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
-use crate::insert_history::HistoryLineWrapPolicy;
 use crate::notifications::DesktopNotificationBackend;
 use crate::notifications::detect_backend;
 use crate::tui::event_stream::EventBroker;
@@ -56,16 +55,115 @@ mod frame_rate_limiter;
 mod frame_requester;
 #[cfg(unix)]
 mod job_control;
-mod keyboard_modes;
 
 /// Target frame interval for UI redraw scheduling.
 pub(crate) const TARGET_FRAME_INTERVAL: Duration = frame_rate_limiter::MIN_FRAME_INTERVAL;
+const DISABLE_KEYBOARD_ENHANCEMENT_ENV_VAR: &str = "CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT";
 
 /// A type alias for the terminal type used in this application
 pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
 
+fn keyboard_enhancement_disabled() -> bool {
+    let disable_env = std::env::var(DISABLE_KEYBOARD_ENHANCEMENT_ENV_VAR).ok();
+    let is_wsl = running_in_wsl();
+    let is_vscode_terminal = is_wsl && running_in_vscode_terminal();
+    keyboard_enhancement_disabled_for(disable_env.as_deref(), is_wsl, is_vscode_terminal)
+}
+
+fn keyboard_enhancement_disabled_for(
+    disable_env: Option<&str>,
+    is_wsl: bool,
+    is_vscode_terminal: bool,
+) -> bool {
+    if let Some(disabled) = parse_bool_env(disable_env) {
+        return disabled;
+    }
+
+    // VS Code running a WSL shell can hide TERM_PROGRAM from the Linux process
+    // environment, so `running_in_vscode_terminal` also probes the Windows-side
+    // environment through WSL interop.
+    is_wsl && is_vscode_terminal
+}
+
+fn parse_bool_env(value: Option<&str>) -> Option<bool> {
+    match value.map(str::trim) {
+        Some("1") => Some(true),
+        Some(value) if value.eq_ignore_ascii_case("true") => Some(true),
+        Some(value) if value.eq_ignore_ascii_case("yes") => Some(true),
+        Some("0") => Some(false),
+        Some(value) if value.eq_ignore_ascii_case("false") => Some(false),
+        Some(value) if value.eq_ignore_ascii_case("no") => Some(false),
+        _ => None,
+    }
+}
+
+fn running_in_wsl() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::clipboard_paste::is_probably_wsl()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 pub(crate) fn running_in_vscode_terminal() -> bool {
-    keyboard_modes::running_in_vscode_terminal()
+    vscode_terminal_detected(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        windows_term_program().as_deref(),
+    )
+}
+
+fn vscode_terminal_detected(
+    linux_term_program: Option<&str>,
+    windows_term_program: Option<&str>,
+) -> bool {
+    term_program_is_vscode(linux_term_program) || term_program_is_vscode(windows_term_program)
+}
+
+fn term_program_is_vscode(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("vscode"))
+}
+
+fn windows_term_program() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        static WINDOWS_TERM_PROGRAM: std::sync::OnceLock<Option<String>> =
+            std::sync::OnceLock::new();
+        WINDOWS_TERM_PROGRAM
+            .get_or_init(read_windows_term_program)
+            .clone()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_windows_term_program() -> Option<String> {
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "set TERM_PROGRAM"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            line.trim_end_matches('\r')
+                .strip_prefix("TERM_PROGRAM=")
+                .map(str::to_string)
+        })
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn should_emit_notification(condition: NotificationCondition, terminal_focused: bool) -> bool {
@@ -77,15 +175,11 @@ fn should_emit_notification(condition: NotificationCondition, terminal_focused: 
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
-    use super::clear_for_viewport_change;
+    use super::keyboard_enhancement_disabled_for;
+    use super::parse_bool_env;
     use super::should_emit_notification;
-    use crate::custom_terminal::Terminal as CustomTerminal;
-    use crate::test_backend::VT100Backend;
+    use super::vscode_terminal_detected;
     use codex_config::types::NotificationCondition;
-    use ratatui::layout::Position;
-    use ratatui::layout::Rect;
 
     #[test]
     fn unfocused_notification_condition_is_suppressed_when_focused() {
@@ -112,44 +206,65 @@ mod tests {
     }
 
     #[test]
-    fn first_viewport_change_clears_from_new_viewport_when_old_viewport_is_empty() {
-        let width = 12;
-        let height = 4;
-        let backend = VT100Backend::new(width, height);
-        let mut terminal =
-            CustomTerminal::with_options_and_cursor_position(backend, Position { x: 0, y: 1 })
-                .expect("terminal");
-        write!(
-            terminal.backend_mut(),
-            "shell line\r\nstale cells\r\nmore stale"
-        )
-        .expect("prefill terminal");
+    fn keyboard_enhancement_env_flag_parses_common_values() {
+        assert_eq!(parse_bool_env(Some("1")), Some(true));
+        assert_eq!(parse_bool_env(Some("true")), Some(true));
+        assert_eq!(parse_bool_env(Some("YES")), Some(true));
+        assert_eq!(parse_bool_env(Some("0")), Some(false));
+        assert_eq!(parse_bool_env(Some("false")), Some(false));
+        assert_eq!(parse_bool_env(Some("NO")), Some(false));
+        assert_eq!(parse_bool_env(Some("unexpected")), None);
+        assert_eq!(parse_bool_env(/*value*/ None), None);
+    }
 
-        clear_for_viewport_change(
-            &mut terminal,
-            Rect::new(
-                /*x*/ 0,
-                /*y*/ 1,
-                /*width*/ width,
-                /*height*/ height - 1,
-            ),
-        )
-        .expect("clear transition");
+    #[test]
+    fn keyboard_enhancement_auto_disables_for_vscode_in_wsl() {
+        assert!(keyboard_enhancement_disabled_for(
+            /*disable_env*/ None, /*is_wsl*/ true, /*is_vscode_terminal*/ true
+        ));
+    }
 
-        let rows: Vec<String> = terminal
-            .backend()
-            .vt100()
-            .screen()
-            .rows(/*start*/ 0, width)
-            .collect();
-        assert!(
-            rows[0].contains("shell line"),
-            "expected content before the viewport to remain visible, rows: {rows:?}"
-        );
-        assert!(
-            !rows.iter().skip(1).any(|row| row.contains("stale")),
-            "expected stale cells inside the new viewport to be cleared, rows: {rows:?}"
-        );
+    #[test]
+    fn keyboard_enhancement_auto_disable_requires_wsl_and_vscode() {
+        assert!(!keyboard_enhancement_disabled_for(
+            /*disable_env*/ None, /*is_wsl*/ true, /*is_vscode_terminal*/ false
+        ));
+        assert!(!keyboard_enhancement_disabled_for(
+            /*disable_env*/ None, /*is_wsl*/ false, /*is_vscode_terminal*/ true
+        ));
+    }
+
+    #[test]
+    fn keyboard_enhancement_env_flag_overrides_auto_detection() {
+        assert!(!keyboard_enhancement_disabled_for(
+            Some("0"),
+            /*is_wsl*/ true,
+            /*is_vscode_terminal*/ true
+        ));
+        assert!(keyboard_enhancement_disabled_for(
+            Some("1"),
+            /*is_wsl*/ false,
+            /*is_vscode_terminal*/ false
+        ));
+    }
+
+    #[test]
+    fn vscode_terminal_detection_uses_linux_and_windows_term_program() {
+        assert!(vscode_terminal_detected(
+            Some("vscode"),
+            /*windows_term_program*/ None
+        ));
+        assert!(vscode_terminal_detected(
+            /*linux_term_program*/ None,
+            Some("vscode")
+        ));
+        assert!(!vscode_terminal_detected(
+            /*linux_term_program*/ None,
+            Some("WindowsTerminal")
+        ));
+        assert!(!vscode_terminal_detected(
+            /*linux_term_program*/ None, /*windows_term_program*/ None
+        ));
     }
 }
 
@@ -163,7 +278,16 @@ pub fn set_modes() -> Result<()> {
     // Some terminals (notably legacy Windows consoles) do not support
     // keyboard enhancement flags. Attempt to enable them, but continue
     // gracefully if unsupported.
-    keyboard_modes::enable_keyboard_enhancement();
+    if !keyboard_enhancement_disabled() {
+        let _ = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        );
+    }
 
     let _ = execute!(stdout(), EnableFocusChange);
     Ok(())
@@ -211,64 +335,29 @@ impl Command for DisableAlternateScroll {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RawModeRestore {
-    Disable,
-    Keep,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyboardRestore {
-    PopStack,
-    ResetAfterExit,
-}
-
-fn restore_common(
-    raw_mode_restore: RawModeRestore,
-    keyboard_restore: KeyboardRestore,
-) -> Result<()> {
-    match keyboard_restore {
-        KeyboardRestore::PopStack => keyboard_modes::restore_keyboard_enhancement_stack(),
-        KeyboardRestore::ResetAfterExit => keyboard_modes::reset_keyboard_reporting_after_exit(),
-    }
-
-    let mut first_error = execute!(stdout(), DisableBracketedPaste).err();
+fn restore_common(should_disable_raw_mode: bool) -> Result<()> {
+    // Pop may fail on platforms that didn't support the push; ignore errors.
+    let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    execute!(stdout(), DisableBracketedPaste)?;
     let _ = execute!(stdout(), DisableFocusChange);
-    if matches!(raw_mode_restore, RawModeRestore::Disable)
-        && let Err(err) = disable_raw_mode()
-    {
-        first_error.get_or_insert(err);
+    if should_disable_raw_mode {
+        disable_raw_mode()?;
     }
-    if let Err(err) = execute!(
-        stdout(),
-        SetCursorStyle::DefaultUserShape,
-        crossterm::cursor::Show
-    ) {
-        first_error.get_or_insert(err);
-    }
-    match first_error {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    let _ = execute!(stdout(), crossterm::cursor::Show);
+    Ok(())
 }
 
 /// Restore the terminal to its original state.
 /// Inverse of `set_modes`.
 pub fn restore() -> Result<()> {
-    restore_common(RawModeRestore::Disable, KeyboardRestore::PopStack)
-}
-
-/// Restore the terminal after Codex is exiting.
-///
-/// Uses a stronger keyboard reset than [`restore`] so the parent shell recovers even if a
-/// terminal missed the stack pop that normally pairs with [`set_modes`].
-pub fn restore_after_exit() -> Result<()> {
-    restore_common(RawModeRestore::Disable, KeyboardRestore::ResetAfterExit)
+    let should_disable_raw_mode = true;
+    restore_common(should_disable_raw_mode)
 }
 
 /// Restore the terminal to its original state, but keep raw mode enabled.
 pub fn restore_keep_raw() -> Result<()> {
-    restore_common(RawModeRestore::Keep, KeyboardRestore::PopStack)
+    let should_disable_raw_mode = false;
+    restore_common(should_disable_raw_mode)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,61 +429,15 @@ pub fn init() -> Result<Terminal> {
 
     set_panic_hook();
 
-    #[cfg(unix)]
     let backend = CrosstermBackend::new(stdout());
-
-    #[cfg(unix)]
-    let cursor_pos =
-        match crate::terminal_probe::cursor_position(crate::terminal_probe::DEFAULT_TIMEOUT) {
-            Ok(Some(pos)) => pos,
-            Ok(None) => {
-                tracing::warn!("initial cursor position probe timed out; defaulting to origin");
-                Position { x: 0, y: 0 }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "failed to read initial cursor position; defaulting to origin: {err}"
-                );
-                Position { x: 0, y: 0 }
-            }
-        };
-
-    #[cfg(not(unix))]
-    let mut backend = CrosstermBackend::new(stdout());
-
-    #[cfg(not(unix))]
-    let cursor_pos = cursor_position_with_crossterm(&mut backend);
-
-    let tui = CustomTerminal::with_options_and_cursor_position(backend, cursor_pos)?;
+    let tui = CustomTerminal::with_options(backend)?;
     Ok(tui)
-}
-
-#[cfg(not(unix))]
-fn cursor_position_with_crossterm(backend: &mut CrosstermBackend<Stdout>) -> Position {
-    backend.get_cursor_position().unwrap_or_else(|err| {
-        tracing::warn!("failed to read initial cursor position; defaulting to origin: {err}");
-        Position { x: 0, y: 0 }
-    })
-}
-
-#[cfg(unix)]
-fn detect_keyboard_enhancement_supported() -> bool {
-    crate::terminal_probe::keyboard_enhancement_supported(crate::terminal_probe::DEFAULT_TIMEOUT)
-        .unwrap_or(/*default*/ None)
-        .unwrap_or(/*default*/ false)
-}
-
-#[cfg(not(unix))]
-fn detect_keyboard_enhancement_supported() -> bool {
-    // Non-Unix startup keeps the existing crossterm path because the bounded probe implementation
-    // relies on Unix file descriptors and `/dev/tty` semantics.
-    supports_keyboard_enhancement().unwrap_or(/*default*/ false)
 }
 
 fn set_panic_hook() {
     let hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        let _ = restore_after_exit(); // ignore any errors as we are already failing
+        let _ = restore(); // ignore any errors as we are already failing
         hook(panic_info);
     }));
 }
@@ -419,7 +462,7 @@ pub struct Tui {
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
-    pending_history_lines: Vec<PendingHistoryLines>,
+    pending_history_lines: Vec<Line<'static>>,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
@@ -435,23 +478,6 @@ pub struct Tui {
     alt_screen_enabled: bool,
 }
 
-struct PendingHistoryLines {
-    lines: Vec<Line<'static>>,
-    wrap_policy: HistoryLineWrapPolicy,
-}
-
-fn clear_for_viewport_change<B>(terminal: &mut CustomTerminal<B>, new_area: Rect) -> Result<()>
-where
-    B: Backend + Write,
-{
-    let clear_position = if terminal.viewport_area.is_empty() {
-        new_area.as_position()
-    } else {
-        terminal.viewport_area.as_position()
-    };
-    terminal.clear_after_position(clear_position)
-}
-
 impl Tui {
     pub fn new(terminal: Terminal) -> Self {
         let (draw_tx, _) = broadcast::channel(1);
@@ -459,8 +485,8 @@ impl Tui {
 
         // Detect keyboard enhancement support before any EventStream is created so the
         // crossterm poller can acquire its lock without contention.
-        let enhanced_keys_supported = !keyboard_modes::keyboard_enhancement_disabled()
-            && detect_keyboard_enhancement_supported();
+        let enhanced_keys_supported =
+            !keyboard_enhancement_disabled() && supports_keyboard_enhancement().unwrap_or(false);
         // Cache this to avoid contention with the event reader.
         supports_color::on_cached(supports_color::Stream::Stdout);
         let _ = crate::terminal_palette::default_colors();
@@ -649,25 +675,7 @@ impl Tui {
     }
 
     pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.insert_history_lines_with_wrap_policy(lines, HistoryLineWrapPolicy::PreWrap);
-    }
-
-    pub fn insert_history_lines_with_wrap_policy(
-        &mut self,
-        lines: Vec<Line<'static>>,
-        wrap_policy: HistoryLineWrapPolicy,
-    ) {
-        if lines.is_empty() {
-            return;
-        }
-        if let Some(last) = self.pending_history_lines.last_mut()
-            && last.wrap_policy == wrap_policy
-        {
-            last.lines.extend(lines);
-        } else {
-            self.pending_history_lines
-                .push(PendingHistoryLines { lines, wrap_policy });
-        }
+        self.pending_history_lines.extend(lines);
         self.frame_requester().schedule_frame();
     }
 
@@ -703,9 +711,8 @@ impl Tui {
             area.y = size.height - area.height;
         }
         if area != terminal.viewport_area {
-            // On startup, the old viewport can still be empty. Clear from the
-            // new viewport top so stale shell cells do not show through spaces.
-            clear_for_viewport_change(terminal, area)?;
+            // TODO(nornagon): probably this could be collapsed with the clear + set_viewport_area above.
+            terminal.clear()?;
             terminal.set_viewport_area(area);
         }
 
@@ -784,21 +791,18 @@ impl Tui {
     /// invalidate the diff buffer for a full repaint.
     fn flush_pending_history_lines(
         terminal: &mut Terminal,
-        pending_history_lines: &mut Vec<PendingHistoryLines>,
+        pending_history_lines: &mut Vec<Line<'static>>,
         is_zellij: bool,
     ) -> Result<bool> {
         if pending_history_lines.is_empty() {
             return Ok(false);
         }
 
-        for batch in pending_history_lines.iter() {
-            crate::insert_history::insert_history_lines_with_mode_and_wrap_policy(
-                terminal,
-                batch.lines.clone(),
-                crate::insert_history::InsertHistoryMode::new(is_zellij),
-                batch.wrap_policy,
-            )?;
-        }
+        crate::insert_history::insert_history_lines_with_mode(
+            terminal,
+            pending_history_lines.clone(),
+            crate::insert_history::InsertHistoryMode::new(is_zellij),
+        )?;
         pending_history_lines.clear();
         Ok(is_zellij)
     }
