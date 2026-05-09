@@ -89,8 +89,6 @@ pub fn build_provider(
         trace_exporter,
         metrics_exporter,
         runtime_metrics,
-        span_attributes: config.otel.span_attributes.clone(),
-        tracestate: config.otel.tracestate.clone(),
     })
 }
 
