@@ -413,7 +413,6 @@ fn list_marketplaces_supports_alternate_manifest_layout() {
                     logo: None,
                     screenshots: Vec::new(),
                 }),
-                keywords: Vec::new(),
             }],
         }]
     );
@@ -463,7 +462,6 @@ fn list_marketplaces_includes_plugins_without_discoverable_manifest() {
                     products: None,
                 },
                 interface: None,
-                keywords: Vec::new(),
             }],
         }]
     );
@@ -604,7 +602,6 @@ fn list_marketplaces_returns_home_and_repo_marketplaces() {
                             products: None,
                         },
                         interface: None,
-                        keywords: Vec::new(),
                     },
                     MarketplacePlugin {
                         name: "home-only".to_string(),
@@ -617,7 +614,6 @@ fn list_marketplaces_returns_home_and_repo_marketplaces() {
                             products: None,
                         },
                         interface: None,
-                        keywords: Vec::new(),
                     },
                 ],
             },
@@ -639,7 +635,6 @@ fn list_marketplaces_returns_home_and_repo_marketplaces() {
                             products: None,
                         },
                         interface: None,
-                        keywords: Vec::new(),
                     },
                     MarketplacePlugin {
                         name: "repo-only".to_string(),
@@ -652,7 +647,6 @@ fn list_marketplaces_returns_home_and_repo_marketplaces() {
                             products: None,
                         },
                         interface: None,
-                        keywords: Vec::new(),
                     },
                 ],
             },
@@ -730,7 +724,6 @@ fn list_marketplaces_keeps_distinct_entries_for_same_name() {
                         products: None,
                     },
                     interface: None,
-                    keywords: Vec::new(),
                 }],
             },
             Marketplace {
@@ -748,7 +741,6 @@ fn list_marketplaces_keeps_distinct_entries_for_same_name() {
                         products: None,
                     },
                     interface: None,
-                    keywords: Vec::new(),
                 }],
             },
         ]
@@ -822,7 +814,6 @@ fn list_marketplaces_dedupes_multiple_roots_in_same_repo() {
                     products: None,
                 },
                 interface: None,
-                keywords: Vec::new(),
             }],
         }]
     );
@@ -985,7 +976,6 @@ fn list_marketplaces_skips_plugins_with_invalid_names_but_keeps_marketplace() {
                     products: None,
                 },
                 interface: None,
-                keywords: Vec::new(),
             }],
         }]
     );
@@ -1103,7 +1093,6 @@ fn list_marketplaces_keeps_remote_and_local_plugin_sources() {
                     products: None,
                 },
                 interface: None,
-                keywords: Vec::new(),
             },
             MarketplacePlugin {
                 name: "url-plugin".to_string(),
@@ -1119,7 +1108,6 @@ fn list_marketplaces_keeps_remote_and_local_plugin_sources() {
                     products: None,
                 },
                 interface: None,
-                keywords: Vec::new(),
             },
             MarketplacePlugin {
                 name: "git-subdir-plugin".to_string(),
@@ -1135,7 +1123,6 @@ fn list_marketplaces_keeps_remote_and_local_plugin_sources() {
                     products: None,
                 },
                 interface: None,
-                keywords: Vec::new(),
             },
         ]
     );

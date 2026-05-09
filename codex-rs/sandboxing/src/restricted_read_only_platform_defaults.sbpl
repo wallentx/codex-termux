@@ -1,4 +1,4 @@
-; macOS platform defaults included when a split filesystem policy requests `:minimal`.
+; macOS platform defaults included via `ReadOnlyAccess::Restricted::include_platform_defaults`
 
 ; Read access to standard system paths
 (allow file-read* file-test-existence

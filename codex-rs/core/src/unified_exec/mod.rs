@@ -27,7 +27,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Weak;
 
-use codex_exec_server::Environment;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -38,7 +37,6 @@ use tokio::sync::Mutex;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
 mod errors;
@@ -94,8 +92,7 @@ pub(crate) struct ExecCommandRequest {
     pub process_id: i32,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
-    pub cwd: AbsolutePathBuf,
-    pub environment: Arc<Environment>,
+    pub workdir: Option<AbsolutePathBuf>,
     pub network: Option<NetworkProxy>,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
@@ -153,7 +150,7 @@ struct ProcessEntry {
     process_id: i32,
     hook_command: String,
     tty: bool,
-    network_approval: Option<DeferredNetworkApproval>,
+    network_approval_id: Option<String>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }
