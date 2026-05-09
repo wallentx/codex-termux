@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Prompt;
-use crate::client::CompactConversationRequestSettings;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
@@ -11,10 +10,6 @@ use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
 use crate::context_manager::is_codex_generated_item;
-use crate::hook_runtime::PostCompactHookOutcome;
-use crate::hook_runtime::PreCompactHookOutcome;
-use crate::hook_runtime::run_post_compact_hooks;
-use crate::hook_runtime::run_pre_compact_hooks;
 use crate::session::session::Session;
 use crate::session::turn::built_tools;
 use crate::session::turn_context::TurnContext;
@@ -76,8 +71,7 @@ pub(crate) async fn run_remote_compact_task(
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 async fn run_remote_compact_task_inner(
@@ -97,33 +91,15 @@ async fn run_remote_compact_task_inner(
         phase,
     )
     .await;
-    let pre_compact_outcome = run_pre_compact_hooks(sess, turn_context, trigger).await;
-    match pre_compact_outcome {
-        PreCompactHookOutcome::Continue => {}
-        PreCompactHookOutcome::Stopped { reason } => {
-            let error = reason.unwrap_or_else(|| "PreCompact hook stopped execution".to_string());
-            attempt
-                .track(
-                    sess.as_ref(),
-                    codex_analytics::CompactionStatus::Interrupted,
-                    Some(error),
-                )
-                .await;
-            return Err(CodexErr::TurnAborted);
-        }
-    }
     let result =
         run_remote_compact_task_inner_impl(sess, turn_context, initial_context_injection).await;
-    let status = compaction_status_from_result(&result);
-    let error = result.as_ref().err().map(ToString::to_string);
-    if result.is_ok() {
-        let post_compact_outcome = run_post_compact_hooks(sess, turn_context, trigger).await;
-        if let PostCompactHookOutcome::Stopped = post_compact_outcome {
-            attempt.track(sess.as_ref(), status, error).await;
-            return Err(CodexErr::TurnAborted);
-        }
-    }
-    attempt.track(sess.as_ref(), status, error.clone()).await;
+    attempt
+        .track(
+            sess.as_ref(),
+            compaction_status_from_result(&result),
+            result.as_ref().err().map(ToString::to_string),
+        )
+        .await;
     if let Err(err) = result {
         let event = EventMsg::Error(
             err.to_error_event(Some("Error running remote compact task".to_string())),
@@ -169,6 +145,14 @@ async fn run_remote_compact_task_inner_impl(
     // compact endpoint. The checkpoint below records it separately from the next sampling request,
     // whose prompt will repeat current developer/context prefix items.
     let trace_input_history = history.raw_items().to_vec();
+    // Required to keep `/undo` available after compaction
+    let ghost_snapshots: Vec<ResponseItem> = history
+        .raw_items()
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+        .cloned()
+        .collect();
+
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
     let tool_router = built_tools(
         sess.as_ref(),
@@ -194,11 +178,8 @@ async fn run_remote_compact_task_inner_impl(
         .compact_conversation_history(
             &prompt,
             &turn_context.model_info,
-            CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort,
-                summary: turn_context.reasoning_summary,
-                service_tier: turn_context.config.service_tier.clone(),
-            },
+            turn_context.reasoning_effort,
+            turn_context.reasoning_summary,
             &turn_context.session_telemetry,
             &compaction_trace,
         )
@@ -223,6 +204,9 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await;
 
+    if !ghost_snapshots.is_empty() {
+        new_history.extend(ghost_snapshots);
+    }
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
@@ -295,7 +279,7 @@ fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         }
         ResponseItem::Message { role, .. } if role == "assistant" => true,
         ResponseItem::Message { .. } => false,
-        ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::Compaction { .. } => true,
         ResponseItem::Reasoning { .. }
         | ResponseItem::LocalShellCall { .. }
         | ResponseItem::FunctionCall { .. }
@@ -306,16 +290,17 @@ fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Other => false,
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct CompactRequestLogData {
+struct CompactRequestLogData {
     failing_compaction_request_model_visible_bytes: i64,
 }
 
-pub(crate) fn build_compact_request_log_data(
+fn build_compact_request_log_data(
     input: &[ResponseItem],
     instructions: &str,
 ) -> CompactRequestLogData {
@@ -332,7 +317,7 @@ pub(crate) fn build_compact_request_log_data(
     }
 }
 
-pub(crate) fn log_remote_compact_failure(
+fn log_remote_compact_failure(
     turn_context: &TurnContext,
     log_data: &CompactRequestLogData,
     total_usage_breakdown: TotalTokenUsageBreakdown,
@@ -351,7 +336,7 @@ pub(crate) fn log_remote_compact_failure(
     );
 }
 
-pub(crate) fn trim_function_call_history_to_fit_context_window(
+fn trim_function_call_history_to_fit_context_window(
     history: &mut ContextManager,
     turn_context: &TurnContext,
     base_instructions: &BaseInstructions,
