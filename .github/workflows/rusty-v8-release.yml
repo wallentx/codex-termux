@@ -16,15 +16,6 @@ on:
         description: Optional release tag. Defaults to rusty-v8-v<resolved_v8_version>.
         required: false
         type: string
-      android_artifact_repository:
-        description: Repository containing Android rusty_v8 release artifacts.
-        required: false
-        default: wallentx/rusty_v8
-        type: string
-      android_artifact_tag:
-        description: Optional Android rusty_v8 release tag. Defaults to v<resolved_v8_version>.
-        required: false
-        type: string
       publish:
         description: Publish the staged Android artifacts to a GitHub release.
         required: false
@@ -87,42 +78,74 @@ jobs:
 
           echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
 
-  stage-android:
-    name: Stage aarch64-linux-android
+  build-android:
+    name: Build aarch64-linux-android
     needs: metadata
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
 
     steps:
-      - name: Download Android release pair
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ANDROID_ARTIFACT_REPOSITORY: ${{ inputs.android_artifact_repository }}
-          ANDROID_ARTIFACT_TAG_INPUT: ${{ inputs.android_artifact_tag }}
-          TARGET: aarch64-linux-android
-          V8_VERSION: ${{ needs.metadata.outputs.v8_version }}
+      - name: Check out source ref
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.release_ref }}
+          path: source
+
+      - name: Check out workflow tools
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          path: workflow
+
+      - uses: dtolnay/rust-toolchain@1.93
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Android source build dependencies
         shell: bash
         run: |
           set -euo pipefail
 
-          artifact_tag="${ANDROID_ARTIFACT_TAG_INPUT}"
-          if [[ -z "${artifact_tag}" ]]; then
-            artifact_tag="v${V8_VERSION}"
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            git \
+            libglib2.0-dev \
+            ninja-build \
+            pkg-config \
+            unzip \
+            wget \
+            xz-utils
+
+          if ! command -v clang-19 >/dev/null 2>&1; then
+            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh 19
           fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            clang-19 \
+            libclang-19-dev \
+            lld-19
 
-          output_dir="dist/${TARGET}"
-          mkdir -p "${output_dir}"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
 
-          echo "Downloading Android rusty_v8 artifacts from ${ANDROID_ARTIFACT_REPOSITORY}@${artifact_tag}"
-          gh release download "${artifact_tag}" \
-            --repo "${ANDROID_ARTIFACT_REPOSITORY}" \
-            --dir "${output_dir}" \
-            --pattern "librusty_v8_release_${TARGET}.a.gz" \
-            --pattern "src_binding_release_${TARGET}.rs"
+      - name: Stage Android release pair
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          test -s "${output_dir}/librusty_v8_release_${TARGET}.a.gz"
-          test -s "${output_dir}/src_binding_release_${TARGET}.rs"
+          python3 workflow/.github/scripts/rusty_v8_android_release.py stage-android-release-pair \
+            --repo-root source \
+            --target aarch64-linux-android \
+            --output-dir dist/aarch64-linux-android
 
       - name: Upload staged Android artifacts
         uses: actions/upload-artifact@v6
@@ -134,7 +157,7 @@ jobs:
     if: ${{ inputs.publish }}
     needs:
       - metadata
-      - stage-android
+      - build-android
     runs-on: ubuntu-latest
     permissions:
       contents: write
