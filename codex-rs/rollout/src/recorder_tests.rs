@@ -3,18 +3,11 @@
 use super::*;
 use crate::config::RolloutConfig;
 use chrono::TimeZone;
-use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SandboxPolicy;
-use codex_protocol::protocol::SessionMeta;
-use codex_protocol::protocol::SessionMetaLine;
-use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
@@ -70,295 +63,6 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
 }
 
 #[tokio::test]
-async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let uuid = Uuid::new_v4();
-    let thread_id = ThreadId::from_string(&uuid.to_string())?;
-    let rollout_path = home.path().join(format!(
-        "sessions/2026/01/27/rollout-2026-01-27T12-34-56-{uuid}.jsonl"
-    ));
-    let parent = rollout_path
-        .parent()
-        .expect("rollout path should have parent");
-    fs::create_dir_all(parent)?;
-
-    let session_meta_line = SessionMetaLine {
-        meta: SessionMeta {
-            id: thread_id,
-            forked_from_id: None,
-            timestamp: "2026-01-27T12:34:56Z".to_string(),
-            cwd: home.path().to_path_buf(),
-            originator: "test".to_string(),
-            cli_version: "test".to_string(),
-            source: SessionSource::Cli,
-            thread_source: None,
-            agent_path: None,
-            agent_nickname: None,
-            agent_role: None,
-            model_provider: None,
-            base_instructions: None,
-            dynamic_tools: None,
-            memory_mode: None,
-        },
-        git: None,
-    };
-    let lines = [
-        RolloutLine {
-            timestamp: "2026-01-27T12:34:56Z".to_string(),
-            item: RolloutItem::SessionMeta(session_meta_line),
-        },
-        RolloutLine {
-            timestamp: "2026-01-27T12:34:57Z".to_string(),
-            item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-                message: "hello from startup backfill".to_string(),
-                images: None,
-                local_images: Vec::new(),
-                text_elements: Vec::new(),
-            })),
-        },
-    ];
-    let jsonl = lines
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()?
-        .join("\n");
-    fs::write(&rollout_path, format!("{jsonl}\n"))?;
-
-    let runtime = crate::state_db::init(&test_config(home.path()))
-        .await
-        .expect("state db should initialize");
-
-    let metadata = runtime
-        .get_thread(thread_id)
-        .await?
-        .expect("thread should be backfilled before init returns");
-    assert_eq!(metadata.rollout_path, rollout_path);
-    assert_eq!(
-        runtime.get_backfill_state().await?.status,
-        codex_state::BackfillStatus::Complete
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn load_rollout_items_skips_legacy_ghost_snapshot_lines() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let rollout_path = home.path().join("rollout.jsonl");
-    let mut file = File::create(&rollout_path)?;
-    let thread_id = ThreadId::new();
-    let ts = "2025-01-03T12:00:00Z";
-
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "session_meta",
-            "payload": {
-                "id": thread_id,
-                "timestamp": ts,
-                "cwd": ".",
-                "originator": "test_originator",
-                "cli_version": "test_version",
-                "source": "cli",
-                "model_provider": "test-provider",
-            },
-        })
-    )?;
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "response_item",
-            "payload": {
-                "type": "ghost_snapshot",
-                "ghost_commit": {
-                    "id": "deadbeef",
-                    "preexisting_untracked_dirs": [],
-                    "preexisting_untracked_files": [],
-                },
-            },
-        })
-    )?;
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": "hello",
-                    }
-                ],
-            },
-        })
-    )?;
-
-    let (items, loaded_thread_id, parse_errors) =
-        RolloutRecorder::load_rollout_items(&rollout_path).await?;
-
-    assert_eq!(loaded_thread_id, Some(thread_id));
-    assert_eq!(parse_errors, 0);
-    assert_eq!(items.len(), 2);
-    assert!(matches!(items[0], RolloutItem::SessionMeta(_)));
-    assert!(matches!(
-        items[1],
-        RolloutItem::ResponseItem(ResponseItem::Message { .. })
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let rollout_path = home.path().join("rollout.jsonl");
-    let mut file = File::create(&rollout_path)?;
-    let thread_id = ThreadId::new();
-    let ts = "2025-01-03T12:00:00Z";
-
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "session_meta",
-            "payload": {
-                "id": thread_id,
-                "timestamp": ts,
-                "cwd": ".",
-                "originator": "test_originator",
-                "cli_version": "test_version",
-                "source": "cli",
-                "model_provider": "test-provider",
-            },
-        })
-    )?;
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "event_msg",
-            "payload": {
-                "type": "guardian_assessment",
-                "id": "guardian-1",
-                "turn_id": "turn-1",
-                "status": "in_progress",
-                "action": {
-                    "type": "command",
-                    "source": "shell",
-                    "command": "rm -rf /tmp/guardian",
-                    "cwd": if cfg!(windows) { r"C:\tmp" } else { "/tmp" },
-                },
-            },
-        })
-    )?;
-
-    let (items, loaded_thread_id, parse_errors) =
-        RolloutRecorder::load_rollout_items(&rollout_path).await?;
-
-    assert_eq!(loaded_thread_id, Some(thread_id));
-    assert_eq!(parse_errors, 0);
-    assert_eq!(items.len(), 2);
-    let RolloutItem::EventMsg(EventMsg::GuardianAssessment(assessment)) = &items[1] else {
-        panic!("expected guardian assessment rollout item");
-    };
-    assert_eq!(assessment.id, "guardian-1");
-    assert_eq!(assessment.turn_id, "turn-1");
-    assert_eq!(assessment.started_at_ms, 0);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_history()
--> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let rollout_path = home.path().join("rollout.jsonl");
-    let mut file = File::create(&rollout_path)?;
-    let thread_id = ThreadId::new();
-    let ts = "2025-01-03T12:00:00Z";
-
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "session_meta",
-            "payload": {
-                "id": thread_id,
-                "timestamp": ts,
-                "cwd": ".",
-                "originator": "test_originator",
-                "cli_version": "test_version",
-                "source": "cli",
-                "model_provider": "test-provider",
-            },
-        })
-    )?;
-    writeln!(
-        file,
-        "{}",
-        serde_json::json!({
-            "timestamp": ts,
-            "type": "compacted",
-            "payload": {
-                "message": "summary",
-                "replacement_history": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": "kept",
-                            }
-                        ],
-                    },
-                    {
-                        "type": "ghost_snapshot",
-                        "ghost_commit": {
-                            "id": "deadbeef",
-                            "preexisting_untracked_dirs": [],
-                            "preexisting_untracked_files": [],
-                        },
-                    }
-                ],
-            },
-        })
-    )?;
-
-    let (items, loaded_thread_id, parse_errors) =
-        RolloutRecorder::load_rollout_items(&rollout_path).await?;
-
-    assert_eq!(loaded_thread_id, Some(thread_id));
-    assert_eq!(parse_errors, 0);
-    assert_eq!(items.len(), 2);
-    let RolloutItem::Compacted(compacted) = &items[1] else {
-        panic!("expected compacted rollout item");
-    };
-    let replacement_history = compacted
-        .replacement_history
-        .as_ref()
-        .expect("replacement history");
-    assert_eq!(replacement_history.len(), 1);
-    assert!(matches!(
-        &replacement_history[0],
-        ResponseItem::Message { .. }
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
@@ -369,7 +73,6 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
             thread_id,
             /*forked_from_id*/ None,
             SessionSource::Exec,
-            /*thread_source*/ None,
             BaseInstructions::default(),
             Vec::new(),
             EventPersistenceMode::Limited,
@@ -450,7 +153,6 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
             thread_id,
             /*forked_from_id*/ None,
             SessionSource::Exec,
-            /*thread_source*/ None,
             BaseInstructions::default(),
             Vec::new(),
             EventPersistenceMode::Limited,
@@ -531,7 +233,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
 }
 
 #[tokio::test]
-async fn metadata_irrelevant_events_coalesce_state_db_updated_at() -> std::io::Result<()> {
+async fn metadata_irrelevant_events_touch_state_db_updated_at() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
 
@@ -550,7 +252,6 @@ async fn metadata_irrelevant_events_coalesce_state_db_updated_at() -> std::io::R
             thread_id,
             /*forked_from_id*/ None,
             SessionSource::Cli,
-            /*thread_source*/ None,
             BaseInstructions::default(),
             Vec::new(),
             EventPersistenceMode::Limited,
@@ -581,6 +282,8 @@ async fn metadata_irrelevant_events_coalesce_state_db_updated_at() -> std::io::R
     let initial_title = initial_thread.title.clone();
     let initial_first_user_message = initial_thread.first_user_message.clone();
 
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
     recorder
         .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
             AgentMessageEvent {
@@ -598,120 +301,14 @@ async fn metadata_irrelevant_events_coalesce_state_db_updated_at() -> std::io::R
         .expect("thread should load after agent message")
         .expect("thread should still exist");
 
-    assert_eq!(updated_thread.updated_at, initial_updated_at);
+    assert!(updated_thread.updated_at > initial_updated_at);
     assert_eq!(updated_thread.title, initial_title);
     assert_eq!(
         updated_thread.first_user_message,
         initial_first_user_message
     );
 
-    tokio::time::sleep(THREAD_UPDATED_AT_TOUCH_INTERVAL + Duration::from_millis(10)).await;
-
-    recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
-            AgentMessageEvent {
-                message: "more assistant text".to_string(),
-                phase: None,
-                memory_citation: None,
-            },
-        ))])
-        .await?;
-    recorder.flush().await?;
-
-    let refreshed_thread = state_db
-        .get_thread(thread_id)
-        .await
-        .expect("thread should load after refresh")
-        .expect("thread should still exist");
-    assert!(refreshed_thread.updated_at > initial_updated_at);
-    assert_eq!(refreshed_thread.title, initial_title);
-    assert_eq!(
-        refreshed_thread.first_user_message,
-        initial_first_user_message
-    );
-
     recorder.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn shutdown_flushes_pending_metadata_irrelevant_updated_at() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let config = test_config(home.path());
-
-    let state_db = StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
-        .await
-        .expect("state db should initialize");
-    state_db
-        .mark_backfill_complete(/*last_watermark*/ None)
-        .await
-        .expect("backfill should be complete");
-
-    let thread_id = ThreadId::new();
-    let recorder = RolloutRecorder::new(
-        &config,
-        RolloutRecorderParams::new(
-            thread_id,
-            /*forked_from_id*/ None,
-            SessionSource::Cli,
-            /*thread_source*/ None,
-            BaseInstructions::default(),
-            Vec::new(),
-            EventPersistenceMode::Limited,
-        ),
-        Some(state_db.clone()),
-        /*state_builder*/ None,
-    )
-    .await?;
-
-    recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
-            UserMessageEvent {
-                message: "first-user-message".to_string(),
-                images: None,
-                local_images: Vec::new(),
-                text_elements: Vec::new(),
-            },
-        ))])
-        .await?;
-    recorder.persist().await?;
-    recorder.flush().await?;
-    let initial_updated_at = state_db
-        .get_thread(thread_id)
-        .await
-        .expect("thread should load")
-        .expect("thread should exist")
-        .updated_at;
-
-    recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
-            AgentMessageEvent {
-                message: "assistant text".to_string(),
-                phase: None,
-                memory_citation: None,
-            },
-        ))])
-        .await?;
-    recorder.flush().await?;
-    assert_eq!(
-        state_db
-            .get_thread(thread_id)
-            .await
-            .expect("thread should load before shutdown")
-            .expect("thread should still exist")
-            .updated_at,
-        initial_updated_at
-    );
-
-    recorder.shutdown().await?;
-
-    let shutdown_updated_at = state_db
-        .get_thread(thread_id)
-        .await
-        .expect("thread should load after shutdown")
-        .expect("thread should still exist")
-        .updated_at;
-    assert!(shutdown_updated_at > initial_updated_at);
     Ok(())
 }
 
@@ -740,7 +337,6 @@ async fn metadata_irrelevant_events_fall_back_to_upsert_when_thread_missing() ->
         },
     ))];
 
-    let mut thread_updated_at_touch = ThreadUpdatedAtTouch::default();
     sync_thread_state_after_write(
         Some(state_db.as_ref()),
         rollout_path.as_path(),
@@ -748,7 +344,6 @@ async fn metadata_irrelevant_events_fall_back_to_upsert_when_thread_missing() ->
         items.as_slice(),
         config.model_provider_id.as_str(),
         /*new_thread_memory_mode*/ None,
-        &mut thread_updated_at_touch,
     )
     .await;
 
@@ -773,7 +368,6 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
 
     let default_provider = config.model_provider_id.clone();
     let page1 = RolloutRecorder::list_threads(
-        /*state_db_ctx*/ None,
         &config,
         /*page_size*/ 1,
         /*cursor*/ None,
@@ -791,7 +385,6 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
     let cursor = page1.next_cursor.clone().expect("cursor should be present");
 
     let page2 = RolloutRecorder::list_threads(
-        /*state_db_ctx*/ None,
         &config,
         /*page_size*/ 1,
         Some(&cursor),
@@ -851,7 +444,6 @@ async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Resul
 
     let default_provider = config.model_provider_id.clone();
     let page = RolloutRecorder::list_threads(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -916,7 +508,6 @@ async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Resul
 
     let default_provider = config.model_provider_id.clone();
     let page = RolloutRecorder::list_threads(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 1,
         /*cursor*/ None,
@@ -989,7 +580,6 @@ async fn list_threads_state_db_only_skips_jsonl_repair_scan() -> std::io::Result
 
     let cwd_filters = [home.path().to_path_buf()];
     let state_db_only_page = RolloutRecorder::list_threads_from_state_db(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1005,7 +595,6 @@ async fn list_threads_state_db_only_skips_jsonl_repair_scan() -> std::io::Result
     assert_eq!(state_db_only_page.items.len(), 0);
 
     let repaired_page = RolloutRecorder::list_threads(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1021,7 +610,6 @@ async fn list_threads_state_db_only_skips_jsonl_repair_scan() -> std::io::Result
     assert_eq!(repaired_page.items.len(), 1);
 
     let repaired_state_db_only_page = RolloutRecorder::list_threads_from_state_db(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1079,7 +667,6 @@ async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::i
 
     let cwd_filters = [stale_cwd];
     let state_db_only_page = RolloutRecorder::list_threads_from_state_db(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1095,7 +682,6 @@ async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::i
     assert_eq!(state_db_only_page.items.len(), 1);
 
     let scanned_page = RolloutRecorder::list_threads(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1111,7 +697,6 @@ async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::i
     assert_eq!(scanned_page.items.len(), 0);
 
     let repaired_state_db_only_page = RolloutRecorder::list_threads_from_state_db(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1170,7 +755,6 @@ async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::
         .expect("state db upsert should succeed");
 
     let page = RolloutRecorder::list_threads(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1195,7 +779,7 @@ async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::
 }
 
 #[test]
-fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fields() {
+fn fill_missing_thread_item_metadata_preserves_filesystem_identity() {
     let filesystem_thread_id = ThreadId::new();
     let state_thread_id = ThreadId::new();
     let filesystem_path = PathBuf::from("/tmp/filesystem-rollout.jsonl");
@@ -1205,9 +789,9 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(filesystem_thread_id),
         first_user_message: Some("filesystem message".to_string()),
         cwd: None,
-        git_branch: Some("filesystem-branch".to_string()),
-        git_sha: Some("filesystem-sha".to_string()),
-        git_origin_url: Some("https://example.com/filesystem.git".to_string()),
+        git_branch: None,
+        git_sha: None,
+        git_origin_url: None,
         source: None,
         agent_nickname: None,
         agent_role: None,
@@ -1297,7 +881,6 @@ async fn list_threads_search_repairs_stale_state_db_hits_before_returning() -> s
         .expect("state db upsert should succeed");
 
     let stale_state_db_only_page = RolloutRecorder::list_threads_from_state_db(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1313,7 +896,6 @@ async fn list_threads_search_repairs_stale_state_db_hits_before_returning() -> s
     assert_eq!(stale_state_db_only_page.items.len(), 1);
 
     let scanned_page = RolloutRecorder::list_threads(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
@@ -1329,7 +911,6 @@ async fn list_threads_search_repairs_stale_state_db_hits_before_returning() -> s
     assert_eq!(scanned_page.items.len(), 0);
 
     let repaired_state_db_only_page = RolloutRecorder::list_threads_from_state_db(
-        Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,

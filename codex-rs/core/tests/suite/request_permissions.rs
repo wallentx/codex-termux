@@ -286,6 +286,7 @@ async fn expect_request_permissions_event(
 fn workspace_write_excluding_tmp() -> SandboxPolicy {
     SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![],
+        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: true,
         exclude_slash_tmp: true,
@@ -324,9 +325,7 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -421,9 +420,7 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::RequestPermissionsTool)
@@ -506,9 +503,7 @@ async fn relative_additional_permissions_resolve_against_tool_workdir() -> Resul
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -609,9 +604,7 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -711,9 +704,7 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -812,9 +803,7 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -918,9 +907,7 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1025,9 +1012,7 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1151,9 +1136,7 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1271,9 +1254,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1385,9 +1366,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::RequestPermissionsTool)
@@ -1499,9 +1478,7 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1665,9 +1642,7 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1780,9 +1755,7 @@ async fn request_permissions_session_grants_carry_across_turns() -> Result<()> {
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
