@@ -139,9 +139,23 @@ class RustyV8BazelTest(unittest.TestCase):
             stage_root = temp_path / "stage"
             output_dir = temp_path / "dist"
             cargo_home = temp_path / "cargo-home"
+            rusty_v8_source = temp_path / "rusty-v8-source"
             crate_source = cargo_home / "registry" / "src" / "index" / "v8-146.4.0"
+            source_vendor_crate = (
+                rusty_v8_source
+                / "third_party"
+                / "rust"
+                / "chromium_crates_io"
+                / "vendor"
+                / "icu_calendar_data-v2"
+            )
             stage_root.mkdir()
             crate_source.mkdir(parents=True)
+            source_vendor_crate.mkdir(parents=True)
+            (source_vendor_crate / "build.rs").write_text(
+                "// vendor build\n",
+                encoding="utf-8",
+            )
 
             def fake_run(*_args: object, **kwargs: object) -> Mock:
                 args = _args[0]
@@ -170,7 +184,9 @@ class RustyV8BazelTest(unittest.TestCase):
                 patch.dict("rusty_v8_bazel.os.environ", {"CARGO_HOME": str(cargo_home)}),
             ):
                 rusty_v8_bazel.stage_android_release_pair(
-                    "aarch64-linux-android", output_dir
+                    "aarch64-linux-android",
+                    output_dir,
+                    rusty_v8_source,
                 )
 
             archive = output_dir / "librusty_v8_release_aarch64-linux-android.a.gz"
@@ -186,9 +202,23 @@ class RustyV8BazelTest(unittest.TestCase):
                 / "presentation"
                 / "test_results_presentation.pydeps"
             )
+            vendored_rust_build = (
+                stage_root
+                / "v8-146.4.0"
+                / "third_party"
+                / "rust"
+                / "chromium_crates_io"
+                / "vendor"
+                / "icu_calendar_data-v2"
+                / "build.rs"
+            )
             self.assertEqual(b"archive", gzip.decompress(archive.read_bytes()))
             self.assertEqual("// binding\n", binding.read_text(encoding="utf-8"))
             self.assertTrue(vendored_pydeps.exists())
+            self.assertEqual(
+                "// vendor build\n",
+                vendored_rust_build.read_text(encoding="utf-8"),
+            )
             self.assertIn(archive.name, checksums.read_text(encoding="utf-8"))
             self.assertIn(binding.name, checksums.read_text(encoding="utf-8"))
 

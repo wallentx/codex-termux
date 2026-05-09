@@ -80,6 +80,15 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Check out rusty_v8 source
+        if: ${{ matrix.target == 'aarch64-linux-android' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: denoland/rusty_v8
+          ref: v${{ needs.metadata.outputs.v8_version }}
+          path: rusty_v8_source
+          submodules: recursive
+
       - name: Set up Bazel
         if: ${{ matrix.target != 'aarch64-linux-android' }}
         uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
@@ -171,7 +180,8 @@ jobs:
           if [[ "${TARGET}" == "aarch64-linux-android" ]]; then
             python3 .github/scripts/rusty_v8_bazel.py stage-android-release-pair \
               --target "${TARGET}" \
-              --output-dir "dist/${TARGET}"
+              --output-dir "dist/${TARGET}" \
+              --rusty-v8-source-root rusty_v8_source
             exit 0
           fi
 
