@@ -15,6 +15,16 @@ import tomllib
 from pathlib import Path
 
 
+ANDROID_GN_PYDEPS_FILES = [
+    "build/android/pylib/results/presentation/test_results_presentation.pydeps",
+    "build/android/devil_chromium.pydeps",
+    "build/android/apk_operations.pydeps",
+    "build/android/test_runner.pydeps",
+    "build/android/test_wrapper/logdog_wrapper.pydeps",
+    "build/android/resource_sizes.pydeps",
+]
+
+
 def resolved_v8_crate_version(repo_root: Path) -> str:
     cargo_lock_path = repo_root / "codex-rs" / "Cargo.lock"
     cargo_lock = tomllib.loads(cargo_lock_path.read_text(encoding="utf-8"))
@@ -80,22 +90,15 @@ def vendor_android_v8_crate_source(
     vendored_source = temp_dir / f"v8-{version}"
     shutil.copytree(candidates[0], vendored_source)
 
-    # The crates.io v8 147.x source omits this Android test-runner pydeps file,
-    # but GN reads it while generating Android release build files.
-    pydeps_path = (
-        vendored_source
-        / "build"
-        / "android"
-        / "pylib"
-        / "results"
-        / "presentation"
-        / "test_results_presentation.pydeps"
-    )
-    pydeps_path.parent.mkdir(parents=True, exist_ok=True)
-    pydeps_path.write_text(
-        "# Generated for Android rusty_v8 release staging.\n",
-        encoding="utf-8",
-    )
+    # The crates.io v8 147.x source omits Android test-runner pydeps files, but
+    # GN reads them while generating Android release build files.
+    for relative_path in ANDROID_GN_PYDEPS_FILES:
+        pydeps_path = vendored_source / relative_path
+        pydeps_path.parent.mkdir(parents=True, exist_ok=True)
+        pydeps_path.write_text(
+            "# Generated for Android rusty_v8 release staging.\n",
+            encoding="utf-8",
+        )
     return vendored_source
 
 
