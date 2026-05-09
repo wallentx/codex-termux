@@ -202,6 +202,14 @@ class RustyV8BazelTest(unittest.TestCase):
                     'android_ndk_version="r26c"',
                     env["EXTRA_GN_ARGS"],
                 )
+                self.assertIn(
+                    "--target=aarch64-linux-android29",
+                    env["BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"],
+                )
+                self.assertIn(
+                    "--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
+                    env["BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android"],
+                )
                 build_dir = (
                     Path(env["CARGO_TARGET_DIR"])
                     / "aarch64-linux-android"
