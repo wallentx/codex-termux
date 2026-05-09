@@ -58,7 +58,7 @@ use codex_api::SseTelemetry;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
 use codex_api::auth_header_telemetry;
-use codex_api::build_session_headers;
+use codex_api::build_conversation_headers;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
 use codex_app_server_protocol::AuthMode;
@@ -70,14 +70,13 @@ use codex_login::default_client::build_reqwest_client;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
 
-use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::W3cTraceContext;
@@ -99,19 +98,13 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_util::sync::CancellationToken;
-use tracing::debug;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
 
-use crate::attestation::AttestationContext;
-use crate::attestation::AttestationProvider;
-use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
-use crate::feedback_tags;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_api::map_api_error;
@@ -150,20 +143,13 @@ const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
 pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
 
-pub(crate) struct CompactConversationRequestSettings {
-    pub(crate) effort: Option<ReasoningEffortConfig>,
-    pub(crate) summary: ReasoningSummaryConfig,
-    pub(crate) service_tier: Option<String>,
-}
-
 /// Session-scoped state shared by all [`ModelClient`] clones.
 ///
 /// This is intentionally kept minimal so `ModelClient` does not need to hold a full `Config`. Most
 /// configuration is per turn and is passed explicitly to streaming/unary methods.
 #[derive(Debug)]
 struct ModelClientState {
-    session_id: SessionId,
-    thread_id: ThreadId,
+    conversation_id: ThreadId,
     window_generation: AtomicU64,
     installation_id: String,
     provider: SharedModelProvider,
@@ -173,8 +159,6 @@ struct ModelClientState {
     enable_request_compression: bool,
     include_timing_metrics: bool,
     beta_features_header: Option<String>,
-    include_attestation: bool,
-    attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
     cached_websocket_session: StdMutex<WebsocketSession>,
 }
@@ -203,7 +187,7 @@ impl RequestRouteTelemetry {
 /// A session-scoped client for model-provider API calls.
 ///
 /// This holds configuration and state that should be shared across turns within a Codex session
-/// (auth, provider selection, thread id, and transport fallback state).
+/// (auth, provider selection, conversation id, and transport fallback state).
 ///
 /// WebSocket fallback is session-scoped: once a turn activates the HTTP fallback, subsequent turns
 /// will also use HTTP for the remainder of the session.
@@ -310,8 +294,7 @@ impl ModelClient {
     /// are passed to [`ModelClientSession::stream`] (and other turn-scoped methods) explicitly.
     pub fn new(
         auth_manager: Option<Arc<AuthManager>>,
-        session_id: SessionId,
-        thread_id: ThreadId,
+        conversation_id: ThreadId,
         installation_id: String,
         provider_info: ModelProviderInfo,
         session_source: SessionSource,
@@ -319,7 +302,6 @@ impl ModelClient {
         enable_request_compression: bool,
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
-        attestation_provider: Option<Arc<dyn AttestationProvider>>,
     ) -> Self {
         let model_provider = create_model_provider(provider_info, auth_manager);
         let codex_api_key_env_enabled = model_provider
@@ -328,11 +310,9 @@ impl ModelClient {
             .is_some_and(|manager| manager.codex_api_key_env_enabled());
         let auth_env_telemetry =
             collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
-        let include_attestation = model_provider.supports_attestation();
         Self {
             state: Arc::new(ModelClientState {
-                session_id,
-                thread_id,
+                conversation_id,
                 window_generation: AtomicU64::new(0),
                 installation_id,
                 provider: model_provider,
@@ -342,8 +322,6 @@ impl ModelClient {
                 enable_request_compression,
                 include_timing_metrics,
                 beta_features_header,
-                include_attestation,
-                attestation_provider,
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
@@ -379,9 +357,9 @@ impl ModelClient {
     }
 
     fn current_window_id(&self) -> String {
-        let thread_id = self.state.thread_id;
+        let conversation_id = self.state.conversation_id;
         let window_generation = self.state.window_generation.load(Ordering::Relaxed);
-        format!("{thread_id}:{window_generation}")
+        format!("{conversation_id}:{window_generation}")
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
@@ -429,11 +407,12 @@ impl ModelClient {
     ///
     /// The model selection and telemetry context are passed explicitly to keep `ModelClient`
     /// session-scoped.
-    pub(crate) async fn compact_conversation_history(
+    pub async fn compact_conversation_history(
         &self,
         prompt: &Prompt,
         model_info: &ModelInfo,
-        settings: CompactConversationRequestSettings,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
         session_telemetry: &SessionTelemetry,
         compaction_trace: &CompactionTraceContext,
     ) -> Result<Vec<ResponseItem>> {
@@ -452,35 +431,37 @@ impl ModelClient {
             RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
             self.state.auth_env_telemetry.clone(),
         );
-        let request = self.build_responses_request(
-            &client_setup.api_provider,
-            prompt,
-            model_info,
-            settings.effort,
-            settings.summary,
-            settings.service_tier,
-        )?;
-        let ResponsesApiRequest {
-            model,
-            instructions,
-            input,
-            tools,
-            parallel_tool_calls,
-            reasoning,
-            service_tier,
-            prompt_cache_key,
-            text,
-            ..
-        } = request;
+        let client =
+            ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                .with_telemetry(Some(request_telemetry));
+
+        let instructions = prompt.base_instructions.text.clone();
+        let input = prompt.get_formatted_input();
+        let tools = create_tools_json_for_responses_api(&prompt.tools)?;
+        let reasoning = Self::build_reasoning(model_info, effort, summary);
+        let verbosity = if model_info.support_verbosity {
+            self.state.model_verbosity.or(model_info.default_verbosity)
+        } else {
+            if self.state.model_verbosity.is_some() {
+                warn!(
+                    "model_verbosity is set but ignored as the model does not support verbosity: {}",
+                    model_info.slug
+                );
+            }
+            None
+        };
+        let text = create_text_param_for_request(
+            verbosity,
+            &prompt.output_schema,
+            prompt.output_schema_strict,
+        );
         let payload = ApiCompactionInput {
-            model: &model,
+            model: &model_info.slug,
             input: &input,
             instructions: &instructions,
             tools,
-            parallel_tool_calls,
+            parallel_tool_calls: prompt.parallel_tool_calls,
             reasoning,
-            service_tier: service_tier.as_deref(),
-            prompt_cache_key: prompt_cache_key.as_deref(),
             text,
         };
 
@@ -488,22 +469,10 @@ impl ModelClient {
         if let Ok(header_value) = HeaderValue::from_str(&self.state.installation_id) {
             extra_headers.insert(X_CODEX_INSTALLATION_ID_HEADER, header_value);
         }
-        extra_headers.extend(build_responses_headers(
-            self.state.beta_features_header.as_deref(),
-            /*turn_state*/ None,
-            /*turn_metadata_header*/ None,
-        ));
         extra_headers.extend(self.build_responses_identity_headers());
-        extra_headers.extend(build_session_headers(
-            Some(self.state.session_id.to_string()),
-            Some(self.state.thread_id.to_string()),
-        ));
-        if let Some(header_value) = self.generate_attestation_header_for().await {
-            extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
-        }
-        let client =
-            ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
-                .with_telemetry(Some(request_telemetry));
+        extra_headers.extend(build_conversation_headers(Some(
+            self.state.conversation_id.to_string(),
+        )));
         let trace_attempt = compaction_trace.start_attempt(&payload);
         let result = client
             .compact_input(&payload, extra_headers)
@@ -517,14 +486,11 @@ impl ModelClient {
         &self,
         sdp: String,
         session_config: ApiRealtimeSessionConfig,
-        mut extra_headers: ApiHeaderMap,
+        extra_headers: ApiHeaderMap,
     ) -> Result<RealtimeWebrtcCallStart> {
         // Create the media call over HTTP first, then retain matching auth so realtime can attach
         // the server-side control WebSocket to the call id from that HTTP response.
         let client_setup = self.current_client_setup().await?;
-        if let Some(header_value) = self.generate_attestation_header_for().await {
-            extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
-        }
         let mut sideband_headers = extra_headers.clone();
         sideband_headers.extend(sideband_websocket_auth_headers(
             client_setup.api_auth.as_ref(),
@@ -599,7 +565,7 @@ impl ModelClient {
         }
         if matches!(
             self.state.session_source,
-            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation)
         ) {
             extra_headers.insert(
                 X_OPENAI_MEMGEN_REQUEST_HEADER,
@@ -655,20 +621,6 @@ impl ModelClient {
         client_metadata
     }
 
-    async fn generate_attestation_header_for(&self) -> Option<HeaderValue> {
-        if !self.state.include_attestation {
-            return None;
-        }
-
-        self.state
-            .attestation_provider
-            .as_ref()?
-            .header_for_request(AttestationContext {
-                thread_id: self.state.thread_id,
-            })
-            .await
-    }
-
     /// Builds request telemetry for unary API calls (e.g., Compact endpoint).
     fn build_request_telemetry(
         session_telemetry: &SessionTelemetry,
@@ -703,65 +655,6 @@ impl ModelClient {
         } else {
             None
         }
-    }
-
-    fn build_responses_request(
-        &self,
-        provider: &codex_api::Provider,
-        prompt: &Prompt,
-        model_info: &ModelInfo,
-        effort: Option<ReasoningEffortConfig>,
-        summary: ReasoningSummaryConfig,
-        service_tier: Option<String>,
-    ) -> Result<ResponsesApiRequest> {
-        let instructions = &prompt.base_instructions.text;
-        let input = prompt.get_formatted_input();
-        let tools = create_tools_json_for_responses_api(&prompt.tools)?;
-        let reasoning = Self::build_reasoning(model_info, effort, summary);
-        let include = if reasoning.is_some() {
-            vec!["reasoning.encrypted_content".to_string()]
-        } else {
-            Vec::new()
-        };
-        let verbosity = if model_info.support_verbosity {
-            self.state.model_verbosity.or(model_info.default_verbosity)
-        } else {
-            if self.state.model_verbosity.is_some() {
-                warn!(
-                    "model_verbosity is set but ignored as the model does not support verbosity: {}",
-                    model_info.slug
-                );
-            }
-            None
-        };
-        let text = create_text_param_for_request(
-            verbosity,
-            &prompt.output_schema,
-            prompt.output_schema_strict,
-        );
-        let prompt_cache_key = Some(self.state.thread_id.to_string());
-        let service_tier =
-            service_tier.filter(|service_tier| model_info.supports_service_tier(service_tier));
-        let request = ResponsesApiRequest {
-            model: model_info.slug.clone(),
-            instructions: instructions.clone(),
-            input,
-            tools,
-            tool_choice: "auto".to_string(),
-            parallel_tool_calls: prompt.parallel_tool_calls,
-            reasoning,
-            store: provider.is_azure_responses_endpoint(),
-            stream: true,
-            include,
-            service_tier,
-            prompt_cache_key,
-            text,
-            client_metadata: Some(HashMap::from([(
-                X_CODEX_INSTALLATION_ID_HEADER.to_string(),
-                self.state.installation_id.clone(),
-            )])),
-        };
-        Ok(request)
     }
 
     /// Returns whether the Responses-over-WebSocket transport is active for this session.
@@ -808,9 +701,7 @@ impl ModelClient {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
     ) -> std::result::Result<ApiWebSocketConnection, ApiError> {
-        let headers = self
-            .build_websocket_headers(turn_state.as_ref(), turn_metadata_header)
-            .await;
+        let headers = self.build_websocket_headers(turn_state.as_ref(), turn_metadata_header);
         let websocket_telemetry = ModelClientSession::build_websocket_telemetry(
             session_telemetry,
             auth_context,
@@ -887,27 +778,23 @@ impl ModelClient {
     ///
     /// Callers should pass the current turn-state lock when available so sticky-routing state is
     /// replayed on reconnect within the same turn.
-    async fn build_websocket_headers(
+    fn build_websocket_headers(
         &self,
         turn_state: Option<&Arc<OnceLock<String>>>,
         turn_metadata_header: Option<&str>,
     ) -> ApiHeaderMap {
         let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
-        let session_id = self.state.session_id.to_string();
-        let thread_id = self.state.thread_id.to_string();
+        let conversation_id = self.state.conversation_id.to_string();
         let mut headers = build_responses_headers(
             self.state.beta_features_header.as_deref(),
             turn_state,
             turn_metadata_header.as_ref(),
         );
-        if let Ok(header_value) = HeaderValue::from_str(&thread_id) {
+        if let Ok(header_value) = HeaderValue::from_str(&conversation_id) {
             headers.insert("x-client-request-id", header_value);
         }
-        headers.extend(build_session_headers(Some(session_id), Some(thread_id)));
+        headers.extend(build_conversation_headers(Some(conversation_id)));
         headers.extend(self.build_responses_identity_headers());
-        if let Some(header_value) = self.generate_attestation_header_for().await {
-            headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
-        }
         headers.insert(
             OPENAI_BETA_HEADER,
             HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
@@ -939,16 +826,80 @@ impl ModelClientSession {
             .set_connection_reused(/*connection_reused*/ false);
     }
 
-    pub(crate) async fn send_response_processed(&self, response_id: &str) {
-        let Some(connection) = self.websocket_session.connection.as_ref() else {
-            return;
+    fn build_responses_request(
+        &self,
+        provider: &codex_api::Provider,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<ServiceTier>,
+    ) -> Result<ResponsesApiRequest> {
+        let instructions = &prompt.base_instructions.text;
+        let input = prompt.get_formatted_input();
+        let tools = create_tools_json_for_responses_api(&prompt.tools)?;
+        let default_reasoning_effort = model_info.default_reasoning_level;
+        let reasoning = if model_info.supports_reasoning_summaries {
+            Some(Reasoning {
+                effort: effort.or(default_reasoning_effort),
+                summary: if summary == ReasoningSummaryConfig::None {
+                    None
+                } else {
+                    Some(summary)
+                },
+            })
+        } else {
+            None
         };
-        if let Err(err) = connection
-            .send_response_processed(response_id.to_string())
-            .await
-        {
-            debug!("failed to send response.processed websocket request: {err}");
-        }
+        let include = if reasoning.is_some() {
+            vec!["reasoning.encrypted_content".to_string()]
+        } else {
+            Vec::new()
+        };
+        let verbosity = if model_info.support_verbosity {
+            self.client
+                .state
+                .model_verbosity
+                .or(model_info.default_verbosity)
+        } else {
+            if self.client.state.model_verbosity.is_some() {
+                warn!(
+                    "model_verbosity is set but ignored as the model does not support verbosity: {}",
+                    model_info.slug
+                );
+            }
+            None
+        };
+        let text = create_text_param_for_request(
+            verbosity,
+            &prompt.output_schema,
+            prompt.output_schema_strict,
+        );
+        let prompt_cache_key = Some(self.client.state.conversation_id.to_string());
+        let request = ResponsesApiRequest {
+            model: model_info.slug.clone(),
+            instructions: instructions.clone(),
+            input,
+            tools,
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: prompt.parallel_tool_calls,
+            reasoning,
+            store: provider.is_azure_responses_endpoint(),
+            stream: true,
+            include,
+            service_tier: match service_tier {
+                Some(ServiceTier::Fast) => Some("priority".to_string()),
+                Some(service_tier) => Some(service_tier.to_string()),
+                None => None,
+            },
+            prompt_cache_key,
+            text,
+            client_metadata: Some(HashMap::from([(
+                X_CODEX_INSTALLATION_ID_HEADER.to_string(),
+                self.client.state.installation_id.clone(),
+            )])),
+        };
+        Ok(request)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -956,17 +907,15 @@ impl ModelClientSession {
     ///
     /// Keeping option construction in one place ensures request-scoped headers are consistent
     /// regardless of transport choice.
-    async fn build_responses_options(
+    fn build_responses_options(
         &self,
         turn_metadata_header: Option<&str>,
         compression: Compression,
     ) -> ApiResponsesOptions {
         let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
-        let session_id = self.client.state.session_id.to_string();
-        let thread_id = self.client.state.thread_id.to_string();
+        let conversation_id = self.client.state.conversation_id.to_string();
         ApiResponsesOptions {
-            session_id: Some(session_id),
-            thread_id: Some(thread_id),
+            conversation_id: Some(conversation_id),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: {
                 let mut headers = build_responses_headers(
@@ -975,9 +924,6 @@ impl ModelClientSession {
                     turn_metadata_header.as_ref(),
                 );
                 headers.extend(self.client.build_responses_identity_headers());
-                if let Some(header_value) = self.client.generate_attestation_header_for().await {
-                    headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
-                }
                 headers
             },
             compression,
@@ -1215,7 +1161,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-        service_tier: Option<String>,
+        service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
@@ -1254,17 +1200,15 @@ impl ModelClientSession {
                 self.client.state.auth_env_telemetry.clone(),
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
-            let options = self
-                .build_responses_options(turn_metadata_header, compression)
-                .await;
+            let options = self.build_responses_options(turn_metadata_header, compression);
 
-            let request = self.client.build_responses_request(
+            let request = self.build_responses_request(
                 &client_setup.api_provider,
                 prompt,
                 model_info,
                 effort,
                 summary,
-                service_tier.clone(),
+                service_tier,
             )?;
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.record_started(&request);
@@ -1288,13 +1232,7 @@ impl ModelClientSession {
                 Err(ApiError::Transport(
                     unauthorized_transport @ TransportError::Http { status, .. },
                 )) if status == StatusCode::UNAUTHORIZED => {
-                    let response_debug_context =
-                        extract_response_debug_context(&unauthorized_transport);
-                    inference_trace_attempt.record_failed(
-                        &unauthorized_transport,
-                        response_debug_context.request_id.as_deref(),
-                        /*output_items*/ &[],
-                    );
+                    inference_trace_attempt.record_failed(&unauthorized_transport);
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -1306,14 +1244,8 @@ impl ModelClientSession {
                     continue;
                 }
                 Err(err) => {
-                    let response_debug_context =
-                        extract_response_debug_context_from_api_error(&err);
                     let err = map_api_error(err);
-                    inference_trace_attempt.record_failed(
-                        &err,
-                        response_debug_context.request_id.as_deref(),
-                        /*output_items*/ &[],
-                    );
+                    inference_trace_attempt.record_failed(&err);
                     return Err(err);
                 }
             }
@@ -1342,7 +1274,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-        service_tier: Option<String>,
+        service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
@@ -1363,16 +1295,14 @@ impl ModelClientSession {
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
 
-            let options = self
-                .build_responses_options(turn_metadata_header, compression)
-                .await;
-            let request = self.client.build_responses_request(
+            let options = self.build_responses_options(turn_metadata_header, compression);
+            let request = self.build_responses_request(
                 &client_setup.api_provider,
                 prompt,
                 model_info,
                 effort,
                 summary,
-                service_tier.clone(),
+                service_tier,
             )?;
             let mut ws_payload = ResponseCreateWsRequest {
                 client_metadata: response_create_client_metadata(
@@ -1441,14 +1371,8 @@ impl ModelClientSession {
                 .stream_request(ws_request, self.websocket_session.connection_reused())
                 .await
                 .map_err(|err| {
-                    let response_debug_context =
-                        extract_response_debug_context_from_api_error(&err);
                     let err = map_api_error(err);
-                    inference_trace_attempt.record_failed(
-                        &err,
-                        response_debug_context.request_id.as_deref(),
-                        /*output_items*/ &[],
-                    );
+                    inference_trace_attempt.record_failed(&err);
                     err
                 })?;
             let (stream, last_request_rx) = map_response_stream(
@@ -1504,7 +1428,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-        service_tier: Option<String>,
+        service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
     ) -> Result<()> {
         if !self.client.responses_websocket_enabled() {
@@ -1565,7 +1489,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
-        service_tier: Option<String>,
+        service_tier: Option<ServiceTier>,
         turn_metadata_header: Option<&str>,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
@@ -1581,7 +1505,7 @@ impl ModelClientSession {
                             session_telemetry,
                             effort,
                             summary,
-                            service_tier.clone(),
+                            service_tier,
                             turn_metadata_header,
                             /*warmup*/ false,
                             request_trace,
@@ -1670,23 +1594,15 @@ fn build_responses_headers(
 }
 
 fn subagent_header_value(session_source: &SessionSource) -> Option<String> {
-    match session_source {
-        SessionSource::SubAgent(subagent_source) => match subagent_source {
-            SubAgentSource::Review => Some("review".to_string()),
-            SubAgentSource::Compact => Some("compact".to_string()),
-            SubAgentSource::MemoryConsolidation => Some("memory_consolidation".to_string()),
-            SubAgentSource::ThreadSpawn { .. } => Some("collab_spawn".to_string()),
-            SubAgentSource::Other(label) => Some(label.clone()),
-        },
-        SessionSource::Internal(InternalSessionSource::MemoryConsolidation) => {
-            Some("memory_consolidation".to_string())
-        }
-        SessionSource::Cli
-        | SessionSource::VSCode
-        | SessionSource::Exec
-        | SessionSource::Mcp
-        | SessionSource::Custom(_)
-        | SessionSource::Unknown => None,
+    let SessionSource::SubAgent(subagent_source) = session_source else {
+        return None;
+    };
+    match subagent_source {
+        SubAgentSource::Review => Some("review".to_string()),
+        SubAgentSource::Compact => Some("compact".to_string()),
+        SubAgentSource::MemoryConsolidation => Some("memory_consolidation".to_string()),
+        SubAgentSource::ThreadSpawn { .. } => Some("collab_spawn".to_string()),
+        SubAgentSource::Other(label) => Some(label.clone()),
     }
 }
 
@@ -1700,38 +1616,12 @@ fn parent_thread_id_header_value(session_source: &SessionSource) -> Option<Strin
         | SessionSource::Exec
         | SessionSource::Mcp
         | SessionSource::Custom(_)
-        | SessionSource::Internal(_)
         | SessionSource::SubAgent(_)
         | SessionSource::Unknown => None,
     }
 }
 
-const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
-const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
-
-fn map_response_stream(
-    api_stream: codex_api::ResponseStream,
-    session_telemetry: SessionTelemetry,
-    inference_trace_attempt: InferenceTraceAttempt,
-) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
-    let codex_api::ResponseStream {
-        rx_event,
-        upstream_request_id,
-    } = api_stream;
-    let api_stream = codex_api::ResponseStream {
-        rx_event,
-        upstream_request_id: None,
-    };
-    map_response_events(
-        upstream_request_id,
-        api_stream,
-        session_telemetry,
-        inference_trace_attempt,
-    )
-}
-
-fn map_response_events<S>(
-    upstream_request_id: Option<String>,
+fn map_response_stream<S>(
     api_stream: S,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
@@ -1742,36 +1632,15 @@ where
         + Send
         + 'static,
 {
-    let (tx_event, rx_event) =
-        mpsc::channel::<Result<ResponseEvent>>(RESPONSE_STREAM_CHANNEL_CAPACITY);
+    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
-    let consumer_dropped = CancellationToken::new();
-    let consumer_dropped_for_stream = consumer_dropped.clone();
 
     tokio::spawn(async move {
         let mut logged_error = false;
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
         let mut api_stream = api_stream;
-        let upstream_request_id = upstream_request_id.as_deref();
-        if let Some(upstream_request_id) = upstream_request_id {
-            feedback_tags!(last_model_request_id = upstream_request_id);
-        }
-        loop {
-            let event = tokio::select! {
-                _ = consumer_dropped.cancelled() => {
-                    inference_trace_attempt.record_cancelled(
-                        STREAM_DROPPED_REASON,
-                        upstream_request_id,
-                        &items_added,
-                    );
-                    return;
-                }
-                event = api_stream.next() => event,
-            };
-            let Some(event) = event else {
-                break;
-            };
+        while let Some(event) = api_stream.next().await {
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     items_added.push(item.clone());
@@ -1780,11 +1649,6 @@ where
                         .await
                         .is_err()
                     {
-                        inference_trace_attempt.record_cancelled(
-                            STREAM_DROPPED_REASON,
-                            upstream_request_id,
-                            &items_added,
-                        );
                         return;
                     }
                 }
@@ -1793,7 +1657,6 @@ where
                     token_usage,
                     end_turn,
                 }) => {
-                    feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(
                             usage.input_tokens,
@@ -1805,7 +1668,6 @@ where
                     }
                     inference_trace_attempt.record_completed(
                         &response_id,
-                        upstream_request_id,
                         &token_usage,
                         &items_added,
                     );
@@ -1829,28 +1691,12 @@ where
                 }
                 Ok(event) => {
                     if tx_event.send(Ok(event)).await.is_err() {
-                        inference_trace_attempt.record_cancelled(
-                            STREAM_DROPPED_REASON,
-                            upstream_request_id,
-                            &items_added,
-                        );
                         return;
                     }
                 }
                 Err(err) => {
-                    let response_debug_context =
-                        extract_response_debug_context_from_api_error(&err);
-                    let upstream_request_id =
-                        upstream_request_id.or(response_debug_context.request_id.as_deref());
-                    if let Some(upstream_request_id) = upstream_request_id {
-                        feedback_tags!(last_model_request_id = upstream_request_id);
-                    }
                     let mapped = map_api_error(err);
-                    inference_trace_attempt.record_failed(
-                        &mapped,
-                        upstream_request_id,
-                        &items_added,
-                    );
+                    inference_trace_attempt.record_failed(&mapped);
                     if !logged_error {
                         session_telemetry.see_event_completed_failed(&mapped);
                         logged_error = true;
@@ -1861,20 +1707,9 @@ where
                 }
             }
         }
-        inference_trace_attempt.record_failed(
-            "stream closed before response.completed",
-            upstream_request_id,
-            &items_added,
-        );
     });
 
-    (
-        ResponseStream {
-            rx_event,
-            consumer_dropped: consumer_dropped_for_stream,
-        },
-        rx_last_response,
-    )
+    (ResponseStream { rx_event }, rx_last_response)
 }
 
 /// Handles a 401 response by optionally refreshing ChatGPT tokens once.

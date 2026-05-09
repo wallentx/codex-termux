@@ -246,7 +246,7 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn command_exec_permission_profile_project_roots_use_command_cwd() -> Result<()> {
+async fn command_exec_permission_profile_cwd_uses_command_cwd() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     let command_dir = codex_home.path().join("command-cwd");
@@ -264,7 +264,7 @@ async fn command_exec_permission_profile_project_roots_use_command_cwd() -> Resu
     };
     entries.push(FileSystemSandboxEntry {
         path: FileSystemPath::Special {
-            value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+            value: FileSystemSpecialPath::CurrentWorkingDirectory,
         },
         access: FileSystemAccessMode::Write,
     });
@@ -298,7 +298,7 @@ async fn command_exec_permission_profile_project_roots_use_command_cwd() -> Resu
     let response: CommandExecResponse = to_response(response)?;
     assert_eq!(
         response.exit_code, 0,
-        "parent cwd write should fail under command project-root profile: {response:?}"
+        "parent cwd write should fail under command-cwd-scoped profile: {response:?}"
     );
     assert_eq!(
         std::fs::read_to_string(command_dir.join("child.txt"))?,
@@ -306,7 +306,7 @@ async fn command_exec_permission_profile_project_roots_use_command_cwd() -> Resu
     );
     assert!(
         !codex_home.path().join("parent.txt").exists(),
-        "permissionProfile :project_roots write should not grant the server cwd when command cwd differs"
+        "permissionProfile :cwd write should not grant the server cwd when command cwd differs"
     );
 
     Ok(())

@@ -18,8 +18,6 @@ use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 #[cfg(unix)]
 use std::thread::sleep;
 #[cfg(unix)]
@@ -30,11 +28,10 @@ use std::time::Duration;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_config::types::McpServerEnvVar;
+use codex_config::types::ShellEnvironmentPolicyInherit;
 use codex_exec_server::ExecBackend;
 use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecParams;
-use codex_exec_server::ExecProcess;
-use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 #[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
 #[cfg(unix)]
@@ -91,7 +88,11 @@ pub struct StdioServerCommand {
 /// directly to `rmcp::service::serve_client`.
 pub struct StdioServerTransport {
     inner: StdioServerTransportInner,
-    process: StdioServerProcessHandle,
+    // Local child processes can leave subprocesses behind, so the local
+    // variant keeps a process-group guard with the transport. Executor-backed
+    // processes are owned and cleaned up by the executor, so that variant uses
+    // `None`.
+    _process_group_guard: Option<ProcessGroupGuard>,
 }
 
 enum StdioServerTransportInner {
@@ -126,17 +127,10 @@ impl Transport<RoleClient> for StdioServerTransport {
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        self.process.terminate().await?;
         match &mut self.inner {
             StdioServerTransportInner::Local(transport) => transport.close().await,
             StdioServerTransportInner::Executor(transport) => transport.close().await,
         }
-    }
-}
-
-impl StdioServerTransport {
-    pub(crate) fn process_handle(&self) -> StdioServerProcessHandle {
-        self.process.clone()
     }
 }
 
@@ -198,33 +192,12 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
-struct LocalProcessTerminator {
+struct ProcessGroupGuard {
     process_group_id: u32,
 }
 
-#[cfg(windows)]
-struct LocalProcessTerminator {
-    pid: u32,
-}
-
-#[cfg(not(any(unix, windows)))]
-struct LocalProcessTerminator;
-
-#[derive(Clone)]
-pub(crate) struct StdioServerProcessHandle {
-    inner: Arc<StdioServerProcessHandleInner>,
-}
-
-struct StdioServerProcessHandleInner {
-    program_name: String,
-    kind: StdioServerProcessKind,
-    terminated: AtomicBool,
-}
-
-enum StdioServerProcessKind {
-    Local(Option<LocalProcessTerminator>),
-    Executor(Arc<dyn ExecProcess>),
-}
+#[cfg(not(unix))]
+struct ProcessGroupGuard;
 
 mod private {
     pub trait Sealed {}
@@ -265,10 +238,7 @@ impl LocalStdioServerLauncher {
         let (transport, stderr) = TokioChildProcess::builder(command)
             .stderr(Stdio::piped())
             .spawn()?;
-        let process = StdioServerProcessHandle::local(
-            program_name.clone(),
-            transport.id().map(LocalProcessTerminator::new),
-        );
+        let process_group_guard = transport.id().map(ProcessGroupGuard::new);
 
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
@@ -290,24 +260,18 @@ impl LocalStdioServerLauncher {
 
         Ok(StdioServerTransport {
             inner: StdioServerTransportInner::Local(transport),
-            process,
+            _process_group_guard: process_group_guard,
         })
     }
 }
 
-impl LocalProcessTerminator {
+impl ProcessGroupGuard {
     fn new(process_group_id: u32) -> Self {
         #[cfg(unix)]
         {
             Self { process_group_id }
         }
-        #[cfg(windows)]
-        {
-            Self {
-                pid: process_group_id,
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(not(unix))]
         {
             let _ = process_group_id;
             Self
@@ -315,7 +279,7 @@ impl LocalProcessTerminator {
     }
 
     #[cfg(unix)]
-    fn terminate(&self) {
+    fn maybe_terminate_process_group(&self) {
         let process_group_id = self.process_group_id;
         let should_escalate = match terminate_process_group(process_group_id) {
             Ok(exists) => exists,
@@ -334,93 +298,14 @@ impl LocalProcessTerminator {
         }
     }
 
-    #[cfg(windows)]
-    fn terminate(&self) {
-        let _ = std::process::Command::new("taskkill")
-            .arg("/PID")
-            .arg(self.pid.to_string())
-            .arg("/T")
-            .arg("/F")
-            .status();
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn terminate(&self) {}
+    #[cfg(not(unix))]
+    fn maybe_terminate_process_group(&self) {}
 }
 
-impl StdioServerProcessHandle {
-    fn local(program_name: String, terminator: Option<LocalProcessTerminator>) -> Self {
-        Self {
-            inner: Arc::new(StdioServerProcessHandleInner {
-                program_name,
-                kind: StdioServerProcessKind::Local(terminator),
-                terminated: AtomicBool::new(false),
-            }),
-        }
-    }
-
-    pub(crate) fn executor(program_name: String, process: Arc<dyn ExecProcess>) -> Self {
-        Self {
-            inner: Arc::new(StdioServerProcessHandleInner {
-                program_name,
-                kind: StdioServerProcessKind::Executor(process),
-                terminated: AtomicBool::new(false),
-            }),
-        }
-    }
-
-    pub(crate) async fn terminate(&self) -> io::Result<()> {
-        if self.inner.terminated.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-
-        match &self.inner.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
-                Ok(())
-            }
-            StdioServerProcessKind::Local(None) => Ok(()),
-            StdioServerProcessKind::Executor(process) => match process.terminate().await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    self.inner.terminated.store(false, Ordering::Release);
-                    Err(io::Error::other(error))
-                }
-            },
-        }
-    }
-}
-
-impl Drop for StdioServerProcessHandleInner {
+impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        if self.terminated.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        match &self.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
-            }
-            StdioServerProcessKind::Local(None) => {}
-            StdioServerProcessKind::Executor(process) => {
-                let process = Arc::clone(process);
-                let program_name = self.program_name.clone();
-                let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                    warn!(
-                        "Could not schedule remote MCP server process termination on drop ({}): no Tokio runtime is available",
-                        self.program_name
-                    );
-                    return;
-                };
-
-                std::mem::drop(handle.spawn(async move {
-                    if let Err(error) = process.terminate().await {
-                        warn!(
-                            "Failed to terminate remote MCP server process on drop ({program_name}): {error}"
-                        );
-                    }
-                }));
-            }
+        if cfg!(unix) {
+            self.maybe_terminate_process_group();
         }
     }
 }
@@ -507,14 +392,12 @@ impl ExecutorStdioServerLauncher {
             .await
             .map_err(io::Error::other)?;
 
-        let process =
-            StdioServerProcessHandle::executor(program_name.clone(), Arc::clone(&started.process));
         Ok(StdioServerTransport {
             inner: StdioServerTransportInner::Executor(ExecutorProcessTransport::new(
                 started.process,
                 program_name,
             )),
-            process,
+            _process_group_guard: None,
         })
     }
 
@@ -581,9 +464,9 @@ impl ExecutorStdioServerLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_protocol::config_types::EnvironmentVariablePattern;
-    use codex_protocol::config_types::ShellEnvironmentPolicy;
-    use codex_protocol::shell_environment;
+    use codex_config::shell_environment;
+    use codex_config::types::EnvironmentVariablePattern;
+    use codex_config::types::ShellEnvironmentPolicy;
 
     #[test]
     fn remote_env_policy_uses_core_env_without_remote_source_vars() {

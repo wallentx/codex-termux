@@ -4,8 +4,7 @@ use std::time::Duration;
 use crate::chatgpt_client::chatgpt_get_request_with_timeout;
 
 use codex_app_server_protocol::AppInfo;
-use codex_connectors::ConnectorDirectoryCacheContext;
-use codex_connectors::ConnectorDirectoryCacheKey;
+use codex_connectors::AllConnectorsCacheKey;
 use codex_connectors::DirectoryListResponse;
 use codex_connectors::filter::filter_disallowed_connectors;
 use codex_connectors::merge::merge_connectors;
@@ -17,17 +16,17 @@ pub use codex_core::connectors::list_accessible_connectors_from_mcp_tools_with_o
 pub use codex_core::connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status;
 pub use codex_core::connectors::list_cached_accessible_connectors_from_mcp_tools;
 pub use codex_core::connectors::with_app_enabled_state;
-use codex_core_plugins::PluginsManager;
+use codex_core::plugins::AppConnectorId;
+use codex_core::plugins::PluginsManager;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::default_client::originator;
-use codex_plugin::AppConnectorId;
 
 const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn apps_enabled(config: &Config) -> bool {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
     let auth = auth_manager.auth().await;
     config
         .features
@@ -36,7 +35,7 @@ async fn apps_enabled(config: &Config) -> bool {
 
 async fn connector_auth(config: &Config) -> anyhow::Result<CodexAuth> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
     let auth = auth_manager
         .auth()
         .await
@@ -76,8 +75,8 @@ pub async fn list_cached_all_connectors(config: &Config) -> Option<Vec<AppInfo>>
     }
 
     let auth = connector_auth(config).await.ok()?;
-    let cache_context = connector_directory_cache_context(config, &auth);
-    let connectors = codex_connectors::cached_directory_connectors(&cache_context)?;
+    let cache_key = all_connectors_cache_key(config, &auth);
+    let connectors = codex_connectors::cached_all_connectors(&cache_key)?;
     let connectors = merge_plugin_connectors(
         connectors,
         plugin_apps_for_config(config)
@@ -99,9 +98,9 @@ pub async fn list_all_connectors_with_options(
         return Ok(Vec::new());
     }
     let auth = connector_auth(config).await?;
-    let cache_context = connector_directory_cache_context(config, &auth);
+    let cache_key = all_connectors_cache_key(config, &auth);
     let connectors = codex_connectors::list_all_connectors_with_options(
-        cache_context,
+        cache_key,
         auth.is_workspace_account(),
         force_refetch,
         |path| async move {
@@ -127,25 +126,18 @@ pub async fn list_all_connectors_with_options(
     ))
 }
 
-fn connector_directory_cache_context(
-    config: &Config,
-    auth: &CodexAuth,
-) -> ConnectorDirectoryCacheContext {
-    ConnectorDirectoryCacheContext::new(
-        config.codex_home.to_path_buf(),
-        ConnectorDirectoryCacheKey::new(
-            config.chatgpt_base_url.clone(),
-            auth.get_account_id(),
-            auth.get_chatgpt_user_id(),
-            auth.is_workspace_account(),
-        ),
+fn all_connectors_cache_key(config: &Config, auth: &CodexAuth) -> AllConnectorsCacheKey {
+    AllConnectorsCacheKey::new(
+        config.chatgpt_base_url.clone(),
+        auth.get_account_id(),
+        auth.get_chatgpt_user_id(),
+        auth.is_workspace_account(),
     )
 }
 
-async fn plugin_apps_for_config(config: &Config) -> Vec<AppConnectorId> {
-    let plugins_input = config.plugins_config_input();
+async fn plugin_apps_for_config(config: &Config) -> Vec<codex_core::plugins::AppConnectorId> {
     PluginsManager::new(config.codex_home.to_path_buf())
-        .plugins_for_config(&plugins_input)
+        .plugins_for_config(config)
         .await
         .effective_apps()
 }
@@ -196,7 +188,7 @@ pub fn merge_connectors_with_accessible(
 mod tests {
     use super::*;
     use codex_connectors::metadata::connector_install_url;
-    use codex_plugin::AppConnectorId;
+    use codex_core::plugins::AppConnectorId;
     use pretty_assertions::assert_eq;
 
     fn app(id: &str) -> AppInfo {

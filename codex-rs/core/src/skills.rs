@@ -14,7 +14,6 @@ use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_plugins::PluginSkillRoot;
 use tracing::warn;
 
 pub use codex_core_skills::SkillDependencyInfo;
@@ -46,7 +45,7 @@ pub use codex_core_skills::system;
 
 pub(crate) fn skills_load_input_from_config(
     config: &Config,
-    effective_skill_roots: Vec<PluginSkillRoot>,
+    effective_skill_roots: Vec<AbsolutePathBuf>,
 ) -> SkillsLoadInput {
     SkillsLoadInput::new(
         config.cwd.clone(),
@@ -188,7 +187,6 @@ pub(crate) async fn maybe_emit_implicit_skill_invocation(
         skill_name: candidate.name,
         skill_scope: candidate.scope,
         skill_path: candidate.path_to_skills_md.to_path_buf(),
-        plugin_id: candidate.plugin_id,
         invocation_type: InvocationType::Implicit,
     };
     let skill_scope = match invocation.skill_scope {

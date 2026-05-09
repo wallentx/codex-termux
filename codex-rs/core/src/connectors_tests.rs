@@ -1,12 +1,12 @@
 use super::*;
 use crate::config::CONFIG_TOML_FILE;
 use crate::config::ConfigBuilder;
-use codex_config::AppRequirementToml;
-use codex_config::AppsRequirementsToml;
-use codex_config::CloudRequirementsLoader;
-use codex_config::ConfigLayerStack;
-use codex_config::ConfigRequirements;
-use codex_config::ConfigRequirementsToml;
+use crate::config_loader::AppRequirementToml;
+use crate::config_loader::AppsRequirementsToml;
+use crate::config_loader::CloudRequirementsLoader;
+use crate::config_loader::ConfigLayerStack;
+use crate::config_loader::ConfigRequirements;
+use crate::config_loader::ConfigRequirementsToml;
 use codex_config::types::AppConfig;
 use codex_config::types::AppToolConfig;
 use codex_config::types::AppToolsConfig;
@@ -19,7 +19,6 @@ use codex_connectors::metadata::connector_install_url;
 use codex_connectors::metadata::connector_mention_slug;
 use codex_connectors::metadata::sanitize_name;
 use codex_features::Feature;
-use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ToolInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -120,10 +119,11 @@ fn codex_app_tool(
         server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
         callable_name: tool_name.to_string(),
         callable_namespace: tool_namespace,
-        namespace_description: None,
+        server_instructions: None,
         tool: test_tool_definition(tool_name),
         connector_id: Some(connector_id.to_string()),
         connector_name: connector_name.map(ToOwned::to_owned),
+        connector_description: None,
         plugin_display_names: plugin_names(plugin_display_names),
     }
 }
@@ -173,30 +173,40 @@ fn merge_connectors_replaces_plugin_placeholder_name_with_accessible_name() {
 
 #[test]
 fn accessible_connectors_from_mcp_tools_carries_plugin_display_names() {
-    let tools = vec![
-        codex_app_tool(
-            "calendar_list_events",
-            "calendar",
-            /*connector_name*/ None,
-            &["sample", "sample"],
+    let tools = HashMap::from([
+        (
+            "mcp__codex_apps__calendar_list_events".to_string(),
+            codex_app_tool(
+                "calendar_list_events",
+                "calendar",
+                /*connector_name*/ None,
+                &["sample", "sample"],
+            ),
         ),
-        codex_app_tool(
-            "calendar_create_event",
-            "calendar",
-            Some("Google Calendar"),
-            &["beta", "sample"],
+        (
+            "mcp__codex_apps__calendar_create_event".to_string(),
+            codex_app_tool(
+                "calendar_create_event",
+                "calendar",
+                Some("Google Calendar"),
+                &["beta", "sample"],
+            ),
         ),
-        ToolInfo {
-            server_name: "sample".to_string(),
-            callable_name: "echo".to_string(),
-            callable_namespace: "sample".to_string(),
-            namespace_description: None,
-            tool: test_tool_definition("echo"),
-            connector_id: None,
-            connector_name: None,
-            plugin_display_names: plugin_names(&["ignored"]),
-        },
-    ];
+        (
+            "mcp__sample__echo".to_string(),
+            ToolInfo {
+                server_name: "sample".to_string(),
+                callable_name: "echo".to_string(),
+                callable_namespace: "sample".to_string(),
+                server_instructions: None,
+                tool: test_tool_definition("echo"),
+                connector_id: None,
+                connector_name: None,
+                connector_description: None,
+                plugin_display_names: plugin_names(&["ignored"]),
+            },
+        ),
+    ]);
 
     let connectors = accessible_connectors_from_mcp_tools(&tools);
 
@@ -230,20 +240,26 @@ async fn refresh_accessible_connectors_cache_from_mcp_tools_writes_latest_instal
         .expect("config should load");
     let _ = config.features.set_enabled(Feature::Apps, /*enabled*/ true);
     let cache_key = accessible_connectors_cache_key(&config, /*auth*/ None);
-    let tools = vec![
-        codex_app_tool(
-            "calendar_list_events",
-            "calendar",
-            Some("Google Calendar"),
-            &["calendar-plugin"],
+    let tools = HashMap::from([
+        (
+            "mcp__codex_apps__calendar_list_events".to_string(),
+            codex_app_tool(
+                "calendar_list_events",
+                "calendar",
+                Some("Google Calendar"),
+                &["calendar-plugin"],
+            ),
         ),
-        codex_app_tool(
-            "openai_hidden",
-            "connector_openai_hidden",
-            Some("Hidden"),
-            &[],
+        (
+            "mcp__codex_apps__openai_hidden".to_string(),
+            codex_app_tool(
+                "openai_hidden",
+                "connector_openai_hidden",
+                Some("Hidden"),
+                &[],
+            ),
         ),
-    ];
+    ]);
 
     let cached = with_accessible_connectors_cache_cleared(|| {
         refresh_accessible_connectors_cache_from_mcp_tools(&config, /*auth*/ None, &tools);
@@ -301,26 +317,30 @@ fn merge_connectors_unions_and_dedupes_plugin_display_names() {
 
 #[test]
 fn accessible_connectors_from_mcp_tools_preserves_description() {
-    let mcp_tools = vec![ToolInfo {
-        server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
-        callable_name: "calendar_create_event".to_string(),
-        callable_namespace: "mcp__codex_apps__calendar".to_string(),
-        namespace_description: Some("Plan events".to_string()),
-        tool: Tool {
-            name: "calendar_create_event".to_string().into(),
-            title: None,
-            description: Some("Create a calendar event".into()),
-            input_schema: Arc::new(JsonObject::default()),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-            icons: None,
-            meta: None,
+    let mcp_tools = HashMap::from([(
+        "mcp__codex_apps__calendar_create_event".to_string(),
+        ToolInfo {
+            server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+            callable_name: "calendar_create_event".to_string(),
+            callable_namespace: "mcp__codex_apps__calendar".to_string(),
+            server_instructions: None,
+            tool: Tool {
+                name: "calendar_create_event".to_string().into(),
+                title: None,
+                description: Some("Create a calendar event".into()),
+                input_schema: Arc::new(JsonObject::default()),
+                output_schema: None,
+                annotations: None,
+                execution: None,
+                icons: None,
+                meta: None,
+            },
+            connector_id: Some("calendar".to_string()),
+            connector_name: Some("Calendar".to_string()),
+            connector_description: Some("Plan events".to_string()),
+            plugin_display_names: Vec::new(),
         },
-        connector_id: Some("calendar".to_string()),
-        connector_name: Some("Calendar".to_string()),
-        plugin_display_names: Vec::new(),
-    }];
+    )]);
 
     assert_eq!(
         accessible_connectors_from_mcp_tools(&mcp_tools),
@@ -1089,71 +1109,6 @@ discoverables = [
     assert_eq!(
         tool_suggest_connector_ids(&config).await,
         HashSet::from(["connector_2128aebfecb84f64a069897515042a44".to_string()])
-    );
-}
-
-#[tokio::test]
-async fn tool_suggest_connector_ids_exclude_disabled_tool_suggestions() {
-    let codex_home = tempdir().expect("tempdir should succeed");
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"
-[tool_suggest]
-discoverables = [
-  { type = "connector", id = "connector_calendar" },
-  { type = "connector", id = "connector_gmail" }
-]
-disabled_tools = [
-  { type = "connector", id = "connector_calendar" }
-]
-"#,
-    )
-    .expect("write config");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .build()
-        .await
-        .expect("config should load");
-
-    assert_eq!(
-        tool_suggest_connector_ids(&config).await,
-        HashSet::from(["connector_gmail".to_string()])
-    );
-}
-
-#[tokio::test]
-async fn tool_suggest_uses_connector_id_fallback_when_directory_cache_is_empty() {
-    let codex_home = tempdir().expect("tempdir should succeed");
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"
-[features]
-apps = true
-
-[tool_suggest]
-discoverables = [
-  { type = "connector", id = "connector_gmail" }
-]
-"#,
-    )
-    .expect("write config");
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .build()
-        .await
-        .expect("config should load");
-    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-
-    let discoverable_tools =
-        list_tool_suggest_discoverable_tools_with_auth(&config, Some(&auth), &[])
-            .await
-            .expect("discoverable tools should load");
-
-    assert_eq!(
-        discoverable_tools,
-        vec![DiscoverableTool::from(plugin_connector_to_app_info(
-            "connector_gmail".to_string(),
-        ))]
     );
 }
 

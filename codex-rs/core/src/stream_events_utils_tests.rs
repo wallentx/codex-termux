@@ -28,6 +28,7 @@ fn assistant_output_text_with_phase(text: &str, phase: Option<MessagePhase>) -> 
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
+        end_turn: Some(true),
         phase,
     }
 }
