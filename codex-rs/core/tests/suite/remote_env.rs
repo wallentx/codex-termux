@@ -3,52 +3,19 @@ use anyhow::Result;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::FileSystemSandboxContext;
-use codex_exec_server::LOCAL_ENVIRONMENT_ID;
-use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_exec_server::RemoveOptions;
-use codex_features::Feature;
-use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::FileSystemAccessMode;
-use codex_protocol::permissions::FileSystemPath;
-use codex_protocol::permissions::FileSystemSandboxEntry;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::protocol::ReadOnlyAccess;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::PathBufExt;
-use core_test_support::PathExt;
 use core_test_support::get_remote_test_env;
-use core_test_support::responses::ev_assistant_message;
-use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_function_call;
-use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_sse_sequence;
-use core_test_support::responses::sse;
-use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::test_env;
 use pretty_assertions::assert_eq;
-use serde_json::Value;
-use serde_json::json;
-use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use tempfile::TempDir;
-async fn unified_exec_test(server: &wiremock::MockServer) -> Result<TestCodex> {
-    let mut builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
-        let result = config.features.enable(Feature::UnifiedExec);
-        assert!(
-            result.is_ok(),
-            "unified exec should enable for test: {result:?}",
-        );
-    });
-    builder.build_remote_aware(server).await
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_test_env_can_connect_and_use_filesystem() -> Result<()> {
@@ -93,28 +60,37 @@ fn absolute_path(path: PathBuf) -> AbsolutePathBuf {
 
 fn read_only_sandbox(readable_root: PathBuf) -> FileSystemSandboxContext {
     let readable_root = absolute_path(readable_root);
-    FileSystemSandboxContext::from_permission_profile(PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: readable_root,
+    // The policy is evaluated in the remote container, so use a container path
+    // for cwd instead of capturing the local test runner cwd.
+    FileSystemSandboxContext::from_legacy_sandbox_policy(
+        SandboxPolicy::ReadOnly {
+            access: ReadOnlyAccess::Restricted {
+                include_platform_defaults: false,
+                readable_roots: vec![readable_root.clone()],
             },
-            access: FileSystemAccessMode::Read,
-        }]),
-        NetworkSandboxPolicy::Restricted,
-    ))
+            network_access: false,
+        },
+        readable_root,
+    )
 }
 
 fn workspace_write_sandbox(writable_root: PathBuf) -> FileSystemSandboxContext {
     let writable_root = absolute_path(writable_root);
-    FileSystemSandboxContext::from_permission_profile(PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: writable_root,
+    // The policy is evaluated in the remote container, so use a container path
+    // for cwd instead of capturing the local test runner cwd.
+    FileSystemSandboxContext::from_legacy_sandbox_policy(
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![writable_root.clone()],
+            read_only_access: ReadOnlyAccess::Restricted {
+                include_platform_defaults: false,
+                readable_roots: vec![],
             },
-            access: FileSystemAccessMode::Write,
-        }]),
-        NetworkSandboxPolicy::Restricted,
-    ))
+            network_access: false,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        },
+        writable_root,
+    )
 }
 
 fn assert_normalized_path_rejected(error: &std::io::Error) {
@@ -147,114 +123,6 @@ fn remote_exec(script: &str) -> Result<()> {
         String::from_utf8_lossy(&output.stdout).trim(),
         String::from_utf8_lossy(&output.stderr).trim(),
     );
-    Ok(())
-}
-
-async fn exec_command_routing_output(
-    test: &TestCodex,
-    server: &wiremock::MockServer,
-    call_id: &str,
-    arguments: Value,
-    environments: Option<Vec<TurnEnvironmentSelection>>,
-) -> Result<String> {
-    let response_mock = mount_sse_sequence(
-        server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_function_call(call_id, "exec_command", &serde_json::to_string(&arguments)?),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    test.submit_turn_with_environments("route exec command", environments)
-        .await?;
-
-    response_mock
-        .function_call_output_text(call_id)
-        .with_context(|| format!("missing function_call_output for {call_id}"))
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_command_routes_to_selected_remote_environment() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-    let Some(_remote_env) = get_remote_test_env() else {
-        return Ok(());
-    };
-
-    let server = start_mock_server().await;
-    let test = unified_exec_test(&server).await?;
-    let local_cwd = TempDir::new()?;
-    fs::write(local_cwd.path().join("marker.txt"), "local-routing")?;
-    let local_selection = TurnEnvironmentSelection {
-        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
-        cwd: local_cwd.path().abs(),
-    };
-    let remote_cwd = PathBuf::from(format!(
-        "/tmp/codex-remote-routing-{}",
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
-    ))
-    .abs();
-    let remote_marker_name = "marker.txt";
-    test.fs()
-        .create_directory(
-            &remote_cwd,
-            CreateDirectoryOptions { recursive: true },
-            /*sandbox*/ None,
-        )
-        .await?;
-    test.fs()
-        .write_file(
-            &remote_cwd.join(remote_marker_name),
-            b"remote-routing".to_vec(),
-            /*sandbox*/ None,
-        )
-        .await?;
-    let remote_selection = TurnEnvironmentSelection {
-        environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-        cwd: remote_cwd.clone(),
-    };
-    let multi_env_output = exec_command_routing_output(
-        &test,
-        &server,
-        "call-multi-env",
-        json!({
-            "shell": "/bin/sh",
-            "cmd": format!("cat {remote_marker_name}"),
-            "login": false,
-            "yield_time_ms": 1_000,
-            "environment_id": REMOTE_ENVIRONMENT_ID,
-        }),
-        Some(vec![local_selection, remote_selection]),
-    )
-    .await?;
-    assert!(
-        multi_env_output.contains("remote-routing"),
-        "unexpected multi-env output: {multi_env_output}",
-    );
-    assert!(
-        !multi_env_output.contains("local-routing"),
-        "multi-env command should not route to local: {multi_env_output}",
-    );
-
-    test.fs()
-        .remove(
-            &remote_cwd,
-            RemoveOptions {
-                recursive: true,
-                force: true,
-            },
-            /*sandbox*/ None,
-        )
-        .await?;
-
     Ok(())
 }
 

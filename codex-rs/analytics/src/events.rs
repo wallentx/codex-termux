@@ -18,10 +18,8 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
 use crate::facts::TurnSubmissionType;
-use crate::now_unix_millis;
 use crate::now_unix_seconds;
 use codex_app_server_protocol::CodexErrorInfo;
-use codex_app_server_protocol::CommandExecutionSource;
 use codex_login::default_client::originator;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::approvals::NetworkApprovalProtocol;
@@ -35,7 +33,6 @@ use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use serde::Serialize;
 
@@ -64,15 +61,6 @@ pub(crate) enum TrackEventRequest {
     Compaction(Box<CodexCompactionEventRequest>),
     TurnEvent(Box<CodexTurnEventRequest>),
     TurnSteer(CodexTurnSteerEventRequest),
-    CommandExecution(CodexCommandExecutionEventRequest),
-    FileChange(CodexFileChangeEventRequest),
-    McpToolCall(CodexMcpToolCallEventRequest),
-    DynamicToolCall(CodexDynamicToolCallEventRequest),
-    CollabAgentToolCall(CodexCollabAgentToolCallEventRequest),
-    WebSearch(CodexWebSearchEventRequest),
-    ImageGeneration(CodexImageGenerationEventRequest),
-    #[allow(dead_code)]
-    ReviewEvent(CodexReviewEventRequest),
     PluginUsed(CodexPluginUsedEventRequest),
     PluginInstalled(CodexPluginEventRequest),
     PluginUninstalled(CodexPluginEventRequest),
@@ -92,10 +80,8 @@ pub(crate) struct SkillInvocationEventRequest {
 pub(crate) struct SkillInvocationEventParams {
     pub(crate) product_client_id: Option<String>,
     pub(crate) skill_scope: Option<String>,
-    pub(crate) plugin_id: Option<String>,
     pub(crate) repo_url: Option<String>,
     pub(crate) thread_id: Option<String>,
-    pub(crate) turn_id: Option<String>,
     pub(crate) invoke_type: Option<InvocationType>,
     pub(crate) model_slug: Option<String>,
 }
@@ -124,7 +110,7 @@ pub(crate) struct ThreadInitializedEventParams {
     pub(crate) runtime: CodexRuntimeMetadata,
     pub(crate) model: String,
     pub(crate) ephemeral: bool,
-    pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) thread_source: Option<&'static str>,
     pub(crate) initialization_mode: ThreadInitializationMode,
     pub(crate) subagent_source: Option<String>,
     pub(crate) parent_thread_id: Option<String>,
@@ -262,7 +248,7 @@ pub struct GuardianReviewTrackContext {
     approval_request_source: GuardianApprovalRequestSource,
     reviewed_action: GuardianReviewedAction,
     review_timeout_ms: u64,
-    pub started_at_ms: u64,
+    started_at: u64,
     started_instant: Instant,
 }
 
@@ -284,7 +270,7 @@ impl GuardianReviewTrackContext {
             approval_request_source,
             reviewed_action,
             review_timeout_ms,
-            started_at_ms: now_unix_millis(),
+            started_at: now_unix_seconds(),
             started_instant: Instant::now(),
         }
     }
@@ -317,7 +303,7 @@ impl GuardianReviewTrackContext {
             tool_call_count: None,
             time_to_first_token_ms: result.time_to_first_token_ms,
             completion_latency_ms: Some(self.started_instant.elapsed().as_millis() as u64),
-            started_at: self.started_at_ms / 1_000,
+            started_at: self.started_at,
             completed_at: Some(now_unix_seconds()),
             input_tokens: result.token_usage.as_ref().map(|usage| usage.input_tokens),
             cached_input_tokens: result
@@ -398,276 +384,6 @@ pub(crate) struct GuardianReviewEventPayload {
     pub(crate) guardian_review: GuardianReviewEventParams,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ToolItemFinalApprovalOutcome {
-    Unknown,
-    NotNeeded,
-    ConfigAllowed,
-    PolicyForbidden,
-    GuardianApproved,
-    GuardianDenied,
-    GuardianAborted,
-    UserApproved,
-    UserApprovedForSession,
-    UserDenied,
-    UserAborted,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ToolItemTerminalStatus {
-    Completed,
-    Failed,
-    Rejected,
-    Interrupted,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ToolItemFailureKind {
-    ToolError,
-    ApprovalDenied,
-    ApprovalAborted,
-    SandboxDenied,
-    PolicyForbidden,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexToolItemEventBase {
-    pub(crate) thread_id: String,
-    pub(crate) turn_id: String,
-    /// App-server ThreadItem.id. For tool-originated items this generally
-    /// corresponds to the originating core call_id.
-    pub(crate) item_id: String,
-    pub(crate) app_server_client: CodexAppServerClientMetadata,
-    pub(crate) runtime: CodexRuntimeMetadata,
-    pub(crate) thread_source: Option<ThreadSource>,
-    pub(crate) subagent_source: Option<String>,
-    pub(crate) parent_thread_id: Option<String>,
-    pub(crate) tool_name: String,
-    pub(crate) started_at_ms: u64,
-    pub(crate) completed_at_ms: u64,
-    // Observed item lifecycle duration. This may undercount end-to-end execution
-    // for tools where app-server only sees part of the upstream flow.
-    pub(crate) duration_ms: Option<u64>,
-    pub(crate) execution_duration_ms: Option<u64>,
-    pub(crate) review_count: u64,
-    pub(crate) guardian_review_count: u64,
-    pub(crate) user_review_count: u64,
-    pub(crate) final_approval_outcome: ToolItemFinalApprovalOutcome,
-    pub(crate) terminal_status: ToolItemTerminalStatus,
-    pub(crate) failure_kind: Option<ToolItemFailureKind>,
-    pub(crate) requested_additional_permissions: bool,
-    pub(crate) requested_network_access: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ReviewSubjectKind {
-    CommandExecution,
-    FileChange,
-    McpToolCall,
-    Permissions,
-    NetworkAccess,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Reviewer {
-    Guardian,
-    User,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ReviewTrigger {
-    Initial,
-    SandboxDenial,
-    NetworkPolicyDenial,
-    ExecveIntercept,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ReviewStatus {
-    Approved,
-    Denied,
-    Aborted,
-    TimedOut,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ReviewResolution {
-    None,
-    SessionApproval,
-    ExecPolicyAmendment,
-    NetworkPolicyAmendment,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexReviewEventParams {
-    pub(crate) thread_id: String,
-    pub(crate) turn_id: String,
-    pub(crate) item_id: Option<String>,
-    pub(crate) review_id: String,
-    pub(crate) app_server_client: CodexAppServerClientMetadata,
-    pub(crate) runtime: CodexRuntimeMetadata,
-    pub(crate) thread_source: Option<ThreadSource>,
-    pub(crate) subagent_source: Option<String>,
-    pub(crate) parent_thread_id: Option<String>,
-    pub(crate) tool_kind: ReviewSubjectKind,
-    pub(crate) tool_name: String,
-    pub(crate) reviewer: Reviewer,
-    pub(crate) trigger: ReviewTrigger,
-    pub(crate) status: ReviewStatus,
-    pub(crate) resolution: ReviewResolution,
-    pub(crate) started_at_ms: u64,
-    pub(crate) completed_at_ms: u64,
-    pub(crate) duration_ms: Option<u64>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexReviewEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexReviewEventParams,
-}
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WebSearchActionKind {
-    Search,
-    OpenPage,
-    FindInPage,
-    Other,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexCommandExecutionEventParams {
-    #[serde(flatten)]
-    pub(crate) base: CodexToolItemEventBase,
-    pub(crate) command_execution_source: CommandExecutionSource,
-    pub(crate) exit_code: Option<i32>,
-    pub(crate) command_total_action_count: u64,
-    pub(crate) command_read_action_count: u64,
-    pub(crate) command_list_files_action_count: u64,
-    pub(crate) command_search_action_count: u64,
-    pub(crate) command_unknown_action_count: u64,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexCommandExecutionEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexCommandExecutionEventParams,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexFileChangeEventParams {
-    #[serde(flatten)]
-    pub(crate) base: CodexToolItemEventBase,
-    pub(crate) file_change_count: u64,
-    pub(crate) file_add_count: u64,
-    pub(crate) file_update_count: u64,
-    pub(crate) file_delete_count: u64,
-    pub(crate) file_move_count: u64,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexFileChangeEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexFileChangeEventParams,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexMcpToolCallEventParams {
-    #[serde(flatten)]
-    pub(crate) base: CodexToolItemEventBase,
-    pub(crate) mcp_server_name: String,
-    pub(crate) mcp_tool_name: String,
-    pub(crate) mcp_error_present: bool,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexMcpToolCallEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexMcpToolCallEventParams,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexDynamicToolCallEventParams {
-    #[serde(flatten)]
-    pub(crate) base: CodexToolItemEventBase,
-    pub(crate) dynamic_tool_name: String,
-    pub(crate) success: Option<bool>,
-    pub(crate) output_content_item_count: Option<u64>,
-    pub(crate) output_text_item_count: Option<u64>,
-    pub(crate) output_image_item_count: Option<u64>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexDynamicToolCallEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexDynamicToolCallEventParams,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexCollabAgentToolCallEventParams {
-    #[serde(flatten)]
-    pub(crate) base: CodexToolItemEventBase,
-    pub(crate) sender_thread_id: String,
-    pub(crate) receiver_thread_count: u64,
-    pub(crate) receiver_thread_ids: Option<Vec<String>>,
-    pub(crate) requested_model: Option<String>,
-    pub(crate) requested_reasoning_effort: Option<String>,
-    pub(crate) agent_state_count: Option<u64>,
-    pub(crate) completed_agent_count: Option<u64>,
-    pub(crate) failed_agent_count: Option<u64>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexCollabAgentToolCallEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexCollabAgentToolCallEventParams,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexWebSearchEventParams {
-    #[serde(flatten)]
-    pub(crate) base: CodexToolItemEventBase,
-    pub(crate) web_search_action: Option<WebSearchActionKind>,
-    pub(crate) query_present: bool,
-    pub(crate) query_count: Option<u64>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexWebSearchEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexWebSearchEventParams,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexImageGenerationEventParams {
-    #[serde(flatten)]
-    pub(crate) base: CodexToolItemEventBase,
-    pub(crate) revised_prompt_present: bool,
-    pub(crate) saved_path_present: bool,
-}
-
-#[derive(Serialize)]
-pub(crate) struct CodexImageGenerationEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexImageGenerationEventParams,
-}
-
 #[derive(Serialize)]
 pub(crate) struct CodexAppMetadata {
     pub(crate) connector_id: Option<String>,
@@ -713,7 +429,7 @@ pub(crate) struct CodexCompactionEventParams {
     pub(crate) turn_id: String,
     pub(crate) app_server_client: CodexAppServerClientMetadata,
     pub(crate) runtime: CodexRuntimeMetadata,
-    pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) thread_source: Option<&'static str>,
     pub(crate) subagent_source: Option<String>,
     pub(crate) parent_thread_id: Option<String>,
     pub(crate) trigger: CompactionTrigger,
@@ -746,7 +462,7 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) app_server_client: CodexAppServerClientMetadata,
     pub(crate) runtime: CodexRuntimeMetadata,
     pub(crate) ephemeral: bool,
-    pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) thread_source: Option<String>,
     pub(crate) initialization_mode: ThreadInitializationMode,
     pub(crate) subagent_source: Option<String>,
     pub(crate) parent_thread_id: Option<String>,
@@ -799,7 +515,7 @@ pub(crate) struct CodexTurnSteerEventParams {
     pub(crate) accepted_turn_id: Option<String>,
     pub(crate) app_server_client: CodexAppServerClientMetadata,
     pub(crate) runtime: CodexRuntimeMetadata,
-    pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) thread_source: Option<String>,
     pub(crate) subagent_source: Option<String>,
     pub(crate) parent_thread_id: Option<String>,
     pub(crate) num_input_images: usize,
@@ -871,16 +587,11 @@ pub(crate) fn codex_app_metadata(
 }
 
 pub(crate) fn codex_plugin_metadata(plugin: PluginTelemetryMetadata) -> CodexPluginMetadata {
-    let PluginTelemetryMetadata {
-        plugin_id,
-        remote_plugin_id,
-        capability_summary,
-    } = plugin;
-    let event_plugin_id = remote_plugin_id.unwrap_or_else(|| plugin_id.as_key());
+    let capability_summary = plugin.capability_summary;
     CodexPluginMetadata {
-        plugin_id: Some(event_plugin_id),
-        plugin_name: Some(plugin_id.plugin_name),
-        marketplace_name: Some(plugin_id.marketplace_name),
+        plugin_id: Some(plugin.plugin_id.as_key()),
+        plugin_name: Some(plugin.plugin_id.plugin_name),
+        marketplace_name: Some(plugin.plugin_id.marketplace_name),
         has_skills: capability_summary
             .as_ref()
             .map(|summary| summary.has_skills),
@@ -902,7 +613,7 @@ pub(crate) fn codex_compaction_event_params(
     input: CodexCompactionEvent,
     app_server_client: CodexAppServerClientMetadata,
     runtime: CodexRuntimeMetadata,
-    thread_source: Option<ThreadSource>,
+    thread_source: Option<&'static str>,
     subagent_source: Option<String>,
     parent_thread_id: Option<String>,
 ) -> CodexCompactionEventParams {
@@ -960,8 +671,6 @@ fn analytics_hook_event_name(event_name: HookEventName) -> &'static str {
         HookEventName::PreToolUse => "PreToolUse",
         HookEventName::PermissionRequest => "PermissionRequest",
         HookEventName::PostToolUse => "PostToolUse",
-        HookEventName::PreCompact => "PreCompact",
-        HookEventName::PostCompact => "PostCompact",
         HookEventName::SessionStart => "SessionStart",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
         HookEventName::Stop => "Stop",
@@ -975,8 +684,6 @@ fn analytics_hook_source(source: HookSource) -> &'static str {
         HookSource::Project => "project",
         HookSource::Mdm => "mdm",
         HookSource::SessionFlags => "session_flags",
-        HookSource::Plugin => "plugin",
-        HookSource::CloudRequirements => "cloud_requirements",
         HookSource::LegacyManagedConfigFile => "legacy_managed_config_file",
         HookSource::LegacyManagedConfigMdm => "legacy_managed_config_mdm",
         HookSource::Unknown => "unknown",
@@ -1008,7 +715,7 @@ pub(crate) fn subagent_thread_started_event_request(
         runtime: current_runtime_metadata(),
         model: input.model,
         ephemeral: input.ephemeral,
-        thread_source: Some(ThreadSource::Subagent),
+        thread_source: Some("subagent"),
         initialization_mode: ThreadInitializationMode::New,
         subagent_source: Some(subagent_source_name(&input.subagent_source)),
         parent_thread_id: input
