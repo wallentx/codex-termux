@@ -195,11 +195,11 @@ class RustyV8BazelTest(unittest.TestCase):
                     return Mock(returncode=0)
 
                 self.assertIn(
-                    'default_android_ndk_root="//third_party/android_ndk"',
+                    'android_ndk_root="//third_party/android_ndk"',
                     env["EXTRA_GN_ARGS"],
                 )
                 self.assertIn(
-                    'default_android_ndk_version="r26c"',
+                    'android_ndk_version="r26c"',
                     env["EXTRA_GN_ARGS"],
                 )
                 build_dir = (
