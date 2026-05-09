@@ -210,6 +210,36 @@ def write_checksums(paths: list[Path], checksums_path: Path) -> None:
             checksums.write(f"{digest.hexdigest()}  {path.name}\n")
 
 
+def vendor_android_v8_crate_source(
+    version: str, temp_dir: Path, env: dict[str, str]
+) -> Path:
+    cargo_home = Path(env.get("CARGO_HOME", Path.home() / ".cargo")).expanduser()
+    candidates = sorted((cargo_home / "registry" / "src").glob(f"*/v8-{version}"))
+    if not candidates:
+        raise SystemExit(f"missing fetched v8 crate source for {version}")
+
+    vendored_source = temp_dir / f"v8-{version}"
+    shutil.copytree(candidates[0], vendored_source)
+
+    # The crates.io v8 147.x source omits this Android test-runner pydeps file,
+    # but GN reads it while generating Android release build files.
+    pydeps_path = (
+        vendored_source
+        / "build"
+        / "android"
+        / "pylib"
+        / "results"
+        / "presentation"
+        / "test_results_presentation.pydeps"
+    )
+    pydeps_path.parent.mkdir(parents=True, exist_ok=True)
+    pydeps_path.write_text(
+        "# Generated for Android rusty_v8 release staging.\n",
+        encoding="utf-8",
+    )
+    return vendored_source
+
+
 def is_musl_archive_target(target: str, source_path: Path) -> bool:
     return target.endswith("-unknown-linux-musl") and source_path.suffix == ".a"
 
@@ -336,6 +366,32 @@ def stage_android_release_pair(target: str, output_dir: Path) -> None:
         "CARGO_TARGET_DIR": str(target_dir),
         "V8_FROM_SOURCE": "1",
     }
+    subprocess.run(
+        [
+            "cargo",
+            "fetch",
+            "--manifest-path",
+            str(manifest_path),
+            "--target",
+            target,
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
+    vendored_source = vendor_android_v8_crate_source(version, temp_dir, env)
+    with manifest_path.open("a", encoding="utf-8") as manifest:
+        manifest.write(
+            "\n".join(
+                [
+                    "",
+                    "[patch.crates-io]",
+                    f'v8 = {{ path = "{vendored_source.as_posix()}" }}',
+                    "",
+                ]
+            )
+        )
+
     subprocess.run(
         [
             "cargo",

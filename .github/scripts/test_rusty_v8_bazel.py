@@ -138,11 +138,18 @@ class RustyV8BazelTest(unittest.TestCase):
             temp_path = Path(temp_dir)
             stage_root = temp_path / "stage"
             output_dir = temp_path / "dist"
+            cargo_home = temp_path / "cargo-home"
+            crate_source = cargo_home / "registry" / "src" / "index" / "v8-146.4.0"
             stage_root.mkdir()
+            crate_source.mkdir(parents=True)
 
             def fake_run(*_args: object, **kwargs: object) -> Mock:
+                args = _args[0]
                 env = kwargs["env"]
                 self.assertIsInstance(env, dict)
+                if args[1] == "fetch":
+                    return Mock(returncode=0)
+
                 build_dir = (
                     Path(env["CARGO_TARGET_DIR"])
                     / "aarch64-linux-android"
@@ -158,17 +165,30 @@ class RustyV8BazelTest(unittest.TestCase):
                 return Mock(returncode=0)
 
             run.side_effect = fake_run
-            with patch("rusty_v8_bazel.tempfile.mkdtemp", return_value=str(stage_root)):
+            with (
+                patch("rusty_v8_bazel.tempfile.mkdtemp", return_value=str(stage_root)),
+                patch.dict("rusty_v8_bazel.os.environ", {"CARGO_HOME": str(cargo_home)}),
+            ):
                 rusty_v8_bazel.stage_android_release_pair(
-                    "aarch64-linux-android",
-                    output_dir,
+                    "aarch64-linux-android", output_dir
                 )
 
             archive = output_dir / "librusty_v8_release_aarch64-linux-android.a.gz"
             binding = output_dir / "src_binding_release_aarch64-linux-android.rs"
             checksums = output_dir / "rusty_v8_release_aarch64-linux-android.sha256"
+            vendored_pydeps = (
+                stage_root
+                / "v8-146.4.0"
+                / "build"
+                / "android"
+                / "pylib"
+                / "results"
+                / "presentation"
+                / "test_results_presentation.pydeps"
+            )
             self.assertEqual(b"archive", gzip.decompress(archive.read_bytes()))
             self.assertEqual("// binding\n", binding.read_text(encoding="utf-8"))
+            self.assertTrue(vendored_pydeps.exists())
             self.assertIn(archive.name, checksums.read_text(encoding="utf-8"))
             self.assertIn(binding.name, checksums.read_text(encoding="utf-8"))
 
