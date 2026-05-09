@@ -79,8 +79,24 @@ def write_checksums(paths: list[Path], checksums_path: Path) -> None:
             checksums.write(f"{digest.hexdigest()}  {path.name}\n")
 
 
+def copy_chromium_rust_vendor(vendored_source: Path, rusty_v8_source_root: Path) -> None:
+    source_vendor_dir = (
+        rusty_v8_source_root / "third_party" / "rust" / "chromium_crates_io" / "vendor"
+    )
+    if not source_vendor_dir.exists():
+        raise SystemExit(f"missing Chromium Rust vendor directory: {source_vendor_dir}")
+
+    dest_vendor_dir = (
+        vendored_source / "third_party" / "rust" / "chromium_crates_io" / "vendor"
+    )
+    if dest_vendor_dir.exists():
+        shutil.rmtree(dest_vendor_dir)
+    dest_vendor_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_vendor_dir, dest_vendor_dir)
+
+
 def vendor_android_v8_crate_source(
-    version: str, temp_dir: Path, env: dict[str, str]
+    version: str, temp_dir: Path, env: dict[str, str], rusty_v8_source_root: Path
 ) -> Path:
     cargo_home = Path(env.get("CARGO_HOME", Path.home() / ".cargo")).expanduser()
     candidates = sorted((cargo_home / "registry" / "src").glob(f"*/v8-{version}"))
@@ -99,6 +115,7 @@ def vendor_android_v8_crate_source(
             "# Generated for Android rusty_v8 release staging.\n",
             encoding="utf-8",
         )
+    copy_chromium_rust_vendor(vendored_source, rusty_v8_source_root)
     return vendored_source
 
 
@@ -121,7 +138,9 @@ def install_android_v8_host_sysroot(vendored_source: Path, env: dict[str, str]) 
     )
 
 
-def stage_android_release_pair(repo_root: Path, target: str, output_dir: Path) -> None:
+def stage_android_release_pair(
+    repo_root: Path, target: str, output_dir: Path, rusty_v8_source_root: Path
+) -> None:
     if target != "aarch64-linux-android":
         raise SystemExit(f"unsupported Android rusty_v8 target: {target}")
 
@@ -169,7 +188,12 @@ def stage_android_release_pair(repo_root: Path, target: str, output_dir: Path) -
         env=env,
         check=True,
     )
-    vendored_source = vendor_android_v8_crate_source(version, temp_dir, env)
+    vendored_source = vendor_android_v8_crate_source(
+        version,
+        temp_dir,
+        env,
+        rusty_v8_source_root,
+    )
     install_android_v8_host_sysroot(vendored_source, env)
     with manifest_path.open("a", encoding="utf-8") as manifest:
         manifest.write(
@@ -231,6 +255,7 @@ def parse_args() -> argparse.Namespace:
     stage_parser.add_argument("--repo-root", type=Path, required=True)
     stage_parser.add_argument("--target", required=True)
     stage_parser.add_argument("--output-dir", type=Path, required=True)
+    stage_parser.add_argument("--rusty-v8-source-root", type=Path, required=True)
 
     return parser.parse_args()
 
@@ -242,7 +267,12 @@ def main() -> int:
         print(resolved_v8_crate_version(repo_root))
         return 0
     if args.command == "stage-android-release-pair":
-        stage_android_release_pair(repo_root, args.target, args.output_dir)
+        stage_android_release_pair(
+            repo_root,
+            args.target,
+            args.output_dir,
+            args.rusty_v8_source_root.resolve(),
+        )
         return 0
     raise SystemExit(f"unsupported command: {args.command}")
 

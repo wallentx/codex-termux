@@ -99,6 +99,14 @@ jobs:
           ref: ${{ github.ref_name }}
           path: workflow
 
+      - name: Check out rusty_v8 source
+        uses: actions/checkout@v6
+        with:
+          repository: denoland/rusty_v8
+          ref: v${{ needs.metadata.outputs.v8_version }}
+          path: rusty_v8_source
+          submodules: recursive
+
       - uses: dtolnay/rust-toolchain@1.93
         with:
           targets: aarch64-linux-android
@@ -145,7 +153,8 @@ jobs:
           python3 workflow/.github/scripts/rusty_v8_android_release.py stage-android-release-pair \
             --repo-root source \
             --target aarch64-linux-android \
-            --output-dir dist/aarch64-linux-android
+            --output-dir dist/aarch64-linux-android \
+            --rusty-v8-source-root rusty_v8_source
 
       - name: Upload staged Android artifacts
         uses: actions/upload-artifact@v6
