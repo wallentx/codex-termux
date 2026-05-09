@@ -101,8 +101,44 @@ jobs:
 
           release_branch_current_tag() {
             local release_branch="$1"
-            git show "origin/${release_branch}:.github/termux-release.json" 2>/dev/null \
+            release_branch_current_metadata "${release_branch}" \
               | jq -r '.upstream_tag // .termux_tag // empty'
+          }
+
+          release_branch_current_metadata() {
+            local release_branch="$1"
+            git show "origin/${release_branch}:.github/termux-release.json" 2>/dev/null || true
+          }
+
+          release_branch_current_termux_tag() {
+            local release_branch="$1"
+            release_branch_current_metadata "${release_branch}" \
+              | jq -r '.termux_tag // empty'
+          }
+
+          open_release_train_prs_for_branch() {
+            local release_branch="$1"
+            local open_prs
+
+            open_prs="$(
+              gh pr list \
+                --repo "${GITHUB_REPOSITORY}" \
+                --state open \
+                --limit 200 \
+                --json number,title,body,baseRefName,url
+            )"
+
+            jq -r \
+              --arg release_branch "${release_branch}" \
+              '
+                .[]
+                | select(.baseRefName == $release_branch)
+                | select(
+                    ((.title // "") | startswith("Termux rust-v"))
+                    and ((.body // "") | contains("Release train branch: `" + $release_branch + "`"))
+                  )
+                | "- #\(.number) \(.title) (\(.url))"
+              ' <<< "${open_prs}"
           }
 
           release_tag_is_newer_than_current_train() {
@@ -214,6 +250,25 @@ jobs:
             echo "${termux_tag} already exists; nothing to do."
             echo "selected=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          if [[ -z "${REQUESTED_TAG}" ]]; then
+            pending_release_train_prs="$(open_release_train_prs_for_branch "${release_branch}")"
+            if [[ -n "${pending_release_train_prs}" ]]; then
+              echo "${upstream_tag} is newer, but ${release_branch} already has an open release train PR; waiting for it to merge and deploy."
+              printf '%s\n' "${pending_release_train_prs}"
+              echo "selected=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            current_termux_tag="$(release_branch_current_termux_tag "${release_branch}")"
+            if [[ -n "${current_termux_tag}" && "${current_termux_tag}" != "${termux_tag}" ]]; then
+              if ! gh release view "${current_termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+                echo "${upstream_tag} is newer, but ${release_branch} is still waiting for ${current_termux_tag} to be deployed."
+                echo "selected=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
           fi
 
           {
