@@ -408,14 +408,18 @@ jobs:
           binding_dir="${RUNNER_TEMP}/rusty_v8"
           archive="${binding_dir}/librusty_v8_release_${TARGET}.a.gz"
           binding_path="${binding_dir}/src_binding_release_${TARGET}.rs"
+          checksums_path="${binding_dir}/rusty_v8_release_${TARGET}.sha256"
+          artifact_repository="wallentx/codex-termux"
           release_tag="rusty-v8-v${version}"
           mkdir -p "${binding_dir}"
-          echo "Downloading Android rusty_v8 artifacts from ${GITHUB_REPOSITORY}@${release_tag}"
+          echo "Downloading Android rusty_v8 artifacts from ${artifact_repository}@${release_tag}"
           gh release download "${release_tag}" \
-            --repo "${GITHUB_REPOSITORY}" \
+            --repo "${artifact_repository}" \
             --dir "${binding_dir}" \
             --pattern "librusty_v8_release_${TARGET}.a.gz" \
-            --pattern "src_binding_release_${TARGET}.rs"
+            --pattern "src_binding_release_${TARGET}.rs" \
+            --pattern "rusty_v8_release_${TARGET}.sha256"
+          (cd "${binding_dir}" && sha256sum -c "$(basename "${checksums_path}")")
           echo "RUSTY_V8_ARCHIVE=${archive}" >> "$GITHUB_ENV"
           echo "RUSTY_V8_SRC_BINDING_PATH=${binding_path}" >> "$GITHUB_ENV"
 
