@@ -124,7 +124,7 @@ while IFS= read -r release_only_path; do
   if git cat-file -e "origin/${DESTINATION_BRANCH}:${release_only_path}" 2>/dev/null; then
     git restore --source="origin/${DESTINATION_BRANCH}" --staged --worktree -- "${release_only_path}"
   else
-    git rm -f --ignore-unmatch -- "${release_only_path}"
+    git rm -f --ignore-unmatch --cached -- "${release_only_path}"
   fi
 done < <(release_only_checkpoint_paths)
 
