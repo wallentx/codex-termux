@@ -423,6 +423,7 @@ async fn azure_default_store_attaches_ids_and_headers() -> Result<()> {
             id: Some("msg_1".into()),
             role: "user".into(),
             content: vec![ContentItem::InputText { text: "hi".into() }],
+            end_turn: None,
             phase: None,
         }],
         tools: Vec::new(),
@@ -444,8 +445,7 @@ async fn azure_default_store_attaches_ids_and_headers() -> Result<()> {
         .stream_request(
             request,
             ResponsesOptions {
-                session_id: Some("sess_123".into()),
-                thread_id: Some("thread_123".into()),
+                conversation_id: Some("sess_123".into()),
                 session_source: Some(SessionSource::SubAgent(SubAgentSource::Review)),
                 extra_headers,
                 compression: Compression::None,
@@ -461,16 +461,6 @@ async fn azure_default_store_attaches_ids_and_headers() -> Result<()> {
     assert_eq!(
         req.headers.get("session_id").and_then(|v| v.to_str().ok()),
         Some("sess_123")
-    );
-    assert_eq!(
-        req.headers.get("thread_id").and_then(|v| v.to_str().ok()),
-        Some("thread_123")
-    );
-    assert_eq!(
-        req.headers
-            .get("x-client-request-id")
-            .and_then(|v| v.to_str().ok()),
-        Some("thread_123")
     );
     assert_eq!(
         req.headers

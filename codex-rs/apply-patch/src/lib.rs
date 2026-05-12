@@ -2,7 +2,6 @@ mod invocation;
 mod parser;
 mod seek_sequence;
 mod standalone_executable;
-mod streaming_parser;
 
 use std::collections::HashMap;
 use std::io;
@@ -21,8 +20,8 @@ pub use parser::ParseError;
 use parser::ParseError::*;
 pub use parser::UpdateFileChunk;
 pub use parser::parse_patch;
+pub use parser::parse_patch_streaming;
 use similar::TextDiff;
-pub use streaming_parser::StreamingPatchParser;
 use thiserror::Error;
 
 pub use invocation::maybe_parse_apply_patch_verified;
