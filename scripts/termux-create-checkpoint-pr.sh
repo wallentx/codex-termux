@@ -24,6 +24,78 @@ release_only_checkpoint_paths() {
     scripts/termux-find-release-pr.sh
 }
 
+resolve_source_version_conflicts() {
+  local path="$1"
+  local resolved_path
+  resolved_path="$(mktemp)"
+
+  if ! awk '
+    function normalize_versions(text) {
+      gsub(/version = "[^"]+"/, "version = \"<version>\"", text)
+      return text
+    }
+
+    BEGIN {
+      in_block = 0
+      side = ""
+      ours = ""
+      theirs = ""
+      blocks = 0
+    }
+
+    /^<<<<<<< / {
+      if (in_block) {
+        exit 1
+      }
+      in_block = 1
+      side = "ours"
+      ours = ""
+      theirs = ""
+      blocks++
+      next
+    }
+
+    /^=======$/ && in_block {
+      side = "theirs"
+      next
+    }
+
+    /^>>>>>>> / && in_block {
+      if (normalize_versions(ours) != normalize_versions(theirs)) {
+        exit 1
+      }
+      printf "%s", theirs
+      in_block = 0
+      side = ""
+      next
+    }
+
+    {
+      if (!in_block) {
+        print
+      } else if (side == "ours") {
+        ours = ours $0 ORS
+      } else if (side == "theirs") {
+        theirs = theirs $0 ORS
+      } else {
+        exit 1
+      }
+    }
+
+    END {
+      if (in_block || blocks == 0) {
+        exit 1
+      }
+    }
+  ' "${path}" > "${resolved_path}"; then
+    rm -f "${resolved_path}"
+    return 1
+  fi
+
+  cp "${resolved_path}" "${path}"
+  rm -f "${resolved_path}"
+}
+
 short_sha="${source_sha:0:12}"
 source_slug="${source_branch//\//_}"
 dest_slug="${DESTINATION_BRANCH//\//_}"
@@ -86,10 +158,31 @@ if ! git merge --no-ff --no-edit "${source_sha}"; then
   done
 
   mapfile -t remaining_conflicts < <(git diff --name-only --diff-filter=U)
-  if [[ "${#remaining_conflicts[@]}" -eq 1 && "${remaining_conflicts[0]}" == "codex-rs/Cargo.toml" ]]; then
-    echo "Auto-resolving recurring codex-rs/Cargo.toml checkpoint conflict by keeping ${source_branch}."
-    git checkout --theirs -- codex-rs/Cargo.toml
-    git add codex-rs/Cargo.toml
+  if ((${#remaining_conflicts[@]})); then
+    cargo_version_conflicts=true
+    for remaining_conflict in "${remaining_conflicts[@]}"; do
+      case "${remaining_conflict}" in
+        codex-rs/Cargo.toml|codex-rs/Cargo.lock)
+          ;;
+        *)
+          cargo_version_conflicts=false
+          ;;
+      esac
+    done
+
+    if [[ "${cargo_version_conflicts}" == "true" ]]; then
+      for remaining_conflict in "${remaining_conflicts[@]}"; do
+        if ! resolve_source_version_conflicts "${remaining_conflict}"; then
+          cargo_version_conflicts=false
+          break
+        fi
+      done
+
+      if [[ "${cargo_version_conflicts}" == "true" ]]; then
+        echo "Auto-resolving recurring Cargo version checkpoint conflicts by keeping ${source_branch} versions."
+        git add -- "${remaining_conflicts[@]}"
+      fi
+    fi
   fi
 
   mapfile -t remaining_conflicts < <(git diff --name-only --diff-filter=U)
@@ -98,7 +191,7 @@ if ! git merge --no-ff --no-edit "${source_sha}"; then
   else
     merge_conflicted=true
     conflict_summary="$(
-      printf '%s\n' "${remaining_conflicts[@]}" | sed 's/^/- `&`/'
+      printf '%s\n' "${remaining_conflicts[@]}" | sed 's/.*/- `&`/'
     )"
     echo "Automatic checkpoint merge failed; creating a manual-resolution PR instead." >&2
     if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
