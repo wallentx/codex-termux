@@ -1,13 +1,9 @@
-use codex_config::ConfigLayerStack;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ModelClient;
 use codex_core::NewThread;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_core::ThreadManager;
-use codex_core::resolve_installation_id;
-use codex_core::thread_store_from_config;
-use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -16,6 +12,7 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
+use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
@@ -74,7 +71,6 @@ use std::io::Write;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use tempfile::TempDir;
-use toml::toml;
 use uuid::Uuid;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -292,6 +288,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::InputText {
             text: "resumed user message".to_string(),
         }],
+        end_turn: None,
         phase: None,
     };
     let prior_user_json = serde_json::to_value(&prior_user).unwrap();
@@ -313,6 +310,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::OutputText {
             text: "resumed system instruction".to_string(),
         }],
+        end_turn: None,
         phase: None,
     };
     let prior_system_json = serde_json::to_value(&prior_system).unwrap();
@@ -334,6 +332,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::OutputText {
             text: "resumed assistant message".to_string(),
         }],
+        end_turn: None,
         phase: Some(MessagePhase::Commentary),
     };
     let prior_item_json = serde_json::to_value(&prior_item).unwrap();
@@ -516,6 +515,7 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
                     image_url: legacy_image_url.to_string(),
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 }],
+                end_turn: None,
                 phase: None,
             }),
         },
@@ -726,7 +726,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn includes_session_id_thread_id_and_model_headers_in_request() {
+async fn includes_conversation_id_and_model_headers_in_request() {
     skip_if_no_network!();
 
     // Mock server
@@ -744,8 +744,7 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
         .await
         .expect("create new conversation");
     let codex = test.codex.clone();
-    let expected_session_id = test.session_configured.session_id;
-    let expected_thread_id = test.session_configured.thread_id;
+    let session_id = test.session_configured.session_id;
 
     codex
         .submit(Op::UserInput {
@@ -765,9 +764,6 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     let request = resp_mock.single_request();
     assert_eq!(request.path(), "/v1/responses");
     let request_session_id = request.header("session_id").expect("session_id header");
-    let request_session_id_hyphenated = request.header("session-id").expect("session-id header");
-    let request_thread_id = request.header("thread_id").expect("thread_id header");
-    let request_thread_id_hyphenated = request.header("thread-id").expect("thread-id header");
     let request_authorization = request
         .header("authorization")
         .expect("authorization header");
@@ -776,21 +772,10 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     let installation_id =
         std::fs::read_to_string(test.codex_home_path().join(INSTALLATION_ID_FILENAME))
             .expect("read installation id");
-    let thread_id_string = expected_thread_id.to_string();
 
-    assert_eq!(request_session_id, expected_session_id.to_string());
-    assert_eq!(
-        request_session_id_hyphenated,
-        expected_session_id.to_string()
-    );
-    assert_eq!(request_thread_id, thread_id_string.as_str());
-    assert_eq!(request_thread_id_hyphenated, thread_id_string.as_str());
+    assert_eq!(request_session_id, session_id.to_string());
     assert_eq!(request_originator, originator().value);
     assert_eq!(request_authorization, "Bearer Test API Key");
-    assert_eq!(
-        request_body["prompt_cache_key"].as_str(),
-        Some(thread_id_string.as_str())
-    );
     assert_eq!(
         request_body["client_metadata"]["x-codex-installation-id"].as_str(),
         Some(installation_id.as_str())
@@ -882,9 +867,9 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
     let config = Arc::new(config);
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
-    let thread_id = ThreadId::new();
+    let conversation_id = ThreadId::new();
     let session_telemetry = SessionTelemetry::new(
-        thread_id,
+        conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
         /*account_id*/ None,
@@ -899,8 +884,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
             "unused-api-key",
         ))),
-        thread_id.into(),
-        thread_id,
+        conversation_id,
         /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
         provider,
         SessionSource::Exec,
@@ -908,7 +892,6 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*attestation_provider*/ None,
     );
     let mut client_session = client.new_session();
     let mut prompt = Prompt::default();
@@ -918,6 +901,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         content: vec![ContentItem::InputText {
             text: "hello".to_string(),
         }],
+        end_turn: None,
         phase: None,
     });
 
@@ -1017,8 +1001,7 @@ async fn chatgpt_auth_sends_correct_request() {
         .await
         .expect("create new conversation");
     let codex = test.codex.clone();
-    let expected_session_id = test.session_configured.session_id;
-    let expected_thread_id = test.session_configured.thread_id;
+    let thread_id = test.session_configured.session_id;
 
     codex
         .submit(Op::UserInput {
@@ -1046,20 +1029,11 @@ async fn chatgpt_auth_sends_correct_request() {
         .expect("chatgpt-account-id header");
     let request_body = request.body_json();
 
-    let request_session_id = request.header("session_id").expect("session_id header");
-    let request_session_id_hyphenated = request.header("session-id").expect("session-id header");
-    let request_thread_id = request.header("thread_id").expect("thread_id header");
-    let request_thread_id_hyphenated = request.header("thread-id").expect("thread-id header");
+    let session_id = request.header("session_id").expect("session_id header");
     let installation_id =
         std::fs::read_to_string(test.codex_home_path().join(INSTALLATION_ID_FILENAME))
             .expect("read installation id");
-    assert_eq!(request_session_id, expected_session_id.to_string());
-    assert_eq!(
-        request_session_id_hyphenated,
-        expected_session_id.to_string()
-    );
-    assert_eq!(request_thread_id, expected_thread_id.to_string());
-    assert_eq!(request_thread_id_hyphenated, expected_thread_id.to_string());
+    assert_eq!(session_id, thread_id.to_string());
 
     assert_eq!(request_originator, originator().value);
     assert_eq!(request_authorization, "Bearer Access Token");
@@ -1119,34 +1093,26 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider = model_provider;
 
-    let auth_manager = match CodexAuth::from_auth_storage(
-        codex_home.path(),
-        AuthCredentialsStoreMode::File,
-        /*chatgpt_base_url*/ None,
-    )
-    .await
-    {
-        Ok(Some(auth)) => codex_core::test_support::auth_manager_from_auth(auth),
-        Ok(None) => panic!("No CodexAuth found in codex_home"),
-        Err(e) => panic!("Failed to load CodexAuth: {e}"),
-    };
-    let installation_id = resolve_installation_id(&config.codex_home)
-        .await
-        .expect("resolve installation id");
+    let auth_manager =
+        match CodexAuth::from_auth_storage(codex_home.path(), AuthCredentialsStoreMode::File) {
+            Ok(Some(auth)) => codex_core::test_support::auth_manager_from_auth(auth),
+            Ok(None) => panic!("No CodexAuth found in codex_home"),
+            Err(e) => panic!("Failed to load CodexAuth: {e}"),
+        };
     let thread_manager = ThreadManager::new(
         &config,
         auth_manager,
         SessionSource::Exec,
+        CollaborationModesConfig {
+            default_mode_request_user_input: config
+                .features
+                .enabled(Feature::DefaultModeRequestUserInput),
+        },
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        empty_extension_registry(),
         /*analytics_events_client*/ None,
-        thread_store_from_config(&config, /*state_db*/ None),
-        /*state_db*/ None,
-        installation_id,
-        /*attestation_provider*/ None,
     );
     let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(config.clone())
+        .start_thread(config)
         .await
         .expect("create new conversation");
 
@@ -1528,95 +1494,6 @@ async fn skills_append_to_developer_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
-    skip_if_no_network!();
-    let server = MockServer::start().await;
-
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-
-    let codex_home_parent = TempDir::new().unwrap();
-    let long_home_parent = codex_home_parent
-        .path()
-        .join("codex-home-with-long-shared-prefix-for-skill-alias-budget-test");
-    std::fs::create_dir_all(&long_home_parent).expect("create long home parent");
-    let codex_home = Arc::new(TempDir::new_in(long_home_parent).unwrap());
-    let skill_root = codex_home.path().join("skills");
-    for index in 0..12 {
-        let skill_dir = skill_root.join(format!("s{index:02}"));
-        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            format!("---\nname: s{index:02}\ndescription: d\n---\n\n# body\n"),
-        )
-        .expect("write skill");
-    }
-
-    let codex_home_path = codex_home.path().to_path_buf();
-    let mut builder = test_codex()
-        .with_home(codex_home.clone())
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
-        .with_config(move |config| {
-            config.cwd = codex_home_path.abs();
-            let user_config_path = codex_home_path.join("config.toml").abs();
-            config.config_layer_stack = ConfigLayerStack::default().with_user_config(
-                &user_config_path,
-                toml! { skills = { bundled = { enabled = false } } }.into(),
-            );
-            config.model_context_window = Some(12_000);
-        });
-    let codex = builder
-        .build(&server)
-        .await
-        .expect("create new conversation")
-        .codex;
-
-    codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let developer_messages = request.message_input_texts("developer");
-    let developer_text = developer_messages.join("\n\n");
-    let expected_root = normalize_path(skill_root).unwrap();
-    let expected_root_str = expected_root.to_string_lossy().replace('\\', "/");
-    assert!(
-        developer_text.contains("### Skill roots"),
-        "expected aliased skills root section: {developer_messages:?}"
-    );
-    assert!(
-        developer_text.contains(&format!("- `r0` = `{expected_root_str}`")),
-        "expected root alias for {expected_root_str}: {developer_messages:?}"
-    );
-    assert!(
-        developer_text.contains("- s00: d (file: r0/s00/SKILL.md)"),
-        "expected skill path to use root alias: {developer_messages:?}"
-    );
-    assert!(
-        developer_text.contains(
-            "expand the listed short `path` with the matching alias from `### Skill roots`"
-        ),
-        "expected alias-specific skill instructions: {developer_messages:?}"
-    );
-    let _codex_home_guard = codex_home;
-    let _codex_home_parent_guard = codex_home_parent;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
@@ -1698,7 +1575,7 @@ async fn includes_no_effort_in_request() -> anyhow::Result<()> {
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("xhigh")
     );
 
     Ok(())
@@ -1740,7 +1617,7 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
             .get("reasoning")
             .and_then(|t| t.get("effort"))
             .and_then(|v| v.as_str()),
-        Some("medium")
+        Some("xhigh")
     );
 
     Ok(())
@@ -1782,7 +1659,7 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
             cwd: config.cwd.to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.legacy_sandbox_policy(),
+            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
             permission_profile: None,
             model: session_configured.model.clone(),
             effort: Some(ReasoningEffort::Low),
@@ -1904,7 +1781,7 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
             cwd: config.cwd.to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.legacy_sandbox_policy(),
+            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
             permission_profile: None,
             model: session_configured.model,
             effort: None,
@@ -2304,11 +2181,11 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
     let config = Arc::new(config);
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
-    let thread_id = ThreadId::new();
+    let conversation_id = ThreadId::new();
     let auth_manager =
         codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"));
     let session_telemetry = SessionTelemetry::new(
-        thread_id,
+        conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
         /*account_id*/ None,
@@ -2322,8 +2199,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        thread_id.into(),
-        thread_id,
+        conversation_id,
         /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
         provider.clone(),
         SessionSource::Exec,
@@ -2331,7 +2207,6 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*attestation_provider*/ None,
     );
     let mut client_session = client.new_session();
 
@@ -2352,6 +2227,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         content: vec![ContentItem::OutputText {
             text: "message".into(),
         }],
+        end_turn: None,
         phase: None,
     });
     prompt.input.push(ResponseItem::WebSearchCall {

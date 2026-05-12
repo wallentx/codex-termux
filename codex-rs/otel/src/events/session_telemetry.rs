@@ -18,11 +18,9 @@ use crate::metrics::RESPONSES_API_OVERHEAD_DURATION_METRIC;
 use crate::metrics::Result as MetricsResult;
 use crate::metrics::SSE_EVENT_COUNT_METRIC;
 use crate::metrics::SSE_EVENT_DURATION_METRIC;
-use crate::metrics::STARTUP_PHASE_DURATION_METRIC;
 use crate::metrics::SessionMetricTagValues;
 use crate::metrics::TOOL_CALL_COUNT_METRIC;
 use crate::metrics::TOOL_CALL_DURATION_METRIC;
-use crate::metrics::TURN_TTFT_DURATION_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_COUNT_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_DURATION_METRIC;
 use crate::metrics::WEBSOCKET_REQUEST_COUNT_METRIC;
@@ -185,45 +183,6 @@ impl SessionTelemetry {
         }
     }
 
-    /// Records a coarse startup phase for production latency breakdowns.
-    pub fn record_startup_phase(
-        &self,
-        phase: &'static str,
-        duration: Duration,
-        status: Option<&'static str>,
-    ) {
-        let tags = match status {
-            Some(status) => vec![("phase", phase), ("status", status)],
-            None => vec![("phase", phase)],
-        };
-        self.record_duration(STARTUP_PHASE_DURATION_METRIC, duration, &tags);
-        log_and_trace_event!(
-            self,
-            common: {
-                event.name = "codex.startup_phase",
-                startup.phase = phase,
-                startup.status = status,
-                duration_ms = %duration.as_millis(),
-            },
-            log: {},
-            trace: {},
-        );
-    }
-
-    /// Records time to first token as both a metric and a production telemetry event.
-    pub fn record_turn_ttft(&self, duration: Duration) {
-        self.record_duration(TURN_TTFT_DURATION_METRIC, duration, &[]);
-        log_and_trace_event!(
-            self,
-            common: {
-                event.name = "codex.turn_ttft",
-                duration_ms = %duration.as_millis(),
-            },
-            log: {},
-            trace: {},
-        );
-    }
-
     pub fn start_timer(&self, name: &str, tags: &[(&str, &str)]) -> Result<Timer, MetricsError> {
         let Some(metrics) = &self.metrics else {
             return Err(MetricsError::ExporterDisabled);
@@ -345,23 +304,6 @@ impl SessionTelemetry {
                 if let ResponseItem::FunctionCall { name, .. } = item {
                     handle_responses_span.record("tool_name", name.as_str());
                 }
-            }
-            ResponseEvent::Completed {
-                token_usage: Some(token_usage),
-                ..
-            } => {
-                handle_responses_span.record("gen_ai.usage.input_tokens", token_usage.input_tokens);
-                handle_responses_span.record(
-                    "gen_ai.usage.cache_read.input_tokens",
-                    token_usage.cached_input(),
-                );
-                handle_responses_span
-                    .record("gen_ai.usage.output_tokens", token_usage.output_tokens);
-                handle_responses_span.record(
-                    "codex.usage.reasoning_output_tokens",
-                    token_usage.reasoning_output_tokens,
-                );
-                handle_responses_span.record("codex.usage.total_tokens", token_usage.total_tokens);
             }
             _ => {}
         }
@@ -1136,8 +1078,8 @@ impl SessionTelemetry {
             ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output".into(),
             ResponseItem::WebSearchCall { .. } => "web_search_call".into(),
             ResponseItem::ImageGenerationCall { .. } => "image_generation_call".into(),
+            ResponseItem::GhostSnapshot { .. } => "ghost_snapshot".into(),
             ResponseItem::Compaction { .. } => "compaction".into(),
-            ResponseItem::ContextCompaction { .. } => "context_compaction".into(),
             ResponseItem::Other => "other".into(),
         }
     }

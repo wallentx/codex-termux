@@ -17,7 +17,6 @@ use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
 use crate::shell::ShellType;
-use crate::tools::flat_tool_name;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::build_sandbox_command;
@@ -28,11 +27,13 @@ use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
+use crate::tools::sandboxing::SandboxOverride;
 use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
+use crate::tools::sandboxing::sandbox_override_for_first_attempt;
 use crate::tools::sandboxing::with_cached_approval;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -208,8 +209,8 @@ impl Approvable<ShellRequest> for ShellRuntime {
         ))
     }
 
-    fn sandbox_permissions(&self, req: &ShellRequest) -> SandboxPermissions {
-        req.sandbox_permissions
+    fn sandbox_mode_for_first_attempt(&self, req: &ShellRequest) -> SandboxOverride {
+        sandbox_override_for_first_attempt(req.sandbox_permissions, &req.exec_approval_requirement)
     }
 }
 
@@ -226,7 +227,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             mode: NetworkApprovalMode::Immediate,
             trigger: GuardianNetworkAccessTrigger {
                 call_id: ctx.call_id.clone(),
-                tool_name: flat_tool_name(&ctx.tool_name).into_owned(),
+                tool_name: ctx.tool_name.clone(),
                 command: req.command.clone(),
                 cwd: req.cwd.clone(),
                 sandbox_permissions: req.sandbox_permissions,
@@ -274,12 +275,8 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
 
         let command =
             build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;
-        let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
-        if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
-            expiration = expiration.with_cancellation(cancellation);
-        }
         let options = ExecOptions {
-            expiration,
+            expiration: req.timeout_ms.into(),
             capture_policy: ExecCapturePolicy::ShellTool,
         };
         let env = attempt

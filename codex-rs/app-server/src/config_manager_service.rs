@@ -12,16 +12,16 @@ use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::OverriddenMetadata;
 use codex_app_server_protocol::WriteStatus;
 use codex_config::CONFIG_TOML_FILE;
-use codex_config::ConfigLayerEntry;
-use codex_config::ConfigLayerStack;
-use codex_config::ConfigLayerStackOrdering;
-use codex_config::ConfigRequirementsToml;
 use codex_config::config_toml::ConfigToml;
-use codex_config::merge_toml_values;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::validate_feature_requirements_for_config_toml;
+use codex_core::config_loader::ConfigLayerEntry;
+use codex_core::config_loader::ConfigLayerStack;
+use codex_core::config_loader::ConfigLayerStackOrdering;
+use codex_core::config_loader::ConfigRequirementsToml;
+use codex_core::config_loader::merge_toml_values;
 use codex_core::path_utils;
 use codex_core::path_utils::SymlinkWritePaths;
 use codex_core::path_utils::resolve_symlink_write_paths;
@@ -244,6 +244,10 @@ impl ConfigManager {
 
             apply_merge(&mut user_config, &segments, parsed_value.as_ref(), strategy).map_err(
                 |err| match err {
+                    MergeError::PathNotFound => ConfigManagerError::write(
+                        ConfigWriteErrorCode::ConfigPathNotFound,
+                        "Path not found",
+                    ),
                     MergeError::Validation(message) => ConfigManagerError::write(
                         ConfigWriteErrorCode::ConfigValidationError,
                         message,
@@ -409,6 +413,7 @@ fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
 
 #[derive(Debug)]
 enum MergeError {
+    PathNotFound,
     Validation(String),
 }
 
@@ -480,17 +485,14 @@ fn clear_path(root: &mut TomlValue, segments: &[String]) -> Result<bool, MergeEr
     for segment in parents {
         match current {
             TomlValue::Table(table) => {
-                let Some(next) = table.get_mut(segment) else {
-                    return Ok(false);
-                };
-                current = next;
+                current = table.get_mut(segment).ok_or(MergeError::PathNotFound)?;
             }
-            _ => return Ok(false),
+            _ => return Err(MergeError::PathNotFound),
         }
     }
 
     let Some(parent) = current.as_table_mut() else {
-        return Ok(false);
+        return Err(MergeError::PathNotFound);
     };
 
     Ok(parent.remove(last).is_some())
