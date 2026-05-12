@@ -13,20 +13,16 @@ pub enum SlashCommand {
     // DO NOT ALPHA-SORT! Enum order is presentation order in the popup, so
     // more frequently used commands should be listed first.
     Model,
-    Ide,
+    Fast,
+    Approvals,
     Permissions,
-    Keymap,
-    Vim,
     #[strum(serialize = "setup-default-sandbox")]
     ElevateSandbox,
     #[strum(serialize = "sandbox-add-read-dir")]
     SandboxReadRoot,
     Experimental,
-    #[strum(to_string = "approve")]
-    AutoReview,
     Memories,
     Skills,
-    Hooks,
     Review,
     Rename,
     New,
@@ -35,12 +31,11 @@ pub enum SlashCommand {
     Init,
     Compact,
     Plan,
-    Goal,
     Collab,
     Agent,
     Side,
+    // Undo,
     Copy,
-    Raw,
     Diff,
     Mention,
     Status,
@@ -86,13 +81,12 @@ impl SlashCommand {
             SlashCommand::Resume => "resume a saved chat",
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
+            // SlashCommand::Undo => "ask Codex to undo a turn",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Copy => "copy last response as markdown",
-            SlashCommand::Raw => "toggle raw scrollback mode for copy-friendly terminal selection",
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
-            SlashCommand::Hooks => "view and manage lifecycle hooks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Title => "configure which items appear in the terminal title",
@@ -103,26 +97,23 @@ impl SlashCommand {
             SlashCommand::MemoryDrop => "DO NOT USE",
             SlashCommand::MemoryUpdate => "DO NOT USE",
             SlashCommand::Model => "choose what model and reasoning effort to use",
-            SlashCommand::Ide => {
-                "include current selection, open files, and other context from your IDE"
+            SlashCommand::Fast => {
+                "toggle Fast mode to enable fastest inference with increased plan usage"
             }
             SlashCommand::Personality => "choose a communication style for Codex",
             SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
             SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
-            SlashCommand::Goal => "set or view the goal for a long-running task",
             SlashCommand::Collab => "change collaboration mode (experimental)",
             SlashCommand::Agent | SlashCommand::MultiAgents => "switch the active agent thread",
             SlashCommand::Side => "start a side conversation in an ephemeral fork",
+            SlashCommand::Approvals => "choose what Codex is allowed to do",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
-            SlashCommand::Keymap => "remap TUI shortcuts",
-            SlashCommand::Vim => "toggle Vim mode for the composer",
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
             SlashCommand::SandboxReadRoot => {
                 "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
             }
             SlashCommand::Experimental => "toggle experimental features",
-            SlashCommand::AutoReview => "approve one retry of a recent auto-review denial",
             SlashCommand::Memories => "configure memory use and generation",
             SlashCommand::Mcp => "list configured MCP tools; use /mcp verbose for details",
             SlashCommand::Apps => "manage apps",
@@ -146,11 +137,8 @@ impl SlashCommand {
             SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
-                | SlashCommand::Goal
-                | SlashCommand::Ide
-                | SlashCommand::Keymap
+                | SlashCommand::Fast
                 | SlashCommand::Mcp
-                | SlashCommand::Raw
                 | SlashCommand::Side
                 | SlashCommand::Resume
                 | SlashCommand::SandboxReadRoot
@@ -161,12 +149,7 @@ impl SlashCommand {
     pub fn available_in_side_conversation(self) -> bool {
         matches!(
             self,
-            SlashCommand::Copy
-                | SlashCommand::Raw
-                | SlashCommand::Diff
-                | SlashCommand::Mention
-                | SlashCommand::Status
-                | SlashCommand::Ide
+            SlashCommand::Copy | SlashCommand::Diff | SlashCommand::Mention | SlashCommand::Status
         )
     }
 
@@ -178,11 +161,12 @@ impl SlashCommand {
             | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact
+            // | SlashCommand::Undo
             | SlashCommand::Model
+            | SlashCommand::Fast
             | SlashCommand::Personality
+            | SlashCommand::Approvals
             | SlashCommand::Permissions
-            | SlashCommand::Keymap
-            | SlashCommand::Vim
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
@@ -195,24 +179,17 @@ impl SlashCommand {
             | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff
             | SlashCommand::Copy
-            | SlashCommand::Raw
             | SlashCommand::Rename
             | SlashCommand::Mention
             | SlashCommand::Skills
-            | SlashCommand::Hooks
             | SlashCommand::Status
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Stop
-            | SlashCommand::Goal
             | SlashCommand::Mcp
             | SlashCommand::Apps
             | SlashCommand::Plugins
-            | SlashCommand::Title
-            | SlashCommand::Statusline
-            | SlashCommand::AutoReview
             | SlashCommand::Feedback
-            | SlashCommand::Ide
             | SlashCommand::Quit
             | SlashCommand::Exit
             | SlashCommand::Side => true,
@@ -222,7 +199,9 @@ impl SlashCommand {
             SlashCommand::Settings => true,
             SlashCommand::Collab => true,
             SlashCommand::Agent | SlashCommand::MultiAgents => true,
+            SlashCommand::Statusline => false,
             SlashCommand::Theme => false,
+            SlashCommand::Title => false,
         }
     }
 
@@ -259,25 +238,5 @@ mod tests {
     #[test]
     fn clean_alias_parses_to_stop_command() {
         assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
-    }
-
-    #[test]
-    fn certain_commands_are_available_during_task() {
-        assert!(SlashCommand::Goal.available_during_task());
-        assert!(SlashCommand::Ide.available_during_task());
-        assert!(SlashCommand::Title.available_during_task());
-        assert!(SlashCommand::Statusline.available_during_task());
-        assert!(SlashCommand::Raw.available_during_task());
-        assert!(SlashCommand::Raw.available_in_side_conversation());
-        assert!(SlashCommand::Raw.supports_inline_args());
-    }
-
-    #[test]
-    fn auto_review_command_is_approve() {
-        assert_eq!(SlashCommand::AutoReview.command(), "approve");
-        assert_eq!(
-            SlashCommand::from_str("approve"),
-            Ok(SlashCommand::AutoReview)
-        );
     }
 }

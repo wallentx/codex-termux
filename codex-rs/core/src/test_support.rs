@@ -73,22 +73,6 @@ pub fn thread_manager_with_models_provider_and_home(
     )
 }
 
-pub fn thread_manager_with_models_provider_home_and_state(
-    auth: CodexAuth,
-    provider: ModelProviderInfo,
-    codex_home: PathBuf,
-    environment_manager: Arc<EnvironmentManager>,
-    state_db: Option<crate::StateDbHandle>,
-) -> ThreadManager {
-    ThreadManager::with_models_provider_home_and_state_for_tests(
-        auth,
-        provider,
-        codex_home,
-        environment_manager,
-        state_db,
-    )
-}
-
 pub async fn start_thread_with_user_shell_override(
     thread_manager: &ThreadManager,
     config: Config,
@@ -122,7 +106,11 @@ pub fn models_manager_with_provider(
     provider: ModelProviderInfo,
 ) -> SharedModelsManager {
     let provider = create_model_provider(provider, Some(auth_manager));
-    provider.models_manager(codex_home, /*config_model_catalog*/ None)
+    provider.models_manager(
+        codex_home,
+        /*config_model_catalog*/ None,
+        Default::default(),
+    )
 }
 
 pub fn get_model_offline(model: Option<&str>) -> String {
@@ -138,5 +126,7 @@ pub fn all_model_presets() -> &'static Vec<ModelPreset> {
 }
 
 pub fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
-    collaboration_mode_presets::builtin_collaboration_mode_presets()
+    collaboration_mode_presets::builtin_collaboration_mode_presets(
+        collaboration_mode_presets::CollaborationModesConfig::default(),
+    )
 }
