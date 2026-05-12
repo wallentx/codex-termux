@@ -27,8 +27,28 @@ find_run_id() {
     --jq '.[0].databaseId // empty'
 }
 
+find_artifact_run_id() {
+  local artifact_name="$1"
+
+  gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}" \
+    | jq -rs \
+      --arg artifact_name "${artifact_name}" \
+      --arg head_sha "${HEAD_SHA}" \
+      '
+        [
+          .[].artifacts[]
+          | select(.name == $artifact_name)
+          | select(.expired == false)
+          | select(.workflow_run.head_sha == $head_sha)
+        ]
+        | sort_by(.created_at)
+        | reverse
+        | .[0].workflow_run.id // empty
+      '
+}
+
 artifact_name="${PR_ARTIFACT_NAME}"
-run_id="$(find_run_id pull_request)"
+run_id="$(find_artifact_run_id "${artifact_name}")"
 mkdir -p "${promoted_dir}"
 if [[ -n "${run_id}" ]] && gh run download "${run_id}" \
   --repo "${GITHUB_REPOSITORY}" \
