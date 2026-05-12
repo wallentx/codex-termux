@@ -45,6 +45,7 @@ jobs:
       upstream_prerelease: ${{ steps.upstream.outputs.upstream_prerelease }}
       upstream_target: ${{ steps.upstream.outputs.upstream_target }}
       upstream_id: ${{ steps.upstream.outputs.upstream_id }}
+      release_kind: ${{ steps.upstream.outputs.release_kind }}
       release_train: ${{ steps.upstream.outputs.release_train }}
       release_branch: ${{ steps.upstream.outputs.release_branch }}
       work_branch: ${{ steps.upstream.outputs.work_branch }}
@@ -187,115 +188,191 @@ jobs:
             [[ "${newest_version}" == "${candidate_version}" && "${candidate_version}" != "${current_version}" ]]
           }
 
+          release_json_for_tag() {
+            local tag="$1"
+            gh release view "${tag}" \
+              --repo "${UPSTREAM_REPO}" \
+              --json tagName,name,body,url,isPrerelease,targetCommitish,databaseId
+          }
+
+          emit_selected_release() {
+            local release_kind="$1"
+            local release_json="$2"
+            local release_train="${3:-}"
+            local release_branch="${4:-}"
+            local work_branch="${5:-}"
+            local termux_tag="${6:-}"
+            local upstream_tag
+            local upstream_name
+            local upstream_body
+            local upstream_html_url
+            local upstream_prerelease
+            local upstream_target
+            local upstream_id
+
+            upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
+            upstream_name="$(jq -r '.name // .tagName' <<< "${release_json}")"
+            upstream_body="$(jq -r '.body // ""' <<< "${release_json}")"
+            upstream_html_url="$(jq -r '.url' <<< "${release_json}")"
+            upstream_prerelease="$(jq -r '.isPrerelease' <<< "${release_json}")"
+            upstream_target="$(jq -r '.targetCommitish // ""' <<< "${release_json}")"
+            upstream_id="$(jq -r '.databaseId // ""' <<< "${release_json}")"
+
+            {
+              echo "selected=true"
+              echo "release_kind=${release_kind}"
+              echo "upstream_tag=${upstream_tag}"
+              echo "upstream_name=${upstream_name}"
+              echo "upstream_html_url=${upstream_html_url}"
+              echo "upstream_prerelease=${upstream_prerelease}"
+              echo "upstream_target=${upstream_target}"
+              echo "upstream_id=${upstream_id}"
+              echo "release_train=${release_train}"
+              echo "release_branch=${release_branch}"
+              echo "work_branch=${work_branch}"
+              echo "termux_tag=${termux_tag}"
+            } >> "$GITHUB_OUTPUT"
+
+            {
+              echo "body<<EOF"
+              printf '%s\n' "${upstream_body}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          maybe_select_rusty_v8_release() {
+            local release_json="$1"
+            local upstream_tag
+
+            upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
+            if [[ "${upstream_tag}" != rusty-v8-v* ]]; then
+              return 1
+            fi
+
+            if gh release view "${upstream_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              echo "${upstream_tag} already exists in ${GITHUB_REPOSITORY}; nothing to do."
+              return 1
+            fi
+
+            emit_selected_release "rusty-v8" "${release_json}" "" "" "" "${upstream_tag}"
+            return 0
+          }
+
+          maybe_select_codex_release() {
+            local release_json="$1"
+            local upstream_tag
+            local version
+            local release_train
+            local release_branch
+            local work_branch
+            local termux_tag
+
+            upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
+            if [[ "${upstream_tag}" != rust-v* ]]; then
+              return 1
+            fi
+
+            version="${upstream_tag#rust-v}"
+            version="${version%-termux}"
+            release_train="${version%%-*}"
+            release_branch="release/${release_train}"
+            work_branch="upstream/${upstream_tag}"
+            termux_tag="${upstream_tag}-termux"
+
+            if ! release_tag_is_newer_than_current_train "${upstream_tag}" "${release_branch}"; then
+              current_tag="$(release_branch_current_tag "${release_branch}")"
+              echo "${upstream_tag} is not newer than ${current_tag} already recorded on ${release_branch}; nothing to do."
+              return 1
+            fi
+
+            if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              echo "${termux_tag} already exists; nothing to do."
+              return 1
+            fi
+
+            if [[ -z "${REQUESTED_TAG}" ]]; then
+              pending_release_train_prs="$(open_release_train_prs_for_branch "${release_branch}")"
+              if [[ -n "${pending_release_train_prs}" ]]; then
+                echo "${upstream_tag} is newer, but ${release_branch} already has an open release train PR; waiting for it to merge and deploy."
+                printf '%s\n' "${pending_release_train_prs}"
+                return 1
+              fi
+
+              current_termux_tag="$(release_branch_current_termux_tag "${release_branch}")"
+              if [[ -n "${current_termux_tag}" && "${current_termux_tag}" != "${termux_tag}" ]]; then
+                if ! gh release view "${current_termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+                  echo "${upstream_tag} is newer, but ${release_branch} is still waiting for ${current_termux_tag} to be deployed."
+                  return 1
+                fi
+              fi
+            fi
+
+            emit_selected_release "codex" \
+              "${release_json}" \
+              "${release_train}" \
+              "${release_branch}" \
+              "${work_branch}" \
+              "${termux_tag}"
+            return 0
+          }
+
+          maybe_select_release() {
+            local release_json="$1"
+            local upstream_tag
+
+            upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
+            case "${upstream_tag}" in
+              rust-v*)
+                maybe_select_codex_release "${release_json}"
+                ;;
+              rusty-v8-v*)
+                maybe_select_rusty_v8_release "${release_json}"
+                ;;
+              *)
+                echo "Skipping unsupported upstream release tag: ${upstream_tag}"
+                return 1
+                ;;
+            esac
+          }
+
           if [[ -n "${REQUESTED_TAG}" ]]; then
-            release_json="$(
-              gh release view "${REQUESTED_TAG}" \
-                --repo "${UPSTREAM_REPO}" \
-                --json tagName,name,body,url,isPrerelease,targetCommitish,databaseId
-            )"
+            release_json="$(release_json_for_tag "${REQUESTED_TAG}")"
+            if maybe_select_release "${release_json}"; then
+              exit 0
+            fi
           else
-            upstream_tag="$(
+            mapfile -t upstream_tags < <(
               gh release list \
                 --repo "${UPSTREAM_REPO}" \
                 --exclude-drafts \
-                --limit 1 \
+                --limit 30 \
                 --json tagName \
-                --jq '.[0].tagName // empty'
-            )"
-            if [[ -z "${upstream_tag}" ]]; then
-              release_json=""
-            else
-              release_json="$(
-                gh release view "${upstream_tag}" \
-                  --repo "${UPSTREAM_REPO}" \
-                  --json tagName,name,body,url,isPrerelease,targetCommitish,databaseId
-              )"
-            fi
+                --jq '.[].tagName'
+            )
+
+            for upstream_tag in "${upstream_tags[@]}"; do
+              case "${upstream_tag}" in
+                rust-v* | rusty-v8-v*)
+                  release_json="$(release_json_for_tag "${upstream_tag}")"
+                  if maybe_select_release "${release_json}"; then
+                    exit 0
+                  fi
+                  ;;
+                *)
+                  echo "Skipping unsupported upstream release tag: ${upstream_tag}"
+                  ;;
+              esac
+            done
           fi
 
-          if [[ -z "${release_json}" ]]; then
-            echo "No upstream release or prerelease needs a Termux mirror."
-            echo "selected=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
-          upstream_name="$(jq -r '.name // .tagName' <<< "${release_json}")"
-          upstream_body="$(jq -r '.body // ""' <<< "${release_json}")"
-          upstream_html_url="$(jq -r '.url' <<< "${release_json}")"
-          upstream_prerelease="$(jq -r '.isPrerelease' <<< "${release_json}")"
-          upstream_target="$(jq -r '.targetCommitish // ""' <<< "${release_json}")"
-          upstream_id="$(jq -r '.databaseId // ""' <<< "${release_json}")"
-          if [[ -z "${upstream_tag}" || "${upstream_tag}" != rust-v* ]]; then
-            echo "Latest upstream release is not a rust release: ${upstream_tag}" >&2
-            echo "selected=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          version="${upstream_tag#rust-v}"
-          version="${version%-termux}"
-          release_train="${version%%-*}"
-          release_branch="release/${release_train}"
-          work_branch="upstream/${upstream_tag}"
-          termux_tag="${upstream_tag}-termux"
-
-          if ! release_tag_is_newer_than_current_train "${upstream_tag}" "${release_branch}"; then
-            current_tag="$(release_branch_current_tag "${release_branch}")"
-            echo "${upstream_tag} is not newer than ${current_tag} already recorded on ${release_branch}; nothing to do."
-            echo "selected=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "${termux_tag} already exists; nothing to do."
-            echo "selected=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ -z "${REQUESTED_TAG}" ]]; then
-            pending_release_train_prs="$(open_release_train_prs_for_branch "${release_branch}")"
-            if [[ -n "${pending_release_train_prs}" ]]; then
-              echo "${upstream_tag} is newer, but ${release_branch} already has an open release train PR; waiting for it to merge and deploy."
-              printf '%s\n' "${pending_release_train_prs}"
-              echo "selected=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            current_termux_tag="$(release_branch_current_termux_tag "${release_branch}")"
-            if [[ -n "${current_termux_tag}" && "${current_termux_tag}" != "${termux_tag}" ]]; then
-              if ! gh release view "${current_termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-                echo "${upstream_tag} is newer, but ${release_branch} is still waiting for ${current_termux_tag} to be deployed."
-                echo "selected=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            fi
-          fi
-
-          {
-            echo "selected=true"
-            echo "upstream_tag=${upstream_tag}"
-            echo "upstream_name=${upstream_name}"
-            echo "upstream_html_url=${upstream_html_url}"
-            echo "upstream_prerelease=${upstream_prerelease}"
-            echo "upstream_target=${upstream_target}"
-            echo "upstream_id=${upstream_id}"
-            echo "release_train=${release_train}"
-            echo "release_branch=${release_branch}"
-            echo "work_branch=${work_branch}"
-            echo "termux_tag=${termux_tag}"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "body<<EOF"
-            printf '%s\n' "${upstream_body}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          echo "No upstream Codex or rusty_v8 release needs a Termux mirror."
+          echo "selected=false" >> "$GITHUB_OUTPUT"
 
   create-release-pr:
     needs:
       - look-for-newer-release
       - cleanup-completed-release-branches
-    if: needs.look-for-newer-release.outputs.selected == 'true' && needs.cleanup-completed-release-branches.result == 'success'
+    if: needs.look-for-newer-release.outputs.selected == 'true' && needs.look-for-newer-release.outputs.release_kind == 'codex' && needs.cleanup-completed-release-branches.result == 'success'
     runs-on: ubuntu-slim
     permissions:
       actions: write
@@ -306,6 +383,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       REVIEWER: ${{ inputs.reviewer || 'wallentx' }}
       UPSTREAM_REPO: openai/codex
+      UPSTREAM_TAG: ${{ needs.look-for-newer-release.outputs.upstream_tag }}
       PATCH_BRANCH: wallentx/termux-target
     steps:
       - name: Generate GitHub App token
@@ -337,7 +415,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
           git fetch --prune origin "${PATCH_BRANCH}"
-          git fetch --prune --tags upstream
+          git fetch --prune --no-tags upstream "+refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
 
       - name: Create or update release train PR
         id: pr
@@ -780,6 +858,53 @@ jobs:
           gh label create release-train --repo "${GITHUB_REPOSITORY}" --color 1d76db --description "Release train PR" --force
           gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-label "termux-release" --add-label "release-train"
           echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
+
+  mirror-rusty-v8-release:
+    needs:
+      - look-for-newer-release
+    if: needs.look-for-newer-release.outputs.selected == 'true' && needs.look-for-newer-release.outputs.release_kind == 'rusty-v8'
+    runs-on: ubuntu-slim
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_REPO: ${{ github.repository }}
+      UPSTREAM_REPO: openai/codex
+      UPSTREAM_TAG: ${{ needs.look-for-newer-release.outputs.upstream_tag }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout automation branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: 🧰 Actions Toolbox
+        # This is required for the GitHub CLI
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Dispatch rusty_v8 mirror workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching rusty-v8-release.yml for ${UPSTREAM_REPO}@${UPSTREAM_TAG}"
+          gh workflow run rusty-v8-release.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f "source_repository=${UPSTREAM_REPO}" \
+            -f "release_ref=${UPSTREAM_TAG}" \
+            -f "release_tag=${UPSTREAM_TAG}" \
+            -f "publish=true"
 
   cleanup-completed-release-branches:
     needs: look-for-newer-release
