@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::legacy_core::config::set_project_trust_level;
 use codex_protocol::config_types::TrustLevel;
+use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use ratatui::buffer::Buffer;
@@ -12,8 +13,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
 
-use crate::key_hint::KeyBindingListExt;
-use crate::onboarding::keys;
+use crate::key_hint;
 use crate::onboarding::onboarding_screen::KeyboardHandler;
 use crate::onboarding::onboarding_screen::StepStateProvider;
 use crate::render::Insets;
@@ -112,7 +112,7 @@ impl WidgetRef for &TrustDirectoryWidget {
         column.push(
             Line::from(vec![
                 "Press ".dim(),
-                keys::CONFIRM[0].into(),
+                key_hint::plain(KeyCode::Enter).into(),
                 if self.show_windows_create_sandbox_hint {
                     " to continue and create a sandbox...".dim()
                 } else {
@@ -134,22 +134,20 @@ impl KeyboardHandler for TrustDirectoryWidget {
             return;
         }
 
-        if keys::MOVE_UP.is_pressed(key_event) {
-            self.highlighted = TrustDirectorySelection::Trust;
-        } else if keys::MOVE_DOWN.is_pressed(key_event) {
-            self.highlighted = TrustDirectorySelection::Quit;
-        } else if keys::SELECT_FIRST.is_pressed(key_event) {
-            self.handle_trust();
-        } else if keys::SELECT_SECOND.is_pressed(key_event)
-            || keys::QUIT.is_pressed(key_event)
-            || keys::CANCEL.is_pressed(key_event)
-        {
-            self.handle_quit();
-        } else if keys::CONFIRM.is_pressed(key_event) {
-            match self.highlighted {
+        match key_event.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.highlighted = TrustDirectorySelection::Trust;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.highlighted = TrustDirectorySelection::Quit;
+            }
+            KeyCode::Char('1') | KeyCode::Char('y') => self.handle_trust(),
+            KeyCode::Char('2') | KeyCode::Char('n') => self.handle_quit(),
+            KeyCode::Enter => match self.highlighted {
                 TrustDirectorySelection::Trust => self.handle_trust(),
                 TrustDirectorySelection::Quit => self.handle_quit(),
-            }
+            },
+            _ => {}
         }
     }
 }

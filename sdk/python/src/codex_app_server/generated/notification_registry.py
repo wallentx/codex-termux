@@ -22,7 +22,6 @@ from .v2_all import FileChangePatchUpdatedNotification
 from .v2_all import FsChangedNotification
 from .v2_all import FuzzyFileSearchSessionCompletedNotification
 from .v2_all import FuzzyFileSearchSessionUpdatedNotification
-from .v2_all import GuardianWarningNotification
 from .v2_all import HookCompletedNotification
 from .v2_all import HookStartedNotification
 from .v2_all import ItemCompletedNotification
@@ -33,19 +32,15 @@ from .v2_all import McpServerOauthLoginCompletedNotification
 from .v2_all import McpServerStatusUpdatedNotification
 from .v2_all import McpToolCallProgressNotification
 from .v2_all import ModelReroutedNotification
-from .v2_all import ModelVerificationNotification
 from .v2_all import PlanDeltaNotification
 from .v2_all import ReasoningSummaryPartAddedNotification
 from .v2_all import ReasoningSummaryTextDeltaNotification
 from .v2_all import ReasoningTextDeltaNotification
-from .v2_all import RemoteControlStatusChangedNotification
 from .v2_all import ServerRequestResolvedNotification
 from .v2_all import SkillsChangedNotification
 from .v2_all import TerminalInteractionNotification
 from .v2_all import ThreadArchivedNotification
 from .v2_all import ThreadClosedNotification
-from .v2_all import ThreadGoalClearedNotification
-from .v2_all import ThreadGoalUpdatedNotification
 from .v2_all import ThreadNameUpdatedNotification
 from .v2_all import ThreadRealtimeClosedNotification
 from .v2_all import ThreadRealtimeErrorNotification
@@ -80,7 +75,6 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "fs/changed": FsChangedNotification,
     "fuzzyFileSearch/sessionCompleted": FuzzyFileSearchSessionCompletedNotification,
     "fuzzyFileSearch/sessionUpdated": FuzzyFileSearchSessionUpdatedNotification,
-    "guardianWarning": GuardianWarningNotification,
     "hook/completed": HookCompletedNotification,
     "hook/started": HookStartedNotification,
     "item/agentMessage/delta": AgentMessageDeltaNotification,
@@ -100,15 +94,11 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "mcpServer/oauthLogin/completed": McpServerOauthLoginCompletedNotification,
     "mcpServer/startupStatus/updated": McpServerStatusUpdatedNotification,
     "model/rerouted": ModelReroutedNotification,
-    "model/verification": ModelVerificationNotification,
-    "remoteControl/status/changed": RemoteControlStatusChangedNotification,
     "serverRequest/resolved": ServerRequestResolvedNotification,
     "skills/changed": SkillsChangedNotification,
     "thread/archived": ThreadArchivedNotification,
     "thread/closed": ThreadClosedNotification,
     "thread/compacted": ContextCompactedNotification,
-    "thread/goal/cleared": ThreadGoalClearedNotification,
-    "thread/goal/updated": ThreadGoalUpdatedNotification,
     "thread/name/updated": ThreadNameUpdatedNotification,
     "thread/realtime/closed": ThreadRealtimeClosedNotification,
     "thread/realtime/error": ThreadRealtimeErrorNotification,
@@ -130,3 +120,43 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "windows/worldWritableWarning": WindowsWorldWritableWarningNotification,
     "windowsSandbox/setupCompleted": WindowsSandboxSetupCompletedNotification,
 }
+
+DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
+    AgentMessageDeltaNotification,
+    CommandExecutionOutputDeltaNotification,
+    ContextCompactedNotification,
+    ErrorNotification,
+    FileChangeOutputDeltaNotification,
+    FileChangePatchUpdatedNotification,
+    HookCompletedNotification,
+    HookStartedNotification,
+    ItemCompletedNotification,
+    ItemGuardianApprovalReviewCompletedNotification,
+    ItemGuardianApprovalReviewStartedNotification,
+    ItemStartedNotification,
+    McpToolCallProgressNotification,
+    ModelReroutedNotification,
+    ModelVerificationNotification,
+    PlanDeltaNotification,
+    ReasoningSummaryPartAddedNotification,
+    ReasoningSummaryTextDeltaNotification,
+    ReasoningTextDeltaNotification,
+    TerminalInteractionNotification,
+    ThreadGoalUpdatedNotification,
+    ThreadTokenUsageUpdatedNotification,
+    TurnDiffUpdatedNotification,
+    TurnPlanUpdatedNotification,
+)
+
+NESTED_TURN_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = (
+    TurnCompletedNotification,
+    TurnStartedNotification,
+)
+
+
+def notification_turn_id(payload: BaseModel) -> str | None:
+    if isinstance(payload, DIRECT_TURN_ID_NOTIFICATION_TYPES):
+        return payload.turn_id if isinstance(payload.turn_id, str) else None
+    if isinstance(payload, NESTED_TURN_NOTIFICATION_TYPES):
+        return payload.turn.id
+    return None

@@ -16,11 +16,9 @@ from .generated.v2_all import (
     SandboxMode,
     SandboxPolicy,
     ServiceTier,
-    SortDirection,
     ThreadArchiveResponse,
     ThreadCompactStartResponse,
     ThreadForkParams,
-    ThreadListCwdFilter,
     ThreadListParams,
     ThreadListResponse,
     ThreadReadResponse,
@@ -28,7 +26,6 @@ from .generated.v2_all import (
     ThreadSetNameResponse,
     ThreadSortKey,
     ThreadSourceKind,
-    ThreadStartSource,
     ThreadStartParams,
     Turn as AppServerTurn,
     TurnCompletedNotification,
@@ -38,14 +35,14 @@ from .generated.v2_all import (
 )
 from .models import InitializeResponse, JsonObject, Notification, ServerInfo
 from ._inputs import (
-    ImageInput,
+    ImageInput as ImageInput,
     Input,
-    InputItem,
-    LocalImageInput,
-    MentionInput,
+    InputItem as InputItem,
+    LocalImageInput as LocalImageInput,
+    MentionInput as MentionInput,
     RunInput,
-    SkillInput,
-    TextInput,
+    SkillInput as SkillInput,
+    TextInput as TextInput,
     _normalize_run_input,
     _to_wire_input,
 )
@@ -179,14 +176,13 @@ class Codex:
         *,
         archived: bool | None = None,
         cursor: str | None = None,
-        cwd: ThreadListCwdFilter | None = None,
+        cwd: str | None = None,
         limit: int | None = None,
         model_providers: list[str] | None = None,
         search_term: str | None = None,
         sort_direction: SortDirection | None = None,
         sort_key: ThreadSortKey | None = None,
         source_kinds: list[ThreadSourceKind] | None = None,
-        use_state_db_only: bool | None = None,
     ) -> ThreadListResponse:
         params = ThreadListParams(
             archived=archived,
@@ -198,7 +194,6 @@ class Codex:
             sort_direction=sort_direction,
             sort_key=sort_key,
             source_kinds=source_kinds,
-            use_state_db_only=use_state_db_only,
         )
         return self._client.thread_list(params)
 
@@ -274,6 +269,7 @@ class Codex:
     def thread_unarchive(self, thread_id: str) -> Thread:
         unarchived = self._client.thread_unarchive(thread_id)
         return Thread(self._client, unarchived.thread.id)
+
     # END GENERATED: Codex.flat_methods
 
     def models(self, *, include_hidden: bool = False) -> ModelListResponse:
@@ -376,14 +372,13 @@ class AsyncCodex:
         *,
         archived: bool | None = None,
         cursor: str | None = None,
-        cwd: ThreadListCwdFilter | None = None,
+        cwd: str | None = None,
         limit: int | None = None,
         model_providers: list[str] | None = None,
         search_term: str | None = None,
         sort_direction: SortDirection | None = None,
         sort_key: ThreadSortKey | None = None,
         source_kinds: list[ThreadSourceKind] | None = None,
-        use_state_db_only: bool | None = None,
     ) -> ThreadListResponse:
         await self._ensure_initialized()
         params = ThreadListParams(
@@ -396,7 +391,6 @@ class AsyncCodex:
             sort_direction=sort_direction,
             sort_key=sort_key,
             source_kinds=source_kinds,
-            use_state_db_only=use_state_db_only,
         )
         return await self._client.thread_list(params)
 
@@ -476,6 +470,7 @@ class AsyncCodex:
         await self._ensure_initialized()
         unarchived = await self._client.thread_unarchive(thread_id)
         return AsyncThread(self, unarchived.thread.id)
+
     # END GENERATED: AsyncCodex.flat_methods
 
     async def models(self, *, include_hidden: bool = False) -> ModelListResponse:
@@ -555,6 +550,7 @@ class Thread:
         )
         turn = self._client.turn_start(self.id, wire_input, params=params)
         return TurnHandle(self._client, self.id, turn.turn.id)
+
     # END GENERATED: Thread.flat_methods
 
     def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
@@ -644,6 +640,7 @@ class AsyncThread:
             params=params,
         )
         return AsyncTurnHandle(self._codex, self.id, turn.turn.id)
+
     # END GENERATED: AsyncThread.flat_methods
 
     async def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
@@ -674,11 +671,10 @@ class TurnHandle:
         return self._client.turn_interrupt(self.thread_id, self.id)
 
     def stream(self) -> Iterator[Notification]:
-        # TODO: replace this client-wide experimental guard with per-turn event demux.
-        self._client.acquire_turn_consumer(self.id)
+        self._client.register_turn_notifications(self.id)
         try:
             while True:
-                event = self._client.next_notification()
+                event = self._client.next_turn_notification(self.id)
                 yield event
                 if (
                     event.method == "turn/completed"
@@ -687,7 +683,7 @@ class TurnHandle:
                 ):
                     break
         finally:
-            self._client.release_turn_consumer(self.id)
+            self._client.unregister_turn_notifications(self.id)
 
     def run(self) -> AppServerTurn:
         completed: TurnCompletedNotification | None = None
@@ -728,11 +724,10 @@ class AsyncTurnHandle:
 
     async def stream(self) -> AsyncIterator[Notification]:
         await self._codex._ensure_initialized()
-        # TODO: replace this client-wide experimental guard with per-turn event demux.
-        self._codex._client.acquire_turn_consumer(self.id)
+        self._codex._client.register_turn_notifications(self.id)
         try:
             while True:
-                event = await self._codex._client.next_notification()
+                event = await self._codex._client.next_turn_notification(self.id)
                 yield event
                 if (
                     event.method == "turn/completed"
@@ -741,7 +736,7 @@ class AsyncTurnHandle:
                 ):
                     break
         finally:
-            self._codex._client.release_turn_consumer(self.id)
+            self._codex._client.unregister_turn_notifications(self.id)
 
     async def run(self) -> AppServerTurn:
         completed: TurnCompletedNotification | None = None
