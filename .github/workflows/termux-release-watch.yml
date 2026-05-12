@@ -258,6 +258,44 @@ jobs:
             return 0
           }
 
+          codex_release_v8_release_tag() {
+            local upstream_tag="$1"
+            local cargo_lock
+            local version
+            local is_v8=0
+
+            cargo_lock="$(
+              gh api "repos/${UPSTREAM_REPO}/contents/codex-rs/Cargo.lock?ref=${upstream_tag}" \
+                --jq '.content' \
+                | base64 -d
+            )"
+
+            while IFS= read -r line; do
+              if [[ "${line}" == "[[package]]" ]]; then
+                is_v8=0
+                continue
+              fi
+
+              if [[ "${line}" == 'name = "v8"' ]]; then
+                is_v8=1
+                continue
+              fi
+
+              if [[ ${is_v8} -eq 1 && "${line}" == version\ =\ * ]]; then
+                version="${line#version = \"}"
+                version="${version%\"}"
+                break
+              fi
+            done <<< "${cargo_lock}"
+
+            if [[ -z "${version}" ]]; then
+              echo "Unable to resolve v8 version from ${UPSTREAM_REPO}@${upstream_tag}:codex-rs/Cargo.lock" >&2
+              return 1
+            fi
+
+            printf 'rusty-v8-v%s\n' "${version}"
+          }
+
           maybe_select_codex_release() {
             local release_json="$1"
             local upstream_tag
@@ -266,6 +304,7 @@ jobs:
             local release_branch
             local work_branch
             local termux_tag
+            local v8_release_tag
 
             upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
             if [[ "${upstream_tag}" != rust-v* ]]; then
@@ -288,6 +327,13 @@ jobs:
             if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
               echo "${termux_tag} already exists; nothing to do."
               return 1
+            fi
+
+            v8_release_tag="$(codex_release_v8_release_tag "${upstream_tag}")"
+            if ! gh release view "${v8_release_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              echo "${upstream_tag} requires ${v8_release_tag}, but ${v8_release_tag} is not mirrored in ${GITHUB_REPOSITORY} yet."
+              emit_selected_release "rusty-v8" "${release_json}" "" "" "" "${v8_release_tag}"
+              return 0
             fi
 
             if [[ -z "${REQUESTED_TAG}" ]]; then
@@ -871,6 +917,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       UPSTREAM_REPO: openai/codex
       UPSTREAM_TAG: ${{ needs.look-for-newer-release.outputs.upstream_tag }}
+      RUSTY_V8_RELEASE_TAG: ${{ needs.look-for-newer-release.outputs.termux_tag }}
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -897,13 +944,13 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          echo "Dispatching rusty-v8-release.yml for ${UPSTREAM_REPO}@${UPSTREAM_TAG}"
+          echo "Dispatching rusty-v8-release.yml for ${UPSTREAM_REPO}@${UPSTREAM_TAG} as ${RUSTY_V8_RELEASE_TAG}"
           gh workflow run rusty-v8-release.yml \
             --repo "${GITHUB_REPOSITORY}" \
             --ref "${GITHUB_REF_NAME}" \
             -f "source_repository=${UPSTREAM_REPO}" \
             -f "release_ref=${UPSTREAM_TAG}" \
-            -f "release_tag=${UPSTREAM_TAG}" \
+            -f "release_tag=${RUSTY_V8_RELEASE_TAG}" \
             -f "publish=true"
 
   cleanup-completed-release-branches:
