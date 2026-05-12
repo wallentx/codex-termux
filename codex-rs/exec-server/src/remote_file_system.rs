@@ -252,7 +252,7 @@ mod tests {
     fn remote_sandbox_context_preserves_required_cwd() {
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Special {
-                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                value: FileSystemSpecialPath::CurrentWorkingDirectory,
             },
             access: FileSystemAccessMode::Write,
         }]);

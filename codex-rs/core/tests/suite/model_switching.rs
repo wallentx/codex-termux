@@ -5,11 +5,9 @@ use codex_login::CodexAuth;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -19,6 +17,7 @@ use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_image_generation_call;
@@ -30,35 +29,12 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_completed;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::path::PathBuf;
 use wiremock::MockServer;
-
-fn read_only_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) -> Op {
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::read_only(), test.cwd_path());
-    Op::UserTurn {
-        environments: None,
-        items,
-        final_output_json_schema: None,
-        cwd: test.cwd_path().to_path_buf(),
-        approval_policy: AskForApproval::Never,
-        approvals_reviewer: None,
-        sandbox_policy,
-        permission_profile,
-        model,
-        effort: test.config.model_reasoning_effort,
-        summary: None,
-        service_tier: None,
-        collaboration_mode: None,
-        personality: None,
-    }
-}
 
 fn image_generation_artifact_path(codex_home: &Path, session_id: &str, call_id: &str) -> PathBuf {
     fn sanitize(value: &str) -> String {
@@ -107,7 +83,6 @@ fn test_model_info(
         supports_search_tool: false,
         priority: 1,
         additional_speed_tiers: Vec::new(),
-        service_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -145,14 +120,25 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
     let next_model = "gpt-5.4";
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
             }],
-            test.session_configured.model.clone(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: test.session_configured.model.clone(),
+            effort: test.config.model_reasoning_effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -174,14 +160,25 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
         .await?;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "switch models".into(),
                 text_elements: Vec::new(),
             }],
-            next_model.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: next_model.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -225,14 +222,25 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
     let next_model = "exp-codex-personality";
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
             }],
-            test.session_configured.model.clone(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: test.session_configured.model.clone(),
+            effort: test.config.model_reasoning_effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -254,14 +262,25 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
         .await?;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "switch model and personality".into(),
                 text_elements: Vec::new(),
             }],
-            next_model.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: next_model.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -321,28 +340,9 @@ async fn flex_service_tier_is_applied_to_http_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let model_slug = "test-flex-model";
-    let mut flex_model = test_model_info(
-        model_slug,
-        model_slug,
-        "supports flex tier",
-        default_input_modalities(),
-    );
-    flex_model.service_tiers = vec![ModelServiceTier {
-        id: ServiceTier::Flex.request_value().to_string(),
-        name: "flex".to_string(),
-        description: "Flexible processing.".to_string(),
-    }];
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
 
-    let mut builder = test_codex()
-        .with_model(model_slug)
-        .with_config(move |config| {
-            config.model_catalog = Some(ModelsResponse {
-                models: vec![flex_model],
-            });
-        });
-    let test = builder.build(&server).await?;
+    let test = test_codex().build(&server).await?;
 
     test.submit_turn_with_service_tier("flex turn", Some(ServiceTier::Flex))
         .await?;
@@ -350,39 +350,6 @@ async fn flex_service_tier_is_applied_to_http_turn() -> Result<()> {
     let request = resp_mock.single_request();
     let body = request.body_json();
     assert_eq!(body["service_tier"].as_str(), Some("flex"));
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unsupported_service_tier_is_omitted_from_http_turn() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let model_slug = "test-no-tier-model";
-    let model = test_model_info(
-        model_slug,
-        model_slug,
-        "no service tiers",
-        default_input_modalities(),
-    );
-    let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-
-    let mut builder = test_codex()
-        .with_model(model_slug)
-        .with_config(move |config| {
-            config.model_catalog = Some(ModelsResponse {
-                models: vec![model],
-            });
-        });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn_with_service_tier("fast turn", Some(ServiceTier::Fast))
-        .await?;
-
-    let request = resp_mock.single_request();
-    let body = request.body_json();
-    assert_eq!(body.get("service_tier"), None);
 
     Ok(())
 }
@@ -434,9 +401,9 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
         .to_string();
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![
                 UserInput::Image {
                     image_url: image_url.clone(),
                 },
@@ -445,20 +412,42 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
                     text_elements: Vec::new(),
                 },
             ],
-            image_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: image_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "second turn".to_string(),
                 text_elements: Vec::new(),
             }],
-            text_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: text_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -540,7 +529,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
     let test = builder.build(&server).await?;
     let saved_path = image_generation_artifact_path(
         test.codex_home_path(),
-        &test.session_configured.thread_id.to_string(),
+        &test.session_configured.session_id.to_string(),
         "ig_123",
     );
     let _ = std::fs::remove_file(&saved_path);
@@ -550,26 +539,48 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
         .await;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
             }],
-            image_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: image_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "describe the generated image".to_string(),
                 text_elements: Vec::new(),
             }],
-            image_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: image_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -654,7 +665,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
     let test = builder.build(&server).await?;
     let saved_path = image_generation_artifact_path(
         test.codex_home_path(),
-        &test.session_configured.thread_id.to_string(),
+        &test.session_configured.session_id.to_string(),
         "ig_123",
     );
     let _ = std::fs::remove_file(&saved_path);
@@ -664,26 +675,48 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
         .await;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
             }],
-            image_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: image_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "describe the generated image".to_string(),
                 text_elements: Vec::new(),
             }],
-            text_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: text_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -770,7 +803,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
     let test = builder.build(&server).await?;
     let saved_path = image_generation_artifact_path(
         test.codex_home_path(),
-        &test.session_configured.thread_id.to_string(),
+        &test.session_configured.session_id.to_string(),
         "ig_rollback",
     );
     let _ = std::fs::remove_file(&saved_path);
@@ -780,14 +813,25 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
         .await;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
             }],
-            image_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: image_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -800,14 +844,25 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
     .await;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "after rollback".to_string(),
                 text_elements: Vec::new(),
             }],
-            image_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: image_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -872,7 +927,6 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         supports_search_tool: false,
         priority: 1,
         additional_speed_tiers: Vec::new(),
-        service_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -949,14 +1003,25 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
     );
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "use larger model".into(),
                 text_elements: Vec::new(),
             }],
-            large_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: large_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     let large_window_event = wait_for_event(&test.codex, |event| {
@@ -1000,14 +1065,25 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         .await?;
 
     test.codex
-        .submit(read_only_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "switch to smaller model".into(),
                 text_elements: Vec::new(),
             }],
-            smaller_model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
+            model: smaller_model_slug.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     let smaller_turn_started_event = wait_for_event(&test.codex, |event| {

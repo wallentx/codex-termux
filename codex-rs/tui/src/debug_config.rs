@@ -1,6 +1,5 @@
 use crate::history_cell::PlainHistoryCell;
 use crate::legacy_core::config::Config;
-use crate::session_state::SessionNetworkProxyRuntime;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerStack;
@@ -13,6 +12,7 @@ use codex_config::RequirementSource;
 use codex_config::ResidencyRequirement;
 use codex_config::SandboxModeRequirement;
 use codex_config::WebSearchModeRequirement;
+use codex_protocol::protocol::SessionNetworkProxyRuntime;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use toml::Value as TomlValue;
@@ -126,7 +126,7 @@ fn render_debug_config_lines(stack: &ConfigLayerStack) -> Vec<Line<'static>> {
         requirement_lines.push(requirement_line(
             "allowed_sandbox_modes",
             value,
-            requirements.permission_profile.source.as_ref(),
+            requirements.sandbox_policy.source.as_ref(),
         ));
     }
 
@@ -505,7 +505,6 @@ mod tests {
     use super::render_debug_config_lines;
     use super::session_all_proxy_url;
     use crate::legacy_core::config::Constrained;
-    use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::ConfigLayerSource;
     use codex_config::ConfigLayerEntry;
     use codex_config::ConfigLayerStack;
@@ -532,7 +531,8 @@ mod tests {
     use codex_config::WebSearchModeRequirement;
     use codex_protocol::config_types::ApprovalsReviewer;
     use codex_protocol::config_types::WebSearchMode;
-    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::SandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use ratatui::text::Line;
     use std::collections::BTreeMap;
@@ -615,15 +615,15 @@ mod tests {
 
         let requirements = ConfigRequirements {
             approval_policy: ConstrainedWithSource::new(
-                Constrained::allow_any(AskForApproval::OnRequest.to_core()),
+                Constrained::allow_any(AskForApproval::OnRequest),
                 Some(RequirementSource::CloudRequirements),
             ),
             approvals_reviewer: ConstrainedWithSource::new(
                 Constrained::allow_any(ApprovalsReviewer::AutoReview),
                 Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
             ),
-            permission_profile: ConstrainedWithSource::new(
-                Constrained::allow_any(PermissionProfile::read_only()),
+            sandbox_policy: ConstrainedWithSource::new(
+                Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
                 Some(RequirementSource::SystemRequirementsToml {
                     file: requirements_file.clone(),
                 }),
@@ -679,7 +679,7 @@ mod tests {
         };
 
         let requirements_toml = ConfigRequirementsToml {
-            allowed_approval_policies: Some(vec![AskForApproval::OnRequest.to_core()]),
+            allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
             allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
             allowed_sandbox_modes: Some(vec![SandboxModeRequirement::ReadOnly]),
             remote_sandbox_config: None,
@@ -697,7 +697,6 @@ mod tests {
                     },
                 },
             )])),
-            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: Some(ResidencyRequirement::Us),
@@ -897,7 +896,6 @@ approval_policy = "never"
             feature_requirements: None,
             hooks: None,
             mcp_servers: None,
-            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: None,

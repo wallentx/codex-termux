@@ -7,7 +7,6 @@ version.workspace = true
 [lib]
 name = "codex_protocol"
 path = "src/lib.rs"
-doctest = false
 
 [lints]
 workspace = true
@@ -45,7 +44,6 @@ ts-rs = { workspace = true, features = [
     "no-serde-warnings",
 ] }
 uuid = { workspace = true, features = ["serde", "v7", "v4"] }
-wildmatch = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }

@@ -12,9 +12,13 @@ use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -23,6 +27,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 #[cfg(target_os = "linux")]
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_apply_patch_function_call;
 use core_test_support::responses::ev_assistant_message;
@@ -111,6 +116,45 @@ fn restrictive_workspace_write_profile() -> PermissionProfile {
         /*exclude_tmpdir_env_var*/ true,
         /*exclude_slash_tmp*/ true,
     )
+}
+
+fn workspace_write_with_read_only_root(read_only_root: AbsolutePathBuf) -> PermissionProfile {
+    let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: read_only_root,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Write,
+        },
+    ]);
+    PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    )
+}
+
+#[cfg(unix)]
+fn create_file_symlink(source: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(source: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(source, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_file_symlink(_source: &std::path::Path, _link: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file symlinks are unsupported on this platform",
+    ))
 }
 
 pub async fn mount_apply_patch(
@@ -393,6 +437,10 @@ async fn apply_patch_cli_move_without_content_change_has_no_turn_diff(
     model_output: ApplyPatchModelOutput,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "TurnDiffTracker currently reads the test-runner filesystem, not the remote executor filesystem",
+    );
 
     let harness = apply_patch_harness().await?;
     let test = harness.test();
@@ -404,7 +452,28 @@ async fn apply_patch_cli_move_without_content_change_has_no_turn_diff(
     let call_id = "apply-move-no-change";
     mount_apply_patch(&harness, call_id, patch, "ok", model_output).await;
 
-    submit_without_wait(&harness, "rename without content change").await?;
+    let model = test.session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "rename without content change".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.cwd().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
 
     let mut saw_turn_diff = false;
     wait_for_event(&codex, |event| match event {
@@ -670,10 +739,17 @@ async fn apply_patch_cli_rejects_path_traversal_outside_workspace(
     let call_id = "apply-path-traversal";
     mount_apply_patch(&harness, call_id, patch, "fail", model_output).await;
 
+    let sandbox_policy = SandboxPolicy::WorkspaceWrite {
+        writable_roots: vec![],
+        read_only_access: Default::default(),
+        network_access: false,
+        exclude_tmpdir_env_var: true,
+        exclude_slash_tmp: true,
+    };
     harness
-        .submit_with_permission_profile(
+        .submit_with_policy(
             "attempt to escape workspace via apply_patch",
-            restrictive_workspace_write_profile(),
+            sandbox_policy,
         )
         .await?;
 
@@ -688,6 +764,181 @@ async fn apply_patch_cli_rejects_path_traversal_outside_workspace(
         !harness.abs_path_exists(&escape_path).await?,
         "path traversal should be rejected; tool output: {out}"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case(ApplyPatchModelOutput::Freeform ; "freeform")]
+#[test_case(ApplyPatchModelOutput::Shell ; "shell")]
+#[test_case(ApplyPatchModelOutput::ShellViaHeredoc ; "shell_heredoc")]
+#[test_case(ApplyPatchModelOutput::ShellCommandViaHeredoc ; "shell_command_heredoc")]
+async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace(
+    model_output: ApplyPatchModelOutput,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "link escape setup needs local filesystem link creation"
+    );
+
+    let test_root = tempfile::tempdir_in(std::env::current_dir()?)?;
+    let work_dir = AbsolutePathBuf::try_from(test_root.path().join("work"))?;
+    let outside_dir = AbsolutePathBuf::try_from(test_root.path().join("outside"))?;
+    std::fs::create_dir_all(work_dir.as_path())?;
+    std::fs::create_dir_all(outside_dir.as_path())?;
+
+    let harness_work_dir = work_dir.clone();
+    let harness = apply_patch_harness_with(move |builder| {
+        builder.with_config(move |config| {
+            config.cwd = harness_work_dir;
+        })
+    })
+    .await?;
+    let original_contents = "original outside content\n";
+    let outside_file = outside_dir.join("victim.txt");
+    std::fs::write(&outside_file, original_contents)?;
+
+    let link_rel = "soft-link.txt";
+    let link_path = harness.path(link_rel);
+    match create_file_symlink(&outside_file, &link_path) {
+        Ok(()) => {}
+        Err(error) if cfg!(windows) => {
+            eprintln!("Skipping Windows symlink apply_patch sandbox test: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let patch = format!(
+        r#"*** Begin Patch
+*** Update File: {link_rel}
+@@
+-original outside content
++pwned
+*** End Patch"#
+    );
+    let call_id = "apply-symlink-escape";
+    mount_apply_patch(&harness, call_id, &patch, "fail", model_output).await;
+
+    harness
+        .submit_with_permission_profile(
+            "attempt to escape workspace via apply_patch link",
+            workspace_write_with_read_only_root(outside_dir.clone()),
+        )
+        .await?;
+
+    let out = harness.apply_patch_output(call_id, model_output).await;
+    assert_eq!(
+        std::fs::read_to_string(&outside_file)?,
+        original_contents,
+        "symlink escape should not modify the outside victim; tool output: {out}",
+    );
+    let metadata = std::fs::symlink_metadata(&link_path)?;
+    assert!(metadata.file_type().is_symlink());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case(ApplyPatchModelOutput::Freeform ; "freeform")]
+#[test_case(ApplyPatchModelOutput::Shell ; "shell")]
+#[test_case(ApplyPatchModelOutput::ShellViaHeredoc ; "shell_heredoc")]
+#[test_case(ApplyPatchModelOutput::ShellCommandViaHeredoc ; "shell_command_heredoc")]
+async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace(
+    model_output: ApplyPatchModelOutput,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "link setup needs local filesystem hard link creation"
+    );
+
+    let test_root = tempfile::tempdir_in(std::env::current_dir()?)?;
+    let work_dir = AbsolutePathBuf::try_from(test_root.path().join("work"))?;
+    let outside_dir = AbsolutePathBuf::try_from(test_root.path().join("outside"))?;
+    std::fs::create_dir_all(work_dir.as_path())?;
+    std::fs::create_dir_all(outside_dir.as_path())?;
+
+    let harness_work_dir = work_dir.clone();
+    let harness = apply_patch_harness_with(move |builder| {
+        builder.with_config(move |config| {
+            config.cwd = harness_work_dir;
+        })
+    })
+    .await?;
+    let outside_file = outside_dir.join("victim.txt");
+    std::fs::write(&outside_file, "original outside content\n")?;
+
+    let link_rel = "hard-link.txt";
+    let link_path = harness.path(link_rel);
+    std::fs::hard_link(&outside_file, &link_path)?;
+
+    let patch = format!(
+        r#"*** Begin Patch
+*** Update File: {link_rel}
+@@
+-original outside content
++updated through existing hard link
+*** End Patch"#
+    );
+    let call_id = "apply-hard-link";
+    mount_apply_patch(&harness, call_id, &patch, "ok", model_output).await;
+
+    harness
+        .submit_with_permission_profile(
+            "update existing hard link via apply_patch",
+            workspace_write_with_read_only_root(outside_dir.clone()),
+        )
+        .await?;
+
+    let out = harness.apply_patch_output(call_id, model_output).await;
+    if cfg!(windows) {
+        assert!(
+            out.contains("patch rejected: writing outside of the project"),
+            "Windows sandboxing intentionally rejects writes through existing hard links to files outside the workspace; tool output: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_file)?,
+            "original outside content\n",
+            "Windows rejection must leave the outside hard-link target unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&link_path)?,
+            "original outside content\n",
+            "Windows rejection must leave the workspace hard-link path unchanged"
+        );
+
+        std::fs::write(&outside_file, "post-reject outside write\n")?;
+        assert_eq!(
+            std::fs::read_to_string(&link_path)?,
+            "post-reject outside write\n",
+            "Windows rejection must not unlink or replace an existing hard link"
+        );
+
+        return Ok(());
+    }
+
+    assert!(
+        out.contains("Success. Updated the following files:"),
+        "apply_patch should intentionally allow updates through existing hard links; tool output: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside_file)?,
+        "updated through existing hard link\n",
+        "apply_patch intentionally preserves existing hard-link semantics; the outside path observes the shared inode update"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&link_path)?,
+        "updated through existing hard link\n",
+        "apply_patch intentionally preserves existing hard-link semantics; the workspace path observes the same update"
+    );
+
+    std::fs::write(&outside_file, "post-apply outside write\n")?;
+    assert_eq!(
+        std::fs::read_to_string(&link_path)?,
+        "post-apply outside write\n",
+        "apply_patch must not unlink or replace an existing hard link; later writes through either path should still be visible"
+    );
+
     Ok(())
 }
 
@@ -719,11 +970,15 @@ async fn apply_patch_cli_rejects_move_path_traversal_outside_workspace(
     let call_id = "apply-move-traversal";
     mount_apply_patch(&harness, call_id, patch, "fail", model_output).await;
 
+    let sandbox_policy = SandboxPolicy::WorkspaceWrite {
+        writable_roots: vec![],
+        read_only_access: Default::default(),
+        network_access: false,
+        exclude_tmpdir_env_var: true,
+        exclude_slash_tmp: true,
+    };
     harness
-        .submit_with_permission_profile(
-            "attempt move traversal via apply_patch",
-            restrictive_workspace_write_profile(),
-        )
+        .submit_with_policy("attempt move traversal via apply_patch", sandbox_policy)
         .await?;
 
     let out = harness.apply_patch_output(call_id, model_output).await;
@@ -1012,7 +1267,27 @@ async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()>
     )
     .await;
 
-    submit_without_wait(&harness, "create streamed file").await?;
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "create streamed file".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.cwd().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: test.session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
 
     let mut updates = Vec::new();
     wait_for_event(&codex, |event| match event {
@@ -1039,7 +1314,7 @@ async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()>
             .changes
             .get(&std::path::PathBuf::from("streamed.txt")),
         Some(&codex_protocol::protocol::FileChange::Add {
-            content: String::new(),
+            content: "hello\n".to_string(),
         })
     );
     assert_eq!(
@@ -1062,6 +1337,10 @@ async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_shell_command_heredoc_with_cd_emits_turn_diff() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "TurnDiffTracker currently reads the test-runner filesystem, not the remote executor filesystem",
+    );
 
     let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
     let test = harness.test();
@@ -1086,7 +1365,28 @@ async fn apply_patch_shell_command_heredoc_with_cd_emits_turn_diff() -> Result<(
     ];
     mount_sse_sequence(harness.server(), bodies).await;
 
-    submit_without_wait(&harness, "apply via shell heredoc with cd").await?;
+    let model = test.session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "apply via shell heredoc with cd".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.cwd().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
 
     let mut saw_turn_diff = None;
     let mut saw_patch_begin = false;
@@ -1122,87 +1422,12 @@ async fn apply_patch_shell_command_heredoc_with_cd_emits_turn_diff() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_turn_diff_paths_stay_repo_relative_when_session_cwd_is_nested() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let harness = apply_patch_harness_with(|builder| {
-        builder
-            .with_model("gpt-5.4")
-            .with_config(|config| {
-                config.cwd = config.cwd.join("subdir");
-            })
-            .with_workspace_setup(|cwd, fs| async move {
-                fs.create_directory(
-                    &cwd,
-                    CreateDirectoryOptions { recursive: true },
-                    /*sandbox*/ None,
-                )
-                .await?;
-                let repo_root = cwd.parent().expect("nested cwd should have parent");
-                fs.write_file(
-                    &repo_root.join(".git"),
-                    b"gitdir: /tmp/fake-worktree\n".to_vec(),
-                    /*sandbox*/ None,
-                )
-                .await?;
-                fs.write_file(
-                    &repo_root.join("repo.txt"),
-                    b"before\n".to_vec(),
-                    /*sandbox*/ None,
-                )
-                .await?;
-                Ok(())
-            })
-    })
-    .await?;
-    let test = harness.test();
-    let codex = test.codex.clone();
-    let repo_root = harness
-        .test()
-        .config
-        .cwd
-        .parent()
-        .expect("nested cwd should have parent");
-
-    let call_id = "apply-nested-cwd-repo-relative";
-    let patch = "*** Begin Patch\n*** Update File: ../repo.txt\n@@\n-before\n+after\n*** End Patch";
-    mount_apply_patch(
-        &harness,
-        call_id,
-        patch,
-        "updated repo-relative path",
-        ApplyPatchModelOutput::Function,
-    )
-    .await;
-
-    submit_without_wait(&harness, "update file outside nested cwd but inside repo").await?;
-
-    let mut last_diff: Option<String> = None;
-    wait_for_event(&codex, |event| match event {
-        EventMsg::TurnDiff(ev) => {
-            last_diff = Some(ev.unified_diff.clone());
-            false
-        }
-        EventMsg::TurnComplete(_) => true,
-        _ => false,
-    })
-    .await;
-
-    let diff = last_diff.expect("expected TurnDiff event after update");
-    assert!(
-        diff.contains("diff --git a/repo.txt b/repo.txt"),
-        "diff should stay repo-relative: {diff:?}"
-    );
-    assert!(
-        !diff.contains(repo_root.as_path().to_string_lossy().as_ref()),
-        "diff should not leak absolute repo paths: {diff:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_shell_command_failure_propagates_error_and_skips_diff() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "TurnDiffTracker currently reads the test-runner filesystem, not the remote executor filesystem",
+    );
 
     let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
     let test = harness.test();
@@ -1226,7 +1451,28 @@ async fn apply_patch_shell_command_failure_propagates_error_and_skips_diff() -> 
     ];
     mount_sse_sequence(harness.server(), bodies).await;
 
-    submit_without_wait(&harness, "apply patch via shell").await?;
+    let model = test.session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "apply patch via shell".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.cwd().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
 
     let mut saw_turn_diff = false;
     wait_for_event(&codex, |event| match event {
@@ -1348,6 +1594,10 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff(
     model_output: ApplyPatchModelOutput,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "TurnDiffTracker currently reads the test-runner filesystem, not the remote executor filesystem",
+    );
 
     let harness = apply_patch_harness().await?;
     let test = harness.test();
@@ -1358,7 +1608,28 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff(
     let patch = format!("*** Begin Patch\n*** Add File: {file}\n+hello\n*** End Patch\n");
     mount_apply_patch(&harness, call_id, patch.as_str(), "ok", model_output).await;
 
-    submit_without_wait(&harness, "emit diff").await?;
+    let model = test.session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "emit diff".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.cwd().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
 
     let mut saw_turn_diff = None;
     wait_for_event(&codex, |event| match event {
@@ -1380,8 +1651,84 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case(ApplyPatchModelOutput::Freeform)]
+#[test_case(ApplyPatchModelOutput::Function)]
+#[test_case(ApplyPatchModelOutput::Shell)]
+#[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
+#[test_case(ApplyPatchModelOutput::ShellCommandViaHeredoc)]
+async fn apply_patch_turn_diff_for_rename_with_content_change(
+    model_output: ApplyPatchModelOutput,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "TurnDiffTracker currently reads the test-runner filesystem, not the remote executor filesystem",
+    );
+
+    let harness = apply_patch_harness().await?;
+    let test = harness.test();
+    let codex = test.codex.clone();
+
+    // Seed original file
+    harness.write_file("old.txt", "old\n").await?;
+
+    // Patch: update + move
+    let call_id = "apply-rename-change";
+    let patch = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n-old\n+new\n*** End Patch";
+    mount_apply_patch(&harness, call_id, patch, "ok", model_output).await;
+
+    let model = test.session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "rename with change".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.cwd().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let mut last_diff: Option<String> = None;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::TurnDiff(ev) => {
+            last_diff = Some(ev.unified_diff.clone());
+            false
+        }
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    let diff = last_diff.expect("expected TurnDiff event after rename");
+    // Basic checks: shows old -> new, and the content delta
+    assert!(diff.contains("old.txt"), "diff missing old path: {diff:?}");
+    assert!(diff.contains("new.txt"), "diff missing new path: {diff:?}");
+    assert!(diff.contains("--- a/"), "missing old header");
+    assert!(diff.contains("+++ b/"), "missing new header");
+    assert!(diff.contains("-old\n"), "missing removal line");
+    assert!(diff.contains("+new\n"), "missing addition line");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "TurnDiffTracker currently reads the test-runner filesystem, not the remote executor filesystem",
+    );
 
     let harness = apply_patch_harness().await?;
     let test = harness.test();
@@ -1408,7 +1755,28 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
     ]);
     mount_sse_sequence(harness.server(), vec![s1, s2, s3]).await;
 
-    submit_without_wait(&harness, "aggregate diffs").await?;
+    let model = test.session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "aggregate diffs".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.cwd().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
 
     let mut last_diff: Option<String> = None;
     wait_for_event(&codex, |event| match event {
@@ -1432,6 +1800,10 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_aggregates_diff_preserves_success_after_failure() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    skip_if_remote!(
+        Ok(()),
+        "TurnDiffTracker currently reads the test-runner filesystem, not the remote executor filesystem",
+    );
 
     let harness = apply_patch_harness().await?;
     let test = harness.test();
@@ -1461,7 +1833,28 @@ async fn apply_patch_aggregates_diff_preserves_success_after_failure() -> Result
     ];
     mount_sse_sequence(harness.server(), responses).await;
 
-    submit_without_wait(&harness, "apply patch twice with failure").await?;
+    let model = test.session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "apply patch twice with failure".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.cwd().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
 
     let mut last_diff: Option<String> = None;
     wait_for_event_with_timeout(
@@ -1499,75 +1892,6 @@ async fn apply_patch_aggregates_diff_preserves_success_after_failure() -> Result
     );
 
     assert_eq!(harness.read_file_text("partial/success.txt").await?, "ok\n");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_clears_aggregated_diff_after_inexact_delta() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let harness = apply_patch_harness_with(|builder| {
-        builder.with_workspace_setup(|cwd, fs| async move {
-            fs.write_file(
-                &cwd.join("binary.dat"),
-                vec![0xff, 0xfe, 0xfd],
-                /*sandbox*/ None,
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await?;
-    let test = harness.test();
-    let codex = test.codex.clone();
-
-    let call_success = "agg-success";
-    let call_inexact = "agg-inexact";
-    let patch_success = "*** Begin Patch\n*** Add File: partial/success.txt\n+ok\n*** End Patch";
-    let patch_inexact = "*** Begin Patch\n*** Add File: binary.dat\n+text\n*** End Patch";
-
-    let responses = vec![
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_apply_patch_function_call(call_success, patch_success),
-            ev_completed("resp-1"),
-        ]),
-        sse(vec![
-            ev_response_created("resp-2"),
-            ev_apply_patch_function_call(call_inexact, patch_inexact),
-            ev_completed("resp-2"),
-        ]),
-        sse(vec![
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-3"),
-        ]),
-    ];
-    mount_sse_sequence(harness.server(), responses).await;
-
-    submit_without_wait(&harness, "apply patch twice with inexact delta").await?;
-
-    let mut last_diff: Option<String> = None;
-    wait_for_event_with_timeout(
-        &codex,
-        |event| match event {
-            EventMsg::TurnDiff(ev) => {
-                last_diff = Some(ev.unified_diff.clone());
-                false
-            }
-            EventMsg::TurnComplete(_) => true,
-            _ => false,
-        },
-        Duration::from_secs(30),
-    )
-    .await;
-
-    assert_eq!(
-        last_diff.as_deref(),
-        Some(""),
-        "inexact delta should clear the aggregate diff"
-    );
-    assert_eq!(harness.read_file_text("partial/success.txt").await?, "ok\n");
-    assert_eq!(harness.read_file_text("binary.dat").await?, "text\n");
     Ok(())
 }
 

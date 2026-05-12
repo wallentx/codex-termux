@@ -11,7 +11,7 @@
 )
 
 (allow mach-lookup
-    ; Used by platform helpers that resolve user directory locations.
+    ; Used to look up the _CS_DARWIN_USER_CACHE_DIR in the sandbox.
     (global-name "com.apple.bsd.dirhelper")
     (global-name "com.apple.system.opendirectoryd.membership")
 
@@ -28,4 +28,8 @@
 
 (allow sysctl-read
   (sysctl-name-regex #"^net.routetable")
+)
+
+(allow file-write*
+  (subpath (param "DARWIN_USER_CACHE_DIR"))
 )

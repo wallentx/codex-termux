@@ -7,7 +7,6 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
-doctest = false
 
 [lints]
 workspace = true

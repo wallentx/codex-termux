@@ -10,8 +10,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use uuid::Uuid;
 
-use crate::motion::MotionMode;
-use crate::motion::shimmer_text;
+use crate::shimmer::shimmer_spans;
 
 use super::AuthModeWidget;
 use super::ContinueWithDeviceCodeState;
@@ -99,7 +98,7 @@ pub(super) fn render_device_code_login(
         widget
             .request_frame
             .schedule_frame_in(std::time::Duration::from_millis(100));
-        spans.extend(shimmer_text(banner, MotionMode::Animated));
+        spans.extend(shimmer_spans(banner));
     } else {
         spans.push(banner.into());
     }
@@ -138,11 +137,7 @@ pub(super) fn render_device_code_login(
         None
     };
 
-    lines.push(Line::from(vec![
-        "  Press ".dim(),
-        widget.cancel_binding().into(),
-        " to cancel".dim(),
-    ]));
+    lines.push("  Press Esc to cancel".dim().into());
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .render(area, buf);
