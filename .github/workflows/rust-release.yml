@@ -381,36 +381,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=""
-          is_v8=0
-          while IFS= read -r line; do
-            if [[ "${line}" == "[[package]]" ]]; then
-              is_v8=0
-              continue
-            fi
-
-            if [[ "${line}" == 'name = "v8"' ]]; then
-              is_v8=1
-              continue
-            fi
-
-            if [[ ${is_v8} -eq 1 && "${line}" == version\ =\ * ]]; then
-              version="${line#version = \"}"
-              version="${version%\"}"
-              break
-            fi
-          done < Cargo.lock
-
-          if [[ -z "${version}" ]]; then
-            echo "Unable to resolve v8 version from Cargo.lock" >&2
-            exit 1
-          fi
           binding_dir="${RUNNER_TEMP}/rusty_v8"
           archive="${binding_dir}/librusty_v8_release_${TARGET}.a.gz"
           binding_path="${binding_dir}/src_binding_release_${TARGET}.rs"
           checksums_path="${binding_dir}/rusty_v8_release_${TARGET}.sha256"
           artifact_repository="wallentx/codex-termux"
-          release_tag="rusty-v8-v${version}"
+          release_tag="rusty-v8-v147.4.0"
           mkdir -p "${binding_dir}"
           echo "Downloading Android rusty_v8 artifacts from ${artifact_repository}@${release_tag}"
           gh release download "${release_tag}" \
