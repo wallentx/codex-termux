@@ -54,7 +54,8 @@ from .api import (
     TurnHandle,
 )
 from .retry import retry_on_overload
-from ._version import __version__
+
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",

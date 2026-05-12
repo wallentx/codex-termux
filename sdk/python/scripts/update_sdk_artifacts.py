@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, get_args, get_origin
 
-SDK_DISTRIBUTION_NAME = "openai-codex-app-server-sdk"
 RUNTIME_DISTRIBUTION_NAME = "openai-codex-cli-bin"
 
 
@@ -58,13 +57,6 @@ def runtime_binary_name() -> str:
 
 def staged_runtime_bin_path(root: Path) -> Path:
     return root / "src" / "codex_cli_bin" / "bin" / runtime_binary_name()
-
-
-def staged_runtime_resource_path(root: Path, resource: Path) -> Path:
-    # Runtime wheels include the whole bin/ directory, so helper executables
-    # should be staged beside the main Codex binary instead of changing the
-    # package template for each platform.
-    return root / "src" / "codex_cli_bin" / "bin" / resource.name
 
 
 def run(cmd: list[str], cwd: Path) -> None:
@@ -186,19 +178,15 @@ def _rewrite_sdk_runtime_dependency(pyproject_text: str, runtime_version: str) -
         )
 
     raw_items = [item.strip() for item in match.group(1).split(",") if item.strip()]
-    raw_items = [
-        item
-        for item in raw_items
-        if RUNTIME_DISTRIBUTION_NAME.removeprefix("openai-") not in item
-        and RUNTIME_DISTRIBUTION_NAME not in item
-    ]
+    raw_items = [item for item in raw_items if "codex-cli-bin" not in item]
     raw_items.append(f'"{RUNTIME_DISTRIBUTION_NAME}=={runtime_version}"')
     replacement = "dependencies = [\n  " + ",\n  ".join(raw_items) + ",\n]"
     return pyproject_text[: match.start()] + replacement + pyproject_text[match.end() :]
 
 
-def stage_python_sdk_package(staging_dir: Path, codex_version: str) -> Path:
-    package_version = normalize_codex_version(codex_version)
+def stage_python_sdk_package(
+    staging_dir: Path, sdk_version: str, runtime_version: str
+) -> Path:
     _copy_package_tree(sdk_root(), staging_dir)
     sdk_bin_dir = staging_dir / "src" / "codex_app_server" / "bin"
     if sdk_bin_dir.exists():
@@ -206,9 +194,8 @@ def stage_python_sdk_package(staging_dir: Path, codex_version: str) -> Path:
 
     pyproject_path = staging_dir / "pyproject.toml"
     pyproject_text = pyproject_path.read_text()
-    pyproject_text = _rewrite_project_name(pyproject_text, SDK_DISTRIBUTION_NAME)
-    pyproject_text = _rewrite_project_version(pyproject_text, package_version)
-    pyproject_text = _rewrite_sdk_runtime_dependency(pyproject_text, package_version)
+    pyproject_text = _rewrite_project_version(pyproject_text, sdk_version)
+    pyproject_text = _rewrite_sdk_runtime_dependency(pyproject_text, runtime_version)
     pyproject_path.write_text(pyproject_text)
     return staging_dir
 
@@ -218,7 +205,6 @@ def stage_python_runtime_package(
     codex_version: str,
     binary_path: Path,
     platform_tag: str | None = None,
-    resource_binaries: Sequence[Path] = (),
 ) -> Path:
     package_version = normalize_codex_version(codex_version)
     _copy_package_tree(python_runtime_root(), staging_dir)
@@ -238,16 +224,6 @@ def stage_python_runtime_package(
         out_bin.chmod(
             out_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
         )
-    for resource_binary in resource_binaries:
-        # Some release targets need helper executables beside the main binary
-        # (for example Linux bwrap or Windows sandbox helpers). Keep this
-        # generic so release workflows own the platform-specific list.
-        out_resource = staged_runtime_resource_path(staging_dir, resource_binary)
-        shutil.copy2(resource_binary, out_resource)
-        if not _is_windows():
-            out_resource.chmod(
-                out_resource.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-            )
     return staging_dir
 
 
@@ -585,6 +561,43 @@ def _notification_specs() -> list[tuple[str, str]]:
     return specs
 
 
+def _notification_turn_id_specs(
+    specs: list[tuple[str, str]],
+) -> tuple[list[str], list[str]]:
+    server_notifications = json.loads(
+        (schema_root_dir() / "ServerNotification.json").read_text()
+    )
+    definitions = server_notifications.get("definitions", {})
+    if not isinstance(definitions, dict):
+        return ([], [])
+
+    direct: list[str] = []
+    nested: list[str] = []
+    for _, class_name in specs:
+        definition = definitions.get(class_name)
+        if not isinstance(definition, dict):
+            continue
+        props = definition.get("properties", {})
+        if not isinstance(props, dict):
+            continue
+        if "turnId" in props:
+            direct.append(class_name)
+            continue
+        turn = props.get("turn")
+        if isinstance(turn, dict) and turn.get("$ref") == "#/definitions/Turn":
+            nested.append(class_name)
+
+    return (sorted(set(direct)), sorted(set(nested)))
+
+
+def _type_tuple_source(class_names: list[str]) -> str:
+    if not class_names:
+        return "()"
+    if len(class_names) == 1:
+        return f"({class_names[0]},)"
+    return "(\n" + "".join(f"    {class_name},\n" for class_name in class_names) + ")"
+
+
 def generate_notification_registry() -> None:
     out = (
         sdk_root()
@@ -595,6 +608,7 @@ def generate_notification_registry() -> None:
     )
     specs = _notification_specs()
     class_names = sorted({class_name for _, class_name in specs})
+    direct_turn_id_types, nested_turn_types = _notification_turn_id_specs(specs)
 
     lines = [
         "# Auto-generated by scripts/update_sdk_artifacts.py",
@@ -616,7 +630,26 @@ def generate_notification_registry() -> None:
     )
     for method, class_name in specs:
         lines.append(f'    "{method}": {class_name},')
-    lines.extend(["}", ""])
+    lines.extend(
+        [
+            "}",
+            "",
+            "DIRECT_TURN_ID_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = "
+            f"{_type_tuple_source(direct_turn_id_types)}",
+            "",
+            "NESTED_TURN_NOTIFICATION_TYPES: tuple[type[BaseModel], ...] = "
+            f"{_type_tuple_source(nested_turn_types)}",
+            "",
+            "",
+            "def notification_turn_id(payload: BaseModel) -> str | None:",
+            "    if isinstance(payload, DIRECT_TURN_ID_NOTIFICATION_TYPES):",
+            "        return payload.turn_id if isinstance(payload.turn_id, str) else None",
+            "    if isinstance(payload, NESTED_TURN_NOTIFICATION_TYPES):",
+            "        return payload.turn.id",
+            "    return None",
+            "",
+        ]
+    )
 
     out.write_text("\n".join(lines))
 
@@ -649,10 +682,8 @@ class PublicFieldSpec:
 @dataclass(frozen=True)
 class CliOps:
     generate_types: Callable[[], None]
-    stage_python_sdk_package: Callable[[Path, str], Path]
-    stage_python_runtime_package: Callable[
-        [Path, str, Path, str | None, Sequence[Path]], Path
-    ]
+    stage_python_sdk_package: Callable[[Path, str, str], Path]
+    stage_python_runtime_package: Callable[[Path, str, Path, str | None], Path]
     current_sdk_version: Callable[[], str]
 
 
@@ -1019,20 +1050,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for the staged SDK package",
     )
     stage_sdk_parser.add_argument(
-        "--codex-version",
-        help=(
-            "Codex release version to write into the staged SDK package and exact "
-            f"{RUNTIME_DISTRIBUTION_NAME} dependency. Accepts PEP 440 versions "
-            "or release tags such as rust-v0.116.0-alpha.1."
-        ),
-    )
-    stage_sdk_parser.add_argument(
         "--runtime-version",
-        help=argparse.SUPPRESS,
+        required=True,
+        help="Pinned openai-codex-cli-bin version for the staged SDK package",
     )
     stage_sdk_parser.add_argument(
         "--sdk-version",
-        help=argparse.SUPPRESS,
+        help="Version to write into the staged SDK package (defaults to sdk/python current version)",
     )
 
     stage_runtime_parser = subparsers.add_parser(
@@ -1067,13 +1091,6 @@ def build_parser() -> argparse.ArgumentParser:
             "macosx_11_0_arm64 or musllinux_1_1_x86_64."
         ),
     )
-    stage_runtime_parser.add_argument(
-        "--resource-binary",
-        action="append",
-        default=[],
-        type=Path,
-        help="Additional executable to package beside the codex runtime binary.",
-    )
     return parser
 
 
@@ -1090,23 +1107,22 @@ def default_cli_ops() -> CliOps:
     )
 
 
-def _resolve_codex_version(args: argparse.Namespace) -> str:
+def _resolve_runtime_version(args: argparse.Namespace) -> str:
     versions = [
         value
         for value in (
             getattr(args, "codex_version", None),
             getattr(args, "runtime_version", None),
-            getattr(args, "sdk_version", None),
         )
         if value is not None
     ]
     if not versions:
-        raise RuntimeError("Pass --codex-version to stage Python release artifacts")
+        raise RuntimeError("Pass --codex-version to stage the Python runtime package")
 
     normalized_versions = [normalize_codex_version(version) for version in versions]
     if len(set(normalized_versions)) != 1:
         raise RuntimeError(
-            "SDK and runtime package versions must match; pass one --codex-version"
+            "Runtime package versions must match; pass one --codex-version"
         )
     return normalized_versions[0]
 
@@ -1115,20 +1131,19 @@ def run_command(args: argparse.Namespace, ops: CliOps) -> None:
     if args.command == "generate-types":
         ops.generate_types()
     elif args.command == "stage-sdk":
-        codex_version = _resolve_codex_version(args)
         ops.generate_types()
         ops.stage_python_sdk_package(
             args.staging_dir,
-            codex_version,
+            args.sdk_version or ops.current_sdk_version(),
+            args.runtime_version,
         )
     elif args.command == "stage-runtime":
-        codex_version = _resolve_codex_version(args)
+        runtime_version = _resolve_runtime_version(args)
         ops.stage_python_runtime_package(
             args.staging_dir,
-            codex_version,
+            runtime_version,
             args.runtime_binary.resolve(),
             args.platform_tag,
-            tuple(path.resolve() for path in args.resource_binary),
         )
 
 

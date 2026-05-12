@@ -121,9 +121,6 @@
       ],
       "type": "object"
     },
-    "AttestationGenerateParams": {
-      "type": "object"
-    },
     "ChatgptAuthTokensRefreshParams": {
       "properties": {
         "previousAccountId": {
@@ -420,11 +417,6 @@
             "null"
           ]
         },
-        "startedAtMs": {
-          "description": "Unix timestamp (in milliseconds) when this approval request started.",
-          "format": "int64",
-          "type": "integer"
-        },
         "threadId": {
           "type": "string"
         },
@@ -434,7 +426,6 @@
       },
       "required": [
         "itemId",
-        "startedAtMs",
         "threadId",
         "turnId"
       ],
@@ -607,11 +598,6 @@
             "null"
           ]
         },
-        "startedAtMs": {
-          "description": "Unix timestamp (in milliseconds) when this approval request started.",
-          "format": "int64",
-          "type": "integer"
-        },
         "threadId": {
           "type": "string"
         },
@@ -621,7 +607,6 @@
       },
       "required": [
         "itemId",
-        "startedAtMs",
         "threadId",
         "turnId"
       ],
@@ -744,6 +729,21 @@
             "kind"
           ],
           "title": "MinimalFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "current_working_directory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "CurrentWorkingDirectoryFileSystemSpecialPath",
           "type": "object"
         },
         {
@@ -1602,11 +1602,6 @@
             "null"
           ]
         },
-        "startedAtMs": {
-          "description": "Unix timestamp (in milliseconds) when this approval request started.",
-          "format": "int64",
-          "type": "integer"
-        },
         "threadId": {
           "type": "string"
         },
@@ -1618,7 +1613,6 @@
         "cwd",
         "itemId",
         "permissions",
-        "startedAtMs",
         "threadId",
         "turnId"
       ],
@@ -1919,31 +1913,6 @@
         "params"
       ],
       "title": "Account/chatgptAuthTokens/refreshRequest",
-      "type": "object"
-    },
-    {
-      "description": "Generate a fresh upstream attestation result on demand.",
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "attestation/generate"
-          ],
-          "title": "Attestation/generateRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/AttestationGenerateParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Attestation/generateRequest",
       "type": "object"
     },
     {
