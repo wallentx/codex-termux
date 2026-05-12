@@ -368,12 +368,15 @@ jobs:
           cat > "${v8_compat_source}" <<'EOF'
           #include <locale.h>
           #include <stddef.h>
-          #include <stdlib.h>
+
+          extern int posix_memalign(void **memptr, size_t alignment, size_t size);
+          extern double strtod(const char *nptr, char **endptr);
+          extern float strtof(const char *nptr, char **endptr);
 
           void *aligned_alloc(size_t alignment, size_t size) {
-            void *ptr = NULL;
+            void *ptr = 0;
             if (posix_memalign(&ptr, alignment, size) != 0) {
-              return NULL;
+              return 0;
             }
             return ptr;
           }
