@@ -15,6 +15,11 @@ on:
         required: false
         type: string
         default: "wallentx"
+      bypass_prior_release_train:
+        description: "Allow workflow_dispatch to create or update a release train even when another Termux release train PR is open"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -82,6 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          BYPASS_PRIOR_RELEASE_TRAIN: ${{ inputs.bypass_prior_release_train || false }}
         run: |
           set -euo pipefail
 
@@ -117,7 +123,42 @@ jobs:
               | jq -r '.termux_tag // empty'
           }
 
-          open_release_train_prs_for_branch() {
+          open_release_train_pr_for_branch() {
+            local release_branch="$1"
+            local open_prs
+
+            open_prs="$(
+              gh pr list \
+                --repo "${GITHUB_REPOSITORY}" \
+                --state open \
+                --limit 200 \
+                --json number,title,body,headRefName,baseRefName,url
+            )"
+
+            jq -c \
+              --arg release_branch "${release_branch}" \
+              '
+                [
+                  .[]
+                  | select(.baseRefName == $release_branch)
+                  | select(
+                      ((.title // "") | startswith("Termux rust-v"))
+                      and ((.body // "") | contains("Release train branch: `" + $release_branch + "`"))
+                    )
+                  | . + {
+                      upstreamTag: (
+                        (.body // "")
+                        | try capture("- Upstream tag: `(?<tag>rust-v[^`]+)`").tag catch ""
+                      )
+                    }
+                ]
+                | sort_by(.number)
+                | reverse
+                | .[0] // empty
+              ' <<< "${open_prs}"
+          }
+
+          open_other_release_train_prs() {
             local release_branch="$1"
             local open_prs
 
@@ -133,19 +174,18 @@ jobs:
               --arg release_branch "${release_branch}" \
               '
                 .[]
-                | select(.baseRefName == $release_branch)
+                | select(.baseRefName != $release_branch)
                 | select(
                     ((.title // "") | startswith("Termux rust-v"))
-                    and ((.body // "") | contains("Release train branch: `" + $release_branch + "`"))
+                    and ((.body // "") | contains("Release train branch: `release/"))
                   )
                 | "- #\(.number) \(.title) (\(.url))"
               ' <<< "${open_prs}"
           }
 
-          release_tag_is_newer_than_current_train() {
+          rust_tag_is_newer_than_tag() {
             local candidate_tag="$1"
-            local release_branch="$2"
-            local current_tag
+            local current_tag="$2"
             local candidate_version
             local current_version
             local candidate_base
@@ -154,7 +194,6 @@ jobs:
             local current_is_prerelease=false
             local newest_version
 
-            current_tag="$(release_branch_current_tag "${release_branch}")"
             if [[ -z "${current_tag}" ]]; then
               return 0
             fi
@@ -186,6 +225,30 @@ jobs:
                 | tail -n 1
             )"
             [[ "${newest_version}" == "${candidate_version}" && "${candidate_version}" != "${current_version}" ]]
+          }
+
+          release_tag_is_newer_than_known_train() {
+            local candidate_tag="$1"
+            local release_branch="$2"
+            local open_train_pr_json="${3:-}"
+            local current_tag
+            local open_pr_tag
+
+            current_tag="$(release_branch_current_tag "${release_branch}")"
+            if ! rust_tag_is_newer_than_tag "${candidate_tag}" "${current_tag}"; then
+              echo "${candidate_tag} is not newer than ${current_tag} already recorded on ${release_branch}; nothing to do."
+              return 1
+            fi
+
+            if [[ -n "${open_train_pr_json}" ]]; then
+              open_pr_tag="$(jq -r '.upstreamTag // empty' <<< "${open_train_pr_json}")"
+              if ! rust_tag_is_newer_than_tag "${candidate_tag}" "${open_pr_tag}"; then
+                echo "${candidate_tag} is not newer than ${open_pr_tag} already proposed in open PR $(jq -r '.url' <<< "${open_train_pr_json}"); nothing to do."
+                return 1
+              fi
+            fi
+
+            return 0
           }
 
           release_json_for_tag() {
@@ -266,6 +329,8 @@ jobs:
             local release_branch
             local work_branch
             local termux_tag
+            local open_train_pr_json
+            local pending_other_release_train_prs
 
             upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
             if [[ "${upstream_tag}" != rust-v* ]]; then
@@ -276,8 +341,12 @@ jobs:
             version="${version%-termux}"
             release_train="${version%%-*}"
             release_branch="release/${release_train}"
-            work_branch="upstream/${upstream_tag}"
+            work_branch="upstream/rust-v${release_train}"
             termux_tag="${upstream_tag}-termux"
+            open_train_pr_json="$(open_release_train_pr_for_branch "${release_branch}")"
+            if [[ -n "${open_train_pr_json}" ]]; then
+              work_branch="$(jq -r '.headRefName' <<< "${open_train_pr_json}")"
+            fi
 
             if [[ -z "${REQUESTED_TAG}" && "${version}" == *-* ]]; then
               stable_termux_tag="rust-v${release_train}-termux"
@@ -287,9 +356,7 @@ jobs:
               fi
             fi
 
-            if ! release_tag_is_newer_than_current_train "${upstream_tag}" "${release_branch}"; then
-              current_tag="$(release_branch_current_tag "${release_branch}")"
-              echo "${upstream_tag} is not newer than ${current_tag} already recorded on ${release_branch}; nothing to do."
+            if ! release_tag_is_newer_than_known_train "${upstream_tag}" "${release_branch}" "${open_train_pr_json}"; then
               return 1
             fi
 
@@ -298,14 +365,18 @@ jobs:
               return 1
             fi
 
-            if [[ -z "${REQUESTED_TAG}" ]]; then
-              pending_release_train_prs="$(open_release_train_prs_for_branch "${release_branch}")"
-              if [[ -n "${pending_release_train_prs}" ]]; then
-                echo "${upstream_tag} is newer, but ${release_branch} already has an open release train PR; waiting for it to merge and deploy."
-                printf '%s\n' "${pending_release_train_prs}"
+            if [[ "${BYPASS_PRIOR_RELEASE_TRAIN}" != "true" ]]; then
+              pending_other_release_train_prs="$(open_other_release_train_prs "${release_branch}")"
+              if [[ -n "${pending_other_release_train_prs}" ]]; then
+                echo "${upstream_tag} is newer, but another release train PR is already open; waiting for it to merge and deploy."
+                printf '%s\n' "${pending_other_release_train_prs}"
                 return 1
               fi
+            elif [[ -n "${REQUESTED_TAG}" ]]; then
+              echo "Bypassing prior release train gate for manual dispatch of ${REQUESTED_TAG}."
+            fi
 
+            if [[ -z "${REQUESTED_TAG}" ]]; then
               current_termux_tag="$(release_branch_current_termux_tag "${release_branch}")"
               if [[ -n "${current_termux_tag}" && "${current_termux_tag}" != "${termux_tag}" ]]; then
                 if ! gh release view "${current_termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
@@ -679,20 +750,48 @@ jobs:
               --limit 100 \
               --json number,title,state,isDraft,mergedAt,url
           )"
-          existing_active_or_merged_pr="$(
+          existing_merged_pr="$(
             jq -c --arg title "${pr_title}" '
-              [.[] | select(.title == $title and (.state == "OPEN" or .state == "MERGED" or .mergedAt != null))]
+              [.[] | select(.title == $title and (.state == "MERGED" or .mergedAt != null))]
               | sort_by(.number)
               | reverse
               | .[0] // empty
             ' <<< "${existing_prs}"
           )"
-          if [[ -n "${existing_active_or_merged_pr}" ]]; then
-            existing_pr_url="$(jq -r '.url' <<< "${existing_active_or_merged_pr}")"
-            existing_pr_state="$(jq -r '.state' <<< "${existing_active_or_merged_pr}")"
-            existing_pr_draft="$(jq -r '.isDraft' <<< "${existing_active_or_merged_pr}")"
-            echo "A matching active or merged PR already exists for title '${pr_title}': ${existing_pr_url} (${existing_pr_state}, draft=${existing_pr_draft})."
+          if [[ -n "${existing_merged_pr}" ]]; then
+            existing_pr_url="$(jq -r '.url' <<< "${existing_merged_pr}")"
+            echo "A matching merged PR already exists for title '${pr_title}': ${existing_pr_url}."
             exit 0
+          fi
+
+          existing_open_train_pr="$(
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --limit 200 \
+              --json number,title,body,headRefName,baseRefName,url \
+              | jq -c --arg release_branch "${RELEASE_BRANCH}" '
+                  [
+                    .[]
+                    | select(.baseRefName == $release_branch)
+                    | select(
+                        ((.title // "") | startswith("Termux rust-v"))
+                        and ((.body // "") | contains("Release train branch: `" + $release_branch + "`"))
+                      )
+                  ]
+                  | sort_by(.number)
+                  | reverse
+                  | .[0] // empty
+                '
+          )"
+          existing_open_train_pr_url=""
+          if [[ -n "${existing_open_train_pr}" ]]; then
+            existing_open_train_pr_url="$(jq -r '.url' <<< "${existing_open_train_pr}")"
+            existing_open_train_pr_head="$(jq -r '.headRefName' <<< "${existing_open_train_pr}")"
+            if [[ "${existing_open_train_pr_head}" != "${WORK_BRANCH}" ]]; then
+              echo "Open release train PR uses ${existing_open_train_pr_head}; updating that branch instead of ${WORK_BRANCH}."
+              WORK_BRANCH="${existing_open_train_pr_head}"
+            fi
           fi
 
           release_branch_exists=false
@@ -726,7 +825,17 @@ jobs:
           fi
 
           git fetch origin "${RELEASE_BRANCH}"
-          git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
+          work_branch_exists=false
+          if git ls-remote --exit-code --heads origin "${WORK_BRANCH}" >/dev/null 2>&1; then
+            work_branch_exists=true
+            git fetch origin "${WORK_BRANCH}"
+          fi
+
+          if [[ "${work_branch_exists}" == true ]]; then
+            git checkout -B "${WORK_BRANCH}" "origin/${WORK_BRANCH}"
+          else
+            git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
+          fi
 
           if [[ "${release_branch_exists}" == false ]]; then
             normalized_patch_ref="termux-patch-normalized/${UPSTREAM_TAG}"
@@ -853,14 +962,22 @@ jobs:
             printf '%s\n' "${UPSTREAM_BODY}"
           } > "${body_path}"
 
-          pr_url="$(
-            gh pr create \
+          if [[ -n "${existing_open_train_pr_url}" ]]; then
+            pr_url="${existing_open_train_pr_url}"
+            gh pr edit "${pr_url}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --base "${RELEASE_BRANCH}" \
-              --head "${WORK_BRANCH}" \
               --title "${pr_title}" \
               --body-file "${body_path}"
-          )"
+          else
+            pr_url="$(
+              gh pr create \
+                --repo "${GITHUB_REPOSITORY}" \
+                --base "${RELEASE_BRANCH}" \
+                --head "${WORK_BRANCH}" \
+                --title "${pr_title}" \
+                --body-file "${body_path}"
+            )"
+          fi
           gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-reviewer "${REVIEWER}" || true
           gh label create termux-release --repo "${GITHUB_REPOSITORY}" --color 0e8a16 --description "Termux release automation" --force
           gh label create release-train --repo "${GITHUB_REPOSITORY}" --color 1d76db --description "Release train PR" --force
