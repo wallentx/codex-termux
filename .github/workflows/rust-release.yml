@@ -363,10 +363,48 @@ jobs:
           EOF
           "${toolchain}/bin/aarch64-linux-android${api_level}-clang" -c "${tls_align_source}" -o "${tls_align_object}"
 
-          # Provide C++ ABI (exceptions, RTTI, vtables) missing from libc++_static pulled in by oboe-sys
+          v8_compat_source="${RUNNER_TEMP}/codex-android-v8-compat.c"
+          v8_compat_object="${RUNNER_TEMP}/codex-android-v8-compat.o"
+          cat > "${v8_compat_source}" <<'EOF'
+          #include <locale.h>
+          #include <stddef.h>
+          #include <stdlib.h>
+
+          void *aligned_alloc(size_t alignment, size_t size) {
+            void *ptr = NULL;
+            if (posix_memalign(&ptr, alignment, size) != 0) {
+              return NULL;
+            }
+            return ptr;
+          }
+
+          double strtod_l(const char *nptr, char **endptr, locale_t locale) {
+            (void)locale;
+            return strtod(nptr, endptr);
+          }
+
+          float strtof_l(const char *nptr, char **endptr, locale_t locale) {
+            (void)locale;
+            return strtof(nptr, endptr);
+          }
+          EOF
+          "${toolchain}/bin/aarch64-linux-android${api_level}-clang" -c "${v8_compat_source}" -o "${v8_compat_object}"
+
+          builtins_archive="$(
+            find "${toolchain}/lib/clang" \
+              -path "*/lib/linux/libclang_rt.builtins-aarch64-android.a" \
+              -print -quit
+          )"
+          if [[ -z "${builtins_archive}" ]]; then
+            echo "Could not find Android compiler-rt builtins archive under ${toolchain}/lib/clang" >&2
+            exit 1
+          fi
+          builtins_dir="$(dirname "${builtins_archive}")"
+
+          # Provide compatibility symbols and C++ ABI needed by the Android rusty_v8 archive.
           rustflags_var="CARGO_TARGET_${target^^}_RUSTFLAGS"
           rustflags_var="${rustflags_var//-/_}"
-          echo "${rustflags_var}=-C link-arg=${tls_align_object} -C link-arg=-Wl,-u,__codex_android_tls_align -C link-arg=-lc++abi -C link-arg=-Wl,-z,max-page-size=65536" >> "$GITHUB_ENV"
+          echo "${rustflags_var}=-C link-arg=${tls_align_object} -C link-arg=${v8_compat_object} -C link-arg=-Wl,-u,__codex_android_tls_align -C link-arg=-L${builtins_dir} -C link-arg=-lclang_rt.builtins-aarch64-android -C link-arg=-lc++abi -C link-arg=-Wl,-z,max-page-size=65536" >> "$GITHUB_ENV"
 
 
           # Configure for vendored OpenSSL build
