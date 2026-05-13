@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import importlib.resources as resources
 import inspect
-import tomllib
-from pathlib import Path
 from typing import Any
 
-import codex_app_server
 from codex_app_server import AppServerConfig, RunResult
 from codex_app_server.models import InitializeResponse
 from codex_app_server.api import AsyncCodex, AsyncThread, Codex, Thread
@@ -38,14 +35,6 @@ def test_root_exports_app_server_config() -> None:
 
 def test_root_exports_run_result() -> None:
     assert RunResult.__name__ == "RunResult"
-
-
-def test_package_and_default_client_versions_follow_project_version() -> None:
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    pyproject = tomllib.loads(pyproject_path.read_text())
-
-    assert codex_app_server.__version__ == pyproject["project"]["version"]
-    assert AppServerConfig().client_version == codex_app_server.__version__
 
 
 def test_package_includes_py_typed_marker() -> None:
@@ -81,7 +70,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "sort_direction",
             "sort_key",
             "source_kinds",
-            "use_state_db_only",
         ],
         Codex.thread_resume: [
             "approval_policy",
@@ -159,7 +147,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "sort_direction",
             "sort_key",
             "source_kinds",
-            "use_state_db_only",
         ],
         AsyncCodex.thread_resume: [
             "approval_policy",

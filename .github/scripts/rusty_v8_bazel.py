@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -29,6 +30,19 @@ MUSL_RUNTIME_ARCHIVE_LABELS = [
 ]
 LLVM_AR_LABEL = "@llvm//tools:llvm-ar"
 LLVM_RANLIB_LABEL = "@llvm//tools:llvm-ranlib"
+ANDROID_GN_PYDEPS_FILES = [
+    "build/android/pylib/results/presentation/test_results_presentation.pydeps",
+    "build/android/devil_chromium.pydeps",
+    "build/android/apk_operations.pydeps",
+    "build/android/test_runner.pydeps",
+    "build/android/test_wrapper/logdog_wrapper.pydeps",
+    "build/android/resource_sizes.pydeps",
+]
+
+ANDROID_EXTRA_GN_ARGS = [
+    'android_ndk_root="//third_party/android_ndk"',
+    'android_ndk_version="r26c"',
+]
 
 
 def bazel_execroot() -> Path:
@@ -63,10 +77,8 @@ def bazel_output_files(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> list[Path]:
     expression = "set(" + " ".join(labels) + ")"
-    bazel_configs = bazel_configs or []
     result = subprocess.run(
         [
             "bazel",
@@ -74,7 +86,6 @@ def bazel_output_files(
             "-c",
             compilation_mode,
             f"--platforms=@llvm//platforms:{platform}",
-            *[f"--config={config}" for config in bazel_configs],
             "--output=files",
             expression,
         ],
@@ -90,9 +101,7 @@ def bazel_build(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> None:
-    bazel_configs = bazel_configs or []
     subprocess.run(
         [
             "bazel",
@@ -100,7 +109,6 @@ def bazel_build(
             "-c",
             compilation_mode,
             f"--platforms=@llvm//platforms:{platform}",
-            *[f"--config={config}" for config in bazel_configs],
             *labels,
         ],
         cwd=ROOT,
@@ -112,14 +120,13 @@ def ensure_bazel_output_files(
     platform: str,
     labels: list[str],
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> list[Path]:
-    outputs = bazel_output_files(platform, labels, compilation_mode, bazel_configs)
+    outputs = bazel_output_files(platform, labels, compilation_mode)
     if all(path.exists() for path in outputs):
         return outputs
 
-    bazel_build(platform, labels, compilation_mode, bazel_configs)
-    outputs = bazel_output_files(platform, labels, compilation_mode, bazel_configs)
+    bazel_build(platform, labels, compilation_mode)
+    outputs = bazel_output_files(platform, labels, compilation_mode)
     missing = [str(path) for path in outputs if not path.exists()]
     if missing:
         raise SystemExit(f"missing built outputs for {labels}: {missing}")
@@ -186,6 +193,179 @@ def staged_archive_name(target: str, source_path: Path) -> str:
     return f"librusty_v8_release_{target}.a.gz"
 
 
+def staged_binding_name(target: str) -> str:
+    return f"src_binding_release_{target}.rs"
+
+
+def staged_checksums_name(target: str) -> str:
+    return f"rusty_v8_release_{target}.sha256"
+
+
+def write_gzip_archive(source_archive: Path, staged_library: Path) -> None:
+    with source_archive.open("rb") as src, staged_library.open("wb") as dst:
+        with gzip.GzipFile(
+            filename="",
+            mode="wb",
+            fileobj=dst,
+            compresslevel=6,
+            mtime=0,
+        ) as gz:
+            shutil.copyfileobj(src, gz)
+
+
+def write_checksums(paths: list[Path], checksums_path: Path) -> None:
+    with checksums_path.open("w", encoding="utf-8") as checksums:
+        for path in paths:
+            digest = hashlib.sha256()
+            with path.open("rb") as artifact:
+                for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            checksums.write(f"{digest.hexdigest()}  {path.name}\n")
+
+
+def copy_chromium_rust_vendor(vendored_source: Path, rusty_v8_source_root: Path) -> None:
+    source_vendor_dir = (
+        rusty_v8_source_root / "third_party" / "rust" / "chromium_crates_io" / "vendor"
+    )
+    if not source_vendor_dir.exists():
+        raise SystemExit(f"missing Chromium Rust vendor directory: {source_vendor_dir}")
+
+    dest_vendor_dir = (
+        vendored_source / "third_party" / "rust" / "chromium_crates_io" / "vendor"
+    )
+    if dest_vendor_dir.exists():
+        shutil.rmtree(dest_vendor_dir)
+    dest_vendor_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_vendor_dir, dest_vendor_dir)
+
+
+def patch_android_v8_source(vendored_source: Path) -> None:
+    stdlib_header = (
+        vendored_source / "third_party" / "libc++" / "src" / "include" / "stdlib.h"
+    )
+    if not stdlib_header.exists():
+        raise SystemExit(f"missing libc++ stdlib header: {stdlib_header}")
+
+    text = stdlib_header.read_text(encoding="utf-8")
+    replacements = [
+        (
+            "inline _LIBCPP_HIDE_FROM_ABI ldiv_t div(long __x, long __y) _NOEXCEPT { return ::ldiv(__x, __y); }\n",
+            "#if !defined(__ANDROID__)\n"
+            "inline _LIBCPP_HIDE_FROM_ABI ldiv_t div(long __x, long __y) _NOEXCEPT { return ::ldiv(__x, __y); }\n"
+            "#endif\n",
+        ),
+        (
+            "inline _LIBCPP_HIDE_FROM_ABI lldiv_t div(long long __x, long long __y) _NOEXCEPT { return ::lldiv(__x, __y); }\n",
+            "#if !defined(__ANDROID__)\n"
+            "inline _LIBCPP_HIDE_FROM_ABI lldiv_t div(long long __x, long long __y) _NOEXCEPT { return ::lldiv(__x, __y); }\n"
+            "#endif\n",
+        ),
+    ]
+    for old, new in replacements:
+        if old not in text:
+            raise SystemExit(
+                f"missing expected libc++ Android patch target in {stdlib_header}"
+            )
+        text = text.replace(old, new, 1)
+    stdlib_header.write_text(text, encoding="utf-8")
+
+    abort_message = (
+        vendored_source
+        / "third_party"
+        / "libc++abi"
+        / "src"
+        / "src"
+        / "abort_message.cpp"
+    )
+    if not abort_message.exists():
+        raise SystemExit(f"missing libc++abi abort_message source: {abort_message}")
+
+    text = abort_message.read_text(encoding="utf-8")
+    if "#include <stdio.h>" not in text:
+        text = text.replace(
+            "#include <stdarg.h>\n",
+            "#include <stdarg.h>\n#include <stdio.h>\n",
+        )
+    if "#include <stdlib.h>" not in text:
+        text = text.replace(
+            "#include <stdio.h>\n",
+            "#include <stdio.h>\n#include <stdlib.h>\n",
+        )
+    abort_message.write_text(text, encoding="utf-8")
+
+    build_rs = vendored_source / "build.rs"
+    if not build_rs.exists():
+        raise SystemExit(f"missing v8 build script: {build_rs}")
+
+    text = build_rs.read_text(encoding="utf-8")
+    old = '  } else if target_os == "linux" {\n'
+    new = (
+        '  } else if target_os == "android" {\n'
+        '    clang_args.push("--target=aarch64-linux-android29".to_string());\n'
+        '    clang_args.push("--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot".to_string());\n'
+        '  } else if target_os == "linux" {\n'
+    )
+    if old not in text:
+        raise SystemExit(f"missing expected Android bindgen patch target in {build_rs}")
+    build_rs.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+def add_android_extra_gn_args(env: dict[str, str]) -> None:
+    existing = " ".join(
+        value for value in (env.get("GN_ARGS", ""), env.get("EXTRA_GN_ARGS", "")) if value
+    )
+    extra_args = [env["EXTRA_GN_ARGS"]] if env.get("EXTRA_GN_ARGS") else []
+    for arg in ANDROID_EXTRA_GN_ARGS:
+        key = arg.split("=", 1)[0]
+        if f"{key}=" not in existing:
+            extra_args.append(arg)
+    if extra_args:
+        env["EXTRA_GN_ARGS"] = " ".join(extra_args)
+
+
+def vendor_android_v8_crate_source(
+    version: str, temp_dir: Path, env: dict[str, str], rusty_v8_source_root: Path
+) -> Path:
+    cargo_home = Path(env.get("CARGO_HOME", Path.home() / ".cargo")).expanduser()
+    candidates = sorted((cargo_home / "registry" / "src").glob(f"*/v8-{version}"))
+    if not candidates:
+        raise SystemExit(f"missing fetched v8 crate source for {version}")
+
+    vendored_source = temp_dir / f"v8-{version}"
+    shutil.copytree(candidates[0], vendored_source)
+
+    # The crates.io v8 147.x source omits Android test-runner pydeps files, but
+    # GN reads them while generating Android release build files.
+    for relative_path in ANDROID_GN_PYDEPS_FILES:
+        pydeps_path = vendored_source / relative_path
+        pydeps_path.parent.mkdir(parents=True, exist_ok=True)
+        pydeps_path.write_text(
+            "# Generated for Android rusty_v8 release staging.\n",
+            encoding="utf-8",
+        )
+    copy_chromium_rust_vendor(vendored_source, rusty_v8_source_root)
+    return vendored_source
+
+
+def install_android_v8_host_sysroot(vendored_source: Path, env: dict[str, str]) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            str(
+                vendored_source
+                / "build"
+                / "linux"
+                / "sysroot_scripts"
+                / "install-sysroot.py"
+            ),
+            "--arch=amd64",
+        ],
+        cwd=vendored_source,
+        env=env,
+        check=True,
+    )
+
+
 def is_musl_archive_target(target: str, source_path: Path) -> bool:
     return target.endswith("-unknown-linux-musl") and source_path.suffix == ".a"
 
@@ -194,9 +374,8 @@ def single_bazel_output_file(
     platform: str,
     label: str,
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> Path:
-    outputs = ensure_bazel_output_files(platform, [label], compilation_mode, bazel_configs)
+    outputs = ensure_bazel_output_files(platform, [label], compilation_mode)
     if len(outputs) != 1:
         raise SystemExit(f"expected exactly one output for {label}, found {outputs}")
     return outputs[0]
@@ -206,17 +385,11 @@ def merged_musl_archive(
     platform: str,
     lib_path: Path,
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> Path:
-    llvm_ar = single_bazel_output_file(platform, LLVM_AR_LABEL, compilation_mode, bazel_configs)
-    llvm_ranlib = single_bazel_output_file(
-        platform,
-        LLVM_RANLIB_LABEL,
-        compilation_mode,
-        bazel_configs,
-    )
+    llvm_ar = single_bazel_output_file(platform, LLVM_AR_LABEL, compilation_mode)
+    llvm_ranlib = single_bazel_output_file(platform, LLVM_RANLIB_LABEL, compilation_mode)
     runtime_archives = [
-        single_bazel_output_file(platform, label, compilation_mode, bazel_configs)
+        single_bazel_output_file(platform, label, compilation_mode)
         for label in MUSL_RUNTIME_ARCHIVE_LABELS
     ]
 
@@ -247,13 +420,11 @@ def stage_release_pair(
     target: str,
     output_dir: Path,
     compilation_mode: str = "fastbuild",
-    bazel_configs: list[str] | None = None,
 ) -> None:
     outputs = ensure_bazel_output_files(
         platform,
         [release_pair_label(target)],
         compilation_mode,
-        bazel_configs,
     )
 
     try:
@@ -268,33 +439,128 @@ def stage_release_pair(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     staged_library = output_dir / staged_archive_name(target, lib_path)
-    staged_binding = output_dir / f"src_binding_release_{target}.rs"
+    staged_binding = output_dir / staged_binding_name(target)
     source_archive = (
-        merged_musl_archive(platform, lib_path, compilation_mode, bazel_configs)
+        merged_musl_archive(platform, lib_path, compilation_mode)
         if is_musl_archive_target(target, lib_path)
         else lib_path
     )
 
-    with source_archive.open("rb") as src, staged_library.open("wb") as dst:
-        with gzip.GzipFile(
-            filename="",
-            mode="wb",
-            fileobj=dst,
-            compresslevel=6,
-            mtime=0,
-        ) as gz:
-            shutil.copyfileobj(src, gz)
-
+    write_gzip_archive(source_archive, staged_library)
     shutil.copyfile(binding_path, staged_binding)
 
-    staged_checksums = output_dir / f"rusty_v8_release_{target}.sha256"
-    with staged_checksums.open("w", encoding="utf-8") as checksums:
-        for path in [staged_library, staged_binding]:
-            digest = hashlib.sha256()
-            with path.open("rb") as artifact:
-                for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            checksums.write(f"{digest.hexdigest()}  {path.name}\n")
+    staged_checksums = output_dir / staged_checksums_name(target)
+    write_checksums([staged_library, staged_binding], staged_checksums)
+
+    print(staged_library)
+    print(staged_binding)
+    print(staged_checksums)
+
+
+def stage_android_release_pair(
+    target: str,
+    output_dir: Path,
+    rusty_v8_source_root: Path,
+) -> None:
+    if target != "aarch64-linux-android":
+        raise SystemExit(f"unsupported Android rusty_v8 target: {target}")
+
+    version = resolved_v8_crate_version()
+    temp_dir = Path(tempfile.mkdtemp(prefix="rusty-v8-android-stage-"))
+    target_dir = temp_dir / "target"
+    manifest_path = temp_dir / "Cargo.toml"
+    src_dir = temp_dir / "src"
+    src_dir.mkdir()
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "[package]",
+                'name = "rusty-v8-android-stage"',
+                'version = "0.0.0"',
+                'edition = "2021"',
+                "",
+                "[dependencies]",
+                f'v8 = "={version}"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (src_dir / "lib.rs").write_text(
+        "#![allow(dead_code)]\n\npub fn link_v8() {}\n",
+        encoding="utf-8",
+    )
+
+    env = {
+        **os.environ,
+        "CARGO_TARGET_DIR": str(target_dir),
+        "V8_FROM_SOURCE": "1",
+    }
+    add_android_extra_gn_args(env)
+    subprocess.run(
+        [
+            "cargo",
+            "fetch",
+            "--manifest-path",
+            str(manifest_path),
+            "--target",
+            target,
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
+    vendored_source = vendor_android_v8_crate_source(
+        version,
+        temp_dir,
+        env,
+        rusty_v8_source_root,
+    )
+    patch_android_v8_source(vendored_source)
+    install_android_v8_host_sysroot(vendored_source, env)
+    with manifest_path.open("a", encoding="utf-8") as manifest:
+        manifest.write(
+            "\n".join(
+                [
+                    "",
+                    "[patch.crates-io]",
+                    f'v8 = {{ path = "{vendored_source.as_posix()}" }}',
+                    "",
+                ]
+            )
+        )
+
+    subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--manifest-path",
+            str(manifest_path),
+            "--release",
+            "--target",
+            target,
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
+
+    build_dir = target_dir / target / "release" / "gn_out"
+    archive_path = build_dir / "obj" / "librusty_v8.a"
+    binding_path = build_dir / "src_binding.rs"
+    if not archive_path.exists():
+        raise SystemExit(f"missing Android rusty_v8 archive: {archive_path}")
+    if not binding_path.exists():
+        raise SystemExit(f"missing Android rusty_v8 binding: {binding_path}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staged_library = output_dir / staged_archive_name(target, archive_path)
+    staged_binding = output_dir / staged_binding_name(target)
+    staged_checksums = output_dir / staged_checksums_name(target)
+
+    write_gzip_archive(archive_path, staged_library)
+    shutil.copyfile(binding_path, staged_binding)
+    write_checksums([staged_library, staged_binding], staged_checksums)
 
     print(staged_library)
     print(staged_binding)
@@ -310,15 +576,20 @@ def parse_args() -> argparse.Namespace:
     stage_release_pair_parser.add_argument("--target", required=True)
     stage_release_pair_parser.add_argument("--output-dir", required=True)
     stage_release_pair_parser.add_argument(
-        "--bazel-config",
-        action="append",
-        default=[],
-        dest="bazel_configs",
-    )
-    stage_release_pair_parser.add_argument(
         "--compilation-mode",
         default="fastbuild",
         choices=["fastbuild", "opt", "dbg"],
+    )
+
+    stage_android_release_pair_parser = subparsers.add_parser(
+        "stage-android-release-pair"
+    )
+    stage_android_release_pair_parser.add_argument("--target", required=True)
+    stage_android_release_pair_parser.add_argument("--output-dir", required=True)
+    stage_android_release_pair_parser.add_argument(
+        "--rusty-v8-source-root",
+        type=Path,
+        required=True,
     )
 
     subparsers.add_parser("resolved-v8-crate-version")
@@ -352,7 +623,13 @@ def main() -> int:
             target=args.target,
             output_dir=Path(args.output_dir),
             compilation_mode=args.compilation_mode,
-            bazel_configs=args.bazel_configs,
+        )
+        return 0
+    if args.command == "stage-android-release-pair":
+        stage_android_release_pair(
+            target=args.target,
+            output_dir=Path(args.output_dir),
+            rusty_v8_source_root=args.rusty_v8_source_root.resolve(),
         )
         return 0
     if args.command == "resolved-v8-crate-version":

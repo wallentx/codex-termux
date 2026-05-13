@@ -11,7 +11,6 @@ path = "src/main.rs"
 [lib]
 name = "codex_file_search"
 path = "src/lib.rs"
-doctest = false
 
 [lints]
 workspace = true

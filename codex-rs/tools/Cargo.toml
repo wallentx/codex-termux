@@ -26,6 +26,3 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
-
-[lib]
-doctest = false

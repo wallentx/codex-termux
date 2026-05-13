@@ -55,11 +55,7 @@ static uid_t real_uid;
 static gid_t real_gid;
 static uid_t overflow_uid;
 static gid_t overflow_gid;
-#ifdef ENABLE_SUPPORT_SETUID
 static bool is_privileged; /* See acquire_privs() */
-#else
-#define is_privileged 0
-#endif
 static const char *argv0;
 static const char *host_tty_dev;
 static int proc_fd = -1;
@@ -844,16 +840,13 @@ set_ambient_capabilities (void)
 static void
 acquire_privs (void)
 {
-  uid_t euid;
+  uid_t euid, new_fsuid;
 
   euid = geteuid ();
 
   /* Are we setuid ? */
   if (real_uid != euid)
     {
-#ifdef ENABLE_SUPPORT_SETUID
-      uid_t new_fsuid;
-
       if (euid != 0)
         die ("Unexpected setuid user %d, should be 0", euid);
 
@@ -875,16 +868,13 @@ acquire_privs (void)
       /* setfsuid can't properly report errors, check that it worked (as per manpage) */
       new_fsuid = setfsuid (-1);
       if (new_fsuid != real_uid)
-        die_with_error ("Unable to set fsuid (was %d)", (int)new_fsuid);
+        die ("Unable to set fsuid (was %d)", (int)new_fsuid);
 
       /* We never need capabilities after execve(), so lets drop everything from the bounding set */
       drop_cap_bounding_set (true);
 
       /* Keep only the required capabilities for setup */
       set_required_caps ();
-#else
-      die ("setuid use of bubblewrap is not supported in this build");
-#endif
     }
   else if (real_uid != 0 && has_caps ())
     {
@@ -947,8 +937,7 @@ switch_to_user_with_privs (void)
 /* Call setuid() and use capset() to adjust capabilities */
 static void
 drop_privs (bool keep_requested_caps,
-            bool already_changed_uid,
-            bool set_dumpable)
+            bool already_changed_uid)
 {
   assert (!keep_requested_caps || !is_privileged);
   /* Drop root uid */
@@ -958,12 +947,9 @@ drop_privs (bool keep_requested_caps,
 
   drop_all_caps (keep_requested_caps);
 
-  if (set_dumpable)
-    {
-      /* We don't have any privs now, so mark us dumpable which makes /proc/self be owned by the user instead of root */
-      if (prctl (PR_SET_DUMPABLE, 1, 0, 0, 0) != 0)
-        die_with_error ("can't set dumpable");
-    }
+  /* We don't have any privs now, so mark us dumpable which makes /proc/self be owned by the user instead of root */
+  if (prctl (PR_SET_DUMPABLE, 1, 0, 0, 0) != 0)
+    die_with_error ("can't set dumpable");
 }
 
 static void
@@ -1168,9 +1154,7 @@ privileged_op (int         privileged_op_socket,
       break;
 
     case PRIV_SEP_OP_OVERLAY_MOUNT:
-      if (is_privileged)
-        die ("Overlay mounts are not supported in setuid mode");
-      if (mount ("overlay", arg2, "overlay", MS_MGC_VAL | MS_NOSUID | MS_NODEV, arg1) != 0)
+      if (mount ("overlay", arg2, "overlay", MS_MGC_VAL, arg1) != 0)
         {
           /* The standard message for ELOOP, "Too many levels of symbolic
            * links", is not helpful here. */
@@ -1188,8 +1172,6 @@ privileged_op (int         privileged_op_socket,
          something manages to send hacked priv-sep operation requests. */
       if (!opt_unshare_uts)
         die ("Refusing to set hostname in original namespace");
-      if (arg1 == NULL)
-        die ("Hostname argument is NULL");
       if (sethostname (arg1, strlen(arg1)) != 0)
         die_with_error ("Can't set hostname to %s", arg1);
       break;
@@ -3130,7 +3112,7 @@ main (int    argc,
     }
 
   /* Switch to the custom user ns before the clone, gets us privs in that ns (assuming its a child of the current and thus allowed) */
-  if (opt_userns_fd != -1 && setns (opt_userns_fd, CLONE_NEWUSER) != 0)
+  if (opt_userns_fd > 0 && setns (opt_userns_fd, CLONE_NEWUSER) != 0)
     {
       if (errno == EINVAL)
         die ("Joining the specified user namespace failed, it might not be a descendant of the current user namespace.");
@@ -3196,11 +3178,11 @@ main (int    argc,
 
       /* Initial launched process, wait for pid 1 or exec:ed command to exit */
 
-      if (opt_userns2_fd != -1 && setns (opt_userns2_fd, CLONE_NEWUSER) != 0)
+      if (opt_userns2_fd > 0 && setns (opt_userns2_fd, CLONE_NEWUSER) != 0)
         die_with_error ("Setting userns2 failed");
 
       /* We don't need any privileges in the launcher, drop them immediately. */
-      drop_privs (false, false, true);
+      drop_privs (false, false);
 
       /* Optionally bind our lifecycle to that of the parent */
       handle_die_with_parent ();
@@ -3237,7 +3219,7 @@ main (int    argc,
       return monitor_child (event_fd, pid, setup_finished_pipe[0]);
     }
 
-  if (opt_pidns_fd != -1)
+  if (opt_pidns_fd > 0)
     {
       if (setns (opt_pidns_fd, CLONE_NEWPID) != 0)
         die_with_error ("Setting pidns failed");
@@ -3387,10 +3369,8 @@ main (int    argc,
 
       if (child == 0)
         {
-          /* Unprivileged setup process.
-           * Note: Don't set dumpable, because we can still perform privileged
-           * operations via privileged_op(). */
-          drop_privs (false, true, false);
+          /* Unprivileged setup process */
+          drop_privs (false, true);
           close (privsep_sockets[0]);
           setup_newroot (opt_unshare_pid, privsep_sockets[1]);
           exit (0);
@@ -3466,7 +3446,7 @@ main (int    argc,
       die_with_error ("chdir /");
   }
 
-  if (opt_userns2_fd != -1 && setns (opt_userns2_fd, CLONE_NEWUSER) != 0)
+  if (opt_userns2_fd > 0 && setns (opt_userns2_fd, CLONE_NEWUSER) != 0)
     die_with_error ("Setting userns2 failed");
 
   if (opt_unshare_user && opt_userns_block_fd == -1 &&
@@ -3519,7 +3499,7 @@ main (int    argc,
     }
 
   /* All privileged ops are done now, so drop caps we don't need */
-  drop_privs (!is_privileged, true, true);
+  drop_privs (!is_privileged, true);
 
   if (opt_block_fd != -1)
     {
