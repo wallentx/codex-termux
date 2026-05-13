@@ -19,7 +19,9 @@ use codex_network_proxy::PROXY_ENV_KEYS;
 #[cfg(target_os = "macos")]
 use codex_network_proxy::PROXY_GIT_SSH_COMMAND_ENV_KEY;
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -103,11 +105,14 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
         expiration: ExecExpiration::DefaultTimeout,
         capture_policy: ExecCapturePolicy::ShellTool,
     };
-    let permissions = PermissionProfile::Disabled;
+    let sandbox_policy = SandboxPolicy::DangerFullAccess;
+    let file_system_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
         sandbox: SandboxType::None,
-        permissions: &permissions,
+        policy: &sandbox_policy,
+        file_system_policy: &file_system_policy,
+        network_policy: NetworkSandboxPolicy::Enabled,
         enforce_managed_network: false,
         manager: &manager,
         sandbox_cwd: &cwd,
@@ -115,7 +120,6 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
         use_legacy_landlock: false,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
-        network_denial_cancellation_token: None,
     };
 
     let exec_request = attempt
@@ -676,12 +680,10 @@ fn maybe_wrap_shell_lc_with_snapshot_keeps_user_proxy_env_when_proxy_inactive() 
         &HashMap::new(),
         &HashMap::new(),
     );
-    let mut command = Command::new(&rewritten[0]);
-    command.args(&rewritten[1..]);
-    for key in PROXY_ENV_KEYS {
-        command.env_remove(key);
-    }
-    let output = command.output().expect("run rewritten command");
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .output()
+        .expect("run rewritten command");
 
     assert!(output.status.success(), "command failed: {output:?}");
     assert_eq!(

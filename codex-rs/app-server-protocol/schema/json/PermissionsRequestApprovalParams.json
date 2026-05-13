@@ -181,6 +181,21 @@
           "properties": {
             "kind": {
               "enum": [
+                "current_working_directory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "CurrentWorkingDirectoryFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
                 "project_roots"
               ],
               "type": "string"
@@ -297,11 +312,6 @@
         "null"
       ]
     },
-    "startedAtMs": {
-      "description": "Unix timestamp (in milliseconds) when this approval request started.",
-      "format": "int64",
-      "type": "integer"
-    },
     "threadId": {
       "type": "string"
     },
@@ -313,7 +323,6 @@
     "cwd",
     "itemId",
     "permissions",
-    "startedAtMs",
     "threadId",
     "turnId"
   ],

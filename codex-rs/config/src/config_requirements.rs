@@ -1,8 +1,8 @@
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::WebSearchMode;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -18,7 +18,6 @@ use super::requirements_exec_policy::RequirementsExecPolicyToml;
 use crate::Constrained;
 use crate::ConstraintError;
 use crate::ManagedHooksRequirementsToml;
-use crate::mcp_types::AppToolApproval;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequirementSource {
@@ -85,12 +84,11 @@ impl<T> std::ops::DerefMut for ConstrainedWithSource<T> {
 pub struct ConfigRequirements {
     pub approval_policy: ConstrainedWithSource<AskForApproval>,
     pub approvals_reviewer: ConstrainedWithSource<ApprovalsReviewer>,
-    pub permission_profile: ConstrainedWithSource<PermissionProfile>,
+    pub sandbox_policy: ConstrainedWithSource<SandboxPolicy>,
     pub web_search_mode: ConstrainedWithSource<WebSearchMode>,
     pub feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
     pub managed_hooks: Option<ConstrainedWithSource<ManagedHooksRequirementsToml>>,
     pub mcp_servers: Option<Sourced<BTreeMap<String, McpServerRequirement>>>,
-    pub plugins: Option<Sourced<BTreeMap<String, PluginRequirementsToml>>>,
     pub exec_policy: Option<Sourced<RequirementsExecPolicy>>,
     pub enforce_residency: ConstrainedWithSource<Option<ResidencyRequirement>>,
     /// Managed network constraints derived from requirements.
@@ -112,8 +110,8 @@ impl Default for ConfigRequirements {
                 Constrained::allow_any_from_default(),
                 /*source*/ None,
             ),
-            permission_profile: ConstrainedWithSource::new(
-                Constrained::allow_any(PermissionProfile::read_only()),
+            sandbox_policy: ConstrainedWithSource::new(
+                Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
                 /*source*/ None,
             ),
             web_search_mode: ConstrainedWithSource::new(
@@ -123,7 +121,6 @@ impl Default for ConfigRequirements {
             feature_requirements: None,
             managed_hooks: None,
             mcp_servers: None,
-            plugins: None,
             exec_policy: None,
             enforce_residency: ConstrainedWithSource::new(
                 Constrained::allow_any(/*initial_value*/ None),
@@ -152,17 +149,6 @@ pub enum McpServerIdentity {
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct McpServerRequirement {
     pub identity: McpServerIdentity,
-}
-
-#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct PluginRequirementsToml {
-    pub mcp_servers: Option<BTreeMap<String, McpServerRequirement>>,
-}
-
-impl PluginRequirementsToml {
-    pub fn is_empty(&self) -> bool {
-        self.mcp_servers.as_ref().is_none_or(BTreeMap::is_empty)
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -599,42 +585,8 @@ impl FeatureRequirementsToml {
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct AppToolRequirementToml {
-    pub approval_mode: Option<AppToolApproval>,
-}
-
-impl AppToolRequirementToml {
-    pub fn is_empty(&self) -> bool {
-        self.approval_mode.is_none()
-    }
-}
-
-#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct AppToolsRequirementsToml {
-    #[serde(default, flatten)]
-    pub tools: BTreeMap<String, AppToolRequirementToml>,
-}
-
-impl AppToolsRequirementsToml {
-    pub fn is_empty(&self) -> bool {
-        self.tools.values().all(AppToolRequirementToml::is_empty)
-    }
-}
-
-#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppRequirementToml {
     pub enabled: Option<bool>,
-    pub tools: Option<AppToolsRequirementsToml>,
-}
-
-impl AppRequirementToml {
-    pub fn is_empty(&self) -> bool {
-        self.enabled.is_none()
-            && self
-                .tools
-                .as_ref()
-                .is_none_or(AppToolsRequirementsToml::is_empty)
-    }
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -645,14 +597,14 @@ pub struct AppsRequirementsToml {
 
 impl AppsRequirementsToml {
     pub fn is_empty(&self) -> bool {
-        self.apps.values().all(AppRequirementToml::is_empty)
+        self.apps.values().all(|app| app.enabled.is_none())
     }
 }
 
-/// Merge app requirements from a lower-precedence source into an existing higher-precedence set.
-/// This lets managed sources (for example Cloud/MDM) enforce setting disablement across layers,
-/// while exact tool approval settings keep the higher-precedence value when present.
-pub(crate) fn merge_app_requirements_descending(
+/// Merge `enabled` configs from a lower-precedence source into an existing higher-precedence set.
+/// This lets managed sources (for example Cloud/MDM) enforce setting disablement across layers.
+/// Implemented with AppsRequirementsToml for now, could be abstracted if we have more enablement-style configs in the future.
+pub(crate) fn merge_enablement_settings_descending(
     base: &mut AppsRequirementsToml,
     incoming: AppsRequirementsToml,
 ) {
@@ -666,17 +618,6 @@ pub(crate) fn merge_app_requirements_descending(
             } else {
                 higher_precedence.or(lower_precedence)
             };
-
-        let Some(incoming_tools) = incoming_requirement.tools else {
-            continue;
-        };
-        let base_tools = base_requirement.tools.get_or_insert_with(Default::default);
-        for (tool_name, incoming_tool) in incoming_tools.tools {
-            let base_tool = base_tools.tools.entry(tool_name).or_default();
-            if base_tool.approval_mode.is_none() {
-                base_tool.approval_mode = incoming_tool.approval_mode;
-            }
-        }
     }
 }
 
@@ -692,7 +633,6 @@ pub struct ConfigRequirementsToml {
     pub feature_requirements: Option<FeatureRequirementsToml>,
     pub hooks: Option<ManagedHooksRequirementsToml>,
     pub mcp_servers: Option<BTreeMap<String, McpServerRequirement>>,
-    pub plugins: Option<BTreeMap<String, PluginRequirementsToml>>,
     pub apps: Option<AppsRequirementsToml>,
     pub rules: Option<RequirementsExecPolicyToml>,
     pub enforce_residency: Option<ResidencyRequirement>,
@@ -739,7 +679,6 @@ pub struct ConfigRequirementsWithSources {
     pub feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
     pub hooks: Option<Sourced<ManagedHooksRequirementsToml>>,
     pub mcp_servers: Option<Sourced<BTreeMap<String, McpServerRequirement>>>,
-    pub plugins: Option<Sourced<BTreeMap<String, PluginRequirementsToml>>>,
     pub apps: Option<Sourced<AppsRequirementsToml>>,
     pub rules: Option<Sourced<RequirementsExecPolicyToml>>,
     pub enforce_residency: Option<Sourced<ResidencyRequirement>>,
@@ -775,7 +714,6 @@ impl ConfigRequirementsWithSources {
             feature_requirements: _,
             hooks: _,
             mcp_servers: _,
-            plugins: _,
             apps: _,
             rules: _,
             enforce_residency: _,
@@ -804,7 +742,6 @@ impl ConfigRequirementsWithSources {
                 feature_requirements,
                 hooks,
                 mcp_servers,
-                plugins,
                 rules,
                 enforce_residency,
                 network,
@@ -815,7 +752,7 @@ impl ConfigRequirementsWithSources {
 
         if let Some(incoming_apps) = other.apps.take() {
             if let Some(existing_apps) = self.apps.as_mut() {
-                merge_app_requirements_descending(&mut existing_apps.value, incoming_apps);
+                merge_enablement_settings_descending(&mut existing_apps.value, incoming_apps);
             } else {
                 self.apps = Some(Sourced::new(incoming_apps, source));
             }
@@ -831,7 +768,6 @@ impl ConfigRequirementsWithSources {
             feature_requirements,
             hooks,
             mcp_servers,
-            plugins,
             apps,
             rules,
             enforce_residency,
@@ -848,7 +784,6 @@ impl ConfigRequirementsWithSources {
             feature_requirements: feature_requirements.map(|sourced| sourced.value),
             hooks: hooks.map(|sourced| sourced.value),
             mcp_servers: mcp_servers.map(|sourced| sourced.value),
-            plugins: plugins.map(|sourced| sourced.value),
             apps: apps.map(|sourced| sourced.value),
             rules: rules.map(|sourced| sourced.value),
             enforce_residency: enforce_residency.map(|sourced| sourced.value),
@@ -907,10 +842,10 @@ pub enum ResidencyRequirement {
 
 impl ConfigRequirementsToml {
     pub fn apply_remote_sandbox_config(&mut self, hostname: Option<&str>) {
-        let Some(remote_sandbox_config) = self.remote_sandbox_config.as_ref() else {
+        let Some(hostname) = hostname.and_then(normalize_hostname) else {
             return;
         };
-        let Some(hostname) = hostname.and_then(normalize_hostname) else {
+        let Some(remote_sandbox_config) = self.remote_sandbox_config.as_ref() else {
             return;
         };
         let Some(matched_config) = remote_sandbox_config
@@ -938,10 +873,6 @@ impl ConfigRequirementsToml {
                 .is_none_or(ManagedHooksRequirementsToml::is_empty)
             && self.mcp_servers.is_none()
             && self
-                .plugins
-                .as_ref()
-                .is_none_or(|plugins| plugins.values().all(PluginRequirementsToml::is_empty))
-            && self
                 .apps
                 .as_ref()
                 .is_none_or(AppsRequirementsToml::is_empty)
@@ -968,7 +899,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             feature_requirements,
             hooks,
             mcp_servers,
-            plugins,
             apps: _apps,
             rules,
             enforce_residency,
@@ -1037,8 +967,15 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             ),
         };
 
-        let default_permission_profile = PermissionProfile::read_only();
-        let permission_profile = match allowed_sandbox_modes {
+        // TODO(gt): `ConfigRequirementsToml` should let the author specify the
+        // default `SandboxPolicy`? Should do this for `AskForApproval` too?
+        //
+        // Currently, we force ReadOnly as the default policy because two of
+        // the other variants (WorkspaceWrite, ExternalSandbox) require
+        // additional parameters. Ultimately, we should expand the config
+        // format to allow specifying those parameters.
+        let default_sandbox_policy = SandboxPolicy::new_read_only_policy();
+        let sandbox_policy = match allowed_sandbox_modes {
             Some(Sourced {
                 value: modes,
                 source: requirement_source,
@@ -1047,15 +984,23 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                     return Err(ConstraintError::InvalidValue {
                         field_name: "allowed_sandbox_modes",
                         candidate: format!("{modes:?}"),
-                        allowed: "must include 'read-only' to allow any PermissionProfile"
-                            .to_string(),
+                        allowed: "must include 'read-only' to allow any SandboxPolicy".to_string(),
                         requirement_source,
                     });
                 };
 
                 let requirement_source_for_error = requirement_source.clone();
-                let constrained = Constrained::new(default_permission_profile, move |candidate| {
-                    let mode = sandbox_mode_requirement_for_permission_profile(candidate);
+                let constrained = Constrained::new(default_sandbox_policy, move |candidate| {
+                    let mode = match candidate {
+                        SandboxPolicy::ReadOnly { .. } => SandboxModeRequirement::ReadOnly,
+                        SandboxPolicy::WorkspaceWrite { .. } => {
+                            SandboxModeRequirement::WorkspaceWrite
+                        }
+                        SandboxPolicy::DangerFullAccess => SandboxModeRequirement::DangerFullAccess,
+                        SandboxPolicy::ExternalSandbox { .. } => {
+                            SandboxModeRequirement::ExternalSandbox
+                        }
+                    };
                     if modes.contains(&mode) {
                         Ok(())
                     } else {
@@ -1069,10 +1014,12 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 })?;
                 ConstrainedWithSource::new(constrained, Some(requirement_source))
             }
-            None => ConstrainedWithSource::new(
-                Constrained::allow_any(default_permission_profile),
-                /*source*/ None,
-            ),
+            None => {
+                ConstrainedWithSource::new(
+                    Constrained::allow_any(default_sandbox_policy),
+                    /*source*/ None,
+                )
+            }
         };
         let exec_policy = match rules {
             Some(Sourced { value, source }) => {
@@ -1198,41 +1145,17 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
         Ok(ConfigRequirements {
             approval_policy,
             approvals_reviewer,
-            permission_profile,
+            sandbox_policy,
             web_search_mode,
             feature_requirements,
             managed_hooks,
             mcp_servers,
-            plugins,
             exec_policy,
             enforce_residency,
             network,
             filesystem,
             guardian_policy_config_source,
         })
-    }
-}
-
-pub fn sandbox_mode_requirement_for_permission_profile(
-    permission_profile: &PermissionProfile,
-) -> SandboxModeRequirement {
-    match permission_profile {
-        PermissionProfile::Disabled => SandboxModeRequirement::DangerFullAccess,
-        PermissionProfile::External { .. } => SandboxModeRequirement::ExternalSandbox,
-        PermissionProfile::Managed { .. } => {
-            let file_system_policy = permission_profile.file_system_sandbox_policy();
-            if file_system_policy.has_full_disk_write_access() {
-                SandboxModeRequirement::DangerFullAccess
-            } else if file_system_policy
-                .entries
-                .iter()
-                .any(|entry| entry.access.can_write())
-            {
-                SandboxModeRequirement::WorkspaceWrite
-            } else {
-                SandboxModeRequirement::ReadOnly
-            }
-        }
     }
 }
 
@@ -1245,7 +1168,6 @@ mod tests {
     use codex_execpolicy::Evaluation;
     use codex_execpolicy::RuleMatch;
     use codex_protocol::protocol::NetworkAccess;
-    use codex_protocol::protocol::SandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_absolute_path::AbsolutePathBufGuard;
     use pretty_assertions::assert_eq;
@@ -1261,10 +1183,6 @@ mod tests {
         )?)
     }
 
-    fn profile_from_sandbox_policy(sandbox_policy: &SandboxPolicy) -> PermissionProfile {
-        PermissionProfile::from_legacy_sandbox_policy(sandbox_policy)
-    }
-
     fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSources {
         let ConfigRequirementsToml {
             allowed_approval_policies,
@@ -1275,7 +1193,6 @@ mod tests {
             feature_requirements,
             hooks,
             mcp_servers,
-            plugins,
             apps,
             rules,
             enforce_residency,
@@ -1296,7 +1213,6 @@ mod tests {
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             hooks: hooks.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             mcp_servers: mcp_servers.map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            plugins: plugins.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             apps: apps.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             rules: rules.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             enforce_residency: enforce_residency
@@ -1342,7 +1258,6 @@ mod tests {
             feature_requirements: Some(feature_requirements.clone()),
             hooks: None,
             mcp_servers: None,
-            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: Some(enforce_residency),
@@ -1375,7 +1290,6 @@ mod tests {
                 )),
                 hooks: None,
                 mcp_servers: None,
-                plugins: None,
                 apps: None,
                 rules: None,
                 enforce_residency: Some(Sourced::new(enforce_residency, enforce_source)),
@@ -1414,7 +1328,6 @@ mod tests {
                 feature_requirements: None,
                 hooks: None,
                 mcp_servers: None,
-                plugins: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
@@ -1461,7 +1374,6 @@ mod tests {
                 feature_requirements: None,
                 hooks: None,
                 mcp_servers: None,
-                plugins: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
@@ -1629,37 +1541,6 @@ allowed_approvals_reviewers = ["user"]
                     "connector_123123".to_string(),
                     AppRequirementToml {
                         enabled: Some(false),
-                        tools: None,
-                    },
-                )]),
-            })
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn deserialize_apps_tool_requirements() -> Result<()> {
-        let toml_str = r#"
-            [apps.connector_123123.tools."calendar/list_events"]
-            approval_mode = "approve"
-        "#;
-        let requirements: ConfigRequirementsToml = from_str(toml_str)?;
-
-        assert_eq!(
-            requirements.apps,
-            Some(AppsRequirementsToml {
-                apps: BTreeMap::from([(
-                    "connector_123123".to_string(),
-                    AppRequirementToml {
-                        enabled: None,
-                        tools: Some(AppToolsRequirementsToml {
-                            tools: BTreeMap::from([(
-                                "calendar/list_events".to_string(),
-                                AppToolRequirementToml {
-                                    approval_mode: Some(AppToolApproval::Approve),
-                                },
-                            )]),
-                        }),
                     },
                 )]),
             })
@@ -1674,45 +1555,19 @@ allowed_approvals_reviewers = ["user"]
                 .map(|(app_id, enabled)| {
                     (
                         (*app_id).to_string(),
-                        AppRequirementToml {
-                            enabled: *enabled,
-                            tools: None,
-                        },
+                        AppRequirementToml { enabled: *enabled },
                     )
                 })
                 .collect(),
         }
     }
 
-    fn app_tool_requirements(
-        app_id: &str,
-        tool_name: &str,
-        approval_mode: AppToolApproval,
-    ) -> AppsRequirementsToml {
-        AppsRequirementsToml {
-            apps: BTreeMap::from([(
-                app_id.to_string(),
-                AppRequirementToml {
-                    enabled: None,
-                    tools: Some(AppToolsRequirementsToml {
-                        tools: BTreeMap::from([(
-                            tool_name.to_string(),
-                            AppToolRequirementToml {
-                                approval_mode: Some(approval_mode),
-                            },
-                        )]),
-                    }),
-                },
-            )]),
-        }
-    }
-
     #[test]
-    fn merge_app_requirements_descending_unions_distinct_apps() {
+    fn merge_enablement_settings_descending_unions_distinct_apps() {
         let mut merged = apps_requirements(&[("connector_high", Some(false))]);
         let lower = apps_requirements(&[("connector_low", Some(true))]);
 
-        merge_app_requirements_descending(&mut merged, lower);
+        merge_enablement_settings_descending(&mut merged, lower);
 
         assert_eq!(
             merged,
@@ -1724,11 +1579,11 @@ allowed_approvals_reviewers = ["user"]
     }
 
     #[test]
-    fn merge_app_requirements_descending_prefers_false_from_lower_precedence() {
+    fn merge_enablement_settings_descending_prefers_false_from_lower_precedence() {
         let mut merged = apps_requirements(&[("connector_123123", Some(true))]);
         let lower = apps_requirements(&[("connector_123123", Some(false))]);
 
-        merge_app_requirements_descending(&mut merged, lower);
+        merge_enablement_settings_descending(&mut merged, lower);
 
         assert_eq!(
             merged,
@@ -1737,11 +1592,11 @@ allowed_approvals_reviewers = ["user"]
     }
 
     #[test]
-    fn merge_app_requirements_descending_keeps_higher_true_when_lower_is_unset() {
+    fn merge_enablement_settings_descending_keeps_higher_true_when_lower_is_unset() {
         let mut merged = apps_requirements(&[("connector_123123", Some(true))]);
         let lower = apps_requirements(&[("connector_123123", None)]);
 
-        merge_app_requirements_descending(&mut merged, lower);
+        merge_enablement_settings_descending(&mut merged, lower);
 
         assert_eq!(
             merged,
@@ -1750,11 +1605,11 @@ allowed_approvals_reviewers = ["user"]
     }
 
     #[test]
-    fn merge_app_requirements_descending_uses_lower_value_when_higher_missing() {
+    fn merge_enablement_settings_descending_uses_lower_value_when_higher_missing() {
         let mut merged = apps_requirements(&[]);
         let lower = apps_requirements(&[("connector_123123", Some(true))]);
 
-        merge_app_requirements_descending(&mut merged, lower);
+        merge_enablement_settings_descending(&mut merged, lower);
 
         assert_eq!(
             merged,
@@ -1763,61 +1618,15 @@ allowed_approvals_reviewers = ["user"]
     }
 
     #[test]
-    fn merge_app_requirements_descending_preserves_higher_false_when_lower_missing_app() {
+    fn merge_enablement_settings_descending_preserves_higher_false_when_lower_missing_app() {
         let mut merged = apps_requirements(&[("connector_123123", Some(false))]);
         let lower = apps_requirements(&[]);
 
-        merge_app_requirements_descending(&mut merged, lower);
+        merge_enablement_settings_descending(&mut merged, lower);
 
         assert_eq!(
             merged,
             apps_requirements(&[("connector_123123", Some(false))]),
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_preserves_higher_tool_approval_mode() {
-        let mut merged = app_tool_requirements(
-            "connector_123123",
-            "calendar/list_events",
-            AppToolApproval::Approve,
-        );
-        let lower = app_tool_requirements(
-            "connector_123123",
-            "calendar/list_events",
-            AppToolApproval::Prompt,
-        );
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            app_tool_requirements(
-                "connector_123123",
-                "calendar/list_events",
-                AppToolApproval::Approve,
-            )
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_uses_lower_tool_approval_when_higher_missing() {
-        let mut merged = apps_requirements(&[("connector_123123", None)]);
-        let lower = app_tool_requirements(
-            "connector_123123",
-            "calendar/list_events",
-            AppToolApproval::Approve,
-        );
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            app_tool_requirements(
-                "connector_123123",
-                "calendar/list_events",
-                AppToolApproval::Approve,
-            )
         );
     }
 
@@ -1915,10 +1724,8 @@ allowed_approvals_reviewers = ["user"]
         );
         assert_eq!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(
-                    &SandboxPolicy::DangerFullAccess,
-                )),
+                .sandbox_policy
+                .can_set(&SandboxPolicy::DangerFullAccess),
             Err(ConstraintError::InvalidValue {
                 field_name: "sandbox_mode",
                 candidate: "DangerFullAccess".into(),
@@ -1996,7 +1803,7 @@ allowed_approvals_reviewers = ["user"]
             Some(source_location.clone())
         );
         assert_eq!(
-            requirements.permission_profile.source,
+            requirements.sandbox_policy.source,
             Some(source_location.clone())
         );
         assert_eq!(
@@ -2062,10 +1869,8 @@ allowed_approvals_reviewers = ["user"]
         );
         assert!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(
-                    &SandboxPolicy::new_read_only_policy()
-                ))
+                .sandbox_policy
+                .can_set(&SandboxPolicy::new_read_only_policy())
                 .is_ok()
         );
 
@@ -2147,30 +1952,26 @@ allowed_approvals_reviewers = ["user"]
         let root = if cfg!(windows) { "C:\\repo" } else { "/repo" };
         assert!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(
-                    &SandboxPolicy::new_read_only_policy()
-                ))
+                .sandbox_policy
+                .can_set(&SandboxPolicy::new_read_only_policy())
                 .is_ok()
         );
-        let workspace_write_policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![AbsolutePathBuf::from_absolute_path(root)?],
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
-        };
         assert!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(&workspace_write_policy))
+                .sandbox_policy
+                .can_set(&SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![AbsolutePathBuf::from_absolute_path(root)?],
+                    read_only_access: Default::default(),
+                    network_access: false,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
+                })
                 .is_ok()
         );
         assert_eq!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(
-                    &SandboxPolicy::DangerFullAccess,
-                )),
+                .sandbox_policy
+                .can_set(&SandboxPolicy::DangerFullAccess),
             Err(ConstraintError::InvalidValue {
                 field_name: "sandbox_mode",
                 candidate: "DangerFullAccess".into(),
@@ -2180,12 +1981,10 @@ allowed_approvals_reviewers = ["user"]
         );
         assert_eq!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(
-                    &SandboxPolicy::ExternalSandbox {
-                        network_access: NetworkAccess::Restricted,
-                    }
-                )),
+                .sandbox_policy
+                .can_set(&SandboxPolicy::ExternalSandbox {
+                    network_access: NetworkAccess::Restricted,
+                }),
             Err(ConstraintError::InvalidValue {
                 field_name: "sandbox_mode",
                 candidate: "ExternalSandbox".into(),
@@ -2266,24 +2065,22 @@ allowed_approvals_reviewers = ["user"]
 
         let requirements = ConfigRequirements::try_from(requirements_with_sources)?;
         let root = if cfg!(windows) { "C:\\repo" } else { "/repo" };
-        let workspace_write_policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![AbsolutePathBuf::from_absolute_path(root)?],
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
-        };
         assert!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(&workspace_write_policy))
+                .sandbox_policy
+                .can_set(&SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![AbsolutePathBuf::from_absolute_path(root)?],
+                    read_only_access: Default::default(),
+                    network_access: false,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
+                })
                 .is_ok()
         );
         assert_eq!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(
-                    &SandboxPolicy::DangerFullAccess,
-                )),
+                .sandbox_policy
+                .can_set(&SandboxPolicy::DangerFullAccess),
             Err(ConstraintError::InvalidValue {
                 field_name: "sandbox_mode",
                 candidate: "DangerFullAccess".into(),
@@ -2313,10 +2110,8 @@ allowed_approvals_reviewers = ["user"]
 
         assert_eq!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(
-                    &SandboxPolicy::DangerFullAccess,
-                )),
+                .sandbox_policy
+                .can_set(&SandboxPolicy::DangerFullAccess),
             Err(ConstraintError::InvalidValue {
                 field_name: "sandbox_mode",
                 candidate: "DangerFullAccess".into(),
@@ -2354,10 +2149,8 @@ allowed_approvals_reviewers = ["user"]
 
         assert_eq!(
             requirements
-                .permission_profile
-                .can_set(&profile_from_sandbox_policy(
-                    &SandboxPolicy::new_workspace_write_policy(),
-                )),
+                .sandbox_policy
+                .can_set(&SandboxPolicy::new_workspace_write_policy()),
             Err(ConstraintError::InvalidValue {
                 field_name: "sandbox_mode",
                 candidate: "WorkspaceWrite".into(),
@@ -2871,55 +2664,6 @@ command = "python3 /enterprise/hooks/pre.py"
                             identity: McpServerIdentity::Url {
                                 url: "https://example.com/mcp".to_string(),
                             },
-                        },
-                    ),
-                ]),
-                RequirementSource::Unknown,
-            ))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn deserialize_plugin_mcp_server_requirements() -> Result<()> {
-        let toml_str = r#"
-            [plugins."sample@test".mcp_servers.sample.identity]
-            command = "sample-mcp"
-
-            [plugins."remote@test".mcp_servers.remote.identity]
-            url = "https://example.com/mcp"
-        "#;
-        let requirements: ConfigRequirements =
-            with_unknown_source(from_str(toml_str)?).try_into()?;
-
-        assert_eq!(
-            requirements.plugins,
-            Some(Sourced::new(
-                BTreeMap::from([
-                    (
-                        "remote@test".to_string(),
-                        PluginRequirementsToml {
-                            mcp_servers: Some(BTreeMap::from([(
-                                "remote".to_string(),
-                                McpServerRequirement {
-                                    identity: McpServerIdentity::Url {
-                                        url: "https://example.com/mcp".to_string(),
-                                    },
-                                },
-                            )])),
-                        },
-                    ),
-                    (
-                        "sample@test".to_string(),
-                        PluginRequirementsToml {
-                            mcp_servers: Some(BTreeMap::from([(
-                                "sample".to_string(),
-                                McpServerRequirement {
-                                    identity: McpServerIdentity::Command {
-                                        command: "sample-mcp".to_string(),
-                                    },
-                                },
-                            )])),
                         },
                     ),
                 ]),
