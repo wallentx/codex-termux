@@ -9,7 +9,7 @@ use codex_config::types::AppToolApproval;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
-use core_test_support::hooks::trust_discovered_hooks;
+use codex_features::Feature;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
@@ -163,7 +163,9 @@ fn enable_hooks_and_rmcp_server(
     rmcp_test_server_bin: String,
     approval_mode: AppToolApproval,
 ) {
-    trust_discovered_hooks(config);
+    if let Err(err) = config.features.enable(Feature::CodexHooks) {
+        panic!("test config should allow feature update: {err}");
+    }
     insert_rmcp_test_server(config, rmcp_test_server_bin, approval_mode);
 }
 

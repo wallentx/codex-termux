@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import os
 import sys
 import tempfile
 import zlib
@@ -25,8 +26,8 @@ def _ensure_runtime_dependencies(sdk_python_dir: Path) -> None:
         "Missing required dependency: pydantic.\n"
         f"Interpreter: {python}\n"
         "Install dependencies with the same interpreter used to run this example:\n"
-        f"  cd {sdk_python_dir} && uv sync\n"
-        "Then activate `.venv`, or reinstall with the Python interpreter above."
+        f"  {python} -m pip install -e {sdk_python_dir}\n"
+        "If you installed with `pip` from another Python, reinstall using the command above."
     )
 
 
@@ -34,7 +35,7 @@ def ensure_local_sdk_src() -> Path:
     """Add sdk/python/src to sys.path so examples run without installing the package."""
     sdk_python_dir = _SDK_PYTHON_DIR
     src_dir = sdk_python_dir / "src"
-    package_dir = src_dir / "openai_codex"
+    package_dir = src_dir / "codex_app_server"
     if not package_dir.exists():
         raise RuntimeError(f"Could not locate local SDK package at {package_dir}")
 
@@ -48,7 +49,7 @@ def ensure_local_sdk_src() -> Path:
 
 def runtime_config():
     """Return an example-friendly AppServerConfig for repo-source SDK usage."""
-    from openai_codex import AppServerConfig
+    from codex_app_server import AppServerConfig
 
     ensure_runtime_package_installed(sys.executable, _SDK_PYTHON_DIR)
     return AppServerConfig()
@@ -106,15 +107,11 @@ def temporary_sample_image_path() -> Iterator[Path]:
 def server_label(metadata: object) -> str:
     server = getattr(metadata, "serverInfo", None)
     server_name = ((getattr(server, "name", None) or "") if server is not None else "").strip()
-    server_version = (
-        (getattr(server, "version", None) or "") if server is not None else ""
-    ).strip()
+    server_version = ((getattr(server, "version", None) or "") if server is not None else "").strip()
     if server_name and server_version:
         return f"{server_name} {server_version}"
 
-    user_agent = (
-        (getattr(metadata, "userAgent", None) or "") if metadata is not None else ""
-    ).strip()
+    user_agent = ((getattr(metadata, "userAgent", None) or "") if metadata is not None else "").strip()
     return user_agent or "unknown"
 
 

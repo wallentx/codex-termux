@@ -138,14 +138,12 @@ fn file_system_sandbox_context_uses_active_attempt() {
     };
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
     let file_system_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
-    let permissions = PermissionProfile::from_runtime_permissions(
-        &file_system_policy,
-        NetworkSandboxPolicy::Restricted,
-    );
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
         sandbox: SandboxType::MacosSeatbelt,
-        permissions: &permissions,
+        policy: &sandbox_policy,
+        file_system_policy: &file_system_policy,
+        network_policy: NetworkSandboxPolicy::Restricted,
         enforce_managed_network: false,
         manager: &manager,
         sandbox_cwd: &path,
@@ -153,7 +151,6 @@ fn file_system_sandbox_context_uses_active_attempt() {
         use_legacy_landlock: true,
         windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
         windows_sandbox_private_desktop: true,
-        network_denial_cancellation_token: None,
     };
 
     let sandbox = ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)
@@ -193,11 +190,14 @@ fn no_sandbox_attempt_has_no_file_system_context() {
         additional_permissions: None,
         permissions_preapproved: false,
     };
-    let permissions = PermissionProfile::Disabled;
+    let sandbox_policy = SandboxPolicy::DangerFullAccess;
+    let file_system_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
         sandbox: SandboxType::None,
-        permissions: &permissions,
+        policy: &sandbox_policy,
+        file_system_policy: &file_system_policy,
+        network_policy: NetworkSandboxPolicy::Enabled,
         enforce_managed_network: false,
         manager: &manager,
         sandbox_cwd: &path,
@@ -205,7 +205,6 @@ fn no_sandbox_attempt_has_no_file_system_context() {
         use_legacy_landlock: false,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
-        network_denial_cancellation_token: None,
     };
 
     assert_eq!(
