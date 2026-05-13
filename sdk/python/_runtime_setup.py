@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import importlib
-import importlib.metadata
 import importlib.util
 import json
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -18,7 +16,7 @@ import zipfile
 from pathlib import Path
 
 PACKAGE_NAME = "openai-codex-cli-bin"
-SDK_PACKAGE_NAME = "openai-codex"
+PINNED_RUNTIME_VERSION = "0.116.0-alpha.1"
 REPO_SLUG = "openai/codex"
 
 
@@ -27,22 +25,7 @@ class RuntimeSetupError(RuntimeError):
 
 
 def pinned_runtime_version() -> str:
-    """Return the exact runtime version pinned by the SDK package dependency."""
-    source_pin = _source_tree_runtime_dependency_version()
-    if source_pin is not None:
-        return _normalized_package_version(source_pin)
-
-    try:
-        installed_pin = _installed_sdk_runtime_dependency_version()
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise RuntimeSetupError(
-            f"Unable to resolve {SDK_PACKAGE_NAME} metadata for runtime pinning."
-        ) from exc
-    if installed_pin is None:
-        raise RuntimeSetupError(
-            f"Unable to resolve {PACKAGE_NAME} dependency pin from {SDK_PACKAGE_NAME}."
-        )
-    return _normalized_package_version(installed_pin)
+    return PINNED_RUNTIME_VERSION
 
 
 def ensure_runtime_package_installed(
@@ -56,10 +39,7 @@ def ensure_runtime_package_installed(
         installed_version = _installed_runtime_version(python_executable)
     normalized_requested = _normalized_package_version(requested_version)
 
-    if (
-        installed_version is not None
-        and _normalized_package_version(installed_version) == normalized_requested
-    ):
+    if installed_version is not None and _normalized_package_version(installed_version) == normalized_requested:
         return requested_version
 
     with tempfile.TemporaryDirectory(prefix="codex-python-runtime-") as temp_root_str:
@@ -81,10 +61,7 @@ def ensure_runtime_package_installed(
         importlib.invalidate_caches()
 
     installed_version = _installed_runtime_version(python_executable)
-    if (
-        installed_version is None
-        or _normalized_package_version(installed_version) != normalized_requested
-    ):
+    if installed_version is None or _normalized_package_version(installed_version) != normalized_requested:
         raise RuntimeSetupError(
             f"Expected {PACKAGE_NAME} {requested_version} in {python_executable}, "
             f"but found {installed_version!r} after installation."
@@ -144,8 +121,7 @@ def _installed_runtime_version(python_executable: str | Path) -> str | None:
 
 
 def _release_metadata(version: str) -> dict[str, object]:
-    release_tag = _release_tag(version)
-    url = f"https://api.github.com/repos/{REPO_SLUG}/releases/tags/{release_tag}"
+    url = f"https://api.github.com/repos/{REPO_SLUG}/releases/tags/rust-v{version}"
     token = _github_token()
     attempts = [True, False] if token is not None else [False]
     last_error: urllib.error.HTTPError | None = None
@@ -170,7 +146,7 @@ def _release_metadata(version: str) -> dict[str, object]:
 
     assert last_error is not None
     raise RuntimeSetupError(
-        f"Failed to resolve release metadata for {release_tag} from {REPO_SLUG}: "
+        f"Failed to resolve release metadata for rust-v{version} from {REPO_SLUG}: "
         f"{last_error.code} {last_error.reason}"
     ) from last_error
 
@@ -178,10 +154,9 @@ def _release_metadata(version: str) -> dict[str, object]:
 def _download_release_archive(version: str, temp_root: Path) -> Path:
     asset_name = platform_asset_name()
     archive_path = temp_root / asset_name
-    release_tag = _release_tag(version)
 
     browser_download_url = (
-        f"https://github.com/{REPO_SLUG}/releases/download/{release_tag}/{asset_name}"
+        f"https://github.com/{REPO_SLUG}/releases/download/rust-v{version}/{asset_name}"
     )
     request = urllib.request.Request(
         browser_download_url,
@@ -197,14 +172,18 @@ def _download_release_archive(version: str, temp_root: Path) -> Path:
     metadata = _release_metadata(version)
     assets = metadata.get("assets")
     if not isinstance(assets, list):
-        raise RuntimeSetupError(f"Release {release_tag} returned malformed assets metadata.")
+        raise RuntimeSetupError(f"Release rust-v{version} returned malformed assets metadata.")
     asset = next(
-        (item for item in assets if isinstance(item, dict) and item.get("name") == asset_name),
+        (
+            item
+            for item in assets
+            if isinstance(item, dict) and item.get("name") == asset_name
+        ),
         None,
     )
     if asset is None:
         raise RuntimeSetupError(
-            f"Release {release_tag} does not contain asset {asset_name} for this platform."
+            f"Release rust-v{version} does not contain asset {asset_name} for this platform."
         )
 
     api_url = asset.get("url")
@@ -219,10 +198,7 @@ def _download_release_archive(version: str, temp_root: Path) -> Path:
                 headers=_github_api_headers("application/octet-stream"),
             )
             try:
-                with (
-                    urllib.request.urlopen(request) as response,
-                    archive_path.open("wb") as fh,
-                ):
+                with urllib.request.urlopen(request) as response, archive_path.open("wb") as fh:
                     shutil.copyfileobj(response, fh)
                 return archive_path
             except urllib.error.HTTPError:
@@ -240,7 +216,7 @@ def _download_release_archive(version: str, temp_root: Path) -> Path:
                 "gh",
                 "release",
                 "download",
-                release_tag,
+                f"rust-v{version}",
                 "--repo",
                 REPO_SLUG,
                 "--pattern",
@@ -254,7 +230,7 @@ def _download_release_archive(version: str, temp_root: Path) -> Path:
         )
     except subprocess.CalledProcessError as exc:
         raise RuntimeSetupError(
-            f"gh release download failed for {release_tag} asset {asset_name}.\n"
+            f"gh release download failed for rust-v{version} asset {asset_name}.\n"
             f"STDOUT:\n{exc.stdout}\nSTDERR:\n{exc.stderr}"
         ) from exc
     return archive_path
@@ -282,7 +258,9 @@ def _extract_runtime_binary(archive_path: Path, temp_root: Path) -> Path:
         for path in extract_dir.rglob("*")
         if path.is_file()
         and (
-            path.name == binary_name or path.name == archive_stem or path.name.startswith("codex-")
+            path.name == binary_name
+            or path.name == archive_stem
+            or path.name.startswith("codex-")
         )
     ]
     if not candidates:
@@ -368,63 +346,12 @@ def _github_token() -> str | None:
 
 
 def _normalized_package_version(version: str) -> str:
-    normalized = version.strip()
-    if normalized.startswith("rust-v"):
-        normalized = normalized.removeprefix("rust-v")
-    elif normalized.startswith("v"):
-        normalized = normalized.removeprefix("v")
-
-    normalized = re.sub(r"-alpha\.?([0-9]+)$", r"a\1", normalized)
-    normalized = re.sub(r"-beta\.?([0-9]+)$", r"b\1", normalized)
-    normalized = re.sub(r"-rc\.?([0-9]+)$", r"rc\1", normalized)
-    return normalized
-
-
-def _codex_release_version(version: str) -> str:
-    normalized = _normalized_package_version(version)
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)*)(a|b|rc)([0-9]+)", normalized)
-    if match is None:
-        return normalized
-
-    base, prerelease, number = match.groups()
-    prerelease_name = {"a": "alpha", "b": "beta", "rc": "rc"}[prerelease]
-    return f"{base}-{prerelease_name}.{number}"
-
-
-def _release_tag(version: str) -> str:
-    return f"rust-v{_codex_release_version(version)}"
-
-
-def _source_tree_runtime_dependency_version() -> str | None:
-    """Read the runtime dependency pin when the SDK is running from a checkout."""
-    pyproject_path = Path(__file__).resolve().parent / "pyproject.toml"
-    if not pyproject_path.exists():
-        return None
-
-    match = re.search(_runtime_dependency_pin_pattern(), pyproject_path.read_text())
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def _installed_sdk_runtime_dependency_version() -> str | None:
-    """Read the runtime dependency pin from installed package metadata."""
-    requirements = importlib.metadata.requires(SDK_PACKAGE_NAME) or []
-    for requirement in requirements:
-        match = re.search(_runtime_dependency_pin_pattern(), requirement)
-        if match is not None:
-            return match.group(1)
-    return None
-
-
-def _runtime_dependency_pin_pattern() -> str:
-    """Match the exact runtime dependency pin in TOML and wheel metadata."""
-    return rf'{re.escape(PACKAGE_NAME)}\s*==\s*"?([^",;\s]+)"?'
+    return version.strip().replace("-alpha.", "a").replace("-beta.", "b")
 
 
 __all__ = [
     "PACKAGE_NAME",
-    "SDK_PACKAGE_NAME",
+    "PINNED_RUNTIME_VERSION",
     "RuntimeSetupError",
     "ensure_runtime_package_installed",
     "pinned_runtime_version",

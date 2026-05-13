@@ -1370,11 +1370,6 @@
     }
   },
   "properties": {
-    "completedAtMs": {
-      "description": "Unix timestamp (in milliseconds) when this item lifecycle completed.",
-      "format": "int64",
-      "type": "integer"
-    },
     "item": {
       "$ref": "#/definitions/ThreadItem"
     },
@@ -1386,7 +1381,6 @@
     }
   },
   "required": [
-    "completedAtMs",
     "item",
     "threadId",
     "turnId"
