@@ -1,0 +1,95 @@
+name: termux-release-checkpoint
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Release branch to checkpoint from, for example release/0.123.0"
+        required: false
+        type: string
+        default: ""
+      source_sha:
+        description: "Specific source commit SHA to checkpoint; defaults to the source branch tip"
+        required: false
+        type: string
+        default: ""
+      destination_branch:
+        description: "Destination patch branch to receive the checkpoint PR"
+        required: false
+        type: string
+        default: "wallentx/termux-target"
+      reviewer:
+        description: "GitHub username to request as reviewer"
+        required: false
+        type: string
+        default: "wallentx"
+
+permissions:
+  actions: read
+  attestations: read
+  checks: read
+  contents: read
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  statuses: read
+
+concurrency:
+  group: termux-release-checkpoint-${{ inputs.source_branch || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  checkpoint:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      DESTINATION_BRANCH: ${{ inputs.destination_branch || 'wallentx/termux-target' }}
+      REVIEWER: ${{ inputs.reviewer || 'wallentx' }}
+      REQUESTED_SOURCE_BRANCH: ${{ inputs.source_branch }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout release branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_branch || github.ref_name }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: 🧰 Actions Toolbox
+        # This is required for the GitHub CLI
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Configure git
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          source_branch="${REQUESTED_SOURCE_BRANCH:-${GITHUB_REF_NAME}}"
+          git fetch --prune origin "${DESTINATION_BRANCH}" "${source_branch}"
+
+      - name: Create checkpoint PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          scripts/termux-create-checkpoint-pr.sh
