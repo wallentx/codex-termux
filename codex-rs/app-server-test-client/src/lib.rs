@@ -48,6 +48,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
+use codex_app_server_protocol::ReadOnlyAccess;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
@@ -742,6 +743,7 @@ async fn trigger_zsh_fork_multi_cmd_approval(
             };
             turn_params.approval_policy = Some(AskForApproval::OnRequest);
             turn_params.sandbox_policy = Some(SandboxPolicy::ReadOnly {
+                access: ReadOnlyAccess::FullAccess,
                 network_access: false,
             });
 
@@ -883,6 +885,7 @@ async fn trigger_cmd_approval(
             experimental_api: true,
             approval_policy: Some(AskForApproval::OnRequest),
             sandbox_policy: Some(SandboxPolicy::ReadOnly {
+                access: ReadOnlyAccess::FullAccess,
                 network_access: false,
             }),
             dynamic_tools,
@@ -909,6 +912,7 @@ async fn trigger_patch_approval(
             experimental_api: true,
             approval_policy: Some(AskForApproval::OnRequest),
             sandbox_policy: Some(SandboxPolicy::ReadOnly {
+                access: ReadOnlyAccess::FullAccess,
                 network_access: false,
             }),
             dynamic_tools,
@@ -1551,7 +1555,6 @@ impl CodexClient {
                 },
                 capabilities: Some(InitializeCapabilities {
                     experimental_api,
-                    request_attestation: false,
                     opt_out_notification_methods: Some(
                         NOTIFICATIONS_TO_OPT_OUT
                             .iter()
@@ -1608,9 +1611,7 @@ impl CodexClient {
         let request_id = self.request_id();
         let request = ClientRequest::LoginAccount {
             request_id: request_id.clone(),
-            params: codex_app_server_protocol::LoginAccountParams::Chatgpt {
-                codex_streamlined_login: false,
-            },
+            params: codex_app_server_protocol::LoginAccountParams::Chatgpt,
         };
 
         self.send_request(request, request_id, "account/login/start")
@@ -1946,7 +1947,6 @@ impl CodexClient {
             thread_id,
             turn_id,
             item_id,
-            started_at_ms: _,
             approval_id,
             reason,
             network_approval_context,
@@ -2022,7 +2022,6 @@ impl CodexClient {
             thread_id,
             turn_id,
             item_id,
-            started_at_ms: _,
             reason,
             grant_root,
         } = params;

@@ -18,9 +18,6 @@ use toml::Value as TomlValue;
 #[derive(Debug, Default, Clone)]
 pub struct LoaderOverrides {
     pub managed_config_path: Option<PathBuf>,
-    pub system_config_path: Option<PathBuf>,
-    pub system_requirements_path: Option<PathBuf>,
-    pub ignore_managed_requirements: bool,
     pub ignore_user_config: bool,
     pub ignore_user_and_project_exec_policy_rules: bool,
     //TODO(gt): Add a macos_ prefix to this field and remove the target_os check.
@@ -34,18 +31,11 @@ impl LoaderOverrides {
     ///
     /// This is intended for tests that should load only repo-controlled config fixtures.
     pub fn without_managed_config_for_tests() -> Self {
-        let base = std::env::temp_dir().join("codex-config-tests");
-        Self {
-            managed_config_path: Some(base.join("managed_config.toml")),
-            system_config_path: Some(base.join("config.toml")),
-            system_requirements_path: Some(base.join("requirements.toml")),
-            ignore_managed_requirements: false,
-            ignore_user_config: false,
-            ignore_user_and_project_exec_policy_rules: false,
-            #[cfg(target_os = "macos")]
-            managed_preferences_base64: Some(String::new()),
-            macos_managed_config_requirements_base64: Some(String::new()),
-        }
+        Self::with_managed_config_path_for_tests(
+            std::env::temp_dir()
+                .join("codex-config-tests")
+                .join("managed_config.toml"),
+        )
     }
 
     /// Returns overrides with host MDM disabled and managed config loaded from `managed_config_path`.
@@ -54,7 +44,11 @@ impl LoaderOverrides {
     pub fn with_managed_config_path_for_tests(managed_config_path: PathBuf) -> Self {
         Self {
             managed_config_path: Some(managed_config_path),
-            ..Self::without_managed_config_for_tests()
+            ignore_user_config: false,
+            ignore_user_and_project_exec_policy_rules: false,
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: Some(String::new()),
+            macos_managed_config_requirements_base64: Some(String::new()),
         }
     }
 }
@@ -170,12 +164,6 @@ pub struct ConfigLayerStack {
 
     /// Whether execpolicy should skip `.rules` files from user and project config-layer folders.
     ignore_user_and_project_exec_policy_rules: bool,
-
-    /// Startup warnings discovered while building this stack.
-    ///
-    /// `None` means the loader did not check for stack-level warnings, while
-    /// `Some(vec![])` means it checked and found nothing to report.
-    startup_warnings: Option<Vec<String>>,
 }
 
 impl ConfigLayerStack {
@@ -191,7 +179,6 @@ impl ConfigLayerStack {
             requirements,
             requirements_toml,
             ignore_user_and_project_exec_policy_rules: false,
-            startup_warnings: None,
         })
     }
 
@@ -205,15 +192,6 @@ impl ConfigLayerStack {
 
     pub fn ignore_user_and_project_exec_policy_rules(&self) -> bool {
         self.ignore_user_and_project_exec_policy_rules
-    }
-
-    pub(crate) fn with_startup_warnings(mut self, startup_warnings: Vec<String>) -> Self {
-        self.startup_warnings = Some(startup_warnings);
-        self
-    }
-
-    pub fn startup_warnings(&self) -> Option<&[String]> {
-        self.startup_warnings.as_deref()
     }
 
     /// Returns the raw user config layer, if any.
@@ -237,32 +215,27 @@ impl ConfigLayerStack {
     /// replaced; otherwise, it is inserted into the stack at the appropriate
     /// position based on precedence rules.
     pub fn with_user_config(&self, config_toml: &AbsolutePathBuf, user_config: TomlValue) -> Self {
-        self.with_user_layer(Some(ConfigLayerEntry::new(
+        let user_layer = ConfigLayerEntry::new(
             ConfigLayerSource::User {
                 file: config_toml.clone(),
             },
             user_config,
-        )))
-    }
+        );
 
-    /// Returns a new stack with the user layer copied from `other`, preserving
-    /// every non-user layer already present in this stack.
-    pub fn with_user_layer_from(&self, other: &Self) -> Self {
-        self.with_user_layer(other.get_user_layer().cloned())
-    }
-
-    fn with_user_layer(&self, user_layer: Option<ConfigLayerEntry>) -> Self {
         let mut layers = self.layers.clone();
-        let user_layer_index = match (self.user_layer_index, user_layer) {
-            (Some(index), Some(user_layer)) => {
+        match self.user_layer_index {
+            Some(index) => {
                 layers[index] = user_layer;
-                Some(index)
+                Self {
+                    layers,
+                    user_layer_index: self.user_layer_index,
+                    requirements: self.requirements.clone(),
+                    requirements_toml: self.requirements_toml.clone(),
+                    ignore_user_and_project_exec_policy_rules: self
+                        .ignore_user_and_project_exec_policy_rules,
+                }
             }
-            (Some(index), None) => {
-                layers.remove(index);
-                None
-            }
-            (None, Some(user_layer)) => {
+            None => {
                 let user_layer_index = match layers
                     .iter()
                     .position(|layer| layer.name.precedence() > user_layer.name.precedence())
@@ -276,18 +249,15 @@ impl ConfigLayerStack {
                         layers.len() - 1
                     }
                 };
-                Some(user_layer_index)
+                Self {
+                    layers,
+                    user_layer_index: Some(user_layer_index),
+                    requirements: self.requirements.clone(),
+                    requirements_toml: self.requirements_toml.clone(),
+                    ignore_user_and_project_exec_policy_rules: self
+                        .ignore_user_and_project_exec_policy_rules,
+                }
             }
-            (None, None) => None,
-        };
-        Self {
-            layers,
-            user_layer_index,
-            requirements: self.requirements.clone(),
-            requirements_toml: self.requirements_toml.clone(),
-            ignore_user_and_project_exec_policy_rules: self
-                .ignore_user_and_project_exec_policy_rules,
-            startup_warnings: self.startup_warnings.clone(),
         }
     }
 
