@@ -1,13 +1,13 @@
 use anyhow::Context;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -18,7 +18,6 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use image::ImageBuffer;
 use image::Rgba;
@@ -109,8 +108,6 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
     responses::mount_sse_once(&server, response).await;
 
     let session_model = session_configured.model.clone();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.path());
 
     codex
         .submit(Op::UserTurn {
@@ -128,8 +125,8 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -167,6 +164,7 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
                 text: "pasted image".to_string(),
             },
         ],
+        end_turn: None,
         phase: None,
     };
 
@@ -199,8 +197,6 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
     responses::mount_sse_once(&server, response).await;
 
     let session_model = session_configured.model.clone();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.path());
 
     codex
         .submit(Op::UserTurn {
@@ -218,8 +214,8 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -257,6 +253,7 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
                 text: "dropped image".to_string(),
             },
         ],
+        end_turn: None,
         phase: None,
     };
 

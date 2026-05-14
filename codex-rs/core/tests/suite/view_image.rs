@@ -4,12 +4,8 @@ use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_exec_server::CreateDirectoryOptions;
-use codex_exec_server::LOCAL_ENVIRONMENT_ID;
-use codex_exec_server::REMOTE_ENVIRONMENT_ID;
-use codex_exec_server::RemoveOptions;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ReasoningSummary;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
@@ -21,24 +17,20 @@ use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
-use core_test_support::PathBufExt;
-use core_test_support::PathExt;
-use core_test_support::get_remote_test_env;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_models_once;
-use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event_with_timeout;
 use image::DynamicImage;
 use image::GenericImageView;
@@ -47,13 +39,8 @@ use image::Rgba;
 use image::load_from_memory;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use serde_json::json;
-use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-use tempfile::TempDir;
 use tokio::time::Duration;
 use wiremock::BodyPrintLimit;
 use wiremock::MockServer;
@@ -63,27 +50,6 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::body_string_contains;
 
 const VIEW_IMAGE_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn disabled_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) -> Op {
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
-    Op::UserTurn {
-        environments: None,
-        items,
-        final_output_json_schema: None,
-        cwd: test.config.cwd.to_path_buf(),
-        approval_policy: AskForApproval::Never,
-        approvals_reviewer: None,
-        sandbox_policy,
-        permission_profile,
-        model,
-        effort: None,
-        summary: None,
-        service_tier: None,
-        collaboration_mode: None,
-        personality: None,
-    }
-}
 
 fn image_messages(body: &Value) -> Vec<&Value> {
     body.get("input")
@@ -172,6 +138,7 @@ async fn assert_user_turn_local_image_resizes_to(
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -192,13 +159,24 @@ async fn assert_user_turn_local_image_resizes_to(
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::LocalImage {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::LocalImage {
                 path: abs_path.clone(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -302,36 +280,33 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
-    let mut item_started = None;
-    let mut item_completed = None;
-    let mut legacy_event = None;
+    let mut tool_event = None;
     wait_for_event_with_timeout(
         codex,
         |event| match event {
-            EventMsg::ItemStarted(event) => {
-                if matches!(&event.item, codex_protocol::items::TurnItem::ImageView(_)) {
-                    item_started = Some(event.item.clone());
-                }
-                false
-            }
-            EventMsg::ItemCompleted(event) => {
-                if matches!(&event.item, codex_protocol::items::TurnItem::ImageView(_)) {
-                    item_completed = Some(event.item.clone());
-                }
-                false
-            }
-            EventMsg::ViewImageToolCall(event) => {
-                legacy_event = Some(event.clone());
+            EventMsg::ViewImageToolCall(_) => {
+                tool_event = Some(event.clone());
                 false
             }
             EventMsg::TurnComplete(_) => true,
@@ -343,23 +318,12 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     )
     .await;
 
-    match item_started.expect("view image item started event emitted") {
-        codex_protocol::items::TurnItem::ImageView(item) => {
-            assert_eq!(item.id, call_id);
-            assert_eq!(item.path, abs_path);
-        }
-        other => panic!("expected ImageView item, got {other:?}"),
-    }
-    match item_completed.expect("view image item completed event emitted") {
-        codex_protocol::items::TurnItem::ImageView(item) => {
-            assert_eq!(item.id, call_id);
-            assert_eq!(item.path, abs_path);
-        }
-        other => panic!("expected ImageView item, got {other:?}"),
-    }
-    let legacy_event = legacy_event.expect("legacy view image event emitted");
-    assert_eq!(legacy_event.call_id, call_id);
-    assert_eq!(legacy_event.path, abs_path);
+    let tool_event = match tool_event.expect("view image tool event emitted") {
+        EventMsg::ViewImageToolCall(event) => event,
+        _ => unreachable!("stored event must be ViewImageToolCall"),
+    };
+    assert_eq!(tool_event.call_id, call_id);
+    assert_eq!(tool_event.path, abs_path);
 
     let req = mock.single_request();
     let body = req.body_json();
@@ -404,179 +368,6 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_routes_to_selected_local_environment() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let mut builder = test_codex();
-    let test = builder.build(&server).await?;
-    write_workspace_file(
-        &test,
-        "local.png",
-        png_bytes(/*width*/ 1, /*height*/ 1, [0, 255, 0, 255])?,
-    )
-    .await?;
-    let call_id = "call-view-image-local-env";
-    let response_mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_function_call(
-                    call_id,
-                    "view_image",
-                    &json!({
-                        "path": "local.png",
-                        "environment_id": LOCAL_ENVIRONMENT_ID,
-                    })
-                    .to_string(),
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    test.submit_turn_with_environments(
-        "route local view image",
-        Some(vec![TurnEnvironmentSelection {
-            environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
-            cwd: test.config.cwd.clone(),
-        }]),
-    )
-    .await?;
-
-    let output = response_mock
-        .last_request()
-        .context("missing request containing local view_image output")?
-        .function_call_output(call_id);
-    let output_items = output
-        .get("output")
-        .and_then(Value::as_array)
-        .context("view_image output should be content items")?;
-    assert_eq!(output_items.len(), 1);
-    let image_url = output_items[0]
-        .get("image_url")
-        .and_then(Value::as_str)
-        .context("view_image output should include image_url")?;
-    assert!(
-        image_url.starts_with("data:image/png;base64,"),
-        "unexpected image_url: {image_url}",
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_routes_to_selected_remote_environment() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-    let Some(_remote_env) = get_remote_test_env() else {
-        return Ok(());
-    };
-
-    let server = start_mock_server().await;
-    let mut builder = test_codex();
-    let test = builder.build_remote_aware(&server).await?;
-    let local_cwd = TempDir::new()?;
-    fs::write(local_cwd.path().join("remote.png"), b"not a remote image")?;
-    let local_selection = TurnEnvironmentSelection {
-        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
-        cwd: local_cwd.path().abs(),
-    };
-    let remote_cwd = PathBuf::from(format!(
-        "/tmp/codex-view-image-routing-{}",
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
-    ))
-    .abs();
-    let image_path = remote_cwd.join("remote.png");
-    test.fs()
-        .create_directory(
-            &remote_cwd,
-            CreateDirectoryOptions { recursive: true },
-            /*sandbox*/ None,
-        )
-        .await?;
-    let png = BASE64_STANDARD.decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
-    )?;
-    test.fs()
-        .write_file(&image_path, png, /*sandbox*/ None)
-        .await?;
-    let remote_selection = TurnEnvironmentSelection {
-        environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-        cwd: remote_cwd.clone(),
-    };
-    let call_id = "call-view-image-multi-env";
-    let response_mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_function_call(
-                    call_id,
-                    "view_image",
-                    &json!({
-                        "path": "remote.png",
-                        "environment_id": REMOTE_ENVIRONMENT_ID,
-                    })
-                    .to_string(),
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    test.submit_turn_with_environments(
-        "route view image",
-        Some(vec![local_selection, remote_selection]),
-    )
-    .await?;
-
-    let output = response_mock
-        .last_request()
-        .context("missing request containing view_image output")?
-        .function_call_output(call_id)
-        .clone();
-    let output_items = output
-        .get("output")
-        .and_then(Value::as_array)
-        .context("view_image output should be content items")?;
-    assert_eq!(output_items.len(), 1);
-    let image_url = output_items[0]
-        .get("image_url")
-        .and_then(Value::as_str)
-        .context("view_image output should include image_url")?;
-    assert!(
-        image_url.starts_with("data:image/png;base64,"),
-        "unexpected image_url: {image_url}",
-    );
-
-    test.fs()
-        .remove(
-            &remote_cwd,
-            RemoveOptions {
-                recursive: true,
-                force: true,
-            },
-            /*sandbox*/ None,
-        )
-        .await?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5_3_codex()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
@@ -586,6 +377,7 @@ async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -621,14 +413,25 @@ async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please add the original screenshot".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -677,6 +480,7 @@ async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyho
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -710,14 +514,25 @@ async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyho
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please attach the image at low detail".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -755,6 +570,7 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -790,14 +606,25 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please attach the image with a null detail".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -845,6 +672,7 @@ async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> a
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -880,14 +708,25 @@ async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> a
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -939,6 +778,7 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_only
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -974,14 +814,25 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_only
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -1021,6 +872,233 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_only
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn js_repl_emit_image_attaches_local_image() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::JsRepl)
+            .expect("test config should allow feature update");
+    });
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let call_id = "js-repl-view-image";
+    let js_input = r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const imagePath = path.join(codex.tmpDir, "js-repl-view-image.png");
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+  "base64"
+);
+await fs.writeFile(imagePath, png);
+const out = await codex.tool("view_image", { path: imagePath });
+await codex.emitImage(out);
+"#;
+
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        ev_custom_tool_call(call_id, "js_repl", js_input),
+        ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, first_response).await;
+
+    let second_response = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+    let mock = responses::mount_sse_once(&server, second_response).await;
+
+    let session_model = session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "use js_repl to write an image and attach it".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let mut tool_event = None;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| match event {
+            EventMsg::ViewImageToolCall(_) => {
+                tool_event = Some(event.clone());
+                false
+            }
+            EventMsg::TurnComplete(_) => true,
+            _ => false,
+        },
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
+    let tool_event = match tool_event {
+        Some(EventMsg::ViewImageToolCall(event)) => event,
+        other => panic!("expected ViewImageToolCall event, got {other:?}"),
+    };
+    assert!(
+        tool_event.path.ends_with("js-repl-view-image.png"),
+        "unexpected image path: {}",
+        tool_event.path.display()
+    );
+
+    let req = mock.single_request();
+    let body = req.body_json();
+    assert_eq!(
+        image_messages(&body).len(),
+        0,
+        "js_repl view_image should not inject a pending input image message"
+    );
+
+    let custom_output = req.custom_tool_call_output(call_id);
+    let output_items = custom_output
+        .get("output")
+        .and_then(Value::as_array)
+        .expect("custom_tool_call_output should be a content item array");
+    let image_url = output_items
+        .iter()
+        .find_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("input_image"))
+                .then(|| item.get("image_url").and_then(Value::as_str))
+                .flatten()
+        })
+        .expect("image_url present in js_repl custom tool output");
+    assert!(
+        image_url.starts_with("data:image/png;base64,"),
+        "expected png data URL, got {image_url}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn js_repl_view_image_requires_explicit_emit() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    #[allow(clippy::expect_used)]
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::JsRepl)
+            .expect("test config should allow feature update");
+    });
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let call_id = "js-repl-view-image-no-emit";
+    let js_input = r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const imagePath = path.join(codex.tmpDir, "js-repl-view-image-no-emit.png");
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+  "base64"
+);
+await fs.writeFile(imagePath, png);
+const out = await codex.tool("view_image", { path: imagePath });
+console.log(out.type);
+"#;
+
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        ev_custom_tool_call(call_id, "js_repl", js_input),
+        ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, first_response).await;
+
+    let second_response = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+    let mock = responses::mount_sse_once(&server, second_response).await;
+
+    let session_model = session_configured.model.clone();
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "use js_repl to write an image but do not emit it".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            service_tier: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let mut tool_event = None;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| match event {
+            EventMsg::ViewImageToolCall(_) => {
+                tool_event = Some(event.clone());
+                false
+            }
+            EventMsg::TurnComplete(_) => true,
+            _ => false,
+        },
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
+    let tool_event = match tool_event {
+        Some(EventMsg::ViewImageToolCall(event)) => event,
+        other => panic!("expected ViewImageToolCall event, got {other:?}"),
+    };
+    assert!(
+        tool_event.path.ends_with("js-repl-view-image-no-emit.png"),
+        "unexpected image path: {}",
+        tool_event.path.display()
+    );
+
+    let req = mock.single_request();
+    let custom_output = req.custom_tool_call_output(call_id);
+    let output_items = custom_output.get("output").and_then(Value::as_array);
+    assert!(
+        output_items.is_none_or(|items| items
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("input_image"))),
+        "nested view_image should not auto-populate js_repl output"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1030,6 +1108,7 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -1056,14 +1135,25 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please attach the folder".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -1100,6 +1190,7 @@ async fn view_image_tool_errors_for_non_image_files() -> anyhow::Result<()> {
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -1127,14 +1218,25 @@ async fn view_image_tool_errors_for_non_image_files() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please use the view_image tool to read the json file".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -1204,14 +1306,25 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please attach the missing image".into(),
                 text_elements: Vec::new(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -1271,7 +1384,6 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         supports_search_tool: false,
         priority: 1,
         additional_speed_tiers: Vec::new(),
-        service_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -1305,7 +1417,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
             config.model = Some(model_slug.to_string());
         });
     let test = builder.build_remote_aware(&server).await?;
-    let TestCodex { codex, .. } = &test;
+    let TestCodex { codex, config, .. } = &test;
 
     let rel_path = "assets/example.png";
     write_workspace_png(
@@ -1333,14 +1445,25 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
     let mock = responses::mount_sse_once(&server, second_response).await;
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::Text {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
                 text: "please attach the image".into(),
                 text_elements: Vec::new(),
             }],
-            model_slug.to_string(),
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: model_slug.to_string(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -1394,6 +1517,7 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
+        config,
         session_configured,
         ..
     } = &test;
@@ -1404,13 +1528,24 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(disabled_user_turn(
-            &test,
-            vec![UserInput::LocalImage {
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::LocalImage {
                 path: abs_path.clone(),
             }],
-            session_model,
-        ))
+            final_output_json_schema: None,
+            cwd: config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
         .await?;
 
     wait_for_event_with_timeout(
@@ -1437,3 +1572,4 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
 
     Ok(())
 }
+use codex_features::Feature;

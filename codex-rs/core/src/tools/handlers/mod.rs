@@ -1,34 +1,23 @@
 pub(crate) mod agent_jobs;
-pub(crate) mod agent_jobs_spec;
 pub(crate) mod apply_patch;
-pub(crate) mod apply_patch_spec;
 mod dynamic;
-mod goal;
-pub(crate) mod goal_spec;
+mod js_repl;
+mod list_dir;
 mod mcp;
 mod mcp_resource;
-pub(crate) mod mcp_resource_spec;
 pub(crate) mod multi_agents;
 pub(crate) mod multi_agents_common;
-pub(crate) mod multi_agents_spec;
 pub(crate) mod multi_agents_v2;
 mod plan;
-pub(crate) mod plan_spec;
 mod request_permissions;
-mod request_plugin_install;
-pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
-pub(crate) mod request_user_input_spec;
 mod shell;
-pub(crate) mod shell_spec;
 mod test_sync;
-pub(crate) mod test_sync_spec;
 mod tool_search;
-pub(crate) mod tool_search_spec;
+mod tool_suggest;
 mod unavailable_tool;
 pub(crate) mod unified_exec;
 mod view_image;
-pub(crate) mod view_image_spec;
 
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -42,37 +31,28 @@ use std::path::Path;
 use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
-use crate::session::turn_context::TurnContext;
-use crate::session::turn_context::TurnEnvironment;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
 pub use apply_patch::ApplyPatchHandler;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 pub use dynamic::DynamicToolHandler;
-pub use goal::CreateGoalHandler;
-pub use goal::GetGoalHandler;
-pub use goal::UpdateGoalHandler;
+pub use js_repl::JsReplHandler;
+pub use js_repl::JsReplResetHandler;
+pub use list_dir::ListDirHandler;
 pub use mcp::McpHandler;
-pub use mcp_resource::ListMcpResourceTemplatesHandler;
-pub use mcp_resource::ListMcpResourcesHandler;
-pub use mcp_resource::ReadMcpResourceHandler;
+pub use mcp_resource::McpResourceHandler;
 pub use plan::PlanHandler;
 pub use request_permissions::RequestPermissionsHandler;
-pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
-pub use shell::ContainerExecHandler;
-pub use shell::LocalShellHandler;
 pub use shell::ShellCommandHandler;
-pub(crate) use shell::ShellCommandHandlerOptions;
 pub use shell::ShellHandler;
 pub use test_sync::TestSyncHandler;
 pub use tool_search::ToolSearchHandler;
+pub use tool_suggest::ToolSuggestHandler;
 pub use unavailable_tool::UnavailableToolHandler;
 pub(crate) use unavailable_tool::unavailable_tool_message;
-pub use unified_exec::ExecCommandHandler;
-pub(crate) use unified_exec::ExecCommandHandlerOptions;
-pub use unified_exec::WriteStdinHandler;
+pub use unified_exec::UnifiedExecHandler;
 pub use view_image::ViewImageHandler;
 
 fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
@@ -105,27 +85,6 @@ fn resolve_workdir_base_path(
         .and_then(Value::as_str)
         .filter(|workdir| !workdir.is_empty())
         .map_or_else(|| default_cwd.clone(), |workdir| default_cwd.join(workdir)))
-}
-
-fn resolve_tool_environment<'a>(
-    turn: &'a TurnContext,
-    environment_id: Option<&str>,
-) -> Result<Option<&'a TurnEnvironment>, FunctionCallError> {
-    environment_id.map_or_else(
-        || Ok(turn.environments.primary()),
-        |environment_id| {
-            turn.environments
-                .turn_environments
-                .iter()
-                .find(|environment| environment.environment_id == environment_id)
-                .map(Some)
-                .ok_or_else(|| {
-                    FunctionCallError::RespondToModel(format!(
-                        "unknown turn environment id `{environment_id}`"
-                    ))
-                })
-        },
-    )
 }
 
 /// Validates feature/policy constraints for `with_additional_permissions` and
@@ -396,7 +355,7 @@ mod tests {
                 entries: vec![
                     FileSystemSandboxEntry {
                         path: FileSystemPath::Special {
-                            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                            value: FileSystemSpecialPath::CurrentWorkingDirectory,
                         },
                         access: FileSystemAccessMode::Write,
                     },
