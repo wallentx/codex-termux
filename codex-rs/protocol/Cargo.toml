@@ -7,7 +7,6 @@ version.workspace = true
 [lib]
 name = "codex_protocol"
 path = "src/lib.rs"
-doctest = false
 
 [lints]
 workspace = true
@@ -21,6 +20,7 @@ codex-network-proxy = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-image = { workspace = true }
 codex-utils-string = { workspace = true }
+codex-utils-template = { workspace = true }
 encoding_rs = { workspace = true }
 globset = { workspace = true }
 icu_decimal = { workspace = true }
@@ -44,7 +44,6 @@ ts-rs = { workspace = true, features = [
     "no-serde-warnings",
 ] }
 uuid = { workspace = true, features = ["serde", "v7", "v4"] }
-wildmatch = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }
@@ -59,4 +58,5 @@ tempfile = { workspace = true }
 [package.metadata.cargo-shear]
 # Required because:
 # `icu_provider`: contains a required `sync` feature for `icu_decimal`
-ignored = ["icu_provider"]
+# `strum`: as strum_macros in non-nightly builds
+ignored = ["icu_provider", "strum"]

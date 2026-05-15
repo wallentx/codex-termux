@@ -12,11 +12,11 @@ use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::FunctionCallOutputPayload;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::CALENDAR_CREATE_EVENT_MCP_APP_RESOURCE_URI;
@@ -24,7 +24,6 @@ use core_test_support::apps_test_server::CALENDAR_CREATE_EVENT_RESOURCE_URI;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_tool_search_call;
 use core_test_support::responses::mount_sse_once;
@@ -99,18 +98,6 @@ fn tool_search_output_tools(request: &ResponsesRequest, call_id: &str) -> Vec<Va
         .unwrap_or_default()
 }
 
-fn tool_search_output_has_namespace_child(
-    request: &ResponsesRequest,
-    call_id: &str,
-    namespace: &str,
-    tool_name: &str,
-) -> bool {
-    let output = json!({
-        "tools": tool_search_output_tools(request, call_id),
-    });
-    namespace_child_tool(&output, namespace, tool_name).is_some()
-}
-
 fn configure_search_capable_model(config: &mut Config) {
     let mut model_catalog = bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
@@ -170,10 +157,10 @@ async fn search_tool_enabled_by_default_adds_tool_search() -> Result<()> {
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "list tools",
         AskForApproval::Never,
-        PermissionProfile::Disabled,
+        SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -234,10 +221,10 @@ async fn always_defer_feature_hides_small_app_tool_sets() -> Result<()> {
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "list tools",
         AskForApproval::Never,
-        PermissionProfile::Disabled,
+        SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -278,10 +265,10 @@ async fn tool_search_disabled_exposes_apps_tools_directly() -> Result<()> {
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "list tools",
         AskForApproval::Never,
-        PermissionProfile::Disabled,
+        SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -324,10 +311,10 @@ async fn search_tool_is_hidden_for_api_key_auth() -> Result<()> {
         .with_config(move |config| configure_apps(config, apps_server.chatgpt_base_url.as_str()));
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "list tools",
         AskForApproval::Never,
-        PermissionProfile::Disabled,
+        SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -360,10 +347,10 @@ async fn search_tool_adds_discovery_instructions_to_tool_description() -> Result
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "list tools",
         AskForApproval::Never,
-        PermissionProfile::Disabled,
+        SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -402,10 +389,10 @@ async fn search_tool_hides_apps_tools_without_search() -> Result<()> {
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "hello tools",
         AskForApproval::Never,
-        PermissionProfile::Disabled,
+        SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -438,10 +425,10 @@ async fn explicit_app_mentions_expose_apps_tools_without_search() -> Result<()> 
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "Use [$calendar](app://calendar) and then call tools.",
         AskForApproval::Never,
-        PermissionProfile::Disabled,
+        SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -568,7 +555,6 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
             .structured_content,
         Some(json!({
             "_codex_apps": {
-                "call_id": "calendar-call-1",
                 "resource_uri": CALENDAR_CREATE_EVENT_RESOURCE_URI,
                 "contains_mcp_source": true,
                 "connector_id": "calendar",
@@ -583,7 +569,6 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
-    let first_request_body = requests[0].body_json();
 
     let apps_tool_call = server
         .received_requests()
@@ -601,7 +586,6 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
     assert_eq!(
         apps_tool_call.pointer("/params/_meta/_codex_apps"),
         Some(&json!({
-            "call_id": "calendar-call-1",
             "resource_uri": CALENDAR_CREATE_EVENT_RESOURCE_URI,
             "contains_mcp_source": true,
             "connector_id": "calendar",
@@ -611,10 +595,6 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
         apps_tool_call.pointer("/params/_meta/x-codex-turn-metadata/session_id"),
         Some(&json!(test.session_configured.session_id.to_string()))
     );
-    assert_eq!(
-        apps_tool_call.pointer("/params/_meta/x-codex-turn-metadata/thread_id"),
-        Some(&json!(test.session_configured.thread_id.to_string()))
-    );
     assert!(
         apps_tool_call
             .pointer("/params/_meta/x-codex-turn-metadata/turn_id")
@@ -622,45 +602,8 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
             .is_some_and(|turn_id| !turn_id.is_empty()),
         "apps tools/call should include turn metadata turn_id: {apps_tool_call:?}"
     );
-    assert_eq!(
-        apps_tool_call
-            .pointer("/params/_meta/x-codex-turn-metadata/model")
-            .and_then(Value::as_str),
-        Some("gpt-5.4")
-    );
-    let first_request_reasoning_effort = first_request_body
-        .pointer("/reasoning/effort")
-        .and_then(Value::as_str)
-        .expect("first response request should include reasoning effort");
-    assert_eq!(
-        apps_tool_call
-            .pointer("/params/_meta/x-codex-turn-metadata/reasoning_effort")
-            .and_then(Value::as_str),
-        Some(first_request_reasoning_effort)
-    );
-    let mcp_turn_started_at_unix_ms = apps_tool_call
-        .pointer("/params/_meta/x-codex-turn-metadata/turn_started_at_unix_ms")
-        .and_then(Value::as_i64)
-        .expect("apps tools/call should include turn_started_at_unix_ms");
-    assert!(
-        mcp_turn_started_at_unix_ms > 0,
-        "apps tools/call should include a positive turn_started_at_unix_ms: {apps_tool_call:?}"
-    );
 
-    let first_request_turn_metadata: Value = serde_json::from_str(
-        &requests[0]
-            .header("x-codex-turn-metadata")
-            .expect("first response request should include turn metadata"),
-    )
-    .expect("first response request turn metadata should be valid JSON");
-    assert_eq!(
-        first_request_turn_metadata
-            .get("turn_started_at_unix_ms")
-            .and_then(Value::as_i64),
-        Some(mcp_turn_started_at_unix_ms)
-    );
-
-    let first_request_tools = tool_names(&first_request_body);
+    let first_request_tools = tool_names(&requests[0].body_json());
     assert!(
         first_request_tools
             .iter()
@@ -878,8 +821,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
 
-    let first_request_body = requests[0].body_json();
-    let first_request_tools = tool_names(&first_request_body);
+    let first_request_tools = tool_names(&requests[0].body_json());
     assert!(
         first_request_tools
             .iter()
@@ -909,8 +851,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         })]
     );
 
-    let second_request_body = requests[1].body_json();
-    let second_request_tools = tool_names(&second_request_body);
+    let second_request_tools = tool_names(&requests[1].body_json());
     assert!(
         !second_request_tools.iter().any(|name| name == tool_name),
         "follow-up request should rely on tool_search_output history, not tool injection: {second_request_tools:?}"
@@ -927,8 +868,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         FunctionCallOutputPayload::from_text("dynamic-search-ok".to_string())
     );
 
-    let third_request_body = requests[2].body_json();
-    let third_request_tools = tool_names(&third_request_body);
+    let third_request_tools = tool_names(&requests[2].body_json());
     assert!(
         !third_request_tools.iter().any(|name| name == tool_name),
         "post-tool follow-up should rely on tool_search_output history, not tool injection: {third_request_tools:?}"
@@ -1011,10 +951,10 @@ async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "Find the rmcp echo and image tools.",
         AskForApproval::Never,
-        PermissionProfile::Disabled,
+        SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -1059,442 +999,6 @@ async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
         !found_rmcp_image_tool,
         "disabled non-app MCP tools should not be searchable: {image_tools:?}"
     );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tool_search_surfaced_mcp_tool_errors_are_returned_to_model() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let apps_server = AppsTestServer::mount_searchable(&server).await?;
-    let search_call_id = "tool-search-rmcp-echo";
-    let tool_call_id = "rmcp-echo-error";
-    let mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_tool_search_call(
-                    search_call_id,
-                    &json!({
-                        "query": "Echo back the provided message and include environment data.",
-                        "limit": 8,
-                    }),
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_function_call_with_namespace(tool_call_id, "mcp__rmcp__", "echo", "{}"),
-                ev_completed("resp-2"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-3"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-3"),
-            ]),
-        ],
-    )
-    .await;
-
-    let rmcp_test_server_bin = stdio_server_bin()?;
-    let mut builder =
-        configured_builder(apps_server.chatgpt_base_url.clone()).with_config(move |config| {
-            config
-                .features
-                .enable(Feature::ToolSearchAlwaysDeferMcpTools)
-                .expect("test config should allow feature update");
-            let mut servers = config.mcp_servers.get().clone();
-            servers.insert(
-                "rmcp".to_string(),
-                McpServerConfig {
-                    transport: McpServerTransportConfig::Stdio {
-                        command: rmcp_test_server_bin,
-                        args: Vec::new(),
-                        env: None,
-                        env_vars: Vec::new(),
-                        cwd: None,
-                    },
-                    experimental_environment: None,
-                    enabled: true,
-                    required: false,
-                    disabled_reason: None,
-                    startup_timeout_sec: Some(Duration::from_secs(10)),
-                    tool_timeout_sec: None,
-                    default_tools_approval_mode: None,
-                    enabled_tools: Some(vec!["echo".to_string()]),
-                    disabled_tools: None,
-                    scopes: None,
-                    oauth_resource: None,
-                    supports_parallel_tool_calls: false,
-                    tools: HashMap::new(),
-                },
-            );
-            config
-                .mcp_servers
-                .set(servers)
-                .expect("test mcp servers should accept any configuration");
-        });
-    let test = builder.build(&server).await?;
-
-    test.codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "Find the rmcp echo tool and call it.".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
-        .await?;
-
-    let EventMsg::McpToolCallEnd(end) = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::McpToolCallEnd(_))
-    })
-    .await
-    else {
-        unreachable!("event guard guarantees McpToolCallEnd");
-    };
-    assert_eq!(end.call_id, tool_call_id);
-    assert!(!end.is_success());
-    let tool_error = end
-        .result
-        .as_ref()
-        .expect_err("rmcp echo error should stay in the MCP result");
-    assert!(
-        tool_error.contains("tool call error:")
-            && tool_error.contains("missing field")
-            && tool_error.contains("message"),
-        "MCP invocation should report the execution failure: {tool_error}"
-    );
-
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 3);
-
-    let first_request_tools = tool_names(&requests[0].body_json());
-    assert!(
-        first_request_tools
-            .iter()
-            .any(|name| name == TOOL_SEARCH_TOOL_NAME),
-        "first request should advertise tool_search: {first_request_tools:?}"
-    );
-    assert!(
-        !first_request_tools.iter().any(|name| name == "mcp__rmcp__"),
-        "deferred rmcp namespace should not be directly exposed before search: {first_request_tools:?}"
-    );
-
-    assert!(
-        tool_search_output_has_namespace_child(&requests[1], search_call_id, "mcp__rmcp__", "echo"),
-        "tool_search should return the rmcp echo tool"
-    );
-
-    let output = requests[2].function_call_output(tool_call_id);
-    let output_text = match output.get("output") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        other => panic!("unexpected MCP error output payload: {other:?}"),
-    };
-    assert!(
-        output_text.contains("missing field") && output_text.contains("message"),
-        "MCP error output should be model visible: {output_text}"
-    );
-    assert!(
-        !output_text.contains("unsupported call"),
-        "search-surfaced MCP calls should not fall through to unsupported call: {output_text}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tool_search_uses_non_app_mcp_server_instructions_as_namespace_description() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let apps_server = AppsTestServer::mount_searchable(&server).await?;
-    let search_call_id = "tool-search-echo";
-    let mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_tool_search_call(
-                    search_call_id,
-                    &json!({
-                        "query": "Echo back the provided message and include environment data.",
-                        "limit": 8,
-                    }),
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let rmcp_test_server_bin = stdio_server_bin()?;
-    let mut builder =
-        configured_builder(apps_server.chatgpt_base_url.clone()).with_config(move |config| {
-            let mut servers = config.mcp_servers.get().clone();
-            servers.insert(
-                "rmcp".to_string(),
-                McpServerConfig {
-                    transport: McpServerTransportConfig::Stdio {
-                        command: rmcp_test_server_bin,
-                        args: Vec::new(),
-                        env: None,
-                        env_vars: Vec::new(),
-                        cwd: None,
-                    },
-                    experimental_environment: None,
-                    enabled: true,
-                    required: false,
-                    disabled_reason: None,
-                    startup_timeout_sec: Some(Duration::from_secs(10)),
-                    tool_timeout_sec: None,
-                    default_tools_approval_mode: None,
-                    enabled_tools: Some(vec!["echo".to_string()]),
-                    disabled_tools: None,
-                    scopes: None,
-                    oauth_resource: None,
-                    supports_parallel_tool_calls: false,
-                    tools: HashMap::new(),
-                },
-            );
-            config
-                .mcp_servers
-                .set(servers)
-                .expect("test mcp servers should accept any configuration");
-        });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn_with_approval_and_permission_profile(
-        "Find the rmcp echo tool.",
-        AskForApproval::Never,
-        PermissionProfile::Disabled,
-    )
-    .await?;
-
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 2);
-
-    let tools = tool_search_output_tools(&requests[1], search_call_id);
-    let rmcp_namespace = tools
-        .iter()
-        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("mcp__rmcp__"))
-        .expect("tool_search should return the rmcp namespace");
-    assert_eq!(
-        rmcp_namespace.get("description").and_then(Value::as_str),
-        Some("Use these tools to exercise the rmcp test server.")
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tool_search_matches_mcp_tools_by_distinct_name_description_and_schema_terms() -> Result<()>
-{
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let apps_server = AppsTestServer::mount_searchable(&server).await?;
-    let query_cases = [
-        ("tool-search-mcp-raw-name", "calendar_timezone_option_99"),
-        ("tool-search-mcp-description", "uploaded document"),
-        ("tool-search-mcp-schema", "starts_at"),
-    ];
-    let mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(std::iter::once(ev_response_created("resp-1"))
-                .chain(query_cases.into_iter().map(|(call_id, query)| {
-                    ev_tool_search_call(
-                        call_id,
-                        &json!({
-                            "query": query,
-                            "limit": 8,
-                        }),
-                    )
-                }))
-                .chain(std::iter::once(ev_completed("resp-1")))
-                .collect()),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
-    let test = builder.build(&server).await?;
-
-    test.submit_turn_with_approval_and_permission_profile(
-        "Search for calendar tooling.",
-        AskForApproval::Never,
-        PermissionProfile::Disabled,
-    )
-    .await?;
-
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 2);
-
-    assert!(
-        tool_search_output_has_namespace_child(
-            &requests[1],
-            "tool-search-mcp-raw-name",
-            SEARCH_CALENDAR_NAMESPACE,
-            "_timezone_option_99"
-        ),
-        "expected raw MCP tool-name query to surface _timezone_option_99: {:?}",
-        tool_search_output_tools(&requests[1], "tool-search-mcp-raw-name")
-    );
-    assert!(
-        tool_search_output_has_namespace_child(
-            &requests[1],
-            "tool-search-mcp-description",
-            SEARCH_CALENDAR_NAMESPACE,
-            "_extract_text"
-        ),
-        "expected MCP description query to surface _extract_text: {:?}",
-        tool_search_output_tools(&requests[1], "tool-search-mcp-description")
-    );
-    assert!(
-        tool_search_output_has_namespace_child(
-            &requests[1],
-            "tool-search-mcp-schema",
-            SEARCH_CALENDAR_NAMESPACE,
-            SEARCH_CALENDAR_CREATE_TOOL
-        ),
-        "expected MCP schema query to surface {SEARCH_CALENDAR_CREATE_TOOL}: {:?}",
-        tool_search_output_tools(&requests[1], "tool-search-mcp-schema")
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tool_search_matches_dynamic_tools_by_name_description_namespace_and_schema_terms()
--> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let query_cases = [
-        ("tool-search-dynamic-name", "quasar_ping_beacon"),
-        ("tool-search-dynamic-spaces", "quasar ping beacon"),
-        ("tool-search-dynamic-description", "saffron metronome"),
-        ("tool-search-dynamic-namespace", "orbit_ops"),
-        ("tool-search-dynamic-schema", "chrono_spec"),
-    ];
-    let mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(std::iter::once(ev_response_created("resp-1"))
-                .chain(query_cases.into_iter().map(|(call_id, query)| {
-                    ev_tool_search_call(
-                        call_id,
-                        &json!({
-                            "query": query,
-                            "limit": 8,
-                        }),
-                    )
-                }))
-                .chain(std::iter::once(ev_completed("resp-1")))
-                .collect()),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let dynamic_tool = DynamicToolSpec {
-        namespace: Some("orbit_ops".to_string()),
-        name: "quasar_ping_beacon".to_string(),
-        description: "Trigger the saffron metronome workflow for reminder follow-ups.".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "chrono_spec": { "type": "string" },
-                "targetThreadId": { "type": "string" },
-            },
-            "required": ["chrono_spec"],
-            "additionalProperties": false,
-        }),
-        defer_loading: true,
-    };
-
-    let mut builder = test_codex().with_config(configure_search_capable_model);
-    let base_test = builder.build(&server).await?;
-    let new_thread = base_test
-        .thread_manager
-        .start_thread_with_tools(
-            base_test.config.clone(),
-            vec![dynamic_tool],
-            /*persist_extended_history*/ false,
-        )
-        .await?;
-    let mut test = base_test;
-    test.codex = new_thread.thread;
-    test.session_configured = new_thread.session_configured;
-
-    test.codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "Search for the dynamic tool".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
-        .await?;
-
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let requests = mock.requests();
-    assert_eq!(requests.len(), 2);
-
-    for call_id in [
-        "tool-search-dynamic-name",
-        "tool-search-dynamic-spaces",
-        "tool-search-dynamic-description",
-        "tool-search-dynamic-namespace",
-        "tool-search-dynamic-schema",
-    ] {
-        assert!(
-            tool_search_output_has_namespace_child(
-                &requests[1],
-                call_id,
-                "orbit_ops",
-                "quasar_ping_beacon"
-            ),
-            "expected query {call_id} to surface the quasar_ping_beacon tool: {:?}",
-            tool_search_output_tools(&requests[1], call_id)
-        );
-    }
 
     Ok(())
 }

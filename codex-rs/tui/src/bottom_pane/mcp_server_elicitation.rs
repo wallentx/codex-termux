@@ -2,25 +2,18 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-#[cfg(test)]
-use crate::app_command::AppCommand as Op;
 use codex_app_server_protocol::McpElicitationEnumSchema;
 use codex_app_server_protocol::McpElicitationPrimitiveSchema;
 use codex_app_server_protocol::McpElicitationSingleSelectEnumSchema;
-use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
-use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_protocol::ThreadId;
-use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY as APPROVAL_META_KIND_KEY;
-use codex_protocol::mcp_approval_meta::APPROVAL_KIND_MCP_TOOL_CALL as APPROVAL_META_KIND_MCP_TOOL_CALL;
-use codex_protocol::mcp_approval_meta::APPROVAL_KIND_TOOL_SUGGESTION as APPROVAL_META_KIND_TOOL_SUGGESTION;
-use codex_protocol::mcp_approval_meta::PERSIST_ALWAYS as APPROVAL_PERSIST_ALWAYS_VALUE;
-use codex_protocol::mcp_approval_meta::PERSIST_KEY as APPROVAL_PERSIST_KEY;
-use codex_protocol::mcp_approval_meta::PERSIST_SESSION as APPROVAL_PERSIST_SESSION_VALUE;
-use codex_protocol::mcp_approval_meta::TOOL_NAME_KEY;
-use codex_protocol::mcp_approval_meta::TOOL_PARAMS_DISPLAY_KEY as APPROVAL_TOOL_PARAMS_DISPLAY_KEY;
-use codex_protocol::mcp_approval_meta::TOOL_PARAMS_KEY as APPROVAL_TOOL_PARAMS_KEY;
+use codex_protocol::approvals::ElicitationAction;
+use codex_protocol::approvals::ElicitationRequest;
+use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::mcp::RequestId as McpRequestId;
+#[cfg(test)]
+use codex_protocol::protocol::Op;
 use codex_protocol::user_input::TextElement;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -49,8 +42,6 @@ use crate::bottom_pane::selection_popup_common::menu_surface_inset;
 use crate::bottom_pane::selection_popup_common::menu_surface_padding_height;
 use crate::bottom_pane::selection_popup_common::render_menu_surface;
 use crate::bottom_pane::selection_popup_common::render_rows;
-use crate::key_hint::KeyBindingListExt;
-use crate::keymap::ListKeymap;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::format_json_compact;
 use crate::text_formatting::truncate_text;
@@ -66,10 +57,19 @@ const APPROVAL_ACCEPT_SESSION_VALUE: &str = "accept_session";
 const APPROVAL_ACCEPT_ALWAYS_VALUE: &str = "accept_always";
 const APPROVAL_DECLINE_VALUE: &str = "decline";
 const APPROVAL_CANCEL_VALUE: &str = "cancel";
+const APPROVAL_META_KIND_KEY: &str = "codex_approval_kind";
+const APPROVAL_META_KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
+const APPROVAL_META_KIND_TOOL_SUGGESTION: &str = "tool_suggestion";
+const APPROVAL_PERSIST_KEY: &str = "persist";
+const APPROVAL_PERSIST_SESSION_VALUE: &str = "session";
+const APPROVAL_PERSIST_ALWAYS_VALUE: &str = "always";
+const APPROVAL_TOOL_PARAMS_KEY: &str = "tool_params";
+const APPROVAL_TOOL_PARAMS_DISPLAY_KEY: &str = "tool_params_display";
 const APPROVAL_TOOL_PARAM_DISPLAY_LIMIT: usize = 3;
 const APPROVAL_TOOL_PARAM_VALUE_TRUNCATE_GRAPHEMES: usize = 60;
 const TOOL_TYPE_KEY: &str = "tool_type";
 const TOOL_ID_KEY: &str = "tool_id";
+const TOOL_NAME_KEY: &str = "tool_name";
 const TOOL_SUGGEST_SUGGEST_TYPE_KEY: &str = "suggest_type";
 const TOOL_SUGGEST_REASON_KEY: &str = "suggest_reason";
 const TOOL_SUGGEST_INSTALL_URL_KEY: &str = "install_url";
@@ -166,7 +166,7 @@ struct McpToolApprovalDisplayParam {
 pub(crate) struct McpServerElicitationFormRequest {
     thread_id: ThreadId,
     server_name: String,
-    request_id: AppServerRequestId,
+    request_id: McpRequestId,
     message: String,
     approval_display_params: Vec<McpToolApprovalDisplayParam>,
     response_mode: McpServerElicitationResponseMode,
@@ -206,7 +206,7 @@ impl FooterTip {
 impl McpServerElicitationFormRequest {
     pub(crate) fn from_app_server_request(
         thread_id: ThreadId,
-        request_id: AppServerRequestId,
+        request_id: McpRequestId,
         request: McpServerElicitationRequestParams,
     ) -> Option<Self> {
         let McpServerElicitationRequestParams {
@@ -234,10 +234,33 @@ impl McpServerElicitationFormRequest {
         )
     }
 
+    pub(crate) fn from_event(
+        thread_id: ThreadId,
+        request: ElicitationRequestEvent,
+    ) -> Option<Self> {
+        let ElicitationRequest::Form {
+            meta,
+            message,
+            requested_schema,
+        } = request.request
+        else {
+            return None;
+        };
+
+        Self::from_parts(
+            thread_id,
+            request.server_name,
+            request.id,
+            meta,
+            message,
+            requested_schema,
+        )
+    }
+
     fn from_parts(
         thread_id: ThreadId,
         server_name: String,
-        request_id: AppServerRequestId,
+        request_id: McpRequestId,
         meta: Option<Value>,
         message: String,
         requested_schema: Value,
@@ -365,7 +388,7 @@ impl McpServerElicitationFormRequest {
         self.server_name.as_str()
     }
 
-    pub(crate) fn request_id(&self) -> &AppServerRequestId {
+    pub(crate) fn request_id(&self) -> &McpRequestId {
         &self.request_id
     }
 }
@@ -713,35 +736,15 @@ pub(crate) struct McpServerElicitationOverlay {
     current_idx: usize,
     done: bool,
     validation_error: Option<String>,
-    list_keymap: ListKeymap,
 }
 
 impl McpServerElicitationOverlay {
-    #[cfg(test)]
     pub(crate) fn new(
         request: McpServerElicitationFormRequest,
         app_event_tx: AppEventSender,
         has_input_focus: bool,
         enhanced_keys_supported: bool,
         disable_paste_burst: bool,
-    ) -> Self {
-        Self::new_with_keymap(
-            request,
-            app_event_tx,
-            has_input_focus,
-            enhanced_keys_supported,
-            disable_paste_burst,
-            crate::keymap::RuntimeKeymap::defaults().list,
-        )
-    }
-
-    pub(crate) fn new_with_keymap(
-        request: McpServerElicitationFormRequest,
-        app_event_tx: AppEventSender,
-        has_input_focus: bool,
-        enhanced_keys_supported: bool,
-        disable_paste_burst: bool,
-        list_keymap: ListKeymap,
     ) -> Self {
         let mut composer = ChatComposer::new_with_config(
             has_input_focus,
@@ -761,7 +764,6 @@ impl McpServerElicitationOverlay {
             current_idx: 0,
             done: false,
             validation_error: None,
-            list_keymap,
         };
         overlay.reset_for_request();
         overlay.restore_current_draft();
@@ -1138,7 +1140,7 @@ impl McpServerElicitationOverlay {
             self.request.thread_id,
             self.request.server_name.clone(),
             self.request.request_id.clone(),
-            McpServerElicitationAction::Cancel,
+            ElicitationAction::Cancel,
             /*content*/ None,
             /*meta*/ None,
         );
@@ -1165,22 +1167,22 @@ impl McpServerElicitationOverlay {
         if self.request.response_mode == McpServerElicitationResponseMode::ApprovalAction {
             let (decision, meta) =
                 match self.field_value(/*idx*/ 0).as_ref().and_then(Value::as_str) {
-                    Some(APPROVAL_ACCEPT_ONCE_VALUE) => (McpServerElicitationAction::Accept, None),
+                    Some(APPROVAL_ACCEPT_ONCE_VALUE) => (ElicitationAction::Accept, None),
                     Some(APPROVAL_ACCEPT_SESSION_VALUE) => (
-                        McpServerElicitationAction::Accept,
+                        ElicitationAction::Accept,
                         Some(serde_json::json!({
                             APPROVAL_PERSIST_KEY: APPROVAL_PERSIST_SESSION_VALUE,
                         })),
                     ),
                     Some(APPROVAL_ACCEPT_ALWAYS_VALUE) => (
-                        McpServerElicitationAction::Accept,
+                        ElicitationAction::Accept,
                         Some(serde_json::json!({
                             APPROVAL_PERSIST_KEY: APPROVAL_PERSIST_ALWAYS_VALUE,
                         })),
                     ),
-                    Some(APPROVAL_DECLINE_VALUE) => (McpServerElicitationAction::Decline, None),
-                    Some(APPROVAL_CANCEL_VALUE) => (McpServerElicitationAction::Cancel, None),
-                    _ => (McpServerElicitationAction::Cancel, None),
+                    Some(APPROVAL_DECLINE_VALUE) => (ElicitationAction::Decline, None),
+                    Some(APPROVAL_CANCEL_VALUE) => (ElicitationAction::Cancel, None),
+                    _ => (ElicitationAction::Cancel, None),
                 };
             self.app_event_tx.resolve_elicitation(
                 self.request.thread_id,
@@ -1204,7 +1206,7 @@ impl McpServerElicitationOverlay {
             self.request.thread_id,
             self.request.server_name.clone(),
             self.request.request_id.clone(),
-            McpServerElicitationAction::Accept,
+            ElicitationAction::Accept,
             Some(Value::Object(content)),
             /*meta*/ None,
         );
@@ -1552,18 +1554,7 @@ impl BottomPaneView for McpServerElicitationOverlay {
                 code: KeyCode::Left,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('h'),
-                modifiers: KeyModifiers::NONE,
-                ..
             } if self.current_field_is_select() => {
-                self.move_field(/*next*/ false);
-                return;
-            }
-            _ if self.current_field_is_select()
-                && self.list_keymap.move_left.is_pressed(key_event) =>
-            {
                 self.move_field(/*next*/ false);
                 return;
             }
@@ -1571,18 +1562,7 @@ impl BottomPaneView for McpServerElicitationOverlay {
                 code: KeyCode::Right,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('l'),
-                modifiers: KeyModifiers::NONE,
-                ..
             } if self.current_field_is_select() => {
-                self.move_field(/*next*/ true);
-                return;
-            }
-            _ if self.current_field_is_select()
-                && self.list_keymap.move_right.is_pressed(key_event) =>
-            {
                 self.move_field(/*next*/ true);
                 return;
             }
@@ -1640,10 +1620,6 @@ impl BottomPaneView for McpServerElicitationOverlay {
                 answer.answer_committed = false;
             }
         }
-    }
-
-    fn terminal_title_requires_action(&self) -> bool {
-        true
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
@@ -1752,33 +1728,17 @@ mod tests {
         message: &str,
         requested_schema: Value,
         meta: Option<Value>,
-    ) -> McpServerElicitationRequestParams {
-        McpServerElicitationRequestParams {
-            thread_id: "thread-1".to_string(),
+    ) -> ElicitationRequestEvent {
+        ElicitationRequestEvent {
             turn_id: Some("turn-1".to_string()),
             server_name: "server-1".to_string(),
-            request: McpServerElicitationRequest::Form {
+            id: McpRequestId::String("request-1".to_string()),
+            request: ElicitationRequest::Form {
                 meta,
                 message: message.to_string(),
-                requested_schema: serde_json::from_value(requested_schema)
-                    .expect("test schema should deserialize"),
+                requested_schema,
             },
         }
-    }
-
-    fn request_id(value: &str) -> AppServerRequestId {
-        AppServerRequestId::String(value.to_string())
-    }
-
-    fn from_form_request(
-        thread_id: ThreadId,
-        request: McpServerElicitationRequestParams,
-    ) -> Option<McpServerElicitationFormRequest> {
-        McpServerElicitationFormRequest::from_app_server_request(
-            thread_id,
-            request_id("request-1"),
-            request,
-        )
     }
 
     fn empty_object_schema() -> Value {
@@ -1852,7 +1812,7 @@ mod tests {
     #[test]
     fn parses_boolean_form_request() {
         let thread_id = ThreadId::default();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             thread_id,
             form_request(
                 "Allow this request?",
@@ -1877,7 +1837,7 @@ mod tests {
             McpServerElicitationFormRequest {
                 thread_id,
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
+                request_id: McpRequestId::String("request-1".to_string()),
                 message: "Allow this request?".to_string(),
                 approval_display_params: Vec::new(),
                 response_mode: McpServerElicitationResponseMode::FormContent,
@@ -1909,7 +1869,7 @@ mod tests {
 
     #[test]
     fn unsupported_numeric_form_falls_back() {
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Pick a number",
@@ -1930,15 +1890,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_object_schema_uses_approval_actions() {
+    fn missing_schema_uses_approval_actions() {
         let thread_id = ThreadId::default();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             thread_id,
-            form_request(
-                "Allow this request?",
-                empty_object_schema(),
-                /*meta*/ None,
-            ),
+            form_request("Allow this request?", Value::Null, /*meta*/ None),
         )
         .expect("expected approval fallback");
 
@@ -1947,7 +1903,7 @@ mod tests {
             McpServerElicitationFormRequest {
                 thread_id,
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
+                request_id: McpRequestId::String("request-1".to_string()),
                 message: "Allow this request?".to_string(),
                 approval_display_params: Vec::new(),
                 response_mode: McpServerElicitationResponseMode::ApprovalAction,
@@ -1985,7 +1941,7 @@ mod tests {
     #[test]
     fn empty_tool_approval_schema_uses_approval_actions() {
         let thread_id = ThreadId::default();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             thread_id,
             form_request(
                 "Allow this request?",
@@ -2004,7 +1960,7 @@ mod tests {
             McpServerElicitationFormRequest {
                 thread_id,
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
+                request_id: McpRequestId::String("request-1".to_string()),
                 message: "Allow this request?".to_string(),
                 approval_display_params: Vec::new(),
                 response_mode: McpServerElicitationResponseMode::ApprovalAction,
@@ -2036,7 +1992,7 @@ mod tests {
 
     #[test]
     fn tool_suggestion_meta_is_parsed_into_request_payload() {
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Suggest Google Calendar",
@@ -2069,7 +2025,7 @@ mod tests {
 
     #[test]
     fn plugin_tool_suggestion_meta_without_install_url_is_parsed_into_request_payload() {
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Suggest Slack",
@@ -2101,7 +2057,7 @@ mod tests {
 
     #[test]
     fn tool_approval_display_params_prefer_explicit_display_order() {
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Allow Calendar to create an event",
@@ -2150,7 +2106,7 @@ mod tests {
     fn submit_sends_accept_with_typed_content() {
         let (tx, mut rx) = test_sender();
         let thread_id = ThreadId::default();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             thread_id,
             form_request(
                 "Allow this request?",
@@ -2190,8 +2146,8 @@ mod tests {
             op,
             Op::ResolveElicitation {
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
-                decision: McpServerElicitationAction::Accept,
+                request_id: McpRequestId::String("request-1".to_string()),
+                decision: ElicitationAction::Accept,
                 content: Some(serde_json::json!({
                     "confirmed": true,
                 })),
@@ -2201,47 +2157,10 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_list_keys_move_between_select_fields() {
-        let (tx, _rx) = test_sender();
-        let request = from_form_request(
-            ThreadId::default(),
-            form_request(
-                "Choose values",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "first": {
-                            "type": "boolean",
-                            "title": "First",
-                        },
-                        "second": {
-                            "type": "boolean",
-                            "title": "Second",
-                        }
-                    },
-                    "required": ["first", "second"],
-                }),
-                /*meta*/ None,
-            ),
-        )
-        .expect("expected supported form");
-        let mut overlay = McpServerElicitationOverlay::new(
-            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
-            /*disable_paste_burst*/ false,
-        );
-
-        assert_eq!(overlay.current_idx, 0);
-        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
-        assert_eq!(overlay.current_idx, 1);
-        overlay.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
-        assert_eq!(overlay.current_idx, 0);
-    }
-
-    #[test]
     fn empty_tool_approval_schema_session_choice_sets_persist_meta() {
         let (tx, mut rx) = test_sender();
         let thread_id = ThreadId::default();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             thread_id,
             form_request(
                 "Allow this request?",
@@ -2281,8 +2200,8 @@ mod tests {
             op,
             Op::ResolveElicitation {
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
-                decision: McpServerElicitationAction::Accept,
+                request_id: McpRequestId::String("request-1".to_string()),
+                decision: ElicitationAction::Accept,
                 content: None,
                 meta: Some(serde_json::json!({
                     APPROVAL_PERSIST_KEY: APPROVAL_PERSIST_SESSION_VALUE,
@@ -2295,7 +2214,7 @@ mod tests {
     fn empty_tool_approval_schema_always_allow_sets_persist_meta() {
         let (tx, mut rx) = test_sender();
         let thread_id = ThreadId::default();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             thread_id,
             form_request(
                 "Allow this request?",
@@ -2335,8 +2254,8 @@ mod tests {
             op,
             Op::ResolveElicitation {
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
-                decision: McpServerElicitationAction::Accept,
+                request_id: McpRequestId::String("request-1".to_string()),
+                decision: ElicitationAction::Accept,
                 content: None,
                 meta: Some(serde_json::json!({
                     APPROVAL_PERSIST_KEY: APPROVAL_PERSIST_ALWAYS_VALUE,
@@ -2349,7 +2268,7 @@ mod tests {
     fn ctrl_c_cancels_elicitation() {
         let (tx, mut rx) = test_sender();
         let thread_id = ThreadId::default();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             thread_id,
             form_request(
                 "Allow this request?",
@@ -2388,8 +2307,8 @@ mod tests {
             op,
             Op::ResolveElicitation {
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
-                decision: McpServerElicitationAction::Cancel,
+                request_id: McpRequestId::String("request-1".to_string()),
+                decision: ElicitationAction::Cancel,
                 content: None,
                 meta: None,
             }
@@ -2399,7 +2318,7 @@ mod tests {
     #[test]
     fn queues_requests_fifo() {
         let (tx, _rx) = test_sender();
-        let first = from_form_request(
+        let first = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "First",
@@ -2416,7 +2335,7 @@ mod tests {
             ),
         )
         .expect("expected supported form");
-        let second = from_form_request(
+        let second = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Second",
@@ -2433,7 +2352,7 @@ mod tests {
             ),
         )
         .expect("expected supported form");
-        let third = from_form_request(
+        let third = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Third",
@@ -2482,7 +2401,7 @@ mod tests {
             },
         });
         let mut overlay = McpServerElicitationOverlay::new(
-            from_form_request(
+            McpServerElicitationFormRequest::from_event(
                 thread_id,
                 form_request("First", supported_form_schema.clone(), /*meta*/ None),
             )
@@ -2493,18 +2412,16 @@ mod tests {
             /*disable_paste_burst*/ false,
         );
         overlay.try_consume_mcp_server_elicitation_request(
-            McpServerElicitationFormRequest::from_app_server_request(
+            McpServerElicitationFormRequest::from_event(
                 thread_id,
-                request_id("request-2"),
-                McpServerElicitationRequestParams {
-                    thread_id: "thread-1".to_string(),
+                ElicitationRequestEvent {
                     turn_id: Some("turn-2".to_string()),
                     server_name: "server-1".to_string(),
-                    request: McpServerElicitationRequest::Form {
+                    id: McpRequestId::String("request-2".to_string()),
+                    request: ElicitationRequest::Form {
                         meta: None,
                         message: "Second".to_string(),
-                        requested_schema: serde_json::from_value(supported_form_schema)
-                            .expect("test schema should deserialize"),
+                        requested_schema: supported_form_schema,
                     },
                 },
             )
@@ -2514,7 +2431,7 @@ mod tests {
         assert!(
             overlay.dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-1"),
+                request_id: McpRequestId::String("request-1".to_string()),
             })
         );
         assert_eq!(overlay.request.message, "Second");
@@ -2526,7 +2443,7 @@ mod tests {
         assert!(
             overlay.dismiss_app_server_request(&ResolvedAppServerRequest::McpElicitation {
                 server_name: "server-1".to_string(),
-                request_id: request_id("request-2"),
+                request_id: McpRequestId::String("request-2".to_string()),
             })
         );
         assert!(overlay.is_complete());
@@ -2539,7 +2456,7 @@ mod tests {
     #[test]
     fn boolean_form_snapshot() {
         let (tx, _rx) = test_sender();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Allow this request?",
@@ -2572,7 +2489,7 @@ mod tests {
     #[test]
     fn approval_form_tool_approval_snapshot() {
         let (tx, _rx) = test_sender();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Allow this request?",
@@ -2599,7 +2516,7 @@ mod tests {
     #[test]
     fn message_only_form_snapshot() {
         let (tx, _rx) = test_sender();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Boolean elicit MCP example: do you confirm?",
@@ -2622,7 +2539,7 @@ mod tests {
     #[test]
     fn message_only_form_with_persist_options_snapshot() {
         let (tx, _rx) = test_sender();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Boolean elicit MCP example: do you confirm?",
@@ -2650,7 +2567,7 @@ mod tests {
     #[test]
     fn approval_form_tool_approval_with_persist_options_snapshot() {
         let (tx, _rx) = test_sender();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Allow this request?",
@@ -2680,7 +2597,7 @@ mod tests {
     #[test]
     fn approval_form_tool_approval_with_param_summary_snapshot() {
         let (tx, _rx) = test_sender();
-        let request = from_form_request(
+        let request = McpServerElicitationFormRequest::from_event(
             ThreadId::default(),
             form_request(
                 "Allow Calendar to create an event",
