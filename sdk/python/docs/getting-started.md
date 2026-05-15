@@ -10,21 +10,19 @@ From repo root:
 
 ```bash
 cd sdk/python
-uv sync
-source .venv/bin/activate
+python -m pip install -e .
 ```
 
 Requirements:
 
 - Python `>=3.10`
-- uv
 - installed `openai-codex-cli-bin` runtime package, or an explicit `codex_bin` override
 - local Codex auth/session configured
 
 ## 2) Run your first turn (sync)
 
 ```python
-from openai_codex import Codex
+from codex_app_server import Codex
 
 with Codex() as codex:
     server = codex.metadata.serverInfo
@@ -50,7 +48,7 @@ What happened:
 ## 3) Continue the same thread (multi-turn)
 
 ```python
-from openai_codex import Codex
+from codex_app_server import Codex
 
 with Codex() as codex:
     thread = codex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})
@@ -69,7 +67,7 @@ initializes lazily, and context entry makes startup/shutdown explicit.
 
 ```python
 import asyncio
-from openai_codex import AsyncCodex
+from codex_app_server import AsyncCodex
 
 
 async def main() -> None:
@@ -85,7 +83,7 @@ asyncio.run(main())
 ## 5) Resume an existing thread
 
 ```python
-from openai_codex import Codex
+from codex_app_server import Codex
 
 THREAD_ID = "thr_123"  # replace with a real id
 
@@ -95,13 +93,12 @@ with Codex() as codex:
     print(result.final_response)
 ```
 
-## 6) Public app-server types
+## 6) Generated models
 
-The convenience wrappers live at the package root. Public app-server value and
-event types live under:
+The convenience wrappers live at the package root, but the canonical app-server models live under:
 
 ```python
-from openai_codex.types import ThreadReadResponse, Turn, TurnStatus
+from codex_app_server.generated.v2_all import Turn, TurnStatus, ThreadReadResponse
 ```
 
 ## 7) Next stops

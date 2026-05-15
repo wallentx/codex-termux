@@ -5,26 +5,56 @@ use crate::rate_limits::parse_all_rate_limits;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
+use codex_client::TransportError;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
+use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use std::io::BufRead;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio::time::timeout;
+use tokio_util::io::ReaderStream;
 use tracing::debug;
 use tracing::trace;
 
 const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
 const OPENAI_MODEL_HEADER: &str = "openai-model";
-const REQUEST_ID_HEADER: &str = "x-request-id";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
+
+/// Streams SSE events from an on-disk fixture for tests.
+pub fn stream_from_fixture(
+    path: impl AsRef<Path>,
+    idle_timeout: Duration,
+) -> Result<ResponseStream, ApiError> {
+    let file =
+        std::fs::File::open(path.as_ref()).map_err(|err| ApiError::Stream(err.to_string()))?;
+    let mut content = String::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|err| ApiError::Stream(err.to_string()))?;
+        content.push_str(&line);
+        content.push_str("\n\n");
+    }
+
+    let reader = std::io::Cursor::new(content);
+    let stream = ReaderStream::new(reader).map_err(|err| TransportError::Network(err.to_string()));
+    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
+    tokio::spawn(process_sse(
+        Box::pin(stream),
+        tx_event,
+        idle_timeout,
+        /*telemetry*/ None,
+    ));
+    Ok(ResponseStream { rx_event })
+}
 
 pub fn spawn_response_stream(
     stream_response: StreamResponse,
@@ -47,11 +77,6 @@ pub fn spawn_response_stream(
         .headers
         .get(X_REASONING_INCLUDED_HEADER)
         .is_some();
-    let upstream_request_id = stream_response
-        .headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
     if let Some(turn_state) = turn_state.as_ref()
         && let Some(header_value) = stream_response
             .headers
@@ -79,10 +104,7 @@ pub fn spawn_response_stream(
         process_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
     });
 
-    ResponseStream {
-        rx_event,
-        upstream_request_id,
-    }
+    ResponseStream { rx_event }
 }
 
 #[derive(Debug, Deserialize)]
@@ -559,10 +581,8 @@ mod tests {
     use assert_matches::assert_matches;
     use bytes::Bytes;
     use codex_client::StreamResponse;
-    use codex_client::TransportError;
     use codex_protocol::models::MessagePhase;
     use codex_protocol::models::ResponseItem;
-    use futures::TryStreamExt;
     use futures::stream;
     use http::HeaderMap;
     use http::HeaderValue;
@@ -571,7 +591,6 @@ mod tests {
     use serde_json::json;
     use tokio::sync::mpsc;
     use tokio_test::io::Builder as IoBuilder;
-    use tokio_util::io::ReaderStream;
 
     async fn collect_events(chunks: &[&[u8]]) -> Vec<Result<ResponseEvent, ApiError>> {
         let mut builder = IoBuilder::new();
@@ -1039,9 +1058,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_response_stream_emits_header_events() {
+    async fn spawn_response_stream_emits_server_model_header() {
         let mut headers = HeaderMap::new();
-        headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("req-1"));
         headers.insert(
             OPENAI_MODEL_HEADER,
             HeaderValue::from_static(CYBER_RESTRICTED_MODEL_FOR_TESTS),
@@ -1059,13 +1077,13 @@ mod tests {
             /*telemetry*/ None,
             /*turn_state*/ None,
         );
-        assert_eq!(stream.upstream_request_id.as_deref(), Some("req-1"));
         let event = stream
             .rx_event
             .recv()
             .await
             .expect("expected server model event")
             .expect("expected ok event");
+
         match event {
             ResponseEvent::ServerModel(model) => {
                 assert_eq!(model, CYBER_RESTRICTED_MODEL_FOR_TESTS);

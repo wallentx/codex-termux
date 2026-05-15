@@ -81,6 +81,7 @@ pub trait ContextualUserFragment {
             content: vec![ContentItem::InputText {
                 text: self.render(),
             }],
+            end_turn: None,
             phase: None,
         }
     }

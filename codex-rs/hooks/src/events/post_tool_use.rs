@@ -245,7 +245,7 @@ fn parse_completed(
                             feedback_messages_for_model.push(reason);
                         }
                     }
-                } else if output_parser::looks_like_json(&run_result.stdout) {
+                } else if trimmed_stdout.starts_with('{') || trimmed_stdout.starts_with('[') {
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
@@ -298,7 +298,6 @@ fn parse_completed(
             additional_contexts_for_model,
             feedback_messages_for_model,
         },
-        completion_order: 0,
     }
 }
 
@@ -544,6 +543,7 @@ mod tests {
     fn handler() -> ConfiguredHandler {
         ConfiguredHandler {
             event_name: HookEventName::PostToolUse,
+            is_managed: false,
             matcher: Some("^Bash$".to_string()),
             command: "python3 post_tool_use_hook.py".to_string(),
             timeout_sec: 5,
@@ -551,7 +551,6 @@ mod tests {
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source: codex_protocol::protocol::HookSource::User,
             display_order: 0,
-            env: std::collections::HashMap::new(),
         }
     }
 

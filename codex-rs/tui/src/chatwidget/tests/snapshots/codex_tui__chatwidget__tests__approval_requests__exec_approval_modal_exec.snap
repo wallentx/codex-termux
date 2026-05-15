@@ -1,5 +1,5 @@
 ---
-source: tui/src/chatwidget/tests/approval_requests.rs
+source: tui/src/chatwidget/tests.rs
 expression: "format!(\"{buf:?}\")"
 ---
 Buffer {

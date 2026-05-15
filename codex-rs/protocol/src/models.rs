@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::path::PathBuf;
 
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::load_for_prompt_bytes;
@@ -25,6 +27,60 @@ use codex_utils_image::ImageProcessingError;
 use schemars::JsonSchema;
 
 use crate::mcp::CallToolResult;
+
+type CommitID = String;
+
+/// Details of a ghost commit created from a repository state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct GhostCommit {
+    id: CommitID,
+    parent: Option<CommitID>,
+    preexisting_untracked_files: Vec<PathBuf>,
+    preexisting_untracked_dirs: Vec<PathBuf>,
+}
+
+impl GhostCommit {
+    /// Create a new ghost commit wrapper from a raw commit ID and optional parent.
+    pub fn new(
+        id: CommitID,
+        parent: Option<CommitID>,
+        preexisting_untracked_files: Vec<PathBuf>,
+        preexisting_untracked_dirs: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            id,
+            parent,
+            preexisting_untracked_files,
+            preexisting_untracked_dirs,
+        }
+    }
+
+    /// Commit ID for the snapshot.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Parent commit ID, if the repository had a `HEAD` at creation time.
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+
+    /// Untracked or ignored files that already existed when the snapshot was captured.
+    pub fn preexisting_untracked_files(&self) -> &[PathBuf] {
+        &self.preexisting_untracked_files
+    }
+
+    /// Untracked or ignored directories that already existed when the snapshot was captured.
+    pub fn preexisting_untracked_dirs(&self) -> &[PathBuf] {
+        &self.preexisting_untracked_dirs
+    }
+}
+
+impl fmt::Display for GhostCommit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.id)
+    }
+}
 
 /// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
@@ -297,15 +353,6 @@ impl ManagedFileSystemPermissions {
     }
 }
 
-/// Reserved identifier for the built-in read-only permission profile.
-pub const BUILT_IN_PERMISSION_PROFILE_READ_ONLY: &str = ":read-only";
-
-/// Reserved identifier for the built-in workspace-write permission profile.
-pub const BUILT_IN_PERMISSION_PROFILE_WORKSPACE: &str = ":workspace";
-
-/// Reserved identifier for the built-in full-access permission profile.
-pub const BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS: &str = ":danger-full-access";
-
 /// Canonical active runtime permissions for a conversation, turn, or command.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -326,35 +373,6 @@ pub enum PermissionProfile {
     External { network: NetworkSandboxPolicy },
 }
 
-/// Metadata for the named or implicit built-in permissions profile that
-/// produced the active `PermissionProfile`.
-///
-/// The runtime must honor `PermissionProfile`; this sidecar exists so clients
-/// can display stable profile identity without trying to reverse-engineer a
-/// name from the compiled permissions.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
-pub struct ActivePermissionProfile {
-    /// Profile identifier from `default_permissions` or the implicit built-in
-    /// default, such as `:workspace` or a user-defined `[permissions.<id>]`
-    /// profile.
-    pub id: String,
-
-    /// Optional parent profile identifier once permissions profiles support
-    /// inheritance. This is always `None` until that config feature exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub extends: Option<String>,
-}
-
-impl ActivePermissionProfile {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            extends: None,
-        }
-    }
-}
-
 impl Default for PermissionProfile {
     fn default() -> Self {
         Self::Managed {
@@ -368,80 +386,6 @@ impl Default for PermissionProfile {
 }
 
 impl PermissionProfile {
-    /// Managed read-only filesystem access with restricted network access.
-    pub fn read_only() -> Self {
-        Self::Managed {
-            file_system: ManagedFileSystemPermissions::Restricted {
-                entries: vec![FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::Root,
-                    },
-                    access: FileSystemAccessMode::Read,
-                }],
-                glob_scan_max_depth: None,
-            },
-            network: NetworkSandboxPolicy::Restricted,
-        }
-    }
-
-    /// Managed workspace-write filesystem access with restricted network
-    /// access.
-    ///
-    /// The returned profile contains symbolic `:workspace_roots` entries that
-    /// must be resolved against the active permission root before enforcement.
-    pub fn workspace_write() -> Self {
-        Self::workspace_write_with(
-            &[],
-            NetworkSandboxPolicy::Restricted,
-            /*exclude_tmpdir_env_var*/ false,
-            /*exclude_slash_tmp*/ false,
-        )
-    }
-
-    /// Managed workspace-write filesystem access with the legacy
-    /// `sandbox_workspace_write` knobs applied directly to the profile.
-    ///
-    /// The returned profile contains symbolic `:workspace_roots` entries that
-    /// must be resolved against the active permission root before enforcement.
-    pub fn workspace_write_with(
-        writable_roots: &[AbsolutePathBuf],
-        network: NetworkSandboxPolicy,
-        exclude_tmpdir_env_var: bool,
-        exclude_slash_tmp: bool,
-    ) -> Self {
-        let file_system = FileSystemSandboxPolicy::workspace_write(
-            writable_roots,
-            exclude_tmpdir_env_var,
-            exclude_slash_tmp,
-        );
-        Self::Managed {
-            file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
-            network,
-        }
-    }
-
-    pub fn materialize_project_roots_with_workspace_roots(
-        self,
-        workspace_roots: &[AbsolutePathBuf],
-    ) -> Self {
-        match self {
-            Self::Managed {
-                file_system,
-                network,
-            } => {
-                let file_system = file_system
-                    .to_sandbox_policy()
-                    .materialize_project_roots_with_workspace_roots(workspace_roots);
-                Self::Managed {
-                    file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
-                    network,
-                }
-            }
-            Self::Disabled => Self::Disabled,
-            Self::External { network } => Self::External { network },
-        }
-    }
-
     pub fn from_runtime_permissions(
         file_system_sandbox_policy: &FileSystemSandboxPolicy,
         network_sandbox_policy: NetworkSandboxPolicy,
@@ -468,7 +412,10 @@ impl PermissionProfile {
             FileSystemSandboxKind::ExternalSandbox => Self::External {
                 network: network_sandbox_policy,
             },
-            FileSystemSandboxKind::Unrestricted if enforcement == SandboxEnforcement::Disabled => {
+            FileSystemSandboxKind::Unrestricted
+                if enforcement == SandboxEnforcement::Disabled
+                    && network_sandbox_policy.is_enabled() =>
+            {
                 Self::Disabled
             }
             FileSystemSandboxKind::Restricted | FileSystemSandboxKind::Unrestricted => {
@@ -482,18 +429,10 @@ impl PermissionProfile {
         }
     }
 
-    pub fn from_legacy_sandbox_policy(sandbox_policy: &SandboxPolicy) -> Self {
+    pub fn from_legacy_sandbox_policy(sandbox_policy: &SandboxPolicy, cwd: &Path) -> Self {
         Self::from_runtime_permissions_with_enforcement(
             SandboxEnforcement::from_legacy_sandbox_policy(sandbox_policy),
-            &FileSystemSandboxPolicy::from(sandbox_policy),
-            NetworkSandboxPolicy::from(sandbox_policy),
-        )
-    }
-
-    pub fn from_legacy_sandbox_policy_for_cwd(sandbox_policy: &SandboxPolicy, cwd: &Path) -> Self {
-        Self::from_runtime_permissions_with_enforcement(
-            SandboxEnforcement::from_legacy_sandbox_policy(sandbox_policy),
-            &FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(sandbox_policy, cwd),
+            &FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, cwd),
             NetworkSandboxPolicy::from(sandbox_policy),
         )
     }
@@ -669,9 +608,6 @@ pub enum ResponseInputItem {
     Message {
         role: String,
         content: Vec<ContentItem>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        phase: Option<MessagePhase>,
     },
     FunctionCallOutput {
         call_id: String,
@@ -754,6 +690,10 @@ pub enum ResponseItem {
         id: Option<String>,
         role: String,
         content: Vec<ContentItem>,
+        // Do not use directly, no available consistently across all providers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        end_turn: Option<bool>,
         // Optional output-message phase (for example: "commentary", "final_answer").
         // Availability varies by provider/model, so downstream consumers must
         // preserve fallback behavior when this is absent.
@@ -886,12 +826,13 @@ pub enum ResponseItem {
         revised_prompt: Option<String>,
         result: String,
     },
+    // Generated by the harness but considered exactly as a model response.
+    GhostSnapshot {
+        ghost_commit: GhostCommit,
+    },
     #[serde(alias = "compaction_summary")]
-    Compaction { encrypted_content: String },
-    ContextCompaction {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        encrypted_content: Option<String>,
+    Compaction {
+        encrypted_content: String,
     },
     #[serde(other)]
     Other,
@@ -1102,15 +1043,12 @@ pub fn local_image_content_items_with_label_number(
 impl From<ResponseInputItem> for ResponseItem {
     fn from(item: ResponseInputItem) -> Self {
         match item {
-            ResponseInputItem::Message {
-                role,
-                content,
-                phase,
-            } => Self::Message {
+            ResponseInputItem::Message { role, content } => Self::Message {
                 role,
                 content,
                 id: None,
-                phase,
+                end_turn: None,
+                phase: None,
             },
             ResponseInputItem::FunctionCallOutput { call_id, output } => {
                 Self::FunctionCallOutput { call_id, output }
@@ -1248,7 +1186,6 @@ impl From<Vec<UserInput>> for ResponseInputItem {
                     UserInput::Skill { .. } | UserInput::Mention { .. } => Vec::new(), // Tool bodies are injected later in core
                 })
                 .collect::<Vec<ContentItem>>(),
-            phase: None,
         }
     }
 }
@@ -1258,6 +1195,30 @@ pub struct SearchToolCallParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub limit: Option<usize>,
+}
+
+/// If the `name` of a `ResponseItem::FunctionCall` is either `container.exec`
+/// or `shell`, the `arguments` field should deserialize to this struct.
+#[derive(Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+pub struct ShellToolCallParams {
+    pub command: Vec<String>,
+    pub workdir: Option<String>,
+
+    /// This is the maximum time in milliseconds that the command is allowed to run.
+    #[serde(alias = "timeout")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sandbox_permissions: Option<SandboxPermissions>,
+    /// Suggests a command prefix to persist for future sessions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub prefix_rule: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub additional_permissions: Option<AdditionalPermissionProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub justification: Option<String>,
 }
 
 /// If the `name` of a `ResponseItem::FunctionCall` is `shell_command`, the
@@ -1627,31 +1588,7 @@ mod tests {
     use anyhow::Result;
     use codex_execpolicy::Policy;
     use pretty_assertions::assert_eq;
-    use std::path::PathBuf;
     use tempfile::tempdir;
-
-    #[test]
-    fn response_input_message_conversion_preserves_phase() {
-        let item = ResponseItem::from(ResponseInputItem::Message {
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: "still working".to_string(),
-            }],
-            phase: Some(MessagePhase::Commentary),
-        });
-
-        assert_eq!(
-            item,
-            ResponseItem::Message {
-                id: None,
-                role: "assistant".to_string(),
-                content: vec![ContentItem::OutputText {
-                    text: "still working".to_string(),
-                }],
-                phase: Some(MessagePhase::Commentary),
-            }
-        );
-    }
 
     #[test]
     fn sandbox_permissions_helpers_match_documented_semantics() {
@@ -1826,24 +1763,12 @@ mod tests {
     }
 
     #[test]
-    fn permission_profile_presets_match_legacy_defaults() {
-        assert_eq!(
-            PermissionProfile::read_only(),
-            PermissionProfile::from_legacy_sandbox_policy(&SandboxPolicy::new_read_only_policy())
-        );
-        assert_eq!(
-            PermissionProfile::workspace_write(),
-            PermissionProfile::from_legacy_sandbox_policy(
-                &SandboxPolicy::new_workspace_write_policy()
-            )
-        );
-    }
-
-    #[test]
     fn permission_profile_round_trip_preserves_disabled_sandbox() -> Result<()> {
         let cwd = tempdir()?;
-        let permission_profile =
-            PermissionProfile::from_legacy_sandbox_policy(&SandboxPolicy::DangerFullAccess);
+        let permission_profile = PermissionProfile::from_legacy_sandbox_policy(
+            &SandboxPolicy::DangerFullAccess,
+            cwd.path(),
+        );
 
         assert_eq!(permission_profile, PermissionProfile::Disabled);
         assert_eq!(
@@ -1858,17 +1783,6 @@ mod tests {
             )
         );
         Ok(())
-    }
-
-    #[test]
-    fn disabled_permission_profile_ignores_runtime_network_policy() {
-        let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
-            SandboxEnforcement::Disabled,
-            &FileSystemSandboxPolicy::unrestricted(),
-            NetworkSandboxPolicy::Restricted,
-        );
-
-        assert_eq!(permission_profile, PermissionProfile::Disabled);
     }
 
     #[test]
@@ -1925,7 +1839,8 @@ mod tests {
         let sandbox_policy = SandboxPolicy::ExternalSandbox {
             network_access: crate::protocol::NetworkAccess::Restricted,
         };
-        let permission_profile = PermissionProfile::from_legacy_sandbox_policy(&sandbox_policy);
+        let permission_profile =
+            PermissionProfile::from_legacy_sandbox_policy(&sandbox_policy, cwd.path());
 
         assert_eq!(
             permission_profile,
@@ -2392,54 +2307,6 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_context_compaction() -> Result<()> {
-        let json = r#"{"type":"context_compaction","encrypted_content":"abc"}"#;
-
-        let item: ResponseItem = serde_json::from_str(json)?;
-
-        assert_eq!(
-            item,
-            ResponseItem::ContextCompaction {
-                encrypted_content: Some("abc".into()),
-            }
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn serializes_context_compaction_trigger_without_payload() -> Result<()> {
-        let item = ResponseItem::ContextCompaction {
-            encrypted_content: None,
-        };
-
-        assert_eq!(
-            serde_json::to_value(item)?,
-            serde_json::json!({
-                "type": "context_compaction",
-            })
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn deserializes_legacy_ghost_snapshot_as_other() -> Result<()> {
-        let json = r#"{
-            "type":"ghost_snapshot",
-            "ghost_commit":{
-                "id":"ghost-1",
-                "parent":null,
-                "preexisting_untracked_files":[],
-                "preexisting_untracked_dirs":[]
-            }
-        }"#;
-
-        let item: ResponseItem = serde_json::from_str(json)?;
-
-        assert_eq!(item, ResponseItem::Other);
-        Ok(())
-    }
-
-    #[test]
     fn roundtrips_web_search_call_actions() -> Result<()> {
         let cases = vec![
             (
@@ -2525,6 +2392,30 @@ mod tests {
             assert_eq!(serialized, expected_serialized);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_shell_tool_call_params() -> Result<()> {
+        let json = r#"{
+            "command": ["ls", "-l"],
+            "workdir": "/tmp",
+            "timeout": 1000
+        }"#;
+
+        let params: ShellToolCallParams = serde_json::from_str(json)?;
+        assert_eq!(
+            ShellToolCallParams {
+                command: vec!["ls".to_string(), "-l".to_string()],
+                workdir: Some("/tmp".to_string()),
+                timeout_ms: Some(1000),
+                sandbox_permissions: None,
+                prefix_rule: None,
+                additional_permissions: None,
+                justification: None,
+            },
+            params
+        );
         Ok(())
     }
 

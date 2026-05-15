@@ -5,26 +5,6 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
-    "ActivePermissionProfile": {
-      "properties": {
-        "extends": {
-          "default": null,
-          "description": "Parent profile identifier once permissions profiles support inheritance. This is currently always `null`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "id": {
-          "description": "Identifier from `default_permissions` or the implicit built-in default, such as `:workspace` or a user-defined `[permissions.<id>]` profile.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "id"
-      ],
-      "type": "object"
-    },
     "AgentPath": {
       "type": "string"
     },
@@ -593,6 +573,21 @@
           "properties": {
             "kind": {
               "enum": [
+                "current_working_directory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "CurrentWorkingDirectoryFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
                 "project_roots"
               ],
               "type": "string"
@@ -1033,6 +1028,53 @@
       ],
       "type": "object"
     },
+    "ReadOnlyAccess": {
+      "oneOf": [
+        {
+          "properties": {
+            "includePlatformDefaults": {
+              "default": true,
+              "type": "boolean"
+            },
+            "readableRoots": {
+              "default": [],
+              "items": {
+                "$ref": "#/definitions/AbsolutePathBuf"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "restricted"
+              ],
+              "title": "RestrictedReadOnlyAccessType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "RestrictedReadOnlyAccess",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "fullAccess"
+              ],
+              "title": "FullAccessReadOnlyAccessType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "FullAccessReadOnlyAccess",
+          "type": "object"
+        }
+      ]
+    },
     "ReasoningEffort": {
       "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
       "enum": [
@@ -1065,6 +1107,16 @@
         },
         {
           "properties": {
+            "access": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReadOnlyAccess"
+                }
+              ],
+              "default": {
+                "type": "fullAccess"
+              }
+            },
             "networkAccess": {
               "default": false,
               "type": "boolean"
@@ -1121,6 +1173,16 @@
               "default": false,
               "type": "boolean"
             },
+            "readOnlyAccess": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReadOnlyAccess"
+                }
+              ],
+              "default": {
+                "type": "fullAccess"
+              }
+            },
             "type": {
               "enum": [
                 "workspaceWrite"
@@ -1143,6 +1205,13 @@
           "type": "object"
         }
       ]
+    },
+    "ServiceTier": {
+      "enum": [
+        "fast",
+        "flex"
+      ],
+      "type": "string"
     },
     "SessionSource": {
       "oneOf": [
@@ -1363,10 +1432,6 @@
           "description": "Usually the first user message in the thread, if available.",
           "type": "string"
         },
-        "sessionId": {
-          "description": "Session id shared by threads that belong to the same session tree.",
-          "type": "string"
-        },
         "source": {
           "allOf": [
             {
@@ -1382,17 +1447,6 @@
             }
           ],
           "description": "Current runtime status for the thread."
-        },
-        "threadSource": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ThreadSource"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional analytics source classification for this thread."
         },
         "turns": {
           "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
@@ -1415,7 +1469,6 @@
         "id",
         "modelProvider",
         "preview",
-        "sessionId",
         "source",
         "status",
         "turns",
@@ -2093,14 +2146,6 @@
         }
       ]
     },
-    "ThreadSource": {
-      "enum": [
-        "user",
-        "subagent",
-        "memory_consolidation"
-      ],
-      "type": "string"
-    },
     "ThreadStatus": {
       "oneOf": [
         {
@@ -2209,20 +2254,11 @@
           "type": "string"
         },
         "items": {
-          "description": "Thread items currently included in this turn payload.",
+          "description": "Only populated on a `thread/resume` or `thread/fork` response. For all other responses and notifications returning a Turn, the items field will be an empty list.",
           "items": {
             "$ref": "#/definitions/ThreadItem"
           },
           "type": "array"
-        },
-        "itemsView": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/TurnItemsView"
-            }
-          ],
-          "default": "full",
-          "description": "Describes how much of `items` has been loaded for this turn."
         },
         "startedAt": {
           "description": "Unix timestamp (in seconds) when the turn started.",
@@ -2270,31 +2306,6 @@
         "message"
       ],
       "type": "object"
-    },
-    "TurnItemsView": {
-      "oneOf": [
-        {
-          "description": "`items` was not loaded for this turn. The field is intentionally empty.",
-          "enum": [
-            "notLoaded"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "`items` contains only a display summary for this turn.",
-          "enum": [
-            "summary"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "`items` contains every ThreadItem available from persisted app-server history for this turn.",
-          "enum": [
-            "full"
-          ],
-          "type": "string"
-        }
-      ]
     },
     "TurnStatus": {
       "enum": [
@@ -2556,6 +2567,18 @@
     "modelProvider": {
       "type": "string"
     },
+    "permissionProfile": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PermissionProfile"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Canonical active permissions view for this thread."
+    },
     "reasoningEffort": {
       "anyOf": [
         {
@@ -2572,12 +2595,16 @@
           "$ref": "#/definitions/SandboxPolicy"
         }
       ],
-      "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `permissionProfile` when they need exact runtime permissions."
+      "description": "Legacy sandbox policy retained for compatibility. New clients should use `permissionProfile` when present as the canonical active permissions view."
     },
     "serviceTier": {
-      "type": [
-        "string",
-        "null"
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ServiceTier"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "thread": {
