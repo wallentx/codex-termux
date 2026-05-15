@@ -114,15 +114,6 @@ impl AsRef<str> for McpServerEnvVar {
     }
 }
 
-/// OAuth client settings used when Codex launches an MCP OAuth flow.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct McpServerOAuthConfig {
-    /// Explicit OAuth client identifier to present during authorization and token exchange.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
-}
-
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
     #[serde(flatten)]
@@ -176,10 +167,6 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
-    /// Optional OAuth client settings for MCP login.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth: Option<McpServerOAuthConfig>,
-
     /// Optional OAuth resource parameter to include during MCP login (RFC 8707).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_resource: Option<String>,
@@ -187,14 +174,6 @@ pub struct McpServerConfig {
     /// Per-tool approval settings keyed by tool name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, McpServerToolConfig>,
-}
-
-impl McpServerConfig {
-    pub fn oauth_client_id(&self) -> Option<&str> {
-        self.oauth
-            .as_ref()
-            .and_then(|oauth| oauth.client_id.as_deref())
-    }
 }
 
 /// Raw MCP config shape used for deserialization and supported-field JSON
@@ -254,8 +233,6 @@ pub struct RawMcpServerConfig {
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
     #[serde(default)]
-    pub oauth: Option<McpServerOAuthConfig>,
-    #[serde(default)]
     pub oauth_resource: Option<String>,
     /// Legacy display-name field accepted for backward compatibility.
     #[serde(default, rename = "name")]
@@ -290,7 +267,6 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             enabled_tools,
             disabled_tools,
             scopes,
-            oauth,
             oauth_resource,
             _name: _,
             tools,
@@ -321,7 +297,6 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             throw_if_set("stdio", "bearer_token", bearer_token.as_ref())?;
             throw_if_set("stdio", "http_headers", http_headers.as_ref())?;
             throw_if_set("stdio", "env_http_headers", env_http_headers.as_ref())?;
-            throw_if_set("stdio", "oauth", oauth.as_ref())?;
             throw_if_set("stdio", "oauth_resource", oauth_resource.as_ref())?;
             let env_vars = env_vars.unwrap_or_default();
             for env_var in &env_vars {
@@ -363,7 +338,6 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             enabled_tools,
             disabled_tools,
             scopes,
-            oauth,
             oauth_resource,
             tools: tools.unwrap_or_default(),
         })

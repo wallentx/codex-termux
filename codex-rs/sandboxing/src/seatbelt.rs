@@ -4,14 +4,13 @@ use codex_network_proxy::has_proxy_url_env_vars;
 use codex_network_proxy::proxy_url_env_value;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_protocol::permissions::PROTECTED_METADATA_PATH_NAMES;
 use codex_protocol::protocol::SandboxPolicy;
-use codex_protocol::protocol::WritableRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::ffi::CStr;
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::warn;
@@ -329,7 +328,6 @@ fn root_absolute_path() -> AbsolutePathBuf {
 struct SeatbeltAccessRoot {
     root: AbsolutePathBuf,
     excluded_subpaths: Vec<AbsolutePathBuf>,
-    protected_metadata_names: Vec<String>,
 }
 
 fn build_seatbelt_access_policy(
@@ -344,11 +342,9 @@ fn build_seatbelt_access_policy(
         let root =
             normalize_path_for_sandbox(access_root.root.as_path()).unwrap_or(access_root.root);
         let root_param = format!("{param_prefix}_{index}");
-        params.push((root_param.clone(), root.clone().into_path_buf()));
+        params.push((root_param.clone(), root.into_path_buf()));
 
-        if access_root.excluded_subpaths.is_empty()
-            && access_root.protected_metadata_names.is_empty()
-        {
+        if access_root.excluded_subpaths.is_empty() {
             policy_components.push(format!("(subpath (param \"{root_param}\"))"));
             continue;
         }
@@ -371,11 +367,6 @@ fn build_seatbelt_access_policy(
                 "(require-not (subpath (param \"{excluded_param}\")))"
             ));
         }
-        for metadata_name in access_root.protected_metadata_names {
-            let regex =
-                seatbelt_protected_metadata_name_regex(&root, &metadata_name).replace('"', "\\\"");
-            require_parts.push(format!(r#"(require-not (regex #"{regex}"))"#));
-        }
         policy_components.push(format!("(require-all {} )", require_parts.join(" ")));
     }
 
@@ -387,38 +378,6 @@ fn build_seatbelt_access_policy(
             params,
         )
     }
-}
-
-fn seatbelt_protected_metadata_name_regex(root: &AbsolutePathBuf, name: &str) -> String {
-    let mut root = root.to_string_lossy().to_string();
-    while root.len() > 1 && root.ends_with('/') {
-        root.pop();
-    }
-    let root = regex_lite::escape(&root);
-    let name = regex_lite::escape(name);
-    if root == "/" {
-        format!(r#"^/{name}(/.*)?$"#)
-    } else {
-        format!(r#"^{root}/{name}(/.*)?$"#)
-    }
-}
-
-fn protected_metadata_names_for_writable_root(
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    writable_root: &WritableRoot,
-    cwd: &Path,
-) -> Vec<String> {
-    let mut names = writable_root.protected_metadata_names.clone();
-    for name in PROTECTED_METADATA_PATH_NAMES {
-        if names.iter().any(|existing| existing == name) {
-            continue;
-        }
-        let path = writable_root.root.join(*name);
-        if !file_system_sandbox_policy.can_write_path_with_cwd(path.as_path(), cwd) {
-            names.push((*name).to_string());
-        }
-    }
-    names
 }
 
 fn build_seatbelt_unreadable_glob_policy(
@@ -573,10 +532,8 @@ fn create_seatbelt_command_args_for_legacy_policy(
     enforce_managed_network: bool,
     network: Option<&NetworkProxy>,
 ) -> Vec<String> {
-    let file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
-        sandbox_policy,
-        sandbox_policy_cwd,
-    );
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, sandbox_policy_cwd);
     create_seatbelt_command_args(CreateSeatbeltCommandArgsParams {
         command,
         file_system_sandbox_policy: &file_system_sandbox_policy,
@@ -627,7 +584,6 @@ pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -
                     vec![SeatbeltAccessRoot {
                         root: root_absolute_path(),
                         excluded_subpaths: unreadable_roots.clone(),
-                        protected_metadata_names: Vec::new(),
                     }],
                 )
             }
@@ -639,11 +595,6 @@ pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -
                     .get_writable_roots_with_cwd(sandbox_policy_cwd)
                     .into_iter()
                     .map(|root| SeatbeltAccessRoot {
-                        protected_metadata_names: protected_metadata_names_for_writable_root(
-                            file_system_sandbox_policy,
-                            &root,
-                            sandbox_policy_cwd,
-                        ),
                         root: root.root,
                         excluded_subpaths: root.read_only_subpaths,
                     })
@@ -665,7 +616,6 @@ pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -
                     vec![SeatbeltAccessRoot {
                         root: root_absolute_path(),
                         excluded_subpaths: unreadable_roots,
-                        protected_metadata_names: Vec::new(),
                     }],
                 );
                 (
@@ -686,7 +636,6 @@ pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -
                             .filter(|path| path.as_path().starts_with(root.as_path()))
                             .cloned()
                             .collect(),
-                        protected_metadata_names: Vec::new(),
                         root,
                     })
                     .collect(),
@@ -724,6 +673,7 @@ pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -
     let dir_params = [
         file_read_dir_params,
         file_write_dir_params,
+        macos_dir_params(),
         unix_socket_dir_params(&proxy),
     ]
     .concat();
@@ -738,6 +688,32 @@ pub fn create_seatbelt_command_args(args: CreateSeatbeltCommandArgsParams<'_>) -
     seatbelt_args.push("--".to_string());
     seatbelt_args.extend(command);
     seatbelt_args
+}
+
+/// Wraps libc::confstr to return a String.
+fn confstr(name: libc::c_int) -> Option<String> {
+    let mut buf = vec![0_i8; (libc::PATH_MAX as usize) + 1];
+    let len = unsafe { libc::confstr(name, buf.as_mut_ptr(), buf.len()) };
+    if len == 0 {
+        return None;
+    }
+    // confstr guarantees NUL-termination when len > 0.
+    let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
+    cstr.to_str().ok().map(ToString::to_string)
+}
+
+/// Wraps confstr to return a canonicalized PathBuf.
+fn confstr_path(name: libc::c_int) -> Option<PathBuf> {
+    let s = confstr(name)?;
+    let path = PathBuf::from(s);
+    path.canonicalize().ok().or(Some(path))
+}
+
+fn macos_dir_params() -> Vec<(String, PathBuf)> {
+    if let Some(p) = confstr_path(libc::_CS_DARWIN_USER_CACHE_DIR) {
+        return vec![("DARWIN_USER_CACHE_DIR".to_string(), p)];
+    }
+    vec![]
 }
 
 #[cfg(test)]

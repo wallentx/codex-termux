@@ -1,5 +1,5 @@
 ---
-source: tui/src/chatwidget/tests/popups_and_settings.rs
+source: tui/src/chatwidget/tests.rs
 expression: popup
 ---
   Enable subagents?

@@ -1,6 +1,5 @@
 use crate::history_cell::PlainHistoryCell;
 use crate::legacy_core::config::Config;
-use crate::session_state::SessionNetworkProxyRuntime;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerStack;
@@ -13,6 +12,7 @@ use codex_config::RequirementSource;
 use codex_config::ResidencyRequirement;
 use codex_config::SandboxModeRequirement;
 use codex_config::WebSearchModeRequirement;
+use codex_protocol::protocol::SessionNetworkProxyRuntime;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use toml::Value as TomlValue;
@@ -126,7 +126,7 @@ fn render_debug_config_lines(stack: &ConfigLayerStack) -> Vec<Line<'static>> {
         requirement_lines.push(requirement_line(
             "allowed_sandbox_modes",
             value,
-            requirements.permission_profile.source.as_ref(),
+            requirements.sandbox_policy.source.as_ref(),
         ));
     }
 
@@ -142,17 +142,6 @@ fn render_debug_config_lines(stack: &ConfigLayerStack) -> Vec<Line<'static>> {
             "allowed_web_search_modes",
             value,
             requirements.web_search_mode.source.as_ref(),
-        ));
-    }
-
-    if let Some(allow_managed_hooks_only) = requirements_toml.allow_managed_hooks_only {
-        requirement_lines.push(requirement_line(
-            "allow_managed_hooks_only",
-            allow_managed_hooks_only.to_string(),
-            requirements
-                .allow_managed_hooks_only
-                .as_ref()
-                .map(|sourced| &sourced.source),
         ));
     }
 
@@ -385,7 +374,7 @@ fn format_config_layer_source(source: &ConfigLayerSource) -> String {
         ConfigLayerSource::System { file } => {
             format!("system ({})", file.as_path().display())
         }
-        ConfigLayerSource::User { file, .. } => {
+        ConfigLayerSource::User { file } => {
             format!("user ({})", file.as_path().display())
         }
         ConfigLayerSource::Project { dot_codex_folder } => {
@@ -516,7 +505,6 @@ mod tests {
     use super::render_debug_config_lines;
     use super::session_all_proxy_url;
     use crate::legacy_core::config::Constrained;
-    use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::ConfigLayerSource;
     use codex_config::ConfigLayerEntry;
     use codex_config::ConfigLayerStack;
@@ -543,7 +531,8 @@ mod tests {
     use codex_config::WebSearchModeRequirement;
     use codex_protocol::config_types::ApprovalsReviewer;
     use codex_protocol::config_types::WebSearchMode;
-    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::SandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use ratatui::text::Line;
     use std::collections::BTreeMap;
@@ -626,15 +615,15 @@ mod tests {
 
         let requirements = ConfigRequirements {
             approval_policy: ConstrainedWithSource::new(
-                Constrained::allow_any(AskForApproval::OnRequest.to_core()),
+                Constrained::allow_any(AskForApproval::OnRequest),
                 Some(RequirementSource::CloudRequirements),
             ),
             approvals_reviewer: ConstrainedWithSource::new(
                 Constrained::allow_any(ApprovalsReviewer::AutoReview),
                 Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
             ),
-            permission_profile: ConstrainedWithSource::new(
-                Constrained::allow_any(PermissionProfile::read_only()),
+            sandbox_policy: ConstrainedWithSource::new(
+                Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
                 Some(RequirementSource::SystemRequirementsToml {
                     file: requirements_file.clone(),
                 }),
@@ -658,10 +647,6 @@ mod tests {
                 Constrained::allow_any(WebSearchMode::Cached),
                 Some(RequirementSource::CloudRequirements),
             ),
-            allow_managed_hooks_only: Some(Sourced::new(
-                /*value*/ true,
-                RequirementSource::CloudRequirements,
-            )),
             feature_requirements: Some(Sourced::new(
                 FeatureRequirementsToml {
                     entries: BTreeMap::from([("guardian_approval".to_string(), true)]),
@@ -694,12 +679,11 @@ mod tests {
         };
 
         let requirements_toml = ConfigRequirementsToml {
-            allowed_approval_policies: Some(vec![AskForApproval::OnRequest.to_core()]),
+            allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
             allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
             allowed_sandbox_modes: Some(vec![SandboxModeRequirement::ReadOnly]),
             remote_sandbox_config: None,
             allowed_web_search_modes: Some(vec![WebSearchModeRequirement::Cached]),
-            allow_managed_hooks_only: Some(true),
             guardian_policy_config: Some("Use the managed guardian policy.".to_string()),
             feature_requirements: Some(FeatureRequirementsToml {
                 entries: BTreeMap::from([("guardian_approval".to_string(), true)]),
@@ -713,7 +697,6 @@ mod tests {
                     },
                 },
             )])),
-            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: Some(ResidencyRequirement::Us),
@@ -728,10 +711,7 @@ mod tests {
         };
         let stack = ConfigLayerStack::new(
             vec![ConfigLayerEntry::new(
-                ConfigLayerSource::User {
-                    file: user_file,
-                    profile: None,
-                },
+                ConfigLayerSource::User { file: user_file },
                 empty_toml_table(),
             )],
             requirements,
@@ -760,7 +740,6 @@ mod tests {
                 "allowed_web_search_modes: cached, disabled (source: cloud requirements)"
             )
         );
-        assert!(rendered.contains("allow_managed_hooks_only: true (source: cloud requirements)"));
         assert!(
             rendered.contains("guardian_policy_config: configured (source: cloud requirements)")
         );
@@ -913,12 +892,10 @@ approval_policy = "never"
             allowed_sandbox_modes: None,
             remote_sandbox_config: None,
             allowed_web_search_modes: Some(Vec::new()),
-            allow_managed_hooks_only: None,
             guardian_policy_config: None,
             feature_requirements: None,
             hooks: None,
             mcp_servers: None,
-            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: None,
@@ -951,7 +928,6 @@ approval_policy = "never"
                             matcher: Some("^Bash$".to_string()),
                             hooks: vec![HookHandlerConfig::Command {
                                 command: "python3 /enterprise/hooks/pre.py".to_string(),
-                                command_windows: None,
                                 timeout_sec: Some(10),
                                 r#async: false,
                                 status_message: Some("checking".to_string()),

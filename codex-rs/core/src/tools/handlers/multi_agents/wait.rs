@@ -1,10 +1,6 @@
 use super::*;
 use crate::agent::status::is_final;
-use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
-use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v1;
-use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::error::CodexErr;
-use codex_tools::ToolSpec;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -16,27 +12,17 @@ use tokio::time::Instant;
 
 use tokio::time::timeout_at;
 
-#[derive(Default)]
-pub(crate) struct Handler {
-    options: WaitAgentTimeoutOptions,
-}
+pub(crate) struct Handler;
 
-impl Handler {
-    pub(crate) fn new(options: WaitAgentTimeoutOptions) -> Self {
-        Self { options }
-    }
-}
-
-#[async_trait::async_trait]
-impl ToolExecutor<ToolInvocation> for Handler {
+impl ToolHandler for Handler {
     type Output = WaitAgentResult;
 
-    fn tool_name(&self) -> ToolName {
-        ToolName::plain("wait_agent")
+    fn kind(&self) -> ToolKind {
+        ToolKind::Function
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(create_wait_agent_tool_v1(self.options))
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Function { .. })
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
@@ -87,7 +73,6 @@ impl ToolExecutor<ToolInvocation> for Handler {
             .send_event(
                 &turn,
                 CollabWaitingBeginEvent {
-                    started_at_ms: now_unix_timestamp_ms(),
                     sender_thread_id: session.conversation_id,
                     receiver_thread_ids: receiver_thread_ids.clone(),
                     receiver_agents: receiver_agents.clone(),
@@ -120,7 +105,6 @@ impl ToolExecutor<ToolInvocation> for Handler {
                             CollabWaitingEndEvent {
                                 sender_thread_id: session.conversation_id,
                                 call_id: call_id.clone(),
-                                completed_at_ms: now_unix_timestamp_ms(),
                                 agent_statuses: build_wait_agent_statuses(
                                     &statuses,
                                     &receiver_agents,
@@ -189,7 +173,6 @@ impl ToolExecutor<ToolInvocation> for Handler {
                 CollabWaitingEndEvent {
                     sender_thread_id: session.conversation_id,
                     call_id,
-                    completed_at_ms: now_unix_timestamp_ms(),
                     agent_statuses,
                     statuses: statuses_by_id,
                 }
@@ -198,12 +181,6 @@ impl ToolExecutor<ToolInvocation> for Handler {
             .await;
 
         Ok(result)
-    }
-}
-
-impl ToolHandler for Handler {
-    fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Function { .. })
     }
 }
 

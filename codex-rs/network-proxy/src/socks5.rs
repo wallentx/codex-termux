@@ -1,5 +1,4 @@
 use crate::config::NetworkMode;
-use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::network_policy::BlockDecisionAuditEventArgs;
 use crate::network_policy::NetworkDecision;
 use crate::network_policy::NetworkDecisionSource;
@@ -35,12 +34,12 @@ use rama_socks5::server::udp::RelayRequest;
 use rama_socks5::server::udp::RelayResponse;
 use rama_tcp::TcpStream;
 use rama_tcp::client::Request as TcpRequest;
+use rama_tcp::client::service::TcpConnector;
 use rama_tcp::server::TcpListener;
 use std::io;
 use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -95,7 +94,7 @@ async fn run_socks5_with_listener(
         }
     }
 
-    let tcp_connector = TargetCheckedTcpConnector::new(state.clone());
+    let tcp_connector = TcpConnector::default();
     let policy_tcp_connector = service_fn({
         let policy_decider = policy_decider.clone();
         move |req: TcpRequest| {
@@ -132,7 +131,7 @@ async fn run_socks5_with_listener(
 
 async fn handle_socks5_tcp(
     req: TcpRequest,
-    tcp_connector: TargetCheckedTcpConnector,
+    tcp_connector: TcpConnector,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
 ) -> Result<EstablishedClientConnection<TcpStream, TcpRequest>, BoxError> {
     let app_state = req
@@ -291,20 +290,7 @@ async fn handle_socks5_tcp(
         }
     }
 
-    info!("SOCKS upstream dial started (host={host}, port={port})");
-    let connect_started_at = Instant::now();
-    let result = tcp_connector.serve(req).await;
-    match &result {
-        Ok(_) => info!(
-            "SOCKS upstream dial established (host={host}, port={port}, elapsed_ms={})",
-            connect_started_at.elapsed().as_millis()
-        ),
-        Err(_) => warn!(
-            "SOCKS upstream dial failed (host={host}, port={port}, elapsed_ms={})",
-            connect_started_at.elapsed().as_millis()
-        ),
-    }
-    result
+    tcp_connector.serve(req).await
 }
 
 async fn inspect_socks5_udp(
@@ -562,7 +548,7 @@ mod tests {
         let (result, events) = capture_events(|| async {
             handle_socks5_tcp(
                 request,
-                TargetCheckedTcpConnector::new(state.clone()),
+                TcpConnector::default(),
                 /*policy_decider*/ None,
             )
             .await
