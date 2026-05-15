@@ -4,15 +4,12 @@ use anyhow::bail;
 use clap::Parser;
 use codex_core::config::Config;
 use codex_core::config::find_codex_home;
-use codex_core_plugins::PluginMarketplaceUpgradeOutcome;
-use codex_core_plugins::PluginsManager;
-use codex_core_plugins::installed_marketplaces::marketplace_install_root;
-use codex_core_plugins::installed_marketplaces::resolve_configured_marketplace_root;
+use codex_core::plugins::PluginMarketplaceUpgradeOutcome;
+use codex_core::plugins::PluginsManager;
 use codex_core_plugins::marketplace_add::MarketplaceAddRequest;
 use codex_core_plugins::marketplace_add::add_marketplace;
 use codex_core_plugins::marketplace_remove::MarketplaceRemoveRequest;
 use codex_core_plugins::marketplace_remove::remove_marketplace;
-use codex_plugin::validate_plugin_segment;
 use codex_utils_cli::CliConfigOverrides;
 
 #[derive(Debug, Parser)]
@@ -27,36 +24,21 @@ pub struct MarketplaceCli {
 
 #[derive(Debug, clap::Subcommand)]
 enum MarketplaceSubcommand {
-    /// Add a local or Git marketplace to the configured marketplace sources.
     Add(AddMarketplaceArgs),
-
-    /// List configured marketplace names and their local snapshot roots.
-    List,
-
-    /// Refresh configured Git marketplace snapshots.
-    ///
-    /// Omit MARKETPLACE_NAME to upgrade all configured Git marketplaces.
     Upgrade(UpgradeMarketplaceArgs),
-
-    /// Remove a configured marketplace source by name.
     Remove(RemoveMarketplaceArgs),
 }
 
 #[derive(Debug, Parser)]
-#[command(
-    bin_name = "codex plugin marketplace add",
-    after_help = "Examples:\n  codex plugin marketplace add ./path/to/marketplace\n  codex plugin marketplace add owner/repo --ref main\n  codex plugin marketplace add https://github.com/owner/repo --sparse plugins/foo"
-)]
+#[command(bin_name = "codex plugin marketplace add")]
 struct AddMarketplaceArgs {
-    /// Marketplace source: a local path, owner/repo[@ref], HTTPS Git URL, or SSH Git URL.
-    #[arg(value_name = "SOURCE")]
+    /// Marketplace source. Supports owner/repo[@ref], HTTP(S) Git URLs, SSH URLs,
+    /// or local marketplace root directories.
     source: String,
 
-    /// Git ref to fetch for Git marketplace sources.
     #[arg(long = "ref", value_name = "REF")]
     ref_name: Option<String>,
 
-    /// Sparse checkout path for Git marketplace sources. Can be repeated.
     #[arg(
         long = "sparse",
         value_name = "PATH",
@@ -66,24 +48,15 @@ struct AddMarketplaceArgs {
 }
 
 #[derive(Debug, Parser)]
-#[command(
-    bin_name = "codex plugin marketplace upgrade",
-    after_help = "Examples:\n  codex plugin marketplace upgrade\n  codex plugin marketplace upgrade debug"
-)]
+#[command(bin_name = "codex plugin marketplace upgrade")]
 struct UpgradeMarketplaceArgs {
-    /// Optional configured marketplace name to upgrade. Omit to upgrade all Git marketplaces.
-    #[arg(value_name = "MARKETPLACE_NAME")]
     marketplace_name: Option<String>,
 }
 
 #[derive(Debug, Parser)]
-#[command(
-    bin_name = "codex plugin marketplace remove",
-    after_help = "Example:\n  codex plugin marketplace remove debug"
-)]
+#[command(bin_name = "codex plugin marketplace remove")]
 struct RemoveMarketplaceArgs {
     /// Configured marketplace name to remove.
-    #[arg(value_name = "MARKETPLACE_NAME")]
     marketplace_name: String,
 }
 
@@ -100,7 +73,6 @@ impl MarketplaceCli {
 
         match subcommand {
             MarketplaceSubcommand::Add(args) => run_add(args).await?,
-            MarketplaceSubcommand::List => run_list(overrides).await?,
             MarketplaceSubcommand::Upgrade(args) => run_upgrade(overrides, args).await?,
             MarketplaceSubcommand::Remove(args) => run_remove(args).await?,
         }
@@ -146,48 +118,6 @@ async fn run_add(args: AddMarketplaceArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_list(overrides: Vec<(String, toml::Value)>) -> Result<()> {
-    let config = Config::load_with_cli_overrides(overrides)
-        .await
-        .context("failed to load configuration")?;
-    let configured_marketplaces = config
-        .config_layer_stack
-        .get_active_user_layer()
-        .and_then(|layer| layer.config.get("marketplaces"))
-        .and_then(toml::Value::as_table);
-    let Some(configured_marketplaces) = configured_marketplaces else {
-        println!("No configured plugin marketplaces.");
-        return Ok(());
-    };
-
-    if configured_marketplaces.is_empty() {
-        println!("No configured plugin marketplaces.");
-        return Ok(());
-    }
-
-    let default_install_root = marketplace_install_root(config.codex_home.as_path());
-    for (marketplace_name, marketplace) in configured_marketplaces {
-        if !marketplace.is_table() {
-            eprintln!("Ignoring invalid marketplace `{marketplace_name}`: expected table.");
-            continue;
-        }
-        if let Err(err) = validate_plugin_segment(marketplace_name, "marketplace name") {
-            eprintln!("Ignoring invalid marketplace `{marketplace_name}`: {err}.");
-            continue;
-        }
-        let root = resolve_configured_marketplace_root(
-            marketplace_name,
-            marketplace,
-            default_install_root.as_path(),
-        )
-        .map(|root| root.display().to_string())
-        .unwrap_or_else(|| "<invalid source>".to_string());
-        println!("{marketplace_name}\t{root}");
-    }
-
-    Ok(())
-}
-
 async fn run_upgrade(
     overrides: Vec<(String, toml::Value)>,
     args: UpgradeMarketplaceArgs,
@@ -198,9 +128,8 @@ async fn run_upgrade(
         .context("failed to load configuration")?;
     let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
     let manager = PluginsManager::new(codex_home.to_path_buf());
-    let plugins_input = config.plugins_config_input();
     let outcome = manager
-        .upgrade_configured_marketplaces_for_config(&plugins_input, marketplace_name.as_deref())
+        .upgrade_configured_marketplaces_for_config(&config, marketplace_name.as_deref())
         .map_err(anyhow::Error::msg)?;
     print_upgrade_outcome(&outcome, marketplace_name.as_deref())
 }
