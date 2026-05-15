@@ -46,9 +46,6 @@ pub struct InitializeCapabilities {
     /// Opt into receiving experimental API methods and fields.
     #[serde(default)]
     pub experimental_api: bool,
-    /// Opt into `attestation/generate` requests for upstream `x-oai-attestation`.
-    #[serde(default)]
-    pub request_attestation: bool,
     /// Exact notification method names that should be suppressed for this
     /// connection (for example `thread/started`).
     #[ts(optional = nullable)]
@@ -228,6 +225,7 @@ pub struct Profile {
 #[serde(rename_all = "camelCase")]
 pub struct Tools {
     pub web_search: Option<bool>,
+    pub view_image: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Serialize, JsonSchema, TS)]
