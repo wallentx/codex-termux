@@ -64,10 +64,7 @@ pub enum Multiplexer {
         version: Option<String>,
     },
     /// zellij terminal multiplexer.
-    Zellij {
-        /// Zellij version string when ZELLIJ_VERSION is available.
-        version: Option<String>,
-    },
+    Zellij {},
 }
 
 /// tmux client terminal identification captured via `tmux display-message`.
@@ -210,7 +207,7 @@ impl TerminalInfo {
 
     /// Returns whether the active terminal multiplexer is Zellij.
     pub fn is_zellij(&self) -> bool {
-        matches!(self.multiplexer, Some(Multiplexer::Zellij { .. }))
+        matches!(self.multiplexer, Some(Multiplexer::Zellij {}))
     }
 }
 
@@ -240,11 +237,6 @@ trait Environment {
 
     /// Returns tmux client details when available.
     fn tmux_client_info(&self) -> TmuxClientInfo;
-
-    /// Returns Zellij version details when available.
-    fn zellij_version(&self) -> Option<String> {
-        self.var_non_empty("ZELLIJ_VERSION")
-    }
 }
 
 /// Reads environment variables from the running process.
@@ -264,11 +256,6 @@ impl Environment for ProcessEnvironment {
 
     fn tmux_client_info(&self) -> TmuxClientInfo {
         tmux_client_info()
-    }
-
-    fn zellij_version(&self) -> Option<String> {
-        self.var_non_empty("ZELLIJ_VERSION")
-            .or_else(zellij_version_from_command)
     }
 }
 
@@ -398,9 +385,7 @@ fn detect_multiplexer(env: &dyn Environment) -> Option<Multiplexer> {
         || env.has_non_empty("ZELLIJ_SESSION_NAME")
         || env.has_non_empty("ZELLIJ_VERSION")
     {
-        return Some(Multiplexer::Zellij {
-            version: env.zellij_version(),
-        });
+        return Some(Multiplexer::Zellij {});
     }
 
     None
@@ -469,32 +454,6 @@ fn tmux_display_message(format: &str) -> Option<String> {
 
     let value = String::from_utf8(output.stdout).ok()?;
     none_if_whitespace(value.trim().to_string())
-}
-
-fn zellij_version_from_command() -> Option<String> {
-    // Best-effort fallback: missing or broken zellij binaries should not affect
-    // terminal detection.
-    let output = std::process::Command::new("zellij")
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_zellij_version(stdout.trim())
-}
-
-fn parse_zellij_version(value: &str) -> Option<String> {
-    let value = none_if_whitespace(value.to_string())?;
-    let mut parts = value.split_whitespace();
-    match (parts.next(), parts.next()) {
-        (Some(command), Some(version)) if command.eq_ignore_ascii_case("zellij") => {
-            Some(version.to_string())
-        }
-        _ => Some(value),
-    }
 }
 
 /// Sanitizes a terminal token for use in User-Agent headers.

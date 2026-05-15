@@ -23,17 +23,6 @@ async fn process_compacted_history_with_test_session(
     (refreshed, initial_context)
 }
 
-fn user_message(text: &str) -> ResponseItem {
-    ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: text.to_string(),
-        }],
-        phase: None,
-    }
-}
-
 #[test]
 fn content_items_to_text_joins_non_empty_segments() {
     let items = vec![
@@ -74,6 +63,7 @@ fn collect_user_messages_extracts_user_text_only() {
             content: vec![ContentItem::OutputText {
                 text: "ignored".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -82,6 +72,7 @@ fn collect_user_messages_extracts_user_text_only() {
             content: vec![ContentItem::InputText {
                 text: "first".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Other,
@@ -106,6 +97,7 @@ do things
 </INSTRUCTIONS>"#
                     .to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -114,6 +106,7 @@ do things
             content: vec![ContentItem::InputText {
                 text: "<ENVIRONMENT_CONTEXT>cwd=/tmp</ENVIRONMENT_CONTEXT>".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -122,28 +115,9 @@ do things
             content: vec![ContentItem::InputText {
                 text: "real user message".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
-    ];
-
-    let collected = collect_user_messages(&items);
-
-    assert_eq!(vec!["real user message".to_string()], collected);
-}
-
-#[test]
-fn collect_user_messages_filters_legacy_warnings() {
-    let items = vec![
-        user_message(
-            "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
-        ),
-        user_message(
-            "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
-        ),
-        user_message(
-            "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety",
-        ),
-        user_message("real user message"),
     ];
 
     let collected = collect_user_messages(&items);
@@ -239,6 +213,7 @@ fn should_use_remote_compact_task_for_azure_provider() {
 
     assert!(should_use_remote_compact_task(&provider));
 }
+
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {
     let compacted_history = vec![
@@ -248,6 +223,7 @@ async fn process_compacted_history_replaces_developer_messages() {
             content: vec![ContentItem::InputText {
                 text: "stale permissions".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -256,6 +232,7 @@ async fn process_compacted_history_replaces_developer_messages() {
             content: vec![ContentItem::InputText {
                 text: "summary".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -264,6 +241,7 @@ async fn process_compacted_history_replaces_developer_messages() {
             content: vec![ContentItem::InputText {
                 text: "stale personality".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
     ];
@@ -278,6 +256,7 @@ async fn process_compacted_history_replaces_developer_messages() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
+        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -291,6 +270,7 @@ async fn process_compacted_history_reinjects_full_initial_context() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
+        end_turn: None,
         phase: None,
     }];
     let (refreshed, mut expected) = process_compacted_history_with_test_session(
@@ -304,6 +284,7 @@ async fn process_compacted_history_reinjects_full_initial_context() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
+        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -323,6 +304,7 @@ keep me updated
 </INSTRUCTIONS>"#
                     .to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -335,6 +317,7 @@ keep me updated
 </environment_context>"#
                     .to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -347,6 +330,7 @@ keep me updated
 </turn_aborted>"#
                     .to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -355,6 +339,7 @@ keep me updated
             content: vec![ContentItem::InputText {
                 text: "summary".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -363,6 +348,7 @@ keep me updated
             content: vec![ContentItem::InputText {
                 text: "stale developer instructions".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
     ];
@@ -377,33 +363,9 @@ keep me updated
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
+        end_turn: None,
         phase: None,
     });
-    assert_eq!(refreshed, expected);
-}
-
-#[tokio::test]
-async fn process_compacted_history_drops_legacy_warnings() {
-    let latest_user = user_message("latest user");
-    let compacted_history = vec![
-        user_message(
-            "Warning: The maximum number of unified exec processes you can keep open is 60 and you currently have 61 processes open. Reuse older processes or close them to prevent automatic pruning of old processes",
-        ),
-        user_message(
-            "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
-        ),
-        user_message(
-            "Warning: Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: https://chatgpt.com/cyber or learn more: https://developers.openai.com/codex/concepts/cyber-safety",
-        ),
-        latest_user.clone(),
-    ];
-    let (refreshed, initial_context) = process_compacted_history_with_test_session(
-        compacted_history,
-        /*previous_turn_settings*/ None,
-    )
-    .await;
-    let mut expected = initial_context;
-    expected.push(latest_user);
     assert_eq!(refreshed, expected);
 }
 
@@ -416,6 +378,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: "older user".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -424,6 +387,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -432,6 +396,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: "latest user".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
     ];
@@ -448,6 +413,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: "older user".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -456,6 +422,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             content: vec![ContentItem::InputText {
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
+            end_turn: None,
             phase: None,
         },
     ];
@@ -466,6 +433,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
         content: vec![ContentItem::InputText {
             text: "latest user".to_string(),
         }],
+        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -479,6 +447,7 @@ async fn process_compacted_history_reinjects_model_switch_message() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
+        end_turn: None,
         phase: None,
     }];
     let previous_turn_settings = PreviousTurnSettings {
@@ -508,6 +477,7 @@ async fn process_compacted_history_reinjects_model_switch_message() {
         content: vec![ContentItem::InputText {
             text: "summary".to_string(),
         }],
+        end_turn: None,
         phase: None,
     });
     assert_eq!(refreshed, expected);
@@ -522,6 +492,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "older user".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -530,6 +501,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "latest user".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -538,6 +510,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
+            end_turn: None,
             phase: None,
         },
     ];
@@ -547,6 +520,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
         content: vec![ContentItem::InputText {
             text: "fresh permissions".to_string(),
         }],
+        end_turn: None,
         phase: None,
     }];
 
@@ -559,6 +533,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "older user".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -567,6 +542,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "fresh permissions".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -575,6 +551,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: "latest user".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Message {
@@ -583,6 +560,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             content: vec![ContentItem::InputText {
                 text: format!("{SUMMARY_PREFIX}\nsummary text"),
             }],
+            end_turn: None,
             phase: None,
         },
     ];
@@ -600,6 +578,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
         content: vec![ContentItem::InputText {
             text: "fresh permissions".to_string(),
         }],
+        end_turn: None,
         phase: None,
     }];
 
@@ -612,6 +591,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
             content: vec![ContentItem::InputText {
                 text: "fresh permissions".to_string(),
             }],
+            end_turn: None,
             phase: None,
         },
         ResponseItem::Compaction {

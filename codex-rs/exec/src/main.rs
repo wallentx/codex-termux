@@ -32,7 +32,8 @@ fn main() -> anyhow::Result<()> {
         let mut inner = top_cli.inner;
         inner
             .config_overrides
-            .prepend_root_overrides(top_cli.config_overrides);
+            .raw_overrides
+            .splice(0..0, top_cli.config_overrides.raw_overrides);
 
         run_main(inner, arg0_paths).await?;
         Ok(())

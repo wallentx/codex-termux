@@ -23,8 +23,12 @@ async fn exec_approval_emits_proposed_command_and_decision_history() {
         proposed_network_policy_amendments: None,
         additional_permissions: None,
         available_decisions: None,
+        parsed_cmd: vec![],
     };
-    handle_exec_approval_request(&mut chat, "sub-short", ev);
+    chat.handle_codex_event(Event {
+        id: "sub-short".into(),
+        msg: EventMsg::ExecApprovalRequest(ev),
+    });
 
     let proposed_cells = drain_insert_history(&mut rx);
     assert!(
@@ -55,7 +59,6 @@ fn app_server_exec_approval_request_splits_shell_wrapped_command() {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             item_id: "item-1".to_string(),
-            started_at_ms: 0,
             approval_id: Some("approval-1".to_string()),
             reason: None,
             network_approval_context: None,
@@ -94,7 +97,6 @@ fn app_server_exec_approval_request_preserves_permissions_context() {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             item_id: "item-1".to_string(),
-            started_at_ms: 0,
             approval_id: Some("approval-1".to_string()),
             reason: None,
             network_approval_context: Some(codex_app_server_protocol::NetworkApprovalContext {
@@ -124,147 +126,22 @@ fn app_server_exec_approval_request_preserves_permissions_context() {
 
     assert_eq!(
         request.network_approval_context,
-        Some(codex_app_server_protocol::NetworkApprovalContext {
+        Some(codex_protocol::protocol::NetworkApprovalContext {
             host: "example.com".to_string(),
-            protocol: codex_app_server_protocol::NetworkApprovalProtocol::Socks5Tcp,
+            protocol: codex_protocol::protocol::NetworkApprovalProtocol::Socks5Tcp,
         })
     );
     assert_eq!(
         request.additional_permissions,
-        Some(AppServerAdditionalPermissionProfile {
-            network: Some(AppServerAdditionalNetworkPermissions {
+        Some(codex_protocol::models::AdditionalPermissionProfile {
+            network: Some(NetworkPermissions {
                 enabled: Some(true),
             }),
-            file_system: Some(AppServerAdditionalFileSystemPermissions {
-                read: Some(vec![read_path]),
-                write: Some(vec![write_path]),
-                glob_scan_max_depth: None,
-                entries: None,
-            }),
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                Some(vec![read_path]),
+                Some(vec![write_path]),
+            )),
         })
-    );
-}
-
-#[tokio::test]
-async fn network_exec_approval_history_describes_session_host_allowance() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let request = exec_approval_request_from_params(
-        AppServerCommandExecutionRequestApprovalParams {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            item_id: "item-1".to_string(),
-            started_at_ms: 0,
-            approval_id: Some("approval-1".to_string()),
-            reason: None,
-            network_approval_context: Some(codex_app_server_protocol::NetworkApprovalContext {
-                host: "example.com".to_string(),
-                protocol: codex_app_server_protocol::NetworkApprovalProtocol::Https,
-            }),
-            command: Some("network-access https://example.com:8443".to_string()),
-            cwd: None,
-            command_actions: None,
-            additional_permissions: None,
-            proposed_execpolicy_amendment: None,
-            proposed_network_policy_amendments: None,
-            available_decisions: Some(vec![
-                codex_app_server_protocol::CommandExecutionApprovalDecision::AcceptForSession,
-                codex_app_server_protocol::CommandExecutionApprovalDecision::Cancel,
-            ]),
-        },
-        &test_path_buf("/tmp").abs(),
-    );
-
-    handle_exec_approval_request(&mut chat, "sub-network", request);
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-
-    let decision = drain_insert_history(&mut rx)
-        .pop()
-        .expect("expected decision cell in history");
-    assert_snapshot!(
-        "network_exec_approval_history_session_host_allowance",
-        lines_to_single_string(&decision)
-    );
-}
-
-#[tokio::test]
-async fn network_exec_approval_history_describes_one_time_host_allowance() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let request = exec_approval_request_from_params(
-        AppServerCommandExecutionRequestApprovalParams {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            item_id: "item-1".to_string(),
-            started_at_ms: 0,
-            approval_id: Some("approval-1".to_string()),
-            reason: None,
-            network_approval_context: Some(codex_app_server_protocol::NetworkApprovalContext {
-                host: "example.com".to_string(),
-                protocol: codex_app_server_protocol::NetworkApprovalProtocol::Http,
-            }),
-            command: None,
-            cwd: None,
-            command_actions: None,
-            additional_permissions: None,
-            proposed_execpolicy_amendment: None,
-            proposed_network_policy_amendments: None,
-            available_decisions: Some(vec![
-                codex_app_server_protocol::CommandExecutionApprovalDecision::Accept,
-                codex_app_server_protocol::CommandExecutionApprovalDecision::Cancel,
-            ]),
-        },
-        &test_path_buf("/tmp").abs(),
-    );
-
-    handle_exec_approval_request(&mut chat, "sub-network", request);
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-
-    let decision = drain_insert_history(&mut rx)
-        .pop()
-        .expect("expected decision cell in history");
-    assert_snapshot!(
-        "network_exec_approval_history_one_time_host_allowance",
-        lines_to_single_string(&decision)
-    );
-}
-
-#[tokio::test]
-async fn network_exec_approval_history_describes_canceled_host_request() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let request = exec_approval_request_from_params(
-        AppServerCommandExecutionRequestApprovalParams {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            item_id: "item-1".to_string(),
-            started_at_ms: 0,
-            approval_id: Some("approval-1".to_string()),
-            reason: None,
-            network_approval_context: Some(codex_app_server_protocol::NetworkApprovalContext {
-                host: "example.com".to_string(),
-                protocol: codex_app_server_protocol::NetworkApprovalProtocol::Socks5Tcp,
-            }),
-            command: Some("network-access socks5-tcp://example.com:1080".to_string()),
-            cwd: None,
-            command_actions: None,
-            additional_permissions: None,
-            proposed_execpolicy_amendment: None,
-            proposed_network_policy_amendments: None,
-            available_decisions: Some(vec![
-                codex_app_server_protocol::CommandExecutionApprovalDecision::Accept,
-                codex_app_server_protocol::CommandExecutionApprovalDecision::Cancel,
-            ]),
-        },
-        &test_path_buf("/tmp").abs(),
-    );
-
-    handle_exec_approval_request(&mut chat, "sub-network", request);
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-
-    let decision = drain_insert_history(&mut rx)
-        .pop()
-        .expect("expected decision cell in history");
-    assert_snapshot!(
-        "network_exec_approval_history_canceled_host_request",
-        lines_to_single_string(&decision)
     );
 }
 
@@ -281,7 +158,6 @@ fn app_server_request_permissions_preserves_file_system_permissions() {
         thread_id: "thread-1".to_string(),
         turn_id: "turn-1".to_string(),
         item_id: "item-1".to_string(),
-        started_at_ms: 0,
         cwd: cwd.clone(),
         reason: Some("Select a workspace root".to_string()),
         permissions: codex_app_server_protocol::RequestPermissionProfile {
@@ -316,10 +192,9 @@ fn app_server_request_permissions_preserves_file_system_permissions() {
 async fn exec_approval_uses_approval_id_when_present() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    handle_exec_approval_request(
-        &mut chat,
-        "sub-short",
-        ExecApprovalRequestEvent {
+    chat.handle_codex_event(Event {
+        id: "sub-short".into(),
+        msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id: "call-parent".into(),
             approval_id: Some("approval-subcommand".into()),
             turn_id: "turn-short".into(),
@@ -333,8 +208,9 @@ async fn exec_approval_uses_approval_id_when_present() {
             proposed_network_policy_amendments: None,
             additional_permissions: None,
             available_decisions: None,
-        },
-    );
+            parsed_cmd: vec![],
+        }),
+    });
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
 
@@ -346,10 +222,7 @@ async fn exec_approval_uses_approval_id_when_present() {
         } = app_ev
         {
             assert_eq!(id, "approval-subcommand");
-            assert_matches!(
-                decision,
-                codex_app_server_protocol::CommandExecutionApprovalDecision::Accept
-            );
+            assert_matches!(decision, codex_protocol::protocol::ReviewDecision::Approved);
             found = true;
             break;
         }
@@ -375,8 +248,12 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
         proposed_network_policy_amendments: None,
         additional_permissions: None,
         available_decisions: None,
+        parsed_cmd: vec![],
     };
-    handle_exec_approval_request(&mut chat, "sub-multi", ev_multi);
+    chat.handle_codex_event(Event {
+        id: "sub-multi".into(),
+        msg: EventMsg::ExecApprovalRequest(ev_multi),
+    });
     let proposed_multi = drain_insert_history(&mut rx);
     assert!(
         proposed_multi.is_empty(),
@@ -424,8 +301,12 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
         proposed_network_policy_amendments: None,
         additional_permissions: None,
         available_decisions: None,
+        parsed_cmd: vec![],
     };
-    handle_exec_approval_request(&mut chat, "sub-long", ev_long);
+    chat.handle_codex_event(Event {
+        id: "sub-long".into(),
+        msg: EventMsg::ExecApprovalRequest(ev_long),
+    });
     let proposed_long = drain_insert_history(&mut rx);
     assert!(
         proposed_long.is_empty(),

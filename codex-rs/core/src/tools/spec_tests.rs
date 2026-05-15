@@ -3,9 +3,7 @@ use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::test_support::construct_model_info_offline;
 use crate::tools::ToolRouter;
-use crate::tools::registry::ToolRegistryBuilder;
 use crate::tools::router::ToolRouterParams;
-use crate::tools::spec_plan::build_tool_registry_builder_from_executors;
 use codex_app_server_protocol::AppInfo;
 use codex_features::Feature;
 use codex_features::Features;
@@ -14,17 +12,19 @@ use codex_models_manager::bundled_models_response;
 use codex_models_manager::model_info::with_config_overrides;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+use codex_tools::AdditionalProperties;
+use codex_tools::ConfiguredToolSpec;
 use codex_tools::DiscoverableTool;
 use codex_tools::JsonSchema;
-use codex_tools::REQUEST_PLUGIN_INSTALL_TOOL_NAME;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ShellCommandBackendConfig;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
+use codex_tools::TOOL_SUGGEST_TOOL_NAME;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::ToolsConfig;
@@ -38,7 +38,6 @@ use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use super::*;
 
@@ -59,15 +58,14 @@ fn mcp_tool(name: &str, description: &str, input_schema: serde_json::Value) -> r
 fn mcp_tool_info(tool: rmcp::model::Tool) -> ToolInfo {
     ToolInfo {
         server_name: "test_server".to_string(),
-        supports_parallel_tool_calls: false,
-        server_origin: None,
         callable_name: tool.name.to_string(),
         callable_namespace: "mcp__test_server__".to_string(),
-        namespace_description: None,
+        server_instructions: None,
         tool,
         connector_id: None,
         connector_name: None,
         plugin_display_names: Vec::new(),
+        connector_description: None,
     }
 }
 
@@ -79,15 +77,14 @@ fn mcp_tool_info_with_display_name(display_name: &str, tool: rmcp::model::Tool) 
 
     ToolInfo {
         server_name: "test_server".to_string(),
-        supports_parallel_tool_calls: false,
-        server_origin: None,
         callable_name,
         callable_namespace,
-        namespace_description: None,
+        server_instructions: None,
         tool,
         connector_id: None,
         connector_name: None,
         plugin_display_names: Vec::new(),
+        connector_description: None,
     }
 }
 
@@ -162,11 +159,11 @@ fn deferred_responses_api_tool_serializes_with_defer_loading() {
 }
 
 // Avoid order-based assertions; compare via set containment instead.
-fn assert_contains_tool_names(tools: &[ToolSpec], expected_subset: &[&str]) {
+fn assert_contains_tool_names(tools: &[ConfiguredToolSpec], expected_subset: &[&str]) {
     use std::collections::HashSet;
     let mut names = HashSet::new();
     let mut duplicates = Vec::new();
-    for name in tools.iter().map(ToolSpec::name) {
+    for name in tools.iter().map(ConfiguredToolSpec::name) {
         if !names.insert(name) {
             duplicates.push(name);
         }
@@ -185,15 +182,15 @@ fn assert_contains_tool_names(tools: &[ToolSpec], expected_subset: &[&str]) {
 
 fn shell_tool_name(config: &ToolsConfig) -> Option<&'static str> {
     match config.shell_type {
-        ConfigShellToolType::Default => Some("shell_command"),
-        ConfigShellToolType::Local => Some("shell_command"),
+        ConfigShellToolType::Default => Some("shell"),
+        ConfigShellToolType::Local => Some("local_shell"),
         ConfigShellToolType::UnifiedExec => None,
         ConfigShellToolType::Disabled => None,
         ConfigShellToolType::ShellCommand => Some("shell_command"),
     }
 }
 
-fn find_tool<'a>(tools: &'a [ToolSpec], expected_name: &str) -> &'a ToolSpec {
+fn find_tool<'a>(tools: &'a [ConfiguredToolSpec], expected_name: &str) -> &'a ConfiguredToolSpec {
     tools
         .iter()
         .find(|tool| tool.name() == expected_name)
@@ -201,12 +198,12 @@ fn find_tool<'a>(tools: &'a [ToolSpec], expected_name: &str) -> &'a ToolSpec {
 }
 
 fn find_namespace_function_tool<'a>(
-    tools: &'a [ToolSpec],
+    tools: &'a [ConfiguredToolSpec],
     expected_namespace: &str,
     expected_name: &str,
 ) -> &'a ResponsesApiTool {
     let namespace_tool = find_tool(tools, expected_namespace);
-    let ToolSpec::Namespace(namespace) = namespace_tool else {
+    let ToolSpec::Namespace(namespace) = &namespace_tool.spec else {
         panic!("expected namespace tool {expected_namespace}");
     };
     namespace
@@ -233,10 +230,9 @@ async fn multi_agent_v2_tools_config() -> ToolsConfig {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     })
-    .with_max_concurrent_threads_per_session(Some(4))
 }
 
 fn multi_agent_v2_spawn_agent_description(tools_config: &ToolsConfig) -> String {
@@ -248,7 +244,7 @@ fn multi_agent_v2_spawn_agent_description(tools_config: &ToolsConfig) -> String 
     )
     .build();
     let spawn_agent = find_tool(&tools, "spawn_agent");
-    let ToolSpec::Function(ResponsesApiTool { description, .. }) = spawn_agent else {
+    let ToolSpec::Function(ResponsesApiTool { description, .. }) = &spawn_agent.spec else {
         panic!("spawn_agent should be a function tool");
     };
     description.clone()
@@ -269,37 +265,59 @@ async fn model_info_from_models_json(slug: &str) -> ModelInfo {
 /// Builds the tool registry builder while collecting tool specs for later serialization.
 fn build_specs(
     config: &ToolsConfig,
-    mcp_tools: Option<Vec<ToolInfo>>,
-    deferred_mcp_tools: Option<Vec<ToolInfo>>,
+    mcp_tools: Option<HashMap<String, ToolInfo>>,
+    deferred_mcp_tools: Option<HashMap<String, ToolInfo>>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
-    build_specs_with_inputs_for_test(
+    build_specs_with_unavailable_tools(
         config,
         mcp_tools,
         deferred_mcp_tools,
-        /*discoverable_tools*/ None,
-        /*extension_tool_executors*/ &[],
+        Vec::new(),
         dynamic_tools,
     )
 }
 
-fn build_specs_with_inputs_for_test(
+fn build_specs_with_unavailable_tools(
     config: &ToolsConfig,
-    mcp_tools: Option<Vec<ToolInfo>>,
-    deferred_mcp_tools: Option<Vec<ToolInfo>>,
-    discoverable_tools: Option<Vec<DiscoverableTool>>,
-    extension_tool_executors: &[Arc<dyn codex_extension_api::ExtensionToolExecutor>],
+    mcp_tools: Option<HashMap<String, ToolInfo>>,
+    deferred_mcp_tools: Option<HashMap<String, ToolInfo>>,
+    unavailable_called_tools: Vec<ToolName>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
-    let parts = collect_tool_router_parts(
+    build_specs_with_discoverable_tools(
         config,
         mcp_tools,
         deferred_mcp_tools,
-        discoverable_tools,
-        extension_tool_executors,
+        unavailable_called_tools,
+        /*discoverable_tools*/ None,
         dynamic_tools,
-    );
-    build_tool_registry_builder_from_executors(config, parts.executors, parts.hosted_specs)
+    )
+}
+
+#[tokio::test]
+async fn model_provided_unified_exec_is_blocked_for_windows_sandboxed_policies() {
+    let mut model_info = model_info_from_models_json("gpt-5.4").await;
+    model_info.shell_type = ConfigShellToolType::UnifiedExec;
+    let features = Features::with_defaults();
+    let available_models = Vec::new();
+    let config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::new_workspace_write_policy(),
+        windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+    });
+
+    let expected_shell_type = if cfg!(target_os = "windows") {
+        ConfigShellToolType::ShellCommand
+    } else {
+        ConfigShellToolType::UnifiedExec
+    };
+    assert_eq!(config.shell_type, expected_shell_type);
 }
 
 #[tokio::test]
@@ -316,7 +334,7 @@ async fn get_memory_requires_feature_flag() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(
@@ -327,7 +345,7 @@ async fn get_memory_requires_feature_flag() {
     )
     .build();
     assert!(
-        !tools.iter().any(|t| t.name() == "get_memory"),
+        !tools.iter().any(|t| t.spec.name() == "get_memory"),
         "get_memory should be disabled when memory_tool feature is off"
     );
 }
@@ -348,7 +366,7 @@ async fn assert_model_tools(
         image_generation_tool_auth_allowed: true,
         web_search_mode,
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let router = ToolRouter::from_config(
@@ -356,8 +374,9 @@ async fn assert_model_tools(
         ToolRouterParams {
             mcp_tools: None,
             deferred_mcp_tools: None,
+            unavailable_called_tools: Vec::new(),
+            parallel_mcp_server_names: std::collections::HashSet::new(),
             discoverable_tools: None,
-            extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
         },
     );
@@ -366,7 +385,7 @@ async fn assert_model_tools(
         .iter()
         .map(ToolSpec::name)
         .collect::<Vec<_>>();
-    assert_eq!(&tool_names, &expected_tools);
+    assert_eq!(&tool_names, &expected_tools,);
 }
 
 async fn assert_default_model_tools(
@@ -397,14 +416,14 @@ async fn test_build_specs_gpt5_codex_default() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -422,14 +441,14 @@ async fn test_build_specs_gpt51_codex_default() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -449,14 +468,14 @@ async fn test_build_specs_gpt5_codex_unified_exec_web_search() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -476,14 +495,14 @@ async fn test_build_specs_gpt51_codex_unified_exec_web_search() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -501,14 +520,14 @@ async fn test_gpt_5_1_codex_max_defaults() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -526,14 +545,14 @@ async fn test_codex_5_1_mini_defaults() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -551,14 +570,14 @@ async fn test_gpt_5_defaults() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -576,14 +595,14 @@ async fn test_gpt_5_1_defaults() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -603,14 +622,14 @@ async fn test_gpt_5_1_codex_max_unified_exec_web_search() {
             "update_plan",
             "request_user_input",
             "apply_patch",
+            "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
             "resume_agent",
             "wait_agent",
             "close_agent",
-            "web_search",
-            "image_generation",
         ],
     )
     .await;
@@ -630,12 +649,12 @@ async fn test_build_specs_default_shell_present() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Live),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(
         &tools_config,
-        Some(Vec::new()),
+        Some(HashMap::new()),
         /*deferred_mcp_tools*/ None,
         &[],
     )
@@ -665,7 +684,7 @@ async fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Live),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let user_shell = Shell {
@@ -730,7 +749,6 @@ async fn spawn_agent_description_omits_usage_hint_when_disabled() {
             \s+Spawned\ agents\ inherit\ your\ current\ model\ by\ default\.\ Omit\ `model`\ to\ use\ that\ preferred\ default;\ set\ `model`\ only\ when\ an\ explicit\ override\ is\ needed\.
             \s+It\ will\ be\ able\ to\ send\ you\ and\ other\ running\ agents\ messages,\ and\ its\ final\ answer\ will\ be\ provided\ to\ you\ when\ it\ finishes\.
             \s+The\ new\ agent's\ canonical\ task\ name\ will\ be\ provided\ to\ it\ along\ with\ the\ message\.
-            \s+This\ session\ is\ configured\ with\ `max_concurrent_threads_per_session\ =\ 4`\ for\ concurrently\ open\ agent\ threads\.
             \s*$
         "#,
         &description,
@@ -756,7 +774,6 @@ async fn spawn_agent_description_uses_configured_usage_hint_text() {
             \s+Spawned\ agents\ inherit\ your\ current\ model\ by\ default\.\ Omit\ `model`\ to\ use\ that\ preferred\ default;\ set\ `model`\ only\ when\ an\ explicit\ override\ is\ needed\.
             \s+It\ will\ be\ able\ to\ send\ you\ and\ other\ running\ agents\ messages,\ and\ its\ final\ answer\ will\ be\ provided\ to\ you\ when\ it\ finishes\.
             \s+The\ new\ agent's\ canonical\ task\ name\ will\ be\ provided\ to\ it\ along\ with\ the\ message\.
-            \s+This\ session\ is\ configured\ with\ `max_concurrent_threads_per_session\ =\ 4`\ for\ concurrently\ open\ agent\ threads\.
             \s+Custom\ delegation\ guidance\ only\.
             \s*$
         "#,
@@ -765,40 +782,7 @@ async fn spawn_agent_description_uses_configured_usage_hint_text() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_wait_agent_schema_uses_configured_timeouts() {
-    let wait_agent_min_timeout_ms = Some(20_000);
-    let wait_agent_max_timeout_ms = Some(120_000);
-    let wait_agent_default_timeout_ms = Some(60_000);
-    let tools_config = multi_agent_v2_tools_config()
-        .await
-        .with_wait_agent_min_timeout_ms(wait_agent_min_timeout_ms)
-        .with_wait_agent_max_timeout_ms(wait_agent_max_timeout_ms)
-        .with_wait_agent_default_timeout_ms(wait_agent_default_timeout_ms);
-    let (tools, _) = build_specs(
-        &tools_config,
-        /*mcp_tools*/ None,
-        /*deferred_mcp_tools*/ None,
-        &[],
-    )
-    .build();
-    let wait_agent = find_tool(&tools, "wait_agent");
-    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = wait_agent else {
-        panic!("wait_agent should be a function tool");
-    };
-    let timeout_description = parameters
-        .properties
-        .as_ref()
-        .and_then(|properties| properties.get("timeout_ms"))
-        .and_then(|schema| schema.description.as_deref());
-
-    assert_eq!(
-        timeout_description,
-        Some("Optional timeout in milliseconds. Defaults to 60000, min 20000, max 120000.")
-    );
-}
-
-#[tokio::test]
-async fn request_plugin_install_requires_apps_and_plugins_features() {
+async fn tool_suggest_requires_apps_and_plugins_features() {
     let model_info = search_capable_model_info().await;
     let discoverable_tools = Some(vec![discoverable_connector(
         "connector_2128aebfecb84f64a069897515042a44",
@@ -822,15 +806,15 @@ async fn request_plugin_install_requires_apps_and_plugins_features() {
             image_generation_tool_auth_allowed: true,
             web_search_mode: Some(WebSearchMode::Cached),
             session_source: SessionSource::Cli,
-            permission_profile: &PermissionProfile::Disabled,
+            sandbox_policy: &SandboxPolicy::DangerFullAccess,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
         });
-        let (tools, _) = build_specs_with_inputs_for_test(
+        let (tools, _) = build_specs_with_discoverable_tools(
             &tools_config,
             /*mcp_tools*/ None,
             /*deferred_mcp_tools*/ None,
+            Vec::new(),
             discoverable_tools.clone(),
-            /*extension_tool_executors*/ &[],
             &[],
         )
         .build();
@@ -838,14 +822,14 @@ async fn request_plugin_install_requires_apps_and_plugins_features() {
         assert!(
             !tools
                 .iter()
-                .any(|tool| tool.name() == REQUEST_PLUGIN_INSTALL_TOOL_NAME),
+                .any(|tool| tool.name() == TOOL_SUGGEST_TOOL_NAME),
             "tool_suggest should be absent when {disabled_feature:?} is disabled"
         );
     }
 }
 
 #[tokio::test]
-async fn search_tool_is_hidden_without_deferred_tools() {
+async fn search_tool_description_handles_no_enabled_mcp_tools() {
     let model_info = search_capable_model_info().await;
     let mut features = Features::with_defaults();
     features.enable(Feature::Apps);
@@ -858,22 +842,24 @@ async fn search_tool_is_hidden_without_deferred_tools() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
     let (tools, _) = build_specs(
         &tools_config,
         /*mcp_tools*/ None,
-        Some(Vec::new()),
+        Some(HashMap::new()),
         &[],
     )
     .build();
-    assert!(
-        !tools
-            .iter()
-            .any(|tool| tool.name() == TOOL_SEARCH_TOOL_NAME)
-    );
+    let search_tool = find_tool(&tools, TOOL_SEARCH_TOOL_NAME);
+    let ToolSpec::ToolSearch { description, .. } = &search_tool.spec else {
+        panic!("expected tool_search tool");
+    };
+
+    assert!(description.contains("None currently enabled."));
+    assert!(!description.contains("{{source_descriptions}}"));
 }
 
 #[tokio::test]
@@ -890,34 +876,36 @@ async fn search_tool_description_falls_back_to_connector_name_without_descriptio
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
     let (tools, _) = build_specs(
         &tools_config,
         /*mcp_tools*/ None,
-        Some(vec![ToolInfo {
-            server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            supports_parallel_tool_calls: false,
-            server_origin: None,
-            callable_name: "_create_event".to_string(),
-            callable_namespace: "mcp__codex_apps__calendar".to_string(),
-            namespace_description: None,
-            tool: mcp_tool(
-                "calendar_create_event",
-                "Create calendar event",
-                serde_json::json!({"type": "object"}),
-            ),
-            connector_id: Some("calendar".to_string()),
-            connector_name: Some("Calendar".to_string()),
-            plugin_display_names: Vec::new(),
-        }]),
+        Some(HashMap::from([(
+            "mcp__codex_apps__calendar_create_event".to_string(),
+            ToolInfo {
+                server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                callable_name: "_create_event".to_string(),
+                callable_namespace: "mcp__codex_apps__calendar".to_string(),
+                server_instructions: None,
+                tool: mcp_tool(
+                    "calendar_create_event",
+                    "Create calendar event",
+                    serde_json::json!({"type": "object"}),
+                ),
+                connector_id: Some("calendar".to_string()),
+                connector_name: Some("Calendar".to_string()),
+                plugin_display_names: Vec::new(),
+                connector_description: None,
+            },
+        )])),
         &[],
     )
     .build();
     let search_tool = find_tool(&tools, TOOL_SEARCH_TOOL_NAME);
-    let ToolSpec::ToolSearch { description, .. } = search_tool else {
+    let ToolSpec::ToolSearch { description, .. } = &search_tool.spec else {
         panic!("expected tool_search tool");
     };
 
@@ -939,59 +927,65 @@ async fn search_tool_registers_namespaced_mcp_tool_aliases() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
     let (_, registry) = build_specs(
         &tools_config,
         /*mcp_tools*/ None,
-        Some(vec![
-            ToolInfo {
-                server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
-                supports_parallel_tool_calls: false,
-                server_origin: None,
-                callable_name: "_create_event".to_string(),
-                callable_namespace: "mcp__codex_apps__calendar".to_string(),
-                namespace_description: None,
-                tool: mcp_tool(
-                    "calendar-create-event",
-                    "Create calendar event",
-                    serde_json::json!({"type": "object"}),
-                ),
-                connector_id: Some("calendar".to_string()),
-                connector_name: Some("Calendar".to_string()),
-                plugin_display_names: Vec::new(),
-            },
-            ToolInfo {
-                server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
-                supports_parallel_tool_calls: false,
-                server_origin: None,
-                callable_name: "_list_events".to_string(),
-                callable_namespace: "mcp__codex_apps__calendar".to_string(),
-                namespace_description: None,
-                tool: mcp_tool(
-                    "calendar-list-events",
-                    "List calendar events",
-                    serde_json::json!({"type": "object"}),
-                ),
-                connector_id: Some("calendar".to_string()),
-                connector_name: Some("Calendar".to_string()),
-                plugin_display_names: Vec::new(),
-            },
-            ToolInfo {
-                server_name: "rmcp".to_string(),
-                supports_parallel_tool_calls: false,
-                server_origin: None,
-                callable_name: "echo".to_string(),
-                callable_namespace: "mcp__rmcp__".to_string(),
-                namespace_description: None,
-                tool: mcp_tool("echo", "Echo", serde_json::json!({"type": "object"})),
-                connector_id: None,
-                connector_name: None,
-                plugin_display_names: Vec::new(),
-            },
-        ]),
+        Some(HashMap::from([
+            (
+                "mcp__codex_apps__calendar_create_event".to_string(),
+                ToolInfo {
+                    server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                    callable_name: "_create_event".to_string(),
+                    callable_namespace: "mcp__codex_apps__calendar".to_string(),
+                    server_instructions: None,
+                    tool: mcp_tool(
+                        "calendar-create-event",
+                        "Create calendar event",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                    connector_id: Some("calendar".to_string()),
+                    connector_name: Some("Calendar".to_string()),
+                    connector_description: None,
+                    plugin_display_names: Vec::new(),
+                },
+            ),
+            (
+                "mcp__codex_apps__calendar_list_events".to_string(),
+                ToolInfo {
+                    server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                    callable_name: "_list_events".to_string(),
+                    callable_namespace: "mcp__codex_apps__calendar".to_string(),
+                    server_instructions: None,
+                    tool: mcp_tool(
+                        "calendar-list-events",
+                        "List calendar events",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                    connector_id: Some("calendar".to_string()),
+                    connector_name: Some("Calendar".to_string()),
+                    connector_description: None,
+                    plugin_display_names: Vec::new(),
+                },
+            ),
+            (
+                "mcp__rmcp__echo".to_string(),
+                ToolInfo {
+                    server_name: "rmcp".to_string(),
+                    callable_name: "echo".to_string(),
+                    callable_namespace: "mcp__rmcp__".to_string(),
+                    server_instructions: None,
+                    tool: mcp_tool("echo", "Echo", serde_json::json!({"type": "object"})),
+                    connector_id: None,
+                    connector_name: None,
+                    connector_description: None,
+                    plugin_display_names: Vec::new(),
+                },
+            ),
+        ])),
         &[],
     )
     .build();
@@ -1018,17 +1012,20 @@ async fn direct_mcp_tools_register_namespaced_handlers() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
     let (_, registry) = build_specs(
         &tools_config,
-        Some(vec![mcp_tool_info(mcp_tool(
-            "echo",
-            "Echo",
-            serde_json::json!({"type": "object"}),
-        ))]),
+        Some(HashMap::from([(
+            "mcp__test_server__echo".to_string(),
+            mcp_tool_info(mcp_tool(
+                "echo",
+                "Echo",
+                serde_json::json!({"type": "object"}),
+            )),
+        )])),
         /*deferred_mcp_tools*/ None,
         &[],
     )
@@ -1036,6 +1033,55 @@ async fn direct_mcp_tools_register_namespaced_handlers() {
 
     assert!(registry.has_handler(&ToolName::namespaced("mcp__test_server__", "echo")));
     assert!(!registry.has_handler(&ToolName::plain("mcp__test_server__echo")));
+}
+
+#[tokio::test]
+async fn unavailable_mcp_tools_are_exposed_as_dummy_function_tools() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
+    let mut features = Features::with_defaults();
+    features.enable(Feature::UnifiedExec);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+
+    let unavailable_tool = ToolName::namespaced("mcp__codex_apps__calendar", "_create_event");
+    let (tools, registry) = build_specs_with_unavailable_tools(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        vec![unavailable_tool],
+        &[],
+    )
+    .build();
+
+    let tool = find_tool(&tools, "mcp__codex_apps__calendar_create_event");
+    let ToolSpec::Function(ResponsesApiTool {
+        description,
+        parameters,
+        ..
+    }) = &tool.spec
+    else {
+        panic!("unavailable MCP tool should be exposed as a function tool");
+    };
+    assert!(description.contains("not currently available"));
+    assert_eq!(
+        parameters.additional_properties,
+        Some(AdditionalProperties::Boolean(false))
+    );
+    assert!(registry.has_handler(&ToolName::namespaced(
+        "mcp__codex_apps__calendar",
+        "_create_event"
+    )));
+    assert!(!registry.has_handler(&ToolName::plain("mcp__codex_apps__calendar_create_event")));
 }
 
 #[tokio::test]
@@ -1052,25 +1098,28 @@ async fn test_mcp_tool_property_missing_type_defaults_to_string() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
     let (tools, _) = build_specs(
         &tools_config,
-        Some(vec![mcp_tool_info_with_display_name(
-            "dash/search",
-            mcp_tool(
-                "search",
-                "Search docs",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {"description": "search query"}
-                    }
-                }),
+        Some(HashMap::from([(
+            "dash/search".to_string(),
+            mcp_tool_info_with_display_name(
+                "dash/search",
+                mcp_tool(
+                    "search",
+                    "Search docs",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"description": "search query"}
+                        }
+                    }),
+                ),
             ),
-        )]),
+        )])),
         /*deferred_mcp_tools*/ None,
         &[],
     )
@@ -1112,23 +1161,26 @@ async fn test_mcp_tool_preserves_integer_schema() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
     let (tools, _) = build_specs(
         &tools_config,
-        Some(vec![mcp_tool_info_with_display_name(
-            "dash/paginate",
-            mcp_tool(
-                "paginate",
-                "Pagination",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"page": {"type": "integer"}}
-                }),
+        Some(HashMap::from([(
+            "dash/paginate".to_string(),
+            mcp_tool_info_with_display_name(
+                "dash/paginate",
+                mcp_tool(
+                    "paginate",
+                    "Pagination",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"page": {"type": "integer"}}
+                    }),
+                ),
             ),
-        )]),
+        )])),
         /*deferred_mcp_tools*/ None,
         &[],
     )
@@ -1162,6 +1214,7 @@ async fn test_mcp_tool_array_without_items_gets_default_string_items() {
     let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
+    features.enable(Feature::ApplyPatchFreeform);
     let available_models = Vec::new();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
@@ -1170,23 +1223,26 @@ async fn test_mcp_tool_array_without_items_gets_default_string_items() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
     let (tools, _) = build_specs(
         &tools_config,
-        Some(vec![mcp_tool_info_with_display_name(
-            "dash/tags",
-            mcp_tool(
-                "tags",
-                "Tags",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"tags": {"type": "array"}}
-                }),
+        Some(HashMap::from([(
+            "dash/tags".to_string(),
+            mcp_tool_info_with_display_name(
+                "dash/tags",
+                mcp_tool(
+                    "tags",
+                    "Tags",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"tags": {"type": "array"}}
+                    }),
+                ),
             ),
-        )]),
+        )])),
         /*deferred_mcp_tools*/ None,
         &[],
     )
@@ -1231,25 +1287,28 @@ async fn test_mcp_tool_anyof_defaults_to_string() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
     let (tools, _) = build_specs(
         &tools_config,
-        Some(vec![mcp_tool_info_with_display_name(
-            "dash/value",
-            mcp_tool(
-                "value",
-                "AnyOf Value",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "value": {"anyOf": [{"type": "string"}, {"type": "number"}]}
-                    }
-                }),
+        Some(HashMap::from([(
+            "dash/value".to_string(),
+            mcp_tool_info_with_display_name(
+                "dash/value",
+                mcp_tool(
+                    "value",
+                    "AnyOf Value",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "value": {"anyOf": [{"type": "string"}, {"type": "number"}]}
+                        }
+                    }),
+                ),
             ),
-        )]),
+        )])),
         /*deferred_mcp_tools*/ None,
         &[],
     )
@@ -1297,41 +1356,44 @@ async fn test_get_openai_tools_mcp_tools_with_additional_properties_schema() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(
         &tools_config,
-        Some(vec![mcp_tool_info_with_display_name(
-            "test_server/do_something_cool",
-            mcp_tool(
-                "do_something_cool",
-                "Do something cool",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                    "string_argument": {"type": "string"},
-                    "number_argument": {"type": "number"},
-                    "object_argument": {
+        Some(HashMap::from([(
+            "test_server/do_something_cool".to_string(),
+            mcp_tool_info_with_display_name(
+                "test_server/do_something_cool",
+                mcp_tool(
+                    "do_something_cool",
+                    "Do something cool",
+                    serde_json::json!({
                         "type": "object",
                         "properties": {
-                            "string_property": {"type": "string"},
-                            "number_property": {"type": "number"}
-                        },
-                        "required": ["string_property", "number_property"],
-                        "additionalProperties": {
+                        "string_argument": {"type": "string"},
+                        "number_argument": {"type": "number"},
+                        "object_argument": {
                             "type": "object",
                             "properties": {
-                                "addtl_prop": {"type": "string"}
+                                "string_property": {"type": "string"},
+                                "number_property": {"type": "number"}
                             },
-                            "required": ["addtl_prop"],
-                            "additionalProperties": false
+                            "required": ["string_property", "number_property"],
+                            "additionalProperties": {
+                                "type": "object",
+                                "properties": {
+                                    "addtl_prop": {"type": "string"}
+                                },
+                                "required": ["addtl_prop"],
+                                "additionalProperties": false
+                                }
                             }
                         }
-                    }
-                }),
+                    }),
+                ),
             ),
-        )]),
+        )])),
         /*deferred_mcp_tools*/ None,
         &[],
     )
@@ -1408,73 +1470,4 @@ async fn code_mode_only_restricts_model_tools_to_exec_tools() {
         &["exec", "wait"],
     )
     .await;
-}
-
-#[tokio::test]
-async fn code_mode_only_can_expose_multi_agent_v2_as_normal_tools() {
-    let config = test_config().await;
-    let model_info = construct_model_info_offline("gpt-5.4", &config);
-    let mut features = Features::with_defaults();
-    features.enable(Feature::CodeMode);
-    features.enable(Feature::CodeModeOnly);
-    features.enable(Feature::MultiAgentV2);
-    let available_models = Vec::new();
-    let tools_config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &model_info,
-        available_models: &available_models,
-        features: &features,
-        image_generation_tool_auth_allowed: true,
-        web_search_mode: Some(WebSearchMode::Live),
-        session_source: SessionSource::Cli,
-        permission_profile: &PermissionProfile::Disabled,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-    })
-    .with_multi_agent_v2_non_code_mode_only(/*multi_agent_v2_non_code_mode_only*/ true);
-    let router = ToolRouter::from_config(
-        &tools_config,
-        ToolRouterParams {
-            mcp_tools: None,
-            deferred_mcp_tools: None,
-            discoverable_tools: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: &[],
-        },
-    );
-    let model_visible_specs = router.model_visible_specs();
-    let tool_names = model_visible_specs
-        .iter()
-        .map(ToolSpec::name)
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        tool_names,
-        vec![
-            "exec",
-            "wait",
-            "spawn_agent",
-            "send_message",
-            "followup_task",
-            "wait_agent",
-            "close_agent",
-            "list_agents",
-        ]
-    );
-
-    let exec = find_tool(&model_visible_specs, "exec");
-    let ToolSpec::Freeform(exec) = exec else {
-        panic!("exec should be a freeform tool");
-    };
-    assert!(!exec.description.contains("spawn_agent"));
-    assert!(!exec.description.contains("wait_agent"));
-    assert!(
-        !exec
-            .description
-            .contains("do not attempt to use any other tools directly")
-    );
-
-    let spawn_agent = find_tool(&model_visible_specs, "spawn_agent");
-    let ToolSpec::Function(spawn_agent) = spawn_agent else {
-        panic!("spawn_agent should be a function tool");
-    };
-    assert!(!spawn_agent.description.contains("exec tool declaration"));
 }

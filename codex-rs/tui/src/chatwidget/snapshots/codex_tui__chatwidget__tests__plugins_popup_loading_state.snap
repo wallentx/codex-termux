@@ -1,5 +1,5 @@
 ---
-source: tui/src/chatwidget/tests/popups_and_settings.rs
+source: tui/src/chatwidget/tests.rs
 expression: popup
 ---
   Plugins
@@ -7,5 +7,3 @@ expression: popup
   This updates when the marketplace list is ready.
 
 ›    Loading plugins...  This updates when the marketplace list is ready.
-
-  Press enter to confirm or esc to go back
