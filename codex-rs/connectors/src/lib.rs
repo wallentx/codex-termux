@@ -9,27 +9,23 @@ use codex_app_server_protocol::AppBranding;
 use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::AppMetadata;
 use serde::Deserialize;
-use serde::Serialize;
 
 pub mod accessible;
-mod directory_cache;
 pub mod filter;
 pub mod merge;
 pub mod metadata;
 
-pub use directory_cache::ConnectorDirectoryCacheContext;
-
 pub const CONNECTORS_CACHE_TTL: Duration = Duration::from_secs(3600);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConnectorDirectoryCacheKey {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllConnectorsCacheKey {
     chatgpt_base_url: String,
     account_id: Option<String>,
     chatgpt_user_id: Option<String>,
     is_workspace_account: bool,
 }
 
-impl ConnectorDirectoryCacheKey {
+impl AllConnectorsCacheKey {
     pub fn new(
         chatgpt_base_url: String,
         account_id: Option<String>,
@@ -46,13 +42,13 @@ impl ConnectorDirectoryCacheKey {
 }
 
 #[derive(Clone)]
-struct CachedConnectorDirectory {
-    key: ConnectorDirectoryCacheKey,
+struct CachedAllConnectors {
+    key: AllConnectorsCacheKey,
     expires_at: Instant,
     connectors: Vec<AppInfo>,
 }
 
-static CONNECTOR_DIRECTORY_CACHE: LazyLock<StdMutex<Option<CachedConnectorDirectory>>> =
+static ALL_CONNECTORS_CACHE: LazyLock<StdMutex<Option<CachedAllConnectors>>> =
     LazyLock::new(|| StdMutex::new(None));
 
 #[derive(Debug, Deserialize)]
@@ -80,54 +76,26 @@ pub struct DirectoryApp {
     visibility: Option<String>,
 }
 
-pub fn cached_directory_connectors(
-    cache_context: &ConnectorDirectoryCacheContext,
-) -> Option<Vec<AppInfo>> {
-    if let Some(cached_connectors) = cached_directory_connectors_in_memory(&cache_context.cache_key)
-    {
-        return Some(cached_connectors);
-    }
-
-    let directory_cache::CachedConnectorDirectoryDiskLoad::Hit { connectors } =
-        directory_cache::load_cached_directory_connectors_from_disk(cache_context)
-    else {
-        return None;
-    };
-    write_cached_directory_connectors_in_memory(
-        cache_context.cache_key.clone(),
-        &connectors,
-        Duration::ZERO,
-    );
-    Some(connectors)
-}
-
-fn cached_directory_connectors_in_memory(
-    cache_key: &ConnectorDirectoryCacheKey,
-) -> Option<Vec<AppInfo>> {
-    let cache_guard = CONNECTOR_DIRECTORY_CACHE
+pub fn cached_all_connectors(cache_key: &AllConnectorsCacheKey) -> Option<Vec<AppInfo>> {
+    let mut cache_guard = ALL_CONNECTORS_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache_guard
-        .as_ref()
-        .filter(|cached| cached.key == *cache_key)
-        .map(|cached| cached.connectors.clone())
-}
+    let now = Instant::now();
 
-fn unexpired_directory_connectors_in_memory(
-    cache_key: &ConnectorDirectoryCacheKey,
-) -> Option<Vec<AppInfo>> {
-    let cache_guard = CONNECTOR_DIRECTORY_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cached = cache_guard.as_ref()?;
-    if cached.key == *cache_key && Instant::now() < cached.expires_at {
-        return Some(cached.connectors.clone());
+    if let Some(cached) = cache_guard.as_ref() {
+        if now < cached.expires_at && cached.key == *cache_key {
+            return Some(cached.connectors.clone());
+        }
+        if now >= cached.expires_at {
+            *cache_guard = None;
+        }
     }
+
     None
 }
 
 pub async fn list_all_connectors_with_options<F, Fut>(
-    cache_context: ConnectorDirectoryCacheContext,
+    cache_key: AllConnectorsCacheKey,
     is_workspace_account: bool,
     force_refetch: bool,
     mut fetch_page: F,
@@ -136,10 +104,7 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = anyhow::Result<DirectoryListResponse>>,
 {
-    if !force_refetch
-        && let Some(cached_connectors) =
-            unexpired_directory_connectors_in_memory(&cache_context.cache_key)
-    {
+    if !force_refetch && let Some(cached_connectors) = cached_all_connectors(&cache_key) {
         return Ok(cached_connectors);
     }
 
@@ -167,33 +132,17 @@ where
             .cmp(&right.name)
             .then_with(|| left.id.cmp(&right.id))
     });
-    write_cached_directory_connectors(&cache_context, &connectors);
+    write_cached_all_connectors(cache_key, &connectors);
     Ok(connectors)
 }
 
-fn write_cached_directory_connectors(
-    cache_context: &ConnectorDirectoryCacheContext,
-    connectors: &[AppInfo],
-) {
-    write_cached_directory_connectors_in_memory(
-        cache_context.cache_key.clone(),
-        connectors,
-        CONNECTORS_CACHE_TTL,
-    );
-    directory_cache::write_cached_directory_connectors_to_disk(cache_context, connectors);
-}
-
-fn write_cached_directory_connectors_in_memory(
-    cache_key: ConnectorDirectoryCacheKey,
-    connectors: &[AppInfo],
-    ttl: Duration,
-) {
-    let mut cache_guard = CONNECTOR_DIRECTORY_CACHE
+fn write_cached_all_connectors(cache_key: AllConnectorsCacheKey, connectors: &[AppInfo]) {
+    let mut cache_guard = ALL_CONNECTORS_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *cache_guard = Some(CachedConnectorDirectory {
+    *cache_guard = Some(CachedAllConnectors {
         key: cache_key,
-        expires_at: Instant::now() + ttl,
+        expires_at: Instant::now() + CONNECTORS_CACHE_TTL,
         connectors: connectors.to_vec(),
     });
 }
@@ -468,29 +417,17 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use tempfile::TempDir;
 
-    static CONNECTOR_DIRECTORY_CACHE_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    static ALL_CONNECTORS_CACHE_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-    fn cache_key(id: &str) -> ConnectorDirectoryCacheKey {
-        ConnectorDirectoryCacheKey::new(
+    fn cache_key(id: &str) -> AllConnectorsCacheKey {
+        AllConnectorsCacheKey::new(
             "https://chatgpt.example".to_string(),
             Some(format!("account-{id}")),
             Some(format!("user-{id}")),
             /*is_workspace_account*/ true,
         )
-    }
-
-    fn cache_context(codex_home: &TempDir, id: &str) -> ConnectorDirectoryCacheContext {
-        ConnectorDirectoryCacheContext::new(codex_home.path().to_path_buf(), cache_key(id))
-    }
-
-    fn clear_directory_memory_cache() {
-        let mut cache_guard = CONNECTOR_DIRECTORY_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *cache_guard = None;
     }
 
     fn app(id: &str, name: &str) -> DirectoryApp {
@@ -513,16 +450,15 @@ mod tests {
         clippy::await_holding_invalid_type,
         reason = "test serializes access to the shared connector cache for its full duration"
     )]
-    async fn list_all_connectors_uses_shared_directory_cache() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+    async fn list_all_connectors_uses_shared_cache() -> anyhow::Result<()> {
+        let _cache_guard = ALL_CONNECTORS_CACHE_TEST_LOCK.lock().await;
 
         let calls = Arc::new(AtomicUsize::new(0));
         let call_counter = Arc::clone(&calls);
-        let codex_home = TempDir::new()?;
-        let cache_context = cache_context(&codex_home, "shared");
+        let key = cache_key("shared");
 
         let first = list_all_connectors_with_options(
-            cache_context.clone(),
+            key.clone(),
             /*is_workspace_account*/ false,
             /*force_refetch*/ false,
             move |_path| {
@@ -539,7 +475,7 @@ mod tests {
         .await?;
 
         let second = list_all_connectors_with_options(
-            cache_context,
+            key,
             /*is_workspace_account*/ false,
             /*force_refetch*/ false,
             move |_path| async move {
@@ -559,15 +495,14 @@ mod tests {
         reason = "test serializes access to the shared connector cache for its full duration"
     )]
     async fn list_all_connectors_merges_and_normalizes_directory_apps() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+        let _cache_guard = ALL_CONNECTORS_CACHE_TEST_LOCK.lock().await;
 
-        let codex_home = TempDir::new()?;
-        let cache_context = cache_context(&codex_home, "merged");
+        let key = cache_key("merged");
         let calls = Arc::new(AtomicUsize::new(0));
         let call_counter = Arc::clone(&calls);
 
         let connectors = list_all_connectors_with_options(
-            cache_context,
+            key,
             /*is_workspace_account*/ true,
             /*force_refetch*/ true,
             move |path| {
@@ -628,134 +563,6 @@ mod tests {
         );
         assert_eq!(connectors[1].id, "beta");
         assert_eq!(connectors[1].name, "Beta");
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
-    async fn cached_directory_connectors_reads_directory_disk_cache() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
-
-        let codex_home = TempDir::new()?;
-        let cache_context = cache_context(&codex_home, "disk");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let call_counter = Arc::clone(&calls);
-
-        let first = list_all_connectors_with_options(
-            cache_context.clone(),
-            /*is_workspace_account*/ false,
-            /*force_refetch*/ false,
-            move |_path| {
-                let call_counter = Arc::clone(&call_counter);
-                async move {
-                    call_counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(DirectoryListResponse {
-                        apps: vec![app("alpha", "Alpha")],
-                        next_token: None,
-                    })
-                }
-            },
-        )
-        .await?;
-
-        clear_directory_memory_cache();
-
-        let second = cached_directory_connectors(&cache_context).expect("disk cache should load");
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(first, second);
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "test serializes access to the shared connector cache for its full duration"
-    )]
-    async fn list_all_connectors_refreshes_when_only_directory_disk_cache_exists()
-    -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
-
-        let codex_home = TempDir::new()?;
-        let cache_context = cache_context(&codex_home, "disk-refresh");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let call_counter = Arc::clone(&calls);
-
-        list_all_connectors_with_options(
-            cache_context.clone(),
-            /*is_workspace_account*/ false,
-            /*force_refetch*/ false,
-            move |_path| {
-                let call_counter = Arc::clone(&call_counter);
-                async move {
-                    call_counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(DirectoryListResponse {
-                        apps: vec![app("alpha", "Alpha")],
-                        next_token: None,
-                    })
-                }
-            },
-        )
-        .await?;
-
-        clear_directory_memory_cache();
-        let mut cached_expected = directory_app_to_app_info(app("alpha", "Alpha"));
-        cached_expected.install_url = Some(connector_install_url(
-            &cached_expected.name,
-            &cached_expected.id,
-        ));
-        assert_eq!(
-            cached_directory_connectors(&cache_context),
-            Some(vec![cached_expected])
-        );
-        let refreshed_calls = Arc::clone(&calls);
-
-        let refreshed = list_all_connectors_with_options(
-            cache_context,
-            /*is_workspace_account*/ false,
-            /*force_refetch*/ false,
-            move |_path| {
-                let call_counter = Arc::clone(&refreshed_calls);
-                async move {
-                    call_counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(DirectoryListResponse {
-                        apps: vec![app("beta", "Beta")],
-                        next_token: None,
-                    })
-                }
-            },
-        )
-        .await?;
-
-        let mut expected = directory_app_to_app_info(app("beta", "Beta"));
-        expected.install_url = Some(connector_install_url(&expected.name, &expected.id));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(refreshed, vec![expected]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cached_directory_connectors_drops_stale_disk_schema() -> anyhow::Result<()> {
-        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
-
-        clear_directory_memory_cache();
-        let codex_home = TempDir::new()?;
-        let cache_context = cache_context(&codex_home, "stale-schema");
-        let cache_path = cache_context.cache_path();
-        std::fs::create_dir_all(cache_path.parent().expect("cache parent"))?;
-        std::fs::write(
-            &cache_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 0,
-                "connectors": [],
-            }))?,
-        )?;
-
-        assert_eq!(cached_directory_connectors(&cache_context), None);
-        assert!(!cache_path.exists());
         Ok(())
     }
 

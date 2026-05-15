@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use codex_connectors::metadata::connector_display_label;
 use codex_protocol::models::ResponseItem;
@@ -13,7 +14,7 @@ use codex_mcp::ToolInfo;
 
 pub(crate) fn build_plugin_injections(
     mentioned_plugins: &[PluginCapabilitySummary],
-    mcp_tools: &[ToolInfo],
+    mcp_tools: &HashMap<String, ToolInfo>,
     available_connectors: &[connectors::AppInfo],
 ) -> Vec<ResponseItem> {
     if mentioned_plugins.is_empty() {
@@ -26,7 +27,7 @@ pub(crate) fn build_plugin_injections(
         .iter()
         .filter_map(|plugin| {
             let available_mcp_servers = mcp_tools
-                .iter()
+                .values()
                 .filter(|tool| {
                     tool.server_name != CODEX_APPS_MCP_SERVER_NAME
                         && tool

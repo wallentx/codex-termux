@@ -1,22 +1,21 @@
-# OpenAI Codex SDK — API Reference
+# Codex App Server SDK — API Reference
 
-Public surface of `openai_codex` for app-server v2.
+Public surface of `codex_app_server` for app-server v2.
 
 This SDK surface is experimental. Turn streams are routed by turn ID so one client can consume multiple active turns concurrently.
-Thread and turn starts expose `approval_mode`. `ApprovalMode.auto_review` is the default; use `ApprovalMode.deny_all` to deny escalated permissions.
 
 ## Package Entry
 
 ```python
-from openai_codex import (
+from codex_app_server import (
     Codex,
     AsyncCodex,
-    ApprovalMode,
     RunResult,
     Thread,
     AsyncThread,
     TurnHandle,
     AsyncTurnHandle,
+    InitializeResponse,
     Input,
     InputItem,
     TextInput,
@@ -24,18 +23,14 @@ from openai_codex import (
     LocalImageInput,
     SkillInput,
     MentionInput,
-)
-from openai_codex.types import (
-    InitializeResponse,
-    ThreadItem,
-    ThreadTokenUsage,
     TurnStatus,
 )
+from codex_app_server.generated.v2_all import ThreadItem, ThreadTokenUsage
 ```
 
-- Version: `openai_codex.__version__`
+- Version: `codex_app_server.__version__`
 - Requires Python >= 3.10
-- Public app-server value and event types live in `openai_codex.types`
+- Canonical generated app-server models live in `codex_app_server.generated.v2_all`
 
 ## Codex (sync)
 
@@ -47,10 +42,10 @@ Properties/methods:
 
 - `metadata -> InitializeResponse`
 - `close() -> None`
-- `thread_start(*, approval_mode=ApprovalMode.auto_review, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, personality=None, sandbox=None) -> Thread`
+- `thread_start(*, approval_policy=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, personality=None, sandbox=None) -> Thread`
 - `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, model_providers=None, sort_key=None, source_kinds=None) -> ThreadListResponse`
-- `thread_resume(thread_id: str, *, approval_mode=ApprovalMode.auto_review, base_instructions=None, config=None, cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox=None) -> Thread`
-- `thread_fork(thread_id: str, *, approval_mode=ApprovalMode.auto_review, base_instructions=None, config=None, cwd=None, developer_instructions=None, model=None, model_provider=None, sandbox=None) -> Thread`
+- `thread_resume(thread_id: str, *, approval_policy=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox=None) -> Thread`
+- `thread_fork(thread_id: str, *, approval_policy=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, model=None, model_provider=None, sandbox=None) -> Thread`
 - `thread_archive(thread_id: str) -> ThreadArchiveResponse`
 - `thread_unarchive(thread_id: str) -> Thread`
 - `models(*, include_hidden: bool = False) -> ModelListResponse`
@@ -82,10 +77,10 @@ Properties/methods:
 
 - `metadata -> InitializeResponse`
 - `close() -> Awaitable[None]`
-- `thread_start(*, approval_mode=ApprovalMode.auto_review, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, personality=None, sandbox=None) -> Awaitable[AsyncThread]`
+- `thread_start(*, approval_policy=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, personality=None, sandbox=None) -> Awaitable[AsyncThread]`
 - `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, model_providers=None, sort_key=None, source_kinds=None) -> Awaitable[ThreadListResponse]`
-- `thread_resume(thread_id: str, *, approval_mode=ApprovalMode.auto_review, base_instructions=None, config=None, cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox=None) -> Awaitable[AsyncThread]`
-- `thread_fork(thread_id: str, *, approval_mode=ApprovalMode.auto_review, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, sandbox=None) -> Awaitable[AsyncThread]`
+- `thread_resume(thread_id: str, *, approval_policy=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox=None) -> Awaitable[AsyncThread]`
+- `thread_fork(thread_id: str, *, approval_policy=None, base_instructions=None, config=None, cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None, sandbox=None) -> Awaitable[AsyncThread]`
 - `thread_archive(thread_id: str) -> Awaitable[ThreadArchiveResponse]`
 - `thread_unarchive(thread_id: str) -> Awaitable[AsyncThread]`
 - `models(*, include_hidden: bool = False) -> Awaitable[ModelListResponse]`
@@ -103,16 +98,16 @@ async with AsyncCodex() as codex:
 
 ### Thread
 
-- `run(input: str | Input, *, approval_mode=ApprovalMode.auto_review, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox_policy=None, service_tier=None, summary=None) -> RunResult`
-- `turn(input: Input, *, approval_mode=ApprovalMode.auto_review, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox_policy=None, summary=None) -> TurnHandle`
+- `run(input: str | Input, *, approval_policy=None, approvals_reviewer=None, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox_policy=None, service_tier=None, summary=None) -> RunResult`
+- `turn(input: Input, *, approval_policy=None, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox_policy=None, summary=None) -> TurnHandle`
 - `read(*, include_turns: bool = False) -> ThreadReadResponse`
 - `set_name(name: str) -> ThreadSetNameResponse`
 - `compact() -> ThreadCompactStartResponse`
 
 ### AsyncThread
 
-- `run(input: str | Input, *, approval_mode=ApprovalMode.auto_review, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox_policy=None, service_tier=None, summary=None) -> Awaitable[RunResult]`
-- `turn(input: Input, *, approval_mode=ApprovalMode.auto_review, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox_policy=None, summary=None) -> Awaitable[AsyncTurnHandle]`
+- `run(input: str | Input, *, approval_policy=None, approvals_reviewer=None, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox_policy=None, service_tier=None, summary=None) -> Awaitable[RunResult]`
+- `turn(input: Input, *, approval_policy=None, cwd=None, effort=None, model=None, output_schema=None, personality=None, sandbox_policy=None, summary=None) -> Awaitable[AsyncTurnHandle]`
 - `read(*, include_turns: bool = False) -> Awaitable[ThreadReadResponse]`
 - `set_name(name: str) -> Awaitable[ThreadSetNameResponse]`
 - `compact() -> Awaitable[ThreadCompactStartResponse]`
@@ -129,7 +124,7 @@ object with:
 phase-less assistant message item.
 
 Use `turn(...)` when you need low-level turn control (`stream()`, `steer()`,
-`interrupt()`) or the public `Turn` model from `TurnHandle.run()`.
+`interrupt()`) or the canonical generated `Turn` from `TurnHandle.run()`.
 
 ## TurnHandle / AsyncTurnHandle
 
@@ -138,7 +133,7 @@ Use `turn(...)` when you need low-level turn control (`stream()`, `steer()`,
 - `steer(input: Input) -> TurnSteerResponse`
 - `interrupt() -> TurnInterruptResponse`
 - `stream() -> Iterator[Notification]`
-- `run() -> openai_codex.types.Turn`
+- `run() -> codex_app_server.generated.v2_all.Turn`
 
 Behavior notes:
 
@@ -150,7 +145,7 @@ Behavior notes:
 - `steer(input: Input) -> Awaitable[TurnSteerResponse]`
 - `interrupt() -> Awaitable[TurnInterruptResponse]`
 - `stream() -> AsyncIterator[Notification]`
-- `run() -> Awaitable[openai_codex.types.Turn]`
+- `run() -> Awaitable[codex_app_server.generated.v2_all.Turn]`
 
 Behavior notes:
 
@@ -170,14 +165,16 @@ InputItem = TextInput | ImageInput | LocalImageInput | SkillInput | MentionInput
 Input = list[InputItem] | InputItem
 ```
 
-## Public Types
+## Generated Models
 
-The SDK wrappers return and accept public app-server models wherever possible:
+The SDK wrappers return and accept canonical generated app-server models wherever possible:
 
 ```python
-from openai_codex.types import (
+from codex_app_server.generated.v2_all import (
+    AskForApproval,
     ThreadReadResponse,
     Turn,
+    TurnStartParams,
     TurnStatus,
 )
 ```
@@ -185,7 +182,7 @@ from openai_codex.types import (
 ## Retry + errors
 
 ```python
-from openai_codex import (
+from codex_app_server import (
     retry_on_overload,
     JsonRpcError,
     MethodNotFoundError,
@@ -201,7 +198,7 @@ from openai_codex import (
 ## Example
 
 ```python
-from openai_codex import Codex
+from codex_app_server import Codex
 
 with Codex() as codex:
     thread = codex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})

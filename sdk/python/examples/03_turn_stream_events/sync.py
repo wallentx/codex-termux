@@ -14,7 +14,7 @@ from _bootstrap import (
 
 ensure_local_sdk_src()
 
-from openai_codex import Codex, TextInput
+from codex_app_server import Codex, TextInput
 
 with Codex(config=runtime_config()) as codex:
     thread = codex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})
@@ -40,9 +40,7 @@ with Codex(config=runtime_config()) as codex:
                 saw_delta = True
             continue
         if event.method == "turn/completed":
-            completed_status = getattr(
-                event.payload.turn.status, "value", str(event.payload.turn.status)
-            )
+            completed_status = getattr(event.payload.turn.status, "value", str(event.payload.turn.status))
 
     if saw_delta:
         print()

@@ -1,20 +1,17 @@
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
 use codex_core::CodexThread;
 use codex_core::ThreadConfigSnapshot;
-use codex_file_watcher::WatchRegistration;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
-use codex_rollout::state_db::StateDbHandle;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::Mutex;
@@ -23,34 +20,24 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tracing::error;
 
-type PendingInterruptQueue = Vec<ConnectionRequestId>;
+type PendingInterruptQueue = Vec<(
+    ConnectionRequestId,
+    crate::codex_message_processor::ApiVersion,
+)>;
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
-    pub(crate) history_items: Vec<RolloutItem>,
+    pub(crate) rollout_path: PathBuf,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<AbsolutePathBuf>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
-    pub(crate) emit_thread_goal_update: bool,
-    pub(crate) thread_goal_state_db: Option<StateDbHandle>,
     pub(crate) include_turns: bool,
-    pub(crate) redact_resume_payloads: bool,
 }
 
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.
 pub(crate) enum ThreadListenerCommand {
     // SendThreadResumeResponse is used to resume an already running thread by sending the thread's history to the client and atomically subscribing for new updates.
     SendThreadResumeResponse(Box<PendingThreadResumeRequest>),
-    // EmitThreadGoalUpdated is used to order app-server goal updates with running-thread resume responses.
-    EmitThreadGoalUpdated {
-        goal: ThreadGoal,
-    },
-    // EmitThreadGoalCleared is used to order app-server goal clears with running-thread resume responses.
-    EmitThreadGoalCleared,
-    // EmitThreadGoalSnapshot is used to read and emit the latest goal state in the listener order.
-    EmitThreadGoalSnapshot {
-        state_db: StateDbHandle,
-    },
     // ResolveServerRequest is used to notify the client that the request has been resolved.
     // It is executed in the thread listener's context to ensure that the resolved notification is ordered with regard to the request itself.
     ResolveServerRequest {
@@ -63,6 +50,7 @@ pub(crate) enum ThreadListenerCommand {
 #[derive(Default, Clone)]
 pub(crate) struct TurnSummary {
     pub(crate) started_at: Option<i64>,
+    pub(crate) file_change_started: HashSet<String>,
     pub(crate) command_execution_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
 }
@@ -72,14 +60,12 @@ pub(crate) struct ThreadState {
     pub(crate) pending_interrupts: PendingInterruptQueue,
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
-    pub(crate) last_terminal_turn_id: Option<String>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
     listener_thread: Option<Weak<CodexThread>>,
-    watch_registration: WatchRegistration,
 }
 
 impl ThreadState {
@@ -94,7 +80,6 @@ impl ThreadState {
         &mut self,
         cancel_tx: oneshot::Sender<()>,
         conversation: &Arc<CodexThread>,
-        watch_registration: WatchRegistration,
     ) -> (mpsc::UnboundedReceiver<ThreadListenerCommand>, u64) {
         if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
             let _ = previous.send(());
@@ -103,7 +88,6 @@ impl ThreadState {
         let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();
         self.listener_command_tx = Some(listener_command_tx);
         self.listener_thread = Some(Arc::downgrade(conversation));
-        self.watch_registration = watch_registration;
         (listener_command_rx, self.listener_generation)
     }
 
@@ -114,7 +98,6 @@ impl ThreadState {
         self.listener_command_tx = None;
         self.current_turn_history.reset();
         self.listener_thread = None;
-        self.watch_registration = WatchRegistration::default();
     }
 
     pub(crate) fn set_experimental_raw_events(&mut self, enabled: bool) {
@@ -131,7 +114,7 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
-    pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
+    pub(crate) fn track_current_turn_event(&mut self, event: &EventMsg) {
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
         }
@@ -139,7 +122,6 @@ impl ThreadState {
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
             && !self.current_turn_history.has_active_turn()
         {
-            self.last_terminal_turn_id = Some(event_turn_id.to_string());
             self.current_turn_history.reset();
         }
     }
@@ -205,14 +187,9 @@ impl ThreadEntry {
 
 #[derive(Default)]
 struct ThreadStateManagerInner {
-    live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
+    live_connections: HashSet<ConnectionId>,
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct ConnectionCapabilities {
-    pub(crate) request_attestation: bool,
 }
 
 #[derive(Clone, Default)]
@@ -225,36 +202,12 @@ impl ThreadStateManager {
         Self::default()
     }
 
-    pub(crate) async fn connection_initialized(
-        &self,
-        connection_id: ConnectionId,
-        capabilities: ConnectionCapabilities,
-    ) {
+    pub(crate) async fn connection_initialized(&self, connection_id: ConnectionId) {
         self.state
             .lock()
             .await
             .live_connections
-            .insert(connection_id, capabilities);
-    }
-
-    pub(crate) async fn first_attestation_capable_connection_for_thread(
-        &self,
-        thread_id: ThreadId,
-    ) -> Option<ConnectionId> {
-        let state = self.state.lock().await;
-        state
-            .threads
-            .get(&thread_id)?
-            .connection_ids
-            .iter()
-            .filter_map(|connection_id| {
-                state
-                    .live_connections
-                    .get(connection_id)?
-                    .request_attestation
-                    .then_some(*connection_id)
-            })
-            .min_by_key(|connection_id| connection_id.0)
+            .insert(connection_id);
     }
 
     pub(crate) async fn subscribed_connection_ids(&self, thread_id: ThreadId) -> Vec<ConnectionId> {
@@ -373,7 +326,7 @@ impl ThreadStateManager {
     ) -> Option<Arc<Mutex<ThreadState>>> {
         let thread_state = {
             let mut state = self.state.lock().await;
-            if !state.live_connections.contains_key(&connection_id) {
+            if !state.live_connections.contains(&connection_id) {
                 return None;
             }
             state
@@ -401,7 +354,7 @@ impl ThreadStateManager {
         connection_id: ConnectionId,
     ) -> bool {
         let mut state = self.state.lock().await;
-        if !state.live_connections.contains_key(&connection_id) {
+        if !state.live_connections.contains(&connection_id) {
             return false;
         }
         state

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -9,280 +8,170 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::HookEventsToml;
 use codex_config::HookHandlerConfig;
-use codex_config::HookStateToml;
 use codex_config::HooksFile;
 use codex_config::ManagedHooksRequirementsToml;
 use codex_config::MatcherGroup;
 use codex_config::RequirementSource;
-use codex_config::TomlValue;
-use codex_config::version_for_toml;
-use codex_plugin::PluginHookSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
-use serde::Serialize;
 
 use super::ConfiguredHandler;
-use super::HookListEntry;
-use crate::config_rules::hook_states_from_stack;
 use crate::events::common::matcher_pattern_for_event;
 use crate::events::common::validate_matcher_pattern;
-use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookSource;
-use codex_protocol::protocol::HookTrustStatus;
 
 pub(crate) struct DiscoveryResult {
     pub handlers: Vec<ConfiguredHandler>,
-    pub hook_entries: Vec<HookListEntry>,
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
 struct HookHandlerSource<'a> {
     path: &'a AbsolutePathBuf,
-    key_source: String,
-    source: HookSource,
     is_managed: bool,
-    bypass_hook_trust: bool,
-    hook_states: &'a HashMap<String, HookStateToml>,
-    env: HashMap<String, String>,
-    plugin_id: Option<String>,
+    source: HookSource,
 }
 
-#[derive(Clone, Copy)]
-struct HookDiscoveryPolicy {
-    allow_managed_hooks_only: bool,
-    bypass_hook_trust: bool,
-}
-
-impl HookDiscoveryPolicy {
-    fn allows(self, source: &HookHandlerSource<'_>) -> bool {
-        !self.allow_managed_hooks_only || source.is_managed
-    }
-}
-
-pub(crate) fn discover_handlers(
-    config_layer_stack: Option<&ConfigLayerStack>,
-    plugin_hook_sources: Vec<PluginHookSource>,
-    plugin_hook_load_warnings: Vec<String>,
-    bypass_hook_trust: bool,
-) -> DiscoveryResult {
-    let mut handlers = Vec::new();
-    let mut hook_entries = Vec::new();
-    let mut warnings = plugin_hook_load_warnings;
-    let mut display_order = 0_i64;
-    let hook_states = hook_states_from_stack(config_layer_stack);
-    let policy = HookDiscoveryPolicy {
-        allow_managed_hooks_only: config_layer_stack.is_some_and(|config_layer_stack| {
-            config_layer_stack
-                .requirements()
-                .allow_managed_hooks_only
-                .as_ref()
-                .is_some_and(|requirement| requirement.value)
-        }),
-        bypass_hook_trust,
+pub(crate) fn discover_handlers(config_layer_stack: Option<&ConfigLayerStack>) -> DiscoveryResult {
+    let Some(config_layer_stack) = config_layer_stack else {
+        return DiscoveryResult {
+            handlers: Vec::new(),
+            warnings: Vec::new(),
+        };
     };
 
-    if let Some(config_layer_stack) = config_layer_stack {
-        append_managed_requirement_handlers(
-            &mut handlers,
-            &mut hook_entries,
-            &mut warnings,
-            &mut display_order,
-            config_layer_stack,
-            &hook_states,
-            policy,
-        );
+    let mut handlers = Vec::new();
+    let mut warnings = Vec::new();
+    let mut display_order = 0_i64;
 
-        for layer in config_layer_stack.get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ false,
-        ) {
-            let (hook_source, is_managed) = hook_metadata_for_config_layer_source(&layer.name);
-            let policy_path = config_toml_source_path(layer);
-            let policy_source = HookHandlerSource {
-                path: &policy_path,
-                key_source: policy_path.display().to_string(),
-                source: hook_source,
-                is_managed,
-                bypass_hook_trust: false,
-                hook_states: &hook_states,
-                env: HashMap::new(),
-                plugin_id: None,
-            };
-            if !policy.allows(&policy_source) {
-                continue;
-            }
-            let json_hooks = load_hooks_json(layer.hooks_config_folder().as_deref(), &mut warnings);
-            let toml_hooks = load_toml_hooks_from_layer(layer, &mut warnings);
+    append_managed_requirement_handlers(
+        &mut handlers,
+        &mut warnings,
+        &mut display_order,
+        config_layer_stack,
+    );
 
-            if let (Some((json_source_path, json_events)), Some((toml_source_path, toml_events))) =
-                (&json_hooks, &toml_hooks)
-                && !json_events.is_empty()
-                && !toml_events.is_empty()
-            {
-                warnings.push(format!(
-                    "loading hooks from both {} and {}; prefer a single representation for this layer",
-                    json_source_path.display(),
-                    toml_source_path.display()
-                ));
-            }
+    for layer in config_layer_stack.get_layers(
+        ConfigLayerStackOrdering::LowestPrecedenceFirst,
+        /*include_disabled*/ false,
+    ) {
+        let hook_source = hook_source_for_config_layer_source(&layer.name);
+        let json_hooks = load_hooks_json(layer.config_folder().as_deref(), &mut warnings);
+        let toml_hooks = load_toml_hooks_from_layer(layer, &mut warnings);
 
-            for (source_path, hook_events) in [json_hooks, toml_hooks].into_iter().flatten() {
-                append_hook_events(
-                    &mut handlers,
-                    &mut hook_entries,
-                    &mut warnings,
-                    &mut display_order,
-                    HookHandlerSource {
-                        path: &source_path,
-                        key_source: source_path.display().to_string(),
-                        source: hook_source,
-                        is_managed,
-                        bypass_hook_trust: policy.bypass_hook_trust,
-                        hook_states: &hook_states,
-                        env: HashMap::new(),
-                        plugin_id: None,
-                    },
-                    hook_events,
-                    policy,
-                );
-            }
+        if let (Some((json_source_path, json_events)), Some((toml_source_path, toml_events))) =
+            (&json_hooks, &toml_hooks)
+            && !json_events.is_empty()
+            && !toml_events.is_empty()
+        {
+            warnings.push(format!(
+                "loading hooks from both {} and {}; prefer a single representation for this layer",
+                json_source_path.display(),
+                toml_source_path.display()
+            ));
+        }
+
+        if let Some((source_path, hook_events)) = json_hooks {
+            append_hook_events(
+                &mut handlers,
+                &mut warnings,
+                &mut display_order,
+                HookHandlerSource {
+                    path: &source_path,
+                    is_managed: false,
+                    source: hook_source,
+                },
+                hook_events,
+            );
+        }
+
+        if let Some((source_path, hook_events)) = toml_hooks {
+            append_hook_events(
+                &mut handlers,
+                &mut warnings,
+                &mut display_order,
+                HookHandlerSource {
+                    path: &source_path,
+                    is_managed: false,
+                    source: hook_source,
+                },
+                hook_events,
+            );
         }
     }
 
-    append_plugin_hook_sources(
-        &mut handlers,
-        &mut hook_entries,
-        &mut warnings,
-        &mut display_order,
-        plugin_hook_sources,
-        &hook_states,
-        policy,
-    );
-
-    DiscoveryResult {
-        handlers,
-        hook_entries,
-        warnings,
-    }
+    DiscoveryResult { handlers, warnings }
 }
 
 fn append_managed_requirement_handlers(
     handlers: &mut Vec<ConfiguredHandler>,
-    hook_entries: &mut Vec<HookListEntry>,
     warnings: &mut Vec<String>,
     display_order: &mut i64,
     config_layer_stack: &ConfigLayerStack,
-    hook_states: &HashMap<String, HookStateToml>,
-    policy: HookDiscoveryPolicy,
 ) {
     let Some(managed_hooks) = config_layer_stack.requirements().managed_hooks.as_ref() else {
         return;
     };
-    let source_path = managed_hooks_source_path(managed_hooks.get(), managed_hooks.source.as_ref());
+    let Some(source_path) =
+        managed_hooks_source_path(managed_hooks.get(), managed_hooks.source.as_ref(), warnings)
+    else {
+        return;
+    };
     append_hook_events(
         handlers,
-        hook_entries,
         warnings,
         display_order,
         HookHandlerSource {
             path: &source_path,
-            key_source: source_path.display().to_string(),
-            source: hook_source_for_requirement_source(managed_hooks.source.as_ref()),
             is_managed: true,
-            bypass_hook_trust: false,
-            hook_states,
-            env: HashMap::new(),
-            plugin_id: None,
+            source: hook_source_for_requirement_source(managed_hooks.source.as_ref()),
         },
         managed_hooks.get().hooks.clone(),
-        policy,
     );
-}
-
-fn append_plugin_hook_sources(
-    handlers: &mut Vec<ConfiguredHandler>,
-    hook_entries: &mut Vec<HookListEntry>,
-    warnings: &mut Vec<String>,
-    display_order: &mut i64,
-    plugin_hook_sources: Vec<PluginHookSource>,
-    hook_states: &HashMap<String, HookStateToml>,
-    policy: HookDiscoveryPolicy,
-) {
-    for source in plugin_hook_sources {
-        let PluginHookSource {
-            plugin_root,
-            plugin_id,
-            plugin_data_root,
-            source_path,
-            source_relative_path,
-            hooks,
-        } = source;
-        let mut env = HashMap::new();
-        let plugin_root_value = plugin_root.display().to_string();
-        let plugin_data_root_value = plugin_data_root.display().to_string();
-        env.insert("PLUGIN_ROOT".to_string(), plugin_root_value.clone());
-        // For OOTB compat with existing plugins that use this env var.
-        env.insert("CLAUDE_PLUGIN_ROOT".to_string(), plugin_root_value);
-        env.insert("PLUGIN_DATA".to_string(), plugin_data_root_value.clone());
-        // For OOTB compat with existing plugins that use this env var.
-        env.insert("CLAUDE_PLUGIN_DATA".to_string(), plugin_data_root_value);
-        let plugin_id = plugin_id.as_key();
-        append_hook_events(
-            handlers,
-            hook_entries,
-            warnings,
-            display_order,
-            HookHandlerSource {
-                path: &source_path,
-                key_source: crate::declarations::plugin_hook_key_source(
-                    plugin_id.as_str(),
-                    source_relative_path.as_str(),
-                ),
-                source: HookSource::Plugin,
-                is_managed: false,
-                bypass_hook_trust: policy.bypass_hook_trust,
-                hook_states,
-                env,
-                plugin_id: Some(plugin_id),
-            },
-            hooks,
-            policy,
-        );
-    }
 }
 
 fn managed_hooks_source_path(
     managed_hooks: &ManagedHooksRequirementsToml,
     requirement_source: Option<&RequirementSource>,
-) -> AbsolutePathBuf {
-    if let Some(source_path) = managed_hooks.managed_dir_for_current_platform()
-        && source_path.is_absolute()
-        && let Ok(source_path) = AbsolutePathBuf::from_absolute_path(source_path)
-    {
-        return source_path;
-    }
+    warnings: &mut Vec<String>,
+) -> Option<AbsolutePathBuf> {
+    let source = requirement_source
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "managed requirements".to_string());
+    let Some(source_path) = managed_hooks.managed_dir_for_current_platform() else {
+        warnings.push(format!(
+            "skipping managed hooks from {source}: no managed hook directory is configured for this platform"
+        ));
+        return None;
+    };
 
-    fallback_managed_hooks_source_path(requirement_source)
-}
-
-fn fallback_managed_hooks_source_path(
-    requirement_source: Option<&RequirementSource>,
-) -> AbsolutePathBuf {
-    match requirement_source {
-        Some(RequirementSource::SystemRequirementsToml { file })
-        | Some(RequirementSource::LegacyManagedConfigTomlFromFile { file }) => file.clone(),
-        Some(RequirementSource::MdmManagedPreferences { domain, key }) => {
-            synthetic_layer_path(&format!("<mdm:{domain}:{key}>/requirements.toml"))
-        }
-        Some(RequirementSource::CloudRequirements) => {
-            synthetic_layer_path("<cloud-requirements>/requirements.toml")
-        }
-        Some(RequirementSource::LegacyManagedConfigTomlFromMdm) => {
-            synthetic_layer_path("<legacy-managed-config.toml-mdm>/managed_config.toml")
-        }
-        Some(RequirementSource::Unknown) | None => {
-            synthetic_layer_path("<managed-requirements>/requirements.toml")
-        }
+    if !source_path.is_absolute() {
+        warnings.push(format!(
+            "skipping managed hooks from {source}: managed hook directory {} is not absolute",
+            source_path.display()
+        ));
+        None
+    } else if !source_path.exists() {
+        warnings.push(format!(
+            "skipping managed hooks from {source}: managed hook directory {} does not exist",
+            source_path.display()
+        ));
+        None
+    } else if !source_path.is_dir() {
+        warnings.push(format!(
+            "skipping managed hooks from {source}: managed hook directory {} is not a directory",
+            source_path.display()
+        ));
+        None
+    } else {
+        AbsolutePathBuf::from_absolute_path(source_path)
+            .inspect_err(|err| {
+                warnings.push(format!(
+                    "skipping managed hooks from {source}: could not normalize managed hook directory {}: {err}",
+                    source_path.display()
+                ));
+            })
+            .ok()
     }
 }
 
@@ -352,12 +241,9 @@ fn load_toml_hooks_from_layer(
 fn config_toml_source_path(layer: &ConfigLayerEntry) -> AbsolutePathBuf {
     match &layer.name {
         ConfigLayerSource::System { file }
-        | ConfigLayerSource::User { file, .. }
+        | ConfigLayerSource::User { file }
         | ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => file.clone(),
-        ConfigLayerSource::Project { dot_codex_folder } => layer
-            .hooks_config_folder()
-            .unwrap_or_else(|| dot_codex_folder.clone())
-            .join(CONFIG_TOML_FILE),
+        ConfigLayerSource::Project { dot_codex_folder } => dot_codex_folder.join(CONFIG_TOML_FILE),
         ConfigLayerSource::Mdm { domain, key } => {
             synthetic_layer_path(&format!("<mdm:{domain}:{key}>/{CONFIG_TOML_FILE}"))
         }
@@ -382,24 +268,17 @@ fn synthetic_layer_path(path: &str) -> AbsolutePathBuf {
 
 fn append_hook_events(
     handlers: &mut Vec<ConfiguredHandler>,
-    hook_entries: &mut Vec<HookListEntry>,
     warnings: &mut Vec<String>,
     display_order: &mut i64,
     source: HookHandlerSource<'_>,
     hook_events: HookEventsToml,
-    policy: HookDiscoveryPolicy,
 ) {
-    if !policy.allows(&source) {
-        return;
-    }
-
     for (event_name, groups) in hook_events.into_matcher_groups() {
         append_matcher_groups(
             handlers,
-            hook_entries,
             warnings,
             display_order,
-            &source,
+            source,
             event_name,
             groups,
         );
@@ -408,191 +287,103 @@ fn append_hook_events(
 
 fn append_matcher_groups(
     handlers: &mut Vec<ConfiguredHandler>,
-    hook_entries: &mut Vec<HookListEntry>,
     warnings: &mut Vec<String>,
     display_order: &mut i64,
-    source: &HookHandlerSource<'_>,
+    source: HookHandlerSource<'_>,
     event_name: codex_protocol::protocol::HookEventName,
     groups: Vec<MatcherGroup>,
 ) {
-    for (group_index, group) in groups.into_iter().enumerate() {
-        let matcher = matcher_pattern_for_event(event_name, group.matcher.as_deref());
-        if let Some(matcher) = matcher
-            && let Err(err) = validate_matcher_pattern(matcher)
-        {
-            warnings.push(format!(
-                "invalid matcher {matcher:?} in {}: {err}",
-                source.path.display()
-            ));
-            continue;
-        }
-        for (handler_index, handler) in group.hooks.iter().cloned().enumerate() {
-            match handler {
-                HookHandlerConfig::Command {
-                    command,
-                    command_windows,
-                    timeout_sec,
-                    r#async,
-                    status_message,
-                } => {
-                    let command = if cfg!(windows) {
-                        command_windows.unwrap_or(command)
-                    } else {
-                        command
-                    };
-                    if r#async {
-                        warnings.push(format!(
-                            "skipping async hook in {}: async hooks are not supported yet",
-                            source.path.display()
-                        ));
-                        continue;
-                    }
-                    if command.trim().is_empty() {
-                        warnings.push(format!(
-                            "skipping empty hook command in {}",
-                            source.path.display()
-                        ));
-                        continue;
-                    }
-                    let timeout_sec = timeout_sec.unwrap_or(600).max(1);
-                    let normalized_handler = HookHandlerConfig::Command {
-                        command: command.clone(),
-                        command_windows: None,
-                        timeout_sec: Some(timeout_sec),
-                        r#async,
-                        status_message: status_message.clone(),
-                    };
-                    let current_hash =
-                        command_hook_hash(event_name, matcher, &group, normalized_handler);
-                    let command = source.env.iter().fold(command, |command, (key, value)| {
-                        command.replace(&format!("${{{key}}}"), value)
-                    });
-                    // TODO(abhinav): replace this positional suffix with a durable hook id.
-                    let key =
-                        crate::hook_key(&source.key_source, event_name, group_index, handler_index);
-                    let state = source.hook_states.get(&key);
-                    let enabled = hook_enabled(source.is_managed, state);
-                    let trusted_hash = hook_trusted_hash(source.is_managed, state);
-                    let trust_status =
-                        hook_trust_status(source.is_managed, &current_hash, trusted_hash);
-                    hook_entries.push(HookListEntry {
-                        key,
-                        event_name,
-                        handler_type: HookHandlerType::Command,
-                        matcher: matcher.map(ToOwned::to_owned),
-                        command: Some(command.clone()),
-                        timeout_sec,
-                        status_message: status_message.clone(),
-                        source_path: source.path.clone(),
-                        source: source.source,
-                        plugin_id: source.plugin_id.clone(),
-                        display_order: *display_order,
-                        enabled,
-                        is_managed: source.is_managed,
-                        current_hash,
-                        trust_status,
-                    });
-                    if enabled
-                        && (source.bypass_hook_trust
-                            || matches!(
-                                trust_status,
-                                HookTrustStatus::Managed | HookTrustStatus::Trusted
-                            ))
-                    {
-                        handlers.push(ConfiguredHandler {
-                            event_name,
-                            matcher: matcher.map(ToOwned::to_owned),
-                            command,
-                            timeout_sec,
-                            status_message,
-                            source_path: source.path.clone(),
-                            source: source.source,
-                            display_order: *display_order,
-                            env: source.env.clone(),
-                        });
-                    }
-                    *display_order += 1;
-                }
-                HookHandlerConfig::Prompt {} => warnings.push(format!(
-                    "skipping prompt hook in {}: prompt hooks are not supported yet",
-                    source.path.display()
-                )),
-                HookHandlerConfig::Agent {} => warnings.push(format!(
-                    "skipping agent hook in {}: agent hooks are not supported yet",
-                    source.path.display()
-                )),
-            }
-        }
+    for group in groups {
+        append_group_handlers(
+            handlers,
+            warnings,
+            display_order,
+            source,
+            event_name,
+            matcher_pattern_for_event(event_name, group.matcher.as_deref()),
+            group.hooks,
+        );
     }
 }
 
-/// Hash a normalized, config-derived identity instead of source text so equivalent
-/// hooks from config TOML and hooks.json converge on the same trust identity.
-#[derive(Serialize)]
-struct NormalizedHookIdentity {
-    event_name: &'static str,
-    #[serde(flatten)]
-    group: MatcherGroup,
-}
-
-fn command_hook_hash(
+fn append_group_handlers(
+    handlers: &mut Vec<ConfiguredHandler>,
+    warnings: &mut Vec<String>,
+    display_order: &mut i64,
+    source: HookHandlerSource<'_>,
     event_name: codex_protocol::protocol::HookEventName,
     matcher: Option<&str>,
-    group: &MatcherGroup,
-    normalized_handler: HookHandlerConfig,
-) -> String {
-    let mut group = group.clone();
-    group.matcher = matcher.map(ToOwned::to_owned);
-    group.hooks = vec![normalized_handler];
-    let identity = NormalizedHookIdentity {
-        event_name: crate::hook_event_key_label(event_name),
-        group,
-    };
-    let Ok(value) = TomlValue::try_from(identity) else {
-        unreachable!("normalized hook identity should serialize to TOML");
-    };
-    version_for_toml(&value)
-}
+    group_handlers: Vec<HookHandlerConfig>,
+) {
+    if let Some(matcher) = matcher
+        && let Err(err) = validate_matcher_pattern(matcher)
+    {
+        warnings.push(format!(
+            "invalid matcher {matcher:?} in {}: {err}",
+            source.path.display()
+        ));
+        return;
+    }
 
-fn hook_trust_status(
-    is_managed: bool,
-    current_hash: &str,
-    trusted_hash: Option<&str>,
-) -> HookTrustStatus {
-    if is_managed {
-        HookTrustStatus::Managed
-    } else {
-        match trusted_hash {
-            Some(trusted_hash) if trusted_hash == current_hash => HookTrustStatus::Trusted,
-            Some(_) => HookTrustStatus::Modified,
-            None => HookTrustStatus::Untrusted,
+    for handler in group_handlers {
+        match handler {
+            HookHandlerConfig::Command {
+                command,
+                timeout_sec,
+                r#async,
+                status_message,
+            } => {
+                if r#async {
+                    warnings.push(format!(
+                        "skipping async hook in {}: async hooks are not supported yet",
+                        source.path.display()
+                    ));
+                    continue;
+                }
+                if command.trim().is_empty() {
+                    warnings.push(format!(
+                        "skipping empty hook command in {}",
+                        source.path.display()
+                    ));
+                    continue;
+                }
+                let timeout_sec = timeout_sec.unwrap_or(600).max(1);
+                handlers.push(ConfiguredHandler {
+                    event_name,
+                    is_managed: source.is_managed,
+                    matcher: matcher.map(ToOwned::to_owned),
+                    command,
+                    timeout_sec,
+                    status_message,
+                    source_path: source.path.clone(),
+                    source: source.source,
+                    display_order: *display_order,
+                });
+                *display_order += 1;
+            }
+            HookHandlerConfig::Prompt {} => warnings.push(format!(
+                "skipping prompt hook in {}: prompt hooks are not supported yet",
+                source.path.display()
+            )),
+            HookHandlerConfig::Agent {} => warnings.push(format!(
+                "skipping agent hook in {}: agent hooks are not supported yet",
+                source.path.display()
+            )),
         }
     }
 }
 
-fn hook_enabled(is_managed: bool, state: Option<&HookStateToml>) -> bool {
-    is_managed || state.and_then(|state| state.enabled) != Some(false)
-}
-
-fn hook_trusted_hash(is_managed: bool, state: Option<&HookStateToml>) -> Option<&str> {
-    (!is_managed)
-        .then(|| state.and_then(|state| state.trusted_hash.as_deref()))
-        .flatten()
-}
-
-fn hook_metadata_for_config_layer_source(source: &ConfigLayerSource) -> (HookSource, bool) {
+fn hook_source_for_config_layer_source(source: &ConfigLayerSource) -> HookSource {
     match source {
-        ConfigLayerSource::System { .. } => (HookSource::System, true),
-        ConfigLayerSource::User { .. } => (HookSource::User, false),
-        ConfigLayerSource::Project { .. } => (HookSource::Project, false),
-        ConfigLayerSource::Mdm { .. } => (HookSource::Mdm, true),
-        ConfigLayerSource::SessionFlags => (HookSource::SessionFlags, false),
+        ConfigLayerSource::System { .. } => HookSource::System,
+        ConfigLayerSource::User { .. } => HookSource::User,
+        ConfigLayerSource::Project { .. } => HookSource::Project,
+        ConfigLayerSource::Mdm { .. } => HookSource::Mdm,
+        ConfigLayerSource::SessionFlags => HookSource::SessionFlags,
         ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. } => {
-            (HookSource::LegacyManagedConfigFile, true)
+            HookSource::LegacyManagedConfigFile
         }
-        ConfigLayerSource::LegacyManagedConfigTomlFromMdm => {
-            (HookSource::LegacyManagedConfigMdm, true)
-        }
+        ConfigLayerSource::LegacyManagedConfigTomlFromMdm => HookSource::LegacyManagedConfigMdm,
     }
 }
 
@@ -606,16 +397,15 @@ fn hook_source_for_requirement_source(source: Option<&RequirementSource>) -> Hoo
         Some(RequirementSource::LegacyManagedConfigTomlFromMdm) => {
             HookSource::LegacyManagedConfigMdm
         }
-        Some(RequirementSource::CloudRequirements) => HookSource::CloudRequirements,
-        Some(RequirementSource::Unknown) | None => HookSource::Unknown,
+        Some(RequirementSource::CloudRequirements | RequirementSource::Unknown) | None => {
+            HookSource::Unknown
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use codex_config::ConfigLayerEntry;
     use codex_config::ConfigLayerSource;
-    use codex_config::HookEventsToml;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookSource;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -626,49 +416,21 @@ mod tests {
     use super::ConfiguredHandler;
     use super::append_matcher_groups;
     use codex_config::HookHandlerConfig;
-    use codex_config::HookStateToml;
     use codex_config::MatcherGroup;
-    use codex_config::TomlValue;
-    use codex_protocol::protocol::HookTrustStatus;
 
     fn source_path() -> AbsolutePathBuf {
         test_path_buf("/tmp/hooks.json").abs()
     }
 
     fn hook_source() -> HookSource {
-        HookSource::System
+        HookSource::User
     }
 
-    fn hook_handler_source<'a>(
-        path: &'a AbsolutePathBuf,
-        hook_states: &'a std::collections::HashMap<String, HookStateToml>,
-    ) -> super::HookHandlerSource<'a> {
+    fn hook_handler_source(path: &AbsolutePathBuf) -> super::HookHandlerSource<'_> {
         super::HookHandlerSource {
             path,
-            key_source: path.display().to_string(),
-            source: hook_source(),
-            is_managed: true,
-            bypass_hook_trust: false,
-            hook_states,
-            env: std::collections::HashMap::new(),
-            plugin_id: None,
-        }
-    }
-
-    fn unmanaged_hook_handler_source<'a>(
-        path: &'a AbsolutePathBuf,
-        hook_states: &'a std::collections::HashMap<String, HookStateToml>,
-        bypass_hook_trust: bool,
-    ) -> super::HookHandlerSource<'a> {
-        super::HookHandlerSource {
-            path,
-            key_source: path.display().to_string(),
-            source: HookSource::User,
             is_managed: false,
-            bypass_hook_trust,
-            hook_states,
-            env: std::collections::HashMap::new(),
-            plugin_id: None,
+            source: hook_source(),
         }
     }
 
@@ -677,7 +439,6 @@ mod tests {
             matcher: matcher.map(str::to_string),
             hooks: vec![HookHandlerConfig::Command {
                 command: "echo hello".to_string(),
-                command_windows: None,
                 timeout_sec: None,
                 r#async: false,
                 status_message: None,
@@ -691,14 +452,12 @@ mod tests {
         let mut warnings = Vec::new();
         let mut display_order = 0;
         let source_path = source_path();
-        let hook_states = std::collections::HashMap::new();
 
         append_matcher_groups(
             &mut handlers,
-            &mut Vec::new(),
             &mut warnings,
             &mut display_order,
-            &hook_handler_source(&source_path, &hook_states),
+            hook_handler_source(&source_path),
             HookEventName::UserPromptSubmit,
             vec![command_group(Some("["))],
         );
@@ -708,6 +467,7 @@ mod tests {
             handlers,
             vec![ConfiguredHandler {
                 event_name: HookEventName::UserPromptSubmit,
+                is_managed: false,
                 matcher: None,
                 command: "echo hello".to_string(),
                 timeout_sec: 600,
@@ -715,7 +475,6 @@ mod tests {
                 source_path: source_path.clone(),
                 source: hook_source(),
                 display_order: 0,
-                env: std::collections::HashMap::new(),
             }]
         );
     }
@@ -726,14 +485,12 @@ mod tests {
         let mut warnings = Vec::new();
         let mut display_order = 0;
         let source_path = source_path();
-        let hook_states = std::collections::HashMap::new();
 
         append_matcher_groups(
             &mut handlers,
-            &mut Vec::new(),
             &mut warnings,
             &mut display_order,
-            &hook_handler_source(&source_path, &hook_states),
+            hook_handler_source(&source_path),
             HookEventName::PreToolUse,
             vec![command_group(Some("^Bash$"))],
         );
@@ -743,6 +500,7 @@ mod tests {
             handlers,
             vec![ConfiguredHandler {
                 event_name: HookEventName::PreToolUse,
+                is_managed: false,
                 matcher: Some("^Bash$".to_string()),
                 command: "echo hello".to_string(),
                 timeout_sec: 600,
@@ -750,75 +508,8 @@ mod tests {
                 source_path: source_path.clone(),
                 source: hook_source(),
                 display_order: 0,
-                env: std::collections::HashMap::new(),
             }]
         );
-    }
-
-    #[test]
-    fn bypass_hook_trust_allows_enabled_untrusted_handlers() {
-        let mut handlers = Vec::new();
-        let mut hook_entries = Vec::new();
-        let mut warnings = Vec::new();
-        let mut display_order = 0;
-        let source_path = source_path();
-        let hook_states = std::collections::HashMap::new();
-
-        append_matcher_groups(
-            &mut handlers,
-            &mut hook_entries,
-            &mut warnings,
-            &mut display_order,
-            &unmanaged_hook_handler_source(
-                &source_path,
-                &hook_states,
-                /*bypass_hook_trust*/ true,
-            ),
-            HookEventName::PreToolUse,
-            vec![command_group(Some("Bash"))],
-        );
-
-        assert_eq!(warnings, Vec::<String>::new());
-        assert_eq!(handlers.len(), 1);
-        assert_eq!(hook_entries.len(), 1);
-        assert_eq!(hook_entries[0].trust_status, HookTrustStatus::Untrusted);
-        assert_eq!(hook_entries[0].enabled, true);
-    }
-
-    #[test]
-    fn bypass_hook_trust_respects_disabled_handlers() {
-        let mut handlers = Vec::new();
-        let mut hook_entries = Vec::new();
-        let mut warnings = Vec::new();
-        let mut display_order = 0;
-        let source_path = source_path();
-        let hook_states = std::collections::HashMap::from([(
-            format!("{}:pre_tool_use:0:0", source_path.display()),
-            HookStateToml {
-                enabled: Some(false),
-                trusted_hash: None,
-            },
-        )]);
-
-        append_matcher_groups(
-            &mut handlers,
-            &mut hook_entries,
-            &mut warnings,
-            &mut display_order,
-            &unmanaged_hook_handler_source(
-                &source_path,
-                &hook_states,
-                /*bypass_hook_trust*/ true,
-            ),
-            HookEventName::PreToolUse,
-            vec![command_group(Some("Bash"))],
-        );
-
-        assert_eq!(warnings, Vec::<String>::new());
-        assert_eq!(handlers, Vec::<ConfiguredHandler>::new());
-        assert_eq!(hook_entries.len(), 1);
-        assert_eq!(hook_entries[0].trust_status, HookTrustStatus::Untrusted);
-        assert_eq!(hook_entries[0].enabled, false);
     }
 
     #[test]
@@ -827,14 +518,12 @@ mod tests {
         let mut warnings = Vec::new();
         let mut display_order = 0;
         let source_path = source_path();
-        let hook_states = std::collections::HashMap::new();
 
         append_matcher_groups(
             &mut handlers,
-            &mut Vec::new(),
             &mut warnings,
             &mut display_order,
-            &hook_handler_source(&source_path, &hook_states),
+            hook_handler_source(&source_path),
             HookEventName::PreToolUse,
             vec![command_group(Some("*"))],
         );
@@ -850,14 +539,12 @@ mod tests {
         let mut warnings = Vec::new();
         let mut display_order = 0;
         let source_path = source_path();
-        let hook_states = std::collections::HashMap::new();
 
         append_matcher_groups(
             &mut handlers,
-            &mut Vec::new(),
             &mut warnings,
             &mut display_order,
-            &hook_handler_source(&source_path, &hook_states),
+            hook_handler_source(&source_path),
             HookEventName::PostToolUse,
             vec![command_group(Some("Edit|Write"))],
         );
@@ -869,142 +556,50 @@ mod tests {
     }
 
     #[test]
-    fn toml_hook_discovery_ignores_malformed_state_entries() {
-        let layer = ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: test_path_buf("/tmp/config.toml").abs(),
-                profile: None,
-            },
-            config_with_malformed_state_and_session_start_hook(),
-        );
-        let mut warnings = Vec::new();
-
-        let (_, hooks) = super::load_toml_hooks_from_layer(&layer, &mut warnings)
-            .expect("valid hook events should still load");
-
-        assert_eq!(warnings, Vec::<String>::new());
-        assert_eq!(
-            hooks,
-            HookEventsToml {
-                session_start: vec![MatcherGroup {
-                    matcher: None,
-                    hooks: vec![HookHandlerConfig::Command {
-                        command: "echo hello".to_string(),
-                        command_windows: None,
-                        timeout_sec: None,
-                        r#async: false,
-                        status_message: None,
-                    }],
-                }],
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn pre_tool_use_resolves_windows_command_override_during_discovery() {
-        let mut handlers = Vec::new();
-        let mut warnings = Vec::new();
-        let mut display_order = 0;
-        let source_path = source_path();
-        let hook_states = std::collections::HashMap::new();
-
-        append_matcher_groups(
-            &mut handlers,
-            &mut Vec::new(),
-            &mut warnings,
-            &mut display_order,
-            &hook_handler_source(&source_path, &hook_states),
-            HookEventName::PreToolUse,
-            vec![MatcherGroup {
-                matcher: Some("^Bash$".to_string()),
-                hooks: vec![HookHandlerConfig::Command {
-                    command: "echo unix".to_string(),
-                    command_windows: Some("echo windows".to_string()),
-                    timeout_sec: None,
-                    r#async: false,
-                    status_message: None,
-                }],
-            }],
-        );
-
-        assert_eq!(warnings, Vec::<String>::new());
-        assert_eq!(handlers.len(), 1);
-        assert_eq!(
-            handlers[0].command,
-            if cfg!(windows) {
-                "echo windows"
-            } else {
-                "echo unix"
-            }
-        );
-    }
-
-    fn config_with_malformed_state_and_session_start_hook() -> TomlValue {
-        serde_json::from_value(serde_json::json!({
-            "hooks": {
-                "state": {
-                    "some_key": {
-                        "enabled": "not a bool",
-                    },
-                },
-                "SessionStart": [{
-                    "hooks": [{
-                        "type": "command",
-                        "command": "echo hello",
-                    }],
-                }],
-            },
-        }))
-        .expect("config TOML should deserialize")
-    }
-
-    #[test]
-    fn hook_metadata_for_config_layer_source_discards_source_details() {
+    fn hook_source_for_config_layer_source_discards_source_details() {
         let config_file = test_path_buf("/tmp/.codex/config.toml").abs();
         let dot_codex_folder = test_path_buf("/tmp/worktree/.codex").abs();
 
         assert_eq!(
-            super::hook_metadata_for_config_layer_source(&ConfigLayerSource::System {
+            super::hook_source_for_config_layer_source(&ConfigLayerSource::System {
                 file: config_file.clone(),
             }),
-            (HookSource::System, true),
+            HookSource::System,
         );
         assert_eq!(
-            super::hook_metadata_for_config_layer_source(&ConfigLayerSource::User {
+            super::hook_source_for_config_layer_source(&ConfigLayerSource::User {
                 file: config_file.clone(),
-                profile: None,
             }),
-            (HookSource::User, false),
+            HookSource::User,
         );
         assert_eq!(
-            super::hook_metadata_for_config_layer_source(&ConfigLayerSource::Project {
+            super::hook_source_for_config_layer_source(&ConfigLayerSource::Project {
                 dot_codex_folder
             }),
-            (HookSource::Project, false),
+            HookSource::Project,
         );
         assert_eq!(
-            super::hook_metadata_for_config_layer_source(&ConfigLayerSource::Mdm {
+            super::hook_source_for_config_layer_source(&ConfigLayerSource::Mdm {
                 domain: "com.openai.codex".to_string(),
                 key: "config".to_string(),
             }),
-            (HookSource::Mdm, true),
+            HookSource::Mdm,
         );
         assert_eq!(
-            super::hook_metadata_for_config_layer_source(&ConfigLayerSource::SessionFlags),
-            (HookSource::SessionFlags, false),
+            super::hook_source_for_config_layer_source(&ConfigLayerSource::SessionFlags),
+            HookSource::SessionFlags,
         );
         assert_eq!(
-            super::hook_metadata_for_config_layer_source(
+            super::hook_source_for_config_layer_source(
                 &ConfigLayerSource::LegacyManagedConfigTomlFromFile { file: config_file },
             ),
-            (HookSource::LegacyManagedConfigFile, true),
+            HookSource::LegacyManagedConfigFile,
         );
         assert_eq!(
-            super::hook_metadata_for_config_layer_source(
+            super::hook_source_for_config_layer_source(
                 &ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
             ),
-            (HookSource::LegacyManagedConfigMdm, true),
+            HookSource::LegacyManagedConfigMdm,
         );
     }
 }

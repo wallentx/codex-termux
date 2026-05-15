@@ -1,5 +1,5 @@
 ---
-source: tui/src/chatwidget/tests/permissions.rs
+source: tui/src/chatwidget/tests.rs
 expression: popup
 ---
   Enable full access?

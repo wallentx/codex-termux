@@ -3,30 +3,27 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
-use codex_core::config::Config;
 use codex_core::config::Constrained;
+use codex_core::config_loader::ConfigLayerStack;
+use codex_core::config_loader::ConfigLayerStackOrdering;
+use codex_core::config_loader::NetworkConstraints;
+use codex_core::config_loader::NetworkRequirementsToml;
+use codex_core::config_loader::RequirementSource;
+use codex_core::config_loader::Sourced;
 use codex_features::Feature;
-use codex_plugin::PluginHookSource;
-use codex_plugin::PluginId;
 use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
-use codex_utils_absolute_path::AbsolutePathBuf;
-use core_test_support::hooks::trust_discovered_hooks;
-use core_test_support::hooks::trust_hooks;
-use core_test_support::managed_network_requirements_loader;
-use core_test_support::responses::ev_apply_patch_custom_tool_call;
+use core_test_support::responses::ev_apply_patch_function_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
@@ -55,41 +52,6 @@ const SECOND_CONTINUATION_PROMPT: &str = "Now tighten it to just: meow.";
 const BLOCKED_PROMPT_CONTEXT: &str = "Remember the blocked lighthouse note.";
 const PERMISSION_REQUEST_HOOK_MATCHER: &str = "^Bash$";
 const PERMISSION_REQUEST_ALLOW_REASON: &str = "should not be used for allow";
-
-fn restrictive_workspace_write_profile() -> PermissionProfile {
-    PermissionProfile::workspace_write_with(
-        &[],
-        NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ true,
-        /*exclude_slash_tmp*/ true,
-    )
-}
-
-fn network_workspace_write_profile() -> PermissionProfile {
-    PermissionProfile::workspace_write_with(
-        &[],
-        NetworkSandboxPolicy::Enabled,
-        /*exclude_tmpdir_env_var*/ false,
-        /*exclude_slash_tmp*/ false,
-    )
-}
-
-fn trust_plugin_hooks(config: &mut Config, plugin_hook_sources: Vec<PluginHookSource>) {
-    if let Err(err) = config.features.enable(Feature::CodexHooks) {
-        panic!("test config should allow feature update: {err}");
-    }
-    let listed = codex_hooks::list_hooks(codex_hooks::HooksConfig {
-        feature_enabled: true,
-        config_layer_stack: Some(config.config_layer_stack.clone()),
-        plugin_hook_sources,
-        ..codex_hooks::HooksConfig::default()
-    });
-    assert!(
-        !listed.hooks.is_empty(),
-        "trusted plugin hook fixture should discover at least one hook"
-    );
-    trust_hooks(config, listed.hooks);
-}
 
 fn write_stop_hook(home: &Path, block_prompts: &[&str]) -> Result<()> {
     let script_path = home.join("stop_hook.py");
@@ -261,22 +223,6 @@ if mode == "json_deny":
             "permissionDecisionReason": reason
         }}
     }}))
-elif mode == "context":
-    print(json.dumps({{
-        "hookSpecificOutput": {{
-            "hookEventName": "PreToolUse",
-            "additionalContext": reason
-        }}
-    }}))
-elif mode == "json_deny_with_context":
-    print(json.dumps({{
-        "hookSpecificOutput": {{
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-            "additionalContext": reason
-        }}
-    }}))
 elif mode == "exit_2":
     sys.stderr.write(reason + "\n")
     raise SystemExit(2)
@@ -304,54 +250,6 @@ elif mode == "exit_2":
     });
 
     fs::write(&script_path, script).context("write pre tool use hook script")?;
-    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
-    Ok(())
-}
-
-fn write_updating_pre_tool_use_hook(
-    home: &Path,
-    matcher: &str,
-    updated_input: &Value,
-) -> Result<()> {
-    let script_path = home.join("pre_tool_use_hook.py");
-    let log_path = home.join("pre_tool_use_hook_log.jsonl");
-    let updated_input_json =
-        serde_json::to_string(updated_input).context("serialize updated pre tool input")?;
-    let script = format!(
-        r#"import json
-from pathlib import Path
-import sys
-
-payload = json.load(sys.stdin)
-
-with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps(payload) + "\n")
-
-print(json.dumps({{
-    "hookSpecificOutput": {{
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "allow",
-        "updatedInput": {updated_input_json}
-    }}
-}}))
-"#,
-        log_path = log_path.display(),
-        updated_input_json = updated_input_json,
-    );
-    let hooks = serde_json::json!({
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": matcher,
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("python3 {}", script_path.display()),
-                    "statusMessage": "rewriting pre tool input",
-                }]
-            }]
-        }
-    });
-
-    fs::write(&script_path, script).context("write updating pre tool use hook script")?;
     fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
     Ok(())
 }
@@ -403,7 +301,7 @@ elif mode == "exit_2":
         .unwrap_or_default();
     let config_toml = format!(
         r#"[features]
-hooks = true
+codex_hooks = true
 
 [hooks]
 
@@ -673,38 +571,6 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
     Ok(())
 }
 
-fn write_session_start_hook_with_context(home: &Path, additional_context: &str) -> Result<()> {
-    let script_path = home.join("session_start_hook.py");
-    let additional_context_json = serde_json::to_string(additional_context)
-        .context("serialize session start additional context for test")?;
-    let script = format!(
-        r#"import json
-
-print(json.dumps({{
-    "hookSpecificOutput": {{
-        "hookEventName": "SessionStart",
-        "additionalContext": {additional_context_json}
-    }}
-}}))
-"#,
-    );
-    let hooks = serde_json::json!({
-        "hooks": {
-            "SessionStart": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("python3 {}", script_path.display()),
-                    "statusMessage": "running session start hook",
-                }]
-            }]
-        }
-    });
-
-    fs::write(&script_path, script).context("write session start hook script")?;
-    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
-    Ok(())
-}
-
 fn rollout_hook_prompt_texts(text: &str) -> Result<Vec<String>> {
     let mut texts = Vec::new();
     for line in text.lines() {
@@ -736,11 +602,6 @@ fn request_hook_prompt_texts(
         .into_iter()
         .filter_map(|text| parse_hook_prompt_fragment(&text).map(|fragment| fragment.text))
         .collect()
-}
-
-fn spilled_hook_output_path(text: &str) -> Option<&str> {
-    text.lines()
-        .find_map(|line| line.strip_prefix("Full hook output saved to: "))
 }
 
 fn read_stop_hook_inputs(home: &Path) -> Result<Vec<serde_json::Value>> {
@@ -871,7 +732,7 @@ fn request_message_input_texts(body: &[u8], role: &str) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_hook_can_block_multiple_times_in_same_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -907,7 +768,12 @@ async fn stop_hook_can_block_multiple_times_in_same_turn() -> Result<()> {
                 panic!("failed to write stop hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("hello from the sea").await?;
@@ -980,7 +846,7 @@ async fn stop_hook_can_block_multiple_times_in_same_turn() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_start_hook_sees_materialized_transcript_path() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1001,7 +867,12 @@ async fn session_start_hook_sees_materialized_transcript_path() -> Result<()> {
                 panic!("failed to write session start hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("hello").await?;
@@ -1020,163 +891,7 @@ async fn session_start_hook_sees_materialized_transcript_path() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn session_start_hook_spills_large_additional_context() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let response = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "hello from the reef"),
-            ev_completed("resp-1"),
-        ]),
-    )
-    .await;
-    let additional_context = "remember the reef ".repeat(800);
-
-    let mut builder = test_codex()
-        .with_pre_build_hook({
-            let additional_context = additional_context.clone();
-            move |home| {
-                if let Err(error) = write_session_start_hook_with_context(home, &additional_context)
-                {
-                    panic!("failed to write session start hook test fixture: {error}");
-                }
-            }
-        })
-        .with_config(trust_discovered_hooks);
-    let test = builder.build(&server).await?;
-
-    test.submit_turn("hello").await?;
-
-    let request = response.single_request();
-    let developer_messages = request.message_input_texts("developer");
-    let developer_message = developer_messages
-        .iter()
-        .find(|message| spilled_hook_output_path(message).is_some())
-        .context("spilled developer hook message")?;
-    assert!(developer_message.contains("tokens truncated"));
-    let path = spilled_hook_output_path(developer_message).context("spill path")?;
-    assert_eq!(fs::read_to_string(path)?, additional_context);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn pre_tool_use_hook_spills_large_additional_context() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let call_id = "pretooluse-shell-command-large-context";
-    let command = "printf pre-tool-output".to_string();
-    let args = serde_json::json!({ "command": command });
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                core_test_support::responses::ev_function_call(
-                    call_id,
-                    "shell_command",
-                    &serde_json::to_string(&args)?,
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "pre hook context observed"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-    let additional_context = "remember the pre tool reef ".repeat(800);
-
-    let mut builder = test_codex()
-        .with_pre_build_hook({
-            let additional_context = additional_context.clone();
-            move |home| {
-                if let Err(error) =
-                    write_pre_tool_use_hook(home, Some("^Bash$"), "context", &additional_context)
-                {
-                    panic!("failed to write pre tool use hook test fixture: {error}");
-                }
-            }
-        })
-        .with_config(trust_discovered_hooks);
-    let test = builder.build(&server).await?;
-
-    test.submit_turn("run the shell command with large pre hook context")
-        .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    let developer_messages = requests[1].message_input_texts("developer");
-    let developer_message = developer_messages
-        .iter()
-        .find(|message| spilled_hook_output_path(message).is_some())
-        .context("spilled developer hook message")?;
-    assert!(developer_message.contains("tokens truncated"));
-    let path = spilled_hook_output_path(developer_message).context("spill path")?;
-    assert_eq!(fs::read_to_string(path)?, additional_context);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn stop_hook_spills_large_continuation_prompt() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_assistant_message("msg-1", "draft one"),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-2", "draft two"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-    let continuation_prompt = std::iter::repeat_n("retry with the reef note", 800)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let mut builder = test_codex()
-        .with_pre_build_hook({
-            let continuation_prompt = continuation_prompt.clone();
-            move |home| {
-                if let Err(error) = write_stop_hook(home, &[&continuation_prompt]) {
-                    panic!("failed to write stop hook test fixture: {error}");
-                }
-            }
-        })
-        .with_config(trust_discovered_hooks);
-    let test = builder.build(&server).await?;
-
-    test.submit_turn("hello from the sea").await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    let hook_prompt_texts = request_hook_prompt_texts(&requests[1]);
-    assert_eq!(hook_prompt_texts.len(), 1);
-    let hook_prompt_text = &hook_prompt_texts[0];
-    assert!(hook_prompt_text.contains("tokens truncated"));
-    let path = spilled_hook_output_path(hook_prompt_text).context("spill path")?;
-    assert_eq!(fs::read_to_string(path)?, continuation_prompt);
-
-    Ok(())
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1204,7 +919,12 @@ async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()
                 panic!("failed to write stop hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let initial = initial_builder.build(&server).await?;
     let home = initial.home.clone();
     let rollout_path = initial
@@ -1227,7 +947,12 @@ async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()
     )
     .await;
 
-    let mut resume_builder = test_codex().with_config(trust_discovered_hooks);
+    let mut resume_builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::CodexHooks)
+            .expect("test config should allow feature update");
+    });
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
 
     resumed.submit_turn("and now continue").await?;
@@ -1242,7 +967,7 @@ async fn resumed_thread_keeps_stop_continuation_prompt_in_history() -> Result<()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiple_blocking_stop_hooks_persist_multiple_hook_prompt_fragments() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1273,7 +998,12 @@ async fn multiple_blocking_stop_hooks_persist_multiple_hook_prompt_fragments() -
                 panic!("failed to write parallel stop hook fixtures: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("hello again").await?;
@@ -1303,7 +1033,7 @@ async fn multiple_blocking_stop_hooks_persist_multiple_hook_prompt_fragments() -
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1326,7 +1056,12 @@ async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() 
                 panic!("failed to write user prompt submit hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("blocked first prompt").await?;
@@ -1381,7 +1116,7 @@ async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1428,7 +1163,12 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
                 panic!("failed to write user prompt submit hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build_with_streaming_server(&server).await?;
 
     test.codex
@@ -1541,7 +1281,7 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permission_request_hook_allows_shell_command_without_user_approval() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1577,15 +1317,20 @@ async fn permission_request_hook_allows_shell_command_without_user_approval() ->
                 panic!("failed to write permission request hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     fs::write(&marker, "seed").context("create permission request marker")?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "run the shell command after hook approval",
         AskForApproval::OnRequest,
-        PermissionProfile::Disabled,
+        codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -1615,7 +1360,7 @@ async fn permission_request_hook_allows_shell_command_without_user_approval() ->
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permission_request_hook_allows_apply_patch_with_write_alias() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1634,7 +1379,7 @@ async fn permission_request_hook_allows_apply_patch_with_write_alias() -> Result
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_apply_patch_custom_tool_call(call_id, &patch),
+                ev_apply_patch_function_call(call_id, &patch),
                 ev_completed("resp-1"),
             ]),
             sse(vec![
@@ -1658,21 +1403,31 @@ async fn permission_request_hook_allows_apply_patch_with_write_alias() -> Result
             }
         })
         .with_config(|config| {
-            trust_discovered_hooks(config);
+            config.include_apply_patch_tool = true;
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
         });
     let test = builder.build(&server).await?;
     let target_path = test.workspace_path(&patch_path);
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "apply the patch after hook approval",
         AskForApproval::OnRequest,
-        restrictive_workspace_write_profile(),
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![],
+            read_only_access: Default::default(),
+            network_access: false,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        },
     )
     .await?;
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    requests[1].custom_tool_call_output(call_id);
+    requests[1].function_call_output(call_id);
     assert!(
         target_path.exists(),
         "approved apply_patch should create the out-of-workspace file"
@@ -1688,7 +1443,7 @@ async fn permission_request_hook_allows_apply_patch_with_write_alias() -> Result
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1732,7 +1487,10 @@ async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()> {
         })
         .with_config(|config| {
             config.use_experimental_unified_exec_tool = true;
-            trust_discovered_hooks(config);
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
             config
                 .features
                 .enable(Feature::UnifiedExec)
@@ -1742,10 +1500,10 @@ async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()> {
 
     fs::write(&marker, "seed").context("create exec command permission request marker")?;
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "run the exec command after hook approval",
         AskForApproval::OnRequest,
-        PermissionProfile::read_only(),
+        codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
     )
     .await?;
 
@@ -1766,7 +1524,7 @@ async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permission_request_hook_allows_network_approval_without_prompt() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1806,8 +1564,14 @@ allow_local_binding = true
     .await;
 
     let approval_policy = AskForApproval::OnFailure;
-    let permission_profile = network_workspace_write_profile();
-    let permission_profile_for_config = permission_profile.clone();
+    let sandbox_policy = SandboxPolicy::WorkspaceWrite {
+        writable_roots: vec![],
+        read_only_access: Default::default(),
+        network_access: true,
+        exclude_tmpdir_env_var: false,
+        exclude_slash_tmp: false,
+    };
+    let sandbox_policy_for_config = sandbox_policy.clone();
     let test = test_codex()
         .with_home(Arc::clone(&home))
         .with_pre_build_hook(|home| {
@@ -1815,14 +1579,40 @@ allow_local_binding = true
                 panic!("failed to write permission request hook test fixture: {error}");
             }
         })
-        .with_cloud_requirements(managed_network_requirements_loader())
         .with_config(move |config| {
-            trust_discovered_hooks(config);
-            config.permissions.approval_policy = Constrained::allow_any(approval_policy);
             config
-                .permissions
-                .set_permission_profile(permission_profile_for_config)
-                .expect("set permission profile");
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+            config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+            config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+            let layers = config
+                .config_layer_stack
+                .get_layers(
+                    ConfigLayerStackOrdering::LowestPrecedenceFirst,
+                    /*include_disabled*/ true,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+            let mut requirements = config.config_layer_stack.requirements().clone();
+            requirements.network = Some(Sourced::new(
+                NetworkConstraints {
+                    enabled: Some(true),
+                    allow_local_binding: Some(true),
+                    ..Default::default()
+                },
+                RequirementSource::CloudRequirements,
+            ));
+            let mut requirements_toml = config.config_layer_stack.requirements_toml().clone();
+            requirements_toml.network = Some(NetworkRequirementsToml {
+                enabled: Some(true),
+                allow_local_binding: Some(true),
+                ..Default::default()
+            });
+            config.config_layer_stack =
+                ConfigLayerStack::new(layers, requirements, requirements_toml)
+                    .expect("rebuild config layer stack with network requirements");
         })
         .build(&server)
         .await?;
@@ -1839,10 +1629,10 @@ allow_local_binding = true
         .as_ref()
         .expect("expected runtime managed network proxy addresses");
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "run the shell command after network hook approval",
         approval_policy,
-        permission_profile,
+        sandbox_policy,
     )
     .await?;
 
@@ -1890,7 +1680,7 @@ allow_local_binding = true
 }
 
 #[cfg(not(target_os = "linux"))]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn permission_request_hook_sees_retry_context_after_sandbox_denial() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1926,15 +1716,20 @@ async fn permission_request_hook_sees_retry_context_after_sandbox_denial() -> Re
                 panic!("failed to write permission request hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
     let marker_path = test.workspace_path(marker);
     let _ = fs::remove_file(&marker_path);
 
-    test.submit_turn_with_approval_and_permission_profile(
+    test.submit_turn_with_policies(
         "retry the shell command after sandbox denial",
         AskForApproval::OnFailure,
-        PermissionProfile::read_only(),
+        codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
     )
     .await?;
 
@@ -1955,7 +1750,7 @@ async fn permission_request_hook_sees_retry_context_after_sandbox_denial() -> Re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1993,16 +1788,21 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
                 panic!("failed to write pre tool use hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     if marker.exists() {
         fs::remove_file(&marker).context("remove leftover pre tool use marker")?;
     }
 
-    test.submit_turn_with_permission_profile(
+    test.submit_turn_with_policy(
         "run the blocked shell command",
-        PermissionProfile::Disabled,
+        codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -2052,520 +1852,7 @@ async fn pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn pre_tool_use_records_additional_context_for_shell_command() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let call_id = "pretooluse-shell-command-context";
-    let command = "printf pre-tool-output".to_string();
-    let args = serde_json::json!({ "command": command });
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                core_test_support::responses::ev_function_call(
-                    call_id,
-                    "shell_command",
-                    &serde_json::to_string(&args)?,
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "pre hook context observed"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let pre_context = "Remember the bash pre-tool note.";
-    let mut builder = test_codex()
-        .with_pre_build_hook(|home| {
-            if let Err(error) =
-                write_pre_tool_use_hook(home, Some("^Bash$"), "context", pre_context)
-            {
-                panic!("failed to write pre tool use hook test fixture: {error}");
-            }
-        })
-        .with_config(trust_discovered_hooks);
-    let test = builder.build(&server).await?;
-
-    test.submit_turn("run the shell command with pre hook")
-        .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests[1]
-            .message_input_texts("developer")
-            .contains(&pre_context.to_string()),
-        "follow-up request should include pre tool use additional context",
-    );
-    let output_item = requests[1].function_call_output(call_id);
-    let output = output_item
-        .get("output")
-        .and_then(Value::as_str)
-        .expect("shell command output string");
-    assert!(
-        output.contains("pre-tool-output"),
-        "shell command output should still reach the model",
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn blocked_pre_tool_use_records_additional_context_for_shell_command() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let call_id = "pretooluse-shell-command-blocked-context";
-    let marker = std::env::temp_dir().join("pretooluse-shell-command-blocked-context-marker");
-    let command = format!("printf blocked > {}", marker.display());
-    let args = serde_json::json!({ "command": command });
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                core_test_support::responses::ev_function_call(
-                    call_id,
-                    "shell_command",
-                    &serde_json::to_string(&args)?,
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "blocked pre hook context observed"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let pre_context = "blocked by pre hook with context";
-    let mut builder = test_codex()
-        .with_pre_build_hook(|home| {
-            if let Err(error) =
-                write_pre_tool_use_hook(home, Some("^Bash$"), "json_deny_with_context", pre_context)
-            {
-                panic!("failed to write pre tool use hook test fixture: {error}");
-            }
-        })
-        .with_config(trust_discovered_hooks);
-    let test = builder.build(&server).await?;
-
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover pre tool use marker")?;
-    }
-
-    test.submit_turn_with_permission_profile(
-        "run the blocked shell command with pre hook context",
-        PermissionProfile::Disabled,
-    )
-    .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests[1]
-            .message_input_texts("developer")
-            .contains(&pre_context.to_string()),
-        "follow-up request should include blocked pre tool use additional context",
-    );
-    let output_item = requests[1].function_call_output(call_id);
-    let output = output_item
-        .get("output")
-        .and_then(Value::as_str)
-        .expect("shell command output string");
-    assert!(
-        output.contains("Command blocked by PreToolUse hook: blocked by pre hook with context"),
-        "blocked tool output should still surface the hook reason",
-    );
-    assert!(
-        !marker.exists(),
-        "blocked command should not create marker file"
-    );
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum BashRewriteSurface {
-    ExecCommand,
-    ShellCommand,
-}
-
-impl BashRewriteSurface {
-    fn slug(self) -> &'static str {
-        match self {
-            BashRewriteSurface::ExecCommand => "exec-command",
-            BashRewriteSurface::ShellCommand => "shell-command",
-        }
-    }
-
-    fn tool_call(self, call_id: &str, command_text: &str) -> Result<Value> {
-        match self {
-            BashRewriteSurface::ExecCommand => Ok(ev_function_call(
-                call_id,
-                "exec_command",
-                &serde_json::to_string(&serde_json::json!({ "cmd": command_text }))?,
-            )),
-            BashRewriteSurface::ShellCommand => Ok(ev_function_call(
-                call_id,
-                "shell_command",
-                &serde_json::to_string(&serde_json::json!({ "command": command_text }))?,
-            )),
-        }
-    }
-
-    fn original_command(self, marker: &Path) -> String {
-        match self {
-            BashRewriteSurface::ExecCommand | BashRewriteSurface::ShellCommand => {
-                format!("printf original > {}", marker.display())
-            }
-        }
-    }
-
-    fn rewritten_command(self, marker: &Path) -> String {
-        match self {
-            BashRewriteSurface::ExecCommand | BashRewriteSurface::ShellCommand => {
-                format!("printf rewritten > {}", marker.display())
-            }
-        }
-    }
-
-    fn configure(self, config: &mut Config) {
-        trust_discovered_hooks(config);
-        if matches!(self, BashRewriteSurface::ExecCommand) {
-            config.use_experimental_unified_exec_tool = true;
-            if let Err(error) = config.features.enable(Feature::UnifiedExec) {
-                panic!("test config should allow feature update: {error}");
-            }
-        }
-    }
-}
-
-async fn assert_pre_tool_use_rewrites_bash_surface(surface: BashRewriteSurface) -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let slug = surface.slug();
-    let call_id = format!("pretooluse-{slug}-rewrite");
-    let original_marker = std::env::temp_dir().join(format!("pretooluse-{slug}-original-marker"));
-    let rewritten_marker = std::env::temp_dir().join(format!("pretooluse-{slug}-rewritten-marker"));
-    let original_command = surface.original_command(&original_marker);
-    let rewritten_command = surface.rewritten_command(&rewritten_marker);
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                surface.tool_call(&call_id, &original_command)?,
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "hook rewrote it"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let updated_input = serde_json::json!({ "command": rewritten_command });
-    let mut builder = test_codex()
-        .with_pre_build_hook(move |home| {
-            if let Err(error) = write_updating_pre_tool_use_hook(home, "^Bash$", &updated_input) {
-                panic!("failed to write updating pre tool use hook fixture: {error}");
-            }
-        })
-        .with_config(move |config| surface.configure(config));
-    let test = builder.build(&server).await?;
-
-    if original_marker.exists() {
-        fs::remove_file(&original_marker).context("remove stale original pre tool marker")?;
-    }
-    if rewritten_marker.exists() {
-        fs::remove_file(&rewritten_marker).context("remove stale rewritten pre tool marker")?;
-    }
-
-    test.submit_turn_with_permission_profile(
-        &format!("run the rewritten {slug} command"),
-        PermissionProfile::Disabled,
-    )
-    .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    requests[1].function_call_output(&call_id);
-    assert!(
-        !original_marker.exists(),
-        "original {slug} command should not execute after rewrite"
-    );
-    assert_eq!(
-        fs::read_to_string(&rewritten_marker).context("read rewritten pre tool marker")?,
-        "rewritten"
-    );
-
-    let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
-    assert_eq!(hook_inputs.len(), 1);
-    assert_eq!(hook_inputs[0]["tool_input"]["command"], original_command);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn pre_tool_use_rewrites_shell_command_before_execution() -> Result<()> {
-    assert_pre_tool_use_rewrites_bash_surface(BashRewriteSurface::ShellCommand).await
-}
-
-#[tokio::test]
-async fn pre_tool_use_rewrites_exec_command_before_execution() -> Result<()> {
-    assert_pre_tool_use_rewrites_bash_surface(BashRewriteSurface::ExecCommand).await
-}
-
-#[tokio::test]
-async fn pre_tool_use_rewrites_code_mode_nested_exec_command_before_execution() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let call_id = "pretooluse-code-mode-rewrite";
-    let original_marker = std::env::temp_dir().join("pretooluse-code-mode-original-marker");
-    let rewritten_marker = std::env::temp_dir().join("pretooluse-code-mode-rewritten-marker");
-    let original_command = format!("printf original > {}", original_marker.display());
-    let rewritten_command = format!("printf rewritten > {}", rewritten_marker.display());
-    let original_command_json =
-        serde_json::to_string(&original_command).context("serialize original command")?;
-    let code = format!(
-        r#"
-const output = await tools.exec_command({{ cmd: {original_command_json} }});
-text(output.output);
-"#
-    );
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_custom_tool_call(call_id, "exec", &code),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "hook rewrote the nested command"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let updated_input = serde_json::json!({ "command": rewritten_command });
-    let mut builder = test_codex()
-        .with_model("test-gpt-5.1-codex")
-        .with_pre_build_hook(move |home| {
-            if let Err(error) = write_updating_pre_tool_use_hook(home, "^Bash$", &updated_input) {
-                panic!("failed to write updating pre tool use hook fixture: {error}");
-            }
-        })
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::CodeMode);
-            trust_discovered_hooks(config);
-        });
-    let test = builder.build(&server).await?;
-
-    if original_marker.exists() {
-        fs::remove_file(&original_marker).context("remove stale original pre tool marker")?;
-    }
-    if rewritten_marker.exists() {
-        fs::remove_file(&rewritten_marker).context("remove stale rewritten pre tool marker")?;
-    }
-
-    test.submit_turn_with_permission_profile(
-        "run the rewritten shell command from code mode",
-        PermissionProfile::Disabled,
-    )
-    .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    requests[1].custom_tool_call_output(call_id);
-    assert!(
-        !original_marker.exists(),
-        "original nested shell command should not execute after rewrite"
-    );
-    assert_eq!(
-        fs::read_to_string(&rewritten_marker)
-            .context("read rewritten code mode pre tool marker")?,
-        "rewritten"
-    );
-
-    let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
-    assert_eq!(hook_inputs.len(), 1);
-    assert_eq!(hook_inputs[0]["tool_input"]["command"], original_command);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn plugin_pre_tool_use_blocks_shell_command_before_execution() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let call_id = "plugin-pretooluse-shell-command";
-    let marker = std::env::temp_dir().join("plugin-pretooluse-shell-command-marker");
-    let command = format!("printf blocked > {}", marker.display());
-    let args = serde_json::json!({ "command": command });
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                core_test_support::responses::ev_function_call(
-                    call_id,
-                    "shell_command",
-                    &serde_json::to_string(&args)?,
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "plugin hook blocked it"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let home = Arc::new(TempDir::new()?);
-    let plugin_root = home.path().join("plugins/cache/test/sample/local");
-    let hooks_dir = plugin_root.join("hooks");
-    fs::create_dir_all(plugin_root.join(".codex-plugin"))
-        .context("create plugin manifest directory")?;
-    fs::create_dir_all(&hooks_dir).context("create plugin hooks directory")?;
-    fs::write(
-        plugin_root.join(".codex-plugin/plugin.json"),
-        r#"{"name":"sample"}"#,
-    )
-    .context("write plugin manifest")?;
-    fs::write(
-        home.path().join("config.toml"),
-        r#"[plugins."sample@test"]
-enabled = true
-"#,
-    )
-    .context("write plugin config")?;
-
-    let script_path = hooks_dir.join("pre_tool_use_hook.py");
-    let log_path = hooks_dir.join("pre_tool_use_hook_log.jsonl");
-    fs::write(
-        &script_path,
-        format!(
-            r#"import json
-from pathlib import Path
-import sys
-
-payload = json.load(sys.stdin)
-with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps(payload) + "\n")
-
-print(json.dumps({{
-    "hookSpecificOutput": {{
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": "blocked by plugin hook"
-    }}
-}}))
-"#,
-            log_path = log_path.display(),
-        ),
-    )
-    .context("write plugin pre tool use hook script")?;
-    let plugin_hooks_json = r#"{
-  "hooks": {
-    "PreToolUse": [{
-      "matcher": "^Bash$",
-      "hooks": [{
-        "type": "command",
-        "command": "python3 ${PLUGIN_ROOT}/hooks/pre_tool_use_hook.py"
-      }]
-    }]
-  }
-}"#;
-    let plugin_hooks_path = hooks_dir.join("hooks.json");
-    fs::write(&plugin_hooks_path, plugin_hooks_json).context("write plugin hooks config")?;
-    let plugin_root_abs =
-        AbsolutePathBuf::try_from(plugin_root.clone()).context("absolute plugin root")?;
-    let plugin_hooks_path_abs =
-        AbsolutePathBuf::try_from(plugin_hooks_path).context("absolute plugin hooks path")?;
-    let plugin_data_root =
-        AbsolutePathBuf::try_from(plugin_root.join("data")).context("absolute plugin data root")?;
-    let plugin_hook_sources = vec![PluginHookSource {
-        plugin_id: PluginId::parse("sample@test").context("plugin id")?,
-        plugin_root: plugin_root_abs,
-        plugin_data_root,
-        source_path: plugin_hooks_path_abs,
-        source_relative_path: "hooks/hooks.json".to_string(),
-        hooks: serde_json::from_str::<codex_config::HooksFile>(plugin_hooks_json)
-            .context("parse plugin hooks")?
-            .hooks,
-    }];
-
-    let mut builder = test_codex()
-        .with_home(Arc::clone(&home))
-        .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::Plugins)
-                .expect("test config should allow feature update");
-            trust_plugin_hooks(config, plugin_hook_sources);
-            config
-                .features
-                .enable(Feature::PluginHooks)
-                .expect("test config should allow feature update");
-        });
-    let test = builder.build(&server).await?;
-
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover plugin pre tool use marker")?;
-    }
-
-    test.submit_turn_with_policy(
-        "run the shell command blocked by a plugin hook",
-        codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
-    )
-    .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    let output_item = requests[1].function_call_output(call_id);
-    let output = output_item
-        .get("output")
-        .and_then(Value::as_str)
-        .expect("shell command output string");
-    assert!(
-        output.contains("Command blocked by PreToolUse hook: blocked by plugin hook"),
-        "blocked tool output should surface the plugin hook reason",
-    );
-    assert!(
-        !marker.exists(),
-        "plugin hook should block shell command execution"
-    );
-
-    let hook_inputs = read_hook_inputs_from_log(&log_path)?;
-    assert_eq!(hook_inputs.len(), 1);
-    assert_eq!(hook_inputs[0]["hook_event_name"], "PreToolUse");
-    assert_eq!(hook_inputs[0]["tool_name"], "Bash");
-    assert_eq!(hook_inputs[0]["tool_use_id"], call_id);
-    assert_eq!(hook_inputs[0]["tool_input"]["command"], command);
-
-    Ok(())
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_tool_use_blocks_shell_when_defined_in_config_toml() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2595,29 +1882,27 @@ async fn pre_tool_use_blocks_shell_when_defined_in_config_toml() -> Result<()> {
     )
     .await;
 
-    let mut builder = test_codex()
-        .with_pre_build_hook(|home| {
-            if let Err(error) = write_pre_tool_use_hook_toml(
-                home,
-                "pre_tool_use_config_hook.py",
-                "pre_tool_use_config_hook_log.jsonl",
-                Some("^Bash$"),
-                "json_deny",
-                "blocked by config toml hook",
-            ) {
-                panic!("failed to write config.toml hook test fixture: {error}");
-            }
-        })
-        .with_config(trust_discovered_hooks);
+    let mut builder = test_codex().with_pre_build_hook(|home| {
+        if let Err(error) = write_pre_tool_use_hook_toml(
+            home,
+            "pre_tool_use_config_hook.py",
+            "pre_tool_use_config_hook_log.jsonl",
+            Some("^Bash$"),
+            "json_deny",
+            "blocked by config toml hook",
+        ) {
+            panic!("failed to write config.toml hook test fixture: {error}");
+        }
+    });
     let test = builder.build(&server).await?;
 
     if marker.exists() {
         fs::remove_file(&marker).context("remove leftover config.toml marker")?;
     }
 
-    test.submit_turn_with_permission_profile(
+    test.submit_turn_with_policy(
         "run the blocked shell command from config toml",
-        PermissionProfile::Disabled,
+        codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
     )
     .await?;
 
@@ -2650,7 +1935,7 @@ async fn pre_tool_use_blocks_shell_when_defined_in_config_toml() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_tool_use_merges_hooks_json_and_config_toml() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2679,23 +1964,21 @@ async fn pre_tool_use_merges_hooks_json_and_config_toml() -> Result<()> {
     )
     .await;
 
-    let mut builder = test_codex()
-        .with_pre_build_hook(|home| {
-            if let Err(error) = write_pre_tool_use_hook(home, Some("^Bash$"), "allow", "unused") {
-                panic!("failed to write hooks.json hook fixture: {error}");
-            }
-            if let Err(error) = write_pre_tool_use_hook_toml(
-                home,
-                "pre_tool_use_toml_hook.py",
-                "pre_tool_use_toml_hook_log.jsonl",
-                Some("^Bash$"),
-                "allow",
-                "unused",
-            ) {
-                panic!("failed to write config.toml hook fixture: {error}");
-            }
-        })
-        .with_config(trust_discovered_hooks);
+    let mut builder = test_codex().with_pre_build_hook(|home| {
+        if let Err(error) = write_pre_tool_use_hook(home, Some("^Bash$"), "allow", "unused") {
+            panic!("failed to write hooks.json hook fixture: {error}");
+        }
+        if let Err(error) = write_pre_tool_use_hook_toml(
+            home,
+            "pre_tool_use_toml_hook.py",
+            "pre_tool_use_toml_hook_log.jsonl",
+            Some("^Bash$"),
+            "allow",
+            "unused",
+        ) {
+            panic!("failed to write config.toml hook fixture: {error}");
+        }
+    });
     let test = builder.build(&server).await?;
 
     test.submit_turn("run the shell command with merged hook sources")
@@ -2753,7 +2036,101 @@ async fn pre_tool_use_merges_hooks_json_and_config_toml() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_tool_use_blocks_local_shell_before_execution() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let call_id = "pretooluse-local-shell";
+    let marker = std::env::temp_dir().join("pretooluse-local-shell-marker");
+    let command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("printf blocked > {}", marker.display()),
+    ];
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                core_test_support::responses::ev_local_shell_call(
+                    call_id,
+                    "completed",
+                    command.iter().map(String::as_str).collect(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "local shell blocked"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) =
+                write_pre_tool_use_hook(home, Some("^Bash$"), "json_deny", "blocked local shell")
+            {
+                panic!("failed to write pre tool use hook test fixture: {error}");
+            }
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    if marker.exists() {
+        fs::remove_file(&marker).context("remove leftover local shell marker")?;
+    }
+
+    test.submit_turn("run the blocked local shell command")
+        .await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let output_item = requests[1].function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("local shell output string");
+    assert!(
+        output.contains("Command blocked by PreToolUse hook: blocked local shell"),
+        "blocked local shell output should surface the hook reason",
+    );
+    assert!(
+        output.contains(&format!(
+            "Command: {}",
+            codex_shell_command::parse_command::shlex_join(&command)
+        )),
+        "blocked local shell output should surface the blocked command",
+    );
+    assert!(
+        !marker.exists(),
+        "blocked local shell command should not execute"
+    );
+
+    let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
+    assert_eq!(hook_inputs.len(), 1);
+    assert_eq!(
+        hook_inputs[0]["tool_input"]["command"],
+        codex_shell_command::parse_command::shlex_join(&command),
+    );
+    assert!(
+        hook_inputs[0]["turn_id"]
+            .as_str()
+            .is_some_and(|turn_id| !turn_id.is_empty())
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_tool_use_blocks_exec_command_before_execution() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2793,7 +2170,10 @@ async fn pre_tool_use_blocks_exec_command_before_execution() -> Result<()> {
         })
         .with_config(|config| {
             config.use_experimental_unified_exec_tool = true;
-            trust_discovered_hooks(config);
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
             config
                 .features
                 .enable(Feature::UnifiedExec)
@@ -2837,7 +2217,7 @@ async fn pre_tool_use_blocks_exec_command_before_execution() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_tool_use_blocks_apply_patch_before_execution() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2855,7 +2235,7 @@ async fn pre_tool_use_blocks_apply_patch_before_execution() -> Result<()> {
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_apply_patch_custom_tool_call(call_id, &patch),
+                ev_apply_patch_function_call(call_id, &patch),
                 ev_completed("resp-1"),
             ]),
             sse(vec![
@@ -2879,7 +2259,11 @@ async fn pre_tool_use_blocks_apply_patch_before_execution() -> Result<()> {
             }
         })
         .with_config(|config| {
-            trust_discovered_hooks(config);
+            config.include_apply_patch_tool = true;
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
         });
     let test = builder.build(&server).await?;
 
@@ -2887,7 +2271,7 @@ async fn pre_tool_use_blocks_apply_patch_before_execution() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    let output_item = requests[1].custom_tool_call_output(call_id);
+    let output_item = requests[1].function_call_output(call_id);
     let output = output_item
         .get("output")
         .and_then(Value::as_str)
@@ -2910,80 +2294,7 @@ async fn pre_tool_use_blocks_apply_patch_before_execution() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn pre_tool_use_rewrites_apply_patch_before_execution() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let call_id = "pretooluse-apply-patch-rewrite";
-    let original_file = "pre_tool_use_apply_patch_original.txt";
-    let rewritten_file = "pre_tool_use_apply_patch_rewritten.txt";
-    let original_patch = format!(
-        r#"*** Begin Patch
-*** Add File: {original_file}
-+original
-*** End Patch"#
-    );
-    let rewritten_patch = format!(
-        r#"*** Begin Patch
-*** Add File: {rewritten_file}
-+rewritten
-*** End Patch"#
-    );
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_apply_patch_custom_tool_call(call_id, &original_patch),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "apply_patch rewritten"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    let updated_input = serde_json::json!({ "command": rewritten_patch });
-    let mut builder = test_codex()
-        .with_pre_build_hook(move |home| {
-            if let Err(error) =
-                write_updating_pre_tool_use_hook(home, "^apply_patch$", &updated_input)
-            {
-                panic!("failed to write updating pre tool use hook fixture: {error}");
-            }
-        })
-        .with_config(|config| {
-            trust_discovered_hooks(config);
-        });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn("apply the rewritten patch").await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    requests[1].custom_tool_call_output(call_id);
-    assert!(
-        !test.workspace_path(original_file).exists(),
-        "original patch should not create its target file"
-    );
-    assert_eq!(
-        fs::read_to_string(test.workspace_path(rewritten_file))
-            .context("read rewritten apply_patch file")?,
-        "rewritten\n"
-    );
-
-    let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
-    assert_eq!(hook_inputs.len(), 1);
-    assert_eq!(hook_inputs[0]["tool_input"]["command"], original_patch);
-
-    Ok(())
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_tool_use_blocks_apply_patch_with_write_alias() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3001,7 +2312,7 @@ async fn pre_tool_use_blocks_apply_patch_with_write_alias() -> Result<()> {
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_apply_patch_custom_tool_call(call_id, &patch),
+                ev_apply_patch_function_call(call_id, &patch),
                 ev_completed("resp-1"),
             ]),
             sse(vec![
@@ -3022,7 +2333,11 @@ async fn pre_tool_use_blocks_apply_patch_with_write_alias() -> Result<()> {
             }
         })
         .with_config(|config| {
-            trust_discovered_hooks(config);
+            config.include_apply_patch_tool = true;
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
         });
     let test = builder.build(&server).await?;
 
@@ -3031,7 +2346,7 @@ async fn pre_tool_use_blocks_apply_patch_with_write_alias() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    let output_item = requests[1].custom_tool_call_output(call_id);
+    let output_item = requests[1].function_call_output(call_id);
     let output = output_item
         .get("output")
         .and_then(Value::as_str)
@@ -3054,7 +2369,7 @@ async fn pre_tool_use_blocks_apply_patch_with_write_alias() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_tool_use_does_not_fire_for_plan_tool() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3095,7 +2410,12 @@ async fn pre_tool_use_does_not_fire_for_plan_tool() -> Result<()> {
                 panic!("failed to write pre tool use hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("update the plan").await?;
@@ -3121,7 +2441,7 @@ async fn pre_tool_use_does_not_fire_for_plan_tool() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_tool_use_records_additional_context_for_shell_command() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3159,7 +2479,12 @@ async fn post_tool_use_records_additional_context_for_shell_command() -> Result<
                 panic!("failed to write post tool use hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("run the shell command with post hook")
@@ -3213,7 +2538,7 @@ async fn post_tool_use_records_additional_context_for_shell_command() -> Result<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_tool_use_block_decision_replaces_shell_command_output_with_reason() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3251,7 +2576,12 @@ async fn post_tool_use_block_decision_replaces_shell_command_output_with_reason(
                 panic!("failed to write post tool use hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("run the shell command with blocking post hook")
@@ -3276,7 +2606,7 @@ async fn post_tool_use_block_decision_replaces_shell_command_output_with_reason(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_tool_use_continue_false_replaces_shell_command_output_with_stop_reason() -> Result<()>
 {
     skip_if_no_network!(Ok(()));
@@ -3315,7 +2645,12 @@ async fn post_tool_use_continue_false_replaces_shell_command_output_with_stop_re
                 panic!("failed to write post tool use hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("run the shell command with stop-style post hook")
@@ -3340,7 +2675,81 @@ async fn post_tool_use_continue_false_replaces_shell_command_output_with_stop_re
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_tool_use_records_additional_context_for_local_shell() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let call_id = "posttooluse-local-shell";
+    let command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "printf local-post-tool-output".to_string(),
+    ];
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                core_test_support::responses::ev_local_shell_call(
+                    call_id,
+                    "completed",
+                    command.iter().map(String::as_str).collect(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "local shell post hook context observed"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let post_context = "Remember the local shell post-tool note.";
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) =
+                write_post_tool_use_hook(home, Some("^Bash$"), "context", post_context)
+            {
+                panic!("failed to write post tool use hook test fixture: {error}");
+            }
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("run the local shell command with post hook")
+        .await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .message_input_texts("developer")
+            .contains(&post_context.to_string()),
+        "follow-up request should include local shell post tool use additional context",
+    );
+    let hook_inputs = read_post_tool_use_hook_inputs(test.codex_home_path())?;
+    assert_eq!(hook_inputs.len(), 1);
+    assert_eq!(
+        hook_inputs[0]["tool_input"]["command"],
+        codex_shell_command::parse_command::shlex_join(&command),
+    );
+    assert_eq!(
+        hook_inputs[0]["tool_response"],
+        Value::String("local-post-tool-output".to_string()),
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_tool_use_exit_two_replaces_one_shot_exec_command_output_with_feedback() -> Result<()>
 {
     skip_if_no_network!(Ok(()));
@@ -3380,7 +2789,10 @@ async fn post_tool_use_exit_two_replaces_one_shot_exec_command_output_with_feedb
         })
         .with_config(|config| {
             config.use_experimental_unified_exec_tool = true;
-            trust_discovered_hooks(config);
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
             config
                 .features
                 .enable(Feature::UnifiedExec)
@@ -3412,75 +2824,7 @@ async fn post_tool_use_exit_two_replaces_one_shot_exec_command_output_with_feedb
     Ok(())
 }
 
-#[tokio::test]
-async fn post_tool_use_spills_large_feedback_message() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let call_id = "posttooluse-large-feedback";
-    let command = "printf post-hook-output".to_string();
-    let args = serde_json::json!({ "cmd": command, "tty": false });
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                core_test_support::responses::ev_function_call(
-                    call_id,
-                    "exec_command",
-                    &serde_json::to_string(&args)?,
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "post hook blocked the exec result"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-    let feedback = "blocked by post hook ".repeat(800);
-
-    let mut builder = test_codex()
-        .with_pre_build_hook({
-            let feedback = feedback.clone();
-            move |home| {
-                if let Err(error) =
-                    write_post_tool_use_hook(home, Some("^Bash$"), "exit_2", &feedback)
-                {
-                    panic!("failed to write post tool use hook test fixture: {error}");
-                }
-            }
-        })
-        .with_config(|config| {
-            config.use_experimental_unified_exec_tool = true;
-            trust_discovered_hooks(config);
-            config
-                .features
-                .enable(Feature::UnifiedExec)
-                .expect("test config should allow feature update");
-        });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn("run the exec command with long post-hook feedback")
-        .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    let output_item = requests[1].function_call_output(call_id);
-    let output = output_item
-        .get("output")
-        .and_then(Value::as_str)
-        .expect("exec command output string");
-    assert!(output.contains("tokens truncated"));
-    let path = spilled_hook_output_path(output).context("spill path")?;
-    assert_eq!(fs::read_to_string(path)?, feedback.trim());
-
-    Ok(())
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_tool_use_blocks_when_exec_session_completes_via_write_stdin() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_windows!(Ok(()));
@@ -3540,7 +2884,10 @@ async fn post_tool_use_blocks_when_exec_session_completes_via_write_stdin() -> R
         })
         .with_config(|config| {
             config.use_experimental_unified_exec_tool = true;
-            trust_discovered_hooks(config);
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
             config
                 .features
                 .enable(Feature::UnifiedExec)
@@ -3583,7 +2930,7 @@ async fn post_tool_use_blocks_when_exec_session_completes_via_write_stdin() -> R
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_tool_use_records_additional_context_for_apply_patch() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3601,7 +2948,7 @@ async fn post_tool_use_records_additional_context_for_apply_patch() -> Result<()
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_apply_patch_custom_tool_call(call_id, &patch),
+                ev_apply_patch_function_call(call_id, &patch),
                 ev_completed("resp-1"),
             ]),
             sse(vec![
@@ -3623,7 +2970,11 @@ async fn post_tool_use_records_additional_context_for_apply_patch() -> Result<()
             }
         })
         .with_config(|config| {
-            trust_discovered_hooks(config);
+            config.include_apply_patch_tool = true;
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
         });
     let test = builder.build(&server).await?;
 
@@ -3670,7 +3021,7 @@ async fn post_tool_use_records_additional_context_for_apply_patch() -> Result<()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_tool_use_records_apply_patch_context_with_edit_alias() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3688,7 +3039,7 @@ async fn post_tool_use_records_apply_patch_context_with_edit_alias() -> Result<(
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_apply_patch_custom_tool_call(call_id, &patch),
+                ev_apply_patch_function_call(call_id, &patch),
                 ev_completed("resp-1"),
             ]),
             sse(vec![
@@ -3710,7 +3061,11 @@ async fn post_tool_use_records_apply_patch_context_with_edit_alias() -> Result<(
             }
         })
         .with_config(|config| {
-            trust_discovered_hooks(config);
+            config.include_apply_patch_tool = true;
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
         });
     let test = builder.build(&server).await?;
 
@@ -3739,7 +3094,7 @@ async fn post_tool_use_records_apply_patch_context_with_edit_alias() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_tool_use_does_not_fire_for_plan_tool() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3783,7 +3138,12 @@ async fn post_tool_use_does_not_fire_for_plan_tool() -> Result<()> {
                 panic!("failed to write post tool use hook test fixture: {error}");
             }
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build(&server).await?;
 
     test.submit_turn("update the plan").await?;

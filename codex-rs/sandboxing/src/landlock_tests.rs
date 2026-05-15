@@ -52,16 +52,20 @@ fn proxy_flag_is_included_when_requested() {
 }
 
 #[test]
-fn permission_profile_flag_is_included() {
+fn split_policy_flags_are_included() {
     let command = vec!["/bin/true".to_string()];
     let command_cwd = Path::new("/tmp/link");
     let cwd = Path::new("/tmp");
-    let permission_profile = PermissionProfile::read_only();
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+    let file_system_sandbox_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
+    let network_sandbox_policy = NetworkSandboxPolicy::from(&sandbox_policy);
 
-    let args = create_linux_sandbox_command_args_for_permission_profile(
+    let args = create_linux_sandbox_command_args_for_policies(
         command,
         command_cwd,
-        &permission_profile,
+        &sandbox_policy,
+        &file_system_sandbox_policy,
+        network_sandbox_policy,
         cwd,
         /*use_legacy_landlock*/ true,
         /*allow_network_for_proxy*/ false,
@@ -69,7 +73,12 @@ fn permission_profile_flag_is_included() {
 
     assert_eq!(
         args.windows(2)
-            .any(|window| { window[0] == "--permission-profile" && !window[1].is_empty() }),
+            .any(|window| { window[0] == "--file-system-sandbox-policy" && !window[1].is_empty() }),
+        true
+    );
+    assert_eq!(
+        args.windows(2)
+            .any(|window| window[0] == "--network-sandbox-policy" && window[1] == "\"restricted\""),
         true
     );
     assert_eq!(
