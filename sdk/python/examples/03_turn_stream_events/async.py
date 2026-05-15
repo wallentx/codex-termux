@@ -16,14 +16,12 @@ ensure_local_sdk_src()
 
 import asyncio
 
-from openai_codex import AsyncCodex, TextInput
+from codex_app_server import AsyncCodex, TextInput
 
 
 async def main() -> None:
     async with AsyncCodex(config=runtime_config()) as codex:
-        thread = await codex.thread_start(
-            model="gpt-5.4", config={"model_reasoning_effort": "high"}
-        )
+        thread = await codex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})
         turn = await thread.turn(TextInput("Explain SIMD in 3 short bullets."))
 
         event_count = 0
@@ -46,9 +44,7 @@ async def main() -> None:
                     saw_delta = True
                 continue
             if event.method == "turn/completed":
-                completed_status = getattr(
-                    event.payload.turn.status, "value", str(event.payload.turn.status)
-                )
+                completed_status = getattr(event.payload.turn.status, "value", str(event.payload.turn.status))
 
         if saw_delta:
             print()

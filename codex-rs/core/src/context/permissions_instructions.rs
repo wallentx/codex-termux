@@ -2,12 +2,11 @@ use super::ContextualUserFragment;
 use codex_execpolicy::Policy;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::format_allow_prefixes;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::NetworkAccess;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::WritableRoot;
 use codex_utils_template::Template;
 use std::path::Path;
@@ -58,9 +57,9 @@ pub struct PermissionsInstructions {
 }
 
 impl PermissionsInstructions {
-    /// Builds permissions instructions from the effective permission profile and approval policy.
-    pub fn from_permission_profile(
-        permission_profile: &PermissionProfile,
+    /// Builds permissions instructions from the effective sandbox and approval policy.
+    pub fn from_policy(
+        sandbox_policy: &SandboxPolicy,
         approval_policy: AskForApproval,
         approvals_reviewer: ApprovalsReviewer,
         exec_policy: &Policy,
@@ -68,11 +67,25 @@ impl PermissionsInstructions {
         exec_permission_approvals_enabled: bool,
         request_permissions_tool_enabled: bool,
     ) -> Self {
-        let (sandbox_mode, writable_roots) = sandbox_prompt_from_profile(permission_profile, cwd);
+        let network_access = if sandbox_policy.has_full_network_access() {
+            NetworkAccess::Enabled
+        } else {
+            NetworkAccess::Restricted
+        };
+
+        let (sandbox_mode, writable_roots) = match sandbox_policy {
+            SandboxPolicy::DangerFullAccess => (SandboxMode::DangerFullAccess, None),
+            SandboxPolicy::ReadOnly { .. } => (SandboxMode::ReadOnly, None),
+            SandboxPolicy::ExternalSandbox { .. } => (SandboxMode::DangerFullAccess, None),
+            SandboxPolicy::WorkspaceWrite { .. } => {
+                let roots = sandbox_policy.get_writable_roots_with_cwd(cwd);
+                (SandboxMode::WorkspaceWrite, Some(roots))
+            }
+        };
 
         Self::from_permissions_with_network(
             sandbox_mode,
-            network_access_from_policy(permission_profile.network_sandbox_policy()),
+            network_access,
             PermissionsPromptConfig {
                 approval_policy,
                 approvals_reviewer,
@@ -109,38 +122,6 @@ impl PermissionsInstructions {
             text.push('\n');
         }
         Self { text }
-    }
-}
-
-fn sandbox_prompt_from_profile(
-    permission_profile: &PermissionProfile,
-    cwd: &Path,
-) -> (SandboxMode, Option<Vec<WritableRoot>>) {
-    match permission_profile {
-        PermissionProfile::Disabled | PermissionProfile::External { .. } => {
-            (SandboxMode::DangerFullAccess, None)
-        }
-        PermissionProfile::Managed { .. } => {
-            let file_system_policy = permission_profile.file_system_sandbox_policy();
-            if file_system_policy.has_full_disk_write_access() {
-                return (SandboxMode::DangerFullAccess, None);
-            }
-
-            let writable_roots = file_system_policy.get_writable_roots_with_cwd(cwd);
-            if writable_roots.is_empty() {
-                (SandboxMode::ReadOnly, None)
-            } else {
-                (SandboxMode::WorkspaceWrite, Some(writable_roots))
-            }
-        }
-    }
-}
-
-fn network_access_from_policy(network_policy: NetworkSandboxPolicy) -> NetworkAccess {
-    if network_policy.is_enabled() {
-        NetworkAccess::Enabled
-    } else {
-        NetworkAccess::Restricted
     }
 }
 
@@ -229,11 +210,10 @@ fn sandbox_text(mode: SandboxMode, network_access: NetworkAccess) -> String {
 }
 
 fn writable_roots_text(writable_roots: Option<Vec<WritableRoot>>) -> Option<String> {
-    let mut roots = writable_roots?;
+    let roots = writable_roots?;
     if roots.is_empty() {
         return None;
     }
-    roots.sort_by(|left, right| left.root.as_path().cmp(right.root.as_path()));
 
     let roots_list: Vec<String> = roots
         .iter()

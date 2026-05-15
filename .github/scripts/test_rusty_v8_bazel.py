@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import gzip
+import tempfile
 import textwrap
 import unittest
+from pathlib import Path
+from unittest.mock import Mock
+from unittest.mock import patch
 
+import rusty_v8_bazel
 import rusty_v8_module_bazel
 
 
@@ -120,6 +126,187 @@ class RustyV8BazelTest(unittest.TestCase):
                 checksums,
                 "146.4.0",
             )
+
+    @patch("rusty_v8_bazel.resolved_v8_crate_version", return_value="146.4.0")
+    @patch("rusty_v8_bazel.subprocess.run")
+    def test_stage_android_release_pair_stages_cargo_source_outputs(
+        self,
+        run: Mock,
+        _resolved_version: Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            stage_root = temp_path / "stage"
+            output_dir = temp_path / "dist"
+            cargo_home = temp_path / "cargo-home"
+            rusty_v8_source = temp_path / "rusty-v8-source"
+            crate_source = cargo_home / "registry" / "src" / "index" / "v8-146.4.0"
+            crate_stdlib = (
+                crate_source
+                / "third_party"
+                / "libc++"
+                / "src"
+                / "include"
+                / "stdlib.h"
+            )
+            crate_build_rs = crate_source / "build.rs"
+            crate_abort_message = (
+                crate_source
+                / "third_party"
+                / "libc++abi"
+                / "src"
+                / "src"
+                / "abort_message.cpp"
+            )
+            source_vendor_crate = (
+                rusty_v8_source
+                / "third_party"
+                / "rust"
+                / "chromium_crates_io"
+                / "vendor"
+                / "icu_calendar_data-v2"
+            )
+            stage_root.mkdir()
+            crate_stdlib.parent.mkdir(parents=True)
+            crate_abort_message.parent.mkdir(parents=True)
+            source_vendor_crate.mkdir(parents=True)
+            crate_stdlib.write_text(
+                textwrap.dedent(
+                    """\
+                    inline _LIBCPP_HIDE_FROM_ABI ldiv_t div(long __x, long __y) _NOEXCEPT { return ::ldiv(__x, __y); }
+                    inline _LIBCPP_HIDE_FROM_ABI lldiv_t div(long long __x, long long __y) _NOEXCEPT { return ::lldiv(__x, __y); }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            crate_abort_message.write_text(
+                "#include <stdarg.h>\nvoid abort_message() {}\n",
+                encoding="utf-8",
+            )
+            crate_build_rs.write_text(
+                'fn main() {\n  } else if target_os == "linux" {\n}\n',
+                encoding="utf-8",
+            )
+            (source_vendor_crate / "build.rs").write_text(
+                "// vendor build\n",
+                encoding="utf-8",
+            )
+
+            def fake_run(*_args: object, **kwargs: object) -> Mock:
+                args = _args[0]
+                env = kwargs["env"]
+                self.assertIsInstance(env, dict)
+                if args[0] != "cargo" or args[1] == "fetch":
+                    return Mock(returncode=0)
+
+                self.assertIn(
+                    'android_ndk_root="//third_party/android_ndk"',
+                    env["EXTRA_GN_ARGS"],
+                )
+                self.assertIn(
+                    'android_ndk_version="r26c"',
+                    env["EXTRA_GN_ARGS"],
+                )
+                build_dir = (
+                    Path(env["CARGO_TARGET_DIR"])
+                    / "aarch64-linux-android"
+                    / "release"
+                    / "gn_out"
+                )
+                (build_dir / "obj").mkdir(parents=True)
+                (build_dir / "obj" / "librusty_v8.a").write_bytes(b"archive")
+                (build_dir / "src_binding.rs").write_text(
+                    "// binding\n",
+                    encoding="utf-8",
+                )
+                return Mock(returncode=0)
+
+            run.side_effect = fake_run
+            with (
+                patch("rusty_v8_bazel.tempfile.mkdtemp", return_value=str(stage_root)),
+                patch.dict("rusty_v8_bazel.os.environ", {"CARGO_HOME": str(cargo_home)}),
+            ):
+                rusty_v8_bazel.stage_android_release_pair(
+                    "aarch64-linux-android",
+                    output_dir,
+                    rusty_v8_source,
+                )
+
+            archive = output_dir / "librusty_v8_release_aarch64-linux-android.a.gz"
+            binding = output_dir / "src_binding_release_aarch64-linux-android.rs"
+            checksums = output_dir / "rusty_v8_release_aarch64-linux-android.sha256"
+            vendored_pydeps = (
+                stage_root
+                / "v8-146.4.0"
+                / "build"
+                / "android"
+                / "pylib"
+                / "results"
+                / "presentation"
+                / "test_results_presentation.pydeps"
+            )
+            vendored_rust_build = (
+                stage_root
+                / "v8-146.4.0"
+                / "third_party"
+                / "rust"
+                / "chromium_crates_io"
+                / "vendor"
+                / "icu_calendar_data-v2"
+                / "build.rs"
+            )
+            vendored_stdlib = (
+                stage_root
+                / "v8-146.4.0"
+                / "third_party"
+                / "libc++"
+                / "src"
+                / "include"
+                / "stdlib.h"
+            )
+            vendored_abort_message = (
+                stage_root
+                / "v8-146.4.0"
+                / "third_party"
+                / "libc++abi"
+                / "src"
+                / "src"
+                / "abort_message.cpp"
+            )
+            vendored_build_rs = stage_root / "v8-146.4.0" / "build.rs"
+            self.assertEqual(b"archive", gzip.decompress(archive.read_bytes()))
+            self.assertEqual("// binding\n", binding.read_text(encoding="utf-8"))
+            self.assertTrue(vendored_pydeps.exists())
+            self.assertEqual(
+                "// vendor build\n",
+                vendored_rust_build.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "#if !defined(__ANDROID__)\n"
+                "inline _LIBCPP_HIDE_FROM_ABI ldiv_t div(long __x, long __y)",
+                vendored_stdlib.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "#if !defined(__ANDROID__)\n"
+                "inline _LIBCPP_HIDE_FROM_ABI lldiv_t div(long long __x, long long __y)",
+                vendored_stdlib.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                "#include <stdarg.h>\n"
+                "#include <stdio.h>\n"
+                "#include <stdlib.h>\n"
+                "void abort_message() {}\n",
+                vendored_abort_message.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                '  } else if target_os == "android" {\n'
+                '    clang_args.push("--target=aarch64-linux-android29".to_string());\n'
+                '    clang_args.push("--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot".to_string());\n'
+                '  } else if target_os == "linux" {\n',
+                vendored_build_rs.read_text(encoding="utf-8"),
+            )
+            self.assertIn(archive.name, checksums.read_text(encoding="utf-8"))
+            self.assertIn(binding.name, checksums.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
