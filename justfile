@@ -30,11 +30,9 @@ app-server-test-client *args:
     cargo build -p codex-cli
     cargo run -p codex-app-server-test-client -- --codex-bin ./target/debug/codex "$@"
 
-# Format Rust and Python SDK code.
+# format code
 fmt:
     cargo fmt -- --config imports_granularity=Item 2>/dev/null
-    uv run --frozen --project ../sdk/python --extra dev ruff check --fix --fix-only ../sdk/python
-    uv run --frozen --project ../sdk/python --extra dev ruff format ../sdk/python
 
 fix *args:
     cargo clippy --fix --tests --allow-dirty "$@"
@@ -49,7 +47,7 @@ install:
 # Run `cargo nextest` since it's faster than `cargo test`, though including
 # --no-fail-fast is important to ensure all tests are run.
 #
-# Run `cargo install --locked cargo-nextest` if you don't have it installed.
+# Run `cargo install cargo-nextest` if you don't have it installed.
 # Prefer this for routine local runs. Workspace crate features are banned, so
 # there should be no need to add `--all-features`.
 test:
@@ -115,6 +113,11 @@ argument-comment-lint *args:
 [no-cd]
 argument-comment-lint-from-source *args:
     {{ justfile_directory() }}/tools/argument-comment-lint/run.py "$@"
+
+# Audit advisory file locks that may need Termux Unsupported handling.
+[no-cd]
+termux-lock-audit *args:
+    {{ justfile_directory() }}/scripts/termux-lock-audit.sh "$@"
 
 # Tail logs from the state SQLite database
 log *args:

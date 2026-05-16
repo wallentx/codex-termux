@@ -7,7 +7,6 @@ license.workspace = true
 [lib]
 name = "codex_arg0"
 path = "src/lib.rs"
-doctest = false
 
 [lints]
 workspace = true
@@ -20,6 +19,7 @@ codex-linux-sandbox = { workspace = true }
 codex-sandboxing = { workspace = true }
 codex-shell-escalation = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-file-lock = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 dotenvy = { workspace = true }
 tempfile = { workspace = true }

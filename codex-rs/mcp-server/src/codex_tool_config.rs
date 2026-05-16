@@ -2,7 +2,6 @@
 
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::config::Config;
-use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::SandboxMode;
@@ -192,11 +191,8 @@ impl CodexToolCallParam {
             .map(|(k, v)| (k, json_to_toml(v)))
             .collect();
 
-        let cfg = ConfigBuilder::default()
-            .cli_overrides(cli_overrides)
-            .harness_overrides(overrides)
-            .build()
-            .await?;
+        let cfg =
+            Config::load_with_cli_overrides_and_harness_overrides(cli_overrides, overrides).await?;
 
         Ok((prompt, cfg))
     }

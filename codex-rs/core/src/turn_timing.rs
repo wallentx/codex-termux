@@ -4,6 +4,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use codex_otel::TURN_TTFM_DURATION_METRIC;
+use codex_otel::TURN_TTFT_DURATION_METRIC;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use tokio::sync::Mutex;
@@ -20,7 +21,9 @@ pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &
     else {
         return;
     };
-    turn_context.session_telemetry.record_turn_ttft(duration);
+    turn_context
+        .session_telemetry
+        .record_duration(TURN_TTFT_DURATION_METRIC, duration, &[]);
 }
 
 pub(crate) async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &TurnItem) {
@@ -50,14 +53,12 @@ struct TurnTimingStateInner {
 }
 
 impl TurnTimingState {
-    pub(crate) async fn mark_turn_started(&self, started_at: Instant) -> i64 {
-        let started_at_unix_ms = now_unix_timestamp_ms();
+    pub(crate) async fn mark_turn_started(&self, started_at: Instant) {
         let mut state = self.state.lock().await;
         state.started_at = Some(started_at);
-        state.started_at_unix_secs = Some(started_at_unix_ms / 1000);
+        state.started_at_unix_secs = Some(now_unix_timestamp_secs());
         state.first_token_at = None;
         state.first_message_at = None;
-        started_at_unix_ms
     }
 
     pub(crate) async fn started_at_unix_secs(&self) -> Option<i64> {
@@ -101,14 +102,10 @@ impl TurnTimingState {
 }
 
 fn now_unix_timestamp_secs() -> i64 {
-    now_unix_timestamp_ms() / 1000
-}
-
-pub(crate) fn now_unix_timestamp_ms() -> i64 {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
 impl TurnTimingStateInner {
@@ -183,9 +180,8 @@ fn response_item_records_turn_ttft(item: &ResponseItem) -> bool {
         | ResponseItem::ToolSearchCall { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::Compaction { .. }
-        | ResponseItem::ContextCompaction { .. } => true,
-        ResponseItem::CompactionTrigger => false,
+        | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::Compaction { .. } => true,
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }

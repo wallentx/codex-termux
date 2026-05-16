@@ -1,15 +1,14 @@
 use super::cache::ModelsCacheManager;
+use crate::collaboration_mode_presets::CollaborationModesConfig;
 use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::config::ModelsManagerConfig;
 use crate::model_info;
 use async_trait::async_trait;
-use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::Result as CoreResult;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
-use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use std::fmt;
 use std::path::PathBuf;
@@ -181,6 +180,7 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
     remote_models: RwLock<Vec<ModelInfo>>,
+    collaboration_modes_config: CollaborationModesConfig,
     etag: RwLock<Option<String>>,
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
@@ -191,6 +191,7 @@ pub struct OpenAiModelsManager {
 #[derive(Debug)]
 pub struct StaticModelsManager {
     remote_models: Vec<ModelInfo>,
+    collaboration_modes_config: CollaborationModesConfig,
     auth_manager: Option<Arc<AuthManager>>,
 }
 
@@ -200,12 +201,14 @@ impl OpenAiModelsManager {
         codex_home: PathBuf,
         endpoint_client: Arc<dyn ModelsEndpointClient>,
         auth_manager: Option<Arc<AuthManager>>,
+        collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
             remote_models: RwLock::new(remote_models),
+            collaboration_modes_config,
             etag: RwLock::new(None),
             cache_manager,
             endpoint_client,
@@ -216,9 +219,14 @@ impl OpenAiModelsManager {
 
 impl StaticModelsManager {
     /// Construct a static model manager from an authoritative catalog.
-    pub fn new(auth_manager: Option<Arc<AuthManager>>, model_catalog: ModelsResponse) -> Self {
+    pub fn new(
+        auth_manager: Option<Arc<AuthManager>>,
+        model_catalog: ModelsResponse,
+        collaboration_modes_config: CollaborationModesConfig,
+    ) -> Self {
         Self {
             remote_models: model_catalog.models,
+            collaboration_modes_config,
             auth_manager,
         }
     }
@@ -248,7 +256,7 @@ impl ModelsManager for OpenAiModelsManager {
     }
 
     fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
-        builtin_collaboration_mode_presets()
+        builtin_collaboration_mode_presets(self.collaboration_modes_config)
     }
 
     async fn refresh_if_new_etag(&self, etag: String) {
@@ -321,23 +329,6 @@ impl OpenAiModelsManager {
 
     /// Replace the cached remote models and rebuild the derived presets list.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
-        // Use the remote models list as the source of truth if it contains at least one
-        // non-hidden model and the user is using ChatGPT auth.
-        let should_use_remote_models_only = !models.is_empty()
-            && models
-                .iter()
-                .any(|model| model.visibility == ModelVisibility::List)
-            && self.auth_manager.as_ref().is_some_and(|auth_manager| {
-                matches!(
-                    auth_manager.auth_mode(),
-                    Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
-                )
-            });
-        if should_use_remote_models_only {
-            *self.remote_models.write().await = models;
-            return;
-        }
-
         let mut existing_models = load_remote_models_from_file().unwrap_or_default();
         for model in models {
             if let Some(existing_index) = existing_models
@@ -400,7 +391,7 @@ impl ModelsManager for StaticModelsManager {
     }
 
     fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
-        builtin_collaboration_mode_presets()
+        builtin_collaboration_mode_presets(self.collaboration_modes_config)
     }
 
     async fn refresh_if_new_etag(&self, _etag: String) {}
@@ -440,16 +431,15 @@ fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option
 fn find_model_by_namespaced_suffix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
     // Retry metadata lookup for a single namespaced slug like `namespace/model-name`.
     //
-    // This only strips one leading namespace segment and only when the namespace looks
-    // like a simple provider id to avoid broadly matching arbitrary aliases.
+    // This only strips one leading namespace segment and only when the namespace is ASCII
+    // alphanumeric/underscore (`\w+`) to avoid broadly matching arbitrary aliases.
     let (namespace, suffix) = model.split_once('/')?;
     if suffix.contains('/') {
         return None;
     }
-    if namespace.is_empty()
-        || !namespace
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    if !namespace
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return None;
     }
