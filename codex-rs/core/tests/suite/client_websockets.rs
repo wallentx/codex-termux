@@ -15,7 +15,6 @@ use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_otel::current_span_w3c_trace_context;
-use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::ReasoningSummary;
@@ -54,7 +53,6 @@ use tracing_test::traced_test;
 
 const MODEL: &str = "gpt-5.3-codex";
 const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
-const USER_AGENT_HEADER: &str = "user-agent";
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const X_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -88,8 +86,7 @@ fn assert_request_trace_matches(body: &serde_json::Value, expected_trace: &W3cTr
 struct WebsocketTestHarness {
     _codex_home: TempDir,
     client: ModelClient,
-    session_id: SessionId,
-    thread_id: ThreadId,
+    conversation_id: ThreadId,
     model_info: ModelInfo,
     effort: Option<ReasoningEffortConfig>,
     summary: ReasoningSummary,
@@ -127,19 +124,7 @@ async fn responses_websocket_streams_request() {
     );
     assert_eq!(
         handshake.header(X_CLIENT_REQUEST_ID_HEADER),
-        Some(harness.thread_id.to_string())
-    );
-    assert_eq!(
-        handshake.header("session_id"),
-        Some(harness.session_id.to_string())
-    );
-    assert_eq!(
-        handshake.header("thread_id"),
-        Some(harness.thread_id.to_string())
-    );
-    assert_eq!(
-        handshake.header(USER_AGENT_HEADER),
-        Some(codex_login::default_client::get_codex_user_agent())
+        Some(harness.conversation_id.to_string())
     );
     assert_eq!(
         body["client_metadata"]["x-codex-installation-id"].as_str(),
@@ -167,168 +152,6 @@ async fn responses_websocket_streams_without_feature_flag_when_provider_supports
 
     assert_eq!(server.handshakes().len(), 1);
     assert_eq!(server.single_connection().len(), 1);
-
-    server.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_sends_response_processed_when_feature_enabled() {
-    skip_if_no_network!();
-
-    let server = start_websocket_server(vec![vec![
-        vec![
-            ev_response_created("resp-prewarm"),
-            ev_completed("resp-prewarm"),
-        ],
-        vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "hi"),
-            ev_completed("resp-1"),
-        ],
-        vec![],
-    ]])
-    .await;
-
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::ResponsesWebsocketResponseProcessed)
-            .expect("test config should allow feature update");
-    });
-    let test = builder
-        .build_with_websocket_server(&server)
-        .await
-        .expect("build websocket codex");
-
-    test.submit_turn("hello")
-        .await
-        .expect("submission should send response.processed after processing");
-
-    let processed = server
-        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 2)
-        .await;
-    assert_eq!(
-        processed.body_json(),
-        json!({
-            "type": "response.processed",
-            "response_id": "resp-1",
-        })
-    );
-
-    let connection = server.single_connection();
-    assert_eq!(connection.len(), 3);
-    assert_eq!(
-        connection[1].body_json()["type"].as_str(),
-        Some("response.create")
-    );
-
-    server.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_sends_response_processed_after_remote_compaction_v2() {
-    skip_if_no_network!();
-
-    let server = start_websocket_server(vec![vec![
-        vec![
-            ev_response_created("resp-prewarm"),
-            ev_completed("resp-prewarm"),
-        ],
-        vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "hi"),
-            ev_completed("resp-1"),
-        ],
-        vec![],
-        vec![
-            json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "context_compaction",
-                    "encrypted_content": "ENCRYPTED_CONTEXT_COMPACTION_SUMMARY",
-                }
-            }),
-            ev_completed("resp-compact"),
-        ],
-        vec![],
-    ]])
-    .await;
-
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::RemoteCompactionV2)
-            .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::ResponsesWebsocketResponseProcessed)
-            .expect("test config should allow feature update");
-    });
-    let test = builder
-        .build_with_websocket_server(&server)
-        .await
-        .expect("build websocket codex");
-
-    test.submit_turn("hello")
-        .await
-        .expect("submission should send response.processed after processing");
-
-    test.codex
-        .submit(Op::Compact)
-        .await
-        .expect("compact submission should succeed");
-    wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
-
-    let compact_processed = server
-        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 4)
-        .await;
-    assert_eq!(
-        compact_processed.body_json(),
-        json!({
-            "type": "response.processed",
-            "response_id": "resp-compact",
-        })
-    );
-
-    let connection = server.single_connection();
-    assert_eq!(connection.len(), 5);
-    assert_eq!(
-        connection[3].body_json()["type"].as_str(),
-        Some("response.create")
-    );
-
-    server.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_omits_response_processed_without_feature() {
-    skip_if_no_network!();
-
-    let server = start_websocket_server(vec![vec![
-        vec![
-            ev_response_created("resp-prewarm"),
-            ev_completed("resp-prewarm"),
-        ],
-        vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "hi"),
-            ev_completed("resp-1"),
-        ],
-        vec![],
-    ]])
-    .await;
-    let mut builder = test_codex();
-    let test = builder
-        .build_with_websocket_server(&server)
-        .await
-        .expect("build websocket codex");
-
-    test.submit_turn("hello")
-        .await
-        .expect("submission should complete without response.processed");
-
-    let connection = server.single_connection();
-    assert_eq!(connection.len(), 2);
 
     server.shutdown().await;
 }
@@ -374,10 +197,6 @@ async fn responses_websocket_reuses_connection_with_per_turn_trace_payloads() {
     };
 
     assert_eq!(server.handshakes().len(), 1);
-    assert_eq!(
-        server.single_handshake().header(USER_AGENT_HEADER),
-        Some(codex_login::default_client::get_codex_user_agent())
-    );
     let connection = server.single_connection();
     assert_eq!(connection.len(), 2);
 
@@ -463,12 +282,7 @@ async fn responses_websocket_preconnect_reuses_connection() {
     stream_until_complete(&mut client_session, &harness, &prompt).await;
 
     assert_eq!(server.handshakes().len(), 1);
-    assert_eq!(
-        server.single_handshake().header(USER_AGENT_HEADER),
-        Some(codex_login::default_client::get_codex_user_agent())
-    );
-    let connection = server.single_connection();
-    assert_eq!(connection.len(), 1);
+    assert_eq!(server.single_connection().len(), 1);
 
     server.shutdown().await;
 }
@@ -501,10 +315,6 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
     stream_until_complete(&mut client_session, &harness, &prompt).await;
 
     assert_eq!(server.handshakes().len(), 1);
-    assert_eq!(
-        server.single_handshake().header(USER_AGENT_HEADER),
-        Some(codex_login::default_client::get_codex_user_agent())
-    );
     let connection = server.single_connection();
     assert_eq!(connection.len(), 2);
     let warmup = connection
@@ -1341,18 +1151,6 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
 
     let total_websocket_requests: usize = server.connections().iter().map(Vec::len).sum();
     assert_eq!(total_websocket_requests, 2);
-    let handshake_user_agents: Vec<_> = server
-        .handshakes()
-        .iter()
-        .map(|handshake| handshake.header(USER_AGENT_HEADER))
-        .collect();
-    assert_eq!(
-        handshake_user_agents,
-        vec![
-            Some(codex_login::default_client::get_codex_user_agent()),
-            Some(codex_login::default_client::get_codex_user_agent()),
-        ]
-    );
 
     server.shutdown().await;
 }
@@ -1902,6 +1700,7 @@ fn message_item(text: &str) -> ResponseItem {
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText { text: text.into() }],
+        end_turn: None,
         phase: None,
     }
 }
@@ -1911,6 +1710,7 @@ fn assistant_message_item(id: &str, text: &str) -> ResponseItem {
         id: Some(id.to_string()),
         role: "assistant".into(),
         content: vec![ContentItem::OutputText { text: text.into() }],
+        end_turn: None,
         phase: None,
     }
 }
@@ -1999,8 +1799,7 @@ async fn websocket_harness_with_provider_options(
     }
     let config = Arc::new(config);
     let model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
-    let thread_id = ThreadId::new();
-    let session_id = SessionId::new();
+    let conversation_id = ThreadId::new();
     let auth_manager =
         codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"));
     let exporter = InMemoryMetricExporter::default();
@@ -2010,7 +1809,7 @@ async fn websocket_harness_with_provider_options(
     )
     .expect("in-memory metrics client");
     let session_telemetry = SessionTelemetry::new(
-        thread_id,
+        conversation_id,
         MODEL,
         model_info.slug.as_str(),
         /*account_id*/ None,
@@ -2026,8 +1825,7 @@ async fn websocket_harness_with_provider_options(
     let summary = ReasoningSummary::Auto;
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        session_id,
-        thread_id,
+        conversation_id,
         /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),
         SessionSource::Exec,
@@ -2035,14 +1833,12 @@ async fn websocket_harness_with_provider_options(
         /*enable_request_compression*/ false,
         runtime_metrics_enabled,
         /*beta_features_header*/ None,
-        /*attestation_provider*/ None,
     );
 
     WebsocketTestHarness {
         _codex_home: codex_home,
         client,
-        session_id,
-        thread_id,
+        conversation_id,
         model_info,
         effort,
         summary,
@@ -2111,7 +1907,7 @@ async fn stream_until_complete_with_request_metadata(
             &harness.session_telemetry,
             harness.effort,
             harness.summary,
-            service_tier.map(|service_tier| service_tier.request_value().to_string()),
+            service_tier,
             turn_metadata_header,
             &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
