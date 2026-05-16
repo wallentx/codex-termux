@@ -1,5 +1,4 @@
 use crate::config::NetworkMode;
-use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::mitm;
 use crate::network_policy::BlockDecisionAuditEventArgs;
 use crate::network_policy::NetworkDecision;
@@ -67,6 +66,7 @@ use rama_net::proxy::ProxyTarget;
 use rama_net::proxy::StreamForwardService;
 use rama_net::stream::SocketInfo;
 use rama_tcp::client::Request as TcpRequest;
+use rama_tcp::client::service::TcpConnector;
 use rama_tcp::server::TcpListener;
 use rama_tls_rustls::client::TlsConnectorDataBuilder;
 use rama_tls_rustls::client::TlsConnectorLayer;
@@ -75,7 +75,6 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -346,22 +345,20 @@ async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), Infallible> {
         return Ok(());
     }
 
-    let app_state = match upgraded
+    let allow_upstream_proxy = match upgraded
         .extensions()
         .get::<Arc<NetworkProxyState>>()
         .cloned()
     {
-        Some(state) => state,
+        Some(state) => match state.allow_upstream_proxy().await {
+            Ok(allowed) => allowed,
+            Err(err) => {
+                error!("failed to read upstream proxy setting: {err}");
+                false
+            }
+        },
         None => {
             error!("missing app state");
-            return Ok(());
-        }
-    };
-
-    let allow_upstream_proxy = match app_state.allow_upstream_proxy().await {
-        Ok(allowed) => allowed,
-        Err(err) => {
-            error!("failed to read upstream proxy setting: {err}");
             false
         }
     };
@@ -371,18 +368,8 @@ async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), Infallible> {
     } else {
         None
     };
-    match proxy.as_ref() {
-        Some(proxy) => info!(
-            "CONNECT route selected (host={}, port={}, route=upstream_proxy, proxy={})",
-            target.host, target.port, proxy.address
-        ),
-        None => info!(
-            "CONNECT route selected (host={}, port={}, route=direct)",
-            target.host, target.port
-        ),
-    }
 
-    if let Err(err) = forward_connect_tunnel(upgraded, proxy, app_state).await {
+    if let Err(err) = forward_connect_tunnel(upgraded, proxy).await {
         warn!("tunnel error: {err}");
     }
     Ok(())
@@ -391,7 +378,6 @@ async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), Infallible> {
 async fn forward_connect_tunnel(
     upgraded: Upgraded,
     proxy: Option<ProxyAddress>,
-    app_state: Arc<NetworkProxyState>,
 ) -> Result<(), BoxError> {
     let authority = upgraded
         .extensions()
@@ -406,54 +392,28 @@ async fn forward_connect_tunnel(
 
     let req = TcpRequest::new_with_extensions(authority.clone(), extensions)
         .with_protocol(Protocol::HTTPS);
-    let proxy_connector = HttpProxyConnector::optional(TargetCheckedTcpConnector::new(app_state));
+    let proxy_connector = HttpProxyConnector::optional(TcpConnector::new());
     let tls_config = TlsConnectorDataBuilder::new()
         .with_alpn_protocols_http_auto()
         .build();
     let connector = TlsConnectorLayer::tunnel(None)
         .with_connector_data(tls_config)
         .into_layer(proxy_connector);
-    info!("CONNECT upstream dial started (target={authority})");
-    let connect_started_at = Instant::now();
-    let EstablishedClientConnection { conn: target, .. } = match connector.connect(req).await {
-        Ok(connection) => {
-            info!(
-                "CONNECT upstream dial established (target={authority}, elapsed_ms={})",
-                connect_started_at.elapsed().as_millis()
-            );
-            connection
-        }
-        Err(err) => {
-            warn!(
-                "CONNECT upstream dial failed (target={authority}, elapsed_ms={})",
-                connect_started_at.elapsed().as_millis()
-            );
-            return Err(OpaqueError::from_boxed(err)
+    let EstablishedClientConnection { conn: target, .. } =
+        connector.connect(req).await.map_err(|err| {
+            OpaqueError::from_boxed(err)
                 .with_context(|| format!("establish CONNECT tunnel to {authority}"))
-                .into_boxed());
-        }
-    };
+                .into_boxed()
+        })?;
 
     let proxy_req = ProxyRequest {
         source: upgraded,
         target,
     };
-    info!("CONNECT tunnel forwarding started (target={authority})");
-    let forward_started_at = Instant::now();
     StreamForwardService::default()
         .serve(proxy_req)
         .await
-        .map(|_| {
-            info!(
-                "CONNECT tunnel forwarding completed (target={authority}, elapsed_ms={})",
-                forward_started_at.elapsed().as_millis()
-            );
-        })
         .map_err(|err| {
-            warn!(
-                "CONNECT tunnel forwarding failed (target={authority}, elapsed_ms={})",
-                forward_started_at.elapsed().as_millis()
-            );
             OpaqueError::from_boxed(err.into())
                 .with_context(|| format!("forward CONNECT tunnel to {authority}"))
                 .into_boxed()
@@ -770,9 +730,9 @@ async fn http_plain_proxy(
         Err(resp) => return Ok(resp),
     };
     let client = if allow_upstream_proxy {
-        UpstreamClient::from_env_proxy(app_state.clone())
+        UpstreamClient::from_env_proxy()
     } else {
-        UpstreamClient::direct(app_state.clone())
+        UpstreamClient::direct()
     };
 
     // Strip hop-by-hop headers only after extracting metadata used for policy correlation.
@@ -1071,10 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn http_connect_accept_allows_allowlisted_host_in_full_mode() {
         let policy = {
-            let mut policy = NetworkProxySettings {
-                allow_local_binding: true,
-                ..NetworkProxySettings::default()
-            };
+            let mut policy = NetworkProxySettings::default();
             policy.set_allowed_domains(vec!["example.com".to_string()]);
             policy
         };

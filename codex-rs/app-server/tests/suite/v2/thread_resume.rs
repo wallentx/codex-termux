@@ -38,11 +38,9 @@ use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
-use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
-use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
@@ -73,7 +71,6 @@ use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::fs::FileTimes;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -87,7 +84,7 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 use super::analytics::assert_basic_thread_initialized_event;
-use super::analytics::mount_analytics_capture;
+use super::analytics::enable_analytics_capture;
 use super::analytics::thread_initialized_event;
 use super::analytics::wait_for_analytics_payload;
 
@@ -95,6 +92,7 @@ use super::analytics::wait_for_analytics_payload;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const INTERNAL_ERROR_CODE: i64 = -32603;
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
 fn normalized_existing_path(path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -187,7 +185,10 @@ async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+        config.replace(
+            "general_analytics = true\n",
+            "general_analytics = true\ngoals = true\n",
+        ),
     )?;
 
     let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
@@ -237,22 +238,22 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
-    mount_analytics_capture(&server, codex_home.path()).await?;
+    create_config_toml_with_chatgpt_base_url(
+        codex_home.path(),
+        &server.uri(),
+        &server.uri(),
+        /*general_analytics_enabled*/ true,
+    )?;
+    enable_analytics_capture(&server, codex_home.path()).await?;
 
-    let conversation_id = create_fake_rollout(
+    let conversation_id = create_fake_rollout_with_text_elements(
         codex_home.path(),
         "2025-01-05T12-00-00",
         "2025-01-05T12:00:00Z",
         "Saved user message",
+        Vec::new(),
         Some("mock_provider"),
         /*git_info*/ None,
-    )?;
-    set_thread_source_on_fake_rollout(
-        codex_home.path(),
-        "2025-01-05T12-00-00",
-        &conversation_id,
-        "user",
     )?;
 
     let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
@@ -270,35 +271,10 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
     )
     .await??;
     let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
-    assert!(
-        !thread.session_id.is_empty(),
-        "session id should not be empty"
-    );
-    assert_eq!(thread.thread_source, Some(ThreadSource::User));
 
     let payload = wait_for_analytics_payload(&server, DEFAULT_READ_TIMEOUT).await?;
     let event = thread_initialized_event(&payload)?;
-    assert_basic_thread_initialized_event(event, &thread.id, "gpt-5.3-codex", "resumed", "user");
-    assert_eq!(event["event_params"]["thread_source"], "user");
-    Ok(())
-}
-
-fn set_thread_source_on_fake_rollout(
-    codex_home: &std::path::Path,
-    filename_ts: &str,
-    thread_id: &str,
-    thread_source: &str,
-) -> Result<()> {
-    let path = rollout_path(codex_home, filename_ts, thread_id);
-    let contents = std::fs::read_to_string(&path)?;
-    let mut lines = contents.lines();
-    let session_meta = lines
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("fake rollout missing session meta"))?;
-    let mut session_meta: serde_json::Value = serde_json::from_str(session_meta)?;
-    session_meta["payload"]["thread_source"] = serde_json::json!(thread_source);
-    let remaining = lines.collect::<Vec<_>>().join("\n");
-    std::fs::write(&path, format!("{session_meta}\n{remaining}\n"))?;
+    assert_basic_thread_initialized_event(event, &thread.id, "gpt-5.3-codex", "resumed");
     Ok(())
 }
 
@@ -416,7 +392,7 @@ async fn thread_resume_can_skip_turns_for_metadata_only_resume() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
+async fn thread_resume_emits_active_goal_update_before_continuation() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -424,7 +400,10 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+        config.replace(
+            "general_analytics = true\n",
+            "general_analytics = true\ngoals = true\n",
+        ),
     )?;
 
     let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
@@ -508,12 +487,12 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
     let ServerNotification::ThreadGoalUpdated(notification) = notification else {
         anyhow::bail!("expected thread goal update notification");
     };
-    assert_eq!(notification.goal.status, ThreadGoalStatus::Paused);
+    assert_eq!(notification.goal.status, ThreadGoalStatus::Active);
     assert!(
         !mcp.pending_notification_methods()
             .iter()
             .any(|method| method == "turn/started"),
-        "paused goal should not continue after thread resume"
+        "goal continuation should start only after the resume goal snapshot"
     );
 
     Ok(())
@@ -528,7 +507,10 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+        config.replace(
+            "general_analytics = true\n",
+            "general_analytics = true\ngoals = true\n",
+        ),
     )?;
 
     let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
@@ -626,7 +608,10 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+        config.replace(
+            "general_analytics = true\n",
+            "general_analytics = true\ngoals = true\n",
+        ),
     )?;
 
     let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
@@ -740,6 +725,37 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
     .await??;
     let clear_again: ThreadGoalClearResponse = to_response(clear_again_resp)?;
     assert!(!clear_again.cleared);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_by_path_uses_remote_thread_store_error() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_with_remote_thread_store(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: "ignored-when-path-is-present".to_string(),
+            path: Some(PathBuf::from("sessions/2025/01/05/rollout.jsonl")),
+            ..Default::default()
+        })
+        .await?;
+    let resume_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+
+    assert_eq!(resume_err.error.code, INTERNAL_ERROR_CODE);
+    assert_eq!(
+        resume_err.error.message,
+        "failed to read thread: thread-store internal error: remote thread store does not support read_thread_by_rollout_path"
+    );
 
     Ok(())
 }
@@ -1178,7 +1194,6 @@ stream_max_retries = 0
         originator: "codex".to_string(),
         cli_version: "0.0.0".to_string(),
         source: RolloutSessionSource::Cli,
-        thread_source: None,
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
@@ -1630,7 +1645,6 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
     .await??;
     let TurnStartResponse { turn: running_turn } =
         to_response::<TurnStartResponse>(running_turn_resp)?;
-    assert_eq!(running_turn.items_view, TurnItemsView::NotLoaded);
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/started"),
@@ -1646,6 +1660,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
                 content: vec![ContentItem::InputText {
                     text: "history override".to_string(),
                 }],
+                end_turn: None,
                 phase: None,
             }]),
             ..Default::default()
@@ -1672,7 +1687,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_resume_uses_path_over_thread_id_when_thread_is_running() -> Result<()> {
+async fn thread_resume_rejects_mismatched_path_when_thread_is_running() -> Result<()> {
     let server = responses::start_mock_server().await;
     let first_body = responses::sse(vec![
         responses::ev_response_created("resp-1"),
@@ -1752,70 +1767,23 @@ async fn thread_resume_uses_path_over_thread_id_when_thread_is_running() -> Resu
     )
     .await??;
 
-    let other_thread_id = ThreadId::new().to_string();
-    let stale_path = rollout_path(codex_home.path(), "2025-01-01T00-00-00", &thread_id);
-    std::fs::create_dir_all(stale_path.parent().expect("stale path parent"))?;
-    let thread_uuid = Uuid::parse_str(&thread_id)?;
-    let mut stale_file = std::fs::File::create(&stale_path)?;
-    let stale_meta = json!({
-        "timestamp": "2025-01-01T00:00:00Z",
-        "type": "session_meta",
-        "payload": {
-            "id": thread_uuid,
-            "timestamp": "2025-01-01T00:00:00Z",
-            "cwd": codex_home.path(),
-            "originator": "test_originator",
-            "cli_version": "test_version",
-            "source": "cli",
-            "model_provider": "test-provider",
-        },
-    });
-    writeln!(stale_file, "{stale_meta}")?;
-    let stale_user_event = json!({
-        "timestamp": "2025-01-01T00:00:00Z",
-        "type": "event_msg",
-        "payload": {
-            "type": "user_message",
-            "message": "stale history",
-            "kind": "plain",
-        },
-    });
-    writeln!(stale_file, "{stale_user_event}")?;
-
-    let stale_resume_id = primary
+    let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: other_thread_id.clone(),
-            path: Some(stale_path),
+            thread_id: thread_id.clone(),
+            path: Some(PathBuf::from("/tmp/does-not-match-running-rollout.jsonl")),
             ..Default::default()
         })
         .await?;
-    let stale_resume_err: JSONRPCError = timeout(
+    let resume_err: JSONRPCError = timeout(
         DEFAULT_READ_TIMEOUT,
-        primary.read_stream_until_error_message(RequestId::Integer(stale_resume_id)),
+        primary.read_stream_until_error_message(RequestId::Integer(resume_id)),
     )
     .await??;
     assert!(
-        stale_resume_err.error.message.contains("stale path"),
+        resume_err.error.message.contains("mismatched path"),
         "unexpected resume error: {}",
-        stale_resume_err.error.message
+        resume_err.error.message
     );
-
-    let resume_by_path_id = primary
-        .send_thread_resume_request(ThreadResumeParams {
-            thread_id: other_thread_id.clone(),
-            path: thread.path,
-            ..Default::default()
-        })
-        .await?;
-    let resume_by_path_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        primary.read_stream_until_response_message(RequestId::Integer(resume_by_path_id)),
-    )
-    .await??;
-    let ThreadResumeResponse {
-        thread: resumed, ..
-    } = to_response::<ThreadResumeResponse>(resume_by_path_resp)?;
-    assert_eq!(resumed.id, thread_id);
 
     primary
         .interrupt_turn_and_wait_for_aborted(thread_id, running_turn.id, DEFAULT_READ_TIMEOUT)
@@ -2447,6 +2415,7 @@ async fn thread_resume_surfaces_cloud_requirements_load_errors() -> Result<()> {
         codex_home.path(),
         &model_server.uri(),
         &chatgpt_base_url,
+        /*general_analytics_enabled*/ false,
     )?;
     write_chatgpt_auth(
         codex_home.path(),
@@ -2513,7 +2482,7 @@ async fn thread_resume_surfaces_cloud_requirements_load_errors() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_resume_uses_path_over_invalid_thread_id() -> Result<()> {
+async fn thread_resume_prefers_path_over_thread_id() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -2573,6 +2542,13 @@ async fn thread_resume_uses_path_over_invalid_thread_id() -> Result<()> {
         thread: resumed, ..
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
     assert_eq!(resumed.id, thread.id);
+    let resumed_path = resumed.path.as_ref().expect("resumed thread path");
+    let original_path = thread.path.as_ref().expect("original thread path");
+    assert_eq!(
+        normalized_existing_path(resumed_path)?,
+        normalized_existing_path(original_path)?
+    );
+    assert_eq!(resumed.status, ThreadStatus::Idle);
 
     Ok(())
 }
@@ -2640,6 +2616,7 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
         content: vec![ContentItem::InputText {
             text: history_text.to_string(),
         }],
+        end_turn: None,
         phase: None,
     }];
 
@@ -2884,6 +2861,38 @@ model_provider = "mock_provider"
 
 [features]
 personality = true
+general_analytics = true
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_config_toml_with_remote_thread_store(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "gpt-5.3-codex"
+approval_policy = "never"
+sandbox_mode = "read-only"
+experimental_thread_store_endpoint = "http://127.0.0.1:1"
+
+model_provider = "mock_provider"
+
+[features]
+personality = true
+general_analytics = true
 
 [model_providers.mock_provider]
 name = "Mock provider for test"
@@ -2900,7 +2909,13 @@ fn create_config_toml_with_chatgpt_base_url(
     codex_home: &std::path::Path,
     server_uri: &str,
     chatgpt_base_url: &str,
+    general_analytics_enabled: bool,
 ) -> std::io::Result<()> {
+    let general_analytics_toml = if general_analytics_enabled {
+        "\ngeneral_analytics = true".to_string()
+    } else {
+        "\ngeneral_analytics = false".to_string()
+    };
     let config_toml = codex_home.join("config.toml");
     std::fs::write(
         config_toml,
@@ -2915,6 +2930,7 @@ model_provider = "mock_provider"
 
 [features]
 personality = true
+{general_analytics_toml}
 
 [model_providers.mock_provider]
 name = "Mock provider for test"

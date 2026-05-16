@@ -17,7 +17,6 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::with_cached_approval;
-use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchAction;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_protocol::error::CodexErr;
@@ -25,12 +24,19 @@ use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecOutputStream;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
-use codex_sandboxing::policy_transforms::effective_permission_profile;
+use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
+use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::path::PathBuf;
@@ -47,23 +53,11 @@ pub struct ApplyPatchRequest {
 }
 
 #[derive(Default)]
-pub struct ApplyPatchRuntime {
-    committed_delta: AppliedPatchDelta,
-}
-
-#[derive(Debug)]
-pub struct ApplyPatchRuntimeOutput {
-    pub exec_output: ExecToolCallOutput,
-    pub delta: AppliedPatchDelta,
-}
+pub struct ApplyPatchRuntime;
 
 impl ApplyPatchRuntime {
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn committed_delta(&self) -> &AppliedPatchDelta {
-        &self.committed_delta
+        Self
     }
 
     fn build_guardian_review_request(
@@ -86,8 +80,19 @@ impl ApplyPatchRuntime {
             return None;
         }
 
-        let permissions =
-            effective_permission_profile(attempt.permissions, req.additional_permissions.as_ref());
+        let file_system_policy = effective_file_system_sandbox_policy(
+            attempt.file_system_policy,
+            req.additional_permissions.as_ref(),
+        );
+        let network_policy = effective_network_sandbox_policy(
+            attempt.network_policy,
+            req.additional_permissions.as_ref(),
+        );
+        let permissions = PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::from_legacy_sandbox_policy(attempt.policy),
+            &file_system_policy,
+            network_policy,
+        );
         Some(FileSystemSandboxContext {
             permissions,
             cwd: Some(attempt.sandbox_cwd.clone()),
@@ -95,6 +100,22 @@ impl ApplyPatchRuntime {
             windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
             use_legacy_landlock: attempt.use_legacy_landlock,
         })
+    }
+
+    async fn emit_output_delta(ctx: &ToolCtx, stream: ExecOutputStream, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        let event = Event {
+            id: ctx.turn.sub_id.clone(),
+            msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                call_id: ctx.call_id.clone(),
+                stream,
+                chunk: chunk.to_vec(),
+            }),
+        };
+        let _ = ctx.session.get_tx_event().send(event).await;
     }
 }
 
@@ -197,18 +218,18 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
     }
 }
 
-impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRuntime {
+impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
     async fn run(
         &mut self,
         req: &ApplyPatchRequest,
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
-    ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
-        let turn_environment = ctx.turn.environments.primary().ok_or_else(|| {
+    ) -> Result<ExecToolCallOutput, ToolError> {
+        let environment = ctx.turn.environment.as_ref().ok_or_else(|| {
             ToolError::Rejected("apply_patch is unavailable in this session".to_string())
         })?;
         let started_at = Instant::now();
-        let fs = turn_environment.environment.get_filesystem();
+        let fs = environment.get_filesystem();
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -223,13 +244,9 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         .await;
         let stdout = String::from_utf8_lossy(&stdout).into_owned();
         let stderr = String::from_utf8_lossy(&stderr).into_owned();
-        let failed = result.is_err();
-        let exit_code = if failed { 1 } else { 0 };
-        let delta = match result {
-            Ok(delta) => delta,
-            Err(failure) => failure.into_parts().1,
-        };
-        self.committed_delta.append(delta);
+        Self::emit_output_delta(ctx, ExecOutputStream::Stdout, stdout.as_bytes()).await;
+        Self::emit_output_delta(ctx, ExecOutputStream::Stderr, stderr.as_bytes()).await;
+        let exit_code = if result.is_ok() { 0 } else { 1 };
         let output = ExecToolCallOutput {
             exit_code,
             stdout: StreamOutput::new(stdout.clone()),
@@ -238,16 +255,13 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             duration: started_at.elapsed(),
             timed_out: false,
         };
-        if failed && is_likely_sandbox_denied(attempt.sandbox, &output) {
+        if result.is_err() && is_likely_sandbox_denied(attempt.sandbox, &output) {
             return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                 output: Box::new(output),
                 network_policy_decision: None,
             })));
         }
-        Ok(ApplyPatchRuntimeOutput {
-            exec_output: output,
-            delta: self.committed_delta.clone(),
-        })
+        Ok(output)
     }
 }
 
