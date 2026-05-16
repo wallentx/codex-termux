@@ -61,7 +61,9 @@ fn shell_responses(call_id: &str, command: &str, login: Option<bool>) -> Vec<Str
 async fn shell_command_harness_with(
     configure: impl FnOnce(TestCodexBuilder) -> TestCodexBuilder,
 ) -> Result<TestCodexHarness> {
-    let builder = configure(test_codex());
+    let builder = configure(test_codex()).with_config(|config| {
+        config.include_apply_patch_tool = true;
+    });
     TestCodexHarness::with_builder(builder).await
 }
 

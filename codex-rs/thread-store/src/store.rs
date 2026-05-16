@@ -5,26 +5,21 @@ use std::any::Any;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
-use crate::ItemPage;
-use crate::ListItemsParams;
 use crate::ListThreadsParams;
-use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
-use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadPage;
-use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
-use crate::TurnPage;
 use crate::UpdateThreadMetadataParams;
 
 /// Storage-neutral thread persistence boundary.
 #[async_trait]
 pub trait ThreadStore: Any + Send + Sync {
-    /// Return this store as [`Any`] for implementation-owned escape hatches.
+    /// Return this store as [`Any`] so callers at API boundaries can reject requests that only
+    /// make sense for a concrete store implementation.
     fn as_any(&self) -> &dyn Any;
 
     /// Creates a new live thread.
@@ -33,11 +28,7 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Reopens an existing thread for live appends.
     async fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreResult<()>;
 
-    /// Appends canonical rollout items to a live thread.
-    ///
-    /// This is the raw history API. It does not infer metadata from item contents. Callers that
-    /// need metadata updates should call [`ThreadStore::update_thread_metadata`] with explicit
-    /// metadata facts prepared above the store.
+    /// Appends items to a live thread.
     async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()>;
 
     /// Materializes the thread if persistence is lazy, then persists all queued items.
@@ -65,35 +56,10 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Reads a thread summary and optionally its persisted history.
     async fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreResult<StoredThread>;
 
-    /// Reads a rollout-backed thread by path when the store supports path-addressed lookups.
-    ///
-    /// Deprecated: new callers should use [`ThreadStore::read_thread`] instead.
-    async fn read_thread_by_rollout_path(
-        &self,
-        params: ReadThreadByRolloutPathParams,
-    ) -> ThreadStoreResult<StoredThread>;
-
     /// Lists stored threads matching the supplied filters.
     async fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreResult<ThreadPage>;
 
-    /// Lists turns within a stored thread.
-    async fn list_turns(&self, _params: ListTurnsParams) -> ThreadStoreResult<TurnPage> {
-        Err(ThreadStoreError::Unsupported {
-            operation: "list_turns",
-        })
-    }
-
-    /// Lists persisted items within a stored turn.
-    async fn list_items(&self, _params: ListItemsParams) -> ThreadStoreResult<ItemPage> {
-        Err(ThreadStoreError::Unsupported {
-            operation: "list_items",
-        })
-    }
-
-    /// Applies a literal metadata patch and returns the updated thread.
-    ///
-    /// Implementations should apply the supplied fields directly. Policy such as deciding whether
-    /// an append-derived preview should be emitted belongs above the store.
+    /// Applies a mutable metadata patch and returns the updated thread.
     async fn update_thread_metadata(
         &self,
         params: UpdateThreadMetadataParams,

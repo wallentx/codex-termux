@@ -1,11 +1,5 @@
 use super::*;
 use codex_execpolicy::Decision;
-use codex_protocol::permissions::FileSystemAccessMode;
-use codex_protocol::permissions::FileSystemPath;
-use codex_protocol::permissions::FileSystemSandboxEntry;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 
@@ -54,33 +48,27 @@ fn builds_permissions_with_network_access_override() {
 }
 
 #[test]
-fn builds_permissions_from_profile() {
-    let cwd = PathBuf::from("/tmp");
-    let writable_root =
-        AbsolutePathBuf::from_absolute_path(cwd.join("repo")).expect("absolute path");
-    let permission_profile = PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: writable_root.clone(),
-            },
-            access: FileSystemAccessMode::Write,
-        }]),
-        NetworkSandboxPolicy::Enabled,
-    );
+fn builds_permissions_from_policy() {
+    let policy = SandboxPolicy::WorkspaceWrite {
+        writable_roots: vec![],
+        read_only_access: Default::default(),
+        network_access: true,
+        exclude_tmpdir_env_var: false,
+        exclude_slash_tmp: false,
+    };
 
-    let instructions = PermissionsInstructions::from_permission_profile(
-        &permission_profile,
+    let instructions = PermissionsInstructions::from_policy(
+        &policy,
         AskForApproval::UnlessTrusted,
         ApprovalsReviewer::User,
         &Policy::empty(),
-        &cwd,
+        &PathBuf::from("/tmp"),
         /*exec_permission_approvals_enabled*/ false,
         /*request_permissions_tool_enabled*/ false,
     );
     let text = instructions.body();
-    assert!(text.contains("`sandbox_mode` is `workspace-write`"));
     assert!(text.contains("Network access is enabled."));
-    assert!(text.contains(writable_root.to_string_lossy().as_ref()));
+    assert!(text.contains("`approval_policy` is `unless-trusted`"));
 }
 
 #[test]

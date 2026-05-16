@@ -6,10 +6,10 @@ use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
@@ -17,7 +17,6 @@ use core_test_support::responses;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
@@ -25,14 +24,11 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
-use tokio::time::Duration;
-use tokio::time::timeout;
 
 fn call_output(req: &ResponsesRequest, call_id: &str) -> String {
     let raw = req.function_call_output(call_id);
@@ -121,7 +117,6 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
     let first_response = sse(vec![
         ev_response_created("resp-1"),
         ev_function_call(call_id, "request_user_input", &request_args),
-        ev_rate_limits(),
         ev_completed("resp-1"),
     ]);
     responses::mount_sse_once(&server, first_response).await;
@@ -133,8 +128,6 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
     let second_mock = responses::mount_sse_once(&server, second_response).await;
 
     let session_model = session_configured.model.clone();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.path());
 
     codex
         .submit(Op::UserTurn {
@@ -147,8 +140,8 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -173,22 +166,6 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
     assert_eq!(request.call_id, call_id);
     assert_eq!(request.questions.len(), 1);
     assert_eq!(request.questions[0].is_other, true);
-    assert!(
-        timeout(Duration::from_millis(200), async {
-            loop {
-                let event = match codex.next_event().await {
-                    Ok(event) => event,
-                    Err(err) => panic!("event stream should stay open: {err}"),
-                };
-                if matches!(event.msg, EventMsg::TokenCount(_)) {
-                    return;
-                }
-            }
-        })
-        .await
-        .is_err(),
-        "TokenCount should wait until request_user_input resolves"
-    );
 
     let mut answers = HashMap::new();
     answers.insert(
@@ -205,7 +182,6 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
         })
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TokenCount(_))).await;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let req = second_mock.single_request();
@@ -220,118 +196,6 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
         })
     );
 
-    Ok(())
-}
-
-fn ev_rate_limits() -> Value {
-    json!({
-        "type": "codex.rate_limits",
-        "plan_type": "plus",
-        "rate_limits": {
-            "allowed": true,
-            "limit_reached": false,
-            "primary": {
-                "used_percent": 42,
-                "window_minutes": 60,
-                "reset_at": 1700000000
-            },
-            "secondary": null
-        },
-        "code_review_rate_limits": null,
-        "credits": null,
-        "promo": null
-    })
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let TestCodex {
-        codex,
-        cwd,
-        session_configured,
-        ..
-    } = test_codex().build(&server).await?;
-
-    let call_id = "user-input-interrupt";
-    let request_args = json!({
-        "questions": [{
-            "id": "confirm_path",
-            "header": "Confirm",
-            "question": "Proceed with the plan?",
-            "options": [{
-                "label": "Yes (Recommended)",
-                "description": "Continue the current plan."
-            }, {
-                "label": "No",
-                "description": "Stop and revisit the approach."
-            }]
-        }]
-    })
-    .to_string();
-
-    let response = sse(vec![
-        ev_response_created("resp-interrupt"),
-        ev_function_call(call_id, "request_user_input", &request_args),
-        ev_completed_with_tokens("resp-interrupt", /*total_tokens*/ 77),
-    ]);
-    responses::mount_sse_once(&server, response).await;
-
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.path());
-    codex
-        .submit(Op::UserTurn {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "please confirm".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
-            model: session_configured.model.clone(),
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: Some(CollaborationMode {
-                mode: ModeKind::Plan,
-                settings: Settings {
-                    model: session_configured.model,
-                    reasoning_effort: None,
-                    developer_instructions: None,
-                },
-            }),
-            personality: None,
-        })
-        .await?;
-
-    let request = wait_for_event_match(&codex, |event| match event {
-        EventMsg::RequestUserInput(request) => Some(request.clone()),
-        _ => None,
-    })
-    .await;
-
-    codex.submit(Op::Interrupt).await?;
-
-    let token_count = wait_for_event_match(&codex, |event| match event {
-        EventMsg::TokenCount(token_count) => Some(token_count.clone()),
-        _ => None,
-    })
-    .await;
-    assert_eq!(
-        token_count
-            .info
-            .map(|info| info.total_token_usage.total_tokens),
-        Some(77)
-    );
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnAborted(_))).await;
-
-    assert_eq!(request.call_id, call_id);
     Ok(())
 }
 
@@ -384,8 +248,6 @@ where
 
     let session_model = session_configured.model.clone();
     let collaboration_mode = build_mode(session_model.clone());
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.path());
 
     codex
         .submit(Op::UserTurn {
@@ -398,8 +260,8 @@ where
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
             approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
