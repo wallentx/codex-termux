@@ -18,7 +18,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
-use core_test_support::responses;
+use core_test_support::load_sse_fixture_with_id_from_str;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
@@ -61,11 +61,17 @@ async fn review_op_emits_lifecycle_and_review_output() {
         "overall_confidence_score": 0.8
     })
     .to_string();
-    let (server, _request_log) = start_responses_server_with_sse(
-        assistant_message_sse(&review_json),
-        /*expected_requests*/ 1,
-    )
-    .await;
+    let sse_template = r#"[
+            {"type":"response.output_item.done", "item":{
+                "type":"message", "role":"assistant",
+                "content":[{"type":"output_text","text":__REVIEW__}]
+            }},
+            {"type":"response.completed", "response": {"id": "__ID__"}}
+        ]"#;
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let sse_raw = sse_template.replace("__REVIEW__", &review_json_escaped);
+    let (server, _request_log) =
+        start_responses_server_with_sse(&sse_raw, /*expected_requests*/ 1).await;
     let codex_home = Arc::new(TempDir::new().unwrap());
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
@@ -180,11 +186,15 @@ async fn review_op_emits_lifecycle_and_review_output() {
 async fn review_op_with_plain_text_emits_review_fallback() {
     skip_if_no_network!();
 
-    let (server, _request_log) = start_responses_server_with_sse(
-        assistant_message_sse("just plain text"),
-        /*expected_requests*/ 1,
-    )
-    .await;
+    let sse_raw = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"just plain text"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (server, _request_log) =
+        start_responses_server_with_sse(sse_raw, /*expected_requests*/ 1).await;
     let codex_home = Arc::new(TempDir::new().unwrap());
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
@@ -223,6 +233,7 @@ async fn review_op_with_plain_text_emits_review_fallback() {
 
 /// Ensure review flow suppresses assistant-specific streaming/completion events:
 /// - AgentMessageContentDelta
+/// - AgentMessageDelta (legacy)
 /// - ItemCompleted for TurnItem::AgentMessage
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
@@ -230,17 +241,22 @@ async fn review_op_with_plain_text_emits_review_fallback() {
 async fn review_filters_agent_message_related_events() {
     skip_if_no_network!();
 
-    let (server, _request_log) = start_responses_server_with_sse(
-        vec![
-            responses::ev_message_item_added("msg-1", ""),
-            responses::ev_output_text_delta("Hi"),
-            responses::ev_output_text_delta(" there"),
-            responses::ev_assistant_message("msg-1", "Hi there"),
-            responses::ev_completed("resp-1"),
-        ],
-        /*expected_requests*/ 1,
-    )
-    .await;
+    // Stream simulating a typing assistant message with deltas and finalization.
+    let sse_raw = r#"[
+        {"type":"response.output_item.added", "item":{
+            "type":"message", "role":"assistant", "id":"msg-1",
+            "content":[{"type":"output_text","text":""}]
+        }},
+        {"type":"response.output_text.delta", "delta":"Hi"},
+        {"type":"response.output_text.delta", "delta":" there"},
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant", "id":"msg-1",
+            "content":[{"type":"output_text","text":"Hi there"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (server, _request_log) =
+        start_responses_server_with_sse(sse_raw, /*expected_requests*/ 1).await;
     let codex_home = Arc::new(TempDir::new().unwrap());
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
@@ -273,6 +289,9 @@ async fn review_filters_agent_message_related_events() {
         // The following must be filtered by review flow
         EventMsg::AgentMessageContentDelta(_) => {
             panic!("unexpected AgentMessageContentDelta surfaced during review")
+        }
+        EventMsg::AgentMessageDelta(_) => {
+            panic!("unexpected AgentMessageDelta surfaced during review")
         }
         _ => false,
     })
@@ -310,11 +329,17 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
         "overall_confidence_score": 0.5
     })
     .to_string();
-    let (server, _request_log) = start_responses_server_with_sse(
-        assistant_message_sse(&review_json),
-        /*expected_requests*/ 1,
-    )
-    .await;
+    let sse_template = r#"[
+            {"type":"response.output_item.done", "item":{
+                "type":"message", "role":"assistant",
+                "content":[{"type":"output_text","text":__REVIEW__}]
+            }},
+            {"type":"response.completed", "response": {"id": "__ID__"}}
+        ]"#;
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let sse_raw = sse_template.replace("__REVIEW__", &review_json_escaped);
+    let (server, _request_log) =
+        start_responses_server_with_sse(&sse_raw, /*expected_requests*/ 1).await;
     let codex_home = Arc::new(TempDir::new().unwrap());
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
@@ -365,8 +390,12 @@ async fn review_does_not_emit_agent_message_on_structured_output() {
 async fn review_uses_custom_review_model_from_config() {
     skip_if_no_network!();
 
+    // Minimal stream: just a completed event
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
     let (server, request_log) =
-        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
+        start_responses_server_with_sse(sse_raw, /*expected_requests*/ 1).await;
     let codex_home = Arc::new(TempDir::new().unwrap());
     // Choose a review model different from the main model; ensure it is used.
     let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
@@ -416,8 +445,12 @@ async fn review_uses_custom_review_model_from_config() {
 async fn review_uses_session_model_when_review_model_unset() {
     skip_if_no_network!();
 
+    // Minimal stream: just a completed event
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
     let (server, request_log) =
-        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
+        start_responses_server_with_sse(sse_raw, /*expected_requests*/ 1).await;
     let codex_home = Arc::new(TempDir::new().unwrap());
     let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
         cfg.model = Some("gpt-4.1".to_string());
@@ -467,8 +500,12 @@ async fn review_uses_session_model_when_review_model_unset() {
 async fn review_input_isolated_from_parent_history() {
     skip_if_no_network!();
 
+    // Mock server for the single review request
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
     let (server, request_log) =
-        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
+        start_responses_server_with_sse(sse_raw, /*expected_requests*/ 1).await;
 
     // Seed a parent session history via resume file with both user + assistant items.
     let codex_home = Arc::new(TempDir::new().unwrap());
@@ -501,6 +538,7 @@ async fn review_input_isolated_from_parent_history() {
             content: vec![codex_protocol::models::ContentItem::InputText {
                 text: "parent: earlier user message".to_string(),
             }],
+            end_turn: None,
             phase: None,
         };
         let user_json = serde_json::to_value(&user).unwrap();
@@ -520,6 +558,7 @@ async fn review_input_isolated_from_parent_history() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: "parent: assistant reply".to_string(),
             }],
+            end_turn: None,
             phase: None,
         };
         let assistant_json = serde_json::to_value(&assistant).unwrap();
@@ -641,11 +680,16 @@ async fn review_input_isolated_from_parent_history() {
 async fn review_history_surfaces_in_parent_session() {
     skip_if_no_network!();
 
-    let (server, request_log) = start_responses_server_with_sse(
-        assistant_message_sse("review assistant output"),
-        /*expected_requests*/ 2,
-    )
-    .await;
+    // Respond to both the review request and the subsequent parent request.
+    let sse_raw = r#"[
+        {"type":"response.output_item.done", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"review assistant output"}]
+        }},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (server, request_log) =
+        start_responses_server_with_sse(sse_raw, /*expected_requests*/ 2).await;
     let codex_home = Arc::new(TempDir::new().unwrap());
     let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
 
@@ -738,8 +782,9 @@ async fn review_history_surfaces_in_parent_session() {
 async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     skip_if_no_network!();
 
+    let sse_raw = r#"[{"type":"response.completed", "response": {"id": "__ID__"}}]"#;
     let (server, request_log) =
-        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
+        start_responses_server_with_sse(sse_raw, /*expected_requests*/ 1).await;
 
     let initial_cwd = TempDir::new().unwrap();
 
@@ -842,24 +887,13 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     server.verify().await;
 }
 
-fn assistant_message_sse(text: &str) -> Vec<serde_json::Value> {
-    vec![
-        responses::ev_assistant_message("msg-1", text),
-        responses::ev_completed("resp-1"),
-    ]
-}
-
-fn completed_sse() -> Vec<serde_json::Value> {
-    vec![responses::ev_completed("resp-1")]
-}
-
-/// Start a mock Responses API server and mount the given SSE events.
+/// Start a mock Responses API server and mount the given SSE stream body.
 async fn start_responses_server_with_sse(
-    events: Vec<serde_json::Value>,
+    sse_raw: &str,
     expected_requests: usize,
 ) -> (MockServer, ResponseMock) {
     let server = start_mock_server().await;
-    let sse = responses::sse(events);
+    let sse = load_sse_fixture_with_id_from_str(sse_raw, &Uuid::new_v4().to_string());
     let responses = vec![sse; expected_requests];
     let request_log = mount_sse_sequence(&server, responses).await;
     (server, request_log)

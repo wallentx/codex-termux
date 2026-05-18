@@ -3,10 +3,6 @@ use std::time::Duration;
 
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
-use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
-use codex_network_proxy::PROXY_ENV_KEYS;
-#[cfg(target_os = "macos")]
-use codex_network_proxy::PROXY_GIT_SSH_COMMAND_ENV_KEY;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -21,7 +17,6 @@ use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use crate::tools::format_exec_output_str;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
-use crate::turn_timing::now_unix_timestamp_ms;
 use crate::user_shell_command::user_shell_command_record_item;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
@@ -30,6 +25,7 @@ use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
@@ -37,9 +33,10 @@ use codex_shell_command::parse_command::parse_command;
 use super::SessionTask;
 use super::SessionTaskContext;
 use crate::session::session::Session;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 
 const USER_SHELL_TIMEOUT_MS: u64 = 60 * 60 * 1000; // 1 hour
 
@@ -127,28 +124,13 @@ pub(crate) async fn execute_user_shell_command(
     let use_login_shell = true;
     let session_shell = session.user_shell();
     let display_command = session_shell.derive_exec_args(&command, use_login_shell);
-    let mut exec_env_map = create_env(
+    let exec_env_map = create_env(
         &turn_context.shell_environment_policy,
         Some(session.conversation_id),
     );
-    if exec_env_map.contains_key(PROXY_ACTIVE_ENV_KEY) {
-        for key in PROXY_ENV_KEYS {
-            exec_env_map.remove(*key);
-        }
-        #[cfg(target_os = "macos")]
-        if exec_env_map
-            .get(PROXY_GIT_SSH_COMMAND_ENV_KEY)
-            .is_some_and(|value| {
-                value.starts_with(codex_network_proxy::CODEX_PROXY_GIT_SSH_COMMAND_MARKER)
-            })
-        {
-            exec_env_map.remove(PROXY_GIT_SSH_COMMAND_ENV_KEY);
-        }
-    }
     let exec_command = maybe_wrap_shell_lc_with_snapshot(
         &display_command,
         session_shell.as_ref(),
-        #[allow(deprecated)]
         &turn_context.cwd,
         &turn_context.shell_environment_policy.r#set,
         &exec_env_map,
@@ -156,7 +138,6 @@ pub(crate) async fn execute_user_shell_command(
 
     let call_id = Uuid::new_v4().to_string();
     let raw_command = command;
-    #[allow(deprecated)]
     let cwd = turn_context.cwd.clone();
 
     let parsed_cmd = parse_command(&display_command);
@@ -167,7 +148,6 @@ pub(crate) async fn execute_user_shell_command(
                 call_id: call_id.clone(),
                 process_id: None,
                 turn_id: turn_context.sub_id.clone(),
-                started_at_ms: now_unix_timestamp_ms(),
                 command: display_command.clone(),
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.clone(),
@@ -177,7 +157,7 @@ pub(crate) async fn execute_user_shell_command(
         )
         .await;
 
-    let permission_profile = PermissionProfile::Disabled;
+    let sandbox_policy = SandboxPolicy::DangerFullAccess;
     let exec_env = ExecRequest {
         command: exec_command.clone(),
         cwd: cwd.clone(),
@@ -197,9 +177,9 @@ pub(crate) async fn execute_user_shell_command(
             .config
             .permissions
             .windows_sandbox_private_desktop,
-        permission_profile: permission_profile.clone(),
-        file_system_sandbox_policy: permission_profile.file_system_sandbox_policy(),
-        network_sandbox_policy: permission_profile.network_sandbox_policy(),
+        sandbox_policy: sandbox_policy.clone(),
+        file_system_sandbox_policy: FileSystemSandboxPolicy::from(&sandbox_policy),
+        network_sandbox_policy: NetworkSandboxPolicy::from(&sandbox_policy),
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
     };
@@ -240,7 +220,6 @@ pub(crate) async fn execute_user_shell_command(
                         call_id,
                         process_id: None,
                         turn_id: turn_context.sub_id.clone(),
-                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command.clone(),
                         cwd: cwd.clone(),
                         parsed_cmd: parsed_cmd.clone(),
@@ -265,7 +244,6 @@ pub(crate) async fn execute_user_shell_command(
                         call_id: call_id.clone(),
                         process_id: None,
                         turn_id: turn_context.sub_id.clone(),
-                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command.clone(),
                         cwd: cwd.clone(),
                         parsed_cmd: parsed_cmd.clone(),
@@ -310,7 +288,6 @@ pub(crate) async fn execute_user_shell_command(
                         call_id,
                         process_id: None,
                         turn_id: turn_context.sub_id.clone(),
-                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command,
                         cwd,
                         parsed_cmd,
@@ -361,16 +338,7 @@ async fn persist_user_shell_output(
     }
 
     let response_input_item = match output_item {
-        ResponseItem::Message {
-            role,
-            content,
-            phase,
-            ..
-        } => ResponseInputItem::Message {
-            role,
-            content,
-            phase,
-        },
+        ResponseItem::Message { role, content, .. } => ResponseInputItem::Message { role, content },
         _ => unreachable!("user shell command output record should always be a message"),
     };
 

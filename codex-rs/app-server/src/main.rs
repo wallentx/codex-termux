@@ -1,12 +1,10 @@
 use clap::Parser;
-use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
 use codex_app_server::AppServerWebsocketAuthArgs;
-use codex_app_server::PluginStartupTasks;
-use codex_app_server::run_main_with_transport_options;
+use codex_app_server::run_main_with_transport;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
-use codex_config::LoaderOverrides;
+use codex_core::config_loader::LoaderOverrides;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
@@ -38,33 +36,11 @@ struct AppServerArgs {
 
     #[command(flatten)]
     auth: AppServerWebsocketAuthArgs,
-
-    /// Fail if config.toml contains unknown configuration fields.
-    #[arg(long = "strict-config", default_value_t = false)]
-    strict_config: bool,
-
-    /// Hidden debug-only test hook used by integration tests that spawn the
-    /// production app-server binary.
-    #[cfg(debug_assertions)]
-    #[arg(long = "disable-plugin-startup-tasks-for-tests", hide = true)]
-    disable_plugin_startup_tasks_for_tests: bool,
-
-    /// Enable remote control for this app-server process.
-    #[arg(long = "remote-control", hide = true)]
-    remote_control: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
-        let AppServerArgs {
-            listen,
-            session_source,
-            auth,
-            strict_config,
-            #[cfg(debug_assertions)]
-            disable_plugin_startup_tasks_for_tests,
-            remote_control,
-        } = AppServerArgs::parse();
+        let args = AppServerArgs::parse();
         let loader_overrides = if disable_managed_config_from_debug_env() {
             LoaderOverrides::without_managed_config_for_tests()
         } else {
@@ -72,25 +48,18 @@ fn main() -> anyhow::Result<()> {
                 .map(LoaderOverrides::with_managed_config_path_for_tests)
                 .unwrap_or_default()
         };
-        let transport = listen;
-        let auth = auth.try_into_settings()?;
-        let mut runtime_options = AppServerRuntimeOptions::default();
-        #[cfg(debug_assertions)]
-        if disable_plugin_startup_tasks_for_tests {
-            runtime_options.plugin_startup_tasks = PluginStartupTasks::Skip;
-        }
-        runtime_options.remote_control_enabled = remote_control;
+        let transport = args.listen;
+        let session_source = args.session_source;
+        let auth = args.auth.try_into_settings()?;
 
-        run_main_with_transport_options(
+        run_main_with_transport(
             arg0_paths,
             CliConfigOverrides::default(),
             loader_overrides,
-            strict_config,
             /*default_analytics_enabled*/ false,
             transport,
             session_source,
             auth,
-            runtime_options,
         )
         .await?;
         Ok(())

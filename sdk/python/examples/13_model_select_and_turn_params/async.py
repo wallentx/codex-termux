@@ -5,26 +5,20 @@ _EXAMPLES_ROOT = Path(__file__).resolve().parents[1]
 if str(_EXAMPLES_ROOT) not in sys.path:
     sys.path.insert(0, str(_EXAMPLES_ROOT))
 
-from _bootstrap import (
-    assistant_text_from_turn,
-    ensure_local_sdk_src,
-    find_turn_by_id,
-    runtime_config,
-)
+from _bootstrap import assistant_text_from_turn, ensure_local_sdk_src, find_turn_by_id, runtime_config
 
 ensure_local_sdk_src()
 
 import asyncio
 
-from openai_codex import (
+from codex_app_server import (
+    AskForApproval,
     AsyncCodex,
-    TextInput,
-)
-from openai_codex.types import (
     Personality,
     ReasoningEffort,
     ReasoningSummary,
     SandboxPolicy,
+    TextInput,
 )
 
 REASONING_RANK = {
@@ -40,9 +34,7 @@ PREFERRED_MODEL = "gpt-5.4"
 
 def _pick_highest_model(models):
     visible = [m for m in models if not m.hidden] or models
-    preferred = next(
-        (m for m in visible if m.model == PREFERRED_MODEL or m.id == PREFERRED_MODEL), None
-    )
+    preferred = next((m for m in visible if m.model == PREFERRED_MODEL or m.id == PREFERRED_MODEL), None)
     if preferred is not None:
         return preferred
     known_names = {m.id for m in visible} | {m.model for m in visible}
@@ -81,6 +73,7 @@ SANDBOX_POLICY = SandboxPolicy.model_validate(
         "access": {"type": "fullAccess"},
     }
 )
+APPROVAL_POLICY = AskForApproval.model_validate("never")
 
 
 async def main() -> None:
@@ -107,12 +100,11 @@ async def main() -> None:
         first_persisted_turn = find_turn_by_id(persisted.thread.turns, first.id)
 
         print("agent.message:", assistant_text_from_turn(first_persisted_turn))
-        print(
-            "items:", 0 if first_persisted_turn is None else len(first_persisted_turn.items or [])
-        )
+        print("items:", 0 if first_persisted_turn is None else len(first_persisted_turn.items or []))
 
         second_turn = await thread.turn(
             TextInput("Return JSON for a safe feature-flag rollout plan."),
+            approval_policy=APPROVAL_POLICY,
             cwd=str(Path.cwd()),
             effort=selected_effort,
             model=selected_model.model,
@@ -126,10 +118,7 @@ async def main() -> None:
         second_persisted_turn = find_turn_by_id(persisted.thread.turns, second.id)
 
         print("agent.message.params:", assistant_text_from_turn(second_persisted_turn))
-        print(
-            "items.params:",
-            0 if second_persisted_turn is None else len(second_persisted_turn.items or []),
-        )
+        print("items.params:", 0 if second_persisted_turn is None else len(second_persisted_turn.items or []))
 
 
 if __name__ == "__main__":

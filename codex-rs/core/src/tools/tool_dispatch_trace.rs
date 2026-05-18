@@ -71,6 +71,7 @@ fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchI
             runtime_cell_id: cell_id.clone(),
             runtime_tool_call_id: runtime_tool_call_id.clone(),
         },
+        ToolCallSource::JsRepl => return None,
     };
 
     Some(ToolDispatchInvocation {
@@ -97,6 +98,7 @@ fn tool_dispatch_result(
         ToolCallSource::CodeMode { .. } => Some(ToolDispatchResult::CodeModeResponse {
             value: result.code_mode_result(payload),
         }),
+        ToolCallSource::JsRepl => None,
     }
 }
 
@@ -110,6 +112,24 @@ fn tool_dispatch_payload(payload: &ToolPayload) -> ToolDispatchPayload {
         },
         ToolPayload::Custom { input } => ToolDispatchPayload::Custom {
             input: input.clone(),
+        },
+        ToolPayload::LocalShell { params } => ToolDispatchPayload::LocalShell {
+            command: params.command.clone(),
+            workdir: params.workdir.clone(),
+            timeout_ms: params.timeout_ms,
+            sandbox_permissions: params.sandbox_permissions,
+            prefix_rule: params.prefix_rule.clone(),
+            additional_permissions: params.additional_permissions.clone(),
+            justification: params.justification.clone(),
+        },
+        ToolPayload::Mcp {
+            server,
+            tool,
+            raw_arguments,
+        } => ToolDispatchPayload::Mcp {
+            server: server.clone(),
+            tool: tool.clone(),
+            raw_arguments: raw_arguments.clone(),
         },
     }
 }

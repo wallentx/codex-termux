@@ -47,13 +47,8 @@ async fn run_connection(
     runtime_paths: ExecServerRuntimePaths,
 ) {
     let router = Arc::new(build_router());
-    let JsonRpcConnection {
-        outgoing_tx: json_outgoing_tx,
-        mut incoming_rx,
-        mut disconnected_rx,
-        task_handles: connection_tasks,
-        transport: _transport,
-    } = connection;
+    let (json_outgoing_tx, mut incoming_rx, mut disconnected_rx, connection_tasks) =
+        connection.into_parts();
     let (outgoing_tx, mut outgoing_rx) =
         mpsc::channel::<RpcServerOutboundMessage>(CHANNEL_CAPACITY);
     let notifications = RpcNotificationSender::new(outgoing_tx.clone());

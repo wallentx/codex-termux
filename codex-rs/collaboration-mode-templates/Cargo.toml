@@ -8,7 +8,6 @@ version.workspace = true
 doctest = false
 name = "codex_collaboration_mode_templates"
 path = "src/lib.rs"
-test = false
 
 [lints]
 workspace = true
