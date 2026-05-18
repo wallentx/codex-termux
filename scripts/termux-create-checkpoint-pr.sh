@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/termux-release-paths.sh
+source "${script_dir}/termux-release-paths.sh"
+
 source_branch="${SOURCE_BRANCH:-${REQUESTED_SOURCE_BRANCH:-${GITHUB_REF_NAME}}}"
 source_sha="${SOURCE_SHA:-${REQUESTED_SOURCE_SHA:-}}"
 if [[ -z "${source_sha}" ]]; then
@@ -18,11 +22,7 @@ if [[ -z "${DESTINATION_BRANCH:-}" ]]; then
 fi
 
 release_only_checkpoint_paths() {
-  printf '%s\n' \
-    scripts/termux-create-checkpoint-pr.sh \
-    scripts/termux-download-release-artifact.sh \
-    scripts/termux-find-release-pr.sh \
-    scripts/termux-release-asset-state.sh
+  printf '%s\n' "${TERMUX_RELEASE_BRANCH_SCRIPT_PATHS[@]}"
 }
 
 resolve_source_version_conflicts() {
@@ -126,29 +126,9 @@ fi
 git checkout -B "${checkpoint_branch}" "origin/${DESTINATION_BRANCH}"
 
 if ! git merge --no-ff --no-edit "${source_sha}"; then
-  is_release_only_checkpoint_path() {
-    case "$1" in
-      .github/workflows/rust-release.yml|\
-      .github/workflows/shell-tool-mcp.yml|\
-      .github/workflows/termux-release-checkpoint.yml|\
-      .github/workflows/termux-release-deploy.yml|\
-      .github/workflows/termux-release-promote.yml|\
-      .github/termux-release.json|\
-      scripts/termux-create-checkpoint-pr.sh|\
-      scripts/termux-download-release-artifact.sh|\
-      scripts/termux-find-release-pr.sh|\
-      scripts/termux-release-asset-state.sh)
-        return 0
-        ;;
-      *)
-        return 1
-        ;;
-    esac
-  }
-
   mapfile -t conflicted_paths < <(git diff --name-only --diff-filter=U)
   for conflicted_path in "${conflicted_paths[@]}"; do
-    if is_release_only_checkpoint_path "${conflicted_path}"; then
+    if termux_is_checkpoint_release_only_path "${conflicted_path}"; then
       echo "Auto-resolving release-only checkpoint conflict in ${conflicted_path} by keeping ${DESTINATION_BRANCH}."
       if git cat-file -e "HEAD:${conflicted_path}" 2>/dev/null; then
         git checkout --ours -- "${conflicted_path}"
@@ -193,7 +173,7 @@ if ! git merge --no-ff --no-edit "${source_sha}"; then
   else
     merge_conflicted=true
     conflict_summary="$(
-      printf '%s\n' "${remaining_conflicts[@]}" | sed 's/.*/- `&`/'
+      printf '%s\n' "${remaining_conflicts[@]}" | awk '{ print "- `" $0 "`" }'
     )"
     echo "Automatic checkpoint merge failed; creating a manual-resolution PR instead." >&2
     if git rev-parse -q --verify MERGE_HEAD >/dev/null; then

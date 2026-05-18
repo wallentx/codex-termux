@@ -41,6 +41,10 @@ concurrency:
   group: termux-release-promote-${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.ref_name }}
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   promote:
     runs-on: ubuntu-24.04
@@ -49,7 +53,7 @@ jobs:
       contents: write
       pull-requests: read
     env:
-      GH_REPO: ${{ github.repository }}
+      TERMUX_AUTOMATION_DIR: ${{ github.workspace }}/.termux-release-automation
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -58,6 +62,11 @@ jobs:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
+      - name: Export GitHub App token for gh
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: echo "GH_TOKEN=${APP_TOKEN}" >> "${GITHUB_ENV}"
+
       - name: Checkout release branch
         uses: actions/checkout@v6
         with:
@@ -65,123 +74,53 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.ref }}
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Checkout automation helpers
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          ref: ${{ github.workflow_sha }}
+          path: .termux-release-automation
+          token: ${{ steps.app-token.outputs.token }}
+
       - name: 🧰 Actions Toolbox
-        # This is required for the GitHub CLI
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Validate GitHub CLI environment
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-validate-gh-env.sh"
 
       - name: Resolve release ref
         id: release-ref
-        shell: bash
         env:
           INPUT_RELEASE_BRANCH: ${{ inputs.release_branch }}
           INPUT_RELEASE_SHA: ${{ inputs.release_sha }}
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            release_branch="${INPUT_RELEASE_BRANCH}"
-            if [[ -n "${INPUT_RELEASE_SHA}" ]]; then
-              git checkout --detach "${INPUT_RELEASE_SHA}"
-              release_sha="${INPUT_RELEASE_SHA}"
-            else
-              release_sha="$(git rev-parse HEAD)"
-            fi
-          else
-            release_branch="${GITHUB_REF_NAME}"
-            release_sha="${GITHUB_SHA}"
-          fi
-
-          {
-            echo "branch=${release_branch}"
-            echo "sha=${release_sha}"
-          } >> "$GITHUB_OUTPUT"
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-resolve-release-ref.sh"
 
       - name: Read release metadata
         id: metadata
-        shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          metadata=".github/termux-release.json"
-          if [[ ! -f "${metadata}" ]]; then
-            echo "No ${metadata}; this push is not a Termux release promotion."
-            echo "promote=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          upstream_tag="$(jq -r '.upstream_tag // empty' "${metadata}")"
-          upstream_name="$(jq -r '.upstream_name // .upstream_tag // empty' "${metadata}")"
-          termux_tag="$(jq -r '.termux_tag // empty' "${metadata}")"
-          upstream_version="${upstream_tag#rust-v}"
-          upstream_version="${upstream_version%-termux}"
-          upstream_prerelease=false
-          if [[ "${upstream_version}" == *-* ]]; then
-            upstream_prerelease=true
-          fi
-          upstream_html_url="$(jq -r '.upstream_html_url // ""' "${metadata}")"
-          upstream_repo="$(jq -r '.upstream_repo // "openai/codex"' "${metadata}")"
-          release_train="$(jq -r '.release_train // ""' "${metadata}")"
-          if [[ -z "${upstream_tag}" || -z "${termux_tag}" ]]; then
-            echo "Missing upstream_tag or termux_tag in ${metadata}" >&2
-            exit 1
-          fi
-
-          release_state="$(TERMUX_TAG="${termux_tag}" scripts/termux-release-asset-state.sh)"
-          release_exists="$(awk -F= '$1 == "release_exists" { print $2 }' <<< "${release_state}")"
-          asset_exists="$(awk -F= '$1 == "asset_exists" { print $2 }' <<< "${release_state}")"
-
-          if [[ "${asset_exists}" == "true" ]]; then
-            echo "${termux_tag} already exists with codex-aarch64-linux-android.tar.gz; skipping promotion."
-            echo "promote=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ "${release_exists}" == "true" ]]; then
-            echo "${termux_tag} exists but is missing codex-aarch64-linux-android.tar.gz; repairing promotion."
-          fi
-
-          {
-            echo "promote=true"
-            echo "upstream_tag=${upstream_tag}"
-            echo "upstream_name=${upstream_name}"
-            echo "termux_tag=${termux_tag}"
-            echo "upstream_prerelease=${upstream_prerelease}"
-            echo "upstream_html_url=${upstream_html_url}"
-            echo "upstream_repo=${upstream_repo}"
-            echo "release_train=${release_train}"
-            echo "release_exists=${release_exists}"
-            echo "asset_exists=${asset_exists}"
-          } >> "$GITHUB_OUTPUT"
+          TERMUX_RELEASE_ACTION: promote
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-read-release-metadata.sh"
 
       - name: Locate merged pull request
         if: steps.metadata.outputs.promote == 'true'
         id: pr
-        shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_BRANCH: ${{ steps.release-ref.outputs.branch }}
           RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
           INPUT_PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
-        run: |
-          scripts/termux-find-release-pr.sh
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-find-release-pr.sh"
 
       - name: Download promoted PR artifact
         if: steps.metadata.outputs.promote == 'true'
-        shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_ARTIFACT_NAME: ${{ steps.pr.outputs.artifact_name }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-        run: |
-          scripts/termux-download-release-artifact.sh
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-download-release-artifact.sh"
 
       - name: Create or update mirrored Termux release
         if: steps.metadata.outputs.promote == 'true'
-        shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           UPSTREAM_TAG: ${{ steps.metadata.outputs.upstream_tag }}
           UPSTREAM_REPO: ${{ steps.metadata.outputs.upstream_repo }}
           UPSTREAM_NAME: ${{ steps.metadata.outputs.upstream_name }}
@@ -193,91 +132,4 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
-        run: |
-          set -euo pipefail
-          body_path="${RUNNER_TEMP}/release-body.md"
-          upstream_body_path="${RUNNER_TEMP}/upstream-release-body.md"
-          upstream_body_without_changelog_path="${RUNNER_TEMP}/upstream-release-body-without-changelog.md"
-          if gh release view "${UPSTREAM_TAG}" \
-            --repo "${UPSTREAM_REPO}" \
-            --json body \
-            --jq '.body // ""' > "${upstream_body_path}"; then
-            awk '
-              function heading_level(line, text) {
-                if (match(line, /^(#{1,6})[[:space:]]+(.+)$/, parts)) {
-                  text = tolower(parts[2])
-                  sub(/[[:space:]]+#+[[:space:]]*$/, "", text)
-                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", text)
-                  if (text == "changelog" || text == "change log") {
-                    return length(parts[1])
-                  }
-                }
-                return 0
-              }
-
-              {
-                if (!skip) {
-                  level = heading_level($0)
-                  if (level > 0) {
-                    skip = 1
-                    skip_level = level
-                    next
-                  }
-                  print
-                  next
-                }
-
-                if (match($0, /^(#{1,6})[[:space:]]+/, parts) && length(parts[1]) <= skip_level) {
-                  skip = 0
-                  print
-                }
-              }
-            ' "${upstream_body_path}" > "${upstream_body_without_changelog_path}"
-          else
-            echo "::warning title=Upstream release notes unavailable::Could not read ${UPSTREAM_REPO} release ${UPSTREAM_TAG}."
-            : > "${upstream_body_without_changelog_path}"
-          fi
-
-          {
-            echo "Termux Android build for ${UPSTREAM_TAG}."
-            echo
-            echo "- Upstream release: ${UPSTREAM_HTML_URL}"
-            echo "- Release train: \`${RELEASE_TRAIN}\`"
-            echo "- Promoted PR: #${PR_NUMBER}"
-            echo "- Promoted PR head SHA: \`${HEAD_SHA}\`"
-          } > "${body_path}"
-          if [[ -s "${upstream_body_without_changelog_path}" ]]; then
-            {
-              echo
-              echo "## Upstream release notes"
-              echo
-              cat "${upstream_body_without_changelog_path}"
-            } >> "${body_path}"
-          fi
-
-          release_title="${UPSTREAM_NAME}"
-          if [[ -z "${release_title}" || "${release_title}" == "null" ]]; then
-            release_title="${TERMUX_TAG}"
-          fi
-
-          if [[ "${RELEASE_EXISTS}" == "true" ]]; then
-            gh release upload \
-              "${TERMUX_TAG}" \
-              "promoted/codex-aarch64-linux-android.tar.gz#codex-termux" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --clobber
-            exit 0
-          fi
-
-          release_args=(
-            gh release create "${TERMUX_TAG}"
-            --repo "${GITHUB_REPOSITORY}"
-            --target "${RELEASE_SHA}"
-            --title "${release_title}"
-            --notes-file "${body_path}"
-          )
-          if [[ "${UPSTREAM_PRERELEASE}" == "true" ]]; then
-            release_args+=(--prerelease)
-          fi
-          release_args+=("promoted/codex-aarch64-linux-android.tar.gz#codex-termux")
-          "${release_args[@]}"
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-create-or-update-mirrored-release.sh"

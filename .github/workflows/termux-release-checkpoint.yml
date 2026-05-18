@@ -42,6 +42,10 @@ concurrency:
   group: termux-release-checkpoint-${{ inputs.source_branch || github.ref_name }}
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   checkpoint:
     runs-on: ubuntu-slim
@@ -50,11 +54,11 @@ jobs:
       issues: write
       pull-requests: write
     env:
-      GH_REPO: ${{ github.repository }}
       DESTINATION_BRANCH: ${{ inputs.destination_branch || 'wallentx/termux-target' }}
       REVIEWER: ${{ inputs.reviewer || 'wallentx' }}
       REQUESTED_SOURCE_BRANCH: ${{ inputs.source_branch }}
       REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      TERMUX_AUTOMATION_DIR: ${{ github.workspace }}/.termux-release-automation
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -63,6 +67,11 @@ jobs:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
+      - name: Export GitHub App token for gh
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: echo "GH_TOKEN=${APP_TOKEN}" >> "${GITHUB_ENV}"
+
       - name: Checkout release branch
         uses: actions/checkout@v6
         with:
@@ -70,26 +79,25 @@ jobs:
           ref: ${{ inputs.source_branch || github.ref_name }}
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Checkout automation helpers
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          ref: ${{ github.workflow_sha }}
+          path: .termux-release-automation
+          token: ${{ steps.app-token.outputs.token }}
+
       - name: 🧰 Actions Toolbox
-        # This is required for the GitHub CLI
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         uses: wallentx/gh-actions/composite/actions-toolbox@main
 
+      - name: Validate GitHub CLI environment
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-validate-gh-env.sh"
+
       - name: Configure git
-        shell: bash
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           source_branch="${REQUESTED_SOURCE_BRANCH:-${GITHUB_REF_NAME}}"
-          git fetch --prune origin "${DESTINATION_BRANCH}" "${source_branch}"
+          bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-configure-git.sh" --origin "${DESTINATION_BRANCH}" "${source_branch}"
 
       - name: Create checkpoint PR
-        shell: bash
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          scripts/termux-create-checkpoint-pr.sh
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-create-checkpoint-pr.sh"
