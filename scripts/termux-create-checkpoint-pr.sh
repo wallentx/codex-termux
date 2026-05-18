@@ -204,9 +204,13 @@ while IFS= read -r release_only_path; do
 done < <(release_only_checkpoint_paths)
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
-  git add -A .github
+  if [[ -e .github || -L .github ]] || git ls-files --error-unmatch -- .github >/dev/null 2>&1; then
+    git add -A .github
+  fi
   while IFS= read -r release_only_path; do
-    git add -A -- "${release_only_path}"
+    if [[ -e "${release_only_path}" || -L "${release_only_path}" ]] || git ls-files --error-unmatch -- "${release_only_path}" >/dev/null 2>&1; then
+      git add -A -- "${release_only_path}"
+    fi
   done < <(release_only_checkpoint_paths)
   if [[ "${merge_conflicted}" == "true" ]]; then
     git commit -m "checkpoint: prepare ${source_branch} for ${DESTINATION_BRANCH}"
