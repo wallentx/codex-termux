@@ -349,10 +349,14 @@ jobs:
               echo "termux_tag=${termux_tag}"
             } >> "$GITHUB_OUTPUT"
 
+            body_delimiter="termux_release_body_$(date +%s%N)_${RANDOM}_${RANDOM}"
+            while grep -qxF "${body_delimiter}" <<< "${upstream_body}"; do
+              body_delimiter="termux_release_body_$(date +%s%N)_${RANDOM}_${RANDOM}"
+            done
             {
-              echo "body<<EOF"
+              echo "body<<${body_delimiter}"
               printf '%s\n' "${upstream_body}"
-              echo "EOF"
+              echo "${body_delimiter}"
             } >> "$GITHUB_OUTPUT"
           }
 
@@ -583,6 +587,7 @@ jobs:
           cp scripts/termux-create-checkpoint-pr.sh "${script_seed_dir}/termux-create-checkpoint-pr.sh"
           cp scripts/termux-download-release-artifact.sh "${script_seed_dir}/termux-download-release-artifact.sh"
           cp scripts/termux-find-release-pr.sh "${script_seed_dir}/termux-find-release-pr.sh"
+          cp scripts/termux-release-asset-state.sh "${script_seed_dir}/termux-release-asset-state.sh"
 
           seed_release_branch_workflows() {
             # Release branches start from upstream tags, so keep the Termux-owned
@@ -598,10 +603,12 @@ jobs:
             cp "${script_seed_dir}/termux-create-checkpoint-pr.sh" scripts/termux-create-checkpoint-pr.sh
             cp "${script_seed_dir}/termux-download-release-artifact.sh" scripts/termux-download-release-artifact.sh
             cp "${script_seed_dir}/termux-find-release-pr.sh" scripts/termux-find-release-pr.sh
+            cp "${script_seed_dir}/termux-release-asset-state.sh" scripts/termux-release-asset-state.sh
             chmod +x \
               scripts/termux-create-checkpoint-pr.sh \
               scripts/termux-download-release-artifact.sh \
-              scripts/termux-find-release-pr.sh
+              scripts/termux-find-release-pr.sh \
+              scripts/termux-release-asset-state.sh
           }
 
           is_seeded_release_workflow() {
@@ -613,7 +620,8 @@ jobs:
               .github/workflows/termux-release-promote.yml | \
               scripts/termux-create-checkpoint-pr.sh | \
               scripts/termux-download-release-artifact.sh | \
-              scripts/termux-find-release-pr.sh)
+              scripts/termux-find-release-pr.sh | \
+              scripts/termux-release-asset-state.sh)
                 return 0
                 ;;
               *)
@@ -647,7 +655,8 @@ jobs:
               .github/workflows/termux-release-promote.yml \
               scripts/termux-create-checkpoint-pr.sh \
               scripts/termux-download-release-artifact.sh \
-              scripts/termux-find-release-pr.sh
+              scripts/termux-find-release-pr.sh \
+              scripts/termux-release-asset-state.sh
           }
 
           resolve_workspace_version_conflict() {
@@ -870,7 +879,8 @@ jobs:
               .github/workflows/termux-release-promote.yml \
               scripts/termux-create-checkpoint-pr.sh \
               scripts/termux-download-release-artifact.sh \
-              scripts/termux-find-release-pr.sh
+              scripts/termux-find-release-pr.sh \
+              scripts/termux-release-asset-state.sh
             if ! git diff --cached --quiet; then
               git commit -m "Seed Termux release automation"
             fi
@@ -907,6 +917,7 @@ jobs:
               ':!scripts/termux-create-checkpoint-pr.sh' \
               ':!scripts/termux-download-release-artifact.sh' \
               ':!scripts/termux-find-release-pr.sh' \
+              ':!scripts/termux-release-asset-state.sh' \
               > "${RUNNER_TEMP}/termux.patch"
             if [[ -s "${RUNNER_TEMP}/termux.patch" ]]; then
               if ! git apply --3way "${RUNNER_TEMP}/termux.patch"; then
@@ -1155,8 +1166,16 @@ jobs:
               continue
             fi
 
-            if ! gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            release_state="$(TERMUX_TAG="${termux_tag}" scripts/termux-release-asset-state.sh)"
+            release_exists="$(awk -F= '$1 == "release_exists" { print $2 }' <<< "${release_state}")"
+            asset_exists="$(awk -F= '$1 == "asset_exists" { print $2 }' <<< "${release_state}")"
+
+            if [[ "${release_exists}" != "true" ]]; then
               echo "Keeping ${release_branch}: release ${termux_tag} does not exist yet."
+              continue
+            fi
+            if [[ "${asset_exists}" != "true" ]]; then
+              echo "Keeping ${release_branch}: release ${termux_tag} is missing codex-aarch64-linux-android.tar.gz."
               continue
             fi
 

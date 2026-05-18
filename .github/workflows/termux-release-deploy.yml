@@ -158,20 +158,9 @@ jobs:
             exit 1
           fi
 
-          release_exists=false
-          asset_exists=false
-          if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            release_exists=true
-            release_asset_exists="$(
-              gh release view "${termux_tag}" \
-                --repo "${GITHUB_REPOSITORY}" \
-                --json assets \
-                --jq '.assets | map(.name) | any(. == "codex-aarch64-linux-android.tar.gz")'
-            )"
-            if [[ "${release_asset_exists}" == "true" ]]; then
-              asset_exists=true
-            fi
-          fi
+          release_state="$(TERMUX_TAG="${termux_tag}" scripts/termux-release-asset-state.sh)"
+          release_exists="$(awk -F= '$1 == "release_exists" { print $2 }' <<< "${release_state}")"
+          asset_exists="$(awk -F= '$1 == "asset_exists" { print $2 }' <<< "${release_state}")"
 
           {
             echo "deploy=true"

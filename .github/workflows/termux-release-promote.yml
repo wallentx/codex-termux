@@ -128,10 +128,17 @@ jobs:
             exit 1
           fi
 
-          if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "${termux_tag} already exists; skipping promotion."
+          release_state="$(TERMUX_TAG="${termux_tag}" scripts/termux-release-asset-state.sh)"
+          release_exists="$(awk -F= '$1 == "release_exists" { print $2 }' <<< "${release_state}")"
+          asset_exists="$(awk -F= '$1 == "asset_exists" { print $2 }' <<< "${release_state}")"
+
+          if [[ "${asset_exists}" == "true" ]]; then
+            echo "${termux_tag} already exists with codex-aarch64-linux-android.tar.gz; skipping promotion."
             echo "promote=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          if [[ "${release_exists}" == "true" ]]; then
+            echo "${termux_tag} exists but is missing codex-aarch64-linux-android.tar.gz; repairing promotion."
           fi
 
           {
@@ -143,6 +150,8 @@ jobs:
             echo "upstream_html_url=${upstream_html_url}"
             echo "upstream_repo=${upstream_repo}"
             echo "release_train=${release_train}"
+            echo "release_exists=${release_exists}"
+            echo "asset_exists=${asset_exists}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Locate merged pull request
@@ -168,7 +177,7 @@ jobs:
         run: |
           scripts/termux-download-release-artifact.sh
 
-      - name: Create mirrored Termux release
+      - name: Create or update mirrored Termux release
         if: steps.metadata.outputs.promote == 'true'
         shell: bash
         env:
@@ -180,6 +189,7 @@ jobs:
           UPSTREAM_PRERELEASE: ${{ steps.metadata.outputs.upstream_prerelease }}
           UPSTREAM_HTML_URL: ${{ steps.metadata.outputs.upstream_html_url }}
           RELEASE_TRAIN: ${{ steps.metadata.outputs.release_train }}
+          RELEASE_EXISTS: ${{ steps.metadata.outputs.release_exists }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
@@ -248,6 +258,15 @@ jobs:
           release_title="${UPSTREAM_NAME}"
           if [[ -z "${release_title}" || "${release_title}" == "null" ]]; then
             release_title="${TERMUX_TAG}"
+          fi
+
+          if [[ "${RELEASE_EXISTS}" == "true" ]]; then
+            gh release upload \
+              "${TERMUX_TAG}" \
+              "promoted/codex-aarch64-linux-android.tar.gz#codex-termux" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+            exit 0
           fi
 
           release_args=(

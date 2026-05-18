@@ -21,7 +21,8 @@ release_only_checkpoint_paths() {
   printf '%s\n' \
     scripts/termux-create-checkpoint-pr.sh \
     scripts/termux-download-release-artifact.sh \
-    scripts/termux-find-release-pr.sh
+    scripts/termux-find-release-pr.sh \
+    scripts/termux-release-asset-state.sh
 }
 
 resolve_source_version_conflicts() {
@@ -135,7 +136,8 @@ if ! git merge --no-ff --no-edit "${source_sha}"; then
       .github/termux-release.json|\
       scripts/termux-create-checkpoint-pr.sh|\
       scripts/termux-download-release-artifact.sh|\
-      scripts/termux-find-release-pr.sh)
+      scripts/termux-find-release-pr.sh|\
+      scripts/termux-release-asset-state.sh)
         return 0
         ;;
       *)
