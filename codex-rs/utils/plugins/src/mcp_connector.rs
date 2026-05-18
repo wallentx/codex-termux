@@ -11,6 +11,7 @@ const DISALLOWED_CONNECTOR_IDS: &[&str] = &[
 ];
 const FIRST_PARTY_CHAT_DISALLOWED_CONNECTOR_IDS: &[&str] =
     &["connector_0f9c9d4592e54d0a9a12b3f44a1e2010"];
+const DISALLOWED_CONNECTOR_PREFIX: &str = "connector_openai_";
 
 pub fn is_connector_id_allowed(connector_id: &str) -> bool {
     is_connector_id_allowed_for_originator(connector_id, originator().value.as_str())
@@ -23,7 +24,8 @@ fn is_connector_id_allowed_for_originator(connector_id: &str, originator_value: 
         DISALLOWED_CONNECTOR_IDS
     };
 
-    !disallowed_connector_ids.contains(&connector_id)
+    !connector_id.starts_with(DISALLOWED_CONNECTOR_PREFIX)
+        && !disallowed_connector_ids.contains(&connector_id)
 }
 
 pub fn sanitize_name(name: &str) -> String {

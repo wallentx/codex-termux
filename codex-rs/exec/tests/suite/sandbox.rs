@@ -1,7 +1,6 @@
 #![cfg(unix)]
 use codex_core::spawn::StdioPolicy;
-use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use std::collections::HashMap;
@@ -15,7 +14,7 @@ use tokio::process::Child;
 async fn spawn_command_under_sandbox(
     command: Vec<String>,
     command_cwd: AbsolutePathBuf,
-    permission_profile: &PermissionProfile,
+    sandbox_policy: &SandboxPolicy,
     sandbox_cwd: &AbsolutePathBuf,
     stdio_policy: StdioPolicy,
     env: HashMap<String, String>,
@@ -25,6 +24,8 @@ async fn spawn_command_under_sandbox(
     use codex_core::exec::build_exec_request;
     use codex_core::sandboxing::SandboxPermissions;
     use codex_protocol::config_types::WindowsSandboxLevel;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use std::process::Stdio;
 
     let codex_linux_sandbox_exe = None;
@@ -42,7 +43,9 @@ async fn spawn_command_under_sandbox(
             justification: None,
             arg0: None,
         },
-        permission_profile,
+        sandbox_policy,
+        &FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, sandbox_cwd),
+        NetworkSandboxPolicy::from(sandbox_policy),
         sandbox_cwd,
         &codex_linux_sandbox_exe,
         /*use_legacy_landlock*/ false,
@@ -83,20 +86,19 @@ async fn spawn_command_under_sandbox(
 async fn spawn_command_under_sandbox(
     command: Vec<String>,
     command_cwd: AbsolutePathBuf,
-    permission_profile: &PermissionProfile,
+    sandbox_policy: &SandboxPolicy,
     sandbox_cwd: &AbsolutePathBuf,
     stdio_policy: StdioPolicy,
     env: HashMap<String, String>,
 ) -> std::io::Result<Child> {
     use codex_core::spawn_command_under_linux_sandbox;
-
     let codex_linux_sandbox_exe = core_test_support::find_codex_linux_sandbox_exe()
         .map_err(|err| io::Error::new(io::ErrorKind::NotFound, err))?;
     spawn_command_under_linux_sandbox(
         codex_linux_sandbox_exe,
         command,
         command_cwd,
-        permission_profile,
+        sandbox_policy,
         sandbox_cwd,
         /*use_legacy_landlock*/ false,
         stdio_policy,
@@ -116,16 +118,9 @@ async fn spawn_command_under_sandbox(
 async fn linux_sandbox_test_env() -> Option<HashMap<String, String>> {
     let command_cwd = AbsolutePathBuf::current_dir().ok()?;
     let sandbox_cwd = command_cwd.clone();
-    let permission_profile = PermissionProfile::read_only();
+    let policy = SandboxPolicy::new_read_only_policy();
 
-    if can_apply_linux_sandbox_policy(
-        &permission_profile,
-        &command_cwd,
-        &sandbox_cwd,
-        HashMap::new(),
-    )
-    .await
-    {
+    if can_apply_linux_sandbox_policy(&policy, &command_cwd, &sandbox_cwd, HashMap::new()).await {
         return Some(HashMap::new());
     }
 
@@ -140,7 +135,7 @@ async fn linux_sandbox_test_env() -> Option<HashMap<String, String>> {
 /// This is used as a capability probe so sandbox behavior tests only run when
 /// Landlock enforcement is actually active.
 async fn can_apply_linux_sandbox_policy(
-    permission_profile: &PermissionProfile,
+    policy: &SandboxPolicy,
     command_cwd: &AbsolutePathBuf,
     sandbox_cwd: &AbsolutePathBuf,
     env: HashMap<String, String>,
@@ -148,7 +143,7 @@ async fn can_apply_linux_sandbox_policy(
     let spawn_result = spawn_command_under_sandbox(
         vec!["/usr/bin/true".to_string()],
         command_cwd.clone(),
-        permission_profile,
+        policy,
         sandbox_cwd,
         StdioPolicy::RedirectForShellTool,
         env,
@@ -185,12 +180,13 @@ async fn python_multiprocessing_lock_works_under_sandbox() {
     #[cfg(target_os = "linux")]
     let writable_roots: Vec<AbsolutePathBuf> = vec!["/dev/shm".try_into().unwrap()];
 
-    let permission_profile = PermissionProfile::workspace_write_with(
-        &writable_roots,
-        NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ true,
-        /*exclude_slash_tmp*/ true,
-    );
+    let policy = SandboxPolicy::WorkspaceWrite {
+        writable_roots,
+        read_only_access: Default::default(),
+        network_access: false,
+        exclude_tmpdir_env_var: false,
+        exclude_slash_tmp: false,
+    };
 
     let python_code = r#"import multiprocessing
 from multiprocessing import Lock, Process
@@ -215,7 +211,7 @@ if __name__ == '__main__':
             python_code.to_string(),
         ],
         command_cwd,
-        &permission_profile,
+        &policy,
         &sandbox_cwd,
         StdioPolicy::Inherit,
         sandbox_env,
@@ -247,7 +243,7 @@ async fn python_getpwuid_works_under_sandbox() {
         return;
     }
 
-    let permission_profile = PermissionProfile::read_only();
+    let policy = SandboxPolicy::new_read_only_policy();
     let command_cwd = AbsolutePathBuf::current_dir().expect("should be able to get current dir");
     let sandbox_cwd = command_cwd.clone();
 
@@ -258,7 +254,7 @@ async fn python_getpwuid_works_under_sandbox() {
             "import pwd, os; print(pwd.getpwuid(os.getuid()))".to_string(),
         ],
         command_cwd,
-        &permission_profile,
+        &policy,
         &sandbox_cwd,
         StdioPolicy::RedirectForShellTool,
         sandbox_env,
@@ -299,12 +295,13 @@ async fn sandbox_distinguishes_command_and_policy_cwds() {
     // Note writable_roots is empty: verify that `canonical_allowed_path` is
     // writable only because it is under the sandbox policy cwd, not because it
     // is under a writable root.
-    let permission_profile = PermissionProfile::workspace_write_with(
-        &[],
-        NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ true,
-        /*exclude_slash_tmp*/ true,
-    );
+    let policy = SandboxPolicy::WorkspaceWrite {
+        writable_roots: vec![],
+        read_only_access: Default::default(),
+        network_access: false,
+        exclude_tmpdir_env_var: true,
+        exclude_slash_tmp: true,
+    };
 
     // Attempt to write inside the command cwd, which is outside of the sandbox policy cwd.
     let mut child = spawn_command_under_sandbox(
@@ -314,7 +311,7 @@ async fn sandbox_distinguishes_command_and_policy_cwds() {
             "echo forbidden > forbidden.txt".to_string(),
         ],
         command_root.clone(),
-        &permission_profile,
+        &policy,
         &canonical_sandbox_root,
         StdioPolicy::Inherit,
         sandbox_env.clone(),
@@ -345,7 +342,7 @@ async fn sandbox_distinguishes_command_and_policy_cwds() {
             canonical_allowed_path.to_string_lossy().into_owned(),
         ],
         command_root,
-        &permission_profile,
+        &policy,
         &canonical_sandbox_root,
         StdioPolicy::Inherit,
         sandbox_env,
@@ -380,12 +377,13 @@ async fn sandbox_blocks_first_time_dot_codex_creation() {
     create_dir_all(&repo_root).await.expect("mkdir repo");
     let dot_codex = repo_root.join(".codex");
     let config_toml = dot_codex.join("config.toml");
-    let permission_profile = PermissionProfile::workspace_write_with(
-        &[],
-        NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ true,
-        /*exclude_slash_tmp*/ true,
-    );
+    let policy = SandboxPolicy::WorkspaceWrite {
+        writable_roots: vec![],
+        read_only_access: Default::default(),
+        network_access: false,
+        exclude_tmpdir_env_var: true,
+        exclude_slash_tmp: true,
+    };
 
     let mut child = spawn_command_under_sandbox(
         vec![
@@ -395,7 +393,7 @@ async fn sandbox_blocks_first_time_dot_codex_creation() {
                 .to_string(),
         ],
         repo_root.clone(),
-        &permission_profile,
+        &policy,
         &repo_root,
         StdioPolicy::RedirectForShellTool,
         sandbox_env,
@@ -512,7 +510,7 @@ fn unix_sock_body() {
 async fn allow_unix_socketpair_recvfrom() {
     run_code_under_sandbox(
         "allow_unix_socketpair_recvfrom",
-        &PermissionProfile::read_only(),
+        &SandboxPolicy::new_read_only_policy(),
         || async { unix_sock_body() },
     )
     .await
@@ -524,7 +522,7 @@ const IN_SANDBOX_ENV_VAR: &str = "IN_SANDBOX";
 #[expect(clippy::expect_used)]
 pub async fn run_code_under_sandbox<F, Fut>(
     test_selector: &str,
-    permission_profile: &PermissionProfile,
+    policy: &SandboxPolicy,
     child_body: F,
 ) -> io::Result<Option<ExitStatus>>
 where
@@ -549,7 +547,7 @@ where
         let mut child = spawn_command_under_sandbox(
             cmds,
             command_cwd,
-            permission_profile,
+            policy,
             &sandbox_cwd,
             stdio_policy,
             HashMap::from([("IN_SANDBOX".into(), "1".into())]),

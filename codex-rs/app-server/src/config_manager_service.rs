@@ -12,16 +12,16 @@ use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::OverriddenMetadata;
 use codex_app_server_protocol::WriteStatus;
 use codex_config::CONFIG_TOML_FILE;
-use codex_config::ConfigLayerEntry;
-use codex_config::ConfigLayerStack;
-use codex_config::ConfigLayerStackOrdering;
-use codex_config::ConfigRequirementsToml;
 use codex_config::config_toml::ConfigToml;
-use codex_config::merge_toml_values;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::validate_feature_requirements_for_config_toml;
+use codex_core::config_loader::ConfigLayerEntry;
+use codex_core::config_loader::ConfigLayerStack;
+use codex_core::config_loader::ConfigLayerStackOrdering;
+use codex_core::config_loader::ConfigRequirementsToml;
+use codex_core::config_loader::merge_toml_values;
 use codex_core::path_utils;
 use codex_core::path_utils::SymlinkWritePaths;
 use codex_core::path_utils::resolve_symlink_write_paths;
@@ -196,9 +196,8 @@ impl ConfigManager {
         expected_version: Option<String>,
         edits: Vec<(String, JsonValue, MergeStrategy)>,
     ) -> Result<ConfigWriteResponse, ConfigManagerError> {
-        let allowed_path = self
-            .user_config_path()
-            .map_err(|err| ConfigManagerError::io("failed to resolve user config path", err))?;
+        let allowed_path =
+            AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, self.codex_home());
         let provided_path = match file_path {
             Some(path) => AbsolutePathBuf::from_absolute_path(PathBuf::from(path))
                 .map_err(|err| ConfigManagerError::io("failed to resolve user config path", err))?,
@@ -216,7 +215,7 @@ impl ConfigManager {
             .load_thread_agnostic_config()
             .await
             .map_err(|err| ConfigManagerError::io("failed to load configuration", err))?;
-        let user_layer = match layers.get_active_user_layer() {
+        let user_layer = match layers.get_user_layer() {
             Some(layer) => Cow::Borrowed(layer),
             None => Cow::Owned(create_empty_user_layer(&allowed_path).await?),
         };
@@ -245,6 +244,10 @@ impl ConfigManager {
 
             apply_merge(&mut user_config, &segments, parsed_value.as_ref(), strategy).map_err(
                 |err| match err {
+                    MergeError::PathNotFound => ConfigManagerError::write(
+                        ConfigWriteErrorCode::ConfigPathNotFound,
+                        "Path not found",
+                    ),
                     MergeError::Validation(message) => ConfigManagerError::write(
                         ConfigWriteErrorCode::ConfigValidationError,
                         message,
@@ -306,7 +309,7 @@ impl ConfigManager {
         })?;
 
         if !config_edits.is_empty() {
-            ConfigEditsBuilder::for_config_path(provided_path.as_path())
+            ConfigEditsBuilder::new(self.codex_home())
                 .with_edits(config_edits)
                 .apply()
                 .await
@@ -322,7 +325,7 @@ impl ConfigManager {
         Ok(ConfigWriteResponse {
             status,
             version: updated_layers
-                .get_active_user_layer()
+                .get_user_layer()
                 .ok_or_else(|| {
                     ConfigManagerError::write(
                         ConfigWriteErrorCode::UserLayerNotFound,
@@ -376,7 +379,6 @@ async fn create_empty_user_layer(
     Ok(ConfigLayerEntry::new(
         ConfigLayerSource::User {
             file: config_toml.clone(),
-            profile: None,
         },
         toml_value,
     ))
@@ -403,51 +405,15 @@ fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
     if path.trim().is_empty() {
         return Err("keyPath must not be empty".to_string());
     }
-
-    let mut segments = Vec::new();
-    let mut segment = String::new();
-    let mut chars = path.chars();
-    let mut quoted = false;
-
-    // Split on dots unless they appear inside a quoted segment. Bare segments
-    // intentionally stay permissive so existing paths like `sample@catalog`
-    // remain valid.
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if segment.is_empty() && !quoted => quoted = true,
-            '"' if quoted => quoted = false,
-            '\\' if quoted => {
-                // Quoted segments may escape punctuation that would otherwise
-                // participate in parsing, such as `.` or `"`.
-                let Some(escaped) = chars.next() else {
-                    return Err("unterminated escape in keyPath".to_string());
-                };
-                segment.push(escaped);
-            }
-            '.' if !quoted => {
-                if segment.is_empty() {
-                    return Err("keyPath segments must not be empty".to_string());
-                }
-                segments.push(std::mem::take(&mut segment));
-            }
-            '"' => return Err("invalid quoted keyPath segment".to_string()),
-            _ => segment.push(ch),
-        }
-    }
-
-    if quoted {
-        return Err("unterminated quoted keyPath segment".to_string());
-    }
-    if segment.is_empty() {
-        return Err("keyPath segments must not be empty".to_string());
-    }
-
-    segments.push(segment);
-    Ok(segments)
+    Ok(path
+        .split('.')
+        .map(std::string::ToString::to_string)
+        .collect())
 }
 
 #[derive(Debug)]
 enum MergeError {
+    PathNotFound,
     Validation(String),
 }
 
@@ -519,17 +485,14 @@ fn clear_path(root: &mut TomlValue, segments: &[String]) -> Result<bool, MergeEr
     for segment in parents {
         match current {
             TomlValue::Table(table) => {
-                let Some(next) = table.get_mut(segment) else {
-                    return Ok(false);
-                };
-                current = next;
+                current = table.get_mut(segment).ok_or(MergeError::PathNotFound)?;
             }
-            _ => return Ok(false),
+            _ => return Err(MergeError::PathNotFound),
         }
     }
 
     let Some(parent) = current.as_table_mut() else {
-        return Ok(false);
+        return Err(MergeError::PathNotFound);
     };
 
     Ok(parent.remove(last).is_some())
@@ -613,7 +576,7 @@ fn override_message(layer: &ConfigLayerSource) -> String {
             dot_codex_folder.display(),
         ),
         ConfigLayerSource::SessionFlags => "Overridden by session flags".to_string(),
-        ConfigLayerSource::User { file, .. } => {
+        ConfigLayerSource::User { file } => {
             format!("Overridden by user config: {}", file.display())
         }
         ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => {
@@ -633,7 +596,7 @@ fn compute_override_metadata(
     effective: &TomlValue,
     segments: &[String],
 ) -> Option<OverriddenMetadata> {
-    let user_value = match layers.get_active_user_layer() {
+    let user_value = match layers.get_user_layer() {
         Some(user_layer) => value_at_path(&user_layer.config, segments),
         None => return None,
     };

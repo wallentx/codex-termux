@@ -1,19 +1,16 @@
 use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::context::boxed_tool_output;
-use crate::tools::registry::CoreToolRuntime;
-use crate::tools::registry::ToolExecutor;
-use codex_tools::ToolName;
-use codex_tools::ToolSpec;
+use crate::tools::registry::ToolHandler;
+use crate::tools::registry::ToolKind;
 
 use super::DEFAULT_WAIT_YIELD_TIME_MS;
 use super::ExecContext;
 use super::WAIT_TOOL_NAME;
 use super::handle_runtime_response;
-use super::wait_spec::create_wait_tool;
 
 pub struct CodeModeWaitHandler;
 
@@ -41,20 +38,14 @@ where
     })
 }
 
-#[async_trait::async_trait]
-impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
-    fn tool_name(&self) -> ToolName {
-        ToolName::plain(WAIT_TOOL_NAME)
+impl ToolHandler for CodeModeWaitHandler {
+    type Output = FunctionToolOutput;
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Function
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(create_wait_tool())
-    }
-
-    async fn handle(
-        &self,
-        invocation: ToolInvocation,
-    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -100,7 +91,6 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
                 }
                 handle_runtime_response(&exec, wait_response.into(), args.max_tokens, started_at)
                     .await
-                    .map(boxed_tool_output)
                     .map_err(FunctionCallError::RespondToModel)
             }
             _ => Err(FunctionCallError::RespondToModel(format!(
@@ -109,5 +99,3 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
         }
     }
 }
-
-impl CoreToolRuntime for CodeModeWaitHandler {}
