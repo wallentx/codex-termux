@@ -19,9 +19,7 @@ use crate::SkillMetadata;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::skills::model::SkillToolDependency;
-use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::McpOAuthLoginSupport;
-use codex_mcp::McpPermissionPromptAutoApproveContext;
 use codex_mcp::mcp_permission_prompt_is_auto_approved;
 use codex_mcp::oauth_login_support;
 use codex_mcp::resolve_oauth_scopes;
@@ -36,7 +34,6 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     turn_context: &TurnContext,
     cancellation_token: &CancellationToken,
     mentioned_skills: &[SkillMetadata],
-    elicitation_reviewer: Option<ElicitationReviewerHandle>,
 ) {
     let originator_value = originator().value;
     if !is_first_party_originator(originator_value.as_str()) {
@@ -71,14 +68,7 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     if should_install_mcp_dependencies(sess, turn_context, &unprompted_missing, cancellation_token)
         .await
     {
-        maybe_install_mcp_dependencies(
-            sess,
-            turn_context,
-            config.as_ref(),
-            mentioned_skills,
-            elicitation_reviewer,
-        )
-        .await;
+        maybe_install_mcp_dependencies(sess, turn_context, config.as_ref(), mentioned_skills).await;
     }
 }
 
@@ -87,7 +77,6 @@ pub(crate) async fn maybe_install_mcp_dependencies(
     turn_context: &TurnContext,
     config: &crate::config::Config,
     mentioned_skills: &[SkillMetadata],
-    elicitation_reviewer: Option<ElicitationReviewerHandle>,
 ) {
     if mentioned_skills.is_empty()
         || !config
@@ -146,12 +135,19 @@ pub(crate) async fn maybe_install_mcp_dependencies(
             }
         };
 
+        sess.notify_background_event(
+            turn_context,
+            format!(
+                "Authenticating MCP {name}... Follow instructions in your browser if prompted."
+            ),
+        )
+        .await;
+
         let resolved_scopes = resolve_oauth_scopes(
             /*explicit_scopes*/ None,
             server_config.scopes.clone(),
             oauth_config.discovered_scopes.clone(),
         );
-        let oauth_client_id = server_config.oauth_client_id();
         let first_attempt = perform_oauth_login(
             &name,
             &oauth_config.url,
@@ -159,7 +155,6 @@ pub(crate) async fn maybe_install_mcp_dependencies(
             oauth_config.http_headers.clone(),
             oauth_config.env_http_headers.clone(),
             &resolved_scopes.scopes,
-            oauth_client_id,
             server_config.oauth_resource.as_deref(),
             config.mcp_oauth_callback_port,
             config.mcp_oauth_callback_url.as_deref(),
@@ -168,6 +163,14 @@ pub(crate) async fn maybe_install_mcp_dependencies(
 
         if let Err(err) = first_attempt {
             if should_retry_without_scopes(&resolved_scopes, &err) {
+                sess.notify_background_event(
+                    turn_context,
+                    format!(
+                        "Retrying MCP {name} authentication without scopes after provider rejection."
+                    ),
+                )
+                .await;
+
                 if let Err(err) = perform_oauth_login(
                     &name,
                     &oauth_config.url,
@@ -175,7 +178,6 @@ pub(crate) async fn maybe_install_mcp_dependencies(
                     oauth_config.http_headers,
                     oauth_config.env_http_headers,
                     &[],
-                    oauth_client_id,
                     server_config.oauth_resource.as_deref(),
                     config.mcp_oauth_callback_port,
                     config.mcp_oauth_callback_url.as_deref(),
@@ -190,11 +192,14 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         }
     }
 
-    // Refresh from the config-backed merged MCP map (global + repo + managed)
-    // and overlay the updated global servers so we don't drop repo-scoped
-    // servers. Runtime additions such as built-ins are rebuilt by the refresh
-    // path from the current config.
-    let mut refresh_servers = sess.services.mcp_manager.configured_servers(config).await;
+    // Refresh from the effective merged MCP map (global + repo + managed) and
+    // overlay the updated global servers so we don't drop repo-scoped servers.
+    let auth = sess.services.auth_manager.auth().await;
+    let mut refresh_servers = sess
+        .services
+        .mcp_manager
+        .effective_servers(config, auth.as_ref())
+        .await;
     for (name, server_config) in &servers {
         refresh_servers
             .entry(name.clone())
@@ -204,7 +209,6 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         turn_context,
         refresh_servers,
         config.mcp_oauth_credentials_store_mode,
-        elicitation_reviewer,
     )
     .await;
 }
@@ -217,8 +221,7 @@ async fn should_install_mcp_dependencies(
 ) -> bool {
     if mcp_permission_prompt_is_auto_approved(
         turn_context.approval_policy.value(),
-        &turn_context.permission_profile(),
-        McpPermissionPromptAutoApproveContext::default(),
+        turn_context.sandbox_policy.get(),
     ) {
         return true;
     }
@@ -372,7 +375,6 @@ fn mcp_dependency_to_server_config(
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
-            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         });
@@ -402,7 +404,6 @@ fn mcp_dependency_to_server_config(
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
-            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         });

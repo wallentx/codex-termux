@@ -33,10 +33,6 @@ impl SessionTask for RegularTask {
         "session_task.turn"
     }
 
-    fn records_turn_token_usage_on_span(&self) -> bool {
-        true
-    }
-
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
@@ -45,7 +41,6 @@ impl SessionTask for RegularTask {
         cancellation_token: CancellationToken,
     ) -> Option<String> {
         let sess = session.clone_session();
-        let turn_extension_data = session.turn_extension_data();
         let run_turn_span = trace_span!("run_turn");
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
@@ -73,7 +68,6 @@ impl SessionTask for RegularTask {
             let last_agent_message = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
-                Arc::clone(&turn_extension_data),
                 next_input,
                 prewarmed_client_session.take(),
                 cancellation_token.child_token(),

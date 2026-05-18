@@ -17,7 +17,6 @@ use ts_rs::TS;
 
 use crate::config_types::Personality;
 use crate::config_types::ReasoningSummary;
-use crate::config_types::ServiceTier;
 use crate::config_types::Verbosity;
 
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
@@ -116,13 +115,6 @@ pub struct ModelAvailabilityNux {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
-pub struct ModelServiceTier {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-}
-
 /// Metadata describing a Codex-supported model.
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct ModelPreset {
@@ -141,12 +133,9 @@ pub struct ModelPreset {
     /// Whether this model supports personality-specific instructions.
     #[serde(default)]
     pub supports_personality: bool,
-    /// Deprecated: use `service_tiers` instead.
+    /// Additional speed tiers this model can run with beyond the standard path.
     #[serde(default)]
     pub additional_speed_tiers: Vec<String>,
-    /// Service tiers this model can run with.
-    #[serde(default)]
-    pub service_tiers: Vec<ModelServiceTier>,
     /// Whether this is the default model for new users.
     pub is_default: bool,
     /// recommended upgrade model
@@ -203,6 +192,7 @@ pub enum ConfigShellToolType {
 #[serde(rename_all = "snake_case")]
 pub enum ApplyPatchToolType {
     Freeform,
+    Function,
 }
 
 #[derive(
@@ -268,8 +258,6 @@ pub struct ModelInfo {
     pub priority: i32,
     #[serde(default)]
     pub additional_speed_tiers: Vec<String>,
-    #[serde(default)]
-    pub service_tiers: Vec<ModelServiceTier>,
     pub availability_nux: Option<ModelAvailabilityNux>,
     pub upgrade: Option<ModelInfoUpgrade>,
     pub base_instructions: String,
@@ -454,7 +442,6 @@ impl From<ModelInfo> for ModelPreset {
             supported_reasoning_efforts: info.supported_reasoning_levels.clone(),
             supports_personality,
             additional_speed_tiers: info.additional_speed_tiers,
-            service_tiers: info.service_tiers,
             is_default: false, // default is the highest priority available model
             upgrade: info.upgrade.as_ref().map(|upgrade| ModelUpgrade {
                 id: upgrade.model.clone(),
@@ -477,25 +464,11 @@ impl From<ModelInfo> for ModelPreset {
 
 impl ModelPreset {
     pub fn supports_fast_mode(&self) -> bool {
-        self.service_tiers
+        self.additional_speed_tiers
             .iter()
-            .any(|tier| tier.id == ServiceTier::Fast.request_value())
-            || self
-                .additional_speed_tiers
-                .iter()
-                .any(|tier| tier == SPEED_TIER_FAST)
+            .any(|tier| tier == SPEED_TIER_FAST)
     }
-}
 
-impl ModelInfo {
-    pub fn supports_service_tier(&self, service_tier: &str) -> bool {
-        self.service_tiers
-            .iter()
-            .any(|tier| tier.id == service_tier)
-    }
-}
-
-impl ModelPreset {
     /// Filter models based on authentication mode.
     ///
     /// In ChatGPT mode, all models are visible. Otherwise, only API-supported models are shown.
@@ -575,7 +548,6 @@ mod tests {
             supported_in_api: true,
             priority: 1,
             additional_speed_tiers: Vec::new(),
-            service_tiers: Vec::new(),
             availability_nux: None,
             upgrade: None,
             base_instructions: "base".to_string(),
@@ -846,7 +818,6 @@ mod tests {
                 message: "Try Spark.".to_string(),
             }),
             additional_speed_tiers: vec![SPEED_TIER_FAST.to_string()],
-            service_tiers: Vec::new(),
             ..test_model(/*spec*/ None)
         });
 
@@ -856,20 +827,6 @@ mod tests {
                 message: "Try Spark.".to_string(),
             })
         );
-        assert!(preset.supports_fast_mode());
-    }
-
-    #[test]
-    fn model_preset_supports_fast_mode_from_service_tiers() {
-        let preset = ModelPreset::from(ModelInfo {
-            service_tiers: vec![ModelServiceTier {
-                id: ServiceTier::Fast.request_value().to_string(),
-                name: "Fast".to_string(),
-                description: "Priority processing.".to_string(),
-            }],
-            ..test_model(/*spec*/ None)
-        });
-
         assert!(preset.supports_fast_mode());
     }
 }
