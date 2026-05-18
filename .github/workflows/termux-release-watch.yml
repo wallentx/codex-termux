@@ -106,6 +106,23 @@ jobs:
             printf '%s\n' "${version}"
           }
 
+          termux_release_tags_cache_loaded=false
+          termux_release_tags_cache=""
+          termux_release_tags() {
+            if [[ "${termux_release_tags_cache_loaded}" != "true" ]]; then
+              termux_release_tags_cache="$(
+                gh release list \
+                  --repo "${GITHUB_REPOSITORY}" \
+                  --exclude-drafts \
+                  --limit 200 \
+                  --json tagName \
+                  --jq '.[].tagName'
+              )"
+              termux_release_tags_cache_loaded=true
+            fi
+            printf '%s\n' "${termux_release_tags_cache}"
+          }
+
           release_branch_current_tag() {
             local release_branch="$1"
             release_branch_current_metadata "${release_branch}" \
@@ -227,16 +244,52 @@ jobs:
             [[ "${newest_version}" == "${candidate_version}" && "${candidate_version}" != "${current_version}" ]]
           }
 
+          latest_mirrored_termux_tag_for_train() {
+            local release_train="$1"
+            local newest_tag=""
+            local termux_tag
+            local termux_version
+            local termux_train
+
+            while IFS= read -r termux_tag; do
+              [[ -n "${termux_tag}" ]] || continue
+              case "${termux_tag}" in
+                rust-v*-termux)
+                  ;;
+                *)
+                  continue
+                  ;;
+              esac
+
+              termux_version="$(normalize_rust_tag_version "${termux_tag}")"
+              termux_train="${termux_version%%-*}"
+              [[ "${termux_train}" == "${release_train}" ]] || continue
+
+              if [[ -z "${newest_tag}" ]] || rust_tag_is_newer_than_tag "${termux_tag}" "${newest_tag}"; then
+                newest_tag="${termux_tag}"
+              fi
+            done < <(termux_release_tags)
+
+            printf '%s\n' "${newest_tag}"
+          }
+
           release_tag_is_newer_than_known_train() {
             local candidate_tag="$1"
             local release_branch="$2"
             local open_train_pr_json="${3:-}"
             local current_tag
+            local mirrored_tag
             local open_pr_tag
 
             current_tag="$(release_branch_current_tag "${release_branch}")"
             if ! rust_tag_is_newer_than_tag "${candidate_tag}" "${current_tag}"; then
               echo "${candidate_tag} is not newer than ${current_tag} already recorded on ${release_branch}; nothing to do."
+              return 1
+            fi
+
+            mirrored_tag="$(latest_mirrored_termux_tag_for_train "${release_branch#release/}")"
+            if ! rust_tag_is_newer_than_tag "${candidate_tag}" "${mirrored_tag}"; then
+              echo "${candidate_tag} is not newer than ${mirrored_tag} already mirrored for ${release_branch}; nothing to do."
               return 1
             fi
 
