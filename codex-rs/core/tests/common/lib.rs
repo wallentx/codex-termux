@@ -8,10 +8,6 @@ use ctor::ctor;
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
-use codex_config::CloudRequirementsLoader;
-use codex_config::ConfigRequirementsToml;
-use codex_config::LoaderOverrides;
-use codex_config::NetworkRequirementsToml;
 use codex_core::CodexThread;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -24,7 +20,6 @@ use std::path::PathBuf;
 
 pub mod apps_test_server;
 pub mod context_snapshot;
-pub mod hooks;
 pub mod process;
 pub mod responses;
 pub mod streaming_sse;
@@ -169,40 +164,12 @@ pub fn fetch_dotslash_file(
 /// temporary directory. Using a per-test directory keeps tests hermetic and
 /// avoids clobbering a developer’s real `~/.codex`.
 pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
-    load_default_config_for_test_with_cloud_requirements(
-        codex_home,
-        CloudRequirementsLoader::default(),
-    )
-    .await
-}
-
-/// Returns a default `Config` with test-provided cloud requirements applied
-/// during config construction.
-pub async fn load_default_config_for_test_with_cloud_requirements(
-    codex_home: &TempDir,
-    cloud_requirements: CloudRequirementsLoader,
-) -> Config {
     ConfigBuilder::default()
-        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(default_test_overrides())
-        .cloud_requirements(cloud_requirements)
         .build()
         .await
         .expect("defaults for test should always succeed")
-}
-
-pub fn managed_network_requirements_loader() -> CloudRequirementsLoader {
-    CloudRequirementsLoader::new(async {
-        Ok(Some(ConfigRequirementsToml {
-            network: Some(NetworkRequirementsToml {
-                enabled: Some(true),
-                allow_local_binding: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-    })
 }
 
 #[cfg(target_os = "linux")]
@@ -235,6 +202,54 @@ pub fn find_codex_linux_sandbox_exe() -> Result<PathBuf, CargoBinError> {
     }
 
     codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox")
+}
+
+/// Builds an SSE stream body from a JSON fixture.
+///
+/// The fixture must contain an array of objects where each object represents a
+/// single SSE event with at least a `type` field matching the `event:` value.
+/// Additional fields become the JSON payload for the `data:` line. An object
+/// with only a `type` field results in an event with no `data:` section. This
+/// makes it trivial to extend the fixtures as OpenAI adds new event kinds or
+/// fields.
+pub fn load_sse_fixture(path: impl AsRef<std::path::Path>) -> String {
+    let events: Vec<serde_json::Value> =
+        serde_json::from_reader(std::fs::File::open(path).expect("read fixture"))
+            .expect("parse JSON fixture");
+    events
+        .into_iter()
+        .map(|e| {
+            let kind = e
+                .get("type")
+                .and_then(|v| v.as_str())
+                .expect("fixture event missing type");
+            if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
+                format!("event: {kind}\n\n")
+            } else {
+                format!("event: {kind}\ndata: {e}\n\n")
+            }
+        })
+        .collect()
+}
+
+pub fn load_sse_fixture_with_id_from_str(raw: &str, id: &str) -> String {
+    let replaced = raw.replace("__ID__", id);
+    let events: Vec<serde_json::Value> =
+        serde_json::from_str(&replaced).expect("parse JSON fixture");
+    events
+        .into_iter()
+        .map(|e| {
+            let kind = e
+                .get("type")
+                .and_then(|v| v.as_str())
+                .expect("fixture event missing type");
+            if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
+                format!("event: {kind}\n\n")
+            } else {
+                format!("event: {kind}\ndata: {e}\n\n")
+            }
+        })
+        .collect()
 }
 
 pub async fn wait_for_event<F>(

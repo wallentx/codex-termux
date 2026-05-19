@@ -2,97 +2,35 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-async fn invalid_url_elicitation_is_declined() {
-    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
-    let visible_thread_id = ThreadId::new();
-    let request_thread_id = ThreadId::new();
-    chat.thread_id = Some(visible_thread_id);
-
-    chat.handle_elicitation_request_now(
-        codex_app_server_protocol::RequestId::Integer(9),
-        codex_app_server_protocol::McpServerElicitationRequestParams {
-            thread_id: request_thread_id.to_string(),
-            turn_id: Some("turn-auth".to_string()),
-            server_name: "payments".to_string(),
-            request: codex_app_server_protocol::McpServerElicitationRequest::Url {
-                meta: None,
-                message: "Review the payment details to continue.".to_string(),
-                url: "http://payments.example/checkout/123".to_string(),
-                elicitation_id: "payment-123".to_string(),
-            },
-        },
-    );
-
-    assert_matches!(
-        rx.try_recv(),
-        Ok(AppEvent::SubmitThreadOp {
-            thread_id: op_thread_id,
-            op: Op::ResolveElicitation {
-                server_name,
-                request_id: codex_app_server_protocol::RequestId::Integer(9),
-                decision: codex_app_server_protocol::McpServerElicitationAction::Decline,
-                content: None,
-                meta: None,
-            },
-        }) if op_thread_id == request_thread_id && server_name == "payments"
-    );
-}
-
-#[tokio::test]
 async fn collab_spawn_end_shows_requested_model_and_effort() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     let sender_thread_id = ThreadId::new();
     let spawned_thread_id = ThreadId::new();
-    chat.set_collab_agent_metadata(
-        spawned_thread_id,
-        Some("Robie".to_string()),
-        Some("explorer".to_string()),
-    );
 
-    chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
-            item: AppServerThreadItem::CollabAgentToolCall {
-                id: "call-spawn".to_string(),
-                tool: AppServerCollabAgentTool::SpawnAgent,
-                status: AppServerCollabAgentToolCallStatus::InProgress,
-                sender_thread_id: sender_thread_id.to_string(),
-                receiver_thread_ids: Vec::new(),
-                prompt: Some("Explore the repo".to_string()),
-                model: Some("gpt-5".to_string()),
-                reasoning_effort: Some(ReasoningEffortConfig::High),
-                agents_states: HashMap::new(),
-            },
+    chat.handle_codex_event(Event {
+        id: "spawn-begin".into(),
+        msg: EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id,
+            prompt: "Explore the repo".to_string(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: ReasoningEffortConfig::High,
         }),
-        /*replay_kind*/ None,
-    );
-    chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::CollabAgentToolCall {
-                id: "call-spawn".to_string(),
-                tool: AppServerCollabAgentTool::SpawnAgent,
-                status: AppServerCollabAgentToolCallStatus::Completed,
-                sender_thread_id: sender_thread_id.to_string(),
-                receiver_thread_ids: vec![spawned_thread_id.to_string()],
-                prompt: Some("Explore the repo".to_string()),
-                model: None,
-                reasoning_effort: None,
-                agents_states: HashMap::from([(
-                    spawned_thread_id.to_string(),
-                    AppServerCollabAgentState {
-                        status: AppServerCollabAgentStatus::PendingInit,
-                        message: None,
-                    },
-                )]),
-            },
+    });
+    chat.handle_codex_event(Event {
+        id: "spawn-end".into(),
+        msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id,
+            new_thread_id: Some(spawned_thread_id),
+            new_agent_nickname: Some("Robie".to_string()),
+            new_agent_role: Some("explorer".to_string()),
+            prompt: "Explore the repo".to_string(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: ReasoningEffortConfig::High,
+            status: AgentStatus::PendingInit,
         }),
-        /*replay_kind*/ None,
-    );
+    });
 
     let cells = drain_insert_history(&mut rx);
     let rendered = cells
@@ -129,7 +67,6 @@ async fn live_app_server_user_message_item_completed_does_not_duplicate_rendered
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
             item: AppServerThreadItem::UserMessage {
                 id: "user-1".to_string(),
                 content: vec![AppServerUserInput::Text {
@@ -153,7 +90,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
@@ -176,7 +112,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
             item: AppServerThreadItem::AgentMessage {
                 id: "msg-1".to_string(),
                 text: "Yes. What do you need?".to_string(),
@@ -197,7 +132,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::Completed,
                 error: None,
@@ -222,7 +156,6 @@ async fn live_app_server_turn_started_sets_feedback_turn_id() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
@@ -258,7 +191,7 @@ async fn live_app_server_warning_notification_renders_message() {
     chat.handle_server_notification(
         ServerNotification::Warning(WarningNotification {
             thread_id: None,
-            message: "Exceeded skills context budget of 2%. All skill descriptions were removed and 2 additional skills were not included in the model-visible skills list.".to_string(),
+            message: "Warning: Exceeded skills context budget of 2%. All skill descriptions were removed and 2 additional skills were not included in the model-visible skills list.".to_string(),
         }),
         /*replay_kind*/ None,
     );
@@ -268,7 +201,7 @@ async fn live_app_server_warning_notification_renders_message() {
     let rendered = lines_to_single_string(&cells[0]);
     let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        normalized.contains("Exceeded skills context budget of 2%."),
+        normalized.contains("Warning: Exceeded skills context budget of 2%."),
         "expected warning notification message, got {rendered}"
     );
     assert!(
@@ -331,7 +264,6 @@ async fn live_app_server_file_change_item_started_preserves_changes() {
         ServerNotification::ItemStarted(ItemStartedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
             item: AppServerThreadItem::FileChange {
                 id: "patch-1".to_string(),
                 changes: vec![FileUpdateChange {
@@ -365,7 +297,6 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
         ServerNotification::ItemStarted(ItemStartedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
             item: AppServerThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: command.clone(),
@@ -387,7 +318,6 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
             item: AppServerThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command,
@@ -419,6 +349,25 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
     );
 }
 
+#[test]
+fn app_server_patch_changes_to_core_preserves_diffs() {
+    let changes = app_server_patch_changes_to_core(vec![FileUpdateChange {
+        path: "foo.txt".to_string(),
+        kind: PatchChangeKind::Add,
+        diff: "hello\n".to_string(),
+    }]);
+
+    assert_eq!(
+        changes,
+        HashMap::from([(
+            PathBuf::from("foo.txt"),
+            FileChange::Add {
+                content: "hello\n".to_string(),
+            },
+        )])
+    );
+}
+
 #[tokio::test]
 async fn live_app_server_collab_wait_items_render_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -443,7 +392,6 @@ async fn live_app_server_collab_wait_items_render_history() {
         ServerNotification::ItemStarted(ItemStartedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
             item: AppServerThreadItem::CollabAgentToolCall {
                 id: "wait-1".to_string(),
                 tool: AppServerCollabAgentTool::Wait,
@@ -466,7 +414,6 @@ async fn live_app_server_collab_wait_items_render_history() {
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
             item: AppServerThreadItem::CollabAgentToolCall {
                 id: "wait-1".to_string(),
                 tool: AppServerCollabAgentTool::Wait,
@@ -520,7 +467,6 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
         ServerNotification::ItemStarted(ItemStartedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
             item: AppServerThreadItem::CollabAgentToolCall {
                 id: "spawn-1".to_string(),
                 tool: AppServerCollabAgentTool::SpawnAgent,
@@ -540,7 +486,6 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
             item: AppServerThreadItem::CollabAgentToolCall {
                 id: "spawn-1".to_string(),
                 tool: AppServerCollabAgentTool::SpawnAgent,
@@ -582,7 +527,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
@@ -617,7 +561,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::Failed,
                 error: Some(AppServerTurnError {
@@ -638,40 +581,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
 }
 
 #[tokio::test]
-async fn live_app_server_failed_turn_consolidates_streamed_answer() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    handle_turn_started(&mut chat, "turn-1");
-    while rx.try_recv().is_ok() {}
-
-    handle_agent_message_delta(&mut chat, "```diff\n+ streamed patch\n```\n");
-    chat.run_commit_tick();
-    while rx.try_recv().is_ok() {}
-
-    handle_error(
-        &mut chat,
-        "stream disconnected before completion",
-        /*codex_error_info*/ None,
-    );
-
-    let mut saw_consolidate = false;
-    while let Ok(event) = rx.try_recv() {
-        if let AppEvent::ConsolidateAgentMessage { source, .. } = event {
-            saw_consolidate = true;
-            assert!(
-                source.contains("streamed patch"),
-                "expected partial stream source to be consolidated, got {source:?}"
-            );
-        }
-    }
-
-    assert!(
-        saw_consolidate,
-        "failed turn should consolidate streamed cells before clearing the stream controller"
-    );
-}
-
-#[tokio::test]
 async fn live_app_server_stream_recovery_restores_previous_status_header() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -680,7 +589,6 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
@@ -697,7 +605,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
                 message: "Reconnecting... 1/5".to_string(),
-                codex_error_info: Some(CodexErrorInfo::Other),
+                codex_error_info: Some(CodexErrorInfo::Other.into()),
                 additional_details: None,
             },
             will_retry: true,
@@ -726,7 +634,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
         .expect("status indicator should be visible");
     assert_eq!(status.header(), "Working");
     assert_eq!(status.details(), None);
-    assert!(chat.status_state.retry_status_header.is_none());
+    assert!(chat.retry_status_header.is_none());
 }
 
 #[tokio::test]
@@ -738,7 +646,6 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
@@ -755,7 +662,7 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
                 message: "server overloaded".to_string(),
-                codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                codex_error_info: Some(CodexErrorInfo::ServerOverloaded.into()),
                 additional_details: None,
             },
             will_retry: false,
@@ -780,7 +687,6 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
@@ -797,7 +703,7 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
                 message: "server fallback message".to_string(),
-                codex_error_info: Some(CodexErrorInfo::CyberPolicy),
+                codex_error_info: Some(CodexErrorInfo::CyberPolicy.into()),
                 additional_details: None,
             },
             will_retry: false,
@@ -862,8 +768,7 @@ async fn live_app_server_invalid_thread_name_update_is_ignored() {
 #[tokio::test]
 async fn live_app_server_thread_name_update_shows_resume_hint() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let thread_id =
-        ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").expect("thread id");
+    let thread_id = ThreadId::new();
     chat.thread_id = Some(thread_id);
 
     chat.handle_server_notification(
@@ -880,7 +785,8 @@ async fn live_app_server_thread_name_update_shows_resume_hint() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1);
     let rendered = lines_to_single_string(&cells[0]);
-    assert_chatwidget_snapshot!("thread_name_update_resume_hint", rendered);
+    assert!(rendered.contains("Thread renamed to review-fix"));
+    assert!(rendered.contains("codex resume review-fix"));
 }
 
 #[tokio::test]

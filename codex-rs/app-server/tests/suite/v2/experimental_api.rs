@@ -36,7 +36,6 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
             default_client_info(),
             Some(InitializeCapabilities {
                 experimental_api: false,
-                request_attestation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -67,7 +66,6 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
             default_client_info(),
             Some(InitializeCapabilities {
                 experimental_api: false,
-                request_attestation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -81,7 +79,7 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
             thread_id: "thr_123".to_string(),
             output_modality: RealtimeOutputModality::Audio,
             prompt: Some(Some("hello".to_string())),
-            realtime_session_id: None,
+            session_id: None,
             transport: None,
             voice: None,
         })
@@ -105,7 +103,6 @@ async fn thread_memory_mode_set_requires_experimental_api_capability() -> Result
             default_client_info(),
             Some(InitializeCapabilities {
                 experimental_api: false,
-                request_attestation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -139,7 +136,6 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
             default_client_info(),
             Some(InitializeCapabilities {
                 experimental_api: false,
-                request_attestation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -153,7 +149,7 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
             thread_id: "thr_123".to_string(),
             output_modality: RealtimeOutputModality::Audio,
             prompt: Some(Some("hello".to_string())),
-            realtime_session_id: None,
+            session_id: None,
             transport: Some(ThreadRealtimeStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -181,7 +177,6 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
             default_client_info(),
             Some(InitializeCapabilities {
                 experimental_api: false,
-                request_attestation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -219,7 +214,6 @@ async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capa
             default_client_info(),
             Some(InitializeCapabilities {
                 experimental_api: false,
-                request_attestation: false,
                 opt_out_notification_methods: None,
             }),
         )
@@ -256,7 +250,6 @@ async fn thread_start_granular_approval_policy_requires_experimental_api_capabil
             default_client_info(),
             Some(InitializeCapabilities {
                 experimental_api: false,
-                request_attestation: false,
                 opt_out_notification_methods: None,
             }),
         )

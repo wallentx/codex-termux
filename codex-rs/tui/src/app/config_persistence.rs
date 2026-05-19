@@ -15,7 +15,6 @@ impl App {
             .codex_home(self.config.codex_home.to_path_buf())
             .cli_overrides(self.cli_kv_overrides.clone())
             .harness_overrides(overrides)
-            .loader_overrides(self.loader_overrides.clone())
             .build()
             .await
             .wrap_err_with(|| format!("Failed to rebuild config for cwd {cwd_display}"))
@@ -49,7 +48,7 @@ impl App {
         match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
             Ok(config) => Ok(config),
             Err(err) => {
-                if crate::session_resume::cwds_differ(current_cwd, &resume_cwd) {
+                if crate::cwds_differ(current_cwd, &resume_cwd) {
                     Err(err)
                 } else {
                     let resume_cwd_display = resume_cwd.display().to_string();
@@ -66,20 +65,22 @@ impl App {
 
     pub(super) fn apply_runtime_policy_overrides(&mut self, config: &mut Config) {
         if let Some(policy) = self.runtime_approval_policy_override.as_ref()
-            && let Err(err) = config.permissions.approval_policy.set(policy.to_core())
+            && let Err(err) = config.permissions.approval_policy.set(*policy)
         {
             tracing::warn!(%err, "failed to carry forward approval policy override");
             self.chat_widget.add_error_message(format!(
                 "Failed to carry forward approval policy override: {err}"
             ));
         }
-        if let Some(profile) = self.runtime_permission_profile_override.as_ref()
-            && let Err(err) = config.permissions.set_permission_profile(profile.clone())
-        {
-            tracing::warn!(%err, "failed to carry forward permission profile override");
-            self.chat_widget.add_error_message(format!(
-                "Failed to carry forward permission profile override: {err}"
-            ));
+        if let Some(policy) = self.runtime_sandbox_policy_override.as_ref() {
+            if let Err(err) = config.permissions.sandbox_policy.set(policy.clone()) {
+                tracing::warn!(%err, "failed to carry forward sandbox policy override");
+                self.chat_widget.add_error_message(format!(
+                    "Failed to carry forward sandbox policy override: {err}"
+                ));
+            } else {
+                sync_runtime_permissions_from_legacy_sandbox_policy(config);
+            }
         }
     }
 
@@ -95,7 +96,7 @@ impl App {
         user_message_prefix: &str,
         log_message: &str,
     ) -> bool {
-        if let Err(err) = config.permissions.approval_policy.set(policy.to_core()) {
+        if let Err(err) = config.permissions.approval_policy.set(policy) {
             tracing::warn!(error = %err, "{log_message}");
             self.chat_widget
                 .add_error_message(format!("{user_message_prefix}: {err}"));
@@ -105,41 +106,22 @@ impl App {
         true
     }
 
-    pub(super) fn try_set_builtin_active_permission_profile_on_config(
+    pub(super) fn try_set_sandbox_policy_on_config(
         &mut self,
         config: &mut Config,
-        active_permission_profile: ActivePermissionProfile,
+        policy: SandboxPolicy,
         user_message_prefix: &str,
         log_message: &str,
-    ) -> Option<PermissionProfile> {
-        let Some(permission_profile) =
-            builtin_permission_profile_for_active_permission_profile(&active_permission_profile)
-        else {
-            tracing::warn!(
-                id = %active_permission_profile.id,
-                "{log_message}: unsupported active permission profile"
-            );
-            self.chat_widget.add_error_message(format!(
-                "{user_message_prefix}: unsupported active permission profile `{}`",
-                active_permission_profile.id
-            ));
-            return None;
-        };
-
-        if let Err(err) = config
-            .permissions
-            .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
-                permission_profile.clone(),
-                active_permission_profile,
-            ))
-        {
+    ) -> bool {
+        if let Err(err) = config.permissions.sandbox_policy.set(policy) {
             tracing::warn!(error = %err, "{log_message}");
             self.chat_widget
                 .add_error_message(format!("{user_message_prefix}: {err}"));
-            return None;
+            return false;
         }
+        sync_runtime_permissions_from_legacy_sandbox_policy(config);
 
-        Some(permission_profile)
+        true
     }
 
     pub(super) async fn update_feature_flags(&mut self, updates: Vec<(Feature, bool)>) {
@@ -165,8 +147,7 @@ impl App {
         });
         let mut approval_policy_override = None;
         let mut approvals_reviewer_override = None;
-        let mut permission_profile_override = None;
-        let mut active_permission_profile_override = None;
+        let mut sandbox_policy_override = None;
         let mut feature_updates_to_apply = Vec::with_capacity(updates.len());
         // Auto-Review owns `approvals_reviewer`, but disabling the feature
         // from inside a profile should not silently clear a value configured at
@@ -189,7 +170,7 @@ impl App {
             (root_blocks_disable, profile_configured)
         };
         let mut permissions_history_label: Option<&'static str> = None;
-        let mut builder = ConfigEditsBuilder::for_config(&self.config)
+        let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
             .with_profile(self.active_profile.as_deref());
 
         for (feature, enabled) in updates {
@@ -222,7 +203,7 @@ impl App {
                 let previous_approvals_reviewer = feature_config.approvals_reviewer;
                 if effective_enabled {
                     // Persist the reviewer setting so future sessions keep the
-                    // experiment's matching `/permissions` mode until the user
+                    // experiment's matching `/approvals` mode until the user
                     // changes it explicitly.
                     feature_config.approvals_reviewer = auto_review_preset.approvals_reviewer;
                     feature_edits.push(ConfigEdit::SetPath {
@@ -258,16 +239,14 @@ impl App {
                 ) {
                     continue;
                 }
-                let Some(permission_profile) = self
-                    .try_set_builtin_active_permission_profile_on_config(
-                        &mut feature_config,
-                        auto_review_preset.active_permission_profile.clone(),
-                        "Failed to enable Auto-review",
-                        "failed to set auto-review permission profile on staged config",
-                    )
-                else {
+                if !self.try_set_sandbox_policy_on_config(
+                    &mut feature_config,
+                    auto_review_preset.sandbox_policy.clone(),
+                    "Failed to enable Auto-review",
+                    "failed to set auto-review sandbox policy on staged config",
+                ) {
                     continue;
-                };
+                }
                 feature_edits.extend([
                     ConfigEdit::SetPath {
                         segments: scoped_segments("approval_policy"),
@@ -279,9 +258,7 @@ impl App {
                     },
                 ]);
                 approval_policy_override = Some(auto_review_preset.approval_policy);
-                permission_profile_override = Some(permission_profile);
-                active_permission_profile_override =
-                    Some(auto_review_preset.active_permission_profile.clone());
+                sandbox_policy_override = Some(auto_review_preset.sandbox_policy.clone());
             }
             next_config = feature_config;
             feature_updates_to_apply.push((feature, effective_enabled));
@@ -317,50 +294,42 @@ impl App {
             self.set_approvals_reviewer_in_app_and_widget(self.config.approvals_reviewer);
         }
         if approval_policy_override.is_some() {
-            self.chat_widget.set_approval_policy(AskForApproval::from(
-                self.config.permissions.approval_policy.value(),
-            ));
+            self.chat_widget
+                .set_approval_policy(self.config.permissions.approval_policy.value());
         }
-        let permission_profile_override_value = permission_profile_override
-            .is_some()
-            .then(|| self.config.permissions.permission_profile().clone());
-        if let Some(permission_profile) = permission_profile_override_value.as_ref()
+        if sandbox_policy_override.is_some()
             && let Err(err) = self
                 .chat_widget
-                .set_permission_profile_from_session_snapshot(
-                    PermissionProfileSnapshot::from_session_snapshot(
-                        permission_profile.clone(),
-                        active_permission_profile_override.clone(),
-                    ),
-                )
+                .set_sandbox_policy(self.config.permissions.sandbox_policy.get().clone())
         {
             tracing::error!(
                 error = %err,
-                "failed to set auto-review permission profile on chat config"
+                "failed to set auto-review sandbox policy on chat config"
             );
             self.chat_widget
                 .add_error_message(format!("Failed to enable Auto-review: {err}"));
         }
-        if let Some(permission_profile) = permission_profile_override_value {
-            self.runtime_permission_profile_override = Some(permission_profile);
+        if sandbox_policy_override.is_some() {
+            self.runtime_sandbox_policy_override =
+                Some(self.config.permissions.sandbox_policy.get().clone());
         }
 
         if approval_policy_override.is_some()
             || approvals_reviewer_override.is_some()
-            || permission_profile_override.is_some()
+            || sandbox_policy_override.is_some()
         {
             self.sync_active_thread_permission_settings_to_cached_session()
                 .await;
             // This uses `OverrideTurnContext` intentionally: toggling the
             // experiment should update the active thread's effective approval
-            // settings immediately, just like a `/permissions` selection. Without
+            // settings immediately, just like a `/approvals` selection. Without
             // this runtime patch, the config edit would only affect future
             // sessions or turns recreated from disk.
             let op = AppCommand::override_turn_context(
                 /*cwd*/ None,
                 approval_policy_override,
                 approvals_reviewer_override,
-                active_permission_profile_override,
+                sandbox_policy_override,
                 /*windows_sandbox_level*/ None,
                 /*model*/ None,
                 /*effort*/ None,
@@ -382,12 +351,12 @@ impl App {
             #[cfg(target_os = "windows")]
             {
                 let windows_sandbox_level = WindowsSandboxLevel::from_config(&self.config);
-                self.app_event_tx
-                    .send(AppEvent::CodexOp(AppCommand::override_turn_context(
+                self.app_event_tx.send(AppEvent::CodexOp(
+                    AppCommand::override_turn_context(
                         /*cwd*/ None,
                         /*approval_policy*/ None,
                         /*approvals_reviewer*/ None,
-                        /*active_permission_profile*/ None,
+                        /*sandbox_policy*/ None,
                         #[cfg(target_os = "windows")]
                         Some(windows_sandbox_level),
                         /*model*/ None,
@@ -396,7 +365,9 @@ impl App {
                         /*service_tier*/ None,
                         /*collaboration_mode*/ None,
                         /*personality*/ None,
-                    )));
+                    )
+                    .into_core(),
+                ));
             }
         }
 
@@ -437,7 +408,7 @@ impl App {
             },
         ];
 
-        if let Err(err) = ConfigEditsBuilder::for_config(&self.config)
+        if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
             .with_edits(edits)
             .apply()
             .await
@@ -524,7 +495,7 @@ impl App {
         (!model.starts_with("codex-auto-")).then(|| Self::reasoning_label(reasoning_effort))
     }
 
-    pub(crate) fn token_usage(&self) -> crate::token_usage::TokenUsage {
+    pub(crate) fn token_usage(&self) -> codex_protocol::protocol::TokenUsage {
         self.chat_widget.token_usage()
     }
 
@@ -543,18 +514,6 @@ impl App {
     pub(super) fn sync_tui_theme_selection(&mut self, name: String) {
         self.config.tui_theme = Some(name.clone());
         self.chat_widget.set_tui_theme(Some(name));
-    }
-
-    #[cfg(test)]
-    pub(super) fn sync_tui_pet_selection(&mut self, pet: String) {
-        self.config.tui_pet = Some(pet.clone());
-        self.chat_widget.set_tui_pet(Some(pet));
-    }
-
-    pub(super) fn sync_tui_pet_disabled(&mut self) {
-        let pet = crate::pets::DISABLED_PET_ID.to_string();
-        self.config.tui_pet = Some(pet.clone());
-        self.chat_widget.set_tui_pet(Some(pet));
     }
 
     pub(super) fn restore_runtime_theme_from_config(&self) {
@@ -584,13 +543,26 @@ impl App {
     }
 }
 
+fn sync_runtime_permissions_from_legacy_sandbox_policy(config: &mut Config) {
+    let sandbox_policy = config.permissions.sandbox_policy.get();
+    config.permissions.file_system_sandbox_policy =
+        codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+            sandbox_policy,
+            &config.cwd,
+        );
+    config.permissions.network_sandbox_policy =
+        codex_protocol::permissions::NetworkSandboxPolicy::from(sandbox_policy);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::test_support::app_enabled_in_effective_config;
     use crate::app::test_support::make_test_app;
     use crate::test_support::PathBufExt;
-    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::protocol::Event;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::SessionConfiguredEvent;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -621,7 +593,7 @@ mod tests {
 
         assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
 
-        ConfigEditsBuilder::for_config(&app.config)
+        ConfigEditsBuilder::new(&app.config.codex_home)
             .with_edits([
                 ConfigEdit::SetPath {
                     segments: vec!["apps".to_string(), app_id.clone(), "enabled".to_string()],
@@ -674,27 +646,28 @@ mod tests {
         let next_cwd_tmp = tempdir()?;
         let next_cwd = next_cwd_tmp.path().to_path_buf();
 
-        app.chat_widget
-            .handle_thread_session(crate::session_state::ThreadSessionState {
-                thread_id: ThreadId::new(),
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: ThreadId::new(),
                 forked_from_id: None,
-                fork_parent_title: None,
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
-                permission_profile: PermissionProfile::read_only(),
-                active_permission_profile: None,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 cwd: next_cwd.clone().abs(),
-                runtime_workspace_roots: Vec::new(),
-                instruction_source_paths: Vec::new(),
                 reasoning_effort: None,
-                message_history: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
-            });
+            }),
+        });
 
         assert_eq!(app.chat_widget.config_ref().cwd.to_path_buf(), next_cwd);
         assert_eq!(app.config.cwd, original_cwd);
@@ -773,35 +746,6 @@ terminal_resize_reflow_max_rows = 9000
         assert_eq!(
             app.chat_widget.config_ref().tui_theme.as_deref(),
             Some("dracula")
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_tui_pet_selection_updates_chat_widget_config_copy() {
-        let mut app = make_test_app().await;
-
-        app.sync_tui_pet_selection("chefito".to_string());
-
-        assert_eq!(app.config.tui_pet.as_deref(), Some("chefito"));
-        assert_eq!(
-            app.chat_widget.config_ref().tui_pet.as_deref(),
-            Some("chefito")
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_tui_pet_disabled_updates_chat_widget_config_copy() {
-        let mut app = make_test_app().await;
-
-        app.sync_tui_pet_disabled();
-
-        assert_eq!(
-            app.config.tui_pet.as_deref(),
-            Some(crate::pets::DISABLED_PET_ID)
-        );
-        assert_eq!(
-            app.chat_widget.config_ref().tui_pet.as_deref(),
-            Some(crate::pets::DISABLED_PET_ID)
         );
     }
 }

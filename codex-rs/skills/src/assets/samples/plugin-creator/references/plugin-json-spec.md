@@ -97,11 +97,10 @@
 
 # Marketplace JSON sample spec
 
-`marketplace.json` depends on where the plugin should live. New plugin creation defaults to the
-personal marketplace unless the caller explicitly requests a repo-local destination:
+`marketplace.json` depends on where the plugin should live:
 
-- Personal plugin: `~/.agents/plugins/marketplace.json`
-- Repo/team plugin: `<repo-root>/.agents/plugins/marketplace.json`
+- Repo plugin: `<repo-root>/.agents/plugins/marketplace.json`
+- Local plugin: `~/.agents/plugins/marketplace.json`
 
 ```json
 {
@@ -144,9 +143,9 @@ personal marketplace unless the caller explicitly requests a repo-local destinat
 - `source` (`object`): Plugin source descriptor.
   - `source` (`string`): Use `local` for this repo workflow.
   - `path` (`string`): Relative plugin path based on the marketplace root.
-    - Personal plugin in `~/.agents/plugins/marketplace.json`: `./plugins/<plugin-name>`
-    - Repo/team plugin: `./plugins/<plugin-name>`
-  - The same relative path convention is used for both personal and repo/team marketplaces.
+    - Repo plugin: `./plugins/<plugin-name>`
+    - Local plugin in `~/.agents/plugins/marketplace.json`: `./plugins/<plugin-name>`
+  - The same relative path convention is used for both repo-rooted and home-rooted marketplaces.
     - Example: with `~/.agents/plugins/marketplace.json`, `./plugins/<plugin-name>` resolves to `~/plugins/<plugin-name>`.
 - `policy` (`object`): Marketplace policy block. Always include it.
   - `installation` (`string`): Availability policy.
@@ -166,26 +165,6 @@ personal marketplace unless the caller explicitly requests a repo-local destinat
 - Treat `policy.products` as an override and omit it unless explicitly requested.
 - Append new entries unless the user explicitly requests reordering.
 - Replace an existing entry for the same plugin only when overwrite is intentional.
-- Default new plugin creation to the personal marketplace.
-- Use a repo/team marketplace only when the user specifically requests that destination.
-- Choose marketplace location to match the selected destination:
-  - Personal plugin: `~/.agents/plugins/marketplace.json`
-  - Repo/team plugin: `<repo-root>/.agents/plugins/marketplace.json`
-
-### Plugin validation notes
-
-- The validator mirrors the workspace plugin ingestion schema so generated plugins follow the same
-  manifest contract from the start.
-- Plugin manifests must include real values for `name`, `version`, `description`,
-  `author.name`, and the required `interface` fields.
-- `version` must use strict semver.
-- `websiteURL`, `privacyPolicyURL`, and `termsOfServiceURL` must be absolute `https://` URLs when
-  present.
-- `composerIcon`, `logo`, and `screenshots` must point to real files inside the plugin archive when
-  present.
-- `apps` and `mcpServers` should appear in `plugin.json` only when `.app.json` and `.mcp.json`
-  actually exist.
-- Validation rejects unsupported manifest fields such as `hooks`, so the scaffold keeps them out of
-  generated manifests.
-- Run `scripts/validate_plugin.py <plugin-path>` before handing back a generated plugin. It adds one
-  intentional preflight check that rejects leftover `[TODO: ...]` placeholders.
+- Choose marketplace location to match the plugin destination:
+  - Repo plugin: `<repo-root>/.agents/plugins/marketplace.json`
+  - Local plugin: `~/.agents/plugins/marketplace.json`

@@ -33,7 +33,6 @@ use std::process::Command;
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(any(target_os = "macos", windows)))]
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const OPTIONAL_FS_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn initialized_mcp(codex_home: &TempDir) -> Result<McpProcess> {
     let mut mcp = McpProcess::new(codex_home.path()).await?;
@@ -833,7 +832,7 @@ async fn maybe_fs_changed_notification(
     mcp: &mut McpProcess,
 ) -> Result<Option<FsChangedNotification>> {
     match timeout(
-        OPTIONAL_FS_CHANGE_TIMEOUT,
+        DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("fs/changed"),
     )
     .await
@@ -846,14 +845,6 @@ async fn maybe_fs_changed_notification(
 fn replace_file_atomically(path: &PathBuf, contents: &str) -> Result<()> {
     let temp_path = path.with_extension("lock");
     std::fs::write(&temp_path, contents)?;
-
-    #[cfg(windows)]
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-
     std::fs::rename(temp_path, path)?;
     Ok(())
 }

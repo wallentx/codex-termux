@@ -99,7 +99,6 @@ async fn make_config_for_cwd(codex_home: &TempDir, cwd: PathBuf) -> TestConfig {
         ConfigLayerEntry::new(
             ConfigLayerSource::User {
                 file: config_file(user_config_path),
-                profile: None,
             },
             TomlValue::Table(toml::map::Map::new()),
         ),
@@ -165,10 +164,7 @@ async fn skill_roots_from_layer_stack_maps_user_to_user_and_system_cache_and_sys
             TomlValue::Table(toml::map::Map::new()),
         ),
         ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: user_file,
-                profile: None,
-            },
+            ConfigLayerSource::User { file: user_file },
             TomlValue::Table(toml::map::Map::new()),
         ),
     ];
@@ -226,10 +222,7 @@ async fn skill_roots_from_layer_stack_includes_disabled_project_layers() -> anyh
 
     let layers = vec![
         ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: user_file,
-                profile: None,
-            },
+            ConfigLayerSource::User { file: user_file },
             TomlValue::Table(toml::map::Map::new()),
         ),
         ConfigLayerEntry::new_disabled(
@@ -288,10 +281,7 @@ async fn loads_skills_from_home_agents_dir_for_user_scope() -> anyhow::Result<()
 
     let user_file = user_folder.join("config.toml").abs();
     let layers = vec![ConfigLayerEntry::new(
-        ConfigLayerSource::User {
-            file: user_file,
-            profile: None,
-        },
+        ConfigLayerSource::User { file: user_file },
         TomlValue::Table(toml::map::Map::new()),
     )];
     let stack = ConfigLayerStack::new(
@@ -332,7 +322,6 @@ async fn loads_skills_from_home_agents_dir_for_user_scope() -> anyhow::Result<()
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 
@@ -483,7 +472,6 @@ async fn loads_skill_dependencies_metadata_from_yaml() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -539,7 +527,6 @@ interface:
             policy: None,
             path_to_skills_md: normalized(skill_path.as_path()),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -693,7 +680,6 @@ async fn accepts_icon_paths_under_assets_dir() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -734,7 +720,6 @@ async fn ignores_invalid_brand_color() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -788,7 +773,6 @@ async fn ignores_default_prompt_over_max_length() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -830,7 +814,6 @@ async fn drops_interface_when_icons_are_invalid() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -875,7 +858,6 @@ async fn loads_skills_via_symlinked_subdir_for_user_scope() {
             policy: None,
             path_to_skills_md: normalized(&shared_skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -935,7 +917,6 @@ async fn does_not_loop_on_symlink_cycle_for_user_scope() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -955,7 +936,6 @@ async fn loads_skills_via_symlinked_subdir_for_admin_scope() {
         path: admin_root.path().abs(),
         scope: SkillScope::Admin,
         file_system: Arc::clone(&LOCAL_FS),
-        plugin_id: None,
     }])
     .await;
 
@@ -975,7 +955,6 @@ async fn loads_skills_via_symlinked_subdir_for_admin_scope() {
             policy: None,
             path_to_skills_md: normalized(&shared_skill_path),
             scope: SkillScope::Admin,
-            plugin_id: None,
         }]
     );
 }
@@ -1015,7 +994,6 @@ async fn loads_skills_via_symlinked_subdir_for_repo_scope() {
             policy: None,
             path_to_skills_md: normalized(&linked_skill_path),
             scope: SkillScope::Repo,
-            plugin_id: None,
         }]
     );
 }
@@ -1036,7 +1014,6 @@ async fn system_scope_ignores_symlinked_subdir() {
         path: system_root.abs(),
         scope: SkillScope::System,
         file_system: Arc::clone(&LOCAL_FS),
-        plugin_id: None,
     }])
     .await;
     assert!(
@@ -1069,7 +1046,6 @@ async fn respects_max_scan_depth_for_user_scope() {
         path: skills_root.abs(),
         scope: SkillScope::User,
         file_system: Arc::clone(&LOCAL_FS),
-        plugin_id: None,
     }])
     .await;
 
@@ -1089,7 +1065,6 @@ async fn respects_max_scan_depth_for_user_scope() {
             policy: None,
             path_to_skills_md: normalized(&within_depth_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -1117,7 +1092,6 @@ async fn loads_valid_skill() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -1150,7 +1124,6 @@ async fn falls_back_to_directory_name_when_skill_name_is_missing() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -1175,7 +1148,6 @@ async fn namespaces_plugin_skills_using_plugin_name() {
         path: plugin_root.join("skills").abs(),
         scope: SkillScope::User,
         file_system: Arc::clone(&LOCAL_FS),
-        plugin_id: Some("sample@test".to_string()),
     }])
     .await;
 
@@ -1195,7 +1167,6 @@ async fn namespaces_plugin_skills_using_plugin_name() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: Some("sample@test".to_string()),
         }]
     );
 }
@@ -1227,7 +1198,6 @@ async fn loads_short_description_from_metadata() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::User,
-            plugin_id: None,
         }]
     );
 }
@@ -1340,7 +1310,6 @@ async fn loads_skills_from_repo_root() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::Repo,
-            plugin_id: None,
         }]
     );
 }
@@ -1376,7 +1345,6 @@ async fn loads_skills_from_agents_dir_without_codex_dir() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::Repo,
-            plugin_id: None,
         }]
     );
 }
@@ -1430,7 +1398,6 @@ async fn loads_skills_from_all_codex_dirs_under_project_root() {
                 policy: None,
                 path_to_skills_md: normalized(&nested_skill_path),
                 scope: SkillScope::Repo,
-                plugin_id: None,
             },
             SkillMetadata {
                 name: "root-skill".to_string(),
@@ -1441,7 +1408,6 @@ async fn loads_skills_from_all_codex_dirs_under_project_root() {
                 policy: None,
                 path_to_skills_md: normalized(&root_skill_path),
                 scope: SkillScope::Repo,
-                plugin_id: None,
             },
         ]
     );
@@ -1481,7 +1447,6 @@ async fn loads_skills_from_codex_dir_when_not_git_repo() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::Repo,
-            plugin_id: None,
         }]
     );
 }
@@ -1497,13 +1462,11 @@ async fn deduplicates_by_path_preferring_first_root() {
             path: root.path().abs(),
             scope: SkillScope::Repo,
             file_system: Arc::clone(&LOCAL_FS),
-            plugin_id: None,
         },
         SkillRoot {
             path: root.path().abs(),
             scope: SkillScope::User,
             file_system: Arc::clone(&LOCAL_FS),
-            plugin_id: None,
         },
     ])
     .await;
@@ -1524,7 +1487,6 @@ async fn deduplicates_by_path_preferring_first_root() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::Repo,
-            plugin_id: None,
         }]
     );
 }
@@ -1566,7 +1528,6 @@ async fn keeps_duplicate_names_from_repo_and_user() {
                 policy: None,
                 path_to_skills_md: normalized(&repo_skill_path),
                 scope: SkillScope::Repo,
-                plugin_id: None,
             },
             SkillMetadata {
                 name: "dupe-skill".to_string(),
@@ -1577,7 +1538,6 @@ async fn keeps_duplicate_names_from_repo_and_user() {
                 policy: None,
                 path_to_skills_md: normalized(&user_skill_path),
                 scope: SkillScope::User,
-                plugin_id: None,
             },
         ]
     );
@@ -1640,7 +1600,6 @@ async fn keeps_duplicate_names_from_nested_codex_dirs() {
                 policy: None,
                 path_to_skills_md: first_path,
                 scope: SkillScope::Repo,
-                plugin_id: None,
             },
             SkillMetadata {
                 name: "dupe-skill".to_string(),
@@ -1651,7 +1610,6 @@ async fn keeps_duplicate_names_from_nested_codex_dirs() {
                 policy: None,
                 path_to_skills_md: second_path,
                 scope: SkillScope::Repo,
-                plugin_id: None,
             },
         ]
     );
@@ -1723,7 +1681,6 @@ async fn loads_skills_when_cwd_is_file_in_repo() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::Repo,
-            plugin_id: None,
         }]
     );
 }
@@ -1782,7 +1739,6 @@ async fn loads_skills_from_system_cache_when_present() {
             policy: None,
             path_to_skills_md: normalized(&skill_path),
             scope: SkillScope::System,
-            plugin_id: None,
         }]
     );
 }

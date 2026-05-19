@@ -148,7 +148,7 @@ async fn persist_external_agent_config_migration_prompt_shown(
         return Ok(());
     }
 
-    ConfigEditsBuilder::for_config(config)
+    ConfigEditsBuilder::new(&config.codex_home)
         .with_edits(edits)
         .apply()
         .await
@@ -221,7 +221,7 @@ async fn persist_external_agent_config_migration_prompt_dismissal(
         return Ok(());
     }
 
-    ConfigEditsBuilder::for_config(config)
+    ConfigEditsBuilder::new(&config.codex_home)
         .with_edits(edits)
         .apply()
         .await

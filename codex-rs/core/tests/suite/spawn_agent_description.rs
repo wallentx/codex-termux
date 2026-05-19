@@ -9,7 +9,6 @@ use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -53,7 +52,6 @@ fn test_model_info(
     visibility: ModelVisibility,
     default_reasoning_level: ReasoningEffort,
     supported_reasoning_levels: Vec<ReasoningEffortPreset>,
-    service_tiers: Vec<ModelServiceTier>,
 ) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
@@ -69,7 +67,6 @@ fn test_model_info(
         supports_search_tool: false,
         priority: 1,
         additional_speed_tiers: Vec::new(),
-        service_tiers,
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -124,19 +121,10 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
                             description: "Quick scan".to_string(),
                         },
                         ReasoningEffortPreset {
-                            effort: ReasoningEffort::Medium,
-                            description: "Balanced".to_string(),
-                        },
-                        ReasoningEffortPreset {
                             effort: ReasoningEffort::High,
                             description: "Deep dive".to_string(),
                         },
                     ],
-                    vec![ModelServiceTier {
-                        id: "priority".to_string(),
-                        name: "Fast".to_string(),
-                        description: "1.5x speed, increased usage".to_string(),
-                    }],
                 ),
                 test_model_info(
                     "hidden-model",
@@ -148,7 +136,6 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
                         effort: ReasoningEffort::Low,
                         description: "Not visible".to_string(),
                     }],
-                    Vec::new(),
                 ),
             ],
         },
@@ -179,7 +166,7 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
         spawn_agent_description(&body).expect("spawn_agent description should be present");
 
     assert!(
-        description.contains("- `visible-model`: Fast and capable"),
+        description.contains("- Visible Model (`visible-model`): Fast and capable"),
         "expected visible model summary in spawn_agent description: {description:?}"
     );
     assert!(
@@ -200,15 +187,15 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
         "expected model override usage guidance in spawn_agent description: {description:?}"
     );
     assert!(
-        description.contains("Reasoning efforts: low, medium (default), high."),
+        description.contains("Default reasoning effort: medium."),
         "expected default reasoning effort in spawn_agent description: {description:?}"
     );
     assert!(
-        description.contains("Service tiers: priority."),
-        "expected service tier guidance in spawn_agent description: {description:?}"
+        description.contains("low (Quick scan), high (Deep dive)."),
+        "expected reasoning efforts in spawn_agent description: {description:?}"
     );
     assert!(
-        !description.contains("hidden-model"),
+        !description.contains("Hidden Model"),
         "hidden picker model should be omitted from spawn_agent description: {description:?}"
     );
     assert!(
