@@ -80,6 +80,50 @@ git_diff_without_seeded_release_paths() {
   git diff --binary "${range}" "${pathspecs[@]}"
 }
 
+git_cached_diff_without_release_only_paths() {
+  local base_ref="$1"
+  shift
+
+  local release_only_path
+  local pathspecs=(-- . ":(exclude).github/termux-release.json")
+
+  for release_only_path in "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"; do
+    pathspecs+=(":(exclude)${release_only_path}")
+  done
+
+  git diff --cached "$@" "${base_ref}" "${pathspecs[@]}"
+}
+
+assert_termux_patch_scope() {
+  local base_ref="refs/tags/${UPSTREAM_TAG}"
+  local max_changed_files="${TERMUX_RELEASE_MAX_PATCH_FILES:-250}"
+  local -a changed_paths
+  local changed_count
+  local shown_path
+
+  if ! [[ "${max_changed_files}" =~ ^[0-9]+$ ]]; then
+    echo "TERMUX_RELEASE_MAX_PATCH_FILES must be a non-negative integer; got '${max_changed_files}'." >&2
+    return 1
+  fi
+
+  mapfile -t changed_paths < <(
+    git_cached_diff_without_release_only_paths "${base_ref}" --name-only
+  )
+  changed_count="${#changed_paths[@]}"
+  if ((changed_count <= max_changed_files)); then
+    return 0
+  fi
+
+  echo "::error title=Termux patch scope too large::Proposed release differs from ${base_ref} in ${changed_count} non-release paths; refusing to create a release PR from ${PATCH_BRANCH}." >&2
+  echo "The reusable patch branch should contain only the small Termux compatibility delta. A large diff usually means ${PATCH_BRANCH} was seeded from a stale release tree." >&2
+  git_cached_diff_without_release_only_paths "${base_ref}" --shortstat >&2 || true
+  echo "First changed non-release paths:" >&2
+  for shown_path in "${changed_paths[@]:0:100}"; do
+    printf -- '- %s\n' "${shown_path}" >&2
+  done
+  return 1
+}
+
 resolve_seeded_release_workflow_conflicts() {
   local conflicted_path
   local resolved_any=false
@@ -458,6 +502,7 @@ jq -n \
   }' > .github/termux-release.json
 
 git add -A
+assert_termux_patch_scope
 if git diff --cached --quiet; then
   echo "No changes to propose for ${UPSTREAM_TAG}."
   append_pr_summary "no changes to propose"
