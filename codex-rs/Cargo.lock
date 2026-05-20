@@ -2638,6 +2638,7 @@ dependencies = [
  "libc",
  "pretty_assertions",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "tar",

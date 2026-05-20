@@ -1,5 +1,8 @@
+use super::input_queue::InputQueue;
 use super::*;
 use crate::goals::GoalRuntimeState;
+use crate::skills::SkillError;
+use crate::state::ActiveTurn;
 use codex_protocol::SessionId;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::permissions::FileSystemPath;
@@ -27,9 +30,7 @@ pub(crate) struct Session {
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
-    pub(super) mailbox: Mailbox,
-    pub(super) mailbox_rx: Mutex<MailboxReceiver>,
-    pub(super) idle_pending_input: Mutex<Vec<ResponseInputItem>>, // TODO (jif) merge with mailbox!
+    pub(crate) input_queue: InputQueue,
     pub(crate) goal_runtime: GoalRuntimeState,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
@@ -178,7 +179,9 @@ impl SessionConfiguration {
             profile_workspace_roots: self.profile_workspace_roots().to_vec(),
             ephemeral: self.original_config_do_not_use.ephemeral,
             reasoning_effort: self.collaboration_mode.reasoning_effort(),
+            reasoning_summary: self.model_reasoning_summary,
             personality: self.personality,
+            collaboration_mode: self.collaboration_mode.clone(),
             session_source: self.session_source.clone(),
             thread_source: self.thread_source,
         }
@@ -403,6 +406,29 @@ pub(crate) struct AppServerClientMetadata {
     pub(crate) client_version: Option<String>,
 }
 
+async fn warm_plugins_and_skills_for_session_init(
+    config: Arc<Config>,
+    environment_manager: Arc<EnvironmentManager>,
+    plugins_manager: Arc<PluginsManager>,
+    skills_manager: Arc<SkillsManager>,
+    environments: Vec<TurnEnvironmentSelection>,
+) -> Vec<SkillError> {
+    let fs = crate::environment_selection::resolve_environment_selections(
+        environment_manager.as_ref(),
+        &environments,
+    )
+    .ok()
+    .and_then(|resolved| resolved.primary_filesystem());
+    let plugins_input = config.plugins_config_input();
+    let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
+    let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
+    let skills_input = skills_load_input_from_config(config.as_ref(), effective_skill_roots);
+    skills_manager
+        .skills_for_config(&skills_input, fs)
+        .await
+        .errors
+}
+
 impl Session {
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
@@ -576,9 +602,38 @@ impl Session {
             otel.name = "session_init.auth_mcp",
         ));
 
+        let plugin_and_skill_warmup_fut = warm_plugins_and_skills_for_session_init(
+            Arc::clone(&config),
+            Arc::clone(&environment_manager),
+            Arc::clone(&plugins_manager),
+            Arc::clone(&skills_manager),
+            session_configuration.environments.clone(),
+        )
+        .instrument(info_span!(
+            "session_init.plugin_skill_warmup",
+            otel.name = "session_init.plugin_skill_warmup",
+        ));
+
         // Join all independent futures.
-        let (thread_persistence_result, state_db_ctx, (auth, mcp_servers, auth_statuses)) =
-            tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
+        let (
+            thread_persistence_result,
+            state_db_ctx,
+            (auth, mcp_servers, auth_statuses),
+            plugin_skill_errors,
+        ) = tokio::join!(
+            thread_persistence_fut,
+            state_db_fut,
+            auth_and_mcp_fut,
+            plugin_and_skill_warmup_fut
+        );
+
+        for err in &plugin_skill_errors {
+            error!(
+                "failed to load skill {}: {}",
+                err.path.display(),
+                err.message
+            );
+        }
 
         let mut live_thread_init =
             LiveThreadInitGuard::new(thread_persistence_result.map_err(|e| {
@@ -950,7 +1005,6 @@ impl Session {
             let (out_of_band_elicitation_paused, _out_of_band_elicitation_paused_rx) =
                 watch::channel(false);
 
-            let (mailbox, mailbox_rx) = Mailbox::new();
             let sess = Arc::new(Session {
                 conversation_id: thread_id,
                 installation_id,
@@ -963,9 +1017,7 @@ impl Session {
                 pending_mcp_server_refresh_config: Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
-                mailbox,
-                mailbox_rx: Mutex::new(mailbox_rx),
-                idle_pending_input: Mutex::new(Vec::new()),
+                input_queue: InputQueue::new(),
                 goal_runtime: GoalRuntimeState::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
@@ -1051,14 +1103,13 @@ impl Session {
             .cloned();
             let mcp_runtime_environment = match turn_environment {
                 Some(turn_environment) => McpRuntimeEnvironment::new(
-                    Arc::clone(&turn_environment.environment),
+                    Some(Arc::clone(&turn_environment.environment)),
+                    sess.services.environment_manager.try_local_environment(),
                     turn_environment.cwd.to_path_buf(),
                 ),
                 None => McpRuntimeEnvironment::new(
-                    sess.services
-                        .environment_manager
-                        .default_environment()
-                        .unwrap_or_else(|| sess.services.environment_manager.local_environment()),
+                    sess.services.environment_manager.default_or_local_environment(),
+                    sess.services.environment_manager.try_local_environment(),
                     session_configuration.cwd.to_path_buf(),
                 ),
             };
@@ -1130,7 +1181,7 @@ impl Session {
             };
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
-            sess.record_initial_history(initial_history).await;
+            Box::pin(sess.record_initial_history(initial_history)).await;
             {
                 let mut state = sess.state.lock().await;
                 state.set_pending_session_start_source(Some(session_start_source));

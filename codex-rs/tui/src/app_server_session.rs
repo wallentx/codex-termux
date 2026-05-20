@@ -34,7 +34,6 @@ use codex_app_server_protocol::MemoryResetResponse;
 use codex_app_server_protocol::Model as ApiModel;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
-use codex_app_server_protocol::PermissionProfileSelectionParams;
 use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery;
@@ -150,10 +149,11 @@ pub(crate) struct AppServerSession {
     client: AppServerClient,
     next_request_id: i64,
     remote_cwd_override: Option<PathBuf>,
+    thread_params_mode: ThreadParamsMode,
 }
 
-#[derive(Clone, Copy)]
-enum ThreadParamsMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThreadParamsMode {
     Embedded,
     Remote,
 }
@@ -183,11 +183,12 @@ pub(crate) enum TurnPermissionsOverride {
 }
 
 impl AppServerSession {
-    pub(crate) fn new(client: AppServerClient) -> Self {
+    pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
         Self {
             client,
             next_request_id: 1,
             remote_cwd_override: None,
+            thread_params_mode,
         }
     }
 
@@ -200,8 +201,8 @@ impl AppServerSession {
         self.remote_cwd_override.as_deref()
     }
 
-    pub(crate) fn is_remote(&self) -> bool {
-        matches!(self.client, AppServerClient::Remote(_))
+    pub(crate) fn uses_remote_workspace(&self) -> bool {
+        matches!(self.thread_params_mode, ThreadParamsMode::Remote)
     }
 
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
@@ -427,10 +428,7 @@ impl AppServerSession {
     }
 
     fn thread_params_mode(&self) -> ThreadParamsMode {
-        match &self.client {
-            AppServerClient::InProcess(_) => ThreadParamsMode::Embedded,
-            AppServerClient::Remote(_) => ThreadParamsMode::Remote,
-        }
+        self.thread_params_mode
     }
 
     async fn fork_parent_title_from_app_server(
@@ -1182,10 +1180,8 @@ fn sandbox_mode_from_permission_profile(
     }
 }
 
-fn permissions_selection_from_active_profile(
-    active: ActivePermissionProfile,
-) -> PermissionProfileSelectionParams {
-    PermissionProfileSelectionParams::new(active.id)
+fn permission_profile_id_from_active_profile(active: ActivePermissionProfile) -> String {
+    active.id
 }
 
 fn turn_permissions_overrides(
@@ -1193,13 +1189,13 @@ fn turn_permissions_overrides(
     cwd: &std::path::Path,
 ) -> (
     Option<codex_app_server_protocol::SandboxPolicy>,
-    Option<PermissionProfileSelectionParams>,
+    Option<String>,
 ) {
     match permissions_override {
         TurnPermissionsOverride::Preserve => (None, None),
         TurnPermissionsOverride::ActiveProfile(active_permission_profile) => (
             None,
-            Some(permissions_selection_from_active_profile(
+            Some(permission_profile_id_from_active_profile(
                 active_permission_profile,
             )),
         ),
@@ -1220,7 +1216,7 @@ fn turn_permissions_overrides(
 fn permissions_selection_from_config(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
-) -> Option<PermissionProfileSelectionParams> {
+) -> Option<String> {
     if matches!(thread_params_mode, ThreadParamsMode::Remote) {
         return None;
     }
@@ -1228,7 +1224,7 @@ fn permissions_selection_from_config(
     config
         .permissions
         .active_permission_profile()
-        .map(permissions_selection_from_active_profile)
+        .map(permission_profile_id_from_active_profile)
 }
 
 fn thread_start_params_from_config(
@@ -1591,10 +1587,19 @@ async fn thread_session_state_from_thread_response(
 pub(crate) fn app_server_rate_limit_snapshots(
     response: GetAccountRateLimitsResponse,
 ) -> Vec<RateLimitSnapshot> {
-    let mut snapshots = Vec::new();
-    snapshots.push(response.rate_limits);
+    let primary_limit_id = response.rate_limits.limit_id.clone();
+    let mut snapshots = vec![response.rate_limits];
     if let Some(by_limit_id) = response.rate_limits_by_limit_id {
-        snapshots.extend(by_limit_id.into_values());
+        snapshots.extend(by_limit_id.into_iter().filter_map(|(limit_id, snapshot)| {
+            if primary_limit_id.as_deref().is_some_and(|primary_limit_id| {
+                primary_limit_id == limit_id
+                    || Some(primary_limit_id) == snapshot.limit_id.as_deref()
+            }) {
+                None
+            } else {
+                Some(snapshot)
+            }
+        }));
     }
     snapshots
 }
@@ -1634,6 +1639,43 @@ mod tests {
             .expect("config should build")
     }
 
+    fn rate_limit_snapshot(limit_id: &str) -> RateLimitSnapshot {
+        RateLimitSnapshot {
+            limit_id: Some(limit_id.to_string()),
+            limit_name: None,
+            primary: Some(codex_app_server_protocol::RateLimitWindow {
+                used_percent: 0,
+                window_duration_mins: Some(10_080),
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+            rate_limit_reached_type: None,
+        }
+    }
+
+    #[test]
+    fn app_server_rate_limit_snapshots_deduplicates_top_level_limit_from_map() {
+        let response = GetAccountRateLimitsResponse {
+            rate_limits: rate_limit_snapshot("codex"),
+            rate_limits_by_limit_id: Some(HashMap::from([
+                ("codex".to_string(), rate_limit_snapshot("codex")),
+                ("other".to_string(), rate_limit_snapshot("other")),
+            ])),
+        };
+
+        let snapshots = app_server_rate_limit_snapshots(response);
+
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.limit_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("codex"), Some("other")]
+        );
+    }
+
     #[tokio::test]
     async fn thread_start_params_include_cwd_for_embedded_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1671,7 +1713,7 @@ mod tests {
             config
                 .permissions
                 .active_permission_profile()
-                .map(permissions_selection_from_active_profile)
+                .map(permission_profile_id_from_active_profile)
         );
         assert_eq!(params.model_provider, Some(config.model_provider_id));
         assert_eq!(params.thread_source, Some(ThreadSource::User));
@@ -1698,7 +1740,7 @@ mod tests {
         let active_permission_profile =
             ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE);
         let expected_permissions =
-            permissions_selection_from_active_profile(active_permission_profile.clone());
+            permission_profile_id_from_active_profile(active_permission_profile.clone());
 
         let (sandbox_policy, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
@@ -1723,9 +1765,7 @@ mod tests {
         assert_eq!(sandbox_policy, None);
         assert_eq!(
             permissions,
-            Some(PermissionProfileSelectionParams::new(
-                BUILT_IN_PERMISSION_PROFILE_WORKSPACE
-            ))
+            Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string())
         );
     }
 
@@ -1763,7 +1803,7 @@ mod tests {
         let cwd = test_path_buf("/workspace/project").abs();
         let active_permission_profile = ActivePermissionProfile::new("strict");
         let expected_permissions =
-            permissions_selection_from_active_profile(active_permission_profile.clone());
+            permission_profile_id_from_active_profile(active_permission_profile.clone());
 
         let (sandbox_policy, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
