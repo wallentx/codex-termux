@@ -835,7 +835,7 @@ jobs:
           path: |
             codex-rs/dist/${{ matrix.target }}/*
 
-      - name: Comment Termux artifact download link
+      - name: Publish Termux artifact notification
         if: ${{ github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/') && matrix.target == 'aarch64-linux-android' }}
         shell: bash
         env:
@@ -843,6 +843,7 @@ jobs:
           ARTIFACT_ID: ${{ steps.upload-artifact.outputs.artifact-id }}
           ARTIFACT_NAME: ${{ github.event_name == 'pull_request' && format('termux-android-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || matrix.target }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -euo pipefail
           if [[ -z "${ARTIFACT_ID}" ]]; then
@@ -894,6 +895,64 @@ jobs:
             --description "Android binary is ready for testing" \
             --force
           gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-label binary-ready
+
+          if [[ -n "${SLACK_WEBHOOK_URL:-}" ]]; then
+            slack_payload_path="${RUNNER_TEMP}/termux-artifact-slack.json"
+            pr_url="https://github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
+            jq -n \
+              --arg artifact_name "${ARTIFACT_NAME}" \
+              --arg artifact_url "${artifact_url}" \
+              --arg pr_number "${PR_NUMBER}" \
+              --arg pr_url "${pr_url}" \
+              --arg run_id "${GITHUB_RUN_ID}" \
+              --arg run_url "${run_url}" \
+              '{
+                text: ("Termux Android artifact ready for testing: " + $artifact_url),
+                blocks: [
+                  {
+                    type: "section",
+                    text: {
+                      type: "mrkdwn",
+                      text: ("*Termux Android artifact ready for testing*\n" + $artifact_url)
+                    }
+                  },
+                  {
+                    type: "section",
+                    fields: [
+                      {
+                        type: "mrkdwn",
+                        text: ("*Artifact:*\n<" + $artifact_url + "|" + $artifact_name + ">")
+                      },
+                      {
+                        type: "mrkdwn",
+                        text: ("*Pull request:*\n<" + $pr_url + "|#" + $pr_number + ">")
+                      },
+                      {
+                        type: "mrkdwn",
+                        text: ("*Workflow run:*\n<" + $run_url + "|" + $run_id + ">")
+                      }
+                    ]
+                  },
+                  {
+                    type: "context",
+                    elements: [
+                      {
+                        type: "mrkdwn",
+                        text: "You must be signed in to GitHub with repository access to download Actions artifacts."
+                      }
+                    ]
+                  }
+                ]
+              }' > "${slack_payload_path}"
+
+            if ! curl -fsS \
+              -X POST \
+              -H "Content-type: application/json" \
+              --data @"${slack_payload_path}" \
+              "${SLACK_WEBHOOK_URL}"; then
+              echo "::warning::Failed to send Slack artifact notification"
+            fi
+          fi
 
   shell-tool-mcp:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository_owner == 'openai'
