@@ -70,6 +70,7 @@ git_add_seeded_release_paths() {
 
 git_diff_without_seeded_release_paths() {
   local range="$1"
+  shift
   local seeded_path
   local pathspecs=(-- .)
 
@@ -77,7 +78,7 @@ git_diff_without_seeded_release_paths() {
     pathspecs+=(":(exclude)${seeded_path}")
   done
 
-  git diff --binary "${range}" "${pathspecs[@]}"
+  git diff "$@" "${range}" "${pathspecs[@]}"
 }
 
 git_cached_diff_without_release_only_paths() {
@@ -216,8 +217,9 @@ workspace_version_from_ref() {
   '
 }
 
-normalize_patch_branch_version() {
-  local normalized_ref="$1"
+normalize_ref_workspace_version() {
+  local source_ref="$1"
+  local normalized_ref="$2"
   local upstream_version
 
   upstream_version="$(workspace_version_from_ref "refs/tags/${UPSTREAM_TAG}")"
@@ -226,9 +228,9 @@ normalize_patch_branch_version() {
     exit 1
   fi
 
-  git checkout -B "${normalized_ref}" "origin/${PATCH_BRANCH}"
+  git checkout -B "${normalized_ref}" "${source_ref}"
   if [[ ! -f codex-rs/Cargo.toml ]]; then
-    echo "codex-rs/Cargo.toml is missing from ${PATCH_BRANCH}" >&2
+    echo "codex-rs/Cargo.toml is missing from ${source_ref}" >&2
     exit 1
   fi
 
@@ -242,6 +244,24 @@ normalize_patch_branch_version() {
     git add codex-rs/Cargo.toml
     git commit -m "Normalize Termux patch workspace version"
   fi
+}
+
+termux_patch_base_ref() {
+  local patch_ref="$1"
+  local upstream_base_ref="${TERMUX_PATCH_UPSTREAM_BASE_REF:-origin/main}"
+  local base_sha
+
+  if git rev-parse --verify --quiet "${upstream_base_ref}^{commit}" >/dev/null; then
+    if base_sha="$(git merge-base "${upstream_base_ref}" "${patch_ref}")"; then
+      printf '%s\n' "${base_sha}"
+      return 0
+    fi
+    echo "Unable to find a merge base between ${upstream_base_ref} and ${patch_ref}; falling back to refs/tags/${UPSTREAM_TAG}." >&2
+  else
+    echo "Unable to resolve ${upstream_base_ref}; falling back to refs/tags/${UPSTREAM_TAG}." >&2
+  fi
+
+  printf 'refs/tags/%s\n' "${UPSTREAM_TAG}"
 }
 
 open_prs_cache_loaded=false
@@ -429,24 +449,39 @@ else
 fi
 
 if [[ "${release_branch_exists}" == false ]]; then
+  patch_base_ref=""
+  normalized_patch_base_ref=""
   normalized_patch_ref="termux-patch-normalized/${UPSTREAM_TAG}"
-  normalize_patch_branch_version "${normalized_patch_ref}"
+  normalize_ref_workspace_version "origin/${PATCH_BRANCH}" "${normalized_patch_ref}"
+  patch_base_ref="$(termux_patch_base_ref "${normalized_patch_ref}")"
+  normalized_patch_base_ref="termux-patch-base-normalized/${UPSTREAM_TAG}"
+  normalize_ref_workspace_version "${patch_base_ref}" "${normalized_patch_base_ref}"
   git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
   seed_release_branch_workflows
 
-  echo "Creating Termux patch from refs/tags/${UPSTREAM_TAG} to ${normalized_patch_ref}."
-  git_diff_without_seeded_release_paths "refs/tags/${UPSTREAM_TAG}..${normalized_patch_ref}" > "${RUNNER_TEMP}/termux.patch"
+  echo "Creating Termux patch from ${normalized_patch_base_ref} (base ${patch_base_ref}) to ${normalized_patch_ref}."
+  git_diff_without_seeded_release_paths "${normalized_patch_base_ref}..${normalized_patch_ref}" --binary > "${RUNNER_TEMP}/termux.patch"
   if [[ -s "${RUNNER_TEMP}/termux.patch" ]]; then
     if ! git apply --3way "${RUNNER_TEMP}/termux.patch"; then
+      mapfile -t patch_changed_paths < <(
+        git_diff_without_seeded_release_paths "${normalized_patch_base_ref}..${normalized_patch_ref}" --name-only
+      )
       integration_conflicted=true
       conflict_context="Applying the Termux patch branch onto the upstream tag"
-      fallback_ref="origin/${PATCH_BRANCH}"
+      fallback_ref="${normalized_patch_ref}"
       conflict_summary="$(
         git diff --name-only --diff-filter=U | awk '{ print "- `" $0 "`" }'
       )"
       echo "Applying the Termux patch branch conflicted; creating a manual-resolution PR instead." >&2
       reset_for_fallback_checkout
-      git checkout -B "${WORK_BRANCH}" "${fallback_ref}"
+      git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
+      for patch_path in "${patch_changed_paths[@]}"; do
+        if git cat-file -e "${normalized_patch_ref}:${patch_path}" 2>/dev/null; then
+          git checkout "${normalized_patch_ref}" -- "${patch_path}"
+        else
+          git rm -f --ignore-unmatch -- "${patch_path}"
+        fi
+      done
     fi
   fi
 else
@@ -530,7 +565,7 @@ body_path="${RUNNER_TEMP}/termux-release-pr.md"
     echo
     echo "## Merge conflicts"
     echo
-    echo "${conflict_context} conflicted in GitHub Actions, so this PR was created from \`${fallback_ref}\` for manual resolution."
+    echo "${conflict_context} conflicted in GitHub Actions, so this PR used \`${fallback_ref}\` as its manual-resolution fallback."
     echo
     echo "Conflicted paths from the failed integration attempt:"
     if [[ -n "${conflict_summary}" ]]; then
