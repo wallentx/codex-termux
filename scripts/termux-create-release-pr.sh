@@ -360,9 +360,12 @@ existing_merged_pr="$(
 )"
 if [[ -n "${existing_merged_pr}" ]]; then
   existing_pr_url="$(jq -r '.url' <<< "${existing_merged_pr}")"
-  echo "A matching merged PR already exists for title '${pr_title}': ${existing_pr_url}."
-  append_pr_summary "matching merged PR already exists" "${existing_pr_url}"
-  exit 0
+  if gh release view "${TERMUX_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+    echo "A matching merged PR already exists for title '${pr_title}': ${existing_pr_url}."
+    append_pr_summary "matching merged PR already exists" "${existing_pr_url}"
+    exit 0
+  fi
+  echo "A matching merged PR exists for title '${pr_title}' (${existing_pr_url}), but ${TERMUX_TAG} is missing; rebuilding the release train."
 fi
 
 existing_open_train_pr="$(

@@ -364,6 +364,8 @@ maybe_select_codex_release() {
   local release_branch
   local work_branch
   local termux_tag
+  local termux_release_exists=false
+  local current_tag
   local open_train_pr_json
   local pending_other_release_train_prs
 
@@ -378,6 +380,9 @@ maybe_select_codex_release() {
   release_branch="release/${release_train}"
   work_branch="upstream/rust-v${release_train}"
   termux_tag="${upstream_tag}-termux"
+  if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+    termux_release_exists=true
+  fi
   open_train_pr_json="$(open_release_train_pr_for_branch "${release_branch}")"
   if [[ -n "${open_train_pr_json}" ]]; then
     work_branch="$(jq -r '.headRefName' <<< "${open_train_pr_json}")"
@@ -392,10 +397,12 @@ maybe_select_codex_release() {
   fi
 
   if ! release_tag_is_newer_than_known_train "${upstream_tag}" "${release_branch}" "${open_train_pr_json}"; then
-    return 1
-  fi
-
-  if gh release view "${termux_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+    current_tag="$(release_branch_current_tag "${release_branch}")"
+    if [[ "${termux_release_exists}" == "true" || "${current_tag}" != "${upstream_tag}" || -n "${open_train_pr_json}" ]]; then
+      return 1
+    fi
+    echo "${termux_tag} is missing even though ${release_branch} records ${upstream_tag}; recreating the release train."
+  elif [[ "${termux_release_exists}" == "true" ]]; then
     echo "${termux_tag} already exists; nothing to do."
     return 1
   fi
