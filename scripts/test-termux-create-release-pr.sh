@@ -16,24 +16,67 @@ fail() {
   exit 1
 }
 
-assert_contains() {
-  local file="$1"
-  local expected="$2"
-  local description="$3"
+assert_ref_has_file() {
+  local ref="$1"
+  local path="$2"
 
-  if [[ "$(cat "${file}")" != *"${expected}"* ]]; then
-    cat "${file}" >&2
-    fail "${description}"
+  if ! git cat-file -e "${ref}:${path}" 2>/dev/null; then
+    fail "${ref} does not contain ${path}"
   fi
 }
 
-origin="${tmp_dir}/origin.git"
-work="${tmp_dir}/work"
-bin_dir="${tmp_dir}/bin"
-runner_temp="${tmp_dir}/runner"
-github_output="${tmp_dir}/github-output"
+assert_ref_lacks_file() {
+  local ref="$1"
+  local path="$2"
 
-mkdir -p "${bin_dir}" "${runner_temp}"
+  if git cat-file -e "${ref}:${path}" 2>/dev/null; then
+    fail "${ref} unexpectedly contains ${path}"
+  fi
+}
+
+assert_ref_file_equals() {
+  local ref="$1"
+  local path="$2"
+  local expected="$3"
+  local actual
+
+  actual="$(git show "${ref}:${path}")"
+  if [[ "${actual}" != "${expected}" ]]; then
+    printf 'expected %s:%s to equal:\n%s\nactual:\n%s\n' "${ref}" "${path}" "${expected}" "${actual}" >&2
+    fail "${ref}:${path} did not match expected content"
+  fi
+}
+
+run_release_pr_script() {
+  local runner_temp="$1"
+  local github_output="$2"
+  local upstream_tag="${3:-rust-v1.0.0}"
+  local termux_tag="${4:-${upstream_tag}-termux}"
+
+  PATH="${bin_dir}:${PATH}" \
+  GITHUB_REPOSITORY="wallentx/codex-termux" \
+  UPSTREAM_REPO="openai/codex" \
+  UPSTREAM_TAG="${upstream_tag}" \
+  UPSTREAM_NAME="Codex ${upstream_tag}" \
+  UPSTREAM_HTML_URL="https://github.com/openai/codex/releases/tag/${upstream_tag}" \
+  UPSTREAM_PRERELEASE="false" \
+  UPSTREAM_TARGET="$(git rev-parse "${upstream_tag}")" \
+  UPSTREAM_ID="1" \
+  UPSTREAM_BODY="Test upstream release" \
+  RELEASE_TRAIN="1.0.0" \
+  RELEASE_BRANCH="release/1.0.0" \
+  WORK_BRANCH="release-train/1.0.0" \
+  TERMUX_TAG="${termux_tag}" \
+  PATCH_BRANCH="wallentx/termux-target" \
+  REVIEWER="wallentx" \
+  RUNNER_TEMP="${runner_temp}" \
+  GITHUB_OUTPUT="${github_output}" \
+  GH_TOKEN="test-token" \
+  bash "${script}"
+}
+
+bin_dir="${tmp_dir}/bin"
+mkdir -p "${bin_dir}"
 
 cat > "${bin_dir}/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -41,12 +84,21 @@ set -euo pipefail
 
 case "${1:-} ${2:-}" in
   "pr list")
-    printf '[]\n'
+    if [[ -n "${TERMUX_TEST_OPEN_PR_TAG:-}" ]]; then
+      cat <<JSON
+[{"number":7,"title":"Termux ${TERMUX_TEST_OPEN_PR_TAG}","body":"- Upstream tag: \`${TERMUX_TEST_OPEN_PR_TAG}\`\n- Release train branch: \`release/1.0.0\`","headRefName":"${TERMUX_TEST_OPEN_PR_HEAD:-release-train/1.0.0}","baseRefName":"release/1.0.0","url":"https://github.com/wallentx/codex-termux/pull/7","state":"OPEN","isDraft":false,"mergedAt":null}]
+JSON
+    else
+      printf '[]\n'
+    fi
     ;;
   "pr create")
     printf 'https://github.com/wallentx/codex-termux/pull/1\n'
     ;;
   "pr edit"|"label create")
+    ;;
+  "release view")
+    exit 1
     ;;
   *)
     echo "unexpected gh invocation: $*" >&2
@@ -56,159 +108,15 @@ esac
 STUB
 chmod +x "${bin_dir}/gh"
 
+origin="${tmp_dir}/origin.git"
+work="${tmp_dir}/work"
+runner_temp="${tmp_dir}/runner"
+github_output="${tmp_dir}/github-output"
+
+mkdir -p "${runner_temp}"
 git init --bare "${origin}" >/dev/null
 git init "${work}" >/dev/null
 cd "${work}"
-git config user.name "Termux Release Test"
-git config user.email "termux-release-test@example.invalid"
-
-mkdir -p codex-rs src
-cat > codex-rs/Cargo.toml <<'TOML'
-[workspace.package]
-version = "1.0.0"
-TOML
-printf 'upstream\n' > src/upstream.txt
-git add codex-rs/Cargo.toml src/upstream.txt
-git commit -m "upstream release" >/dev/null
-git tag rust-v1.0.0
-git branch -M main
-git remote add origin "${origin}"
-git push origin main rust-v1.0.0 >/dev/null
-
-git checkout -B wallentx/termux-target rust-v1.0.0 >/dev/null
-mkdir -p termux
-printf 'one\n' > termux/one.txt
-printf 'two\n' > termux/two.txt
-git add termux/one.txt termux/two.txt
-git commit -m "termux compatibility changes" >/dev/null
-git push origin wallentx/termux-target >/dev/null
-
-git checkout -B automation main >/dev/null
-
-set +e
-PATH="${bin_dir}:${PATH}" \
-GITHUB_REPOSITORY="wallentx/codex-termux" \
-UPSTREAM_REPO="openai/codex" \
-UPSTREAM_TAG="rust-v1.0.0" \
-UPSTREAM_NAME="Codex 1.0.0" \
-UPSTREAM_HTML_URL="https://github.com/openai/codex/releases/tag/rust-v1.0.0" \
-UPSTREAM_PRERELEASE="false" \
-UPSTREAM_TARGET="$(git rev-parse rust-v1.0.0)" \
-UPSTREAM_ID="1" \
-UPSTREAM_BODY="Test upstream release" \
-RELEASE_TRAIN="1.0.0" \
-RELEASE_BRANCH="release/1.0.0" \
-WORK_BRANCH="release-train/1.0.0" \
-TERMUX_TAG="rust-v1.0.0-termux" \
-PATCH_BRANCH="wallentx/termux-target" \
-REVIEWER="wallentx" \
-RUNNER_TEMP="${runner_temp}" \
-GITHUB_OUTPUT="${github_output}" \
-GH_TOKEN="test-token" \
-TERMUX_RELEASE_MAX_PATCH_FILES="1" \
-bash "${script}" > "${tmp_dir}/stdout" 2> "${tmp_dir}/stderr"
-status=$?
-set -e
-
-if [[ "${status}" -eq 0 ]]; then
-  cat "${tmp_dir}/stdout" >&2
-  cat "${tmp_dir}/stderr" >&2
-  fail "oversized Termux patch was accepted"
-fi
-
-if [[ "$(cat "${tmp_dir}/stderr")" != *"Termux patch scope too large"* ]]; then
-  cat "${tmp_dir}/stdout" >&2
-  cat "${tmp_dir}/stderr" >&2
-  fail "oversized Termux patch did not report the scope guard"
-fi
-
-echo "ok - oversized Termux patch is rejected"
-
-origin_ahead="${tmp_dir}/origin-ahead.git"
-work_ahead="${tmp_dir}/work-ahead"
-runner_temp_ahead="${tmp_dir}/runner-ahead"
-github_output_ahead="${tmp_dir}/github-output-ahead"
-
-mkdir -p "${runner_temp_ahead}"
-git init --bare "${origin_ahead}" >/dev/null
-git init "${work_ahead}" >/dev/null
-cd "${work_ahead}"
-git config user.name "Termux Release Test"
-git config user.email "termux-release-test@example.invalid"
-
-mkdir -p codex-rs src
-cat > codex-rs/Cargo.toml <<'TOML'
-[workspace.package]
-version = "1.0.0"
-TOML
-printf 'release\n' > src/release.txt
-git add codex-rs/Cargo.toml src/release.txt
-git commit -m "upstream release" >/dev/null
-git tag rust-v1.0.0
-git branch -M main
-git remote add origin "${origin_ahead}"
-git push origin main rust-v1.0.0 >/dev/null
-
-printf 'main-ahead-one\n' > src/main-ahead-one.txt
-printf 'main-ahead-two\n' > src/main-ahead-two.txt
-git add src/main-ahead-one.txt src/main-ahead-two.txt
-git commit -m "upstream main after release" >/dev/null
-git push origin main >/dev/null
-
-git checkout -B wallentx/termux-target main >/dev/null
-mkdir -p termux
-printf 'compat\n' > termux/compat.txt
-git add termux/compat.txt
-git commit -m "termux compatibility changes" >/dev/null
-git push origin wallentx/termux-target >/dev/null
-
-git checkout -B automation main >/dev/null
-
-PATH="${bin_dir}:${PATH}" \
-GITHUB_REPOSITORY="wallentx/codex-termux" \
-UPSTREAM_REPO="openai/codex" \
-UPSTREAM_TAG="rust-v1.0.0" \
-UPSTREAM_NAME="Codex 1.0.0" \
-UPSTREAM_HTML_URL="https://github.com/openai/codex/releases/tag/rust-v1.0.0" \
-UPSTREAM_PRERELEASE="false" \
-UPSTREAM_TARGET="$(git rev-parse rust-v1.0.0)" \
-UPSTREAM_ID="1" \
-UPSTREAM_BODY="Test upstream release" \
-RELEASE_TRAIN="1.0.0" \
-RELEASE_BRANCH="release/1.0.0" \
-WORK_BRANCH="release-train/1.0.0" \
-TERMUX_TAG="rust-v1.0.0-termux" \
-PATCH_BRANCH="wallentx/termux-target" \
-REVIEWER="wallentx" \
-RUNNER_TEMP="${runner_temp_ahead}" \
-GITHUB_OUTPUT="${github_output_ahead}" \
-GH_TOKEN="test-token" \
-TERMUX_RELEASE_MAX_PATCH_FILES="1" \
-bash "${script}" > "${tmp_dir}/stdout-ahead" 2> "${tmp_dir}/stderr-ahead" || {
-  cat "${tmp_dir}/stdout-ahead" >&2
-  cat "${tmp_dir}/stderr-ahead" >&2
-  fail "patch branch synced with main was rejected"
-}
-
-git fetch origin release-train/1.0.0 >/dev/null
-if ! git cat-file -e origin/release-train/1.0.0:termux/compat.txt 2>/dev/null; then
-  fail "Termux compatibility file was not applied to release train"
-fi
-if git cat-file -e origin/release-train/1.0.0:src/main-ahead-one.txt 2>/dev/null; then
-  fail "main-only file leaked into release train patch"
-fi
-
-echo "ok - patch branch synced with main contributes only Termux delta"
-
-origin_conflict="${tmp_dir}/origin-conflict.git"
-work_conflict="${tmp_dir}/work-conflict"
-runner_temp_conflict="${tmp_dir}/runner-conflict"
-github_output_conflict="${tmp_dir}/github-output-conflict"
-
-mkdir -p "${runner_temp_conflict}"
-git init --bare "${origin_conflict}" >/dev/null
-git init "${work_conflict}" >/dev/null
-cd "${work_conflict}"
 git config user.name "Termux Release Test"
 git config user.email "termux-release-test@example.invalid"
 
@@ -222,63 +130,145 @@ git add codex-rs/Cargo.toml src/shared.txt
 git commit -m "upstream release" >/dev/null
 git tag rust-v1.0.0
 git branch -M main
-git remote add origin "${origin_conflict}"
+git remote add origin "${origin}"
 git push origin main rust-v1.0.0 >/dev/null
 
-printf 'main\n' > src/shared.txt
-printf 'main-ahead\n' > src/main-ahead.txt
-git add src/shared.txt src/main-ahead.txt
-git commit -m "upstream main after release" >/dev/null
+printf 'upstream-after-tag\n' > src/upstream-after-tag.txt
+git add src/upstream-after-tag.txt
+git commit -m "upstream after release tag" >/dev/null
 git push origin main >/dev/null
 
 git checkout -B wallentx/termux-target main >/dev/null
+mkdir -p termux
+perl -0pi -e 's/version = "1\.0\.0"/version = "1.0.0-alpha.target"/' codex-rs/Cargo.toml
+printf 'compat\n' > termux/compat.txt
 printf 'termux\n' > src/shared.txt
-git add src/shared.txt
+git add codex-rs/Cargo.toml termux/compat.txt src/shared.txt
 git commit -m "termux compatibility changes" >/dev/null
 git push origin wallentx/termux-target >/dev/null
 
+git checkout -B release-train/1.0.0 rust-v1.0.0 >/dev/null
+printf 'stale\n' > stale-work-branch.txt
+git add stale-work-branch.txt
+git commit -m "stale release train branch" >/dev/null
+git push origin release-train/1.0.0 >/dev/null
+
 git checkout -B automation main >/dev/null
 
-set +e
-PATH="${bin_dir}:${PATH}" \
-GITHUB_REPOSITORY="wallentx/codex-termux" \
-UPSTREAM_REPO="openai/codex" \
-UPSTREAM_TAG="rust-v1.0.0" \
-UPSTREAM_NAME="Codex 1.0.0" \
-UPSTREAM_HTML_URL="https://github.com/openai/codex/releases/tag/rust-v1.0.0" \
-UPSTREAM_PRERELEASE="false" \
-UPSTREAM_TARGET="$(git rev-parse rust-v1.0.0)" \
-UPSTREAM_ID="1" \
-UPSTREAM_BODY="Test upstream release" \
-RELEASE_TRAIN="1.0.0" \
-RELEASE_BRANCH="release/1.0.0" \
-WORK_BRANCH="release-train/1.0.0" \
-TERMUX_TAG="rust-v1.0.0-termux" \
-PATCH_BRANCH="wallentx/termux-target" \
-REVIEWER="wallentx" \
-RUNNER_TEMP="${runner_temp_conflict}" \
-GITHUB_OUTPUT="${github_output_conflict}" \
-GH_TOKEN="test-token" \
-TERMUX_RELEASE_MAX_PATCH_FILES="1" \
-bash "${script}" > "${tmp_dir}/stdout-conflict" 2> "${tmp_dir}/stderr-conflict"
-status=$?
-set -e
+run_release_pr_script "${runner_temp}" "${github_output}" > "${tmp_dir}/stdout" 2> "${tmp_dir}/stderr" || {
+  cat "${tmp_dir}/stdout" >&2
+  cat "${tmp_dir}/stderr" >&2
+  fail "release PR script rejected a target branch that differs from the release tag"
+}
 
-if [[ "${status}" -eq 0 ]]; then
-  cat "${tmp_dir}/stdout-conflict" >&2
-  cat "${tmp_dir}/stderr-conflict" >&2
-  fail "conflicting patch branch synced with main was accepted"
+git fetch origin release/1.0.0 release-train/1.0.0 >/dev/null
+
+assert_ref_file_equals origin/release/1.0.0 src/shared.txt "release"
+assert_ref_lacks_file origin/release/1.0.0 src/upstream-after-tag.txt
+assert_ref_lacks_file origin/release/1.0.0 termux/compat.txt
+assert_ref_has_file origin/release/1.0.0 scripts/termux-download-release-artifact.sh
+
+assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "termux"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
+version = \"1.0.0\""
+assert_ref_has_file origin/release-train/1.0.0 src/upstream-after-tag.txt
+assert_ref_has_file origin/release-train/1.0.0 termux/compat.txt
+assert_ref_has_file origin/release-train/1.0.0 .github/termux-release.json
+assert_ref_has_file origin/release-train/1.0.0 scripts/termux-download-release-artifact.sh
+assert_ref_lacks_file origin/release-train/1.0.0 stale-work-branch.txt
+
+if [[ "$(cat "${github_output}")" != "pr_url=https://github.com/wallentx/codex-termux/pull/1" ]]; then
+  cat "${github_output}" >&2
+  fail "release PR URL was not written to GITHUB_OUTPUT"
 fi
 
-assert_contains "${tmp_dir}/stderr-conflict" \
-  "Termux patch requires manual resolution" \
-  "conflicting patch branch did not report manual resolution"
-assert_contains "${tmp_dir}/stderr-conflict" \
-  "- src/shared.txt" \
-  "conflicting patch branch did not list the conflicted path"
+echo "ok - release PR head is created from Termux target and release base stays on upstream tag"
 
-if git ls-remote --exit-code --heads origin release-train/1.0.0 >/dev/null 2>&1; then
-  fail "conflicting patch branch pushed a fallback release train"
+origin_update="${tmp_dir}/origin-update.git"
+work_update="${tmp_dir}/work-update"
+runner_temp_update="${tmp_dir}/runner-update"
+github_output_update="${tmp_dir}/github-output-update"
+
+mkdir -p "${runner_temp_update}"
+git init --bare "${origin_update}" >/dev/null
+git init "${work_update}" >/dev/null
+cd "${work_update}"
+git config user.name "Termux Release Test"
+git config user.email "termux-release-test@example.invalid"
+
+mkdir -p codex-rs src
+cat > codex-rs/Cargo.toml <<'TOML'
+[workspace.package]
+version = "1.0.0-alpha.1"
+TOML
+printf 'old-release\n' > src/shared.txt
+git add codex-rs/Cargo.toml src/shared.txt
+git commit -m "old upstream release" >/dev/null
+git tag rust-v1.0.0-alpha.1
+git branch -M main
+git remote add origin "${origin_update}"
+git push origin main rust-v1.0.0-alpha.1 >/dev/null
+
+git checkout -B release/1.0.0 rust-v1.0.0-alpha.1 >/dev/null
+printf 'old-base\n' > stale-release-branch.txt
+git add stale-release-branch.txt
+git commit -m "old release branch" >/dev/null
+git push origin release/1.0.0 >/dev/null
+
+git checkout main >/dev/null
+perl -0pi -e 's/version = "1\.0\.0-alpha\.1"/version = "1.0.0-alpha.2"/' codex-rs/Cargo.toml
+printf 'new-release\n' > src/shared.txt
+printf 'new-tag\n' > src/new-tag.txt
+git add codex-rs/Cargo.toml src/shared.txt src/new-tag.txt
+git commit -m "new upstream release" >/dev/null
+git tag rust-v1.0.0-alpha.2
+git push origin main rust-v1.0.0-alpha.2 >/dev/null
+
+git checkout -B wallentx/termux-target main >/dev/null
+mkdir -p termux
+perl -0pi -e 's/version = "1\.0\.0-alpha\.2"/version = "1.0.0-alpha.target"/' codex-rs/Cargo.toml
+printf 'termux\n' > src/shared.txt
+printf 'compat\n' > termux/compat.txt
+git add codex-rs/Cargo.toml src/shared.txt termux/compat.txt
+git commit -m "termux compatibility changes" >/dev/null
+git push origin wallentx/termux-target >/dev/null
+
+git checkout -B release-train/1.0.0 rust-v1.0.0-alpha.1 >/dev/null
+printf 'stale\n' > stale-work-branch.txt
+git add stale-work-branch.txt
+git commit -m "old open release train branch" >/dev/null
+git push origin release-train/1.0.0 >/dev/null
+
+git checkout -B automation main >/dev/null
+
+TERMUX_TEST_OPEN_PR_TAG="rust-v1.0.0-alpha.1" \
+run_release_pr_script \
+  "${runner_temp_update}" \
+  "${github_output_update}" \
+  "rust-v1.0.0-alpha.2" \
+  "rust-v1.0.0-alpha.2-termux" \
+  > "${tmp_dir}/stdout-update" 2> "${tmp_dir}/stderr-update" || {
+    cat "${tmp_dir}/stdout-update" >&2
+    cat "${tmp_dir}/stderr-update" >&2
+    fail "release PR script failed to rebuild an older open release train"
+  }
+
+git fetch origin release/1.0.0 release-train/1.0.0 >/dev/null
+
+assert_ref_file_equals origin/release/1.0.0 src/shared.txt "new-release"
+assert_ref_file_equals origin/release/1.0.0 codex-rs/Cargo.toml "[workspace.package]
+version = \"1.0.0-alpha.2\""
+assert_ref_lacks_file origin/release/1.0.0 stale-release-branch.txt
+
+assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "termux"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
+version = \"1.0.0-alpha.2\""
+assert_ref_has_file origin/release-train/1.0.0 termux/compat.txt
+assert_ref_lacks_file origin/release-train/1.0.0 stale-work-branch.txt
+
+if [[ "$(cat "${github_output_update}")" != "pr_url=https://github.com/wallentx/codex-termux/pull/7" ]]; then
+  cat "${github_output_update}" >&2
+  fail "existing release PR URL was not written to GITHUB_OUTPUT"
 fi
 
-echo "ok - conflicting patch branch synced with main requires manual resolution"
+echo "ok - newer upstream tag rebuilds stale open release train from Termux target"

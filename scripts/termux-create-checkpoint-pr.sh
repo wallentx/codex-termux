@@ -184,7 +184,7 @@ if ! git merge --no-ff --no-edit "${source_sha}"; then
 fi
 
 if git cat-file -e "origin/${DESTINATION_BRANCH}:.github" 2>/dev/null; then
-  git restore --source="origin/${DESTINATION_BRANCH}" --staged --worktree -- .github
+  git checkout "origin/${DESTINATION_BRANCH}" -- .github
   mapfile -t added_github_paths < <(
     git diff --name-only --diff-filter=A "origin/${DESTINATION_BRANCH}" -- .github
   )
@@ -197,7 +197,7 @@ fi
 
 while IFS= read -r release_only_path; do
   if git cat-file -e "origin/${DESTINATION_BRANCH}:${release_only_path}" 2>/dev/null; then
-    git restore --source="origin/${DESTINATION_BRANCH}" --staged --worktree -- "${release_only_path}"
+    git checkout "origin/${DESTINATION_BRANCH}" -- "${release_only_path}"
   else
     git rm -f --ignore-unmatch -- "${release_only_path}"
   fi

@@ -31,10 +31,6 @@ automation_root="$(cd -- "${script_dir}/.." && pwd)"
 source "${script_dir}/termux-release-paths.sh"
 
 pr_title="Termux ${UPSTREAM_TAG}"
-integration_conflicted=false
-conflict_summary=""
-conflict_context=""
-fallback_ref=""
 
 seed_dir="${RUNNER_TEMP}/termux-release-seed"
 
@@ -68,166 +64,6 @@ git_add_seeded_release_paths() {
   git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
 }
 
-git_diff_without_seeded_release_paths() {
-  local range="$1"
-  shift
-  local seeded_path
-  local pathspecs=(-- .)
-
-  for seeded_path in "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"; do
-    pathspecs+=(":(exclude)${seeded_path}")
-  done
-
-  git diff "$@" "${range}" "${pathspecs[@]}"
-}
-
-git_cached_diff_without_release_only_paths() {
-  local base_ref="$1"
-  shift
-
-  local release_only_path
-  local pathspecs=(-- . ":(exclude).github/termux-release.json")
-
-  for release_only_path in "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"; do
-    pathspecs+=(":(exclude)${release_only_path}")
-  done
-
-  git diff --cached "$@" "${base_ref}" "${pathspecs[@]}"
-}
-
-assert_termux_patch_scope() {
-  local base_ref="refs/tags/${UPSTREAM_TAG}"
-  local max_changed_files="${TERMUX_RELEASE_MAX_PATCH_FILES:-250}"
-  local -a changed_paths
-  local changed_count
-  local shown_path
-
-  if ! [[ "${max_changed_files}" =~ ^[0-9]+$ ]]; then
-    echo "TERMUX_RELEASE_MAX_PATCH_FILES must be a non-negative integer; got '${max_changed_files}'." >&2
-    return 1
-  fi
-
-  mapfile -t changed_paths < <(
-    git_cached_diff_without_release_only_paths "${base_ref}" --name-only
-  )
-  changed_count="${#changed_paths[@]}"
-  if ((changed_count <= max_changed_files)); then
-    return 0
-  fi
-
-  echo "::error title=Termux patch scope too large::Proposed release differs from ${base_ref} in ${changed_count} non-release paths; refusing to create a release PR from ${PATCH_BRANCH}." >&2
-  echo "The reusable patch branch should contain only the small Termux compatibility delta. A large diff usually means ${PATCH_BRANCH} was seeded from a stale release tree." >&2
-  git_cached_diff_without_release_only_paths "${base_ref}" --shortstat >&2 || true
-  echo "First changed non-release paths:" >&2
-  for shown_path in "${changed_paths[@]:0:100}"; do
-    printf -- '- %s\n' "${shown_path}" >&2
-  done
-  return 1
-}
-
-resolve_seeded_release_workflow_conflicts() {
-  local conflicted_path
-  local resolved_any=false
-
-  mapfile -t conflicted_paths < <(git diff --name-only --diff-filter=U)
-  for conflicted_path in "${conflicted_paths[@]}"; do
-    if termux_is_release_automation_path "${conflicted_path}"; then
-      resolved_any=true
-    fi
-  done
-
-  if [[ "${resolved_any}" != "true" ]]; then
-    return 0
-  fi
-
-  echo "Auto-resolving Termux-owned release workflow conflicts from the automation branch."
-  seed_release_branch_workflows
-  git_add_seeded_release_paths
-}
-
-resolve_workspace_version_conflict() {
-  local upstream_version
-
-  upstream_version="$(workspace_version_from_ref "refs/tags/${UPSTREAM_TAG}")"
-  if [[ -z "${upstream_version}" ]]; then
-    echo "Unable to read workspace package version from refs/tags/${UPSTREAM_TAG}" >&2
-    return 0
-  fi
-
-  if UPSTREAM_WORKSPACE_VERSION="${upstream_version}" perl -0pi -e '
-    my $version = $ENV{"UPSTREAM_WORKSPACE_VERSION"};
-    s/<<<<<<<[^\n]*\n(version = ")[^"]+("\n)=======\n\1[^"]+\2>>>>>>>[^\n]*(\n)/$1$version$2$3/s
-      or exit 1;
-  ' codex-rs/Cargo.toml; then
-    git add codex-rs/Cargo.toml
-  else
-    echo "codex-rs/Cargo.toml has conflicts beyond the simple workspace version bump; leaving it for the fallback PR."
-    git checkout -m -- codex-rs/Cargo.toml
-  fi
-}
-
-resolve_known_release_train_conflicts() {
-  local conflicted_path
-
-  resolve_seeded_release_workflow_conflicts
-
-  mapfile -t conflicted_paths < <(git diff --name-only --diff-filter=U)
-  for conflicted_path in "${conflicted_paths[@]}"; do
-    case "${conflicted_path}" in
-      .github/workflows/*)
-        echo "Auto-resolving upstream workflow conflict in ${conflicted_path} by keeping ${RELEASE_BRANCH}."
-        git checkout --ours -- "${conflicted_path}"
-        git add "${conflicted_path}"
-        ;;
-    esac
-  done
-
-  mapfile -t conflicted_paths < <(git diff --name-only --diff-filter=U)
-  for conflicted_path in "${conflicted_paths[@]}"; do
-    case "${conflicted_path}" in
-      codex-rs/Cargo.toml)
-        echo "Auto-resolving recurring workspace version conflict in codex-rs/Cargo.toml."
-        resolve_workspace_version_conflict
-        ;;
-      codex-rs/app-server/tests/suite/v2/thread_resume.rs)
-        echo "Auto-resolving upstream-only app-server test conflict in ${conflicted_path} by keeping refs/tags/${UPSTREAM_TAG}."
-        git checkout --theirs -- "${conflicted_path}"
-        git add "${conflicted_path}"
-        ;;
-    esac
-  done
-}
-
-reset_for_fallback_checkout() {
-  git reset --hard "origin/${RELEASE_BRANCH}"
-  git clean -fd .github/workflows
-}
-
-abort_for_termux_patch_conflict() {
-  local patch_ref="$1"
-  local patch_base_ref="$2"
-  local conflicted_path
-  local -a conflicted_paths
-
-  mapfile -t conflicted_paths < <(git diff --name-only --diff-filter=U)
-
-  echo "::error title=Termux patch requires manual resolution::Applying the reusable Termux patch conflicted; refusing to create a fallback release PR from ${patch_ref}." >&2
-  echo "The patch needs a human resolution so stale files from ${PATCH_BRANCH} are not copied into ${WORK_BRANCH}." >&2
-  echo "- Patch ref: ${patch_ref}" >&2
-  echo "- Patch base: ${patch_base_ref}" >&2
-  echo "- Release base: origin/${RELEASE_BRANCH}" >&2
-  echo "Conflicted paths:" >&2
-  if ((${#conflicted_paths[@]} == 0)); then
-    echo "- (none reported by git)" >&2
-  else
-    for conflicted_path in "${conflicted_paths[@]}"; do
-      printf -- '- %s\n' "${conflicted_path}" >&2
-    done
-  fi
-  echo "Resolve these conflicts manually, then push the corrected ${WORK_BRANCH} release PR branch." >&2
-  return 1
-}
-
 workspace_version_from_ref() {
   local ref="$1"
   git show "${ref}:codex-rs/Cargo.toml" | awk '
@@ -242,9 +78,7 @@ workspace_version_from_ref() {
   '
 }
 
-normalize_ref_workspace_version() {
-  local source_ref="$1"
-  local normalized_ref="$2"
+normalize_workspace_version_to_upstream_tag() {
   local upstream_version
 
   upstream_version="$(workspace_version_from_ref "refs/tags/${UPSTREAM_TAG}")"
@@ -252,10 +86,8 @@ normalize_ref_workspace_version() {
     echo "Unable to read workspace package version from refs/tags/${UPSTREAM_TAG}" >&2
     exit 1
   fi
-
-  git checkout -B "${normalized_ref}" "${source_ref}"
   if [[ ! -f codex-rs/Cargo.toml ]]; then
-    echo "codex-rs/Cargo.toml is missing from ${source_ref}" >&2
+    echo "codex-rs/Cargo.toml is missing from ${WORK_BRANCH}" >&2
     exit 1
   fi
 
@@ -264,29 +96,6 @@ normalize_ref_workspace_version() {
     s/(\[workspace\.package\]\n(?:(?!^\[).*\n)*?version = ")[^"]+(")/$1$version$2/m
       or die "workspace.package version not found\n";
   ' codex-rs/Cargo.toml
-
-  if ! git diff --quiet -- codex-rs/Cargo.toml; then
-    git add codex-rs/Cargo.toml
-    git commit -m "Normalize Termux patch workspace version"
-  fi
-}
-
-termux_patch_base_ref() {
-  local patch_ref="$1"
-  local upstream_base_ref="${TERMUX_PATCH_UPSTREAM_BASE_REF:-origin/main}"
-  local base_sha
-
-  if git rev-parse --verify --quiet "${upstream_base_ref}^{commit}" >/dev/null; then
-    if base_sha="$(git merge-base "${upstream_base_ref}" "${patch_ref}")"; then
-      printf '%s\n' "${base_sha}"
-      return 0
-    fi
-    echo "Unable to find a merge base between ${upstream_base_ref} and ${patch_ref}; falling back to refs/tags/${UPSTREAM_TAG}." >&2
-  else
-    echo "Unable to resolve ${upstream_base_ref}; falling back to refs/tags/${UPSTREAM_TAG}." >&2
-  fi
-
-  printf 'refs/tags/%s\n' "${UPSTREAM_TAG}"
 }
 
 open_prs_cache_loaded=false
@@ -342,11 +151,7 @@ append_pr_summary() {
     echo "- Release kind: \`codex\`"
     echo "- Release train branch: \`${RELEASE_BRANCH}\`"
     echo "- Work branch: \`${WORK_BRANCH}\`"
-    echo "- Conflict fallback/manual resolution: \`${integration_conflicted}\`"
-    if [[ "${integration_conflicted}" == "true" ]]; then
-      echo "- Conflict context: ${conflict_context}"
-      echo "- Fallback ref: \`${fallback_ref}\`"
-    fi
+    echo "- Patch source: \`${PATCH_BRANCH}\`"
     if [[ -n "${pr_url}" ]]; then
       echo "- PR: ${pr_url}"
     fi
@@ -429,9 +234,17 @@ existing_open_train_pr="$(
   ' <<< "$(open_prs_json)"
 )"
 existing_open_train_pr_url=""
+existing_open_train_pr_matches_upstream=false
+existing_open_train_pr_tag=""
 if [[ -n "${existing_open_train_pr}" ]]; then
   existing_open_train_pr_url="$(jq -r '.url' <<< "${existing_open_train_pr}")"
   existing_open_train_pr_head="$(jq -r '.headRefName' <<< "${existing_open_train_pr}")"
+  existing_open_train_pr_tag="$(
+    jq -r '(.body // "") | try capture("- Upstream tag: `(?<tag>rust-v[^`]+)`").tag catch ""' <<< "${existing_open_train_pr}"
+  )"
+  if [[ "${existing_open_train_pr_tag}" == "${UPSTREAM_TAG}" ]]; then
+    existing_open_train_pr_matches_upstream=true
+  fi
   if [[ "${existing_open_train_pr_head}" != "${WORK_BRANCH}" ]]; then
     echo "Open release train PR uses ${existing_open_train_pr_head}; updating that branch instead of ${WORK_BRANCH}."
     WORK_BRANCH="${existing_open_train_pr_head}"
@@ -441,12 +254,20 @@ fi
 release_branch_exists=false
 if git ls-remote --exit-code --heads origin "${RELEASE_BRANCH}" >/dev/null 2>&1; then
   release_branch_exists=true
+  git fetch origin "${RELEASE_BRANCH}"
 fi
 
+force_release_branch_push=false
 if [[ "${release_branch_exists}" == true ]]; then
-  delete_existing_release_branch_if_safe "${RELEASE_BRANCH}"
-  if ! git ls-remote --exit-code --heads origin "${RELEASE_BRANCH}" >/dev/null 2>&1; then
+  if [[ -n "${existing_open_train_pr_url}" && "${existing_open_train_pr_matches_upstream}" != "true" ]]; then
+    echo "Rebuilding ${RELEASE_BRANCH} from ${UPSTREAM_TAG}; open PR ${existing_open_train_pr_url} was for ${existing_open_train_pr_tag:-an unknown upstream tag}."
     release_branch_exists=false
+    force_release_branch_push=true
+  else
+    delete_existing_release_branch_if_safe "${RELEASE_BRANCH}"
+    if ! git ls-remote --exit-code --heads origin "${RELEASE_BRANCH}" >/dev/null 2>&1; then
+      release_branch_exists=false
+    fi
   fi
 fi
 
@@ -457,7 +278,11 @@ if [[ "${release_branch_exists}" == false ]]; then
   if ! git diff --cached --quiet; then
     git commit -m "Seed Termux release automation"
   fi
-  git push origin "${RELEASE_BRANCH}"
+  if [[ "${force_release_branch_push}" == "true" ]]; then
+    git push --force-with-lease origin "${RELEASE_BRANCH}"
+  else
+    git push origin "${RELEASE_BRANCH}"
+  fi
 fi
 
 git fetch origin "${RELEASE_BRANCH}"
@@ -467,53 +292,13 @@ if git ls-remote --exit-code --heads origin "${WORK_BRANCH}" >/dev/null 2>&1; th
   git fetch origin "${WORK_BRANCH}"
 fi
 
-if [[ "${work_branch_exists}" == true ]]; then
+if [[ "${work_branch_exists}" == true && -n "${existing_open_train_pr_url}" && "${existing_open_train_pr_matches_upstream}" == "true" ]]; then
   git checkout -B "${WORK_BRANCH}" "origin/${WORK_BRANCH}"
 else
-  git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
-fi
-
-if [[ "${release_branch_exists}" == false ]]; then
-  patch_base_ref=""
-  normalized_patch_base_ref=""
-  normalized_patch_ref="termux-patch-normalized/${UPSTREAM_TAG}"
-  normalize_ref_workspace_version "origin/${PATCH_BRANCH}" "${normalized_patch_ref}"
-  patch_base_ref="$(termux_patch_base_ref "${normalized_patch_ref}")"
-  normalized_patch_base_ref="termux-patch-base-normalized/${UPSTREAM_TAG}"
-  normalize_ref_workspace_version "${patch_base_ref}" "${normalized_patch_base_ref}"
-  git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
-  seed_release_branch_workflows
-
-  echo "Creating Termux patch from ${normalized_patch_base_ref} (base ${patch_base_ref}) to ${normalized_patch_ref}."
-  git_diff_without_seeded_release_paths "${normalized_patch_base_ref}..${normalized_patch_ref}" --binary > "${RUNNER_TEMP}/termux.patch"
-  if [[ -s "${RUNNER_TEMP}/termux.patch" ]]; then
-    if ! git apply --3way "${RUNNER_TEMP}/termux.patch"; then
-      abort_for_termux_patch_conflict "${normalized_patch_ref}" "${normalized_patch_base_ref}"
-    fi
-  fi
-else
-  if ! git merge --no-ff --no-edit "refs/tags/${UPSTREAM_TAG}"; then
-    resolve_known_release_train_conflicts
-    remaining_conflicts="$(git diff --name-only --diff-filter=U)"
-    if [[ -z "${remaining_conflicts}" ]]; then
-      git commit --no-edit
-    else
-      integration_conflicted=true
-      conflict_context="Merging the upstream tag into the existing release train branch"
-      fallback_ref="refs/tags/${UPSTREAM_TAG}"
-      conflict_summary="$(
-        printf '%s\n' "${remaining_conflicts}" | awk '{ print "- `" $0 "`" }'
-      )"
-      echo "Merging the upstream tag conflicted; creating a manual-resolution PR instead." >&2
-      if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-        git merge --abort
-      fi
-      reset_for_fallback_checkout
-      git checkout -B "${WORK_BRANCH}" "${fallback_ref}"
-    fi
-  fi
+  git checkout -B "${WORK_BRANCH}" "origin/${PATCH_BRANCH}"
 fi
 seed_release_branch_workflows
+normalize_workspace_version_to_upstream_tag
 
 mkdir -p .github
 jq -n \
@@ -547,7 +332,6 @@ jq -n \
   }' > .github/termux-release.json
 
 git add -A
-assert_termux_patch_scope
 if git diff --cached --quiet; then
   echo "No changes to propose for ${UPSTREAM_TAG}."
   append_pr_summary "no changes to propose"
@@ -567,20 +351,9 @@ body_path="${RUNNER_TEMP}/termux-release-pr.md"
   echo "- Release train branch: \`${RELEASE_BRANCH}\`"
   echo "- Patch source: \`${PATCH_BRANCH}\`"
   echo
+  echo "This PR is intentionally created from \`${PATCH_BRANCH}\` with the Termux release automation files copied from \`dev\`, then targeted at the upstream release branch. If GitHub reports conflicts, resolve them manually by keeping the upstream release code while preserving the Termux compatibility fixes."
+  echo
   echo "Merging this PR is the manual approval gate. The release build workflow uploads the Android artifact to test; after merge, the deployment workflow attaches that exact artifact to \`${TERMUX_TAG}\` and opens the checkpoint PR."
-  if [[ "${integration_conflicted}" == "true" ]]; then
-    echo
-    echo "## Merge conflicts"
-    echo
-    echo "${conflict_context} conflicted in GitHub Actions, so this PR used \`${fallback_ref}\` as its manual-resolution fallback."
-    echo
-    echo "Conflicted paths from the failed integration attempt:"
-    if [[ -n "${conflict_summary}" ]]; then
-      printf '%s\n' "${conflict_summary}"
-    else
-      echo "- Conflict details unavailable"
-    fi
-  fi
   echo
   echo "## Upstream notes"
   echo
