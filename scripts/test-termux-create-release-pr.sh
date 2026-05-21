@@ -16,6 +16,17 @@ fail() {
   exit 1
 }
 
+assert_contains() {
+  local file="$1"
+  local expected="$2"
+  local description="$3"
+
+  if [[ "$(cat "${file}")" != *"${expected}"* ]]; then
+    cat "${file}" >&2
+    fail "${description}"
+  fi
+}
+
 origin="${tmp_dir}/origin.git"
 work="${tmp_dir}/work"
 bin_dir="${tmp_dir}/bin"
@@ -228,6 +239,7 @@ git push origin wallentx/termux-target >/dev/null
 
 git checkout -B automation main >/dev/null
 
+set +e
 PATH="${bin_dir}:${PATH}" \
 GITHUB_REPOSITORY="wallentx/codex-termux" \
 UPSTREAM_REPO="openai/codex" \
@@ -248,18 +260,25 @@ RUNNER_TEMP="${runner_temp_conflict}" \
 GITHUB_OUTPUT="${github_output_conflict}" \
 GH_TOKEN="test-token" \
 TERMUX_RELEASE_MAX_PATCH_FILES="1" \
-bash "${script}" > "${tmp_dir}/stdout-conflict" 2> "${tmp_dir}/stderr-conflict" || {
+bash "${script}" > "${tmp_dir}/stdout-conflict" 2> "${tmp_dir}/stderr-conflict"
+status=$?
+set -e
+
+if [[ "${status}" -eq 0 ]]; then
   cat "${tmp_dir}/stdout-conflict" >&2
   cat "${tmp_dir}/stderr-conflict" >&2
-  fail "conflicting patch branch synced with main was rejected"
-}
-
-git fetch origin release-train/1.0.0 >/dev/null
-if [[ "$(git show origin/release-train/1.0.0:src/shared.txt)" != "termux" ]]; then
-  fail "conflict fallback did not keep the Termux-side file"
-fi
-if git cat-file -e origin/release-train/1.0.0:src/main-ahead.txt 2>/dev/null; then
-  fail "main-only file leaked into conflict fallback release train"
+  fail "conflicting patch branch synced with main was accepted"
 fi
 
-echo "ok - conflicting patch branch synced with main falls back to small PR"
+assert_contains "${tmp_dir}/stderr-conflict" \
+  "Termux patch requires manual resolution" \
+  "conflicting patch branch did not report manual resolution"
+assert_contains "${tmp_dir}/stderr-conflict" \
+  "- src/shared.txt" \
+  "conflicting patch branch did not list the conflicted path"
+
+if git ls-remote --exit-code --heads origin release-train/1.0.0 >/dev/null 2>&1; then
+  fail "conflicting patch branch pushed a fallback release train"
+fi
+
+echo "ok - conflicting patch branch synced with main requires manual resolution"

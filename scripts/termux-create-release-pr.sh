@@ -203,6 +203,31 @@ reset_for_fallback_checkout() {
   git clean -fd .github/workflows
 }
 
+abort_for_termux_patch_conflict() {
+  local patch_ref="$1"
+  local patch_base_ref="$2"
+  local conflicted_path
+  local -a conflicted_paths
+
+  mapfile -t conflicted_paths < <(git diff --name-only --diff-filter=U)
+
+  echo "::error title=Termux patch requires manual resolution::Applying the reusable Termux patch conflicted; refusing to create a fallback release PR from ${patch_ref}." >&2
+  echo "The patch needs a human resolution so stale files from ${PATCH_BRANCH} are not copied into ${WORK_BRANCH}." >&2
+  echo "- Patch ref: ${patch_ref}" >&2
+  echo "- Patch base: ${patch_base_ref}" >&2
+  echo "- Release base: origin/${RELEASE_BRANCH}" >&2
+  echo "Conflicted paths:" >&2
+  if ((${#conflicted_paths[@]} == 0)); then
+    echo "- (none reported by git)" >&2
+  else
+    for conflicted_path in "${conflicted_paths[@]}"; do
+      printf -- '- %s\n' "${conflicted_path}" >&2
+    done
+  fi
+  echo "Resolve these conflicts manually, then push the corrected ${WORK_BRANCH} release PR branch." >&2
+  return 1
+}
+
 workspace_version_from_ref() {
   local ref="$1"
   git show "${ref}:codex-rs/Cargo.toml" | awk '
@@ -463,25 +488,7 @@ if [[ "${release_branch_exists}" == false ]]; then
   git_diff_without_seeded_release_paths "${normalized_patch_base_ref}..${normalized_patch_ref}" --binary > "${RUNNER_TEMP}/termux.patch"
   if [[ -s "${RUNNER_TEMP}/termux.patch" ]]; then
     if ! git apply --3way "${RUNNER_TEMP}/termux.patch"; then
-      mapfile -t patch_changed_paths < <(
-        git_diff_without_seeded_release_paths "${normalized_patch_base_ref}..${normalized_patch_ref}" --name-only
-      )
-      integration_conflicted=true
-      conflict_context="Applying the Termux patch branch onto the upstream tag"
-      fallback_ref="${normalized_patch_ref}"
-      conflict_summary="$(
-        git diff --name-only --diff-filter=U | awk '{ print "- `" $0 "`" }'
-      )"
-      echo "Applying the Termux patch branch conflicted; creating a manual-resolution PR instead." >&2
-      reset_for_fallback_checkout
-      git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
-      for patch_path in "${patch_changed_paths[@]}"; do
-        if git cat-file -e "${normalized_patch_ref}:${patch_path}" 2>/dev/null; then
-          git checkout "${normalized_patch_ref}" -- "${patch_path}"
-        else
-          git rm -f --ignore-unmatch -- "${patch_path}"
-        fi
-      done
+      abort_for_termux_patch_conflict "${normalized_patch_ref}" "${normalized_patch_base_ref}"
     fi
   fi
 else
