@@ -101,7 +101,6 @@ impl App {
             cwd,
             approval_policy,
             approvals_reviewer,
-            permission_profile: _,
             active_permission_profile,
             windows_sandbox_level: _,
             model,

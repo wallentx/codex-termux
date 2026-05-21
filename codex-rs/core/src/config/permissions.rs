@@ -186,7 +186,6 @@ pub(crate) fn apply_network_proxy_feature_config(
             }
         }),
         allow_local_binding: feature_config.allow_local_binding,
-        mitm: None,
     }
     .apply_to_network_proxy_config(config);
 }
