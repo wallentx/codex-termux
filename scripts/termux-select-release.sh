@@ -61,6 +61,37 @@ open_prs_json() {
   printf '%s\n' "${open_prs_cache}"
 }
 
+normalize_upstream_release_json() {
+  jq -c '
+    def normalize:
+      {
+        tagName: (.tag_name // .tagName // ""),
+        name: (.name // .tag_name // .tagName // ""),
+        body: (.body // ""),
+        url: (.html_url // .url // ""),
+        isPrerelease: (.prerelease // .isPrerelease // false),
+        targetCommitish: (.target_commitish // .targetCommitish // ""),
+        databaseId: (.id // .databaseId // "")
+      };
+    if type == "array" then map(normalize) else normalize end
+  '
+}
+
+upstream_releases_cache_loaded=false
+upstream_releases_cache="[]"
+upstream_releases_json() {
+  if [[ "${upstream_releases_cache_loaded}" != "true" ]]; then
+    upstream_releases_cache="$(
+      gh api \
+        --method GET \
+        "repos/${UPSTREAM_REPO}/releases?per_page=30" \
+        | normalize_upstream_release_json
+    )"
+    upstream_releases_cache_loaded=true
+  fi
+  printf '%s\n' "${upstream_releases_cache}"
+}
+
 release_branch_current_tag() {
   local release_branch="$1"
   release_branch_current_metadata "${release_branch}" \
@@ -232,9 +263,22 @@ release_tag_is_newer_than_known_train() {
 
 release_json_for_tag() {
   local tag="$1"
-  gh release view "${tag}" \
-    --repo "${UPSTREAM_REPO}" \
-    --json tagName,name,body,url,isPrerelease,targetCommitish,databaseId
+  local release_json
+
+  release_json="$(
+    upstream_releases_json \
+      | jq -c --arg tag "${tag}" '.[] | select(.tagName == $tag)' \
+      | head -n 1
+  )"
+  if [[ -n "${release_json}" ]]; then
+    printf '%s\n' "${release_json}"
+    return 0
+  fi
+
+  gh api \
+    --method GET \
+    "repos/${UPSTREAM_REPO}/releases/tags/${tag}" \
+    | normalize_upstream_release_json
 }
 
 append_selection_summary() {
@@ -462,19 +506,10 @@ if [[ -n "${REQUESTED_TAG}" ]]; then
     exit 0
   fi
 else
-  mapfile -t upstream_tags < <(
-    gh release list \
-      --repo "${UPSTREAM_REPO}" \
-      --exclude-drafts \
-      --limit 30 \
-      --json tagName \
-      --jq '.[].tagName'
-  )
-
-  for upstream_tag in "${upstream_tags[@]}"; do
+  while IFS= read -r release_json; do
+    upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
     case "${upstream_tag}" in
       rust-v* | rusty-v8-v*)
-        release_json="$(release_json_for_tag "${upstream_tag}")"
         if maybe_select_release "${release_json}"; then
           exit 0
         fi
@@ -483,7 +518,7 @@ else
         echo "Skipping unsupported upstream release tag: ${upstream_tag}"
         ;;
     esac
-  done
+  done < <(upstream_releases_json | jq -c '.[]')
 fi
 
 echo "No upstream Codex or rusty_v8 release needs a Termux mirror."
