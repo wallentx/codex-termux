@@ -48,11 +48,43 @@ permissions:
   repository-projects: read
   statuses: read
 
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
-
 jobs:
+  cancel-superseded-pr-runs:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Cancel older runs for this PR branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Cancelling older ${GITHUB_WORKFLOW} runs for ${HEAD_BRANCH}"
+          gh run list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --limit 100 \
+            --json databaseId,event,headBranch,status,url \
+            --jq '
+              .[]
+              | select(.event == "pull_request")
+              | select(.headBranch == env.HEAD_BRANCH)
+              | select(.databaseId < (env.CURRENT_RUN_ID | tonumber))
+              | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "requested" or .status == "pending")
+              | "\(.databaseId) \(.url)"
+            ' \
+            | while read -r run_id run_url; do
+                [[ -n "${run_id}" ]] || continue
+                echo "Cancelling superseded run ${run_id}: ${run_url}"
+                gh run cancel "${run_id}" --repo "${GITHUB_REPOSITORY}" || true
+              done
+
   tag-check:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
@@ -172,8 +204,10 @@ jobs:
     if: >-
       always() &&
       (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || needs.tag-check.result == 'success') &&
+      (github.event_name != 'pull_request' || needs.cancel-superseded-pr-runs.result == 'success') &&
       needs.select-build-matrix.result == 'success'
     needs:
+      - cancel-superseded-pr-runs
       - tag-check
       - select-build-matrix
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
