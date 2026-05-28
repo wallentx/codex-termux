@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+use codex_utils_file_lock::TryFileLockOutcome;
+use codex_utils_file_lock::try_lock_exclusive_optional;
 use codex_utils_home_dir::find_codex_home;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -33,12 +35,12 @@ pub struct Arg0DispatchPaths {
 /// Keeps the per-session PATH entry alive and locked for the process lifetime.
 pub struct Arg0PathEntryGuard {
     _temp_dir: TempDir,
-    _lock_file: File,
+    _lock_file: Option<File>,
     paths: Arg0DispatchPaths,
 }
 
 impl Arg0PathEntryGuard {
-    fn new(temp_dir: TempDir, lock_file: File, paths: Arg0DispatchPaths) -> Self {
+    fn new(temp_dir: TempDir, lock_file: Option<File>, paths: Arg0DispatchPaths) -> Self {
         Self {
             _temp_dir: temp_dir,
             _lock_file: lock_file,
@@ -326,7 +328,13 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
-    lock_file.try_lock()?;
+    let lock_file = match try_lock_exclusive_optional(&lock_file)? {
+        TryFileLockOutcome::Acquired => Some(lock_file),
+        TryFileLockOutcome::Unsupported => None,
+        TryFileLockOutcome::WouldBlock => {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+    };
 
     for filename in &[
         APPLY_PATCH_ARG0,
@@ -445,10 +453,9 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
         Err(err) => return Err(err),
     };
 
-    match lock_file.try_lock() {
-        Ok(()) => Ok(Some(lock_file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(err) => Err(err.into()),
+    match try_lock_exclusive_optional(&lock_file)? {
+        TryFileLockOutcome::Acquired => Ok(Some(lock_file)),
+        TryFileLockOutcome::WouldBlock | TryFileLockOutcome::Unsupported => Ok(None),
     }
 }
 
@@ -562,7 +569,13 @@ mod tests {
         let dir = root.path().join("locked");
         fs::create_dir(&dir)?;
         let lock_file = create_lock(&dir)?;
-        lock_file.try_lock()?;
+        match try_lock_exclusive_optional(&lock_file)? {
+            TryFileLockOutcome::Acquired => {}
+            TryFileLockOutcome::Unsupported => return Ok(()),
+            TryFileLockOutcome::WouldBlock => {
+                panic!("newly created lock file should not be locked");
+            }
+        }
 
         janitor_cleanup(root.path())?;
 
