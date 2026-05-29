@@ -255,7 +255,11 @@ jobs:
           set -euo pipefail
           if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update -y
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+            packages=(pkg-config libcap-dev)
+            if [[ "${{ matrix.target }}" == 'x86_64-unknown-linux-musl' || "${{ matrix.target }}" == 'aarch64-unknown-linux-musl' ]]; then
+              packages+=(libubsan1)
+            fi
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
           fi
       - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
@@ -338,6 +342,14 @@ jobs:
           restore-keys: |
             sccache-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-${{ steps.lockhash.outputs.hash }}-
             sccache-${{ matrix.runner }}-${{ matrix.target }}-${{ matrix.profile }}-
+
+      - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
+        name: Disable sccache wrapper (musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "RUSTC_WORKSPACE_WRAPPER=" >> "$GITHUB_ENV"
 
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'}}
         name: Prepare APT cache directories (musl)
@@ -427,12 +439,6 @@ jobs:
       - if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
         name: Configure musl rusty_v8 artifact overrides and verify checksums
         uses: ./.github/actions/setup-rusty-v8-musl
-        with:
-          target: ${{ matrix.target }}
-
-      - if: ${{ !contains(matrix.target, 'windows') && matrix.target != 'x86_64-unknown-linux-musl' && matrix.target != 'aarch64-unknown-linux-musl' }}
-        name: Configure rusty_v8 artifact overrides and verify checksums
-        uses: ./.github/actions/setup-rusty-v8
         with:
           target: ${{ matrix.target }}
 
