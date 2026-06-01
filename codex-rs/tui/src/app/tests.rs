@@ -339,6 +339,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
             TurnStatus::Completed,
             vec![ThreadItem::UserMessage {
                 id: "user-1".to_string(),
+                client_id: None,
                 content: vec![AppServerUserInput::Text {
                     text: "earlier prompt".to_string(),
                     text_elements: Vec::new(),
@@ -1819,7 +1820,7 @@ async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Permissions updated to Auto-review"));
+    assert!(rendered.contains("Permissions updated to Approve for me"));
 
     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
     assert!(config.contains("guardian_approval = true"));
@@ -1914,7 +1915,7 @@ async fn update_feature_flags_disabling_guardian_clears_review_policy_and_restor
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Permissions updated to Default"));
+    assert!(rendered.contains("Permissions updated to Ask for approval"));
 
     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
     assert!(!config.contains("guardian_approval = true"));
@@ -3264,6 +3265,7 @@ async fn side_thread_snapshot_hides_forked_parent_transcript() {
         TurnStatus::Completed,
         vec![ThreadItem::UserMessage {
             id: "parent-user".to_string(),
+            client_id: None,
             content: vec![AppServerUserInput::Text {
                 text: "parent prompt should stay hidden".to_string(),
                 text_elements: Vec::new(),
@@ -4370,6 +4372,32 @@ fn active_turn_not_steerable_turn_error_extracts_structured_server_error() {
 }
 
 #[test]
+fn session_start_error_surfaces_archived_guidance_without_rollout_path() {
+    let thread_id =
+        ThreadId::from_string("019e72f4-e09a-70f2-b2c2-a153a57b8cc0").expect("thread id");
+    let target_session = SessionTarget {
+        path: Some(std::path::PathBuf::from(
+            "/Users/me/.codex/archived_sessions/rollout.jsonl",
+        )),
+        thread_id,
+    };
+    let expected = format!(
+        "session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
+    );
+
+    for action in ["resume", "fork"] {
+        let err = color_eyre::eyre::eyre!(
+            "thread/{action} failed during TUI bootstrap: thread/{action} failed: {expected} (code -32600)"
+        );
+
+        assert_eq!(
+            session_start_error(action, &target_session, err).to_string(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn active_turn_steer_race_detects_missing_active_turn() {
     let error = TypedRequestError::Server {
         method: "turn/steer".to_string(),
@@ -4690,6 +4718,7 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                     items_view: codex_app_server_protocol::TurnItemsView::Full,
                     items: vec![ThreadItem::UserMessage {
                         id: "user-1".to_string(),
+                        client_id: None,
                         content: vec![AppServerUserInput::Text {
                             text: "first prompt".to_string(),
                             text_elements: Vec::new(),
@@ -4707,6 +4736,7 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                     items: vec![
                         ThreadItem::UserMessage {
                             id: "user-2".to_string(),
+                            client_id: None,
                             content: vec![AppServerUserInput::Text {
                                 text: "third prompt".to_string(),
                                 text_elements: Vec::new(),
@@ -4854,6 +4884,7 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
         TurnStatus::Completed,
         vec![ThreadItem::UserMessage {
             id: "user-1".to_string(),
+            client_id: None,
             content: vec![AppServerUserInput::Text {
                 text: "restored prompt".to_string(),
                 text_elements: Vec::new(),

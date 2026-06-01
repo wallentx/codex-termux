@@ -182,6 +182,7 @@ async fn live_app_server_review_prompt_item_is_not_rendered() {
             completed_at_ms: 0,
             item: AppServerThreadItem::UserMessage {
                 id: "review-prompt".to_string(),
+                client_id: None,
                 content: vec![AppServerUserInput::Text {
                     text: "Review the code changes against the base branch 'main'.".to_string(),
                     text_elements: Vec::new(),

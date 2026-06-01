@@ -429,7 +429,7 @@ async fn run_hooks_and_record_inputs(
             blocked_input = true;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
-            if matches!(input_item, TurnInput::UserInput(items) if !items.is_empty()) {
+            if matches!(input_item, TurnInput::UserInput { content, .. } if !content.is_empty()) {
                 accepted_user_input = true;
             }
             record_pending_input(
@@ -457,7 +457,7 @@ async fn build_skills_and_plugins(
     let user_input = input
         .iter()
         .filter_map(|item| match item {
-            TurnInput::UserInput(content) => Some(content.as_slice()),
+            TurnInput::UserInput { content, .. } => Some(content.as_slice()),
             TurnInput::ResponseItem(_) => None,
         })
         .flatten()
@@ -610,7 +610,7 @@ async fn track_turn_resolved_config_analytics(
             num_input_images: input
                 .iter()
                 .filter_map(|item| match item {
-                    TurnInput::UserInput(content) => Some(content.as_slice()),
+                    TurnInput::UserInput { content, .. } => Some(content.as_slice()),
                     TurnInput::ResponseItem(_) => None,
                 })
                 .flatten()
@@ -943,16 +943,12 @@ async fn run_sampling_request(
         Arc::clone(&turn_context),
         Arc::clone(&turn_diff_tracker),
     );
-    let _code_mode_worker = sess
-        .services
-        .code_mode_service
-        .start_turn_worker(
-            &sess,
-            &turn_context,
-            Arc::clone(&router),
-            Arc::clone(&turn_diff_tracker),
-        )
-        .await;
+    let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
+        &sess,
+        &turn_context,
+        Arc::clone(&router),
+        Arc::clone(&turn_diff_tracker),
+    );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut initial_input = Some(input);
@@ -1075,12 +1071,18 @@ pub(crate) async fn built_tools(
         None
     };
     let auth = sess.services.auth_manager.auth().await;
+    let loaded_plugin_app_connector_ids = loaded_plugins
+        .effective_apps()
+        .into_iter()
+        .map(|connector_id| connector_id.0)
+        .collect::<Vec<_>>();
     let discoverable_tools = if apps_enabled && tool_suggest_enabled(turn_context) {
         if let Some(accessible_connectors) = accessible_connectors_with_enabled_state.as_ref() {
             match connectors::list_tool_suggest_discoverable_tools_with_auth(
                 &turn_context.config,
                 auth.as_ref(),
                 accessible_connectors.as_slice(),
+                &loaded_plugin_app_connector_ids,
             )
             .await
             .map(|discoverable_tools| {
