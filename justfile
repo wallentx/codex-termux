@@ -168,6 +168,11 @@ argument-comment-lint *args:
 argument-comment-lint-from-source *args:
     {{ python }} {{ justfile_directory() }}/tools/argument-comment-lint/run.py {args}
 
+# Audit advisory file locks that may need Termux Unsupported handling.
+[no-cd]
+termux-lock-audit *args:
+    {{ justfile_directory() }}/scripts/termux-lock-audit.sh "$@"
+
 # Tail logs from the state SQLite database
 [unix]
 log *args:
