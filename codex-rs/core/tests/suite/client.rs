@@ -1,5 +1,6 @@
 use codex_config::ConfigLayerStack;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_core::LoadedAgentsMd;
 use codex_core::ModelClient;
 use codex_core::NewThread;
 use codex_core::Prompt;
@@ -364,7 +365,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         .with_home(codex_home.clone())
         .with_config(|config| {
             // Ensure user instructions are NOT delivered on resume.
-            config.user_instructions = Some("be nice".to_string());
+            config.user_instructions = Some(LoadedAgentsMd::from_text_for_testing("be nice"));
         });
     let test = builder
         .resume(&server, codex_home, session_path.clone())
@@ -875,7 +876,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    let effort = config.model_reasoning_effort;
+    let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
@@ -1180,7 +1181,7 @@ async fn includes_user_instructions_message_in_request() {
     let mut builder = test_codex()
         .with_auth(CodexAuth::from_api_key("Test API Key"))
         .with_config(|config| {
-            config.user_instructions = Some("be nice".to_string());
+            config.user_instructions = Some(LoadedAgentsMd::from_text_for_testing("be nice"));
         });
     let codex = builder
         .build(&server)
@@ -2212,7 +2213,7 @@ async fn includes_developer_instructions_message_in_request() {
     let mut builder = test_codex()
         .with_auth(CodexAuth::from_api_key("Test API Key"))
         .with_config(|config| {
-            config.user_instructions = Some("be nice".to_string());
+            config.user_instructions = Some(LoadedAgentsMd::from_text_for_testing("be nice"));
             config.developer_instructions = Some("be useful".to_string());
         });
     let codex = builder
@@ -2331,7 +2332,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    let effort = config.model_reasoning_effort;
+    let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
