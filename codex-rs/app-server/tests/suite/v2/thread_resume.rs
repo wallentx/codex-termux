@@ -284,7 +284,7 @@ async fn thread_resume_running_thread_uses_cached_instruction_sources() -> Resul
         instruction_sources,
         ..
     } = to_response::<ThreadStartResponse>(start_resp)?;
-    let project_agents = AbsolutePathBuf::try_from(std::fs::canonicalize(project_agents)?)?;
+    let project_agents = AbsolutePathBuf::try_from(project_agents)?;
     assert_eq!(instruction_sources, vec![project_agents.clone()]);
 
     let turn_id = mcp
@@ -366,7 +366,10 @@ async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Resul
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],
-            runtime_workspace_roots: Some(vec![extra_root.clone(), extra_root.join(".")]),
+            runtime_workspace_roots: Some(vec![
+                AbsolutePathBuf::from_absolute_path(&extra_root)?,
+                AbsolutePathBuf::from_absolute_path(extra_root.join("."))?,
+            ]),
             ..Default::default()
         })
         .await?;
