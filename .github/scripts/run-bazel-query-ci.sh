@@ -7,13 +7,30 @@ set -euo pipefail
 # enumerate labels, so they intentionally do not select a CI build/test config
 # or remote execution.
 
-if [[ $# -lt 2 || "${@: -2:1}" != "--" ]]; then
-  echo "Usage: $0 [<bazel query args>...] -- <query expression>" >&2
+query_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --windows-cross-compile)
+      # Accepted for callers that share option wiring with build/test helpers.
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      query_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $0 [--windows-cross-compile] [<bazel query args>...] -- <query expression>" >&2
   exit 1
 fi
 
-query_args=("${@:1:$#-2}")
-query_expression="${@: -1}"
+query_expression="$1"
 
 run_bazel() {
   if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
@@ -34,9 +51,6 @@ if [[ -n "${BAZEL_REPOSITORY_CACHE:-}" ]]; then
   bazel_query_args+=("--repository_cache=${BAZEL_REPOSITORY_CACHE}")
 fi
 
-if (( ${#query_args[@]} > 0 )); then
-  bazel_query_args+=("${query_args[@]}")
-fi
-bazel_query_args+=("$query_expression")
+bazel_query_args+=("${query_args[@]}" "$query_expression")
 
 run_bazel "${bazel_query_args[@]}"
