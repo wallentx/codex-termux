@@ -5,11 +5,6 @@ on:
     tags:
       - "rusty-v8-v*.*.*"
 
-# Cargo's libgit2 transport has been flaky when fetching git dependencies with
-# nested submodules. Prefer the system git CLI for Cargo smoke tests.
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
 concurrency:
   group: ${{ github.workflow }}::${{ github.ref_name }}
   cancel-in-progress: false
@@ -172,9 +167,9 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust toolchain for Cargo smoke
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.93.0"
 
       - name: Build Bazel V8 release pair
         env:
@@ -208,10 +203,11 @@ jobs:
             bazel_args+=(--config=v8-release-compat)
           fi
 
-          ./.github/scripts/run_bazel_with_buildbuddy.py \
+          bazel \
             --noexperimental_remote_repo_contents_cache \
             "${bazel_args[@]}" \
-            "--config=${{ matrix.bazel_config }}"
+            "--config=${{ matrix.bazel_config }}" \
+            "--remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
 
       - name: Stage release pair
         env:
