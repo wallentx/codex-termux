@@ -23,15 +23,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Run inside a glibc Linux image so dependency resolution exercises
-          # the pinned manylinux runtime wheel that users install.
+          # Run inside Alpine so dependency resolution exercises the pinned
+          # runtime wheel on the same Linux wheel family that CI installs.
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             -e HOME=/tmp/codex-python-sdk-home \
             -e UV_LINK_MODE=copy \
             -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
             -w "${GITHUB_WORKSPACE}/sdk/python" \
-            python:3.12-slim \
+            python:3.12-alpine \
             sh -euxc '
               python -m venv /tmp/uv
               /tmp/uv/bin/python -m pip install uv==0.11.3
@@ -46,9 +46,6 @@ jobs:
       group: ${{ github.event.repository.name }}-runners
       labels: ${{ github.event.repository.name }}-linux-x64
     timeout-minutes: 10
-    environment:
-      name: bazel
-      deployment: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
