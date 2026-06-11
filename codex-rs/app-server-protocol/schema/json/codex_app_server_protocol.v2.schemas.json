@@ -711,15 +711,11 @@
         },
         "name": {
           "type": "string"
-        },
-        "needsAuth": {
-          "type": "boolean"
         }
       },
       "required": [
         "id",
-        "name",
-        "needsAuth"
+        "name"
       ],
       "type": "object"
     },
@@ -1004,6 +1000,13 @@
           "description": "Programmatic Codex auth backed by a personal access token.",
           "enum": [
             "personalAccessToken"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Amazon Bedrock bearer token managed by Codex.",
+          "enum": [
+            "bedrockApiKey"
           ],
           "type": "string"
         }
