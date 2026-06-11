@@ -143,17 +143,17 @@ async fn run_compact_task_inner(
     let pre_compact_outcome = run_pre_compact_hooks(&sess, &turn_context, trigger).await;
     match pre_compact_outcome {
         PreCompactHookOutcome::Continue => {}
-        PreCompactHookOutcome::Stopped { reason } => {
-            let error = reason.unwrap_or_else(|| "PreCompact hook stopped execution".to_string());
+        PreCompactHookOutcome::Stopped => {
+            let error = CodexErr::TurnAborted;
             attempt
                 .track(
                     sess.as_ref(),
                     CompactionStatus::Interrupted,
-                    Some(error),
+                    Some(&error),
                     CompactionAnalyticsDetails::default(),
                 )
                 .await;
-            return Err(CodexErr::TurnAborted);
+            return Err(error);
         }
     }
     let result = run_compact_task_inner_impl(
@@ -165,7 +165,7 @@ async fn run_compact_task_inner(
     )
     .await;
     let status = compaction_status_from_result(&result);
-    let error = result.as_ref().err().map(ToString::to_string);
+    let codex_error = result.as_ref().err();
     if result.is_ok() {
         let post_compact_outcome = run_post_compact_hooks(&sess, &turn_context, trigger).await;
         if let PostCompactHookOutcome::Stopped = post_compact_outcome {
@@ -173,7 +173,7 @@ async fn run_compact_task_inner(
                 .track(
                     sess.as_ref(),
                     status,
-                    error,
+                    codex_error,
                     CompactionAnalyticsDetails::default(),
                 )
                 .await;
@@ -184,7 +184,7 @@ async fn run_compact_task_inner(
         .track(
             sess.as_ref(),
             status,
-            error,
+            codex_error,
             CompactionAnalyticsDetails::default(),
         )
         .await;
@@ -343,6 +343,7 @@ pub(crate) struct CompactionAnalyticsDetails {
     pub(crate) active_context_tokens_before: Option<i64>,
     pub(crate) retained_image_count: Option<usize>,
     pub(crate) compaction_summary_tokens: Option<i64>,
+    pub(crate) cached_input_tokens: Option<i64>,
 }
 
 impl CompactionAnalyticsAttempt {
@@ -372,13 +373,14 @@ impl CompactionAnalyticsAttempt {
         self,
         sess: &Session,
         status: CompactionStatus,
-        error: Option<String>,
+        codex_error: Option<&CodexErr>,
         details: CompactionAnalyticsDetails,
     ) {
         let CompactionAnalyticsDetails {
             active_context_tokens_before,
             retained_image_count,
             compaction_summary_tokens,
+            cached_input_tokens,
         } = details;
         let active_context_tokens_before =
             active_context_tokens_before.unwrap_or(self.active_context_tokens_before);
@@ -394,11 +396,14 @@ impl CompactionAnalyticsAttempt {
                 phase: self.phase,
                 strategy: CompactionStrategy::Memento,
                 status,
-                error,
+                codex_error_kind: codex_error.map(Into::into),
+                codex_error_http_status_code: codex_error
+                    .and_then(CodexErr::http_status_code_value),
                 active_context_tokens_before,
                 active_context_tokens_after,
                 retained_image_count,
                 compaction_summary_tokens,
+                cached_input_tokens,
                 started_at: self.started_at,
                 completed_at: now_unix_seconds(),
                 duration_ms: Some(
