@@ -124,7 +124,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.140.0-alpha.13"
+version = "0.140.0-alpha.14"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -267,7 +267,6 @@ assert_matches = "1.5.0"
 async-channel = "2.3.1"
 async-io = "2.6.0"
 async-stream = "0.3.6"
-async-trait = "0.1.89"
 aws-config = "1"
 aws-credential-types = "1"
 aws-sigv4 = "1"
@@ -516,8 +515,8 @@ split-debuginfo = "off"
 # sidecar symbols and stripped the binaries.
 strip = false
 
-# See https://github.com/openai/codex/issues/1411 for details.
-codegen-units = 1
+# Balance parallel release code generation against binary size.
+codegen-units = 4
 
 [profile.profiling]
 inherits = "release"
