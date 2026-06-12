@@ -202,7 +202,7 @@ All agents in the team, including the agents that you can assign tasks to, are e
 You can use `spawn_agent` to create a new agent, `followup_task` to give an existing agent a new task and trigger a turn, and `send_message` to pass a message to a running agent without triggering a turn.
 Child agents can also spawn their own sub-agents.
 You can decide how much context you want to propagate to your sub-agents with the `fork_turns` parameter.
-Default to doing the work yourself. Spawn sub-agents only for concrete, bounded subtasks that can run independently alongside useful local work and are likely to materially shorten completion time. Do not delegate simple tasks, small edits, routine searches, or work you can complete quickly yourself.
+Do not spawn sub-agents unless the user explicitly asks for sub-agents, delegation, or parallel agent work.
 
 You will receive messages in the analysis channel in the form:
 ```
@@ -219,7 +219,7 @@ You can spawn sub-agents to handle subtasks, and those sub-agents can spawn thei
 
 You can use `spawn_agent` to create a new agent, `followup_task` to give an existing agent a new task and trigger a turn, and `send_message` to pass a message to a running agent.
 Child agents can also spawn their own sub-agents.
-Default to doing the work yourself. Spawn sub-agents only for concrete, bounded subtasks that can run independently alongside useful local work and are likely to materially shorten completion time. Do not delegate simple tasks, small edits, routine searches, or work you can complete quickly yourself.
+Do not spawn sub-agents unless the user explicitly asks for sub-agents, delegation, or parallel agent work.
 
 When you provide a response in the final channel, that content is immediately delivered back to your parent agent.
 
@@ -945,6 +945,9 @@ pub struct Config {
     /// `/v1/realtime`
     /// connection) without changing normal provider HTTP requests.
     pub experimental_realtime_ws_base_url: Option<String>,
+    /// Experimental / do not use. Overrides only the WebRTC realtime call
+    /// creation base URL.
+    pub experimental_realtime_webrtc_call_base_url: Option<String>,
     /// Experimental / do not use. Selects the realtime websocket model/snapshot
     /// used for the `Op::RealtimeConversation` connection.
     pub experimental_realtime_ws_model: Option<String>,
@@ -3549,12 +3552,15 @@ impl Config {
                     speaker: audio.speaker,
                 }),
             experimental_realtime_ws_base_url: cfg.experimental_realtime_ws_base_url,
+            experimental_realtime_webrtc_call_base_url: cfg
+                .experimental_realtime_webrtc_call_base_url,
             experimental_realtime_ws_model: cfg.experimental_realtime_ws_model,
             realtime: cfg
                 .realtime
                 .map_or_else(RealtimeConfig::default, |realtime| {
                     let defaults = RealtimeConfig::default();
                     RealtimeConfig {
+                        architecture: realtime.architecture.unwrap_or(defaults.architecture),
                         version: realtime.version.unwrap_or(defaults.version),
                         session_type: realtime.session_type.unwrap_or(defaults.session_type),
                         transport: realtime.transport.unwrap_or(defaults.transport),
