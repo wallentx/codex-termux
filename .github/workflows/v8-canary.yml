@@ -5,7 +5,6 @@ on:
     paths:
       - ".bazelrc"
       - ".github/actions/setup-bazel-ci/**"
-      - ".github/scripts/run_bazel_with_buildbuddy.py"
       - ".github/scripts/rusty_v8_bazel.py"
       - ".github/scripts/rusty_v8_module_bazel.py"
       - ".github/scripts/v8_canary_changes.py"
@@ -25,7 +24,6 @@ on:
     paths:
       - ".bazelrc"
       - ".github/actions/setup-bazel-ci/**"
-      - ".github/scripts/run_bazel_with_buildbuddy.py"
       - ".github/scripts/rusty_v8_bazel.py"
       - ".github/scripts/rusty_v8_module_bazel.py"
       - ".github/scripts/v8_canary_changes.py"
@@ -40,11 +38,6 @@ on:
       - "patches/v8_*.patch"
       - "third_party/v8/**"
   workflow_dispatch:
-
-# Cargo's libgit2 transport has been flaky when fetching git dependencies with
-# nested submodules. Prefer the system git CLI for Cargo builds and smoke tests.
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 concurrency:
   group: ${{ github.workflow }}::${{ github.event.pull_request.number > 0 && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
@@ -104,9 +97,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-    environment:
-      name: bazel
-      deployment: false
     strategy:
       fail-fast: false
       matrix:
@@ -116,84 +106,72 @@ jobs:
             platform: linux_amd64
             sandbox: false
             target: x86_64-unknown-linux-gnu
-            v8_cpu: x64
             variant: release
           - runner: ubuntu-24.04
             bazel_config: ci-v8
             platform: linux_amd64
             sandbox: true
             target: x86_64-unknown-linux-gnu
-            v8_cpu: x64
             variant: ptrcomp-sandbox
           - runner: ubuntu-24.04-arm
             bazel_config: ci-v8
             platform: linux_arm64
             sandbox: false
             target: aarch64-unknown-linux-gnu
-            v8_cpu: arm64
             variant: release
           - runner: ubuntu-24.04-arm
             bazel_config: ci-v8
             platform: linux_arm64
             sandbox: true
             target: aarch64-unknown-linux-gnu
-            v8_cpu: arm64
             variant: ptrcomp-sandbox
           - runner: macos-15-xlarge
             bazel_config: ci-macos
             platform: macos_amd64
             sandbox: false
             target: x86_64-apple-darwin
-            v8_cpu: x64
             variant: release
           - runner: macos-15-xlarge
             bazel_config: ci-macos
             platform: macos_amd64
             sandbox: true
             target: x86_64-apple-darwin
-            v8_cpu: x64
             variant: ptrcomp-sandbox
           - runner: macos-15-xlarge
             bazel_config: ci-macos
             platform: macos_arm64
             sandbox: false
             target: aarch64-apple-darwin
-            v8_cpu: arm64
             variant: release
           - runner: macos-15-xlarge
             bazel_config: ci-macos
             platform: macos_arm64
             sandbox: true
             target: aarch64-apple-darwin
-            v8_cpu: arm64
             variant: ptrcomp-sandbox
           - runner: ubuntu-24.04
             bazel_config: ci-v8
             platform: linux_amd64_musl
             sandbox: false
             target: x86_64-unknown-linux-musl
-            v8_cpu: x64
             variant: release
           - runner: ubuntu-24.04
             bazel_config: ci-v8
             platform: linux_amd64_musl
             sandbox: true
             target: x86_64-unknown-linux-musl
-            v8_cpu: x64
             variant: ptrcomp-sandbox
           - runner: ubuntu-24.04-arm
             bazel_config: ci-v8
             platform: linux_arm64_musl
             sandbox: false
             target: aarch64-unknown-linux-musl
-            v8_cpu: arm64
             variant: release
           - runner: ubuntu-24.04-arm
             bazel_config: ci-v8
             platform: linux_arm64_musl
             sandbox: true
             target: aarch64-unknown-linux-musl
-            v8_cpu: arm64
             variant: ptrcomp-sandbox
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -212,9 +190,9 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust toolchain for Cargo smoke
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.93.0"
 
       - name: Build Bazel V8 release pair
         env:
@@ -222,7 +200,6 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
           SANDBOX: ${{ matrix.sandbox }}
           TARGET: ${{ matrix.target }}
-          V8_CPU: ${{ matrix.v8_cpu }}
         shell: bash
         run: |
           set -euo pipefail
@@ -238,7 +215,6 @@ jobs:
             build
             "--platforms=@llvm//platforms:${PLATFORM}"
             --config=rusty-v8-upstream-libcxx
-            "--config=v8-target-${V8_CPU}"
             "${pair_target}"
             --build_metadata=COMMIT_SHA=$(git rev-parse HEAD)
           )
@@ -246,10 +222,11 @@ jobs:
             bazel_args+=(--config=v8-release-compat)
           fi
 
-          ./.github/scripts/run_bazel_with_buildbuddy.py \
+          bazel \
             --noexperimental_remote_repo_contents_cache \
             "${bazel_args[@]}" \
-            "--config=${{ matrix.bazel_config }}"
+            "--config=${{ matrix.bazel_config }}" \
+            "--remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
 
       - name: Stage release pair
         env:
@@ -258,7 +235,6 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
           SANDBOX: ${{ matrix.sandbox }}
           TARGET: ${{ matrix.target }}
-          V8_CPU: ${{ matrix.v8_cpu }}
         shell: bash
         run: |
           set -euo pipefail
@@ -268,7 +244,6 @@ jobs:
             --target "${TARGET}"
             --output-dir "dist/${TARGET}"
             --bazel-config "${BAZEL_CONFIG}"
-            --bazel-config "v8-target-${V8_CPU}"
           )
           if [[ "${SANDBOX}" == "true" ]]; then
             stage_args+=(--sandbox)
@@ -360,9 +335,9 @@ jobs:
           architecture: x64
 
       - name: Set up Codex Rust toolchain for Cargo smoke
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.93.0"
           targets: ${{ matrix.target }}
 
       - name: Install rusty_v8 Rust toolchain
@@ -451,7 +426,7 @@ jobs:
             cd codex-rs
             RUSTY_V8_ARCHIVE="${GITHUB_WORKSPACE}/${archive}" \
             RUSTY_V8_SRC_BINDING_PATH="${GITHUB_WORKSPACE}/${binding}" \
-            cargo +1.95.0 test -p codex-v8-poc --target "${TARGET}" --features sandbox --no-run
+            cargo +1.93.0 test -p codex-v8-poc --target "${TARGET}" --features sandbox --no-run
           )
 
       - name: Upload staged artifacts
