@@ -36,6 +36,7 @@ use codex_config::permissions_toml::PermissionsToml;
 use codex_config::sandbox_mode_requirement_for_permission_profile;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::History;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerDisabledReason;
@@ -137,6 +138,7 @@ use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
 
 pub(crate) mod agent_roles;
+mod auth_keyring;
 pub mod edit;
 mod managed_features;
 mod network_proxy_spec;
@@ -145,6 +147,7 @@ mod permissions;
 mod resolved_permission_profile;
 #[cfg(test)]
 mod schema;
+pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
 pub use codex_config::ConfigLoadOptions;
 pub use codex_config::Constrained;
 pub use codex_config::ConstraintError;
@@ -1119,6 +1122,10 @@ impl AuthManagerConfig for Config {
         self.cli_auth_credentials_store_mode
     }
 
+    fn auth_keyring_backend_kind(&self) -> AuthKeyringBackendKind {
+        Config::auth_keyring_backend_kind(self)
+    }
+
     fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>> {
         self.forced_chatgpt_workspace_id.clone()
     }
@@ -1436,6 +1443,7 @@ impl Config {
             apps_mcp_product_sku: self.apps_mcp_product_sku.clone(),
             codex_home: self.codex_home.to_path_buf(),
             mcp_oauth_credentials_store_mode: self.mcp_oauth_credentials_store_mode,
+            auth_keyring_backend_kind: self.auth_keyring_backend_kind(),
             mcp_oauth_callback_port: self.mcp_oauth_callback_port,
             mcp_oauth_callback_url: self.mcp_oauth_callback_url.clone(),
             skill_mcp_dependency_install_enabled: self
@@ -1647,6 +1655,29 @@ pub async fn load_config_as_toml_with_cli_and_load_options(
     cli_overrides: Vec<(String, TomlValue)>,
     options: impl Into<ConfigLoadOptions>,
 ) -> std::io::Result<ConfigToml> {
+    load_config_toml_with_layer_stack(codex_home, cwd, cli_overrides, options)
+        .await
+        .map(|result| result.config_toml)
+}
+
+/// Partially loaded config plus the layer stack used to derive it.
+///
+/// This is intended for startup paths that must inspect raw config before a
+/// full [`Config`] can be constructed, but still need access to managed
+/// requirements loaded with the config layers.
+pub struct ConfigTomlLoadResult {
+    pub config_toml: ConfigToml,
+    pub config_layer_stack: ConfigLayerStack,
+}
+
+/// Loads the partially merged config together with the layer stack used to
+/// derive it, before constructing a full [`Config`].
+pub async fn load_config_toml_with_layer_stack(
+    codex_home: &Path,
+    cwd: Option<&AbsolutePathBuf>,
+    cli_overrides: Vec<(String, TomlValue)>,
+    options: impl Into<ConfigLoadOptions>,
+) -> std::io::Result<ConfigTomlLoadResult> {
     let config_layer_stack = load_config_layers_state(
         LOCAL_FS.as_ref(),
         codex_home,
@@ -1663,7 +1694,10 @@ pub async fn load_config_as_toml_with_cli_and_load_options(
         e
     })?;
 
-    Ok(cfg)
+    Ok(ConfigTomlLoadResult {
+        config_toml: cfg,
+        config_layer_stack,
+    })
 }
 
 pub fn deserialize_config_toml_with_base(
@@ -3668,7 +3702,7 @@ impl Config {
             return Ok(None);
         };
 
-        let path_uri = PathUri::from_abs_path(path)?;
+        let path_uri = PathUri::from_abs_path(path);
         let contents = fs
             .read_file_text(&path_uri, /*sandbox*/ None)
             .await
