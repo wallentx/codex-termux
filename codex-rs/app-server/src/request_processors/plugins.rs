@@ -1070,6 +1070,7 @@ impl PluginRequestProcessor {
                         interface: outcome.plugin.interface.map(local_plugin_interface_to_info),
                         keywords: outcome.plugin.keywords,
                     },
+                    share_url: None,
                     description: outcome.plugin.description,
                     skills: plugin_skills_to_info(
                         &visible_skills,
@@ -1700,6 +1701,7 @@ impl PluginRequestProcessor {
             );
 
             let store_mode = config.mcp_oauth_credentials_store_mode;
+            let keyring_backend_kind = config.auth_keyring_backend_kind();
             let callback_port = config.mcp_oauth_callback_port;
             let callback_url = config.mcp_oauth_callback_url.clone();
             let outgoing = Arc::clone(&self.outgoing);
@@ -1711,6 +1713,7 @@ impl PluginRequestProcessor {
                     &name,
                     &oauth_config.url,
                     store_mode,
+                    keyring_backend_kind,
                     oauth_config.http_headers.clone(),
                     oauth_config.env_http_headers.clone(),
                     &resolved_scopes.scopes,
@@ -1727,6 +1730,7 @@ impl PluginRequestProcessor {
                             &name,
                             &oauth_config.url,
                             store_mode,
+                            keyring_backend_kind,
                             oauth_config.http_headers,
                             oauth_config.env_http_headers,
                             &[],
@@ -2081,6 +2085,7 @@ fn remote_plugin_detail_to_info(
         marketplace_name: detail.marketplace_name,
         marketplace_path: None,
         summary: remote_plugin_summary_to_info(detail.summary),
+        share_url: detail.share_url,
         description: detail.description,
         skills: detail
             .skills

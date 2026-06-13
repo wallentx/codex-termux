@@ -181,6 +181,7 @@ pub struct McpServerRefreshConfig {
     pub mcp_servers: Value,
     /// OAuth credential store mode to use with this server snapshot.
     pub mcp_oauth_credentials_store_mode: Value,
+    pub auth_keyring_backend_kind: Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -400,6 +401,16 @@ pub struct ConversationAudioParams {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConversationTextParams {
     pub text: String,
+    pub role: ConversationTextRole,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ConversationTextRole {
+    #[default]
+    User,
+    Developer,
 }
 
 /// Persistent thread-settings overrides that can be applied before user input or
@@ -528,7 +539,7 @@ pub enum Op {
         thread_settings: ThreadSettingsOverrides,
     },
 
-    /// Inter-agent communication that should be recorded as assistant history
+    /// Inter-agent communication that should be recorded as agent-message history
     /// while still using the normal thread submission lifecycle.
     InterAgentCommunication {
         communication: InterAgentCommunication,
@@ -714,15 +725,18 @@ impl InterAgentCommunication {
     }
 
     pub fn to_model_input_item(&self) -> ResponseItem {
-        match &self.encrypted_content {
-            Some(encrypted_content) => ResponseItem::AgentMessage {
-                author: self.author.to_string(),
-                recipient: self.recipient.to_string(),
-                content: vec![AgentMessageInputContent::EncryptedContent {
-                    encrypted_content: encrypted_content.clone(),
-                }],
+        let content = match &self.encrypted_content {
+            Some(encrypted_content) => AgentMessageInputContent::EncryptedContent {
+                encrypted_content: encrypted_content.clone(),
             },
-            None => self.to_response_input_item().into(),
+            None => AgentMessageInputContent::InputText {
+                text: self.content.clone(),
+            },
+        };
+        ResponseItem::AgentMessage {
+            author: self.author.to_string(),
+            recipient: self.recipient.to_string(),
+            content: vec![content],
         }
     }
 
@@ -2800,6 +2814,7 @@ fn multi_agent_version_from_items(
             RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::EventMsg(_) => None,
         })
@@ -2895,6 +2910,8 @@ pub struct SessionMetaLine {
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
     ResponseItem(ResponseItem),
+    /// Durable delivery metadata reconstructed as a model-visible `agent_message`.
+    InterAgentCommunication(InterAgentCommunication),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     EventMsg(EventMsg),

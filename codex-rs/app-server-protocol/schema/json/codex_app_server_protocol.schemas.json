@@ -6056,6 +6056,26 @@
         "oneOf": [
           {
             "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "input_text"
+                ],
+                "title": "InputTextAgentMessageInputContentType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "type"
+            ],
+            "title": "InputTextAgentMessageInputContent",
+            "type": "object"
+          },
+          {
+            "properties": {
               "encrypted_content": {
                 "type": "string"
               },
@@ -8518,6 +8538,13 @@
         ],
         "title": "ContextCompactedNotification",
         "type": "object"
+      },
+      "ConversationTextRole": {
+        "enum": [
+          "user",
+          "developer"
+        ],
+        "type": "string"
       },
       "CreditsSnapshot": {
         "properties": {
@@ -12545,6 +12572,12 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "shareUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "skills": {
             "items": {
