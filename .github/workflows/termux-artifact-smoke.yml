@@ -1,0 +1,98 @@
+name: termux-artifact-smoke
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: Name of the Actions artifact to download from artifact_run_id.
+        required: false
+        type: string
+        default: ""
+      artifact_run_id:
+        description: Workflow run id containing artifact_name. Defaults to the caller run id.
+        required: false
+        type: string
+        default: ""
+      pr_number:
+        description: Pull request number to approve and merge after a successful smoke test.
+        required: false
+        type: string
+        default: ""
+      approve_and_merge:
+        description: Approve and enable automerge for pr_number after a successful smoke test.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      UNEMPLOYABOT_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag containing codex-aarch64-linux-android.tar.gz.
+        required: false
+        type: string
+        default: ""
+      artifact_url:
+        description: GitHub Actions artifact URL from a rust-release run summary.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  smoke:
+    name: Smoke Codex in Termux
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download Codex Android artifact
+        id: artifact
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name || '' }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
+          ARTIFACT_URL: ${{ inputs.artifact_url || '' }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+        run: bash .github/scripts/termux-download-codex-artifact.sh
+
+      - name: Smoke test in Termux
+        run: bash .github/scripts/termux-smoke-codex-artifact.sh "${{ steps.artifact.outputs.archive_path }}"
+
+      - name: Approve and enable PR automerge
+        if: ${{ inputs.approve_and_merge && inputs.pr_number != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.UNEMPLOYABOT_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "UNEMPLOYABOT_TOKEN is required when approve_and_merge is true." >&2
+            exit 1
+          fi
+
+          gh pr review "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --approve \
+            --body "Termux smoke test passed on aarch64-linux-android."
+
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --squash \
+            --auto \
+            --delete-branch
