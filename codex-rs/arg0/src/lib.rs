@@ -11,6 +11,8 @@ use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use codex_utils_file_lock::TryFileLockOutcome;
 use codex_utils_file_lock::try_lock_exclusive_optional;
 use codex_utils_home_dir::find_codex_home;
+#[cfg(target_os = "windows")]
+use codex_windows_sandbox::CODEX_WINDOWS_SANDBOX_ARG1;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use tempfile::TempDir;
@@ -100,6 +102,10 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     let argv1 = args.next().unwrap_or_default();
     if argv1 == CODEX_FS_HELPER_ARG1 {
         codex_exec_server::run_fs_helper_main();
+    }
+    #[cfg(target_os = "windows")]
+    if argv1 == CODEX_WINDOWS_SANDBOX_ARG1 {
+        codex_windows_sandbox::run_windows_sandbox_wrapper_main();
     }
     if argv1 == CODEX_CORE_APPLY_PATCH_ARG1 {
         let patch_arg = args.next().and_then(|s| s.to_str().map(str::to_owned));
