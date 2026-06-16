@@ -151,6 +151,32 @@ def patch_android_v8_source(vendored_source: Path) -> None:
             "#include <stdio.h>\n",
             "#include <stdio.h>\n#include <stdlib.h>\n",
         )
+    stderr_block_guard = "#if !defined(NDEBUG) || !defined(LIBCXXABI_BAREMETAL)\n"
+    android_stderr_block_guard = (
+        "#if !defined(__ANDROID__) && "
+        "(!defined(NDEBUG) || !defined(LIBCXXABI_BAREMETAL))\n"
+    )
+    if stderr_block_guard in text:
+        text = text.replace(stderr_block_guard, android_stderr_block_guard, 1)
+    elif android_stderr_block_guard not in text:
+        raise SystemExit(
+            f"missing expected libc++abi stderr guard target in {abort_message}"
+        )
+
+    abort_call = "    abort();\n"
+    android_abort_call = (
+        "#if defined(__ANDROID__)\n"
+        "    __builtin_abort();\n"
+        "#else\n"
+        "    abort();\n"
+        "#endif\n"
+    )
+    if abort_call in text:
+        text = text.replace(abort_call, android_abort_call, 1)
+    elif android_abort_call not in text:
+        raise SystemExit(
+            f"missing expected libc++abi abort call target in {abort_message}"
+        )
     abort_message.write_text(text, encoding="utf-8")
 
     build_rs = vendored_source / "build.rs"
