@@ -183,10 +183,10 @@ def add_android_extra_gn_args(env: dict[str, str], args: list[str]) -> None:
         env["EXTRA_GN_ARGS"] = " ".join(extra_args)
 
 
-def android_ndk_version_gn_arg(vendored_source: Path, env: dict[str, str]) -> str:
+def android_ndk_version(vendored_source: Path, env: dict[str, str]) -> str:
     version = env.get("ANDROID_NDK_VERSION")
     if version:
-        return f'android_ndk_version="{version}"'
+        return version
 
     deps_path = vendored_source / "v8" / "DEPS"
     if not deps_path.exists():
@@ -196,7 +196,22 @@ def android_ndk_version_gn_arg(vendored_source: Path, env: dict[str, str]) -> st
     match = re.search(r"'android_ndk_version':\s*Str\('([^']+)'\)", text)
     if not match:
         raise SystemExit(f"missing android_ndk_version in {deps_path}")
-    return f'android_ndk_version="{match.group(1)}"'
+    return match.group(1)
+
+
+def patch_android_gclient_args(vendored_source: Path, env: dict[str, str]) -> None:
+    gclient_args_path = vendored_source / "build" / "config" / "gclient_args.gni"
+    if not gclient_args_path.exists():
+        raise SystemExit(f"missing gclient args file: {gclient_args_path}")
+
+    version = android_ndk_version(vendored_source, env)
+    existing = gclient_args_path.read_text(encoding="utf-8")
+    lines = [existing.rstrip()] if existing.strip() else []
+    if "android_ndk_version" not in existing:
+        lines.append(f'android_ndk_version = "{version}"')
+    if "checkout_src_internal" not in existing:
+        lines.append("checkout_src_internal = false")
+    gclient_args_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def vendor_android_v8_crate_source(
@@ -299,7 +314,7 @@ def stage_android_release_pair(
         env,
         rusty_v8_source_root,
     )
-    add_android_extra_gn_args(env, [android_ndk_version_gn_arg(vendored_source, env)])
+    patch_android_gclient_args(vendored_source, env)
     patch_android_v8_source(vendored_source)
     install_android_v8_host_sysroot(vendored_source, env)
     with manifest_path.open("a", encoding="utf-8") as manifest:
