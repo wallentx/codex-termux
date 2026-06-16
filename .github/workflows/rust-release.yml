@@ -990,7 +990,7 @@ jobs:
 
   termux-artifact-smoke:
     name: Termux artifact smoke
-    if: ${{ github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ always() && github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/') && needs.build.result == 'success' }}
     needs: build
     permissions:
       actions: read
