@@ -52,10 +52,7 @@ elif [[ -n "$artifact_url" ]]; then
     rm -f "$artifact_zip"
 else
     if [[ -z "$artifact_run_id" ]]; then
-        artifact_run_id="${GITHUB_RUN_ID:-}"
-    fi
-    if [[ -z "$artifact_run_id" ]]; then
-        echo "ARTIFACT_RUN_ID or GITHUB_RUN_ID is required when ARTIFACT_NAME is used." >&2
+        echo "ARTIFACT_RUN_ID is required when ARTIFACT_NAME is used." >&2
         exit 1
     fi
 

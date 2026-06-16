@@ -46,7 +46,9 @@ mkdir -p "$CODEX_HOME"
 
 "$codex" --version
 "$codex" --help | tee codex-help.txt
-grep -Eiq 'codex|usage' codex-help.txt
+grep -Eiq 'codex' codex-help.txt
+grep -Eiq 'usage' codex-help.txt
 "$codex" exec --help | tee codex-exec-help.txt
-grep -Eiq 'exec|usage' codex-exec-help.txt
+grep -Eiq 'exec' codex-exec-help.txt
+grep -Eiq 'usage' codex-exec-help.txt
 TERMUX_SCRIPT

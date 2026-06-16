@@ -9,7 +9,7 @@ on:
         type: string
         default: ""
       artifact_run_id:
-        description: Workflow run id containing artifact_name. Defaults to the caller run id.
+        description: Workflow run id containing artifact_name. Required when artifact_name is set.
         required: false
         type: string
         default: ""
@@ -51,8 +51,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       actions: read
-      contents: write
-      pull-requests: write
+      contents: read
+      pull-requests: read
     defaults:
       run:
         shell: bash
@@ -64,7 +64,7 @@ jobs:
         id: artifact
         env:
           ARTIFACT_NAME: ${{ inputs.artifact_name || '' }}
-          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || '' }}
           ARTIFACT_URL: ${{ inputs.artifact_url || '' }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag || '' }}
@@ -73,18 +73,40 @@ jobs:
       - name: Smoke test in Termux
         run: bash .github/scripts/termux-smoke-codex-artifact.sh "${{ steps.artifact.outputs.archive_path }}"
 
+  approve-and-merge:
+    name: Approve and enable PR automerge
+    needs: smoke
+    if: ${{ inputs.approve_and_merge && inputs.pr_number != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check unemployabot token
+        id: token
+        env:
+          GH_TOKEN: ${{ secrets.UNEMPLOYABOT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "UNEMPLOYABOT_TOKEN is unavailable; skipping automerge."
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Approve and enable PR automerge
-        if: ${{ inputs.approve_and_merge && inputs.pr_number != '' }}
+        if: ${{ steps.token.outputs.has_token == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.UNEMPLOYABOT_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
-
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "UNEMPLOYABOT_TOKEN is required when approve_and_merge is true." >&2
-            exit 1
-          fi
 
           gh pr review "$PR_NUMBER" \
             --repo "$GITHUB_REPOSITORY" \
