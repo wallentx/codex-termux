@@ -7,9 +7,16 @@ set -euo pipefail
 readonly -a TERMUX_RELEASE_WORKFLOW_PATHS=(
   .github/workflows/rust-release.yml
   .github/workflows/shell-tool-mcp.yml
+  .github/workflows/termux-artifact-smoke.yml
   .github/workflows/termux-release-checkpoint.yml
   .github/workflows/termux-release-deploy.yml
   .github/workflows/termux-release-promote.yml
+)
+
+readonly -a TERMUX_RELEASE_GITHUB_SCRIPT_PATHS=(
+  .github/scripts/run-termux-pacman.sh
+  .github/scripts/termux-download-codex-artifact.sh
+  .github/scripts/termux-smoke-codex-artifact.sh
 )
 
 readonly -a TERMUX_RELEASE_BRANCH_SCRIPT_PATHS=(
@@ -27,6 +34,7 @@ readonly -a TERMUX_RELEASE_BRANCH_SCRIPT_PATHS=(
 
 readonly -a TERMUX_RELEASE_AUTOMATION_PATHS=(
   "${TERMUX_RELEASE_WORKFLOW_PATHS[@]}"
+  "${TERMUX_RELEASE_GITHUB_SCRIPT_PATHS[@]}"
   "${TERMUX_RELEASE_BRANCH_SCRIPT_PATHS[@]}"
 )
 
