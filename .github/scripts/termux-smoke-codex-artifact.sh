@@ -8,6 +8,7 @@ if [[ ! -f "$archive" ]]; then
 fi
 
 export CODEX_SMOKE_ARCHIVE="$archive"
+export TERMUX_ENV_PASSTHROUGH="CODEX_SMOKE_ARCHIVE"
 
 bash .github/scripts/run-termux-pacman.sh ca-certificates libc++ tar zstd <<'TERMUX_SCRIPT'
 set -Eeuo pipefail

@@ -9,6 +9,7 @@ package_file="$(mktemp)"
 sync_file="$(mktemp)"
 task_script="$(mktemp)"
 output_dir="$(mktemp -d)"
+docker_env_args=()
 
 cleanup() {
     rm -f "${package_file:-}"
@@ -35,7 +36,20 @@ cat > "$task_script"
 chmod 0644 "$task_script"
 chmod 0777 "$output_dir"
 
+if [[ -n "${TERMUX_ENV_PASSTHROUGH:-}" ]]; then
+    read -ra passthrough_env <<< "$TERMUX_ENV_PASSTHROUGH"
+    for env_name in "${passthrough_env[@]}"; do
+        if [[ ! "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "Invalid environment variable name in TERMUX_ENV_PASSTHROUGH: $env_name" >&2
+            exit 1
+        fi
+
+        docker_env_args+=(--env "$env_name")
+    done
+fi
+
 docker run --rm -i \
+    "${docker_env_args[@]}" \
     -v "$workspace:/workspace-src:ro" \
     -v "$output_dir:/workspace-output" \
     -v "$package_file:/tmp/termux-packages:ro" \
