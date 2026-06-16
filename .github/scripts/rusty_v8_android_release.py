@@ -214,16 +214,16 @@ def patch_android_gclient_args(vendored_source: Path, env: dict[str, str]) -> No
     gclient_args_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def copy_android_icu_data(vendored_source: Path, rusty_v8_source_root: Path) -> None:
-    source_icu_android_dir = rusty_v8_source_root / "third_party" / "icu" / "android"
-    if not source_icu_android_dir.exists():
-        raise SystemExit(f"missing Android ICU data directory: {source_icu_android_dir}")
+def copy_chromium_icu(vendored_source: Path, rusty_v8_source_root: Path) -> None:
+    source_icu_dir = rusty_v8_source_root / "third_party" / "icu"
+    if not source_icu_dir.exists():
+        raise SystemExit(f"missing Chromium ICU directory: {source_icu_dir}")
 
-    dest_icu_android_dir = vendored_source / "third_party" / "icu" / "android"
-    if dest_icu_android_dir.exists():
-        shutil.rmtree(dest_icu_android_dir)
-    dest_icu_android_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source_icu_android_dir, dest_icu_android_dir)
+    dest_icu_dir = vendored_source / "third_party" / "icu"
+    if dest_icu_dir.exists():
+        shutil.rmtree(dest_icu_dir)
+    dest_icu_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_icu_dir, dest_icu_dir)
 
 
 def vendor_android_v8_crate_source(
@@ -247,7 +247,7 @@ def vendor_android_v8_crate_source(
             encoding="utf-8",
         )
     copy_chromium_rust_vendor(vendored_source, rusty_v8_source_root)
-    copy_android_icu_data(vendored_source, rusty_v8_source_root)
+    copy_chromium_icu(vendored_source, rusty_v8_source_root)
     return vendored_source
 
 
