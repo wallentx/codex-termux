@@ -170,17 +170,33 @@ def patch_android_v8_source(vendored_source: Path) -> None:
     build_rs.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
-def add_android_extra_gn_args(env: dict[str, str]) -> None:
+def add_android_extra_gn_args(env: dict[str, str], args: list[str]) -> None:
     existing = " ".join(
         value for value in (env.get("GN_ARGS", ""), env.get("EXTRA_GN_ARGS", "")) if value
     )
     extra_args = [env["EXTRA_GN_ARGS"]] if env.get("EXTRA_GN_ARGS") else []
-    for arg in ANDROID_EXTRA_GN_ARGS:
+    for arg in args:
         key = arg.split("=", 1)[0]
         if f"{key}=" not in existing:
             extra_args.append(arg)
     if extra_args:
         env["EXTRA_GN_ARGS"] = " ".join(extra_args)
+
+
+def android_ndk_version_gn_arg(vendored_source: Path, env: dict[str, str]) -> str:
+    version = env.get("ANDROID_NDK_VERSION")
+    if version:
+        return f'android_ndk_version="{version}"'
+
+    deps_path = vendored_source / "v8" / "DEPS"
+    if not deps_path.exists():
+        raise SystemExit(f"missing V8 DEPS file: {deps_path}")
+
+    text = deps_path.read_text(encoding="utf-8")
+    match = re.search(r"'android_ndk_version':\s*Str\('([^']+)'\)", text)
+    if not match:
+        raise SystemExit(f"missing android_ndk_version in {deps_path}")
+    return f'android_ndk_version="{match.group(1)}"'
 
 
 def vendor_android_v8_crate_source(
@@ -263,7 +279,7 @@ def stage_android_release_pair(
         "CARGO_TARGET_DIR": str(target_dir),
         "V8_FROM_SOURCE": "1",
     }
-    add_android_extra_gn_args(env)
+    add_android_extra_gn_args(env, ANDROID_EXTRA_GN_ARGS)
     subprocess.run(
         [
             "cargo",
@@ -283,6 +299,7 @@ def stage_android_release_pair(
         env,
         rusty_v8_source_root,
     )
+    add_android_extra_gn_args(env, [android_ndk_version_gn_arg(vendored_source, env)])
     patch_android_v8_source(vendored_source)
     install_android_v8_host_sysroot(vendored_source, env)
     with manifest_path.open("a", encoding="utf-8") as manifest:
