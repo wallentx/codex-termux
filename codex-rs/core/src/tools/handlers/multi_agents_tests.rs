@@ -5,7 +5,7 @@ use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
 use crate::session::tests::make_session_and_context;
-use crate::session_prefix::format_subagent_notification_message;
+use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
@@ -2043,14 +2043,18 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
-    let first_notification = format_subagent_notification_message(
-        worker_path.as_str(),
+    let first_notification = format_inter_agent_completion_message(
+        AgentPath::root(),
+        worker_path.clone(),
         &AgentStatus::Completed(Some("first done".to_string())),
-    );
-    let second_notification = format_subagent_notification_message(
-        worker_path.as_str(),
+    )
+    .expect("completed status should render");
+    let second_notification = format_inter_agent_completion_message(
+        AgentPath::root(),
+        worker_path.clone(),
         &AgentStatus::Completed(Some("second done".to_string())),
-    );
+    )
+    .expect("completed status should render");
 
     let notifications = timeout(Duration::from_secs(5), async {
         loop {
@@ -4463,17 +4467,19 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         text: "base".to_string(),
     };
     turn.developer_instructions = Some("dev".to_string());
-    turn.compact_prompt = Some("compact".to_string());
-    turn.shell_environment_policy = ShellEnvironmentPolicy {
+    let mut config = (*turn.config).clone();
+    config.compact_prompt = Some("compact".to_string());
+    config.permissions.shell_environment_policy = ShellEnvironmentPolicy {
         use_profile: true,
         ..ShellEnvironmentPolicy::default()
     };
+    config.codex_linux_sandbox_exe = Some(PathBuf::from("/bin/echo"));
+    turn.config = Arc::new(config);
     let temp_dir = tempfile::tempdir().expect("temp dir");
     #[allow(deprecated)]
     {
         turn.cwd = temp_dir.abs();
     }
-    turn.codex_linux_sandbox_exe = Some(PathBuf::from("/bin/echo"));
     #[allow(deprecated)]
     let turn_cwd = turn.cwd.clone();
     let sandbox_policy = pick_allowed_sandbox_policy(
@@ -4502,9 +4508,6 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     expected.model_reasoning_effort = turn.reasoning_effort.clone();
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = turn.developer_instructions.clone();
-    expected.compact_prompt = turn.compact_prompt.clone();
-    expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
-    expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
     #[allow(deprecated)]
     {
         expected.cwd = turn.cwd.clone();
@@ -4540,9 +4543,6 @@ async fn build_agent_resume_config_clears_base_instructions() {
     expected.model_reasoning_effort = turn.reasoning_effort.clone();
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = turn.developer_instructions.clone();
-    expected.compact_prompt = turn.compact_prompt.clone();
-    expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
-    expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
     #[allow(deprecated)]
     {
         expected.cwd = turn.cwd.clone();

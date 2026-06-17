@@ -1423,7 +1423,7 @@ async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
             continue;
         };
         if let RolloutItem::TurnContext(item) = rollout_line.item {
-            return Some(item.cwd);
+            return Some(item.cwd.into_path_buf());
         }
     }
     None
