@@ -8,6 +8,7 @@ packages=(termux-exec "$@")
 package_file="$(mktemp)"
 sync_file="$(mktemp)"
 task_script="$(mktemp)"
+env_file="$(mktemp)"
 output_dir="$(mktemp -d)"
 docker_env_args=()
 
@@ -15,6 +16,7 @@ cleanup() {
     rm -f "${package_file:-}"
     rm -f "${sync_file:-}"
     rm -f "${task_script:-}"
+    rm -f "${env_file:-}"
     rm -rf "${output_dir:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -36,6 +38,7 @@ cat > "$task_script"
 chmod 0644 "$task_script"
 chmod 0777 "$output_dir"
 
+: > "$env_file"
 if [[ -n "${TERMUX_ENV_PASSTHROUGH:-}" ]]; then
     read -ra passthrough_env <<< "$TERMUX_ENV_PASSTHROUGH"
     for env_name in "${passthrough_env[@]}"; do
@@ -45,8 +48,10 @@ if [[ -n "${TERMUX_ENV_PASSTHROUGH:-}" ]]; then
         fi
 
         docker_env_args+=(--env "$env_name")
+        printf 'export %s=%q\n' "$env_name" "${!env_name:-}" >> "$env_file"
     done
 fi
+chmod 0644 "$env_file"
 
 docker run --rm -i \
     "${docker_env_args[@]}" \
@@ -55,8 +60,12 @@ docker run --rm -i \
     -v "$package_file:/tmp/termux-packages:ro" \
     -v "$sync_file:/tmp/termux-sync-back:ro" \
     -v "$task_script:/tmp/termux-task.sh:ro" \
+    -v "$env_file:/tmp/termux-env.sh:ro" \
     "$image" \
     bash -lc '
+        if [ -f /tmp/termux-env.sh ]; then
+            source /tmp/termux-env.sh
+        fi
         set -Eeuo pipefail
         export TERMUX_VERSION="${TERMUX_VERSION:-docker}"
 
