@@ -19,8 +19,9 @@ jobs:
   test:
     # PRs use the sharded Windows cross-compiled test jobs below. Post-merge
     # pushes to main also run the native Windows test job for broader Windows
-    # signal without putting PR latency back on the critical path. Cargo CI
-    # owns V8/code-mode test coverage for now.
+    # signal without putting PR latency back on the critical path. When
+    # Code-mode unit tests run on every Bazel target. When authenticated RBE
+    # is available, the Windows-cross shards exercise the source-built V8 path.
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -85,10 +86,6 @@ jobs:
             # path. V8 consumers under `//codex-rs/...` still participate
             # transitively through `//...`.
             -//third_party/v8:all
-            # V8-backed code-mode tests are covered by Cargo CI. Bazel CI
-            # cross-compiles in several legs, and those tests are not stable in
-            # that setup yet.
-            -//codex-rs/code-mode:code-mode-unit-tests
             -//codex-rs/v8-poc:v8-poc-unit-tests
           )
 
@@ -274,10 +271,6 @@ jobs:
             # path. V8 consumers under `//codex-rs/...` still participate
             # transitively through `//...`.
             -//third_party/v8:all
-            # Keep this aligned with the main Bazel job. The native Windows
-            # job preserves broad post-merge coverage, but code-mode/V8 tests
-            # are covered by Cargo CI rather than Bazel for now.
-            -//codex-rs/code-mode:code-mode-unit-tests
             -//codex-rs/v8-poc:v8-poc-unit-tests
           )
 
