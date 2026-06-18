@@ -24,7 +24,7 @@ on:
         type: boolean
         default: false
     secrets:
-      UNEMPLOYABOT_TOKEN:
+      APP_PRIVATE_KEY:
         required: false
   workflow_dispatch:
     inputs:
@@ -86,24 +86,16 @@ jobs:
         shell: bash
 
     steps:
-      - name: Check unemployabot token
-        id: token
-        env:
-          GH_TOKEN: ${{ secrets.UNEMPLOYABOT_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "UNEMPLOYABOT_TOKEN is unavailable; skipping automerge."
-            echo "has_token=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_token=true" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Approve and enable PR automerge
-        if: ${{ steps.token.outputs.has_token == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.UNEMPLOYABOT_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
