@@ -95,6 +95,25 @@ JSON
   "pr create")
     printf 'https://github.com/wallentx/codex-termux/pull/1\n'
     ;;
+  "pr view")
+    cat <<'JSON'
+{"headRefOid":"test-head-sha","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","state":"OPEN","url":"https://github.com/wallentx/codex-termux/pull/1"}
+JSON
+    ;;
+  "pr merge")
+    expected=(
+      "pr" "merge" "${3:-}"
+      "--repo" "wallentx/codex-termux"
+      "--squash"
+      "--auto"
+      "--delete-branch"
+      "--match-head-commit" "test-head-sha"
+    )
+    if [[ "$*" != "${expected[*]}" ]]; then
+      echo "unexpected gh pr merge invocation: $*" >&2
+      exit 1
+    fi
+    ;;
   "pr edit"|"label create")
     ;;
   "release view")

@@ -994,15 +994,12 @@ jobs:
     needs: build
     permissions:
       actions: read
-      contents: write
-      pull-requests: write
+      contents: read
+      pull-requests: read
     uses: ./.github/workflows/termux-artifact-smoke.yml
     with:
       artifact_name: ${{ format('termux-android-pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}
       artifact_run_id: ${{ github.run_id }}
-      pr_number: ${{ github.event.pull_request.number }}
-      approve_and_merge: true
-    secrets: inherit
 
   shell-tool-mcp:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository_owner == 'openai'

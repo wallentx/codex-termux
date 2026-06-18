@@ -13,19 +13,6 @@ on:
         required: false
         type: string
         default: ""
-      pr_number:
-        description: Pull request number to approve and merge after a successful smoke test.
-        required: false
-        type: string
-        default: ""
-      approve_and_merge:
-        description: Approve and enable automerge for pr_number after a successful smoke test.
-        required: false
-        type: boolean
-        default: false
-    secrets:
-      APP_PRIVATE_KEY:
-        required: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -72,41 +59,3 @@ jobs:
 
       - name: Smoke test in Termux
         run: bash .github/scripts/termux-smoke-codex-artifact.sh "${{ steps.artifact.outputs.archive_path }}"
-
-  approve-and-merge:
-    name: Approve and enable PR automerge
-    needs: smoke
-    if: ${{ inputs.approve_and_merge && inputs.pr_number != '' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v3
-        with:
-          client-id: ${{ vars.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-      - name: Approve and enable PR automerge
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-        run: |
-          set -euo pipefail
-
-          gh pr review "$PR_NUMBER" \
-            --repo "$GITHUB_REPOSITORY" \
-            --approve \
-            --body "Termux smoke test passed on aarch64-linux-android."
-
-          gh pr merge "$PR_NUMBER" \
-            --repo "$GITHUB_REPOSITORY" \
-            --squash \
-            --auto \
-            --delete-branch

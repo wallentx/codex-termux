@@ -158,6 +158,49 @@ append_pr_summary() {
   } >> "${GITHUB_STEP_SUMMARY}"
 }
 
+enable_release_pr_automerge() {
+  local pr_url="$1"
+  local pr_info
+
+  if ! pr_info="$(
+    gh pr view "${pr_url}" \
+      --repo "${GITHUB_REPOSITORY}" \
+      --json headRefOid,mergeStateStatus,mergeable,state,url
+  )"; then
+    echo "::warning::Could not inspect ${pr_url}; leaving release PR auto-merge disabled."
+    return 0
+  fi
+
+  local pr_state
+  pr_state="$(jq -r '.state' <<< "${pr_info}")"
+  if [[ "${pr_state}" != "OPEN" ]]; then
+    echo "Skipping release PR auto-merge for ${pr_url}; PR is ${pr_state}."
+    return 0
+  fi
+
+  local mergeable
+  local merge_state
+  mergeable="$(jq -r '.mergeable // ""' <<< "${pr_info}")"
+  merge_state="$(jq -r '.mergeStateStatus // ""' <<< "${pr_info}")"
+  if [[ "${mergeable}" == "CONFLICTING" || "${merge_state}" == "DIRTY" ]]; then
+    echo "Skipping release PR auto-merge for ${pr_url}; GitHub reports merge conflicts."
+    return 0
+  fi
+
+  local pr_head_sha
+  pr_head_sha="$(jq -r '.headRefOid' <<< "${pr_info}")"
+
+  echo "Enabling auto-merge for release PR ${pr_url}."
+  if ! gh pr merge "${pr_url}" \
+    --repo "${GITHUB_REPOSITORY}" \
+    --squash \
+    --auto \
+    --delete-branch \
+    --match-head-commit "${pr_head_sha}"; then
+    echo "::warning::Could not enable auto-merge for ${pr_url}; leaving it for manual merge."
+  fi
+}
+
 release_branch_open_pr_blockers() {
   local release_branch="$1"
   local release_slug="${release_branch//\//_}"
@@ -353,7 +396,7 @@ body_path="${RUNNER_TEMP}/termux-release-pr.md"
   echo
   echo "This PR is intentionally created from \`${PATCH_BRANCH}\` with the Termux release automation files copied from \`dev\`, then targeted at the upstream release branch. If GitHub reports conflicts, resolve them manually by keeping the upstream release code while preserving the Termux compatibility fixes."
   echo
-  echo "Merging this PR is the manual approval gate. The release build workflow uploads the Android artifact to test; after merge, the deployment workflow attaches that exact artifact to \`${TERMUX_TAG}\` and opens the checkpoint PR."
+  echo "Auto-merge is enabled when GitHub reports the PR as mergeable. Required CI, including the Termux artifact smoke test, is the approval gate. After merge, the deployment workflow attaches the tested artifact to \`${TERMUX_TAG}\` and opens the checkpoint PR."
   echo
   echo "## Upstream notes"
   echo
@@ -382,5 +425,6 @@ gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-reviewer "${REVIEWER}
 gh label create termux-release --repo "${GITHUB_REPOSITORY}" --color 0e8a16 --description "Termux release automation" --force
 gh label create release-train --repo "${GITHUB_REPOSITORY}" --color 1d76db --description "Release train PR" --force
 gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-label "termux-release" --add-label "release-train"
+enable_release_pr_automerge "${pr_url}"
 echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
 append_pr_summary "${pr_action} release train PR" "${pr_url}"
