@@ -60,8 +60,20 @@ seed_release_branch_workflows() {
   done
 }
 
+apply_seeded_release_code_patches() {
+  local patch_path="${seed_dir}/scripts/termux-release-self-update.patch"
+
+  if git apply --reverse --check "${patch_path}" >/dev/null 2>&1; then
+    echo "Termux release code patch is already applied."
+    return 0
+  fi
+
+  git apply --3way "${patch_path}"
+}
+
 git_add_seeded_release_paths() {
   git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
+  git add -- "${TERMUX_RELEASE_CODE_PATHS[@]}"
 }
 
 workspace_version_from_ref() {
@@ -317,6 +329,7 @@ fi
 if [[ "${release_branch_exists}" == false ]]; then
   git checkout -B "${RELEASE_BRANCH}" "refs/tags/${UPSTREAM_TAG}"
   seed_release_branch_workflows
+  apply_seeded_release_code_patches
   git_add_seeded_release_paths
   if ! git diff --cached --quiet; then
     git commit -m "Seed Termux release automation"
@@ -341,6 +354,7 @@ else
   git checkout -B "${WORK_BRANCH}" "origin/${PATCH_BRANCH}"
 fi
 seed_release_branch_workflows
+apply_seeded_release_code_patches
 normalize_workspace_version_to_upstream_tag
 
 mkdir -p .github

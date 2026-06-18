@@ -26,10 +26,21 @@ readonly -a TERMUX_RELEASE_BRANCH_SCRIPT_PATHS=(
   scripts/termux-download-release-artifact.sh
   scripts/termux-find-release-pr.sh
   scripts/termux-read-release-metadata.sh
+  scripts/termux-release-self-update.patch
   scripts/termux-release-asset-state.sh
   scripts/termux-release-paths.sh
   scripts/termux-resolve-release-ref.sh
   scripts/termux-validate-gh-env.sh
+)
+
+readonly -a TERMUX_RELEASE_CODE_PATHS=(
+  codex-rs/cli/src/main.rs
+  codex-rs/tui/src/lib.rs
+  codex-rs/tui/src/termux_update.rs
+  codex-rs/tui/src/update_action.rs
+  codex-rs/tui/src/update_prompt.rs
+  codex-rs/tui/src/update_versions.rs
+  codex-rs/tui/src/updates.rs
 )
 
 readonly -a TERMUX_RELEASE_AUTOMATION_PATHS=(
@@ -40,6 +51,7 @@ readonly -a TERMUX_RELEASE_AUTOMATION_PATHS=(
 
 readonly -a TERMUX_CHECKPOINT_RELEASE_ONLY_PATHS=(
   "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
+  "${TERMUX_RELEASE_CODE_PATHS[@]}"
   .github/termux-release.json
 )
 
