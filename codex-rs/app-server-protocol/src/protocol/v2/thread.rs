@@ -615,30 +615,6 @@ fn instruction_source_path_uris(sources: &[LegacyAppPathString]) -> Vec<PathUri>
         .collect()
 }
 
-impl ThreadForkResponse {
-    /// Parses valid absolute instruction source paths and omits malformed legacy values.
-    pub fn instruction_source_path_uris(&self) -> Vec<PathUri> {
-        instruction_source_path_uris(&self.instruction_sources)
-    }
-}
-
-fn instruction_source_path_uris(sources: &[LegacyAppPathString]) -> Vec<PathUri> {
-    // Instruction sources are advisory diagnostics. Warn and fail open so a malformed legacy
-    // path cannot fail thread start, resume, or fork.
-    sources
-        .iter()
-        .filter_map(|source| {
-            source.to_inferred_path_uri().or_else(|| {
-                tracing::warn!(
-                    path = source.as_str(),
-                    "ignoring invalid instruction source path from app-server"
-                );
-                None
-            })
-        })
-        .collect()
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
