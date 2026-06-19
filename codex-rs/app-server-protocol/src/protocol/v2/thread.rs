@@ -199,13 +199,6 @@ impl ThreadStartResponse {
     }
 }
 
-impl ThreadStartResponse {
-    /// Parses valid absolute instruction source paths and omits malformed legacy values.
-    pub fn instruction_source_path_uris(&self) -> Vec<PathUri> {
-        instruction_source_path_uris(&self.instruction_sources)
-    }
-}
-
 #[derive(
     Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
 )]
