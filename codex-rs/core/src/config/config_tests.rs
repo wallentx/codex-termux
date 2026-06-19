@@ -14,7 +14,6 @@ use codex_config::config_toml::AutoReviewToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::ExperimentalRequestUserInput;
 use codex_config::config_toml::ProjectConfig;
-use codex_config::config_toml::RealtimeArchitecture;
 use codex_config::config_toml::RealtimeConfig;
 use codex_config::config_toml::RealtimeToml;
 use codex_config::config_toml::RealtimeTransport;
@@ -10056,9 +10055,8 @@ max_concurrent_threads_per_session = 17
 
     let config = resolve_multi_agent_v2_config(&config_toml);
     let concurrency_guidance = "There are 17 available concurrency slots, meaning that up to 17 agents can be active at once, including you.";
-    let expected_suffix = format!(
-        "{DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT}\n{concurrency_guidance}\n\n{DEFAULT_MULTI_AGENT_V2_NO_SPAWN_HINT_TEXT}"
-    );
+    let expected_suffix =
+        format!("{DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT}\n{concurrency_guidance}");
     assert!(
         [
             config.root_agent_usage_hint_text,
@@ -10896,7 +10894,6 @@ async fn realtime_loads_from_config_toml() -> std::io::Result<()> {
     let cfg: ConfigToml = toml::from_str(
         r#"
 [realtime]
-architecture = "avas"
 version = "v2"
 type = "transcription"
 transport = "webrtc"
@@ -10908,7 +10905,6 @@ voice = "cedar"
     assert_eq!(
         cfg.realtime,
         Some(RealtimeToml {
-            architecture: Some(RealtimeArchitecture::Avas),
             version: Some(RealtimeWsVersion::V2),
             session_type: Some(RealtimeWsMode::Transcription),
             transport: Some(RealtimeTransport::WebRtc),
@@ -10927,7 +10923,6 @@ voice = "cedar"
     assert_eq!(
         config.realtime,
         RealtimeConfig {
-            architecture: RealtimeArchitecture::Avas,
             version: RealtimeWsVersion::V2,
             session_type: RealtimeWsMode::Transcription,
             transport: RealtimeTransport::WebRtc,
