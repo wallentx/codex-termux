@@ -5187,6 +5187,14 @@ fn web_search_mode_disabled_overrides_legacy_request() {
 }
 
 #[test]
+fn web_search_mode_for_turn_preserves_indexed_for_disabled_permissions() {
+    let web_search_mode = Constrained::allow_any(WebSearchMode::Indexed);
+    let mode = resolve_web_search_mode_for_turn(&web_search_mode, &PermissionProfile::Disabled);
+
+    assert_eq!(mode, WebSearchMode::Indexed);
+}
+
+#[test]
 fn web_search_mode_for_turn_uses_preference_for_read_only() {
     let web_search_mode = Constrained::allow_any(WebSearchMode::Cached);
     let permission_profile = PermissionProfile::read_only();
@@ -5214,6 +5222,31 @@ fn web_search_mode_for_turn_respects_disabled_for_disabled_permissions() {
 #[test]
 fn web_search_mode_for_turn_falls_back_when_live_is_disallowed() -> anyhow::Result<()> {
     let allowed = [WebSearchMode::Disabled, WebSearchMode::Cached];
+    let web_search_mode = Constrained::new(WebSearchMode::Cached, move |candidate| {
+        if allowed.contains(candidate) {
+            Ok(())
+        } else {
+            Err(ConstraintError::InvalidValue {
+                field_name: "web_search_mode",
+                candidate: format!("{candidate:?}"),
+                allowed: format!("{allowed:?}"),
+                requirement_source: RequirementSource::Unknown,
+            })
+        }
+    })?;
+    let mode = resolve_web_search_mode_for_turn(&web_search_mode, &PermissionProfile::Disabled);
+
+    assert_eq!(mode, WebSearchMode::Cached);
+    Ok(())
+}
+
+#[test]
+fn web_search_mode_for_turn_does_not_implicitly_select_indexed() -> anyhow::Result<()> {
+    let allowed = [
+        WebSearchMode::Disabled,
+        WebSearchMode::Cached,
+        WebSearchMode::Indexed,
+    ];
     let web_search_mode = Constrained::new(WebSearchMode::Cached, move |candidate| {
         if allowed.contains(candidate) {
             Ok(())
@@ -9075,6 +9108,39 @@ apps_mcp_product_sku = "tpp"
     .await?;
 
     assert_eq!(config.apps_mcp_product_sku.as_deref(), Some("tpp"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_loads_orchestrator_settings_from_toml() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+model = "gpt-5.4"
+
+[orchestrator.skills]
+enabled = false
+
+[orchestrator.mcp]
+enabled = false
+"#,
+    )
+    .expect("TOML deserialization should succeed for orchestrator settings");
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        (
+            config.orchestrator_skills_enabled,
+            config.orchestrator_mcp_enabled
+        ),
+        (false, false)
+    );
     Ok(())
 }
 
