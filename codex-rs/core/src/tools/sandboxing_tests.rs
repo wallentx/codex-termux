@@ -4,6 +4,7 @@ use crate::tools::hook_names::HookToolName;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxManager;
