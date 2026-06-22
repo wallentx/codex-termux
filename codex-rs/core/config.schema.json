@@ -440,6 +440,9 @@
             "auth_elicitation": {
               "type": "boolean"
             },
+            "auto_compaction": {
+              "type": "boolean"
+            },
             "browser_use": {
               "type": "boolean"
             },
@@ -1722,6 +1725,7 @@
           "type": "string"
         },
         "usage_hint_enabled": {
+          "description": "Deprecated compatibility field. Its value is ignored.",
           "type": "boolean"
         },
         "usage_hint_text": {
@@ -4732,6 +4736,9 @@
           ]
         },
         "auth_elicitation": {
+          "type": "boolean"
+        },
+        "auto_compaction": {
           "type": "boolean"
         },
         "browser_use": {
