@@ -4,7 +4,6 @@ use crate::tools::hook_names::HookToolName;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxManager;
@@ -259,7 +258,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         Some(codex_exec_server::FileSystemSandboxContext {
             permissions: exec_server_permissions.into(),
             cwd: Some(cwd_uri),
-            workspace_roots: vec![PathUri::from_abs_path(&cwd)],
+            workspace_roots: Vec::new(),
             windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
             windows_sandbox_private_desktop: false,
             use_legacy_landlock: false,
