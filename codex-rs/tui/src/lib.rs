@@ -201,6 +201,7 @@ mod width;
 #[cfg(any(target_os = "windows", test))]
 mod windows_sandbox;
 mod workspace_command;
+mod workspace_messages;
 
 mod wrapping;
 
@@ -400,6 +401,7 @@ async fn connect_remote_app_server(
         client_name: "codex-tui".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     })
@@ -563,6 +565,7 @@ where
         client_name: "codex-tui".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     })
@@ -1162,7 +1165,6 @@ pub async fn run_main(
             forced_login_method: config.forced_login_method,
             forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
             chatgpt_base_url: Some(config.chatgpt_base_url.clone()),
-            agent_identity_authapi_base_url: None,
         })
         .await
         {
@@ -2041,6 +2043,7 @@ mod tests {
         std::fs::create_dir_all(parent)?;
 
         let session_meta = codex_protocol::protocol::SessionMeta {
+            session_id: thread_id.into(),
             id: thread_id,
             timestamp: meta_rfc3339.to_string(),
             cwd: cwd.to_path_buf(),
