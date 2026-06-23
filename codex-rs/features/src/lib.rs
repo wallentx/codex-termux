@@ -193,7 +193,7 @@ pub enum Feature {
     ImageGeneration,
     /// Replace hosted image generation with the standalone image-generation extension.
     ImageGenExt,
-    /// Resize all inline data-URL images before recording them in history.
+    /// Removed compatibility flag for always-on centralized image preparation.
     ResizeAllImages,
     /// Generate Responses API item IDs for client-created history items.
     ItemIds,
@@ -472,7 +472,7 @@ impl Features {
                 "tool_search" | "apps_mcp_path_override" => {
                     continue;
                 }
-                "image_detail_original" => {
+                "image_detail_original" | "resize_all_images" => {
                     continue;
                 }
                 "plugin_hooks" => {
@@ -1160,6 +1160,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ResizeAllImages,
         key: "resize_all_images",
+        stage: Stage::Removed,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ItemIds,
+        key: "item_ids",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
