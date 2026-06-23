@@ -238,6 +238,10 @@ async fn non_openai_responses_requests_omit_item_passthrough_metadata() {
             item.get("id").is_none(),
             "input item should omit generated IDs: {item}"
         );
+        assert!(
+            item.get("id").is_none(),
+            "input item should omit generated IDs: {item}"
+        );
     }
 }
 
