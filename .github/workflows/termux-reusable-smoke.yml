@@ -1,0 +1,46 @@
+name: termux-reusable-smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  smoke:
+    name: Termux Reusable Smoke
+    uses: wallentx/gh-actions/.github/workflows/termux-run.yml@wallentx/termux-reusable
+    with:
+      packages: |
+        jq
+      copy-paths: |
+        .github/workflows/termux-artifact-smoke.yml
+        scripts/termux-release-paths.sh
+      env: |
+        TERMUX_REUSABLE_SMOKE=codex-termux
+        CALLER_REPOSITORY=${{ github.repository }}
+        CALLER_REF=${{ github.ref_name }}
+      commands: |
+        set -Eeuo pipefail
+
+        test "$TERMUX_REUSABLE_SMOKE" = "codex-termux"
+        test "$CALLER_REPOSITORY" = "wallentx/codex-termux"
+        command -v bash
+        command -v pacman
+        command -v jq
+        pacman -Q jq
+        test -f .github/workflows/termux-artifact-smoke.yml
+        test -f scripts/termux-release-paths.sh
+
+        mkdir -p termux-reusable-output
+        {
+          printf 'termux reusable smoke ok\n'
+          printf 'repository=%s\n' "$CALLER_REPOSITORY"
+          printf 'ref=%s\n' "$CALLER_REF"
+          printf 'arch=%s\n' "$(uname -m)"
+          jq --version
+        } > termux-reusable-output/result.txt
+      sync-back-paths: |
+        termux-reusable-output/result.txt
+      upload-artifact-name: termux-reusable-smoke-${{ github.run_id }}
