@@ -125,7 +125,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.142.0"
+version = "0.143.0-alpha.9"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -369,7 +369,7 @@ rcgen = { version = "0.14.7", default-features = false, features = [
 regex = "1.12.3"
 regex-lite = "0.1.8"
 reqwest = { version = "0.12", features = ["cookies"] }
-rmcp = { version = "1.7.0", default-features = false }
+rmcp = { version = "1.8.0", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
 rustls = { version = "0.23", default-features = false, features = [
     "aws_lc_rs",
@@ -381,7 +381,7 @@ schemars = "0.8.22"
 seccompiler = "0.5.0"
 semver = "1.0"
 sentry = "0.46.0"
-serde = "1"
+serde = { version = "1", features = ["rc"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
 serde_path_to_error = "0.1.20"
@@ -410,6 +410,7 @@ strum_macros = "0.28.0"
 supports-color = "3.0.2"
 syntect = "5"
 sys-locale = "0.3.2"
+system-configuration = "0.7"
 tar = { version = "=0.4.45", default-features = false }
 tempfile = "3.23.0"
 test-log = "0.2.19"
