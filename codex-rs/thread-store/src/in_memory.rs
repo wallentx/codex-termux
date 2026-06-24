@@ -10,6 +10,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadMemoryMode;
@@ -117,9 +118,11 @@ mod tests {
                     parent_thread_id,
                     source: SessionSource::Exec,
                     thread_source: None,
+                    originator: "test_originator".to_string(),
                     base_instructions: BaseInstructions::default(),
                     dynamic_tools: Vec::new(),
                     multi_agent_version: None,
+                    initial_window_id: uuid::Uuid::now_v7().to_string(),
                     metadata: ThreadPersistenceMetadata {
                         cwd: None,
                         model_provider: "test-provider".to_string(),
@@ -240,6 +243,7 @@ impl InMemoryThreadStore {
             agent_nickname: params.source.get_nickname(),
             agent_role: params.source.get_agent_role(),
             agent_path: params.source.get_agent_path().map(Into::into),
+            originator: params.originator.clone(),
             source: params.source.clone(),
             thread_source: params.thread_source.clone(),
             model_provider: Some(params.metadata.model_provider.clone()),
@@ -248,6 +252,7 @@ impl InMemoryThreadStore {
             memory_mode: matches!(params.metadata.memory_mode, ThreadMemoryMode::Disabled)
                 .then_some("disabled".to_string()),
             multi_agent_version: params.multi_agent_version,
+            context_window: Some(SessionContextWindow::new(params.initial_window_id.clone())),
             ..SessionMeta::default()
         };
         state
