@@ -14,9 +14,7 @@ readonly -a TERMUX_RELEASE_WORKFLOW_PATHS=(
 )
 
 readonly -a TERMUX_RELEASE_GITHUB_SCRIPT_PATHS=(
-  .github/scripts/run-termux-pacman.sh
   .github/scripts/termux-download-codex-artifact.sh
-  .github/scripts/termux-smoke-codex-artifact.sh
 )
 
 readonly -a TERMUX_RELEASE_BRANCH_SCRIPT_PATHS=(
