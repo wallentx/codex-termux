@@ -402,6 +402,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-config",
  "codex-core",
+ "codex-exec-server",
  "codex-features",
  "codex-login",
  "codex-models-manager",
@@ -2883,12 +2884,12 @@ dependencies = [
  "bytes",
  "clatter",
  "codex-api",
- "codex-app-server-protocol",
  "codex-client",
+ "codex-exec-server-protocol",
  "codex-file-system",
+ "codex-network-proxy",
  "codex-protocol",
  "codex-sandboxing",
- "codex-shell-command",
  "codex-test-binary-support",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
@@ -2915,6 +2916,21 @@ dependencies = [
  "uuid",
  "windows-sys 0.52.0",
  "wiremock",
+]
+
+[[package]]
+name = "codex-exec-server-protocol"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "codex-file-system",
+ "codex-network-proxy",
+ "codex-protocol",
+ "codex-shell-command",
+ "codex-utils-path-uri",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3161,8 +3177,10 @@ dependencies = [
 name = "codex-image-generation-extension"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "codex-api",
  "codex-core",
+ "codex-exec-server",
  "codex-extension-api",
  "codex-login",
  "codex-model-provider",
@@ -3178,6 +3196,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3605,6 +3624,7 @@ dependencies = [
  "codex-config",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-path-uri",
  "codex-utils-plugins",
  "pretty_assertions",
  "thiserror 2.0.18",
@@ -3760,7 +3780,6 @@ dependencies = [
  "chrono",
  "codex-file-search",
  "codex-git-utils",
- "codex-login",
  "codex-otel",
  "codex-protocol",
  "codex-state",

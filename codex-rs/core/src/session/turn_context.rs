@@ -113,6 +113,7 @@ pub struct TurnContext {
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
     pub(crate) session_source: SessionSource,
     pub(crate) parent_thread_id: Option<ThreadId>,
+    pub(crate) originator: String,
     pub(crate) environments: TurnEnvironmentSnapshot,
     /// The session's absolute working directory. All relative paths provided
     /// by the model as well as sandbox policies are resolved against this path
@@ -207,10 +208,6 @@ impl TurnContext {
             && self.config.orchestrator_mcp_enabled
     }
 
-    pub(crate) fn tool_environment_mode(&self) -> ToolEnvironmentMode {
-        ToolEnvironmentMode::from_count(self.environments.turn_environments.len())
-    }
-
     pub(crate) async fn with_model(
         &self,
         model: String,
@@ -269,6 +266,7 @@ impl TurnContext {
             reasoning_summary: self.reasoning_summary,
             session_source: self.session_source.clone(),
             parent_thread_id: self.parent_thread_id,
+            originator: self.originator.clone(),
             environments: self.environments.clone(),
             #[allow(deprecated)]
             cwd: self.cwd.clone(),
@@ -301,13 +299,6 @@ impl TurnContext {
                 self.model_verification_emitted.load(Ordering::Relaxed),
             ),
         }
-    }
-
-    #[deprecated(note = "resolve paths from the selected turn environment cwd instead")]
-    pub(crate) fn resolve_path(&self, path: Option<String>) -> AbsolutePathBuf {
-        #[allow(deprecated)]
-        path.as_ref()
-            .map_or_else(|| self.cwd.clone(), |path| self.cwd.join(path))
     }
 
     pub(crate) fn file_system_sandbox_context(
@@ -559,6 +550,7 @@ impl Session {
             reasoning_summary,
             session_source,
             parent_thread_id: session_configuration.parent_thread_id,
+            originator: session_configuration.originator.clone(),
             environments,
             #[allow(deprecated)]
             cwd,

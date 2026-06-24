@@ -40,6 +40,7 @@ use crate::exec_policy::ExecPolicyManager;
 use crate::image_preparation::prepare_response_items;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::skills::SkillRenderSideEffects;
@@ -72,7 +73,6 @@ use codex_hooks::HooksConfig;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
-use codex_login::default_client::originator;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpRuntimeContext;
@@ -210,6 +210,7 @@ use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
 mod config_lock;
+pub(crate) mod context_window;
 mod handlers;
 mod inject;
 mod input_queue;
@@ -388,7 +389,6 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
-use codex_tools::ToolEnvironmentMode;
 use codex_tools::UnifiedExecShellMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(test)]
@@ -432,6 +432,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) originator: String,
     pub(crate) agent_control: AgentControl,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     pub(crate) metrics_service_name: Option<String>,
@@ -521,6 +522,7 @@ impl Codex {
             forked_from_thread_id,
             parent_thread_id,
             thread_source,
+            originator,
             agent_control,
             dynamic_tools,
             metrics_service_name,
@@ -653,6 +655,7 @@ impl Codex {
             forked_from_thread_id,
             parent_thread_id,
             thread_source,
+            originator,
             dynamic_tools,
             user_shell_override,
         };
@@ -724,7 +727,7 @@ impl Codex {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
-        let id = Uuid::now_v7().to_string();
+        let id = new_submission_id();
         let sub = Submission {
             id: id.clone(),
             op,
@@ -742,7 +745,7 @@ impl Codex {
         client_user_message_id: Option<String>,
     ) -> CodexResult<String> {
         debug_assert!(matches!(op, Op::UserInput { .. }));
-        let id = Uuid::now_v7().to_string();
+        let id = new_submission_id();
         let sub = Submission {
             id: id.clone(),
             op,
@@ -867,6 +870,15 @@ impl Codex {
     pub(crate) fn enabled(&self, feature: Feature) -> bool {
         self.session.enabled(feature)
     }
+}
+
+/// Generate a core submission ID. App-server exposes submission IDs that
+/// create turns as a public-facing turn ID.
+///
+/// Some use cases take advantage of the fact that these are UUID7 which
+/// encodes a timestamp, so think carefully before changing this.
+fn new_submission_id() -> String {
+    Uuid::now_v7().to_string()
 }
 
 fn get_service_tier(
@@ -2237,8 +2249,7 @@ impl Session {
                     strict_auto_review: false,
                 });
             }
-            AskForApproval::OnFailure
-            | AskForApproval::OnRequest
+            AskForApproval::OnRequest
             | AskForApproval::UnlessTrusted
             | AskForApproval::Granular(_) => {}
         }
@@ -2729,9 +2740,8 @@ impl Session {
                 ResponseItem::WebSearchCall { .. } => "ws",
                 ResponseItem::ImageGenerationCall { .. } => "ig",
                 ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => "cmp",
-                ResponseItem::AgentMessage { .. }
-                | ResponseItem::CompactionTrigger { .. }
-                | ResponseItem::Other => continue,
+                ResponseItem::AgentMessage { .. } => "amsg",
+                ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => continue,
             };
             item.set_id(Some(format!("{prefix}_{}", Uuid::now_v7())));
         }
@@ -2766,10 +2776,11 @@ impl Session {
 
     pub(crate) async fn record_step_environment_context_if_changed(
         &self,
-        turn_context: &TurnContext,
         previous_world_state: &Arc<WorldState>,
         step_context: &step_context::StepContext,
     ) -> Arc<WorldState> {
+        let turn_context = step_context.turn.as_ref();
+        // Render model-visible state from the same step used to build and run tools.
         let world_state = Arc::new(
             self.build_world_state_for_environments(turn_context, &step_context.environments)
                 .await,
@@ -2790,6 +2801,23 @@ impl Session {
         world_state
     }
 
+    pub(crate) async fn capture_step_context(
+        &self,
+        turn_context: Arc<TurnContext>,
+    ) -> Arc<StepContext> {
+        // Keep the old turn-frozen view unless deferred executors are explicitly enabled.
+        let environments = if turn_context
+            .config
+            .features
+            .enabled(Feature::DeferredExecutor)
+        {
+            self.services.turn_environments.snapshot().await
+        } else {
+            turn_context.environments.clone()
+        };
+        Arc::new(StepContext::new(turn_context, environments))
+    }
+
     pub(crate) async fn record_inter_agent_communication(
         &self,
         turn_context: &TurnContext,
@@ -2802,6 +2830,7 @@ impl Session {
             std::slice::from_ref(&response_item),
         );
         let items = items.as_ref();
+        communication.id = items.first().and_then(ResponseItem::id).map(str::to_string);
         {
             let mut state = self.state.lock().await;
             state.record_items(
@@ -3398,44 +3427,42 @@ impl Session {
         state.request_new_context_window();
     }
 
-    pub(crate) async fn maybe_start_new_context_window(
+    pub(crate) async fn take_new_context_window_request(&self) -> bool {
+        let mut state = self.state.lock().await;
+        state.take_new_context_window_request()
+    }
+
+    pub(crate) async fn start_new_context_window(
         &self,
         turn_context: &TurnContext,
         world_state: Arc<WorldState>,
-    ) -> Option<u64> {
+    ) -> u64 {
         let window = {
             let mut state = self.state.lock().await;
-            state.start_new_context_window_if_requested()
+            state.start_new_context_window()
         };
-        let (window_number, window_ids) = window?;
+        let (window_number, window_ids) = window;
         let context_items = self
             .build_initial_context_with_world_state(turn_context, world_state.as_ref())
             .await;
         let turn_context_item = turn_context.to_turn_context_item();
-        let replacement_history = context_items;
-        {
-            let mut state = self.state.lock().await;
-            state.replace_history(replacement_history.clone(), Some(turn_context_item.clone()));
-            state.history.set_world_state_baseline(world_state);
-        };
-        self.persist_rollout_items(&[
-            RolloutItem::Compacted(CompactedItem {
+        self.replace_compacted_history(
+            turn_context,
+            context_items,
+            Some(turn_context_item),
+            Some(world_state),
+            CompactedItem {
                 message: String::new(),
-                replacement_history: Some(replacement_history),
+                replacement_history: None,
                 window_number: Some(window_number),
                 first_window_id: Some(window_ids.first_window_id.to_string()),
                 previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
                 window_id: Some(window_ids.window_id.to_string()),
-            }),
-            RolloutItem::TurnContext(turn_context_item),
-        ])
+            },
+        )
         .await;
-        {
-            let mut state = self.state.lock().await;
-            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
-        }
         self.recompute_token_usage(turn_context).await;
-        Some(window_number)
+        window_number
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -3881,7 +3908,7 @@ pub(crate) fn emit_subagent_session_started(
         forked_from_thread_id: thread_config
             .forked_from_thread_id
             .map(|thread_id| thread_id.to_string()),
-        product_client_id: client_name.clone(),
+        product_client_id: thread_config.originator.clone(),
         client_name,
         client_version,
         model: thread_config.model,

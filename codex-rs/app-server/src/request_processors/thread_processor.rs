@@ -683,13 +683,13 @@ impl ThreadRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
-    pub(crate) async fn thread_turns_items_list(
+    pub(crate) async fn thread_items_list(
         &self,
-        _params: ThreadTurnsItemsListParams,
+        params: ThreadItemsListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Err(method_not_found(
-            "thread/turns/items/list is not supported yet",
-        ))
+        self.thread_items_list_response_inner(params)
+            .await
+            .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn thread_shell_command(
@@ -2388,6 +2388,68 @@ impl ThreadRequestProcessor {
         )
     }
 
+    async fn thread_items_list_response_inner(
+        &self,
+        params: ThreadItemsListParams,
+    ) -> Result<ThreadItemsListResponse, JSONRPCErrorError> {
+        let ThreadItemsListParams {
+            thread_id,
+            turn_id,
+            cursor,
+            limit,
+            sort_direction,
+        } = params;
+        let thread_id = ThreadId::from_string(&thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        let page_size = limit
+            .map(|value| value as usize)
+            .unwrap_or(THREAD_ITEMS_DEFAULT_LIMIT)
+            .clamp(1, THREAD_ITEMS_MAX_LIMIT);
+        let page = self
+            .thread_store
+            .list_items(StoreListItemsParams {
+                thread_id,
+                turn_id,
+                include_archived: true,
+                cursor,
+                page_size,
+                sort_direction: match sort_direction.unwrap_or(SortDirection::Asc) {
+                    SortDirection::Asc => StoreSortDirection::Asc,
+                    SortDirection::Desc => StoreSortDirection::Desc,
+                },
+            })
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+                ThreadStoreError::Unsupported { .. } => {
+                    method_not_found("thread/items/list is not supported yet")
+                }
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    invalid_request(format!("no rollout found for thread id {thread_id}"))
+                }
+                err => internal_error(format!("failed to list thread items: {err}")),
+            })?;
+        let data =
+            page.items
+                .into_iter()
+                .map(|item| {
+                    serde_json::from_slice::<ThreadItem>(&item.materialized_thread_item_json)
+                        .map_err(|err| {
+                            internal_error(format!(
+                                "failed to deserialize stored thread item {}: {err}",
+                                item.item_key
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ThreadItemsListResponse {
+            data,
+            next_cursor: page.next_cursor,
+            backwards_cursor: page.backwards_cursor,
+        })
+    }
+
     async fn load_thread_turns_list_history(
         &self,
         thread_id: ThreadId,
@@ -3714,6 +3776,8 @@ fn xcode_26_4_mcp_elicitations_auto_deny(
 
 const THREAD_TURNS_DEFAULT_LIMIT: usize = 25;
 const THREAD_TURNS_MAX_LIMIT: usize = 100;
+const THREAD_ITEMS_DEFAULT_LIMIT: usize = 25;
+const THREAD_ITEMS_MAX_LIMIT: usize = 100;
 
 fn thread_backwards_cursor_for_sort_key(
     thread: &StoredThread,
@@ -4156,6 +4220,7 @@ pub(crate) fn thread_from_stored_thread(
     let thread_id = thread.thread_id.to_string();
     let thread = Thread {
         id: thread_id.clone(),
+        extra: None,
         session_id: thread_id,
         forked_from_id: thread.forked_from_id.map(|id| id.to_string()),
         parent_thread_id: thread.parent_thread_id.map(|id| id.to_string()),
@@ -4366,6 +4431,7 @@ fn build_thread_from_snapshot(
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     Thread {
         id: thread_id.to_string(),
+        extra: None,
         session_id,
         forked_from_id: None,
         parent_thread_id: config_snapshot.parent_thread_id.map(|id| id.to_string()),
