@@ -356,10 +356,7 @@ pub enum ThreadItem {
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
-    ImageView {
-        id: String,
-        path: LegacyAppPathString,
-    },
+    ImageView { id: String, path: AbsolutePathBuf },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     Sleep {
@@ -858,7 +855,7 @@ impl From<CoreTurnItem> for ThreadItem {
             },
             CoreTurnItem::ImageView(image) => ThreadItem::ImageView {
                 id: image.id,
-                path: image.path.into(),
+                path: image.path,
             },
             CoreTurnItem::Sleep(sleep) => ThreadItem::Sleep {
                 id: sleep.id,

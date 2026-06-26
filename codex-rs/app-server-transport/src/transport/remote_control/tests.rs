@@ -1,4 +1,4 @@
-use super::auth::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
+use super::enroll::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
 use super::enroll::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::enroll::RemoteControlEnrollment;
 use super::enroll::load_persisted_remote_control_enrollment;
@@ -18,6 +18,7 @@ use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionOrigin;
 use crate::transport::TransportEvent;
 use base64::Engine;
+use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
@@ -35,7 +36,6 @@ use codex_login::CodexAuth;
 use codex_login::save_auth;
 use codex_login::token_data::TokenData;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
-use codex_protocol::auth::AuthMode;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
 use futures::SinkExt;
@@ -1473,16 +1473,14 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
         Some(&"Bearer Access Token".to_string())
     );
     assert_eq!(
-        enroll_request
-            .headers
-            .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
-        vec!["account_id"]
+        enroll_request.headers.get(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+        Some(&"account_id".to_string())
     );
     assert_eq!(
         enroll_request
             .headers
-            .get_all(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
-        vec![TEST_INSTALLATION_ID]
+            .get(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
+        Some(&TEST_INSTALLATION_ID.to_string())
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&enroll_request.body)
@@ -1721,18 +1719,6 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
     assert_eq!(
         refresh_request.headers.get("authorization"),
         Some(&"Bearer Access Token".to_string())
-    );
-    assert_eq!(
-        refresh_request
-            .headers
-            .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
-        vec!["account_id"]
-    );
-    assert_eq!(
-        refresh_request
-            .headers
-            .get_all(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
-        vec![TEST_INSTALLATION_ID]
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&refresh_request.body)
@@ -2592,33 +2578,8 @@ async fn remote_control_http_mode_preserves_enrollment_after_generic_websocket_4
 struct CapturedHttpRequest {
     stream: TcpStream,
     request_line: String,
-    headers: CapturedHttpHeaders,
+    headers: BTreeMap<String, String>,
     body: String,
-}
-
-#[derive(Debug, Default)]
-struct CapturedHttpHeaders(Vec<(String, String)>);
-
-impl CapturedHttpHeaders {
-    fn append(&mut self, name: String, value: String) {
-        self.0.push((name, value));
-    }
-
-    fn get(&self, name: &str) -> Option<&String> {
-        self.0
-            .iter()
-            .rev()
-            .find(|(candidate, _value)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_name, value)| value)
-    }
-
-    fn get_all(&self, name: &str) -> Vec<&str> {
-        self.0
-            .iter()
-            .filter(|(candidate, _value)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_name, value)| value.as_str())
-            .collect()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2651,7 +2612,7 @@ async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
         .expect("request line should read");
     let request_line = request_line.trim_end_matches("\r\n").to_string();
 
-    let mut headers = CapturedHttpHeaders::default();
+    let mut headers = BTreeMap::new();
     loop {
         let mut line = String::new();
         reader
@@ -2663,7 +2624,7 @@ async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
         }
         let line = line.trim_end_matches("\r\n");
         let (name, value) = line.split_once(':').expect("header should contain colon");
-        headers.append(name.to_ascii_lowercase(), value.trim().to_string());
+        headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
     }
 
     let content_length = headers

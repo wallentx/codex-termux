@@ -15,7 +15,6 @@ use crate::exec::execute_exec_request;
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
 use crate::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
 use codex_file_system::FileSystemSandboxContext;
-use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -64,7 +63,6 @@ pub struct ExecRequest {
     pub arg0: Option<String>,
     pub(crate) exec_server_sandbox: Option<FileSystemSandboxContext>,
     pub(crate) exec_server_enforce_managed_network: bool,
-    pub(crate) exec_server_managed_network: Option<ManagedNetworkSandboxContext>,
 }
 
 impl ExecRequest {
@@ -109,7 +107,6 @@ impl ExecRequest {
             arg0,
             exec_server_sandbox: None,
             exec_server_enforce_managed_network: false,
-            exec_server_managed_network: None,
         }
     }
 
@@ -168,7 +165,6 @@ impl ExecRequest {
             arg0,
             exec_server_sandbox: None,
             exec_server_enforce_managed_network: false,
-            exec_server_managed_network: None,
         }
     }
 }

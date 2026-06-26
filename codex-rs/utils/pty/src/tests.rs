@@ -16,10 +16,6 @@ use crate::spawn_pipe_process;
 use crate::spawn_pipe_process_no_stdin;
 use crate::spawn_pty_process;
 
-#[cfg(windows)]
-#[path = "windows_tests.rs"]
-mod windows_tests;
-
 fn find_python() -> Option<String> {
     for candidate in ["python3", "python"] {
         if let Ok(output) = std::process::Command::new(candidate)
@@ -144,6 +140,7 @@ async fn collect_output_until_exit(
     }
 }
 
+#[cfg(unix)]
 async fn wait_for_output_contains(
     output_rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
     needle: &str,

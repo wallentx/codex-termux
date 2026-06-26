@@ -321,7 +321,7 @@ pub(crate) struct HandleOutputCtx {
     pub cancellation_token: CancellationToken,
 }
 
-pub(crate) async fn apply_turn_item_contributors(
+async fn apply_turn_item_contributors(
     sess: &Session,
     turn_store: &ExtensionData,
     item: &mut TurnItem,

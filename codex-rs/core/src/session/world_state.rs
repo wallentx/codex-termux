@@ -1,39 +1,41 @@
-use super::session::Session;
-use super::step_context::StepContext;
-use crate::context::world_state::AgentsMdState;
+use super::turn_context::TurnContext;
 use crate::context::world_state::EnvironmentsState;
 use crate::context::world_state::WorldState;
+use crate::environment_selection::TurnEnvironmentSnapshot;
+use codex_protocol::protocol::TurnContextItem;
 
-impl Session {
-    pub(crate) async fn build_world_state_for_step(
-        &self,
-        step_context: &StepContext,
-    ) -> WorldState {
-        let turn_context = step_context.turn.as_ref();
-        tracing::trace!(
-            selected_capability_root_count = step_context.selected_capability_roots.len(),
-            "building step world state"
+pub(super) fn build_world_state_from_turn_context(
+    turn_context: &TurnContext,
+    environment_subagents: &str,
+) -> WorldState {
+    let mut world_state = WorldState::default();
+    if turn_context.config.include_environment_context {
+        world_state.add_section(
+            EnvironmentsState::from_turn_context(turn_context)
+                .with_subagents(environment_subagents.to_string()),
         );
-        let environment_subagents = if turn_context.config.include_environment_context {
-            self.services
-                .agent_control
-                .format_environment_context_subagents(self.thread_id)
-                .await
-        } else {
-            String::new()
-        };
-
-        let mut world_state = WorldState::default();
-        world_state.add_section(AgentsMdState::new(step_context.loaded_agents_md.as_deref()));
-        if turn_context.config.include_environment_context {
-            world_state.add_section(
-                EnvironmentsState::from_turn_context_with_environments(
-                    turn_context,
-                    &step_context.environments,
-                )
-                .with_subagents(environment_subagents),
-            );
-        }
-        world_state
     }
+    world_state
+}
+
+pub(super) fn build_world_state_from_environment_snapshot(
+    turn_context: &TurnContext,
+    environments: &TurnEnvironmentSnapshot,
+) -> WorldState {
+    let mut world_state = WorldState::default();
+    if turn_context.config.include_environment_context {
+        world_state.add_section(EnvironmentsState::from_turn_context_with_environments(
+            turn_context,
+            environments,
+        ));
+    }
+    world_state
+}
+
+pub(super) fn build_world_state_from_turn_context_item(
+    turn_context_item: &TurnContextItem,
+) -> WorldState {
+    let mut world_state = WorldState::default();
+    world_state.add_section(EnvironmentsState::from_turn_context_item(turn_context_item));
+    world_state
 }

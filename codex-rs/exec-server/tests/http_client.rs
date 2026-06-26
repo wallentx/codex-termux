@@ -4,20 +4,19 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::JSONRPCNotification;
+use codex_app_server_protocol::JSONRPCRequest;
+use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::RequestId;
 use codex_exec_server::ExecServerClient;
 use codex_exec_server::HttpHeader;
-use codex_exec_server::HttpRedirectPolicy;
 use codex_exec_server::HttpRequestBodyDeltaNotification;
 use codex_exec_server::HttpRequestParams;
 use codex_exec_server::HttpRequestResponse;
 use codex_exec_server::InitializeParams;
 use codex_exec_server::InitializeResponse;
 use codex_exec_server::RemoteExecServerConnectArgs;
-use codex_exec_server_protocol::JSONRPCMessage;
-use codex_exec_server_protocol::JSONRPCNotification;
-use codex_exec_server_protocol::JSONRPCRequest;
-use codex_exec_server_protocol::JSONRPCResponse;
-use codex_exec_server_protocol::RequestId;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -64,7 +63,6 @@ async fn http_request_forces_buffered_request_params() -> Result<()> {
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "ignored-stream-id".to_string(),
                 stream_response: false,
             }
@@ -93,7 +91,6 @@ async fn http_request_forces_buffered_request_params() -> Result<()> {
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "ignored-stream-id".to_string(),
             stream_response: true,
         }),
@@ -134,7 +131,6 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
                 }],
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-1".to_string(),
                 stream_response: true,
             }
@@ -190,7 +186,6 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-2".to_string(),
                 stream_response: true,
             }
@@ -220,7 +215,6 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
             }],
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
@@ -259,7 +253,6 @@ async fn http_response_body_stream_uses_generated_ids_and_receives_ordered_delta
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
@@ -296,7 +289,6 @@ async fn http_response_body_stream_drops_queued_terminal_before_next_generated_i
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-1".to_string(),
                 stream_response: true,
             }
@@ -330,7 +322,6 @@ async fn http_response_body_stream_drops_queued_terminal_before_next_generated_i
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-2".to_string(),
                 stream_response: true,
             }
@@ -357,7 +348,6 @@ async fn http_response_body_stream_drops_queued_terminal_before_next_generated_i
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
@@ -382,7 +372,6 @@ async fn http_response_body_stream_drops_queued_terminal_before_next_generated_i
         headers: Vec::new(),
         body: None,
         timeout_ms: None,
-        redirect_policy: HttpRedirectPolicy::Follow,
         request_id: "caller-stream-id".to_string(),
         stream_response: false,
     };
@@ -422,7 +411,6 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-1".to_string(),
                 stream_response: true,
             }
@@ -442,7 +430,6 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-2".to_string(),
                 stream_response: true,
             }
@@ -487,7 +474,6 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "caller-stream-id".to_string(),
                 stream_response: false,
             })
@@ -509,7 +495,6 @@ async fn http_response_body_stream_ignores_late_deltas_after_cancelled_request()
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
@@ -556,7 +541,6 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-1".to_string(),
                 stream_response: true,
             }
@@ -596,7 +580,6 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-2".to_string(),
                 stream_response: true,
             }
@@ -632,7 +615,6 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
@@ -665,7 +647,6 @@ async fn http_response_body_stream_ignores_late_deltas_after_drop() -> Result<()
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
@@ -710,7 +691,6 @@ async fn http_response_body_stream_fails_when_transport_disconnects() -> Result<
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-1".to_string(),
                 stream_response: true,
             }
@@ -737,7 +717,6 @@ async fn http_response_body_stream_fails_when_transport_disconnects() -> Result<
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
@@ -780,7 +759,6 @@ async fn http_response_body_stream_reports_disconnect_when_queue_is_full() -> Re
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-1".to_string(),
                 stream_response: true,
             }
@@ -818,7 +796,6 @@ async fn http_response_body_stream_reports_disconnect_when_queue_is_full() -> Re
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),
@@ -875,7 +852,6 @@ async fn http_response_body_stream_reports_backpressure_truncation() -> Result<(
                 headers: Vec::new(),
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "http-1".to_string(),
                 stream_response: true,
             }
@@ -918,7 +894,6 @@ async fn http_response_body_stream_reports_backpressure_truncation() -> Result<(
             headers: Vec::new(),
             body: None,
             timeout_ms: None,
-            redirect_policy: HttpRedirectPolicy::Follow,
             request_id: "caller-stream-id".to_string(),
             stream_response: false,
         }),

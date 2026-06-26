@@ -247,6 +247,7 @@ impl ElicitationRequestManager {
 pub(crate) fn elicitation_is_rejected_by_policy(approval_policy: AskForApproval) -> bool {
     match approval_policy {
         AskForApproval::Never => true,
+        AskForApproval::OnFailure => false,
         AskForApproval::OnRequest => false,
         AskForApproval::UnlessTrusted => false,
         AskForApproval::Granular(granular_config) => !granular_config.allows_mcp_elicitations(),

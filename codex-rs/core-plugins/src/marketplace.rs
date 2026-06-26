@@ -86,12 +86,11 @@ impl MarketplacePluginManifestFallback {
     }
 
     pub(crate) fn parse_for_listing(&self) -> Option<crate::manifest::PluginManifest> {
-        // Git sources have no plugin root before install. Parse against a host-native synthetic
-        // absolute root, then discard path-bearing fields so listings expose metadata only.
-        let plugin_root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        // Git sources have no plugin root before install. Parse against a synthetic absolute root,
+        // then discard path-bearing fields so listings expose metadata only.
         let mut manifest = crate::manifest::parse_plugin_manifest(
-            plugin_root,
-            &fallback_plugin_manifest_path(plugin_root),
+            Path::new("/"),
+            Path::new("/.codex-plugin/plugin.json"),
             &self.contents,
         )
         .ok()?;

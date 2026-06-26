@@ -357,7 +357,6 @@ fn mcp_dependency_to_server_config(
             .as_ref()
             .ok_or_else(|| "missing url for streamable_http dependency".to_string())?;
         return Ok(McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::StreamableHttp {
                 url: url.clone(),
                 bearer_token_env_var: None,
@@ -387,7 +386,6 @@ fn mcp_dependency_to_server_config(
             .as_ref()
             .ok_or_else(|| "missing command for stdio dependency".to_string())?;
         return Ok(McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: command.clone(),
                 args: Vec::new(),

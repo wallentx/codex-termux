@@ -8,7 +8,6 @@ use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
 use crate::session::turn_context::TurnContext;
-use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolPayload;
@@ -54,7 +53,6 @@ struct RunExecLikeArgs {
     prefix_rule: Option<Vec<String>>,
     session: Arc<crate::session::session::Session>,
     turn: Arc<TurnContext>,
-    turn_environment: TurnEnvironment,
     tracker: crate::tools::context::SharedTurnDiffTracker,
     call_id: String,
     shell_runtime_backend: ShellRuntimeBackend,
@@ -71,12 +69,16 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         prefix_rule,
         session,
         turn,
-        turn_environment,
         tracker,
         call_id,
         shell_runtime_backend,
     } = args;
 
+    let Some(turn_environment) = turn.environments.primary() else {
+        return Err(FunctionCallError::RespondToModel(
+            "shell is unavailable in this session".to_string(),
+        ));
+    };
     let fs = turn_environment.environment.get_filesystem();
 
     let explicit_env_overrides = turn

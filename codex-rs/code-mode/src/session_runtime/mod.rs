@@ -63,6 +63,10 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         }
     }
 
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.inner.shutdown_token.is_cancelled()
+    }
+
     pub(crate) async fn execute(
         &self,
         request: CreateCellRequest,
