@@ -164,9 +164,11 @@ pub(crate) async fn run_turn(
         return Ok(None);
     }
 
+    // run_turn owns the step used to seed context and make the first sampling request.
+    let first_step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
     // Keep the exact model-visible state used by this turn and its inline compactions.
     let mut world_state = sess
-        .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+        .record_context_updates_and_set_reference_context_item(first_step_context.as_ref())
         .await;
 
     let Some((injection_items, explicitly_enabled_connectors)) =
@@ -214,6 +216,7 @@ pub(crate) async fn run_turn(
     // 1. At the start of a turn, so the fresh turn input in `input` gets sampled first.
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
+    let mut next_step_context = Some(first_step_context);
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -237,7 +240,10 @@ pub(crate) async fn run_turn(
         .await;
 
         // Capture once so context, advertised tools, and tool calls share one request view.
-        let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
+        let step_context = match next_step_context.take() {
+            Some(step_context) => step_context,
+            None => sess.capture_step_context(Arc::clone(&turn_context)).await,
+        };
         let sampling_request_result: CodexResult<_> = async {
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
@@ -252,7 +258,7 @@ pub(crate) async fn run_turn(
                 .enabled(Feature::DeferredExecutor)
             {
                 world_state = sess
-                    .record_step_environment_context_if_changed(&world_state, step_context.as_ref())
+                    .record_step_world_state_if_changed(&world_state, step_context.as_ref())
                     .await;
             }
 
@@ -332,13 +338,8 @@ pub(crate) async fn run_turn(
                 .await;
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                let auto_compact_needed = turn_context
-                    .config
-                    .features
-                    .enabled(Feature::AutoCompaction)
-                    && token_limit_reached;
                 if needs_follow_up
-                    && (sess.take_new_context_window_request().await || auto_compact_needed)
+                    && (sess.take_new_context_window_request().await || token_limit_reached)
                 {
                     if let Err(err) = run_auto_compact(
                         &sess,
@@ -537,6 +538,9 @@ async fn build_skills_and_plugins(
     // enabled plugins, then converted into turn-scoped guidance below.
     let mentioned_plugins =
         collect_explicit_plugin_mentions(&user_input, loaded_plugins.capability_summaries());
+    let connector_snapshot = codex_connectors::ConnectorSnapshot::from_plugin_capability_summaries(
+        loaded_plugins.capability_summaries(),
+    );
     let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
         // Plugin mentions need raw MCP/app inventory even when app tools
         // are normally hidden so we can describe the plugin's currently
@@ -558,10 +562,10 @@ async fn build_skills_and_plugins(
     };
     let available_connectors = if turn_context.apps_enabled() {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
-            loaded_plugins
-                .effective_apps()
-                .into_iter()
-                .map(|connector_id| connector_id.0),
+            connector_snapshot
+                .connector_ids()
+                .iter()
+                .map(|connector_id| connector_id.0.clone()),
             connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
         );
         connectors::with_app_enabled_state(connectors, &turn_context.config)
@@ -792,20 +796,13 @@ async fn run_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
 ) -> CodexResult<()> {
-    if !turn_context
-        .config
-        .features
-        .enabled(Feature::AutoCompaction)
-    {
-        return Ok(());
-    }
-
     maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?;
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
     // Compact if the configured auto-compaction budget or usable context window is exhausted.
     if token_status.token_limit_reached {
+        // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
         run_auto_compact(
             sess,
@@ -851,6 +848,7 @@ async fn maybe_run_previous_model_inline_compact(
     );
 
     if should_compact_for_comp_hash_change {
+        // This pre-turn request needs a step built from the previous model's turn context.
         let step_context = sess
             .capture_step_context(Arc::clone(&previous_model_turn_context))
             .await;
@@ -891,6 +889,7 @@ async fn maybe_run_previous_model_inline_compact(
         && previous_model_turn_context.model_info.slug != turn_context.model_info.slug
         && old_context_window > new_context_window;
     if should_run {
+        // This pre-turn request needs a step built from the previous model's turn context.
         let step_context = sess
             .capture_step_context(Arc::clone(&previous_model_turn_context))
             .await;
@@ -926,7 +925,7 @@ async fn run_auto_compact(
         // instead of consuming a pending `new_context` tool request.
         crate::compact_token_budget::run_inline_auto_compact_task(
             Arc::clone(sess),
-            Arc::clone(turn_context),
+            step_context,
             initial_context_injection,
         )
         .await?;
@@ -1190,6 +1189,9 @@ pub(crate) async fn built_tools(
         .plugins_for_config(&turn_context.config.plugins_config_input())
         .instrument(trace_span!("built_tools.load_plugins"))
         .await;
+    let connector_snapshot = codex_connectors::ConnectorSnapshot::from_plugin_capability_summaries(
+        loaded_plugins.capability_summaries(),
+    );
 
     let apps_enabled = turn_context.apps_enabled();
     let accessible_connectors =
@@ -1200,10 +1202,10 @@ pub(crate) async fn built_tools(
         });
     let connectors = if apps_enabled {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
-            loaded_plugins
-                .effective_apps()
-                .into_iter()
-                .map(|connector_id| connector_id.0),
+            connector_snapshot
+                .connector_ids()
+                .iter()
+                .map(|connector_id| connector_id.0.clone()),
             accessible_connectors.clone().unwrap_or_default(),
         );
         Some(connectors::with_app_enabled_state(
@@ -1241,10 +1243,10 @@ pub(crate) async fn built_tools(
                 presentation: ToolSuggestPresentation::RecommendationContext,
             })
         } else {
-            let loaded_plugin_app_connector_ids = loaded_plugins
-                .effective_apps()
-                .into_iter()
-                .map(|connector_id| connector_id.0)
+            let loaded_plugin_app_connector_ids = connector_snapshot
+                .connector_ids()
+                .iter()
+                .map(|connector_id| connector_id.0.clone())
                 .collect::<Vec<_>>();
             async {
                 if apps_enabled && tool_suggest_is_enabled {
