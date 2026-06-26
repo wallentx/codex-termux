@@ -27,3 +27,7 @@ jobs:
         with:
           rust-version: 1.93.0
           manifest-path: ./codex-rs/Cargo.toml
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree

@@ -7,6 +7,8 @@ use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
+use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
+use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
@@ -212,6 +214,52 @@ async fn token_budget_context_is_only_emitted_with_full_context() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_budget_guidance_follows_context_window() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+    let guidance_message = "Preserve important state before compaction.";
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+            config.token_budget = Some(TokenBudgetConfig {
+                guidance_message: Some(guidance_message.to_string()),
+                ..TokenBudgetConfig::default()
+            });
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("test config should allow token budget");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("inspect context guidance").await?;
+
+    let developer_texts = response.single_request().message_input_texts("developer");
+    let context_window_index = developer_texts
+        .iter()
+        .position(|text| text.starts_with(CONTEXT_WINDOW_OPEN_TAG))
+        .expect("context-window metadata should be present");
+    assert_eq!(
+        developer_texts.get(context_window_index + 1),
+        Some(&format!(
+            "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\n{guidance_message}\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+        ))
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -228,6 +276,7 @@ async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
             servers.insert(
                 "notes".to_string(),
                 McpServerConfig {
+                    auth: Default::default(),
                     transport: McpServerTransportConfig::Stdio {
                         command: rmcp_test_server_bin,
                         args: Vec::new(),
@@ -899,54 +948,6 @@ async fn new_context_tool_starts_new_window_before_follow_up() -> Result<()> {
     insta::assert_snapshot!(
         "token_budget_new_context_window_tool_full_context",
         snapshot
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_compaction_feature_disabled_hides_new_context_tool() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
-        &server,
-        vec![sse(vec![
-            ev_response_created("resp-1"),
-            ev_completed("resp-1"),
-        ])],
-    )
-    .await;
-    let test = test_codex()
-        .with_config(|config| {
-            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
-            config
-                .features
-                .enable(Feature::TokenBudget)
-                .expect("test config should allow token budget");
-            config
-                .features
-                .disable(Feature::AutoCompaction)
-                .expect("test config should allow disabling auto-compaction");
-        })
-        .build(&server)
-        .await?;
-
-    test.submit_turn("preserve the current context window")
-        .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 1);
-    let tool_names = tool_names(&requests[0]);
-    assert!(
-        tool_names
-            .iter()
-            .any(|name| name == "get_context_remaining"),
-        "token budget should continue to expose get_context_remaining"
-    );
-    assert!(
-        !tool_names.iter().any(|name| name == "new_context"),
-        "disabled auto-compaction should hide new_context"
     );
 
     Ok(())

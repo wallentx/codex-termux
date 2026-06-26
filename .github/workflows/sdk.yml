@@ -41,6 +41,10 @@ jobs:
               /tmp/uv/bin/uv run --extra dev pytest
             '
 
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   sdks:
     runs-on:
       group: codex-runners
@@ -158,3 +162,7 @@ jobs:
           path: |
             ~/.cache/bazel-repo-cache
           key: bazel-cache-x86_64-unknown-linux-gnu-${{ hashFiles('MODULE.bazel', 'codex-rs/Cargo.lock', 'codex-rs/Cargo.toml') }}
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree

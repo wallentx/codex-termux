@@ -53,6 +53,10 @@ jobs:
           echo "codex=$codex" >> "$GITHUB_OUTPUT"
           echo "workflows=$workflows" >> "$GITHUB_OUTPUT"
 
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   # --- Fast Cargo-native PR checks -------------------------------------------
   general:
     name: Format / etc
@@ -73,6 +77,10 @@ jobs:
       - name: cargo fmt
         run: cargo fmt -- --config imports_granularity=Item --check
 
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   cargo_shear:
     name: cargo shear
     runs-on: ubuntu-24.04
@@ -92,6 +100,10 @@ jobs:
           tool: cargo-shear@1.11.2
       - name: cargo shear
         run: cargo shear --deny-warnings
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
 
   argument_comment_lint_package:
     name: Argument comment lint package
@@ -144,6 +156,10 @@ jobs:
         env:
           RUST_MIN_STACK: "8388608" # 8 MiB
 
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   argument_comment_lint_prebuilt:
     name: Argument comment lint - ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
@@ -191,6 +207,10 @@ jobs:
         with:
           target: ${{ runner.os }}
           buildbuddy-api-key: ${{ secrets.BUILDBUDDY_API_KEY }}
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled() && steps.argument_comment_lint_gate.outputs.run == 'true'
+        uses: ./.github/actions/check-clean-worktree
 
   # --- Gatherer job that you mark as the ONLY required status -----------------
   results:
