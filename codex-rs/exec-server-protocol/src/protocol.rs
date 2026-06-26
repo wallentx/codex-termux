@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_file_system::FileSystemSandboxContext;
+pub use codex_file_system::WalkOptions;
+pub use codex_file_system::WalkOutcome;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_shell_command::shell_detect::DetectedShell;
@@ -31,6 +33,7 @@ pub const FS_CREATE_DIRECTORY_METHOD: &str = "fs/createDirectory";
 pub const FS_GET_METADATA_METHOD: &str = "fs/getMetadata";
 pub const FS_CANONICALIZE_METHOD: &str = "fs/canonicalize";
 pub const FS_READ_DIRECTORY_METHOD: &str = "fs/readDirectory";
+pub const FS_WALK_METHOD: &str = "fs/walk";
 pub const FS_REMOVE_METHOD: &str = "fs/remove";
 pub const FS_COPY_METHOD: &str = "fs/copy";
 /// JSON-RPC request method for executor-side HTTP requests.
@@ -372,6 +375,16 @@ pub struct FsReadDirectoryResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FsWalkParams {
+    pub path: PathUri,
+    pub options: WalkOptions,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+pub type FsWalkResponse = WalkOutcome;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FsRemoveParams {
     pub path: PathUri,
     pub recursive: Option<bool>,
@@ -406,6 +419,17 @@ pub struct HttpHeader {
     pub value: String,
 }
 
+/// Redirect behavior for an executor-side HTTP request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HttpRedirectPolicy {
+    /// Follow redirects using the HTTP client's normal limits.
+    #[default]
+    Follow,
+    /// Return the redirect response without following its location.
+    Stop,
+}
+
 /// Executor-side HTTP request envelope.
 ///
 /// This intentionally stays transport-shaped rather than MCP-shaped so callers
@@ -430,6 +454,9 @@ pub struct HttpRequestParams {
     /// millisecond deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Whether the executor should follow HTTP redirects.
+    #[serde(default)]
+    pub redirect_policy: HttpRedirectPolicy,
     /// Caller-chosen stream id for `http/request/bodyDelta` notifications.
     ///
     /// The id must remain unique on a connection until the terminal body delta

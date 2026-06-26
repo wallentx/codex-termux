@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
@@ -26,10 +25,6 @@ use crate::turn_metadata::McpTurnMetadataContext;
 use codex_analytics::AppInvocation;
 use codex_analytics::InvocationType;
 use codex_analytics::build_track_events_context;
-use codex_app_server_protocol::McpElicitationObjectType;
-use codex_app_server_protocol::McpElicitationSchema;
-use codex_app_server_protocol::McpServerElicitationRequest;
-use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_config::ConfigLayerSource;
 use codex_config::types::AppToolApproval;
 use codex_config::types::ApprovalsReviewer;
@@ -46,6 +41,7 @@ use codex_mcp::auth_elicitation_completed_result;
 use codex_mcp::build_auth_elicitation_plan;
 use codex_mcp::declared_openai_file_input_param_names;
 use codex_mcp::mcp_permission_prompt_is_auto_approved;
+use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::items::McpToolCallError;
 use codex_protocol::items::McpToolCallItem;
 use codex_protocol::items::McpToolCallStatus;
@@ -96,9 +92,7 @@ use url::Url;
 
 mod telemetry;
 
-use telemetry::MCP_CALL_COUNT_METRIC;
 use telemetry::McpCallMetricOutcome;
-use telemetry::McpErrorCodeSource;
 use telemetry::emit_mcp_call_metrics;
 use telemetry::mcp_call_metric_outcome;
 use telemetry::record_mcp_call_outcome_span_telemetry;
@@ -186,6 +180,13 @@ pub(crate) async fn handle_mcp_tool_call(
             .await
     };
 
+    let connector_id = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.connector_id.clone());
+    let connector_name = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.connector_name.clone());
+
     if server == CODEX_APPS_MCP_SERVER_NAME && !app_tool_policy.enabled {
         let result = notify_mcp_tool_call_skip(
             sess.as_ref(),
@@ -198,10 +199,15 @@ pub(crate) async fn handle_mcp_tool_call(
         )
         .await;
         let status = if result.is_ok() { "ok" } else { "error" };
-        turn_context.session_telemetry.counter(
-            MCP_CALL_COUNT_METRIC,
-            /*inc*/ 1,
-            &[("status", status)],
+        let outcome = McpCallMetricOutcome::from_status(status);
+        emit_mcp_call_metrics(
+            turn_context.as_ref(),
+            &outcome,
+            &server,
+            &tool_name,
+            connector_id.as_deref(),
+            connector_name.as_deref(),
+            /*duration*/ None,
         );
         return HandledMcpToolCall {
             result: CallToolResult::from_result(result),
@@ -209,13 +215,6 @@ pub(crate) async fn handle_mcp_tool_call(
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
     }
-    let connector_id = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.connector_id.clone());
-    let connector_name = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.connector_name.clone());
-
     notify_mcp_tool_call_started(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -283,6 +282,7 @@ pub(crate) async fn handle_mcp_tool_call(
         emit_mcp_call_metrics(
             turn_context.as_ref(),
             &outcome,
+            &server,
             &tool_name,
             connector_id.as_deref(),
             connector_name.as_deref(),
@@ -352,17 +352,11 @@ async fn handle_approved_mcp_tool_call(
     let arguments_value = invocation.arguments.clone();
     let connector_id = metadata.and_then(|metadata| metadata.connector_id.as_deref());
     let connector_name = metadata.and_then(|metadata| metadata.connector_name.as_deref());
-    let (server_origin, error_code_source) = {
+    let server_origin = {
         let mcp_connection_manager = sess.services.mcp_connection_manager.load_full();
-        let server_origin = mcp_connection_manager
+        mcp_connection_manager
             .server_origin(&server)
-            .map(str::to_string);
-        let error_code_source = if mcp_connection_manager.is_host_owned_codex_apps_server(&server) {
-            McpErrorCodeSource::HostedPluginService
-        } else {
-            McpErrorCodeSource::Untrusted
-        };
-        (server_origin, error_code_source)
+            .map(str::to_string)
     };
 
     let start = Instant::now();
@@ -396,7 +390,7 @@ async fn handle_approved_mcp_tool_call(
             .await
         }
         .await;
-        record_mcp_result_span_telemetry(&Span::current(), &result, error_code_source);
+        record_mcp_result_span_telemetry(&Span::current(), &result);
         result
     }
     .instrument(mcp_tool_call_span(
@@ -428,10 +422,11 @@ async fn handle_approved_mcp_tool_call(
     .await;
     maybe_track_codex_app_used(sess, turn_context, &server, &tool_name).await;
 
-    let outcome = mcp_call_metric_outcome(&result, error_code_source);
+    let outcome = mcp_call_metric_outcome(&result);
     emit_mcp_call_metrics(
         turn_context,
         &outcome,
+        &server,
         &tool_name,
         connector_id,
         connector_name,
@@ -505,12 +500,8 @@ fn record_server_fields(span: &Span, url: Option<&str>) {
     }
 }
 
-fn record_mcp_result_span_telemetry(
-    span: &Span,
-    result: &Result<CallToolResult, String>,
-    error_code_source: McpErrorCodeSource,
-) {
-    record_mcp_call_outcome_span_telemetry(span, result, error_code_source);
+fn record_mcp_result_span_telemetry(span: &Span, result: &Result<CallToolResult, String>) {
+    record_mcp_call_outcome_span_telemetry(span, result);
 
     let Some(span_telemetry) = result
         .as_ref()
@@ -653,19 +644,19 @@ async fn maybe_request_codex_apps_auth_elicitation(
     };
 
     let request_id = rmcp::model::RequestId::String(plan.elicitation.elicitation_id.clone().into());
-    let params = McpServerElicitationRequestParams {
-        thread_id: sess.thread_id.to_string(),
-        turn_id: Some(turn_context.sub_id.clone()),
-        server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
-        request: McpServerElicitationRequest::Url {
-            meta: Some(plan.elicitation.meta),
-            message: plan.elicitation.message,
-            url: plan.elicitation.url,
-            elicitation_id: plan.elicitation.elicitation_id,
-        },
+    let request = ElicitationRequest::Url {
+        meta: Some(plan.elicitation.meta),
+        message: plan.elicitation.message,
+        url: plan.elicitation.url,
+        elicitation_id: plan.elicitation.elicitation_id,
     };
     let response = sess
-        .request_mcp_server_elicitation(turn_context, request_id, params)
+        .request_mcp_server_elicitation(
+            turn_context,
+            CODEX_APPS_MCP_SERVER_NAME.to_string(),
+            request_id,
+            request,
+        )
         .await
         .response;
     if !response
@@ -1309,10 +1300,8 @@ async fn maybe_request_mcp_tool_approval(
         let request_id = rmcp::model::RequestId::String(
             format!("{MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX}_{call_id}").into(),
         );
-        let params = build_mcp_tool_approval_elicitation_request(
-            sess.as_ref(),
-            turn_context.as_ref(),
-            McpToolApprovalElicitationRequest {
+        let request =
+            build_mcp_tool_approval_elicitation_request(McpToolApprovalElicitationRequest {
                 server: &invocation.server,
                 metadata,
                 tool_params: rendered_template
@@ -1325,12 +1314,16 @@ async fn maybe_request_mcp_tool_approval(
                     .as_ref()
                     .map(|rendered_template| rendered_template.elicitation_message.as_str()),
                 prompt_options,
-            },
-        );
+            });
         let decision = parse_mcp_tool_approval_elicitation_response(
-            sess.request_mcp_server_elicitation(turn_context.as_ref(), request_id, params)
-                .await
-                .response,
+            sess.request_mcp_server_elicitation(
+                turn_context.as_ref(),
+                invocation.server.clone(),
+                request_id,
+                request,
+            )
+            .await
+            .response,
             &question_id,
         );
         let decision = normalize_approval_decision_for_mode(decision, approval_mode);
@@ -1478,9 +1471,15 @@ pub(crate) async fn lookup_mcp_tool_metadata(
         {
             Some(connectors) => Some(connectors),
             None => {
-                connectors::list_accessible_connectors_from_mcp_tools(turn_context.config.as_ref())
-                    .await
-                    .ok()
+                connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+                    turn_context.config.as_ref(),
+                    /*force_refetch*/ false,
+                    sess.services.turn_environments.environment_manager(),
+                    Arc::clone(&sess.services.mcp_manager),
+                )
+                .await
+                .ok()
+                .map(|status| status.connectors)
             }
         };
         connectors.and_then(|connectors| {
@@ -1658,35 +1657,26 @@ fn build_mcp_tool_approval_fallback_message(
 }
 
 fn build_mcp_tool_approval_elicitation_request(
-    sess: &Session,
-    turn_context: &TurnContext,
     request: McpToolApprovalElicitationRequest<'_>,
-) -> McpServerElicitationRequestParams {
+) -> ElicitationRequest {
     let message = request
         .message_override
         .map(ToString::to_string)
         .unwrap_or_else(|| request.question.question.clone());
 
-    McpServerElicitationRequestParams {
-        thread_id: sess.thread_id.to_string(),
-        turn_id: Some(turn_context.sub_id.clone()),
-        server_name: request.server.to_string(),
-        request: McpServerElicitationRequest::Form {
-            meta: build_mcp_tool_approval_elicitation_meta(
-                request.server,
-                request.metadata,
-                request.tool_params,
-                request.tool_params_display,
-                request.prompt_options,
-            ),
-            message,
-            requested_schema: McpElicitationSchema {
-                schema_uri: None,
-                type_: McpElicitationObjectType::Object,
-                properties: BTreeMap::new(),
-                required: None,
-            },
-        },
+    ElicitationRequest::Form {
+        meta: build_mcp_tool_approval_elicitation_meta(
+            request.server,
+            request.metadata,
+            request.tool_params,
+            request.tool_params_display,
+            request.prompt_options,
+        ),
+        message,
+        requested_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+        }),
     }
 }
 
