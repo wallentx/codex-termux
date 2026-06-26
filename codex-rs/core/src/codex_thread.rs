@@ -75,7 +75,6 @@ pub struct ThreadConfigSnapshot {
     pub forked_from_thread_id: Option<ThreadId>,
     pub parent_thread_id: Option<ThreadId>,
     pub thread_source: Option<ThreadSource>,
-    pub originator: String,
 }
 
 /// Explains why `CodexThread::try_start_turn_if_idle` rejected an automatic
@@ -466,15 +465,9 @@ impl CodexThread {
 
         let turn_context = self.codex.session.new_default_turn().await;
         if self.codex.session.reference_context_item().await.is_none() {
-            // This history-only API runs without run_turn, so it owns its initial step.
-            let step_context = self
-                .codex
-                .session
-                .capture_step_context(Arc::clone(&turn_context))
-                .await;
             self.codex
                 .session
-                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+                .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
                 .await;
         }
         self.codex

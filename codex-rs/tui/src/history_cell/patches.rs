@@ -1,7 +1,6 @@
 //! Patch summaries and image-tool transcript helpers.
 
 use super::*;
-use codex_utils_path_uri::LegacyAppPathString;
 
 #[derive(Debug)]
 pub(crate) struct PatchHistoryCell {
@@ -61,12 +60,8 @@ pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_view_image_tool_call(path: LegacyAppPathString, cwd: &Path) -> PlainHistoryCell {
-    let display_path = path
-        .to_inferred_path_uri()
-        .and_then(|path| path.to_abs_path().ok())
-        .map(|path| display_path_for(path.as_path(), cwd))
-        .unwrap_or_else(|| path.into_string());
+pub(crate) fn new_view_image_tool_call(path: AbsolutePathBuf, cwd: &Path) -> PlainHistoryCell {
+    let display_path = display_path_for(path.as_path(), cwd);
 
     let lines: Vec<Line<'static>> = vec![
         vec!["• ".dim(), "Viewed Image".bold()].into(),

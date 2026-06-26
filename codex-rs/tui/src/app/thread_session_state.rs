@@ -409,7 +409,6 @@ mod tests {
         };
         let read_thread = Thread {
             id: read_thread_id.to_string(),
-            extra: None,
             session_id: read_thread_id.to_string(),
             forked_from_id: None,
             parent_thread_id: None,

@@ -10,7 +10,6 @@ use std::ops::Mul;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use strum_macros::EnumIter;
@@ -19,7 +18,6 @@ use crate::AgentPath;
 use crate::SessionId;
 use crate::ThreadId;
 use crate::approvals::ElicitationRequestEvent;
-use crate::capabilities::SelectedCapabilityRoot;
 use crate::config_types::ApprovalsReviewer;
 use crate::config_types::CollaborationMode;
 use crate::config_types::ModeKind;
@@ -115,8 +113,6 @@ pub const REALTIME_CONVERSATION_OPEN_TAG: &str = "<realtime_conversation>";
 pub const REALTIME_CONVERSATION_CLOSE_TAG: &str = "</realtime_conversation>";
 pub const CONTEXT_WINDOW_OPEN_TAG: &str = "<context_window>";
 pub const CONTEXT_WINDOW_CLOSE_TAG: &str = "</context_window>";
-pub const CONTEXT_WINDOW_GUIDANCE_OPEN_TAG: &str = "<context_window_guidance>";
-pub const CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG: &str = "</context_window_guidance>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
 
 // TODO(anp): Replace `TurnEnvironmentSelection` with `PathUri` once path URIs carry environment
@@ -692,9 +688,6 @@ impl From<Vec<UserInput>> for Op {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct InterAgentCommunication {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub id: Option<String>,
     pub author: AgentPath,
     pub recipient: AgentPath,
     #[serde(default)]
@@ -718,7 +711,6 @@ impl InterAgentCommunication {
         trigger_turn: bool,
     ) -> Self {
         Self {
-            id: None,
             author,
             recipient,
             other_recipients,
@@ -737,7 +729,6 @@ impl InterAgentCommunication {
         trigger_turn: bool,
     ) -> Self {
         Self {
-            id: None,
             author,
             recipient,
             other_recipients,
@@ -757,7 +748,6 @@ impl InterAgentCommunication {
 
     pub fn to_response_input_item(&self) -> ResponseInputItem {
         let mut communication = self.clone();
-        communication.id = None;
         communication.internal_chat_message_metadata_passthrough = None;
         ResponseInputItem::Message {
             role: "assistant".to_string(),
@@ -793,7 +783,7 @@ impl InterAgentCommunication {
             }],
         };
         ResponseItem::AgentMessage {
-            id: self.id.clone(),
+            id: None,
             author: self.author.to_string(),
             recipient: self.recipient.to_string(),
             content,
@@ -876,8 +866,15 @@ pub enum AskForApproval {
     #[strum(serialize = "untrusted")]
     UnlessTrusted,
 
+    /// DEPRECATED: *All* commands are auto‑approved, but they are expected to
+    /// run inside a sandbox where network access is disabled and writes are
+    /// confined to a specific set of paths. If the command fails, it will be
+    /// escalated to the user to approve execution without a sandbox.
+    /// Prefer `OnRequest` for interactive runs or `Never` for non-interactive
+    /// runs.
+    OnFailure,
+
     /// The model decides when to ask the user for approval.
-    #[serde(alias = "on-failure")]
     #[default]
     OnRequest,
 
@@ -1696,7 +1693,6 @@ pub enum NonSteerableTurnKind {
 #[ts(rename_all = "snake_case")]
 pub enum CodexErrorInfo {
     ContextWindowExceeded,
-    SessionBudgetExceeded,
     UsageLimitExceeded,
     ServerOverloaded,
     CyberPolicy,
@@ -1734,7 +1730,6 @@ impl CodexErrorInfo {
         match self {
             Self::ThreadRollbackFailed | Self::ActiveTurnNotSteerable { .. } => false,
             Self::ContextWindowExceeded
-            | Self::SessionBudgetExceeded
             | Self::UsageLimitExceeded
             | Self::ServerOverloaded
             | Self::CyberPolicy
@@ -2460,7 +2455,7 @@ pub struct ConversationPathResponseEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ResumedHistory {
     pub conversation_id: ThreadId,
-    pub history: Arc<Vec<RolloutItem>>,
+    pub history: Vec<RolloutItem>,
     pub rollout_path: Option<PathBuf>,
 }
 
@@ -2505,11 +2500,11 @@ impl InitialHistory {
         }
     }
 
-    pub fn get_rollout_items(&self) -> &[RolloutItem] {
+    pub fn get_rollout_items(&self) -> Vec<RolloutItem> {
         match self {
-            InitialHistory::New | InitialHistory::Cleared => &[],
-            InitialHistory::Resumed(resumed) => &resumed.history,
-            InitialHistory::Forked(items) => items,
+            InitialHistory::New | InitialHistory::Cleared => Vec::new(),
+            InitialHistory::Resumed(resumed) => resumed.history.clone(),
+            InitialHistory::Forked(items) => items.clone(),
         }
     }
 
@@ -2571,12 +2566,6 @@ impl InitialHistory {
         }
     }
 
-    pub fn get_selected_capability_roots(&self) -> Vec<SelectedCapabilityRoot> {
-        self.get_session_meta()
-            .map(|meta| meta.selected_capability_roots.clone())
-            .unwrap_or_default()
-    }
-
     pub fn get_multi_agent_version(&self) -> Option<MultiAgentVersion> {
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
@@ -2603,9 +2592,7 @@ impl InitialHistory {
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
-                | RolloutItem::WorldState(_)
                 | RolloutItem::EventMsg(_) => None,
             })
             .and_then(|turn_context| turn_context.multi_agent_mode)
@@ -2621,31 +2608,9 @@ impl InitialHistory {
             .and_then(|meta| meta.thread_source.clone())
     }
 
-    pub fn get_session_originator(&self) -> Option<String> {
-        self.get_session_meta()
-            .map(|meta| meta.originator.clone())
-            .filter(|originator| !originator.is_empty())
-    }
-
     pub fn get_resumed_parent_thread_id(&self) -> Option<ThreadId> {
         self.get_resumed_session_meta()
             .and_then(|meta| meta.parent_thread_id)
-    }
-
-    fn get_session_meta(&self) -> Option<&SessionMeta> {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
-                    _ => None,
-                })
-            }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
-                _ => None,
-            }),
-        }
     }
 
     fn get_resumed_session_meta(&self) -> Option<&SessionMeta> {
@@ -2939,9 +2904,7 @@ fn multi_agent_version_from_items(
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
-            | RolloutItem::WorldState(_)
             | RolloutItem::EventMsg(_) => None,
         })
     })
@@ -2954,18 +2917,6 @@ pub enum MultiAgentVersion {
     Disabled,
     V1,
     V2,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
-pub struct SessionContextWindow {
-    /// UUIDv7 identity of this context window.
-    pub window_id: String,
-}
-
-impl SessionContextWindow {
-    pub fn new(window_id: String) -> Self {
-        Self { window_id }
-    }
 }
 
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
@@ -3010,16 +2961,10 @@ pub struct SessionMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
-    /// Capability roots selected for this thread by the hosting platform.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub selected_capability_roots: Vec<SelectedCapabilityRoot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_agent_version: Option<MultiAgentVersion>,
-    /// Initial context-window identity for consumers that tail rollout JSONL before compaction.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<SessionContextWindow>,
 }
 
 impl Default for SessionMeta {
@@ -3042,10 +2987,8 @@ impl Default for SessionMeta {
             model_provider: None,
             base_instructions: None,
             dynamic_tools: None,
-            selected_capability_roots: Vec::new(),
             memory_mode: None,
             multi_agent_version: None,
-            context_window: None,
         }
     }
 }
@@ -3092,34 +3035,11 @@ impl<'de> Deserialize<'de> for SessionMetaLine {
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
     ResponseItem(ResponseItem),
-    /// Legacy delivery item reconstructed as a model-visible `agent_message`.
+    /// Durable delivery metadata reconstructed as a model-visible `agent_message`.
     InterAgentCommunication(InterAgentCommunication),
-    /// Local delivery metadata that is not part of the Responses API item.
-    InterAgentCommunicationMetadata {
-        trigger_turn: bool,
-    },
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
-    WorldState(WorldStateItem),
     EventMsg(EventMsg),
-}
-
-/// Persisted comparison state used to resume model-visible world-state diffing.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
-pub struct WorldStateItem {
-    /// Full snapshots establish a new baseline; patches update the current baseline.
-    pub full: bool,
-    pub state: Value,
-}
-
-impl WorldStateItem {
-    pub fn full(state: Value) -> Self {
-        Self { full: true, state }
-    }
-
-    pub fn patch(state: Value) -> Self {
-        Self { full: false, state }
-    }
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, JsonSchema, TS)]
@@ -3480,11 +3400,8 @@ pub struct ExecCommandEndEvent {
 pub struct ViewImageToolCallEvent {
     /// Identifier for the originating tool call.
     pub call_id: String,
-    /// Filesystem path resolved for the selected environment.
-    ///
-    /// This core event is not exposed directly in the app-server API. App-server
-    /// converts the path to `LegacyAppPathString` when building its public item.
-    pub path: PathUri,
+    /// Local filesystem path provided to the tool.
+    pub path: AbsolutePathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -4437,7 +4354,6 @@ mod tests {
     #[test]
     fn inter_agent_communication_response_input_item_preserves_commentary_phase() {
         let mut communication = InterAgentCommunication {
-            id: Some("amsg_1".to_string()),
             author: AgentPath::root(),
             recipient: AgentPath::root().join("reviewer").expect("recipient path"),
             other_recipients: vec![AgentPath::root().join("worker").expect("recipient path")],
@@ -4448,7 +4364,6 @@ mod tests {
         };
         communication.set_turn_id_if_missing("turn-1");
         let mut serialized_communication = communication.clone();
-        serialized_communication.id = None;
         serialized_communication.internal_chat_message_metadata_passthrough = None;
 
         assert_eq!(
@@ -5515,20 +5430,6 @@ mod tests {
         assert_eq!(item.network, None);
         assert_eq!(item.file_system_sandbox_policy, None);
         assert_eq!(item.comp_hash, None);
-        Ok(())
-    }
-
-    #[test]
-    fn turn_context_item_deserializes_legacy_on_failure_as_on_request() -> Result<()> {
-        let item: TurnContextItem = serde_json::from_value(json!({
-            "cwd": test_path_buf("/tmp"),
-            "approval_policy": "on-failure",
-            "sandbox_policy": { "type": "danger-full-access" },
-            "model": "gpt-5",
-            "summary": "auto",
-        }))?;
-
-        assert_eq!(item.approval_policy, AskForApproval::OnRequest);
         Ok(())
     }
 

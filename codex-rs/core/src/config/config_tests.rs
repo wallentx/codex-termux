@@ -4,7 +4,6 @@ use crate::config::edit::apply_blocking;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
-use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ProfileV2Name;
 use codex_config::RequirementSource;
@@ -114,7 +113,6 @@ use tempfile::TempDir;
 
 fn stdio_mcp(command: &str) -> McpServerConfig {
     McpServerConfig {
-        auth: Default::default(),
         transport: McpServerTransportConfig::Stdio {
             command: command.to_string(),
             args: Vec::new(),
@@ -141,7 +139,6 @@ fn stdio_mcp(command: &str) -> McpServerConfig {
 
 fn http_mcp(url: &str) -> McpServerConfig {
     McpServerConfig {
-        auth: Default::default(),
         transport: McpServerTransportConfig::StreamableHttp {
             url: url.to_string(),
             bearer_token_env_var: None,
@@ -477,12 +474,10 @@ async fn load_config_resolves_token_budget_config() -> std::io::Result<()> {
 enabled = true
 reminder_threshold_tokens = 16000
 reminder_message_template = "Custom reminder: {n_remaining} tokens."
-guidance_message = "Preserve important state before compaction."
 "#,
             TokenBudgetConfig {
                 reminder_threshold_tokens: Some(16_000),
                 reminder_message_template: "Custom reminder: {n_remaining} tokens.".to_string(),
-                guidance_message: Some("Preserve important state before compaction.".to_string()),
             },
         ),
     ] {
@@ -625,16 +620,12 @@ current_time_reminder = true
             r#"
 [features.current_time_reminder]
 enabled = true
-reminder_interval_seconds = 0
+reminder_interval_model_requests = 4
 clock_source = "external"
-delivery_mode = "after_user_or_tool_output"
-sleep_tool = true
 "#,
             CurrentTimeReminderConfig {
-                reminder_interval_seconds: 0,
+                reminder_interval_model_requests: 4,
                 clock_source: CurrentTimeSource::External,
-                delivery_mode: CurrentTimeReminderDeliveryMode::AfterUserOrToolOutput,
-                sleep_tool: true,
             },
         ),
     ] {
@@ -642,6 +633,26 @@ sleep_tool = true
         assert!(config.features.enabled(Feature::CurrentTimeReminder));
         assert_eq!(config.current_time_reminder, Some(expected));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_rejects_zero_current_time_reminder_interval() -> std::io::Result<()> {
+    let error = load_current_time_reminder_config(
+        r#"
+[features.current_time_reminder]
+enabled = true
+reminder_interval_model_requests = 0
+"#,
+    )
+    .await
+    .expect_err("zero reminder interval should be rejected");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "features.current_time_reminder.reminder_interval_model_requests must be positive"
+    );
     Ok(())
 }
 
@@ -4390,7 +4401,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
     let refreshed_layer_stack = ConfigLayerStack::new(
         vec![
             ConfigLayerEntry::new(
-                ConfigLayerSource::User {
+                codex_app_server_protocol::ConfigLayerSource::User {
                     file: user_file.clone(),
                     profile: None,
                 },
@@ -4405,7 +4416,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
                 .into(),
             ),
             ConfigLayerEntry::new(
-                ConfigLayerSource::Project {
+                codex_app_server_protocol::ConfigLayerSource::Project {
                     dot_codex_folder: project_dot_codex.clone(),
                 },
                 toml::toml! {
@@ -4415,7 +4426,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
                 .into(),
             ),
             ConfigLayerEntry::new(
-                ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
+                codex_app_server_protocol::ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
                 toml::toml! {
                     [mcp_servers.managed_overrides_session]
                     command = "managed-command"
@@ -4445,7 +4456,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
     let thread_layer_stack = ConfigLayerStack::new(
         vec![
             ConfigLayerEntry::new(
-                ConfigLayerSource::User {
+                codex_app_server_protocol::ConfigLayerSource::User {
                     file: user_file.clone(),
                     profile: None,
                 },
@@ -4460,7 +4471,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
                 .into(),
             ),
             ConfigLayerEntry::new(
-                ConfigLayerSource::Project {
+                codex_app_server_protocol::ConfigLayerSource::Project {
                     dot_codex_folder: project_dot_codex,
                 },
                 toml::toml! {
@@ -4470,7 +4481,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
                 .into(),
             ),
             ConfigLayerEntry::new(
-                ConfigLayerSource::SessionFlags,
+                codex_app_server_protocol::ConfigLayerSource::SessionFlags,
                 toml::toml! {
                     [mcp_servers.session_overrides_user]
                     command = "session-command"
@@ -4482,7 +4493,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
                 .into(),
             ),
             ConfigLayerEntry::new(
-                ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
+                codex_app_server_protocol::ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
                 toml::toml! {
                     [mcp_servers.managed_overrides_session]
                     command = "old-managed-command"
@@ -4576,7 +4587,7 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
     let user_file = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home.path());
     let refreshed_layer_stack = ConfigLayerStack::new(
         vec![ConfigLayerEntry::new(
-            ConfigLayerSource::User {
+            codex_app_server_protocol::ConfigLayerSource::User {
                 file: user_file.clone(),
                 profile: None,
             },
@@ -4605,7 +4616,7 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
     .await?;
     let thread_layer_stack = ConfigLayerStack::new(
         vec![ConfigLayerEntry::new(
-            ConfigLayerSource::User {
+            codex_app_server_protocol::ConfigLayerSource::User {
                 file: user_file,
                 profile: None,
             },
@@ -5550,7 +5561,6 @@ async fn replace_mcp_servers_round_trips_entries() -> anyhow::Result<()> {
     servers.insert(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "echo".to_string(),
                 args: vec!["hello".to_string()],
@@ -5908,7 +5918,6 @@ async fn replace_mcp_servers_serializes_env_sorted() -> anyhow::Result<()> {
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "docs-server".to_string(),
                 args: vec!["--verbose".to_string()],
@@ -5988,7 +5997,6 @@ async fn replace_mcp_servers_serializes_env_vars() -> anyhow::Result<()> {
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "docs-server".to_string(),
                 args: Vec::new(),
@@ -6044,7 +6052,6 @@ async fn replace_mcp_servers_serializes_sourced_env_vars() -> anyhow::Result<()>
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "docs-server".to_string(),
                 args: Vec::new(),
@@ -6103,7 +6110,6 @@ async fn replace_mcp_servers_serializes_cwd() -> anyhow::Result<()> {
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "docs-server".to_string(),
                 args: Vec::new(),
@@ -6159,7 +6165,6 @@ async fn replace_mcp_servers_streamable_http_serializes_bearer_token() -> anyhow
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::StreamableHttp {
                 url: "https://example.com/mcp".to_string(),
                 bearer_token_env_var: Some("MCP_TOKEN".to_string()),
@@ -6227,7 +6232,6 @@ async fn replace_mcp_servers_streamable_http_serializes_custom_headers() -> anyh
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::StreamableHttp {
                 url: "https://example.com/mcp".to_string(),
                 bearer_token_env_var: Some("MCP_TOKEN".to_string()),
@@ -6310,7 +6314,6 @@ async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyh
     let mut servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::StreamableHttp {
                 url: "https://example.com/mcp".to_string(),
                 bearer_token_env_var: Some("MCP_TOKEN".to_string()),
@@ -6349,7 +6352,6 @@ async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyh
     servers.insert(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::StreamableHttp {
                 url: "https://example.com/mcp".to_string(),
                 bearer_token_env_var: None,
@@ -6417,7 +6419,6 @@ async fn replace_mcp_servers_streamable_http_isolates_headers_between_servers() 
         (
             "docs".to_string(),
             McpServerConfig {
-                auth: Default::default(),
                 transport: McpServerTransportConfig::StreamableHttp {
                     url: "https://example.com/mcp".to_string(),
                     bearer_token_env_var: Some("MCP_TOKEN".to_string()),
@@ -6446,7 +6447,6 @@ async fn replace_mcp_servers_streamable_http_isolates_headers_between_servers() 
         (
             "logs".to_string(),
             McpServerConfig {
-                auth: Default::default(),
                 transport: McpServerTransportConfig::Stdio {
                     command: "logs-server".to_string(),
                     args: vec!["--follow".to_string()],
@@ -6535,7 +6535,6 @@ async fn replace_mcp_servers_serializes_disabled_flag() -> anyhow::Result<()> {
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "docs-server".to_string(),
                 args: Vec::new(),
@@ -6586,7 +6585,6 @@ async fn replace_mcp_servers_serializes_required_flag() -> anyhow::Result<()> {
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "docs-server".to_string(),
                 args: Vec::new(),
@@ -6637,7 +6635,6 @@ async fn replace_mcp_servers_serializes_tool_filters() -> anyhow::Result<()> {
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "docs-server".to_string(),
                 args: Vec::new(),
@@ -6693,7 +6690,6 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
     let servers = BTreeMap::from([(
         "docs".to_string(),
         McpServerConfig {
-            auth: Default::default(),
             transport: McpServerTransportConfig::StreamableHttp {
                 url: "https://example.com/mcp".to_string(),
                 bearer_token_env_var: None,
@@ -7197,7 +7193,7 @@ config_file = "./agents/researcher.toml"
     .expect("agent role layer config should parse");
     let config_layer_stack = codex_config::ConfigLayerStack::new(
         vec![codex_config::ConfigLayerEntry::new(
-            ConfigLayerSource::User {
+            codex_app_server_protocol::ConfigLayerSource::User {
                 file: codex_home.path().join(CONFIG_TOML_FILE).abs(),
                 profile: None,
             },
@@ -8276,7 +8272,7 @@ model_provider = "openai-custom"
 [profiles.zdr]
 model = "o3"
 model_provider = "openai"
-approval_policy = "on-request"
+approval_policy = "on-failure"
 
 [profiles.zdr.analytics]
 enabled = false
@@ -8284,7 +8280,7 @@ enabled = false
 [profiles.gpt5]
 model = "gpt-5.4"
 model_provider = "openai"
-approval_policy = "on-request"
+approval_policy = "on-failure"
 model_reasoning_effort = "high"
 model_reasoning_summary = "detailed"
 model_verbosity = "high"
@@ -8683,7 +8679,6 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
         hooks: None,
         mcp_servers: None,
         plugins: None,
-        marketplaces: None,
         apps: None,
         rules: None,
         enforce_residency: None,

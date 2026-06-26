@@ -679,7 +679,7 @@ pub(super) fn handle_patch_apply_end(
 pub(super) fn handle_view_image_tool_call(
     chat: &mut ChatWidget,
     call_id: impl Into<String>,
-    path: impl Into<LegacyAppPathString>,
+    path: AbsolutePathBuf,
 ) {
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -688,7 +688,7 @@ pub(super) fn handle_view_image_tool_call(
             completed_at_ms: 0,
             item: AppServerThreadItem::ImageView {
                 id: call_id.into(),
-                path: path.into(),
+                path,
             },
         }),
         /*replay_kind*/ None,

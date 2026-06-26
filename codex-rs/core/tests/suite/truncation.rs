@@ -383,7 +383,6 @@ async fn mcp_tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> 
         servers.insert(
             server_name.to_string(),
             codex_config::types::McpServerConfig {
-                auth: Default::default(),
                 transport: codex_config::types::McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),
@@ -482,7 +481,6 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
         servers.insert(
             server_name.to_string(),
             McpServerConfig {
-                auth: Default::default(),
                 transport: McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),
@@ -775,7 +773,6 @@ async fn mcp_tool_call_output_not_truncated_with_custom_limit() -> Result<()> {
         servers.insert(
             server_name.to_string(),
             codex_config::types::McpServerConfig {
-                auth: Default::default(),
                 transport: codex_config::types::McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),

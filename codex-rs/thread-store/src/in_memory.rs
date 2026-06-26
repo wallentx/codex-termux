@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -11,7 +10,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadMemoryMode;
@@ -30,7 +28,6 @@ use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadMetadataPatch;
 use crate::ThreadPage;
-use crate::ThreadRelationFilter;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
@@ -99,20 +96,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_threads_filters_by_spawn_relationship() {
+    async fn list_threads_filters_by_parent_thread_id() {
         let store = InMemoryThreadStore::default();
         let parent_thread_id = ThreadId::default();
         let child_thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread id");
         let unrelated_thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000002").expect("valid thread id");
-        let grandchild_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000003").expect("valid thread id");
 
         for (thread_id, parent_thread_id) in [
             (child_thread_id, Some(parent_thread_id)),
             (unrelated_thread_id, None),
-            (grandchild_thread_id, Some(child_thread_id)),
         ] {
             store
                 .create_thread(CreateThreadParams {
@@ -123,12 +117,9 @@ mod tests {
                     parent_thread_id,
                     source: SessionSource::Exec,
                     thread_source: None,
-                    originator: "test_originator".to_string(),
                     base_instructions: BaseInstructions::default(),
                     dynamic_tools: Vec::new(),
-                    selected_capability_roots: Vec::new(),
                     multi_agent_version: None,
-                    initial_window_id: uuid::Uuid::now_v7().to_string(),
                     metadata: ThreadPersistenceMetadata {
                         cwd: None,
                         model_provider: "test-provider".to_string(),
@@ -151,7 +142,7 @@ mod tests {
                 cwd_filters: None,
                 archived: false,
                 search_term: None,
-                relation_filter: Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id)),
+                parent_thread_id: Some(parent_thread_id),
                 use_state_db_only: false,
             },
         )
@@ -164,33 +155,6 @@ mod tests {
                 .map(|item| item.thread_id)
                 .collect::<Vec<_>>(),
             vec![child_thread_id]
-        );
-
-        let page = ThreadStore::list_threads(
-            &store,
-            ListThreadsParams {
-                page_size: 10,
-                cursor: None,
-                sort_key: ThreadSortKey::CreatedAt,
-                sort_direction: SortDirection::Desc,
-                allowed_sources: Vec::new(),
-                model_providers: None,
-                cwd_filters: None,
-                archived: false,
-                search_term: None,
-                relation_filter: Some(ThreadRelationFilter::DescendantsOf(parent_thread_id)),
-                use_state_db_only: false,
-            },
-        )
-        .await
-        .expect("list descendant threads");
-
-        assert_eq!(
-            page.items
-                .into_iter()
-                .map(|item| item.thread_id)
-                .collect::<HashSet<_>>(),
-            HashSet::from([child_thread_id, grandchild_thread_id])
         );
     }
 }
@@ -276,17 +240,14 @@ impl InMemoryThreadStore {
             agent_nickname: params.source.get_nickname(),
             agent_role: params.source.get_agent_role(),
             agent_path: params.source.get_agent_path().map(Into::into),
-            originator: params.originator.clone(),
             source: params.source.clone(),
             thread_source: params.thread_source.clone(),
             model_provider: Some(params.metadata.model_provider.clone()),
             base_instructions: Some(params.base_instructions.clone()),
             dynamic_tools: (!params.dynamic_tools.is_empty()).then(|| params.dynamic_tools.clone()),
-            selected_capability_roots: params.selected_capability_roots.clone(),
             memory_mode: matches!(params.metadata.memory_mode, ThreadMemoryMode::Disabled)
                 .then_some("disabled".to_string()),
             multi_agent_version: params.multi_agent_version,
-            context_window: Some(SessionContextWindow::new(params.initial_window_id.clone())),
             ..SessionMeta::default()
         };
         state
@@ -305,9 +266,7 @@ impl InMemoryThreadStore {
         let mut state = self.state.lock().await;
         state.calls.resume_thread += 1;
         if let Some(history) = params.history {
-            state
-                .histories
-                .insert(params.thread_id, Arc::unwrap_or_clone(history));
+            state.histories.insert(params.thread_id, history);
         } else {
             state.histories.entry(params.thread_id).or_default();
         }
@@ -497,33 +456,9 @@ impl ThreadStore for InMemoryThreadStore {
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage> {
         Box::pin(async move {
             let mut page = InMemoryThreadStore::list_threads(self).await?;
-            match params.relation_filter {
-                Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {
-                    page.items
-                        .retain(|thread| thread.parent_thread_id == Some(parent_thread_id));
-                }
-                Some(ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) => {
-                    let mut subtree = HashSet::from([ancestor_thread_id]);
-                    loop {
-                        let mut discovered = false;
-                        for thread in &page.items {
-                            if thread
-                                .parent_thread_id
-                                .is_some_and(|parent_thread_id| subtree.contains(&parent_thread_id))
-                            {
-                                discovered |= subtree.insert(thread.thread_id);
-                            }
-                        }
-                        if !discovered {
-                            break;
-                        }
-                    }
-                    page.items.retain(|thread| {
-                        thread.thread_id != ancestor_thread_id
-                            && subtree.contains(&thread.thread_id)
-                    });
-                }
-                None => {}
+            if let Some(parent_thread_id) = params.parent_thread_id {
+                page.items
+                    .retain(|thread| thread.parent_thread_id == Some(parent_thread_id));
             }
             Ok(page)
         })

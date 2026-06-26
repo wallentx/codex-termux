@@ -1,6 +1,6 @@
 use super::input_queue::InputQueue;
 use super::*;
-use crate::agents_md_manager::AgentsMdManager;
+use crate::agents_md::LoadedAgentsMd;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -8,15 +8,14 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
 use crate::state::ActiveTurn;
 use codex_extension_api::ExtensionDataInit;
-use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_protocol::SessionId;
-use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
@@ -58,6 +57,10 @@ pub(crate) struct SessionConfiguration {
 
     /// Developer instructions that supplement the base instructions.
     pub(super) developer_instructions: Option<String>,
+
+    /// Model instructions assembled from provider instructions and discovered
+    /// AGENTS.md files.
+    pub(super) loaded_agents_md: Option<LoadedAgentsMd>,
 
     /// Personality preference for the model.
     pub(super) personality: Option<Personality>,
@@ -102,8 +105,6 @@ pub(crate) struct SessionConfiguration {
     pub(super) parent_thread_id: Option<ThreadId>,
     /// Optional analytics source classification for this thread.
     pub(super) thread_source: Option<ThreadSource>,
-    /// Effective originator used for this thread's Responses requests and analytics events.
-    pub(super) originator: String,
     pub(super) dynamic_tools: Vec<DynamicToolSpec>,
     pub(super) user_shell_override: Option<shell::Shell>,
 }
@@ -195,7 +196,6 @@ impl SessionConfiguration {
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
             thread_source: self.thread_source.clone(),
-            originator: self.originator.clone(),
         }
     }
 
@@ -467,11 +467,6 @@ impl Session {
         self.services.agent_control.session_id()
     }
 
-    pub(crate) async fn originator(&self) -> String {
-        let state = self.state.lock().await;
-        state.session_configuration.originator.clone()
-    }
-
     #[instrument(name = "session_init", level = "info", skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
@@ -545,7 +540,6 @@ impl Session {
                 SessionId::from(thread_id)
             }
         });
-        let initial_auto_compact_window_ids = AutoCompactWindowIds::new_initial();
         let agent_control = agent_control.with_session_id(
             session_id,
             config
@@ -556,10 +550,6 @@ impl Session {
             config.current_time_reminder.as_ref(),
             external_time_provider,
         )?;
-        let selected_capability_roots = thread_extension_init
-            .get::<Vec<SelectedCapabilityRoot>>()
-            .map(|roots| roots.as_ref().clone())
-            .unwrap_or_else(|| initial_history.get_selected_capability_roots());
         let mcp_thread_init = thread_extension_init.clone();
         let thread_extension_data = codex_extension_api::ExtensionData::new_with_init(
             thread_id.to_string(),
@@ -584,16 +574,11 @@ impl Session {
                             parent_thread_id,
                             source: session_source,
                             thread_source: session_configuration.thread_source.clone(),
-                            originator: session_configuration.originator.clone(),
                             base_instructions: BaseInstructions {
                                 text: session_configuration.base_instructions.clone(),
                             },
                             dynamic_tools: session_configuration.dynamic_tools.clone(),
-                            selected_capability_roots: selected_capability_roots.clone(),
                             multi_agent_version: initial_multi_agent_version,
-                            initial_window_id: initial_auto_compact_window_ids
-                                .window_id
-                                .to_string(),
                             metadata: ThreadPersistenceMetadata {
                                 cwd: Some(config.cwd.to_path_buf()),
                                 model_provider: config.model_provider_id.clone(),
@@ -654,10 +639,6 @@ impl Session {
         let config_for_mcp = Arc::clone(&config);
         let mcp_manager_for_mcp = Arc::clone(&mcp_manager);
         let mcp_thread_init_for_startup = &mcp_thread_init;
-        let mcp_runtime_context_for_auth = McpRuntimeContext::new(
-            Arc::clone(&environment_manager),
-            session_configuration.cwd().to_path_buf(),
-        );
         let auth_and_mcp_fut = async move {
             let auth = auth_manager_clone.auth().await;
             let mcp_config = mcp_manager_for_mcp
@@ -670,7 +651,6 @@ impl Session {
                 config_for_mcp.mcp_oauth_credentials_store_mode,
                 config_for_mcp.auth_keyring_backend_kind(),
                 auth.as_ref(),
-                &mcp_runtime_context_for_auth,
             )
             .await;
             (auth, mcp_servers, auth_statuses, tool_plugin_provenance)
@@ -762,11 +742,20 @@ impl Session {
             ) {
                 post_session_configured_events.push(event);
             }
+            if config.permissions.approval_policy.value() == AskForApproval::OnFailure {
+                post_session_configured_events.push(Event {
+                    id: "".to_owned(),
+                    msg: EventMsg::Warning(WarningEvent {
+                        message: "`on-failure` approval policy is deprecated and will be removed in a future release. Use `on-request` for interactive approvals or `never` for non-interactive runs.".to_string(),
+                    }),
+                });
+            }
+
             let auth = auth.as_ref();
             let auth_mode = auth.map(CodexAuth::auth_mode).map(TelemetryAuthMode::from);
             let account_id = auth.and_then(CodexAuth::get_account_id);
             let account_email = auth.and_then(CodexAuth::get_account_email);
-            let originator = session_configuration.originator.clone();
+            let originator = originator().value;
             let terminal_type = user_agent();
             let session_model = session_configuration.collaboration_mode.model().to_string();
             let auth_env_telemetry = collect_auth_env_telemetry(
@@ -869,10 +858,12 @@ impl Session {
             ));
             turn_environments.update_selections(session_configuration.environment_selections());
             let resolved_environments = turn_environments.snapshot().await;
-            let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
-            agents_md_manager
-                .refresh(config.as_ref(), &resolved_environments)
-                .await;
+            session_configuration.loaded_agents_md = load_project_instructions(
+                config.as_ref(),
+                user_instructions,
+                &resolved_environments,
+            )
+            .await;
             let plugin_skill_errors = warm_plugins_and_skills_for_session_init(
                 Arc::clone(&config),
                 Arc::clone(&plugins_manager),
@@ -901,10 +892,7 @@ impl Session {
             session_configuration.thread_name = thread_name.clone();
             validate_config_lock_if_configured(&session_configuration).await?;
             export_config_lock_if_configured(&session_configuration, thread_id).await?;
-            let state = SessionState::new_with_auto_compact_window_ids(
-                session_configuration.clone(),
-                initial_auto_compact_window_ids,
-            );
+            let state = SessionState::new(session_configuration.clone());
             let managed_network_requirements_configured = config
                 .config_layer_stack
                 .requirements_toml()
@@ -1040,14 +1028,12 @@ impl Session {
                 guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
                 runtime_handle: tokio::runtime::Handle::current(),
                 skills_service,
-                agents_md_manager,
                 plugins_manager: Arc::clone(&plugins_manager),
                 mcp_manager: Arc::clone(&mcp_manager),
                 extensions,
                 // TODO(jif): extract session to share between sub-agents
                 session_extension_data,
                 thread_extension_data,
-                selected_capability_roots,
                 mcp_thread_init,
                 supports_openai_form_elicitation: std::sync::atomic::AtomicBool::new(
                     supports_openai_form_elicitation,
@@ -1064,15 +1050,9 @@ impl Session {
                 time_provider,
                 model_client: ModelClient::new(
                     Some(Arc::clone(&auth_manager)),
-                    if config.features.enabled(Feature::UseAgentIdentity) {
-                        AgentIdentityAuthPolicy::ChatGptAuth
-                    } else {
-                        AgentIdentityAuthPolicy::JwtOnly
-                    },
                     thread_id,
                     session_configuration.provider.clone(),
                     session_configuration.session_source.clone(),
-                    session_configuration.originator.clone(),
                     config.model_verbosity,
                     config.features.enabled(Feature::EnableRequestCompression),
                     config.features.enabled(Feature::RuntimeMetrics),
@@ -1152,6 +1132,9 @@ impl Session {
                 sess.send_event_raw(event).await;
             }
 
+            let host_owned_codex_apps_enabled = config
+                .features
+                .apps_enabled_for_auth(auth.as_ref().is_some_and(|auth| auth.uses_codex_backend()));
             let client_elicitation_capability = if config.features.enabled(Feature::AuthElicitation) {
                 ElicitationCapability {
                     form: Some(FormElicitationCapability::default()),
@@ -1193,8 +1176,8 @@ impl Session {
                 session_configuration.permission_profile(),
                 mcp_runtime_context,
                 config.codex_home.to_path_buf(),
-                sess.services.mcp_manager.codex_apps_tools_cache(),
                 codex_apps_tools_cache_key(auth),
+                host_owned_codex_apps_enabled,
                 config.prefix_mcp_tool_names(),
                 client_elicitation_capability,
                 sess.services

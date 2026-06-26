@@ -1,6 +1,4 @@
 use crate::identity::SandboxCreds;
-use crate::ipc_framed::ErrorPayload;
-use crate::ipc_framed::ErrorStage;
 use crate::ipc_framed::FramedMessage;
 use crate::ipc_framed::IPC_PROTOCOL_VERSION;
 use crate::ipc_framed::Message;
@@ -31,7 +29,6 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
 use windows_sys::Win32::Foundation::DuplicateHandle;
 use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
-use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
 use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -66,84 +63,14 @@ impl std::fmt::Display for RunnerLogonError {
 
 impl std::error::Error for RunnerLogonError {}
 
-#[derive(Debug)]
-pub(crate) struct RunnerStartupError {
-    payload: ErrorPayload,
-}
-
-impl RunnerStartupError {
-    pub(crate) fn new(payload: ErrorPayload) -> Self {
-        Self { payload }
-    }
-}
-
-impl std::fmt::Display for RunnerStartupError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "runner failed during {:?}: {}",
-            self.payload.stage, self.payload.message
-        )?;
-        if let Some(code) = self.payload.windows_error_code {
-            write!(f, " (Windows error {code})")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for RunnerStartupError {}
-
 pub(crate) struct RunnerTransport {
     pipe_write: File,
     pipe_read: File,
 }
 
-fn is_refreshable_windows_error(code: u32) -> bool {
-    matches!(code, ERROR_LOGON_FAILURE | ERROR_NO_SUCH_LOGON_SESSION)
-}
-
-fn command_targets_windows_apps(command: &[String]) -> bool {
-    command.first().is_some_and(|program| {
-        Path::new(program).components().any(|component| {
-            component
-                .as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("WindowsApps")
-        })
-    })
-}
-
-pub(crate) fn is_refreshable_sandbox_creds_error(err: &anyhow::Error, command: &[String]) -> bool {
-    if err
-        .downcast_ref::<RunnerLogonError>()
-        .is_some_and(|err| is_refreshable_windows_error(err.code))
-    {
-        return true;
-    }
-
-    err.downcast_ref::<RunnerStartupError>().is_some_and(|err| {
-        err.payload.stage == ErrorStage::SpawnChild
-            && err.payload.windows_error_code.is_some_and(|code| {
-                // AppX activation can return 1312 for a healthy sandbox token. Rotating the
-                // account password cannot make the same WindowsApps command launch.
-                is_refreshable_windows_error(code)
-                    && (code != ERROR_NO_SUCH_LOGON_SESSION
-                        || !command_targets_windows_apps(command))
-            })
-    })
-}
-
-pub(crate) fn retry_runner_spawn_once<T>(
-    sandbox_creds: SandboxCreds,
-    command: &[String],
-    mut spawn: impl FnMut(SandboxCreds) -> Result<T>,
-    refresh: impl FnOnce() -> Result<SandboxCreds>,
-) -> Result<T> {
-    match spawn(sandbox_creds) {
-        Ok(result) => Ok(result),
-        Err(err) if is_refreshable_sandbox_creds_error(&err, command) => spawn(refresh()?),
-        Err(err) => Err(err),
-    }
+pub(crate) fn is_stale_sandbox_creds_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RunnerLogonError>()
+        .is_some_and(|err| err.code == ERROR_LOGON_FAILURE)
 }
 
 impl RunnerTransport {
@@ -163,7 +90,7 @@ impl RunnerTransport {
             .ok_or_else(|| anyhow::anyhow!("runner pipe closed before spawn_ready"))?;
         match msg.message {
             Message::SpawnReady { .. } => Ok(()),
-            Message::Error { payload } => Err(RunnerStartupError::new(payload).into()),
+            Message::Error { payload } => Err(anyhow::anyhow!("runner error: {}", payload.message)),
             other => Err(anyhow::anyhow!(
                 "expected spawn_ready from runner, got {other:?}"
             )),
@@ -489,67 +416,20 @@ fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::RunnerLogonError;
-    use super::RunnerStartupError;
-    use super::is_refreshable_sandbox_creds_error;
-    use crate::ipc_framed::ErrorPayload;
-    use crate::ipc_framed::ErrorStage;
+    use super::is_stale_sandbox_creds_error;
     use pretty_assertions::assert_eq;
     use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
-    use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
     use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
 
     #[test]
-    fn refreshable_sandbox_creds_error_recognizes_credential_and_child_start_failures() {
+    fn stale_sandbox_creds_error_recognizes_logon_failures() {
         assert_eq!(
-            [
-                ERROR_LOGON_FAILURE,
-                ERROR_NO_SUCH_LOGON_SESSION,
-                ERROR_NOT_FOUND,
-            ]
-            .map(|code| {
+            [ERROR_LOGON_FAILURE, ERROR_NOT_FOUND].map(|code| {
                 let err =
                     anyhow::Error::new(RunnerLogonError { code }).context("runner launch failed");
-                is_refreshable_sandbox_creds_error(&err, &[])
+                is_stale_sandbox_creds_error(&err)
             }),
-            [true, true, false]
-        );
-
-        assert_eq!(
-            [
-                (ErrorStage::SpawnChild, ERROR_NO_SUCH_LOGON_SESSION),
-                (ErrorStage::SpawnChild, ERROR_NOT_FOUND),
-                (ErrorStage::ReadSpawnRequest, ERROR_NO_SUCH_LOGON_SESSION),
-            ]
-            .map(|(stage, windows_error_code)| {
-                let err = anyhow::Error::new(RunnerStartupError::new(ErrorPayload {
-                    message: "runner startup failed".to_string(),
-                    stage,
-                    windows_error_code: Some(windows_error_code),
-                }));
-                is_refreshable_sandbox_creds_error(&err, &["cmd.exe".to_string()])
-            }),
-            [true, false, false]
-        );
-
-        let windows_apps_commands = [
-            vec![
-                r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe".to_string(),
-            ],
-            vec![
-                r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe"
-                    .to_string(),
-            ],
-        ];
-        assert_eq!(
-            windows_apps_commands.map(|command| {
-                let err = anyhow::Error::new(RunnerStartupError::new(ErrorPayload {
-                    message: "runner startup failed".to_string(),
-                    stage: ErrorStage::SpawnChild,
-                    windows_error_code: Some(ERROR_NO_SUCH_LOGON_SESSION),
-                }));
-                is_refreshable_sandbox_creds_error(&err, &command)
-            }),
-            [false, false]
+            [true, false]
         );
     }
 }

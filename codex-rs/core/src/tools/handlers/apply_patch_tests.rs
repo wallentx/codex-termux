@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
-use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ToolInvocation;
 use crate::tools::hook_names::HookToolName;
@@ -30,11 +29,9 @@ fn sample_patch() -> &'static str {
 
 async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
     let (session, turn) = make_session_and_context().await;
-    let turn = Arc::new(turn);
     ToolInvocation {
         session: session.into(),
-        step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
+        turn: turn.into(),
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
         call_id: "call-apply-patch".to_string(),
