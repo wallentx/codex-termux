@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
 use codex_api::AuthProvider;
 use codex_api::SharedAuthProvider;
@@ -11,10 +10,7 @@ use http::HeaderValue;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use tokio::time::sleep;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async_with_config;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -29,7 +25,6 @@ use crate::EnvironmentRegistryRegistrationRequest;
 use crate::EnvironmentRegistryRegistrationResponse;
 use crate::ExecServerError;
 use crate::ExecServerRuntimePaths;
-use crate::ExecServerTelemetry;
 use crate::NoiseChannelIdentity;
 use crate::NoiseChannelPublicKey;
 use crate::NoiseRendezvousConnectBundle;
@@ -39,7 +34,6 @@ use crate::noise_relay::noise_relay_websocket_config;
 use crate::relay::HarnessKeyValidator;
 use crate::relay::run_multiplexed_environment;
 use crate::server::ConnectionProcessor;
-use crate::trace_context::current_trace_context_headers;
 
 const ERROR_BODY_PREVIEW_BYTES: usize = 4096;
 const NOISE_RELAY_SECURITY_PROFILE: &str = "noise_hybrid_ik_v1";
@@ -50,7 +44,6 @@ struct EnvironmentRegistryClient {
     auth_provider: SharedAuthProvider,
     http: reqwest::Client,
     connect_timeout: Duration,
-    telemetry: ExecServerTelemetry,
 }
 
 impl std::fmt::Debug for EnvironmentRegistryClient {
@@ -63,16 +56,7 @@ impl std::fmt::Debug for EnvironmentRegistryClient {
 }
 
 impl EnvironmentRegistryClient {
-    #[cfg(test)]
     fn new(base_url: String, auth_provider: SharedAuthProvider) -> Result<Self, ExecServerError> {
-        Self::new_with_telemetry(base_url, auth_provider, ExecServerTelemetry::default())
-    }
-
-    fn new_with_telemetry(
-        base_url: String,
-        auth_provider: SharedAuthProvider,
-        telemetry: ExecServerTelemetry,
-    ) -> Result<Self, ExecServerError> {
         let base_url = normalize_base_url(base_url)?;
         Ok(Self {
             base_url,
@@ -81,38 +65,12 @@ impl EnvironmentRegistryClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
-            telemetry,
         })
     }
 
     /// Register the executor public key and obtain the rendezvous allocation.
     /// The returned registration ID is included in each stream's Noise prologue.
-    #[tracing::instrument(
-        name = "codex.exec_server.remote.register",
-        skip_all,
-        fields(
-            otel.kind = "client",
-            otel.name = "codex.exec_server.remote.register",
-            result = tracing::field::Empty,
-        )
-    )]
     async fn register_environment(
-        &self,
-        environment_id: &str,
-        executor_public_key: &NoiseChannelPublicKey,
-    ) -> Result<EnvironmentRegistryRegistrationResponse, ExecServerError> {
-        let started_at = Instant::now();
-        let response = self
-            .register_environment_inner(environment_id, executor_public_key)
-            .await;
-        let result = if response.is_ok() { "success" } else { "error" };
-        tracing::Span::current().record("result", result);
-        self.telemetry
-            .remote_registration_completed(result, started_at.elapsed());
-        response
-    }
-
-    async fn register_environment_inner(
         &self,
         environment_id: &str,
         executor_public_key: &NoiseChannelPublicKey,
@@ -124,7 +82,6 @@ impl EnvironmentRegistryClient {
                 &format!("/cloud/environment/{environment_id}/register"),
             ))
             .headers(self.auth_provider.to_auth_headers())
-            .headers(current_trace_context_headers())
             .json(&EnvironmentRegistryRegistrationRequest {
                 security_profile: NOISE_RELAY_SECURITY_PROFILE.to_string(),
                 executor_public_key: executor_public_key.clone(),
@@ -311,11 +268,7 @@ impl NoiseRendezvousEnvironmentConfig {
     ) -> Result<Self, ExecServerError> {
         let environment_id = normalize_environment_id(environment_id)?;
         let auth_provider = static_bearer_auth_provider(bearer_token, chatgpt_account_id)?;
-        let client = EnvironmentRegistryClient::new_with_telemetry(
-            base_url,
-            auth_provider,
-            ExecServerTelemetry::default(),
-        )?;
+        let client = EnvironmentRegistryClient::new(base_url, auth_provider)?;
         Ok(Self {
             provider: Arc::new(EnvironmentRegistryNoiseConnectProvider {
                 client,
@@ -420,7 +373,6 @@ pub struct RemoteEnvironmentConfig {
     pub environment_id: String,
     pub name: String,
     auth_provider: SharedAuthProvider,
-    telemetry: ExecServerTelemetry,
 }
 
 impl std::fmt::Debug for RemoteEnvironmentConfig {
@@ -446,13 +398,7 @@ impl RemoteEnvironmentConfig {
             environment_id,
             name: "codex-exec-server".to_string(),
             auth_provider,
-            telemetry: ExecServerTelemetry::default(),
         })
-    }
-
-    pub fn with_telemetry(mut self, telemetry: ExecServerTelemetry) -> Self {
-        self.telemetry = telemetry;
-        self
     }
 }
 
@@ -472,13 +418,9 @@ pub async fn run_remote_environment(
     runtime_paths: ExecServerRuntimePaths,
 ) -> Result<(), ExecServerError> {
     ensure_rustls_crypto_provider();
-    let client = EnvironmentRegistryClient::new_with_telemetry(
-        config.base_url.clone(),
-        config.auth_provider.clone(),
-        config.telemetry.clone(),
-    )?;
-    let processor =
-        ConnectionProcessor::new_with_telemetry(runtime_paths, config.telemetry.clone());
+    let client =
+        EnvironmentRegistryClient::new(config.base_url.clone(), config.auth_provider.clone())?;
+    let processor = ConnectionProcessor::new(runtime_paths);
     let identity = NoiseChannelIdentity::generate().map_err(|error| {
         ExecServerError::Protocol(format!("failed to generate Noise relay identity: {error}"))
     })?;
@@ -488,8 +430,14 @@ pub async fn run_remote_environment(
         .await?;
 
     loop {
-        match connect_rendezvous(&response.url, &config.telemetry).await {
-            Ok(websocket) => {
+        match connect_async_with_config(
+            response.url.as_str(),
+            Some(noise_relay_websocket_config()),
+            /*disable_nagle*/ false,
+        )
+        .await
+        {
+            Ok((websocket, _)) => {
                 backoff = Duration::from_secs(1);
                 let executor_registration_id = response.executor_registration_id.clone();
                 info!(
@@ -510,7 +458,6 @@ pub async fn run_remote_environment(
                     },
                 )
                 .await;
-                config.telemetry.remote_reconnect("disconnected");
             }
             Err(error) => {
                 let registration_rejected = matches!(
@@ -526,12 +473,9 @@ pub async fn run_remote_environment(
                 );
                 debug!(error = %error, "Noise executor rendezvous connection error");
                 if registration_rejected {
-                    config.telemetry.remote_reconnect("registration_rejected");
                     response = client
                         .register_environment(&config.environment_id, &identity.public_key())
                         .await?;
-                } else {
-                    config.telemetry.remote_reconnect("connect_failed");
                 }
             }
         }
@@ -539,43 +483,6 @@ pub async fn run_remote_environment(
         sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
-}
-
-#[tracing::instrument(
-    name = "codex.exec_server.remote.rendezvous.connect",
-    skip_all,
-    fields(
-        otel.kind = "client",
-        otel.name = "codex.exec_server.remote.rendezvous.connect",
-        result = tracing::field::Empty,
-    )
-)]
-async fn connect_rendezvous(
-    url: &str,
-    telemetry: &ExecServerTelemetry,
-) -> Result<
-    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    tokio_tungstenite::tungstenite::Error,
-> {
-    let started_at = Instant::now();
-    let result = async {
-        let mut request = url.into_client_request()?;
-        request
-            .headers_mut()
-            .extend(current_trace_context_headers());
-        connect_async_with_config(
-            request,
-            Some(noise_relay_websocket_config()),
-            /*disable_nagle*/ false,
-        )
-        .await
-        .map(|(websocket, _)| websocket)
-    }
-    .await;
-    let result_name = if result.is_ok() { "success" } else { "error" };
-    tracing::Span::current().record("result", result_name);
-    telemetry.remote_rendezvous_completed(result_name, started_at.elapsed());
-    result
 }
 
 fn normalize_environment_id(environment_id: String) -> Result<String, ExecServerError> {
@@ -669,17 +576,12 @@ mod tests {
     use codex_api::AuthProvider;
     use http::HeaderMap;
     use http::HeaderValue;
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
     use pretty_assertions::assert_eq;
-    use tracing::Instrument;
-    use tracing_subscriber::prelude::*;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
     use wiremock::matchers::body_partial_json;
     use wiremock::matchers::header;
-    use wiremock::matchers::header_regex;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
 
@@ -705,14 +607,8 @@ mod tests {
         Arc::new(StaticRegistryAuthProvider)
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn register_environment_posts_with_auth_provider_headers() {
-        let provider = SdkTracerProvider::builder().build();
-        let tracer = provider.tracer("exec-server-test");
-        let subscriber =
-            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
-        let _guard = subscriber.set_default();
-        tracing::callsite::rebuild_interest_cache();
         let server = MockServer::start().await;
         let executor_public_key = NoiseChannelIdentity::generate()
             .expect("identity")
@@ -721,10 +617,6 @@ mod tests {
             .and(path("/cloud/environment/environment-requested/register"))
             .and(header("authorization", "Bearer registry-token"))
             .and(header("chatgpt-account-id", "workspace-123"))
-            .and(header_regex(
-                "traceparent",
-                "^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$",
-            ))
             .and(body_partial_json(serde_json::json!({
                 "security_profile": NOISE_RELAY_SECURITY_PROFILE,
                 "executor_public_key": executor_public_key.clone(),
@@ -742,7 +634,6 @@ mod tests {
 
         let response = client
             .register_environment("environment-requested", &executor_public_key)
-            .instrument(tracing::info_span!("remote-operation"))
             .await
             .expect("register environment");
 
