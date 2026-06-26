@@ -165,7 +165,6 @@ impl ExecServerHarness {
             id: id.clone(),
             method: method.to_string(),
             params: Some(params),
-            trace: None,
         }))
         .await?;
         Ok(id)
