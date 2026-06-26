@@ -1,14 +1,7 @@
-use std::future::Future;
-use std::pin::Pin;
-
 use codex_protocol::ThreadId;
 
 use crate::AgentGraphStoreResult;
 use crate::ThreadSpawnEdgeStatus;
-
-/// Future returned by [`AgentGraphStore`] operations.
-pub type AgentGraphStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = AgentGraphStoreResult<T>> + Send + 'a>>;
 
 /// Storage-neutral boundary for persisted thread-spawn parent/child topology.
 ///
@@ -24,7 +17,7 @@ pub trait AgentGraphStore: Send + Sync {
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
         status: ThreadSpawnEdgeStatus,
-    ) -> AgentGraphStoreFuture<'_, ()>;
+    ) -> impl std::future::Future<Output = AgentGraphStoreResult<()>> + Send;
 
     /// Update the persisted lifecycle status of a spawned thread's incoming edge.
     ///
@@ -33,7 +26,7 @@ pub trait AgentGraphStore: Send + Sync {
         &self,
         child_thread_id: ThreadId,
         status: ThreadSpawnEdgeStatus,
-    ) -> AgentGraphStoreFuture<'_, ()>;
+    ) -> impl std::future::Future<Output = AgentGraphStoreResult<()>> + Send;
 
     /// List direct spawned children of a parent thread.
     ///
@@ -44,7 +37,7 @@ pub trait AgentGraphStore: Send + Sync {
         &self,
         parent_thread_id: ThreadId,
         status_filter: Option<ThreadSpawnEdgeStatus>,
-    ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>>;
+    ) -> impl std::future::Future<Output = AgentGraphStoreResult<Vec<ThreadId>>> + Send;
 
     /// List spawned descendants breadth-first by depth, then by thread id.
     ///
@@ -56,5 +49,5 @@ pub trait AgentGraphStore: Send + Sync {
         &self,
         root_thread_id: ThreadId,
         status_filter: Option<ThreadSpawnEdgeStatus>,
-    ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>>;
+    ) -> impl std::future::Future<Output = AgentGraphStoreResult<Vec<ThreadId>>> + Send;
 }

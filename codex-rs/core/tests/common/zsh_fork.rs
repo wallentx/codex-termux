@@ -10,7 +10,6 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 
 use crate::test_codex::TestCodex;
-use crate::test_codex::TestCodexBuilder;
 use crate::test_codex::test_codex;
 
 #[derive(Clone)]
@@ -20,7 +19,12 @@ pub struct ZshForkRuntime {
 }
 
 impl ZshForkRuntime {
-    fn apply_to_config(&self, config: &mut Config, approval_policy: AskForApproval) {
+    fn apply_to_config(
+        &self,
+        config: &mut Config,
+        approval_policy: AskForApproval,
+        permission_profile: PermissionProfile,
+    ) {
         config
             .features
             .enable(Feature::ShellTool)
@@ -33,6 +37,10 @@ impl ZshForkRuntime {
         config.main_execve_wrapper_exe = Some(self.main_execve_wrapper_exe.clone());
         config.permissions.allow_login_shell = false;
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config
+            .permissions
+            .set_permission_profile(permission_profile)
+            .expect("set permission profile");
     }
 }
 
@@ -78,13 +86,10 @@ pub async fn build_zsh_fork_test<F>(
 where
     F: FnOnce(&Path) + Send + 'static,
 {
-    let mut builder = zsh_fork_test_builder(runtime, approval_policy)
+    let mut builder = test_codex()
         .with_pre_build_hook(pre_build_hook)
         .with_config(move |config| {
-            config
-                .permissions
-                .set_permission_profile(permission_profile)
-                .expect("set permission profile");
+            runtime.apply_to_config(config, approval_policy, permission_profile);
         });
     builder.build(server).await
 }
@@ -99,13 +104,10 @@ pub async fn build_unified_exec_zsh_fork_test<F>(
 where
     F: FnOnce(&Path) + Send + 'static,
 {
-    let mut builder = zsh_fork_test_builder(runtime, approval_policy)
+    let mut builder = test_codex()
         .with_pre_build_hook(pre_build_hook)
         .with_config(move |config| {
-            config
-                .permissions
-                .set_permission_profile(permission_profile)
-                .expect("set permission profile");
+            runtime.apply_to_config(config, approval_policy, permission_profile);
             config.use_experimental_unified_exec_tool = true;
             config
                 .features
@@ -117,15 +119,6 @@ where
                 .expect("test config should allow feature update");
         });
     builder.build(server).await
-}
-
-pub fn zsh_fork_test_builder(
-    runtime: ZshForkRuntime,
-    approval_policy: AskForApproval,
-) -> TestCodexBuilder {
-    test_codex().with_config(move |config| {
-        runtime.apply_to_config(config, approval_policy);
-    })
 }
 
 fn find_test_zsh_path() -> Result<Option<PathBuf>> {

@@ -1,7 +1,6 @@
 use crate::context_manager::truncate_function_output_payload;
 use crate::original_image_detail::sanitize_original_image_detail;
 use crate::session::session::Session;
-use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
 use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
@@ -54,9 +53,7 @@ pub enum ToolCallSource {
 #[derive(Clone)]
 pub struct ToolInvocation {
     pub session: Arc<Session>,
-    // TODO(sayan): Remove this compatibility field once handlers use `step_context.turn`.
     pub turn: Arc<TurnContext>,
-    pub(crate) step_context: Arc<StepContext>,
     pub cancellation_token: CancellationToken,
     pub tracker: SharedTurnDiffTracker,
     pub call_id: String,

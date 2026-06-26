@@ -83,8 +83,7 @@ fn strip_image_details(items: &mut [ResponseItem]) {
                     }
                 }
             }
-            ResponseItem::AdditionalTools { .. }
-            | ResponseItem::Reasoning { .. }
+            ResponseItem::Reasoning { .. }
             | ResponseItem::AgentMessage { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }

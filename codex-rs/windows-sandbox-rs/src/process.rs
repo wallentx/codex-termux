@@ -4,7 +4,6 @@ use crate::proc_thread_attr::ProcThreadAttributeList;
 use crate::winutil::argv_to_command_line;
 use crate::winutil::format_last_error;
 use crate::winutil::to_wide;
-use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use std::collections::HashMap;
@@ -147,7 +146,7 @@ pub unsafe fn create_process_as_user(
                     creation_flags,
                 );
                 logging::debug_log(&msg, logs_base_dir);
-                return Err(std::io::Error::from_raw_os_error(err)).context(msg);
+                return Err(anyhow!("CreateProcessAsUserW failed: {err}"));
             }
             Ok(CreatedProcess {
                 process_info: pi,
@@ -188,7 +187,7 @@ pub unsafe fn create_process_as_user(
                     creation_flags,
                 );
                 logging::debug_log(&msg, logs_base_dir);
-                return Err(std::io::Error::from_raw_os_error(err)).context(msg);
+                return Err(anyhow!("CreateProcessAsUserW failed: {err}"));
             }
             Ok(CreatedProcess {
                 process_info: pi,

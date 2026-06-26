@@ -532,24 +532,6 @@
             "null"
           ]
         },
-        "iconAssets": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "iconDarkAssets": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": [
-            "object",
-            "null"
-          ]
-        },
         "id": {
           "type": "string"
         },
@@ -1008,6 +990,7 @@
         {
           "enum": [
             "untrusted",
+            "on-failure",
             "on-request",
             "never"
           ],
@@ -1187,7 +1170,6 @@
               "type": "string"
             },
             "path": {
-              "description": "Absolute path for the root in the selected environment.",
               "type": "string"
             },
             "type": {
@@ -3328,7 +3310,6 @@
         {
           "enum": [
             "contextWindowExceeded",
-            "sessionBudgetExceeded",
             "usageLimitExceeded",
             "serverOverloaded",
             "cyberPolicy",
@@ -8430,12 +8411,6 @@
         },
         "success": {
           "type": "boolean"
-        },
-        "threadId": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
@@ -8457,12 +8432,6 @@
           },
           "type": [
             "array",
-            "null"
-          ]
-        },
-        "threadId": {
-          "type": [
-            "string",
             "null"
           ]
         },
@@ -8823,13 +8792,6 @@
           "default": [],
           "items": {
             "$ref": "#/definitions/SessionMigration"
-          },
-          "type": "array"
-        },
-        "skills": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/SkillMigration"
           },
           "type": "array"
         },
@@ -14154,17 +14116,6 @@
       ],
       "type": "object"
     },
-    "SkillMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
-    },
     "SkillScope": {
       "enum": [
         "user",
@@ -14659,7 +14610,6 @@
           "description": "Optional Git metadata captured when the thread was created."
         },
         "id": {
-          "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
           "type": "string"
         },
         "modelProvider": {
@@ -14879,10 +14829,6 @@
         "threadId"
       ],
       "title": "ThreadDeletedNotification",
-      "type": "object"
-    },
-    "ThreadExtra": {
-      "description": "Extra app-server data for a thread.",
       "type": "object"
     },
     "ThreadForkParams": {
@@ -15867,7 +15813,7 @@
               "type": "string"
             },
             "path": {
-              "$ref": "#/definitions/LegacyAppPathString"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "enum": [
@@ -16776,7 +16722,6 @@
     },
     "ThreadRollbackParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "DEPRECATED: `thread/rollback` will be removed soon.",
       "properties": {
         "numTurns": {
           "description": "The number of turns to drop from the end of the thread. Must be >= 1.\n\nThis only modifies the thread's history and does not revert local file changes that have been made by the agent. Clients are responsible for reverting these changes.",
@@ -17533,7 +17478,6 @@
           "description": "Only populated when the Turn's status is failed."
         },
         "id": {
-          "description": "Identifier for this turn. Codex-generated turn IDs are UUIDv7.",
           "type": "string"
         },
         "items": {

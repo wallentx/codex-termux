@@ -9,13 +9,11 @@ use anyhow::anyhow;
 use anyhow::bail;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use codex_exec_server::HttpClient;
-use codex_exec_server::ReqwestHttpClient;
+use reqwest::ClientBuilder;
 use reqwest::Url;
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::AuthorizationSession;
 use rmcp::transport::auth::OAuthClientConfig;
-use rmcp::transport::auth::OAuthHttpClient;
 use rmcp::transport::auth::OAuthState;
 use sha2::Digest;
 use sha2::Sha256;
@@ -28,16 +26,15 @@ use urlencoding::decode;
 use crate::StoredOAuthTokens;
 use crate::WrappedOAuthTokenResponse;
 use crate::oauth::compute_expires_at_millis;
-use crate::oauth_http_client::OAuthHttpClientAdapter;
 use crate::save_oauth_tokens;
+use crate::utils::apply_default_headers;
 use crate::utils::build_default_headers;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 
-struct OAuthHttpContext {
+struct OauthHeaders {
     http_headers: Option<HashMap<String, String>>,
     env_http_headers: Option<HashMap<String, String>>,
-    http_client: Arc<dyn HttpClient>,
 }
 
 struct CallbackServerGuard {
@@ -157,17 +154,16 @@ async fn perform_oauth_login_with_browser_output(
     callback_url: Option<&str>,
     emit_browser_url: bool,
 ) -> Result<()> {
-    let http_context = OAuthHttpContext {
+    let headers = OauthHeaders {
         http_headers,
         env_http_headers,
-        http_client: Arc::new(ReqwestHttpClient),
     };
     OauthLoginFlow::new(
         server_name,
         server_url,
         store_mode,
         keyring_backend_kind,
-        http_context,
+        headers,
         scopes,
         oauth_client_id,
         oauth_resource,
@@ -196,51 +192,16 @@ pub async fn perform_oauth_login_return_url(
     callback_port: Option<u16>,
     callback_url: Option<&str>,
 ) -> Result<OauthLoginHandle> {
-    perform_oauth_login_return_url_with_http_client(
-        server_name,
-        server_url,
-        store_mode,
-        keyring_backend_kind,
+    let headers = OauthHeaders {
         http_headers,
         env_http_headers,
-        scopes,
-        oauth_client_id,
-        oauth_resource,
-        timeout_secs,
-        callback_port,
-        callback_url,
-        Arc::new(ReqwestHttpClient),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn perform_oauth_login_return_url_with_http_client(
-    server_name: &str,
-    server_url: &str,
-    store_mode: OAuthCredentialsStoreMode,
-    keyring_backend_kind: AuthKeyringBackendKind,
-    http_headers: Option<HashMap<String, String>>,
-    env_http_headers: Option<HashMap<String, String>>,
-    scopes: &[String],
-    oauth_client_id: Option<&str>,
-    oauth_resource: Option<&str>,
-    timeout_secs: Option<i64>,
-    callback_port: Option<u16>,
-    callback_url: Option<&str>,
-    http_client: Arc<dyn HttpClient>,
-) -> Result<OauthLoginHandle> {
-    let http_context = OAuthHttpContext {
-        http_headers,
-        env_http_headers,
-        http_client,
     };
     let flow = OauthLoginFlow::new(
         server_name,
         server_url,
         store_mode,
         keyring_backend_kind,
-        http_context,
+        headers,
         scopes,
         oauth_client_id,
         oauth_resource,
@@ -495,7 +456,7 @@ impl OauthLoginFlow {
         server_url: &str,
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
-        http_context: OAuthHttpContext,
+        headers: OauthHeaders,
         scopes: &[String],
         oauth_client_id: Option<&str>,
         oauth_resource: Option<&str>,
@@ -526,18 +487,17 @@ impl OauthLoginFlow {
         let (tx, rx) = oneshot::channel();
         spawn_callback_server(server, tx, callback_path);
 
-        let OAuthHttpContext {
+        let OauthHeaders {
             http_headers,
             env_http_headers,
-            http_client,
-        } = http_context;
+        } = headers;
         let default_headers = build_default_headers(http_headers, env_http_headers)?;
-        let oauth_http_client = Arc::new(OAuthHttpClientAdapter::new(http_client, default_headers));
+        let http_client = apply_default_headers(ClientBuilder::new(), &default_headers).build()?;
 
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
         let oauth_state = start_authorization(
             server_url,
-            oauth_http_client,
+            http_client,
             &scope_refs,
             &redirect_uri,
             oauth_client_id,
@@ -660,23 +620,22 @@ impl OauthLoginFlow {
 
 async fn start_authorization(
     server_url: &str,
-    http_client: Arc<dyn OAuthHttpClient>,
+    http_client: reqwest::Client,
     scopes: &[&str],
     redirect_uri: &str,
     oauth_client_id: Option<&str>,
 ) -> Result<OAuthState> {
     let Some(oauth_client_id) = oauth_client_id.filter(|client_id| !client_id.trim().is_empty())
     else {
-        let mut oauth_state =
-            OAuthState::new_with_oauth_http_client(server_url, http_client).await?;
+        let mut oauth_state = OAuthState::new(server_url, Some(http_client)).await?;
         oauth_state
             .start_authorization(scopes, redirect_uri, Some("Codex"))
             .await?;
         return Ok(oauth_state);
     };
 
-    let mut auth_manager =
-        AuthorizationManager::new_with_oauth_http_client(server_url, http_client).await?;
+    let mut auth_manager = AuthorizationManager::new(server_url).await?;
+    auth_manager.with_client(http_client)?;
     let metadata = auth_manager.discover_metadata().await?;
     auth_manager.set_metadata(metadata);
     auth_manager.configure_client(
@@ -709,20 +668,15 @@ fn append_query_param(url: &str, key: &str, value: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::Json;
     use axum::Router;
     use axum::routing::get;
-    use codex_exec_server::ReqwestHttpClient;
     use pretty_assertions::assert_eq;
     use reqwest::Url;
-    use reqwest::header::HeaderMap;
     use serde_json::json;
     use tokio::net::TcpListener;
 
     use super::CallbackOutcome;
-    use super::OAuthHttpClientAdapter;
     use super::OAuthProviderError;
     use super::append_callback_id_to_redirect_uri;
     use super::append_query_param;
@@ -773,10 +727,7 @@ mod tests {
         let base_url = spawn_oauth_metadata_server().await;
         let oauth_state = start_authorization(
             &format!("{base_url}/mcp"),
-            Arc::new(OAuthHttpClientAdapter::new(
-                Arc::new(ReqwestHttpClient),
-                HeaderMap::new(),
-            )),
+            reqwest::Client::new(),
             &[],
             "http://127.0.0.1/callback",
             Some("eci-prd-pub-codex-123"),

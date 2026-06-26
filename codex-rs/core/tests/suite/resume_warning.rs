@@ -1,7 +1,5 @@
 #![allow(clippy::unwrap_used)]
 
-use std::sync::Arc;
-
 use codex_core::NewThread;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
@@ -53,7 +51,7 @@ fn resume_history(
 
     InitialHistory::Resumed(ResumedHistory {
         conversation_id: ThreadId::default(),
-        history: Arc::new(vec![
+        history: vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.clone(),
                 trace_id: None,
@@ -77,7 +75,7 @@ fn resume_history(
                 duration_ms: None,
                 time_to_first_token_ms: None,
             })),
-        ]),
+        ],
         rollout_path: Some(rollout_path.to_path_buf()),
     })
 }

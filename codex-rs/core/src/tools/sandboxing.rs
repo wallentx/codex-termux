@@ -196,7 +196,7 @@ impl ExecApprovalRequirement {
     }
 }
 
-/// - Never: do not ask
+/// - Never, OnFailure: do not ask
 /// - OnRequest: ask unless filesystem access is unrestricted
 /// - Granular: ask unless filesystem access is unrestricted, but auto-reject
 ///   when granular sandbox approval is disabled.
@@ -206,7 +206,7 @@ pub(crate) fn default_exec_approval_requirement(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
 ) -> ExecApprovalRequirement {
     let needs_approval = match policy {
-        AskForApproval::Never => false,
+        AskForApproval::Never | AskForApproval::OnFailure => false,
         AskForApproval::OnRequest | AskForApproval::Granular(_) => {
             matches!(
                 file_system_sandbox_policy.kind,
@@ -356,6 +356,7 @@ pub(crate) trait Approvable<Req> {
     /// Decide we can request an approval for no-sandbox execution.
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
         match policy {
+            AskForApproval::OnFailure => true,
             AskForApproval::UnlessTrusted => true,
             AskForApproval::Never => false,
             AskForApproval::OnRequest => false,
@@ -465,7 +466,6 @@ impl<'a> SandboxAttempt<'a> {
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let managed_network = command.managed_network.clone();
         let exec_server_permissions = effective_permission_profile(
             self.exec_server_permissions,
             command.additional_permissions.as_ref(),
@@ -492,7 +492,6 @@ impl<'a> SandboxAttempt<'a> {
             options,
             self.workspace_roots.to_vec(),
         );
-        exec_request.exec_server_managed_network = managed_network;
         if self.sandbox_requested {
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
                 permissions: exec_server_permissions.into(),

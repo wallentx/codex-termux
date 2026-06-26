@@ -70,10 +70,9 @@ pub struct PluginHookSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginTelemetryMetadata {
-    /// Local plugin identifier used by Codex configuration and the plugin cache,
-    /// when it has been resolved.
-    pub plugin_id: Option<PluginId>,
-    /// Optional backend identifier for remote plugins.
+    pub plugin_id: PluginId,
+    /// Optional backend identifier for remote plugins, used when analytics
+    /// should report the remote id instead of the local plugin cache id.
     pub remote_plugin_id: Option<String>,
     pub capability_summary: Option<PluginCapabilitySummary>,
 }
