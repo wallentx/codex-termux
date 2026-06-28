@@ -753,9 +753,7 @@ async fn plugin_list_uses_alternate_discoverable_manifest_and_keeps_undiscoverab
                         composer_icon: None,
                         composer_icon_url: None,
                         logo: None,
-                        logo_dark: None,
                         logo_url: None,
-                        logo_url_dark: None,
                         screenshots: Vec::new(),
                         screenshot_urls: Vec::new(),
                     }),
@@ -1655,7 +1653,6 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
             .chatgpt_account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
-    write_installed_plugin_with_version(&codex_home, "openai-curated-remote", "linear", "1.2.3")?;
 
     let global_directory_body = r#"{
   "plugins": [
@@ -1705,7 +1702,6 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
       "authentication_policy": "ON_USE",
       "status": "ENABLED",
       "release": {
-        "version": "1.2.3",
         "display_name": "Linear",
         "description": "Track work in Linear",
         "app_ids": [],
@@ -1765,14 +1761,6 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/backend-api/plugins/featured"))
-        .and(query_param("platform", "codex"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(r#"["linear@openai-curated-remote"]"#),
-        )
-        .mount(&server)
-        .await;
 
     let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
@@ -1815,10 +1803,6 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
     );
     assert_eq!(remote_marketplace.plugins[0].name, "linear");
     assert_eq!(remote_marketplace.plugins[0].source, PluginSource::Remote);
-    assert_eq!(
-        remote_marketplace.plugins[0].local_version.as_deref(),
-        Some("1.2.3")
-    );
     assert_eq!(remote_marketplace.plugins[0].installed, true);
     assert_eq!(remote_marketplace.plugins[0].enabled, true);
     assert_eq!(
@@ -1870,10 +1854,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled() -
         cached_plugin_ids,
         vec!["plugins~Plugin_00000000000000000000000000000000".to_string()]
     );
-    assert_eq!(
-        response.featured_plugin_ids,
-        vec!["linear@openai-curated-remote".to_string()]
-    );
+    assert_eq!(response.featured_plugin_ids, Vec::<String>::new());
     assert!(
         !server
             .received_requests()

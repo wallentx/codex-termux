@@ -1,9 +1,5 @@
 use super::ContextualUserFragment;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
-use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
-use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
-use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +39,7 @@ impl ContextualUserFragment for TokenBudgetContext {
     }
 
     fn type_markers() -> (&'static str, &'static str) {
-        (CONTEXT_WINDOW_OPEN_TAG, CONTEXT_WINDOW_CLOSE_TAG)
+        ("", "")
     }
 
     fn body(&self) -> String {
@@ -51,7 +47,7 @@ impl ContextualUserFragment for TokenBudgetContext {
         let first_window_id = self.first_window_id;
         let window_id = self.window_id;
         let mut lines = vec![
-            format!("Thread id: {thread_id}"),
+            format!("Thread id {thread_id}."),
             format!("First context window id: {first_window_id}"),
             format!("Current context window id: {window_id}"),
         ];
@@ -61,41 +57,7 @@ impl ContextualUserFragment for TokenBudgetContext {
         if let Some(mcp_result) = &self.mcp_result {
             lines.push(mcp_result.clone());
         }
-        format!("\n{}\n", lines.join("\n"))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContextWindowGuidance {
-    message: String,
-}
-
-impl ContextWindowGuidance {
-    pub(crate) fn new(message: &str) -> Self {
-        Self {
-            message: message.to_string(),
-        }
-    }
-}
-
-impl ContextualUserFragment for ContextWindowGuidance {
-    fn role(&self) -> &'static str {
-        "developer"
-    }
-
-    fn markers(&self) -> (&'static str, &'static str) {
-        Self::type_markers()
-    }
-
-    fn type_markers() -> (&'static str, &'static str) {
-        (
-            CONTEXT_WINDOW_GUIDANCE_OPEN_TAG,
-            CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG,
-        )
-    }
-
-    fn body(&self) -> String {
-        format!("\n{}\n", self.message)
+        lines.join("\n")
     }
 }
 

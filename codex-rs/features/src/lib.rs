@@ -18,7 +18,6 @@ mod feature_configs;
 mod legacy;
 pub use feature_configs::CodeModeConfigToml;
 pub use feature_configs::CurrentTimeReminderConfigToml;
-pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
 pub use feature_configs::MultiAgentV2ConfigToml;
 pub use feature_configs::NetworkProxyConfigToml;
@@ -92,8 +91,6 @@ pub enum Feature {
     // Experimental
     /// Enable JavaScript code mode backed by the in-process V8 runtime.
     CodeMode,
-    /// Run JavaScript code mode in the standalone host process.
-    CodeModeHost,
     /// Restrict model-visible tools to code mode entrypoints (`exec`, `wait`).
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
@@ -160,7 +157,7 @@ pub enum Feature {
     AppsMcpPathOverride,
     /// Removed compatibility flag retained as a no-op now that tool_search is always enabled.
     ToolSearch,
-    /// Removed compatibility flag. MCP tools are always deferred when tool_search is available.
+    /// Always defer MCP tools behind tool_search instead of exposing small sets directly.
     ToolSearchAlwaysDeferMcpTools,
     /// Expose MCP model-visible namespaces without the legacy `mcp__` prefix.
     NonPrefixedMcpToolNames,
@@ -178,10 +175,6 @@ pub enum Feature {
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
     BrowserUse,
-    /// Allow Browser Use integration to access the full Chrome DevTools Protocol surface.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    BrowserUseFullCdpAccess,
     /// Allow Browser Use integration with external browsers.
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
@@ -222,6 +215,8 @@ pub enum Feature {
     RolloutBudget,
     /// Add current-time reminders to model-visible context.
     CurrentTimeReminder,
+    /// Expose an input-interruptible sleep tool.
+    SleepTool,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
     ToolCallMcpElicitation,
     /// Prompt Codex Apps connector auth failures through MCP URL elicitations.
@@ -236,6 +231,8 @@ pub enum Feature {
     RealtimeConversation,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
+    /// Enable automatic context compaction before or during a turn.
+    AutoCompaction,
     /// Enable remote compaction v2 over the normal Responses API.
     RemoteCompactionV2,
     /// Use Agent Identity for ChatGPT-authenticated sessions.
@@ -472,7 +469,7 @@ impl Features {
                 "apply_patch_freeform" => {
                     continue;
                 }
-                "tool_search" | "tool_search_always_defer_mcp_tools" | "apps_mcp_path_override" => {
+                "tool_search" | "apps_mcp_path_override" => {
                     continue;
                 }
                 "image_detail_original" | "resize_all_images" => {
@@ -853,12 +850,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::CodeModeHost,
-        key: "code_mode_host",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::CodeModeOnly,
         key: "code_mode_only",
         stage: Stage::UnderDevelopment,
@@ -1079,8 +1070,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ToolSearchAlwaysDeferMcpTools,
         key: "tool_search_always_defer_mcp_tools",
-        stage: Stage::Removed,
-        default_enabled: true,
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::NonPrefixedMcpToolNames,
@@ -1121,12 +1112,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::BrowserUse,
         key: "browser_use",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::BrowserUseFullCdpAccess,
-        key: "browser_use_full_cdp_access",
         stage: Stage::Stable,
         default_enabled: true,
     },
@@ -1251,6 +1236,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::SleepTool,
+        key: "sleep_tool",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::CollaborationModes,
         key: "collaboration_modes",
         stage: Stage::Removed,
@@ -1345,6 +1336,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "responses_websockets_v2",
         stage: Stage::Removed,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::AutoCompaction,
+        key: "auto_compaction",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::RemoteCompactionV2,

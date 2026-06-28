@@ -14,9 +14,9 @@ use std::time::Instant;
 
 use crate::custom_ca::BuildCustomCaTransportError;
 use crate::custom_ca::build_reqwest_client_with_custom_ca;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 use sha2::Digest;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 use sha2::Sha256;
 use thiserror::Error;
 
@@ -24,8 +24,6 @@ const SYSTEM_PROXY_SUCCESS_CACHE_TTL: Duration = Duration::from_secs(60);
 const SYSTEM_PROXY_UNAVAILABLE_CACHE_TTL: Duration = Duration::from_secs(5);
 const SYSTEM_PROXY_CACHE_MAX_ENTRIES: usize = 256;
 
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -117,23 +115,15 @@ impl From<BuildRouteAwareHttpClientError> for io::Error {
 /// Builds a reqwest client with conservative route selection and shared CA handling.
 ///
 /// Unavailable platform resolution falls back to environment proxies and then direct. Errors after
-/// a route is selected are returned without trying another route. Ordered PAC candidates are
-/// currently collapsed to one route on both Windows and macOS; later proxy or `DIRECT` candidates
-/// are not retried after a connection failure.
+/// a route is selected are returned without trying another route.
 pub fn build_reqwest_client_for_route(
     builder: reqwest::ClientBuilder,
     request_url: &str,
     route_class: ClientRouteClass,
     config: Option<&OutboundProxyConfig>,
 ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
-    let builder = configure_proxy_for_route(
-        &ProcessEnv,
-        builder,
-        request_url,
-        route_class,
-        config,
-        resolve_system_proxy,
-    )?;
+    let builder =
+        configure_proxy_for_route(&ProcessEnv, builder, request_url, route_class, config)?;
     build_reqwest_client_with_custom_ca(builder).map_err(Into::into)
 }
 
@@ -143,7 +133,6 @@ fn configure_proxy_for_route(
     request_url: &str,
     route_class: ClientRouteClass,
     config: Option<&OutboundProxyConfig>,
-    resolve_system_proxy: impl FnOnce(&str, &RequestOrigin) -> SystemProxyDecision,
 ) -> Result<reqwest::ClientBuilder, BuildRouteAwareHttpClientError> {
     if config.is_none() {
         return Ok(builder);
@@ -228,7 +217,7 @@ impl RequestOrigin {
 }
 
 #[cfg_attr(
-    not(any(target_os = "windows", target_os = "macos")),
+    not(target_os = "windows"),
     allow(
         dead_code,
         reason = "Direct and Proxy are constructed only by platform-specific resolvers"
@@ -251,17 +240,12 @@ fn resolve_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProx
     decision
 }
 
-#[cfg(target_os = "macos")]
-fn resolve_platform_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProxyDecision {
-    macos::resolve(request_url, origin)
-}
-
 #[cfg(target_os = "windows")]
 fn resolve_platform_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProxyDecision {
     windows::resolve(request_url, origin)
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 fn resolve_platform_system_proxy(
     _request_url: &str,
     _origin: &RequestOrigin,
@@ -333,7 +317,7 @@ fn insert_system_proxy_cache_entry(
 }
 
 fn system_proxy_cache_key(request_url: &str) -> String {
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
         // Keep URL-specific PAC decisions without retaining the raw routed URL.
         let mut hasher = Sha256::new();
@@ -342,7 +326,7 @@ fn system_proxy_cache_key(request_url: &str) -> String {
         format!("{:x}", hasher.finalize())
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(target_os = "windows"))]
     request_url.to_string()
 }
 

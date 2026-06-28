@@ -1,4 +1,5 @@
-use super::auth::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
+use super::enroll::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
+use super::enroll::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::enroll::RemoteControlEnrollment;
 use super::enroll::load_persisted_remote_control_enrollment;
 use super::enroll::update_persisted_remote_control_enrollment;
@@ -7,7 +8,6 @@ use super::protocol::ClientEvent;
 use super::protocol::ClientId;
 use super::protocol::StreamId;
 use super::protocol::normalize_remote_control_url;
-use super::server_api::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::websocket::REMOTE_CONTROL_PROTOCOL_VERSION;
 use super::websocket::RemoteControlWebsocket;
 use super::websocket::RemoteControlWebsocketConfig;
@@ -18,6 +18,7 @@ use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionOrigin;
 use crate::transport::TransportEvent;
 use base64::Engine;
+use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
@@ -35,7 +36,6 @@ use codex_login::CodexAuth;
 use codex_login::save_auth;
 use codex_login::token_data::TokenData;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
-use codex_protocol::auth::AuthMode;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
 use futures::SinkExt;
@@ -372,7 +372,7 @@ fn test_server_name() -> String {
     gethostname().to_string_lossy().trim().to_string()
 }
 
-pub(super) fn remote_control_handle_with_current_enrollment(
+fn remote_control_handle_with_current_enrollment(
     remote_control_url: &str,
     auth_manager: Arc<AuthManager>,
 ) -> RemoteControlHandle {
@@ -400,7 +400,6 @@ pub(super) fn remote_control_handle_with_current_enrollment(
                 OffsetDateTime::from_unix_timestamp(33_336_362_096)
                     .expect("future timestamp should parse"),
             ),
-            next_refresh_at: None,
         },
     )));
     RemoteControlHandle {
@@ -1474,16 +1473,14 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
         Some(&"Bearer Access Token".to_string())
     );
     assert_eq!(
-        enroll_request
-            .headers
-            .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
-        vec!["account_id"]
+        enroll_request.headers.get(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+        Some(&"account_id".to_string())
     );
     assert_eq!(
         enroll_request
             .headers
-            .get_all(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
-        vec![TEST_INSTALLATION_ID]
+            .get(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
+        Some(&TEST_INSTALLATION_ID.to_string())
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&enroll_request.body)
@@ -1683,7 +1680,6 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
         server_name: "persisted-server".to_string(),
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -1723,18 +1719,6 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
     assert_eq!(
         refresh_request.headers.get("authorization"),
         Some(&"Bearer Access Token".to_string())
-    );
-    assert_eq!(
-        refresh_request
-            .headers
-            .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
-        vec!["account_id"]
-    );
-    assert_eq!(
-        refresh_request
-            .headers
-            .get_all(REMOTE_CONTROL_INSTALLATION_ID_HEADER),
-        vec![TEST_INSTALLATION_ID]
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&refresh_request.body)
@@ -1804,7 +1788,6 @@ async fn remote_control_stdio_mode_waits_for_client_name_before_connecting() {
         server_name: "persisted-server".to_string(),
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -1902,7 +1885,6 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         server_name: expected_server_name,
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
 
     let (transport_event_tx, _transport_event_rx) =
@@ -1999,7 +1981,6 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
         server_name: "server-a".to_string(),
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -2107,7 +2088,6 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
         server_name: "stale-server".to_string(),
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     let refreshed_enrollment = RemoteControlEnrollment {
         remote_control_target: remote_control_target.clone(),
@@ -2117,7 +2097,6 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
         server_name: expected_server_name,
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -2232,7 +2211,6 @@ async fn remote_control_http_mode_reenrolls_after_explicit_missing_server_404() 
         server_name: "stale-server".to_string(),
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     let refreshed_enrollment = RemoteControlEnrollment {
         remote_control_target: remote_control_target.clone(),
@@ -2242,7 +2220,6 @@ async fn remote_control_http_mode_reenrolls_after_explicit_missing_server_404() 
         server_name: expected_server_name,
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -2380,7 +2357,6 @@ async fn remote_control_http_mode_preserves_stale_enrollment_when_reenrollment_f
         server_name: test_server_name(),
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -2431,7 +2407,6 @@ async fn remote_control_http_mode_preserves_stale_enrollment_when_reenrollment_f
         retry_refresh_request.request_line,
         "POST /backend-api/wham/remote/control/server/refresh HTTP/1.1"
     );
-    let refresh_failed_at = OffsetDateTime::now_utc();
     respond_with_status(
         retry_refresh_request.stream,
         "500 Internal Server Error",
@@ -2439,26 +2414,9 @@ async fn remote_control_http_mode_preserves_stale_enrollment_when_reenrollment_f
     )
     .await;
 
-    let current_enrollment = remote_handle
-        .current_enrollment
-        .lock()
-        .await
-        .clone()
-        .expect("stale enrollment should remain available");
-    let next_refresh_at = current_enrollment
-        .next_refresh_at
-        .expect("required refresh failure should set a retry deadline");
-    assert!(
-        (refresh_failed_at + time::Duration::seconds(24)
-            ..=OffsetDateTime::now_utc() + time::Duration::seconds(36))
-            .contains(&next_refresh_at)
-    );
     assert_eq!(
-        current_enrollment,
-        RemoteControlEnrollment {
-            next_refresh_at: Some(next_refresh_at),
-            ..stale_enrollment.clone()
-        }
+        *remote_handle.current_enrollment.lock().await,
+        Some(stale_enrollment.clone())
     );
     assert_eq!(
         state_db
@@ -2502,7 +2460,6 @@ async fn remote_control_http_mode_preserves_enrollment_after_generic_websocket_4
         server_name: "stale-server".to_string(),
         remote_control_token: None,
         expires_at: None,
-        next_refresh_at: None,
     };
     update_persisted_remote_control_enrollment(
         Some(state_db.as_ref()),
@@ -2621,33 +2578,8 @@ async fn remote_control_http_mode_preserves_enrollment_after_generic_websocket_4
 struct CapturedHttpRequest {
     stream: TcpStream,
     request_line: String,
-    headers: CapturedHttpHeaders,
+    headers: BTreeMap<String, String>,
     body: String,
-}
-
-#[derive(Debug, Default)]
-struct CapturedHttpHeaders(Vec<(String, String)>);
-
-impl CapturedHttpHeaders {
-    fn append(&mut self, name: String, value: String) {
-        self.0.push((name, value));
-    }
-
-    fn get(&self, name: &str) -> Option<&String> {
-        self.0
-            .iter()
-            .rev()
-            .find(|(candidate, _value)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_name, value)| value)
-    }
-
-    fn get_all(&self, name: &str) -> Vec<&str> {
-        self.0
-            .iter()
-            .filter(|(candidate, _value)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_name, value)| value.as_str())
-            .collect()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2680,7 +2612,7 @@ async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
         .expect("request line should read");
     let request_line = request_line.trim_end_matches("\r\n").to_string();
 
-    let mut headers = CapturedHttpHeaders::default();
+    let mut headers = BTreeMap::new();
     loop {
         let mut line = String::new();
         reader
@@ -2692,7 +2624,7 @@ async fn accept_http_request(listener: &TcpListener) -> CapturedHttpRequest {
         }
         let line = line.trim_end_matches("\r\n");
         let (name, value) = line.split_once(':').expect("header should contain colon");
-        headers.append(name.to_ascii_lowercase(), value.trim().to_string());
+        headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
     }
 
     let content_length = headers

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::AppInfo;
+use codex_app_server_protocol::AppInfo;
 
 pub fn filter_tool_suggest_discoverable_connectors(
     directory_connectors: Vec<AppInfo>,
@@ -39,8 +39,6 @@ mod tests {
             description: None,
             logo_url: None,
             logo_url_dark: None,
-            icon_assets: None,
-            icon_dark_assets: None,
             distribution_channel: None,
             install_url: None,
             branding: None,

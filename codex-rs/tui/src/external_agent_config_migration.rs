@@ -1,6 +1,5 @@
 use crate::diff_render::display_path_for;
 use crate::external_agent_config_migration_model::ExternalAgentConfigMigrationGroupModel;
-use crate::external_agent_config_migration_model::external_agent_config_migration_count_summary;
 use crate::external_agent_config_migration_model::external_agent_config_migration_groups;
 use crate::external_agent_config_migration_model::external_agent_config_migration_item_detail;
 use crate::external_agent_config_migration_model::external_agent_config_migration_item_label;
@@ -600,13 +599,6 @@ impl ExternalAgentConfigMigrationScreen {
             .iter()
             .enumerate()
             .flat_map(|(idx, group)| {
-                let selected_items = group
-                    .item_indices
-                    .iter()
-                    .filter_map(|idx| self.items.get(*idx))
-                    .filter(|item| item.enabled)
-                    .map(|item| &item.item);
-                let count_summary = external_agent_config_migration_count_summary(selected_items);
                 [
                     RenderLineEntry {
                         item_idx: Some(idx),
@@ -621,15 +613,6 @@ impl ExternalAgentConfigMigrationScreen {
                         item_idx: None,
                         kind: RenderLineKind::ItemDetail,
                         line: Line::from(format!("      {}", group.description)),
-                    },
-                    RenderLineEntry {
-                        item_idx: None,
-                        kind: RenderLineKind::ItemDetail,
-                        line: Line::from(if count_summary.is_empty() {
-                            "      Importing: none".to_string()
-                        } else {
-                            format!("      Importing: {count_summary}")
-                        }),
                     },
                 ]
             })

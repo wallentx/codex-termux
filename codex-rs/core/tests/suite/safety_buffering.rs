@@ -5,9 +5,8 @@ use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_response_once;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
-use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
@@ -15,8 +14,6 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-
-const FASTER_MODEL: &str = "faster-model";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn emits_safety_buffering_with_the_requested_model() -> anyhow::Result<()> {
@@ -28,13 +25,7 @@ async fn emits_safety_buffering_with_the_requested_model() -> anyhow::Result<()>
         "use_cases": ["cyber"],
         "reasons": ["policy-check"],
     });
-    mount_response_once(
-        &server,
-        sse_response(sse(vec![created, ev_completed("resp-1")]))
-            .insert_header("x-codex-safety-buffering-enabled", "true")
-            .insert_header("x-codex-safety-buffering-faster-model", FASTER_MODEL),
-    )
-    .await;
+    mount_sse_once(&server, sse(vec![created, ev_completed("resp-1")])).await;
 
     let test = test_codex().build(&server).await?;
     test.codex
@@ -61,8 +52,6 @@ async fn emits_safety_buffering_with_the_requested_model() -> anyhow::Result<()>
             model: test.session_configured.model.clone(),
             use_cases: vec!["cyber".to_string()],
             reasons: vec!["policy-check".to_string()],
-            show_buffering_ui: true,
-            faster_model: Some(FASTER_MODEL.to_string()),
         }
     );
     wait_for_event(&test.codex, |event| {

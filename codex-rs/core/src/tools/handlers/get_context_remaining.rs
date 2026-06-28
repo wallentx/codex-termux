@@ -75,15 +75,19 @@ impl ToolExecutor<ToolInvocation> for GetContextRemainingHandler {
                 ));
             }
 
-            let token_status = crate::session::context_window::context_window_token_status(
-                invocation.session.as_ref(),
-                invocation.turn.as_ref(),
-            )
-            .await;
+            let Some(model_context_window) = invocation.turn.model_context_window() else {
+                return Ok(boxed_tool_output(GetContextRemainingOutput::new(
+                    /*tokens_left*/ None,
+                )));
+            };
+            let active_context_tokens = invocation.session.get_total_token_usage().await.max(0);
+            let tokens_left = model_context_window
+                .saturating_sub(active_context_tokens)
+                .max(0);
 
-            Ok(boxed_tool_output(GetContextRemainingOutput::new(
-                token_status.tokens_until_compaction,
-            )))
+            Ok(boxed_tool_output(GetContextRemainingOutput::new(Some(
+                tokens_left,
+            ))))
         })
     }
 }
