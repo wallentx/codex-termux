@@ -31,6 +31,10 @@ tui-with-exec-server *args:
 file-search *args:
     cargo run --bin codex-file-search -- {args}
 
+# Run the standalone code-mode host from source.
+code-mode-host *args:
+    cargo run --bin codex-code-mode-host -- {args}
+
 # Build the CLI and run the app-server test client
 app-server-test-client *args:
     cargo build -p codex-cli
@@ -107,6 +111,16 @@ bazel-codex *args:
 bazel-codex *args:
     bazel run //codex-rs/cli:codex --run_under='cd /d "{{ invocation_directory_native() }}" &&' -- @($args | Select-Object -Skip 1)
 
+# Build and run the standalone code-mode host from source using Bazel.
+[no-cd]
+[unix]
+bazel-code-mode-host *args:
+    bazel run //codex-rs/code-mode-host:codex-code-mode-host --run_under="cd $PWD &&" -- "$@"
+
+[windows]
+bazel-code-mode-host *args:
+    bazel run //codex-rs/code-mode-host:codex-code-mode-host --run_under='cd /d "{{ invocation_directory_native() }}" &&' -- @($args | Select-Object -Skip 1)
+
 [no-cd]
 bazel-lock-update:
     bazel mod deps --lockfile_mode=update
@@ -165,11 +179,6 @@ argument-comment-lint *args:
 [no-cd]
 argument-comment-lint-from-source *args:
     {{ python }} {{ justfile_directory() }}/tools/argument-comment-lint/run.py {args}
-
-# Audit advisory file locks that may need Termux Unsupported handling.
-[no-cd]
-termux-lock-audit *args:
-    {{ justfile_directory() }}/scripts/termux-lock-audit.sh "$@"
 
 # Tail logs from the state SQLite database
 [unix]
