@@ -45,7 +45,6 @@ pub enum ReasoningEffort {
     Medium,
     High,
     XHigh,
-    Ultra,
     /// A model-defined effort value that this client does not know yet.
     Custom(String),
 }
@@ -60,7 +59,6 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
-            Self::Ultra => "ultra",
             Self::Custom(effort) => effort,
         }
     }
@@ -125,7 +123,6 @@ impl FromStr for ReasoningEffort {
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
             "xhigh" => Ok(Self::XHigh),
-            "ultra" => Ok(Self::Ultra),
             "" => Err("reasoning_effort must not be empty".to_string()),
             effort => Ok(Self::Custom(effort.to_string())),
         }
@@ -704,25 +701,20 @@ mod tests {
         let deserialized = from_str::<ReasoningEffort>(r#""max""#)
             .expect("custom reasoning effort should deserialize");
         let serialized = to_string(&custom).expect("custom reasoning effort should serialize");
-        let serialized_ultra = to_string(&ReasoningEffort::Ultra).expect("Ultra should serialize");
 
         assert_eq!(
             (
                 "high".parse(),
-                "ultra".parse(),
                 "max".parse(),
                 deserialized,
                 serialized,
-                serialized_ultra,
                 custom.to_string(),
             ),
             (
                 Ok(ReasoningEffort::High),
-                Ok(ReasoningEffort::Ultra),
                 Ok(custom.clone()),
                 custom,
                 r#""max""#.to_string(),
-                r#""ultra""#.to_string(),
                 "max".to_string(),
             )
         );

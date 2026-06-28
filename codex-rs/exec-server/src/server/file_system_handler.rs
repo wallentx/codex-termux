@@ -2,7 +2,7 @@ use std::io;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCErrorError;
 
 use crate::CopyOptions;
 use crate::CreateDirectoryOptions;
@@ -33,8 +33,6 @@ use crate::protocol::FsReadFileParams;
 use crate::protocol::FsReadFileResponse;
 use crate::protocol::FsRemoveParams;
 use crate::protocol::FsRemoveResponse;
-use crate::protocol::FsWalkParams;
-use crate::protocol::FsWalkResponse;
 use crate::protocol::FsWriteFileParams;
 use crate::protocol::FsWriteFileResponse;
 use crate::rpc::internal_error;
@@ -200,16 +198,6 @@ impl FileSystemHandler {
         Ok(FsReadDirectoryResponse { entries })
     }
 
-    pub(crate) async fn walk(
-        &self,
-        params: FsWalkParams,
-    ) -> Result<FsWalkResponse, JSONRPCErrorError> {
-        self.file_system
-            .walk(&params.path, params.options, params.sandbox.as_ref())
-            .await
-            .map_err(map_fs_error)
-    }
-
     pub(crate) async fn remove(
         &self,
         params: FsRemoveParams,
@@ -286,7 +274,7 @@ mod tests {
         )
         .expect("runtime paths");
         let handler = FileSystemHandler::new(runtime_paths);
-        let sandbox_cwd = PathUri::from_host_native_path(temp_dir.path()).expect("tempdir URI");
+        let sandbox_cwd = PathUri::from_path(temp_dir.path()).expect("tempdir URI");
         let sandbox_context = |sandbox_policy| {
             FileSystemSandboxContext::from_legacy_sandbox_policy(
                 sandbox_policy,
@@ -304,8 +292,7 @@ mod tests {
                 },
             ),
         ] {
-            let path =
-                PathUri::from_host_native_path(temp_dir.path().join(file_name)).expect("path URI");
+            let path = PathUri::from_path(temp_dir.path().join(file_name)).expect("path URI");
 
             handler
                 .write_file(FsWriteFileParams {
@@ -325,7 +312,7 @@ mod tests {
                 .expect("canonicalize file");
             assert_eq!(
                 canonicalized.path,
-                PathUri::from_host_native_path(
+                PathUri::from_path(
                     std::fs::canonicalize(temp_dir.path().join(file_name)).expect("canonical path"),
                 )
                 .expect("canonical path URI"),

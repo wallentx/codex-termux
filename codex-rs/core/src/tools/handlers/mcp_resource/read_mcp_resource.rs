@@ -52,13 +52,11 @@ impl ReadMcpResourceHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            step_context,
+            turn,
             call_id,
             payload,
             ..
         } = invocation;
-        let turn = std::sync::Arc::clone(&step_context.turn);
-        let manager = step_context.mcp.manager();
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -86,7 +84,7 @@ impl ReadMcpResourceHandler {
 
         let payload_result: Result<ReadResourcePayload, FunctionCallError> = async {
             ensure_model_can_access_mcp_server(turn.as_ref(), &server)?;
-            let result = manager
+            let result = session
                 .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))
                 .await
                 .map_err(|err| {

@@ -1,5 +1,5 @@
 use codex_core_skills::model::SkillDependencies;
-use codex_utils_path_uri::PathUri;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 /// Source authority that owns a skill package and must be used to read it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -76,7 +76,7 @@ impl SkillResourceId {
     pub fn environment(
         id: impl Into<String>,
         environment_id: impl Into<String>,
-        path: PathUri,
+        path: AbsolutePathBuf,
     ) -> Self {
         Self {
             id: id.into(),
@@ -91,7 +91,7 @@ impl SkillResourceId {
         &self.id
     }
 
-    pub(crate) fn environment_path(&self) -> Option<(&str, &PathUri)> {
+    pub(crate) fn environment_path(&self) -> Option<(&str, &AbsolutePathBuf)> {
         self.environment_path
             .as_ref()
             .map(|resource| (resource.environment_id.as_str(), &resource.path))
@@ -101,7 +101,7 @@ impl SkillResourceId {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct EnvironmentSkillResource {
     environment_id: String,
-    path: PathUri,
+    path: AbsolutePathBuf,
 }
 
 /// Metadata shown in the always-visible skills catalog.

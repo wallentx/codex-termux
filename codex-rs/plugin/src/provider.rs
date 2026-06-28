@@ -1,6 +1,6 @@
 use crate::manifest::PluginManifest;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
-use codex_utils_path_uri::PathUri;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::error::Error as StdError;
 use std::future::Future;
 use thiserror::Error;
@@ -11,8 +11,8 @@ pub enum PluginResourceLocator {
     Environment {
         /// Environment whose filesystem owns the resource.
         environment_id: String,
-        /// Resource URI within that filesystem.
-        path: PathUri,
+        /// Absolute resource path within that filesystem.
+        path: AbsolutePathBuf,
     },
 }
 
@@ -22,8 +22,8 @@ pub enum ResolvedPluginLocation {
     Environment {
         /// Environment whose filesystem owns the package.
         environment_id: String,
-        /// Package root URI within that filesystem.
-        root: PathUri,
+        /// Absolute package root within that filesystem.
+        root: AbsolutePathBuf,
     },
 }
 
@@ -40,7 +40,10 @@ pub struct ResolvedPlugin {
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ResolvedPluginError {
     #[error("plugin resource path `{path}` is outside package root `{root}`")]
-    ResourceOutsideRoot { root: PathUri, path: PathUri },
+    ResourceOutsideRoot {
+        root: AbsolutePathBuf,
+        path: AbsolutePathBuf,
+    },
 }
 
 impl ResolvedPlugin {
@@ -48,9 +51,9 @@ impl ResolvedPlugin {
     pub fn from_environment(
         selected_root_id: String,
         environment_id: String,
-        root: PathUri,
-        manifest_path: PathUri,
-        manifest: PluginManifest<PathUri>,
+        root: AbsolutePathBuf,
+        manifest_path: AbsolutePathBuf,
+        manifest: PluginManifest<AbsolutePathBuf>,
     ) -> Result<Self, ResolvedPluginError> {
         let manifest_path = environment_resource(&environment_id, &root, manifest_path)?;
         let manifest = manifest
@@ -89,10 +92,10 @@ impl ResolvedPlugin {
 
 fn environment_resource(
     environment_id: &str,
-    root: &PathUri,
-    path: PathUri,
+    root: &AbsolutePathBuf,
+    path: AbsolutePathBuf,
 ) -> Result<PluginResourceLocator, ResolvedPluginError> {
-    if !path.starts_with(root) {
+    if !path.as_path().starts_with(root.as_path()) {
         return Err(ResolvedPluginError::ResourceOutsideRoot {
             root: root.clone(),
             path,

@@ -31,12 +31,11 @@ impl AgentControl {
         let known_agent = self.state.agent_metadata_for_thread(agent_id).is_some();
         match state.get_thread(agent_id).await {
             Ok(thread) => {
-                if !thread.config_snapshot().await.ephemeral
-                    && let Some(agent_graph_store) = state.agent_graph_store()
-                    && let Err(err) = agent_graph_store
+                if let Some(state_db_ctx) = thread.state_db()
+                    && let Err(err) = state_db_ctx
                         .set_thread_spawn_edge_status(
                             agent_id,
-                            codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
+                            DirectionalThreadSpawnEdgeStatus::Closed,
                         )
                         .await
                 {
@@ -44,11 +43,11 @@ impl AgentControl {
                 }
             }
             Err(CodexErr::ThreadNotFound(_)) if known_agent => {
-                if let Some(agent_graph_store) = state.agent_graph_store()
-                    && let Err(err) = agent_graph_store
+                if let Some(state_db_ctx) = state.state_db()
+                    && let Err(err) = state_db_ctx
                         .set_thread_spawn_edge_status(
                             agent_id,
-                            codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
+                            DirectionalThreadSpawnEdgeStatus::Closed,
                         )
                         .await
                 {

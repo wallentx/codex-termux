@@ -1,5 +1,4 @@
 mod description;
-pub mod host;
 mod response;
 mod runtime;
 mod session;

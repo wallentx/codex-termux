@@ -53,7 +53,6 @@ pub struct PluginManifestInterface<Resource> {
     pub brand_color: Option<String>,
     pub composer_icon: Option<Resource>,
     pub logo: Option<Resource>,
-    pub logo_dark: Option<Resource>,
     pub screenshots: Vec<Resource>,
 }
 
@@ -73,7 +72,6 @@ impl<Resource> Default for PluginManifestInterface<Resource> {
             brand_color: None,
             composer_icon: None,
             logo: None,
-            logo_dark: None,
             screenshots: Vec::new(),
         }
     }
@@ -90,8 +88,7 @@ impl<Resource> PluginManifest<Resource> {
             .unwrap_or(&self.name)
     }
 
-    /// Maps every path-bearing resource in the manifest.
-    pub fn try_map_resources<Mapped, Error>(
+    pub(crate) fn try_map_resources<Mapped, Error>(
         self,
         mut map: impl FnMut(Resource) -> Result<Mapped, Error>,
     ) -> Result<PluginManifest<Mapped>, Error> {
@@ -144,7 +141,6 @@ impl<Resource> PluginManifest<Resource> {
                     brand_color,
                     composer_icon,
                     logo,
-                    logo_dark,
                     screenshots,
                 } = interface;
                 Some(PluginManifestInterface {
@@ -161,7 +157,6 @@ impl<Resource> PluginManifest<Resource> {
                     brand_color,
                     composer_icon: composer_icon.map(&mut map).transpose()?,
                     logo: logo.map(&mut map).transpose()?,
-                    logo_dark: logo_dark.map(&mut map).transpose()?,
                     screenshots: screenshots
                         .into_iter()
                         .map(&mut map)

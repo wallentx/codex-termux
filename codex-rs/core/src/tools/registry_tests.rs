@@ -1,5 +1,4 @@
 use super::*;
-use crate::session::step_context::StepContext;
 use pretty_assertions::assert_eq;
 
 struct TestHandler {
@@ -458,10 +457,8 @@ fn test_invocation(
     call_id: &str,
     tool_name: codex_tools::ToolName,
 ) -> ToolInvocation {
-    let step_context = StepContext::for_test(Arc::clone(&turn));
     ToolInvocation {
         session,
-        step_context,
         turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(tokio::sync::Mutex::new(

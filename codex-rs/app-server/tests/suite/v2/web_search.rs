@@ -156,10 +156,8 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
         search_body["input"]
             .as_array()
             .context("search input should be an array")?
-            .last()
-            .cloned()
-            .map(responses::strip_metadata_from_json),
-        Some(json!({
+            .last(),
+        Some(&json!({
             "type": "message",
             "role": "user",
             "content": [{"type": "input_text", "text": "Search the web"}],
@@ -167,7 +165,7 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
     );
 
     assert_eq!(
-        responses::strip_metadata_from_json(requests[1].function_call_output(call_id)),
+        requests[1].function_call_output(call_id),
         json!({
             "type": "function_call_output",
             "call_id": call_id,

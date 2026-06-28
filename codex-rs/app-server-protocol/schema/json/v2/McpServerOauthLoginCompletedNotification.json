@@ -12,12 +12,6 @@
     },
     "success": {
       "type": "boolean"
-    },
-    "threadId": {
-      "type": [
-        "string",
-        "null"
-      ]
     }
   },
   "required": [
