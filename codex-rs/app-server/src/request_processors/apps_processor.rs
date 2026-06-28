@@ -1,5 +1,4 @@
 use super::*;
-use crate::app_info::app_info_to_api;
 
 pub(crate) struct AppsRequestProcessor {
     auth_manager: Arc<AuthManager>,
@@ -183,14 +182,10 @@ impl AppsRequestProcessor {
             None => 0,
         };
 
-        let loaded_plugins = plugins_manager
+        let plugin_apps = plugins_manager
             .plugins_for_config(&config.plugins_config_input())
-            .await;
-        let connector_snapshot =
-            codex_connectors::ConnectorSnapshot::from_plugin_capability_summaries(
-                loaded_plugins.capability_summaries(),
-            );
-        let plugin_apps = connector_snapshot.connector_ids().to_vec();
+            .await
+            .effective_apps();
         let (mut accessible_connectors, mut all_connectors) = tokio::join!(
             connectors::list_cached_accessible_connectors_from_mcp_tools(&config),
             connectors::list_cached_all_connectors(&config, &plugin_apps)
@@ -401,11 +396,7 @@ fn paginate_apps(
 
     let effective_limit = limit.unwrap_or(total as u32).max(1) as usize;
     let end = start.saturating_add(effective_limit).min(total);
-    let data = connectors[start..end]
-        .iter()
-        .cloned()
-        .map(app_info_to_api)
-        .collect();
+    let data = connectors[start..end].to_vec();
     let next_cursor = if end < total {
         Some(end.to_string())
     } else {
@@ -419,7 +410,6 @@ async fn send_app_list_updated_notification(
     outgoing: &Arc<OutgoingMessageSender>,
     data: Vec<AppInfo>,
 ) {
-    let data = data.into_iter().map(app_info_to_api).collect();
     outgoing
         .send_server_notification(ServerNotification::AppListUpdated(
             AppListUpdatedNotification { data },

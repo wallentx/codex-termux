@@ -380,8 +380,7 @@ fn response_item_records_turn_ttft(item: &ResponseItem) -> bool {
         | ResponseItem::Compaction { .. }
         | ResponseItem::ContextCompaction { .. } => true,
         ResponseItem::CompactionTrigger { .. } => false,
-        ResponseItem::AdditionalTools { .. }
-        | ResponseItem::FunctionCallOutput { .. }
+        ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::Other => false,

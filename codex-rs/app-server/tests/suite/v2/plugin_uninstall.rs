@@ -139,7 +139,6 @@ async fn plugin_uninstall_tracks_analytics_event() -> Result<()> {
                 "event_type": "codex_plugin_uninstalled",
                 "event_params": {
                     "plugin_id": "sample-plugin@debug",
-                    "remote_plugin_id": null,
                     "plugin_name": "sample-plugin",
                     "marketplace_name": "debug",
                     "has_skills": false,
@@ -217,11 +216,6 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
         )
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/backend-api/codex/analytics-events/events"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":"ok"}"#))
-        .mount(&server)
-        .await;
 
     let remote_plugin_cache_root = codex_home
         .path()
@@ -231,11 +225,6 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
         remote_plugin_cache_root.join("1.0.0/.codex-plugin/plugin.json"),
         r#"{"name":"linear","version":"1.0.0"}"#,
     )?;
-    std::fs::create_dir_all(remote_plugin_cache_root.join("1.0.0/skills/plan-work"))?;
-    std::fs::write(
-        remote_plugin_cache_root.join("1.0.0/skills/plan-work/SKILL.md"),
-        "---\nname: plan-work\ndescription: Plan work\n---\n",
-    )?;
     let legacy_remote_plugin_cache_root = codex_home.path().join(format!(
         "plugins/cache/openai-curated-remote/{REMOTE_PLUGIN_ID}"
     ));
@@ -243,10 +232,6 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
 
     let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    // Simulate a background remote-cache refresh removing the local bundle
-    // before the uninstall request captures its telemetry metadata.
-    std::fs::remove_dir_all(remote_plugin_cache_root.join("1.0.0"))?;
 
     let request_id = mcp
         .send_plugin_uninstall_request(PluginUninstallParams {
@@ -270,25 +255,6 @@ async fn plugin_uninstall_writes_remote_plugin_to_cloud_when_remote_plugin_enabl
     .await?;
     assert!(!remote_plugin_cache_root.exists());
     assert!(!legacy_remote_plugin_cache_root.exists());
-    let payload = wait_for_plugin_analytics_payload(&server).await?;
-    assert_eq!(
-        payload,
-        json!({
-            "events": [{
-                "event_type": "codex_plugin_uninstalled",
-                "event_params": {
-                    "plugin_id": "linear@openai-curated-remote",
-                    "remote_plugin_id": REMOTE_PLUGIN_ID,
-                    "plugin_name": "linear",
-                    "marketplace_name": "openai-curated-remote",
-                    "has_skills": true,
-                    "mcp_server_count": 0,
-                    "connector_ids": [],
-                    "product_client_id": DEFAULT_CLIENT_NAME,
-                }
-            }]
-        })
-    );
     Ok(())
 }
 
@@ -672,11 +638,7 @@ async fn mount_remote_plugin_detail_with_name(
     "interface": {{
       "short_description": "Plan and track work"
     }},
-    "skills": [{{
-      "name": "plan-work",
-      "description": "Plan work",
-      "interface": null
-    }}]
+    "skills": []
   }}
 }}"#
     );
@@ -688,29 +650,6 @@ async fn mount_remote_plugin_detail_with_name(
         .respond_with(ResponseTemplate::new(200).set_body_string(detail_body))
         .mount(server)
         .await;
-}
-
-async fn wait_for_plugin_analytics_payload(server: &MockServer) -> Result<serde_json::Value> {
-    timeout(DEFAULT_TIMEOUT, async {
-        loop {
-            let Some(requests) = server.received_requests().await else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            if let Some(request) = requests.iter().find(|request| {
-                request.method == "POST"
-                    && request
-                        .url
-                        .path()
-                        .ends_with("/codex/analytics-events/events")
-            }) {
-                return serde_json::from_slice(&request.body)
-                    .map_err(|err| anyhow::anyhow!("invalid analytics payload: {err}"));
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await?
 }
 
 async fn wait_for_remote_plugin_request_count(

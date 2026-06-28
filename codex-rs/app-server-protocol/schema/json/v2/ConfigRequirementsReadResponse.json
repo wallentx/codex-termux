@@ -15,6 +15,7 @@
         {
           "enum": [
             "untrusted",
+            "on-failure",
             "on-request",
             "never"
           ],
@@ -168,16 +169,6 @@
           "type": [
             "object",
             "null"
-          ]
-        },
-        "models": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ModelsRequirements"
-            },
-            {
-              "type": "null"
-            }
           ]
         }
       },
@@ -372,21 +363,6 @@
       ],
       "type": "object"
     },
-    "ModelsRequirements": {
-      "properties": {
-        "newThread": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/NewThreadModelDefaults"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "type": "object"
-    },
     "NetworkDomainPermission": {
       "enum": [
         "allow",
@@ -507,38 +483,6 @@
         "allow",
         "deny"
       ],
-      "type": "string"
-    },
-    "NewThreadModelDefaults": {
-      "properties": {
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "modelReasoningEffort": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "serviceTier": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "ReasoningEffort": {
-      "description": "A non-empty reasoning effort value advertised by the model.",
-      "minLength": 1,
       "type": "string"
     },
     "ResidencyRequirement": {

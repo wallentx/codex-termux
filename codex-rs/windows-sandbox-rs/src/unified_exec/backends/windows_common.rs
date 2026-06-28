@@ -11,7 +11,6 @@ use anyhow::Result;
 use codex_utils_pty::ProcessDriver;
 use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::TerminalSize;
-use codex_utils_pty::WindowsTtyInputNormalizer;
 use codex_utils_pty::spawn_from_driver;
 use std::fs::File;
 use tokio::sync::broadcast;
@@ -24,6 +23,23 @@ pub(crate) fn finish_driver_spawn(driver: ProcessDriver, stdin_open: bool) -> Sp
         spawned.session.close_stdin();
     }
     spawned
+}
+
+pub(crate) fn normalize_windows_tty_input(bytes: &[u8], previous_was_cr: &mut bool) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte == b'\n' {
+            if !*previous_was_cr {
+                normalized.push(b'\r');
+            }
+            normalized.push(b'\n');
+            *previous_was_cr = false;
+        } else {
+            normalized.push(byte);
+            *previous_was_cr = byte == b'\r';
+        }
+    }
+    normalized
 }
 
 pub(crate) fn start_runner_pipe_writer(
@@ -47,10 +63,10 @@ pub(crate) fn start_runner_stdin_writer(
     stdin_open: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        let mut windows_input = WindowsTtyInputNormalizer::default();
+        let mut previous_was_cr = false;
         while let Some(bytes) = writer_rx.blocking_recv() {
             let bytes = if normalize_newlines {
-                windows_input.normalize(&bytes)
+                normalize_windows_tty_input(&bytes, &mut previous_was_cr)
             } else {
                 bytes
             };

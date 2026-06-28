@@ -1,26 +1,21 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::Result;
-use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
-use codex_exec_server::HttpClient;
 use codex_login::CodexAuth;
-use codex_rmcp_client::McpAuthState;
+use codex_protocol::protocol::McpAuthStatus;
 use codex_rmcp_client::OAuthProviderError;
 use codex_rmcp_client::determine_streamable_http_auth_status;
-use codex_rmcp_client::determine_streamable_http_auth_status_with_http_client;
 use codex_rmcp_client::discover_streamable_http_oauth;
-use codex_rmcp_client::discover_streamable_http_oauth_with_http_client;
-use futures::FutureExt;
 use futures::future::join_all;
 use tracing::warn;
 
-use crate::runtime::McpRuntimeContext;
 use crate::server::EffectiveMcpServer;
+
+use super::CODEX_APPS_MCP_SERVER_NAME;
 
 #[derive(Debug, Clone)]
 pub struct McpOAuthLoginConfig {
@@ -54,54 +49,10 @@ pub struct ResolvedMcpOAuthScopes {
 #[derive(Debug, Clone)]
 pub struct McpAuthStatusEntry {
     pub config: Option<McpServerConfig>,
-    pub auth_state: McpAuthState,
+    pub auth_status: McpAuthStatus,
 }
 
 pub async fn oauth_login_support(transport: &McpServerTransportConfig) -> McpOAuthLoginSupport {
-    let Some(mut config) = oauth_login_candidate(transport) else {
-        return McpOAuthLoginSupport::Unsupported;
-    };
-    match discover_streamable_http_oauth(
-        &config.url,
-        config.http_headers.clone(),
-        config.env_http_headers.clone(),
-    )
-    .await
-    {
-        Ok(Some(discovery)) => {
-            config.discovered_scopes = discovery.scopes_supported;
-            McpOAuthLoginSupport::Supported(config)
-        }
-        Ok(None) => McpOAuthLoginSupport::Unsupported,
-        Err(err) => McpOAuthLoginSupport::Unknown(err),
-    }
-}
-
-pub async fn oauth_login_support_with_http_client(
-    transport: &McpServerTransportConfig,
-    http_client: Arc<dyn HttpClient>,
-) -> McpOAuthLoginSupport {
-    let Some(mut config) = oauth_login_candidate(transport) else {
-        return McpOAuthLoginSupport::Unsupported;
-    };
-    match discover_streamable_http_oauth_with_http_client(
-        &config.url,
-        config.http_headers.clone(),
-        config.env_http_headers.clone(),
-        http_client,
-    )
-    .await
-    {
-        Ok(Some(discovery)) => {
-            config.discovered_scopes = discovery.scopes_supported;
-            McpOAuthLoginSupport::Supported(config)
-        }
-        Ok(None) => McpOAuthLoginSupport::Unsupported,
-        Err(err) => McpOAuthLoginSupport::Unknown(err),
-    }
-}
-
-fn oauth_login_candidate(transport: &McpServerTransportConfig) -> Option<McpOAuthLoginConfig> {
     let McpServerTransportConfig::StreamableHttp {
         url,
         bearer_token_env_var,
@@ -109,33 +60,30 @@ fn oauth_login_candidate(transport: &McpServerTransportConfig) -> Option<McpOAut
         env_http_headers,
     } = transport
     else {
-        return None;
+        return McpOAuthLoginSupport::Unsupported;
     };
+
     if bearer_token_env_var.is_some() {
-        return None;
+        return McpOAuthLoginSupport::Unsupported;
     }
-    Some(McpOAuthLoginConfig {
-        url: url.clone(),
-        http_headers: http_headers.clone(),
-        env_http_headers: env_http_headers.clone(),
-        discovered_scopes: None,
-    })
+
+    match discover_streamable_http_oauth(url, http_headers.clone(), env_http_headers.clone()).await
+    {
+        Ok(Some(discovery)) => McpOAuthLoginSupport::Supported(McpOAuthLoginConfig {
+            url: url.clone(),
+            http_headers: http_headers.clone(),
+            env_http_headers: env_http_headers.clone(),
+            discovered_scopes: discovery.scopes_supported,
+        }),
+        Ok(None) => McpOAuthLoginSupport::Unsupported,
+        Err(err) => McpOAuthLoginSupport::Unknown(err),
+    }
 }
 
 pub async fn discover_supported_scopes(
     transport: &McpServerTransportConfig,
 ) -> Option<Vec<String>> {
     match oauth_login_support(transport).await {
-        McpOAuthLoginSupport::Supported(config) => config.discovered_scopes,
-        McpOAuthLoginSupport::Unsupported | McpOAuthLoginSupport::Unknown(_) => None,
-    }
-}
-
-pub async fn discover_supported_scopes_with_http_client(
-    transport: &McpServerTransportConfig,
-    http_client: Arc<dyn HttpClient>,
-) -> Option<Vec<String>> {
-    match oauth_login_support_with_http_client(transport, http_client).await {
         McpOAuthLoginSupport::Supported(config) => config.discovered_scopes,
         McpOAuthLoginSupport::Unsupported | McpOAuthLoginSupport::Unknown(_) => None,
     }
@@ -185,7 +133,6 @@ pub async fn compute_auth_statuses<'a, I>(
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     auth: Option<&CodexAuth>,
-    runtime_context: &McpRuntimeContext,
 ) -> HashMap<String, McpAuthStatusEntry>
 where
     I: IntoIterator<Item = (&'a String, &'a EffectiveMcpServer)>,
@@ -193,10 +140,7 @@ where
     let futures = servers.into_iter().map(|(name, server)| {
         let name = name.clone();
         let config = server.configured_config().cloned();
-        let runtime_context = runtime_context.clone();
-        let has_runtime_auth = config
-            .as_ref()
-            .is_some_and(|config| matches!(&config.auth, McpServerAuth::ChatGpt))
+        let has_runtime_auth = name == CODEX_APPS_MCP_SERVER_NAME
             && auth.is_some_and(CodexAuth::uses_codex_backend)
             && config.as_ref().is_some_and(|config| {
                 matches!(
@@ -208,7 +152,7 @@ where
                 )
             });
         async move {
-            let auth_state = match config.as_ref() {
+            let auth_status = match config.as_ref() {
                 Some(config) => {
                     match compute_auth_status(
                         &name,
@@ -216,7 +160,6 @@ where
                         store_mode,
                         keyring_backend_kind,
                         has_runtime_auth,
-                        &runtime_context,
                     )
                     .await
                     {
@@ -225,13 +168,16 @@ where
                             warn!(
                                 "failed to determine auth status for MCP server `{name}`: {error:?}"
                             );
-                            McpAuthState::Unsupported
+                            McpAuthStatus::Unsupported
                         }
                     }
                 }
-                None => McpAuthState::Unsupported,
+                None => McpAuthStatus::Unsupported,
             };
-            let entry = McpAuthStatusEntry { config, auth_state };
+            let entry = McpAuthStatusEntry {
+                config,
+                auth_status,
+            };
             (name, entry)
         }
     });
@@ -245,53 +191,33 @@ async fn compute_auth_status(
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     has_runtime_auth: bool,
-    runtime_context: &McpRuntimeContext,
-) -> Result<McpAuthState> {
+) -> Result<McpAuthStatus> {
     if !config.enabled {
-        return Ok(McpAuthState::Unsupported);
+        return Ok(McpAuthStatus::Unsupported);
     }
 
     if has_runtime_auth {
-        return Ok(McpAuthState::BearerToken);
+        return Ok(McpAuthStatus::BearerToken);
     }
 
     match &config.transport {
-        McpServerTransportConfig::Stdio { .. } => Ok(McpAuthState::Unsupported),
+        McpServerTransportConfig::Stdio { .. } => Ok(McpAuthStatus::Unsupported),
         McpServerTransportConfig::StreamableHttp {
             url,
             bearer_token_env_var,
             http_headers,
             env_http_headers,
         } => {
-            if config.is_local_environment() {
-                determine_streamable_http_auth_status(
-                    server_name,
-                    url,
-                    bearer_token_env_var.as_deref(),
-                    http_headers.clone(),
-                    env_http_headers.clone(),
-                    store_mode,
-                    keyring_backend_kind,
-                )
-                .boxed()
-                .await
-            } else {
-                let http_client = runtime_context
-                    .resolve_http_client(server_name, config)
-                    .map_err(anyhow::Error::msg)?;
-                determine_streamable_http_auth_status_with_http_client(
-                    server_name,
-                    url,
-                    bearer_token_env_var.as_deref(),
-                    http_headers.clone(),
-                    env_http_headers.clone(),
-                    store_mode,
-                    keyring_backend_kind,
-                    http_client,
-                )
-                .boxed()
-                .await
-            }
+            determine_streamable_http_auth_status(
+                server_name,
+                url,
+                bearer_token_env_var.as_deref(),
+                http_headers.clone(),
+                env_http_headers.clone(),
+                store_mode,
+                keyring_backend_kind,
+            )
+            .await
         }
     }
 }

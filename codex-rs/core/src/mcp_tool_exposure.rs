@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_connectors::AppToolPolicyInput;
+use codex_features::Feature;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ToolInfo as McpToolInfo;
 use codex_mcp::tool_is_model_visible;
@@ -9,6 +10,8 @@ use tracing::instrument;
 
 use crate::config::Config;
 use crate::connectors;
+
+pub(crate) const DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD: usize = 100;
 
 pub(crate) struct McpToolExposure {
     pub(crate) direct_tools: Vec<McpToolInfo>,
@@ -31,7 +34,13 @@ pub(crate) fn build_mcp_tool_exposure(
         ));
     }
 
-    if !search_tool_enabled {
+    let should_defer = search_tool_enabled
+        && (config
+            .features
+            .enabled(Feature::ToolSearchAlwaysDeferMcpTools)
+            || deferred_tools.len() >= DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD);
+
+    if !should_defer {
         return McpToolExposure {
             direct_tools: deferred_tools,
             deferred_tools: None,

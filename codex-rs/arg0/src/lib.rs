@@ -596,7 +596,7 @@ mod tests {
         let alias_path = temp_dir.path().join("codex-linux-sandbox");
         let path_entry = Arg0PathEntryGuard::new(
             temp_dir,
-            lock_file,
+            Some(lock_file),
             Arg0DispatchPaths {
                 codex_self_exe: Some(PathBuf::from("/usr/bin/codex")),
                 codex_linux_sandbox_exe: Some(alias_path.clone()),
@@ -677,7 +677,7 @@ mod tests {
         let lock_file = create_lock(temp_dir.path())?;
         let path_entry = Arg0PathEntryGuard::new(
             temp_dir,
-            lock_file,
+            Some(lock_file),
             Arg0DispatchPaths {
                 codex_self_exe: Some(PathBuf::from("/usr/bin/codex")),
                 codex_linux_sandbox_exe: Some(alias_path.clone()),

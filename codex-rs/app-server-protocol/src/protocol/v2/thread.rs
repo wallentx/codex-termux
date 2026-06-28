@@ -4,7 +4,6 @@ use super::AskForApproval;
 use super::SandboxMode;
 use super::SandboxPolicy;
 use super::Thread;
-use super::ThreadHistoryMode;
 use super::ThreadItem;
 use super::ThreadSource;
 use super::Turn;
@@ -58,11 +57,6 @@ pub struct ThreadStartParams {
     pub model: Option<String>,
     #[ts(optional = nullable)]
     pub model_provider: Option<String>,
-    /// Allow a provider with an authoritative static model catalog to replace an unavailable
-    /// requested model with its default.
-    #[experimental("thread/start.allowProviderModelFallback")]
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_provider_model_fallback: bool,
     #[serde(
         default,
         deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
@@ -100,16 +94,14 @@ pub struct ThreadStartParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
-    /// @deprecated Ignored. Use Ultra reasoning effort for proactive multi-agent behavior.
+    /// Set the initial multi-agent mode for this thread. `none` leaves the
+    /// multi-agent tools available without injecting mode instructions.
+    /// Omitted defaults to `explicitRequestOnly`.
     #[experimental("thread/start.multiAgentMode")]
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,
     #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
-    /// Persisted thread history contract to use for this new thread.
-    #[experimental("thread/start.historyMode")]
-    #[ts(optional = nullable)]
-    pub history_mode: Option<ThreadHistoryMode>,
     #[ts(optional = nullable)]
     pub session_start_source: Option<ThreadStartSource>,
     /// Optional client-supplied analytics source classification for this thread.
@@ -194,7 +186,7 @@ pub struct ThreadStartResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
+    /// Current multi-agent mode for this thread.
     #[experimental("thread/start.multiAgentMode")]
     #[serde(default)]
     pub multi_agent_mode: MultiAgentMode,
@@ -258,7 +250,7 @@ pub struct ThreadSettingsUpdateParams {
     #[experimental("thread/settings/update.collaborationMode")]
     #[ts(optional = nullable)]
     pub collaboration_mode: Option<CollaborationMode>,
-    /// @deprecated Ignored. Use `effort: "ultra"` for proactive multi-agent behavior.
+    /// Select the multi-agent mode for subsequent turns.
     #[experimental("thread/settings/update.multiAgentMode")]
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,
@@ -287,7 +279,7 @@ pub struct ThreadSettings {
     pub effort: Option<ReasoningEffort>,
     pub summary: Option<ReasoningSummary>,
     pub collaboration_mode: CollaborationMode,
-    /// @deprecated Always `explicitRequestOnly`. Use `effort` for Ultra behavior.
+    /// Current multi-agent mode for this thread.
     #[experimental("thread/settings.multiAgentMode")]
     #[serde(default)]
     pub multi_agent_mode: MultiAgentMode,
@@ -427,7 +419,7 @@ pub struct ThreadResumeResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
+    /// Current multi-agent mode for this thread.
     #[experimental("thread/resume.multiAgentMode")]
     #[serde(default)]
     pub multi_agent_mode: MultiAgentMode,
@@ -493,13 +485,6 @@ impl From<ThreadTurnsListResponse> for TurnsPage {
 /// Prefer using thread_id whenever possible.
 pub struct ThreadForkParams {
     pub thread_id: String,
-
-    /// Optional last turn id to fork through, inclusive.
-    ///
-    /// When specified, turns after `last_turn_id` are omitted from the fork.
-    /// The referenced turn cannot be in progress.
-    #[ts(optional = nullable)]
-    pub last_turn_id: Option<String>,
 
     /// [UNSTABLE] Specify the rollout path to fork from.
     /// If specified, the thread_id param will be ignored.
@@ -593,7 +578,7 @@ pub struct ThreadForkResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
+    /// Current multi-agent mode for this thread.
     #[experimental("thread/fork.multiAgentMode")]
     #[serde(default)]
     pub multi_agent_mode: MultiAgentMode,
@@ -1042,7 +1027,6 @@ pub struct ThreadBackgroundTerminalsTerminateResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// DEPRECATED: `thread/rollback` will be removed soon.
 pub struct ThreadRollbackParams {
     pub thread_id: String,
     /// The number of turns to drop from the end of the thread. Must be >= 1.
@@ -1104,15 +1088,10 @@ pub struct ThreadListParams {
     /// Optional substring filter for the extracted thread title.
     #[ts(optional = nullable)]
     pub search_term: Option<String>,
-    /// Optional direct parent thread filter. Mutually exclusive with `ancestorThreadId`.
+    /// Optional direct parent thread filter.
     #[experimental("thread/list.parentThreadId")]
     #[ts(optional = nullable)]
     pub parent_thread_id: Option<String>,
-    /// Optional ancestor thread filter. Returns spawned descendants at any depth, excluding the
-    /// ancestor itself. Mutually exclusive with `parentThreadId`.
-    #[experimental("thread/list.ancestorThreadId")]
-    #[ts(optional = nullable)]
-    pub ancestor_thread_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1337,11 +1316,9 @@ pub struct ThreadTurnsListResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ThreadItemsListParams {
+pub struct ThreadTurnsItemsListParams {
     pub thread_id: String,
-    /// Optional turn id to filter by. When omitted, returns items across the thread.
-    #[ts(optional = nullable)]
-    pub turn_id: Option<String>,
+    pub turn_id: String,
     /// Opaque cursor to pass to the next call to continue after the last item.
     #[ts(optional = nullable)]
     pub cursor: Option<String>,
@@ -1356,7 +1333,7 @@ pub struct ThreadItemsListParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ThreadItemsListResponse {
+pub struct ThreadTurnsItemsListResponse {
     pub data: Vec<ThreadItem>,
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// if None, there are no more items to return.

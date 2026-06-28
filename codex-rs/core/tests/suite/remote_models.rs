@@ -1059,11 +1059,7 @@ async fn remote_models_request_times_out_after_5s() -> Result<()> {
     let start = Instant::now();
     let model = timeout(
         Duration::from_secs(7),
-        manager.get_default_model(
-            &None,
-            /*allow_provider_model_fallback*/ false,
-            RefreshStrategy::OnlineIfUncached,
-        ),
+        manager.get_default_model(&None, RefreshStrategy::OnlineIfUncached),
     )
     .await;
     let elapsed = start.elapsed();
@@ -1131,11 +1127,7 @@ async fn remote_models_hide_picker_only_models() -> Result<()> {
     );
 
     let selected = manager
-        .get_default_model(
-            &None,
-            /*allow_provider_model_fallback*/ false,
-            RefreshStrategy::OnlineIfUncached,
-        )
+        .get_default_model(&None, RefreshStrategy::OnlineIfUncached)
         .await;
     assert_eq!(selected, bundled_default_model_slug());
 
