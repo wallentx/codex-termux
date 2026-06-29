@@ -1,5 +1,8 @@
 pub(crate) fn is_newer(latest: &str, current: &str) -> Option<bool> {
-    match (parse_version(latest), parse_version(current)) {
+    match (
+        crate::termux_update::parse_release_version(latest),
+        crate::termux_update::parse_release_version(current),
+    ) {
         (Some(l), Some(c)) => Some(l > c),
         _ => None,
     }
@@ -44,8 +47,11 @@ mod tests {
 
     #[test]
     fn prerelease_version_is_not_considered_newer() {
-        assert_eq!(is_newer("0.11.0-beta.1", "0.11.0"), None);
-        assert_eq!(is_newer("1.0.0-rc.1", "1.0.0"), None);
+        assert_eq!(is_newer("0.11.0-beta.1", "0.11.0"), Some(false));
+        assert_eq!(is_newer("1.0.0-rc.1", "1.0.0"), Some(false));
+        assert_eq!(is_newer("0.141.0-alpha.7", "0.141.0-alpha.5"), Some(true));
+        assert_eq!(is_newer("0.141.0-alpha.7", "0.140.0"), Some(true));
+        assert_eq!(is_newer("0.141.0-alpha.7", "0.141.0"), Some(false));
     }
 
     #[test]
