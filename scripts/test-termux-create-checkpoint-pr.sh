@@ -62,6 +62,35 @@ set -euo pipefail
 case "${1:-} ${2:-}" in
   "pr list")
     ;;
+  "pr view")
+    printf '{"headRefOid":"checkpoint-head-sha","state":"OPEN","url":"%s"}\n' "${3:-}"
+    ;;
+  "pr merge")
+    [[ "${4:-}" == "--repo" ]] || {
+      echo "expected --repo as fourth pr merge arg: $*" >&2
+      exit 1
+    }
+    [[ "$*" == *" --merge "* ]] || {
+      echo "checkpoint auto-merge must use --merge: $*" >&2
+      exit 1
+    }
+    [[ "$*" != *" --squash "* ]] || {
+      echo "checkpoint auto-merge must not use --squash: $*" >&2
+      exit 1
+    }
+    [[ "$*" == *" --auto "* ]] || {
+      echo "expected --auto: $*" >&2
+      exit 1
+    }
+    [[ "$*" == *" --delete-branch "* ]] || {
+      echo "expected --delete-branch: $*" >&2
+      exit 1
+    }
+    [[ "$*" == *" --match-head-commit checkpoint-head-sha"* ]] || {
+      echo "expected --match-head-commit checkpoint-head-sha: $*" >&2
+      exit 1
+    }
+    ;;
   "pr create")
     printf 'https://github.com/wallentx/codex-termux/pull/2\n'
     ;;
