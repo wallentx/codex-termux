@@ -124,10 +124,10 @@ enable_checkpoint_automerge() {
   local pr_head_sha
   pr_head_sha="$(jq -r '.headRefOid' <<< "${pr_info}")"
 
-  echo "Enabling auto-merge for checkpoint PR ${pr_url}."
+  echo "Enabling merge-commit auto-merge for checkpoint PR ${pr_url}."
   gh pr merge "${pr_url}" \
     --repo "${GITHUB_REPOSITORY}" \
-    --squash \
+    --merge \
     --auto \
     --delete-branch \
     --match-head-commit "${pr_head_sha}"
