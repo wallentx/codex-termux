@@ -433,7 +433,9 @@ pub async fn run_remote_environment(
         match connect_async_with_config(
             response.url.as_str(),
             Some(noise_relay_websocket_config()),
-            /*disable_nagle*/ false,
+            // Rendezvous sends small, latency-sensitive frames, so avoid Nagle's coalescing delay.
+            /*disable_nagle*/
+            true,
         )
         .await
         {
