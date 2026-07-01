@@ -132,7 +132,7 @@ impl MarketplaceCli {
             .map_err(anyhow::Error::msg)?;
 
         match subcommand {
-            MarketplaceSubcommand::Add(args) => run_add(overrides, args).await?,
+            MarketplaceSubcommand::Add(args) => run_add(args).await?,
             MarketplaceSubcommand::List(args) => run_list(overrides, args).await?,
             MarketplaceSubcommand::Upgrade(args) => run_upgrade(overrides, args).await?,
             MarketplaceSubcommand::Remove(args) => run_remove(args).await?,
@@ -142,7 +142,7 @@ impl MarketplaceCli {
     }
 }
 
-async fn run_add(overrides: Vec<(String, toml::Value)>, args: AddMarketplaceArgs) -> Result<()> {
+async fn run_add(args: AddMarketplaceArgs) -> Result<()> {
     let AddMarketplaceArgs {
         source,
         ref_name,
@@ -150,12 +150,9 @@ async fn run_add(overrides: Vec<(String, toml::Value)>, args: AddMarketplaceArgs
         json,
     } = args;
 
-    let config = Config::load_with_cli_overrides(overrides)
-        .await
-        .context("failed to load configuration")?;
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
     let outcome = add_marketplace(
-        config.codex_home.to_path_buf(),
-        config.config_layer_stack.requirements().clone(),
+        codex_home.to_path_buf(),
         MarketplaceAddRequest {
             source,
             ref_name,
@@ -341,7 +338,7 @@ fn configured_marketplace_sources_by_root(
     codex_home: &Path,
     plugins_input: &PluginsConfigInput,
 ) -> HashMap<PathBuf, JsonMarketplaceSource> {
-    let marketplace_sources = configured_marketplace_sources(plugins_input, codex_home);
+    let marketplace_sources = configured_marketplace_sources(plugins_input);
     let Some(user_config) = plugins_input.config_layer_stack.effective_user_config() else {
         return HashMap::new();
     };

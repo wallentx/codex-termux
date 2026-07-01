@@ -149,7 +149,7 @@ pub(crate) async fn load_plugins_config(codex_home: &Path, cwd: &Path) -> Plugin
         feature_enabled(
             &effective_config,
             "remote_plugin",
-            /*default_enabled*/ true,
+            /*default_enabled*/ false,
         ),
         "https://chatgpt.com/backend-api/".to_string(),
     )

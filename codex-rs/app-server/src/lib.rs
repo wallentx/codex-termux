@@ -47,12 +47,12 @@ use crate::transport::start_remote_control;
 use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
 use codex_analytics::AppServerRpcTransport;
+use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
-use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
 use codex_config::TextRange as CoreTextRange;
 use codex_core::ExecPolicyError;
@@ -80,14 +80,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
 
 mod analytics_utils;
-mod app_info;
 mod app_server_tracing;
 mod attestation;
-mod auth_mode;
 mod bespoke_event_handling;
 mod command_exec;
 mod config;
-mod config_layer;
 mod config_manager;
 mod config_manager_service;
 mod connection_cleanup;
@@ -912,7 +909,7 @@ pub async fn run_main_with_transport_options(
         async move {
             let mut listen_for_threads = true;
             let mut shutdown_state = ShutdownState::default();
-            let exit_reason = loop {
+            loop {
                 let running_turn_count = {
                     let running_turn_count = running_turn_count_rx.borrow();
                     *running_turn_count
@@ -925,7 +922,7 @@ pub async fn run_main_with_transport_options(
                     let _ = outbound_control_tx
                         .send(OutboundControlEvent::DisconnectAll)
                         .await;
-                    break "shutdown_requested";
+                    break;
                 }
 
                 tokio::select! {
@@ -947,7 +944,7 @@ pub async fn run_main_with_transport_options(
                     }
                     event = transport_event_rx.recv() => {
                         let Some(event) = event else {
-                            break "transport_channel_closed";
+                            break;
                         };
                         match event {
                             TransportEvent::ConnectionOpened {
@@ -977,7 +974,7 @@ pub async fn run_main_with_transport_options(
                                     .await
                                     .is_err()
                                 {
-                                    break "outbound_router_closed";
+                                    break;
                                 }
                                 connections.insert(
                                     connection_id,
@@ -1005,10 +1002,10 @@ pub async fn run_main_with_transport_options(
                                         .await;
                                 });
                                 if !outbound_closed {
-                                    break "outbound_router_closed";
+                                    break;
                                 }
                                 if shutdown_when_no_connections && connections.is_empty() {
-                                    break "last_connection_closed";
+                                    break;
                                 }
                             }
                             TransportEvent::IncomingMessage { connection_id, message } => {
@@ -1147,7 +1144,7 @@ pub async fn run_main_with_transport_options(
                         }
                     }
                 }
-            };
+            }
 
             if !shutdown_state.forced() {
                 futures::future::join_all(
@@ -1162,12 +1159,7 @@ pub async fn run_main_with_transport_options(
             } else {
                 connection_cleanup_tasks.abort();
             }
-            info!(
-                exit_reason,
-                remaining_connection_count = connections.len(),
-                shutdown_forced = shutdown_state.forced(),
-                "processor task exited"
-            );
+            info!("processor task exited (channel closed)");
         }
     });
 

@@ -29,7 +29,6 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
-use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -73,11 +72,9 @@ pub struct ThreadConfigSnapshot {
     pub personality: Option<Personality>,
     pub collaboration_mode: CollaborationMode,
     pub session_source: SessionSource,
-    pub history_mode: ThreadHistoryMode,
     pub forked_from_thread_id: Option<ThreadId>,
     pub parent_thread_id: Option<ThreadId>,
     pub thread_source: Option<ThreadSource>,
-    pub originator: String,
 }
 
 /// Explains why `CodexThread::try_start_turn_if_idle` rejected an automatic
@@ -468,15 +465,9 @@ impl CodexThread {
 
         let turn_context = self.codex.session.new_default_turn().await;
         if self.codex.session.reference_context_item().await.is_none() {
-            // This history-only API runs without run_turn, so it owns its initial step.
-            let step_context = self
-                .codex
-                .session
-                .capture_step_context(Arc::clone(&turn_context))
-                .await;
             self.codex
                 .session
-                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+                .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
                 .await;
         }
         self.codex
@@ -596,17 +587,6 @@ impl CodexThread {
         self.codex.session.runtime_mcp_config(config).await
     }
 
-    /// Returns the exact MCP config, environment bindings, and manager most recently published.
-    pub async fn current_mcp_runtime(&self) -> Arc<crate::session::McpRuntimeSnapshot> {
-        let turn_context = self.codex.session.new_default_turn().await;
-        self.codex
-            .session
-            .capture_step_context(turn_context)
-            .await
-            .mcp
-            .clone()
-    }
-
     pub fn multi_agent_version(&self) -> Option<MultiAgentVersion> {
         self.codex.session.multi_agent_version()
     }
@@ -628,9 +608,8 @@ impl CodexThread {
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
         let result = self
-            .current_mcp_runtime()
-            .await
-            .manager_arc()
+            .codex
+            .session
             .read_resource(server, ReadResourceRequestParams::new(uri))
             .await?;
 
@@ -644,9 +623,8 @@ impl CodexThread {
         arguments: Option<serde_json::Value>,
         meta: Option<serde_json::Value>,
     ) -> anyhow::Result<CallToolResult> {
-        self.current_mcp_runtime()
-            .await
-            .manager_arc()
+        self.codex
+            .session
             .call_tool(server, tool, arguments, meta)
             .await
     }

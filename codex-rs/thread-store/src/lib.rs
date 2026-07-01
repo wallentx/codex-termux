@@ -50,7 +50,6 @@ pub use types::StoredTurnStatus;
 pub use types::ThreadMetadataPatch;
 pub use types::ThreadPage;
 pub use types::ThreadPersistenceMetadata;
-pub use types::ThreadRelationFilter;
 pub use types::ThreadSearchPage;
 pub use types::ThreadSortKey;
 pub use types::TurnPage;

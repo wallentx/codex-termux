@@ -1,5 +1,3 @@
-use codex_utils_path_uri::LegacyAppPathString;
-use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,25 +25,6 @@ pub enum CapabilityRootLocation {
         #[serde(rename = "environmentId")]
         #[ts(rename = "environmentId")]
         environment_id: String,
-        /// Absolute path for the root in the selected environment.
-        #[serde(deserialize_with = "deserialize_path_uri_from_api_path")]
-        #[schemars(with = "String")]
-        #[ts(type = "string")]
-        path: PathUri,
+        path: String,
     },
 }
-
-fn deserialize_path_uri_from_api_path<'de, D>(deserializer: D) -> Result<PathUri, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let path = LegacyAppPathString::deserialize(deserializer)?;
-    if let Ok(path_uri) = PathUri::parse(path.as_str()) {
-        return Ok(path_uri);
-    }
-    path.try_into().map_err(serde::de::Error::custom)
-}
-
-#[cfg(test)]
-#[path = "capabilities_tests.rs"]
-mod tests;

@@ -66,17 +66,17 @@ impl CodeModeSessionProvider for InProcessCodeModeSessionProvider {
     ) -> CodeModeSessionProviderFuture<'a> {
         Box::pin(async move {
             let session: Arc<dyn CodeModeSession> =
-                Arc::new(InProcessCodeModeSession::with_delegate(delegate));
+                Arc::new(CodeModeService::with_delegate(delegate));
             Ok(session)
         })
     }
 }
 
-pub struct InProcessCodeModeSession {
+pub struct CodeModeService {
     runtime: SessionRuntime<ProtocolDelegate>,
 }
 
-impl InProcessCodeModeSession {
+impl CodeModeService {
     pub fn new() -> Self {
         Self::with_delegate(Arc::new(NoopCodeModeSessionDelegate))
     }
@@ -84,18 +84,6 @@ impl InProcessCodeModeSession {
     pub fn with_delegate(delegate: Arc<dyn CodeModeSessionDelegate>) -> Self {
         Self {
             runtime: SessionRuntime::new(Arc::new(ProtocolDelegate { delegate })),
-        }
-    }
-
-    pub fn with_delegate_and_task_failure_handler(
-        delegate: Arc<dyn CodeModeSessionDelegate>,
-        task_failure_handler: Arc<dyn Fn(String) + Send + Sync>,
-    ) -> Self {
-        Self {
-            runtime: SessionRuntime::new_with_task_failure_handler(
-                Arc::new(ProtocolDelegate { delegate }),
-                Some(task_failure_handler),
-            ),
         }
     }
 
@@ -221,30 +209,34 @@ impl InProcessCodeModeSession {
     }
 }
 
-impl Default for InProcessCodeModeSession {
+impl Default for CodeModeService {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CodeModeSession for InProcessCodeModeSession {
+impl CodeModeSession for CodeModeService {
+    fn is_alive(&self) -> bool {
+        self.runtime.is_alive()
+    }
+
     fn execute<'a>(
         &'a self,
         request: ExecuteRequest,
     ) -> CodeModeSessionResultFuture<'a, StartedCell> {
-        Box::pin(InProcessCodeModeSession::execute(self, request))
+        Box::pin(CodeModeService::execute(self, request))
     }
 
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        Box::pin(InProcessCodeModeSession::wait(self, request))
+        Box::pin(CodeModeService::wait(self, request))
     }
 
     fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        Box::pin(InProcessCodeModeSession::terminate(self, cell_id))
+        Box::pin(CodeModeService::terminate(self, cell_id))
     }
 
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
-        Box::pin(InProcessCodeModeSession::shutdown(self))
+        Box::pin(CodeModeService::shutdown(self))
     }
 }
 

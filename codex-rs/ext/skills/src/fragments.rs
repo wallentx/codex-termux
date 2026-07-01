@@ -1,4 +1,3 @@
-use codex_core_skills::SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS;
 use codex_core_skills::render_available_skills_body;
 use codex_extension_api::ContextualUserFragment;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
@@ -10,14 +9,7 @@ pub(crate) struct AvailableSkillsInstructions {
 }
 
 impl AvailableSkillsInstructions {
-    pub(crate) fn from_skill_lines(
-        mut skill_lines: Vec<String>,
-        include_skills_usage_instructions: bool,
-    ) -> Self {
-        if include_skills_usage_instructions {
-            skill_lines.push("### How to use skills".to_string());
-            skill_lines.push(SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS.to_string());
-        }
+    pub(crate) fn from_skill_lines(skill_lines: Vec<String>) -> Self {
         Self { skill_lines }
     }
 }
