@@ -6,14 +6,11 @@ use codex_features::Feature;
 pub(super) async fn maybe_record(
     sess: &Session,
     turn_context: &TurnContext,
-    tokens_until_compaction: Option<i64>,
+    tokens_until_compaction: i64,
 ) {
     if !turn_context.config.features.enabled(Feature::TokenBudget) {
         return;
     }
-    let Some(tokens_until_compaction) = tokens_until_compaction else {
-        return;
-    };
 
     let Some(config) = turn_context.config.token_budget.as_ref().filter(|config| {
         config

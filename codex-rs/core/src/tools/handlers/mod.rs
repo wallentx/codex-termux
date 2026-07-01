@@ -35,7 +35,6 @@ pub(crate) mod tool_search_spec;
 pub(crate) mod unified_exec;
 mod view_image;
 pub(crate) mod view_image_spec;
-mod wait_for_environment;
 
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -47,10 +46,10 @@ use serde_json::Map;
 use serde_json::Value;
 use std::path::Path;
 
-use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
@@ -79,7 +78,6 @@ pub use unified_exec::ExecCommandHandler;
 pub(crate) use unified_exec::ExecCommandHandlerOptions;
 pub use unified_exec::WriteStdinHandler;
 pub use view_image::ViewImageHandler;
-pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 
 pub(crate) fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
 where
@@ -155,13 +153,13 @@ fn resolve_workdir_base_path(
 }
 
 fn resolve_tool_environment<'a>(
-    environments: &'a TurnEnvironmentSnapshot,
+    turn: &'a TurnContext,
     environment_id: Option<&str>,
 ) -> Result<Option<&'a TurnEnvironment>, FunctionCallError> {
     environment_id.map_or_else(
-        || Ok(environments.primary()),
+        || Ok(turn.environments.primary()),
         |environment_id| {
-            environments
+            turn.environments
                 .turn_environments
                 .iter()
                 .find(|environment| environment.environment_id == environment_id)

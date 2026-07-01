@@ -210,19 +210,7 @@ impl ChatWidget {
             {
                 self.codex_rate_limit_reached_type = Some(rate_limit_reached_type);
             }
-
-            let has_workspace_credits = snapshot.credits.as_ref().is_some_and(|credits| {
-                credits.has_credits
-                    && (credits.unlimited
-                        || credits.balance.as_deref().is_some_and(|balance| {
-                            balance
-                                .trim()
-                                .parse::<f64>()
-                                .is_ok_and(|balance| balance > 0.0)
-                        }))
-            });
-            let should_warn_about_rate_limit_usage = is_codex_limit && !has_workspace_credits;
-            let warnings = if should_warn_about_rate_limit_usage {
+            let warnings = if is_codex_limit {
                 self.rate_limit_warnings.take_warnings(
                     snapshot
                         .secondary
@@ -256,6 +244,12 @@ impl ChatWidget {
                         .as_ref()
                         .map(|w| f64::from(w.used_percent) >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
                         .unwrap_or(false));
+
+            let has_workspace_credits = snapshot
+                .credits
+                .as_ref()
+                .map(|credits| credits.has_credits)
+                .unwrap_or(false);
 
             if high_usage
                 && !has_workspace_credits

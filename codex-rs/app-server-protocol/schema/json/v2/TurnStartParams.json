@@ -41,6 +41,7 @@
         {
           "enum": [
             "untrusted",
+            "on-failure",
             "on-request",
             "never"
           ],

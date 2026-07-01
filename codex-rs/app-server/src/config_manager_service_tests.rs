@@ -4,7 +4,6 @@ use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
 use codex_app_server_protocol::AppsConfig;
 use codex_app_server_protocol::AskForApproval;
-use codex_app_server_protocol::ConfigLayerSource as ApiConfigLayerSource;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_config::test_support::CloudConfigBundleFixture;
@@ -375,7 +374,7 @@ async fn read_includes_origins_and_layers() {
             .get("approval_policy")
             .expect("origin")
             .name,
-        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
             file: managed_file.clone()
         },
     );
@@ -384,7 +383,7 @@ async fn read_includes_origins_and_layers() {
     // top of the stack; ignore it so this test stays focused on file/user/system ordering.
     let layers = if matches!(
         layers.first().map(|layer| &layer.name),
-        Some(ApiConfigLayerSource::LegacyManagedConfigTomlFromMdm)
+        Some(ConfigLayerSource::LegacyManagedConfigTomlFromMdm)
     ) {
         &layers[1..]
     } else {
@@ -393,20 +392,20 @@ async fn read_includes_origins_and_layers() {
     assert_eq!(layers.len(), 3, "expected three layers");
     assert_eq!(
         layers.first().unwrap().name,
-        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
             file: managed_file.clone()
         }
     );
     assert_eq!(
         layers.get(1).unwrap().name,
-        ApiConfigLayerSource::User {
+        ConfigLayerSource::User {
             file: user_file.clone(),
             profile: None,
         }
     );
     assert!(matches!(
         layers.get(2).unwrap().name,
-        ApiConfigLayerSource::System { .. }
+        ConfigLayerSource::System { .. }
     ));
 }
 
@@ -506,7 +505,7 @@ async fn write_value_reports_override() {
             .get("approval_policy")
             .expect("origin")
             .name,
-        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
             file: managed_file.clone()
         }
     );
@@ -777,7 +776,7 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
     assert_eq!(response.config.model.as_deref(), Some("system"));
     assert_eq!(
         response.origins.get("model").expect("origin").name,
-        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
             file: managed_file.clone()
         },
     );
@@ -786,7 +785,7 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
     // top of the stack; ignore it so this test stays focused on file/session/user ordering.
     let layers = if matches!(
         layers.first().map(|layer| &layer.name),
-        Some(ApiConfigLayerSource::LegacyManagedConfigTomlFromMdm)
+        Some(ConfigLayerSource::LegacyManagedConfigTomlFromMdm)
     ) {
         &layers[1..]
     } else {
@@ -794,15 +793,12 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
     };
     assert_eq!(
         layers.first().unwrap().name,
-        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
     );
-    assert_eq!(
-        layers.get(1).unwrap().name,
-        ApiConfigLayerSource::SessionFlags
-    );
+    assert_eq!(layers.get(1).unwrap().name, ConfigLayerSource::SessionFlags);
     assert_eq!(
         layers.get(2).unwrap().name,
-        ApiConfigLayerSource::User {
+        ConfigLayerSource::User {
             file: user_file,
             profile: None
         }
@@ -840,7 +836,7 @@ async fn write_value_reports_managed_override() {
     let overridden = result.overridden_metadata.expect("overridden metadata");
     assert_eq!(
         overridden.overriding_layer.name,
-        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
     );
     assert_eq!(overridden.effective_value, serde_json::json!("never"));
 }

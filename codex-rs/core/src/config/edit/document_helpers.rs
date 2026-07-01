@@ -1,5 +1,4 @@
 use codex_config::types::AppToolApproval;
-use codex_config::types::McpServerAuth;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerToolConfig;
@@ -96,9 +95,6 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
         }
     }
 
-    if matches!(&config.auth, McpServerAuth::ChatGpt) {
-        entry["auth"] = value("chatgpt");
-    }
     if !config.enabled {
         entry["enabled"] = value(false);
     }

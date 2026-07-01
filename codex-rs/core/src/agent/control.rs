@@ -35,6 +35,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
+use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_thread_store::ReadThreadParams;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -636,7 +637,7 @@ impl AgentControl {
 
     async fn persist_thread_spawn_edge_for_source(
         &self,
-        child_thread: &crate::CodexThread,
+        thread: &crate::CodexThread,
         child_thread_id: ThreadId,
         session_source: Option<&SessionSource>,
     ) {
@@ -644,20 +645,14 @@ impl AgentControl {
         else {
             return;
         };
-        if child_thread.config_snapshot().await.ephemeral {
-            return;
-        }
-        let Ok(state) = self.upgrade() else {
+        let Some(state_db_ctx) = thread.state_db() else {
             return;
         };
-        let Some(agent_graph_store) = state.agent_graph_store() else {
-            return;
-        };
-        if let Err(err) = agent_graph_store
+        if let Err(err) = state_db_ctx
             .upsert_thread_spawn_edge(
                 parent_thread_id,
                 child_thread_id,
-                codex_agent_graph_store::ThreadSpawnEdgeStatus::Open,
+                DirectionalThreadSpawnEdgeStatus::Open,
             )
             .await
         {

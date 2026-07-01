@@ -1,47 +1,44 @@
-use codex_connectors_extension::ExecutorPluginConnectorProvider;
 use codex_core::config::Config;
 use codex_core_plugins::ExecutorPluginProvider;
 use codex_exec_server::EnvironmentManager;
+use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use codex_extension_api::McpServerContributor;
-use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
+use tokio::sync::OnceCell;
 
 use self::provider::ExecutorPluginMcpProvider;
 
 mod provider;
 
-/// Frozen MCP and connector declarations for one selected package.
+/// Frozen MCP declarations for one selected package.
 ///
 /// Each server config retains the stable logical environment ID. Reconnection may replace the
 /// concrete environment instance without changing that authority.
 #[derive(Clone)]
-struct SelectedPluginMetadata {
+struct SelectedPluginMcpServers {
     plugin_id: String,
     plugin_display_name: String,
+    selection_order: usize,
     servers: Vec<(String, codex_config::McpServerConfig)>,
-    connector_ids: Vec<String>,
 }
 
 #[derive(Default)]
 pub(crate) struct SelectedExecutorPluginMcpState {
-    cache: Mutex<Vec<CachedSelectedRoot>>,
+    snapshot: OnceCell<Vec<SelectedPluginMcpServers>>,
 }
 
-struct CachedSelectedRoot {
-    root: SelectedCapabilityRoot,
-    metadata: Option<SelectedPluginMetadata>,
+pub(crate) fn seed_thread_state(thread_init: &mut ExtensionDataInit) {
+    thread_init.insert(SelectedExecutorPluginMcpState::default());
 }
 
 pub(crate) struct SelectedExecutorPluginMcpContributor {
     plugin_provider: ExecutorPluginProvider,
     mcp_provider: ExecutorPluginMcpProvider,
-    connector_provider: ExecutorPluginConnectorProvider,
 }
 
 impl SelectedExecutorPluginMcpContributor {
@@ -49,87 +46,46 @@ impl SelectedExecutorPluginMcpContributor {
         Self {
             plugin_provider: ExecutorPluginProvider::new(Arc::clone(&environment_manager)),
             mcp_provider: ExecutorPluginMcpProvider,
-            connector_provider: ExecutorPluginConnectorProvider,
         }
     }
 
-    /// Returns metadata for one stable selected root.
-    ///
-    /// Successful resolution, including a root that is not a plugin or declares no capabilities,
-    /// is cached until the thread state is dropped. Environment availability never invalidates
-    /// this cache; it only controls whether the cached metadata is projected into a model step.
-    async fn metadata_for_root(
+    async fn resolve_snapshot(
         &self,
-        state: &SelectedExecutorPluginMcpState,
-        selected_root: &SelectedCapabilityRoot,
-    ) -> Option<SelectedPluginMetadata> {
-        if let Some(cached) = state
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .find(|cached| cached.root == *selected_root)
-        {
-            return cached.metadata.clone();
-        }
+        selected_roots: &[SelectedCapabilityRoot],
+    ) -> Vec<SelectedPluginMcpServers> {
+        let mut snapshot = Vec::new();
 
-        let plugin = match self.plugin_provider.resolve_bound(selected_root).await {
-            Ok(plugin) => plugin,
-            Err(err) => {
-                tracing::warn!(
-                    selected_root = selected_root.id,
-                    error = %err,
-                    "failed to resolve selected executor plugin"
-                );
-                return None;
-            }
-        };
-        let metadata = match plugin {
-            Some(plugin) => {
-                let servers = self.mcp_provider.load(&plugin).await.unwrap_or_else(|err| {
+        for (selection_order, selected_root) in selected_roots.iter().enumerate() {
+            let plugin = match self.plugin_provider.resolve_bound(selected_root).await {
+                Ok(Some(plugin)) => plugin,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        selected_root = selected_root.id,
+                        error = %err,
+                        "failed to resolve selected executor plugin for MCP discovery"
+                    );
+                    continue;
+                }
+            };
+            match self.mcp_provider.load(&plugin).await {
+                Ok(servers) => snapshot.push(SelectedPluginMcpServers {
+                    plugin_id: plugin.plugin().selected_root_id().to_string(),
+                    plugin_display_name: plugin.plugin().manifest().display_name().to_string(),
+                    selection_order,
+                    servers,
+                }),
+                Err(err) => {
                     tracing::warn!(
                         selected_root = selected_root.id,
                         error = %err,
                         "failed to load selected executor plugin MCP servers"
                     );
-                    Vec::new()
-                });
-                let connector_ids = self
-                    .connector_provider
-                    .load(&plugin)
-                    .await
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(
-                            selected_root = selected_root.id,
-                            error = %err,
-                            "failed to load selected executor plugin connectors"
-                        );
-                        Vec::new()
-                    })
-                    .into_iter()
-                    .map(|declaration| declaration.connector_id.0)
-                    .collect();
-                Some(SelectedPluginMetadata {
-                    plugin_id: plugin.plugin().selected_root_id().to_string(),
-                    plugin_display_name: plugin.plugin().manifest().display_name().to_string(),
-                    servers,
-                    connector_ids,
-                })
+                }
             }
-            None => None,
-        };
-        let mut cache = state
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.iter().find(|cached| cached.root == *selected_root) {
-            return cached.metadata.clone();
         }
-        cache.push(CachedSelectedRoot {
-            root: selected_root.clone(),
-            metadata: metadata.clone(),
-        });
-        metadata
+
+        snapshot
     }
 }
 
@@ -146,31 +102,20 @@ impl McpServerContributor<Config> for SelectedExecutorPluginMcpContributor {
             let Some(thread_init) = context.thread_init() else {
                 return Vec::new();
             };
-            let Some(thread_store) = context.thread_store() else {
-                return Vec::new();
-            };
             let Some(selected_roots) = thread_init.get::<Vec<SelectedCapabilityRoot>>() else {
                 return Vec::new();
             };
-            let state = thread_store.get_or_init(SelectedExecutorPluginMcpState::default);
+            let Some(state) = thread_init.get::<SelectedExecutorPluginMcpState>() else {
+                tracing::warn!("selected executor plugin MCP state was not initialized");
+                return Vec::new();
+            };
+            let snapshot = state
+                .snapshot
+                .get_or_init(|| self.resolve_snapshot(selected_roots.as_ref()))
+                .await;
             let mut contributions = Vec::new();
 
-            for (selection_order, selected_root) in selected_roots.iter().enumerate() {
-                let CapabilityRootLocation::Environment { environment_id, .. } =
-                    &selected_root.location;
-                if context
-                    .available_environment_ids()
-                    .is_some_and(|available| {
-                        !available
-                            .iter()
-                            .any(|available| available == environment_id)
-                    })
-                {
-                    continue;
-                }
-                let Some(plugin) = self.metadata_for_root(&state, selected_root).await else {
-                    continue;
-                };
+            for plugin in snapshot {
                 let mut servers = plugin.servers.iter().cloned().collect::<HashMap<_, _>>();
                 context
                     .config()
@@ -182,17 +127,10 @@ impl McpServerContributor<Config> for SelectedExecutorPluginMcpContributor {
                         name,
                         plugin_id: plugin.plugin_id.clone(),
                         plugin_display_name: plugin.plugin_display_name.clone(),
-                        selection_order,
+                        selection_order: plugin.selection_order,
                         config: Box::new(config),
                     }
                 }));
-                if !plugin.connector_ids.is_empty() {
-                    contributions.push(McpServerContribution::SelectedPluginConnectors {
-                        plugin_id: plugin.plugin_id,
-                        plugin_display_name: plugin.plugin_display_name,
-                        connector_ids: plugin.connector_ids,
-                    });
-                }
             }
 
             contributions

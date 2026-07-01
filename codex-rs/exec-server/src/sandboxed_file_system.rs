@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCErrorError;
 use codex_utils_path_uri::PathUri;
 use tokio::io;
 
@@ -15,8 +15,6 @@ use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
 use crate::ReadDirectoryEntry;
 use crate::RemoveOptions;
-use crate::WalkOptions;
-use crate::WalkOutcome;
 use crate::fs_helper::FsHelperPayload;
 use crate::fs_helper::FsHelperRequest;
 use crate::fs_sandbox::FileSystemSandboxRunner;
@@ -27,7 +25,6 @@ use crate::protocol::FsGetMetadataParams;
 use crate::protocol::FsReadDirectoryParams;
 use crate::protocol::FsReadFileParams;
 use crate::protocol::FsRemoveParams;
-use crate::protocol::FsWalkParams;
 use crate::protocol::FsWriteFileParams;
 
 #[derive(Clone)]
@@ -203,29 +200,6 @@ impl SandboxedFileSystem {
             .collect())
     }
 
-    async fn walk(
-        &self,
-        path: &PathUri,
-        options: WalkOptions,
-        sandbox: Option<&FileSystemSandboxContext>,
-    ) -> FileSystemResult<WalkOutcome> {
-        let sandbox = require_platform_sandbox(sandbox)?;
-        validate_native_path(path)?;
-        let response = self
-            .run_sandboxed(
-                sandbox,
-                FsHelperRequest::Walk(FsWalkParams {
-                    path: path.clone(),
-                    options,
-                    sandbox: None,
-                }),
-            )
-            .await?
-            .expect_walk()
-            .map_err(map_sandbox_error)?;
-        Ok(response)
-    }
-
     async fn remove(
         &self,
         path: &PathUri,
@@ -341,15 +315,6 @@ impl ExecutorFileSystem for SandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
         Box::pin(SandboxedFileSystem::read_directory(self, path, sandbox))
-    }
-
-    fn walk<'a>(
-        &'a self,
-        path: &'a PathUri,
-        options: WalkOptions,
-        sandbox: Option<&'a FileSystemSandboxContext>,
-    ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
-        Box::pin(SandboxedFileSystem::walk(self, path, options, sandbox))
     }
 
     fn remove<'a>(

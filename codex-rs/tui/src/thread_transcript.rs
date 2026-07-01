@@ -203,8 +203,7 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
             vec![vec!["web search: ".dim(), query.clone().into()].into()]
         }
         ThreadItem::ImageView { path, .. } => {
-            let path = path.render_for_ui();
-            vec![format!("image: {path}").dim().into()]
+            vec![format!("image: {}", path.as_path().display()).dim().into()]
         }
         ThreadItem::ImageGeneration {
             status, saved_path, ..
