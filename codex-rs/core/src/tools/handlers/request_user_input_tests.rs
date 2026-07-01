@@ -1,5 +1,4 @@
 use super::*;
-use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -22,15 +21,13 @@ async fn multi_agent_v2_request_user_input_rejects_subagent_threads() {
         agent_nickname: None,
         agent_role: None,
     });
-    let turn = Arc::new(turn);
 
     let result = RequestUserInputHandler {
         available_modes: Vec::new(),
     }
     .handle(ToolInvocation {
         session: Arc::new(session),
-        step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
+        turn: Arc::new(turn),
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
         call_id: "call-1".to_string(),

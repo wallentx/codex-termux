@@ -4,7 +4,6 @@
 //! events as transcript cells.
 
 use super::*;
-use codex_utils_path_uri::LegacyAppPathString;
 
 impl ChatWidget {
     pub(super) fn on_patch_apply_begin(&mut self, changes: HashMap<PathBuf, FileChange>) {
@@ -12,7 +11,7 @@ impl ChatWidget {
         self.add_to_history(history_cell::new_patch_event(changes, &self.config.cwd));
     }
 
-    pub(super) fn on_view_image_tool_call(&mut self, path: LegacyAppPathString) {
+    pub(super) fn on_view_image_tool_call(&mut self, path: AbsolutePathBuf) {
         self.record_visible_turn_activity();
         self.flush_answer_stream_with_separator();
         self.add_to_history(history_cell::new_view_image_tool_call(

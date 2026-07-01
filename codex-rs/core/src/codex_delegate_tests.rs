@@ -80,7 +80,6 @@ async fn forward_events_cancelled_while_send_blocked_shuts_down_delegate() {
                     status: None,
                     call_id: "call-1".to_string(),
                     name: "tool".to_string(),
-                    namespace: None,
                     input: "{}".to_string(),
                     internal_chat_message_metadata_passthrough: None,
                 },
@@ -412,13 +411,10 @@ async fn delegated_mcp_guardian_abort_returns_synthetic_decline_answer() {
 
     let pending_mcp_invocations = Arc::new(Mutex::new(HashMap::from([(
         "call-1".to_string(),
-        PendingMcpInvocation {
-            invocation: McpInvocation {
-                server: "custom_server".to_string(),
-                tool: "dangerous_tool".to_string(),
-                arguments: None,
-            },
-            metadata: None,
+        McpInvocation {
+            server: "custom_server".to_string(),
+            tool: "dangerous_tool".to_string(),
+            arguments: None,
         },
     )])));
     let cancel_token = CancellationToken::new();
@@ -464,13 +460,10 @@ async fn delegated_mcp_user_reviewer_returns_none_without_metadata() {
         crate::session::tests::make_session_and_context_with_rx().await;
     let pending_mcp_invocations = Arc::new(Mutex::new(HashMap::from([(
         "call-1".to_string(),
-        PendingMcpInvocation {
-            invocation: McpInvocation {
-                server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
-                tool: "dangerous_tool".to_string(),
-                arguments: None,
-            },
-            metadata: None,
+        McpInvocation {
+            server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
+            tool: "dangerous_tool".to_string(),
+            arguments: None,
         },
     )])));
     let cancel_token = CancellationToken::new();

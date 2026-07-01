@@ -12,8 +12,6 @@ use crate::app_event::AppEvent;
 use crate::app_event::PluginLocation;
 use crate::app_event::PluginRemoteSectionError;
 use crate::bottom_pane::ColumnWidthMode;
-use crate::bottom_pane::SELECTION_TOGGLE_BLOCKED_PREFIX;
-use crate::bottom_pane::SELECTION_TOGGLE_UNAVAILABLE_PREFIX;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionRowDisplay;
@@ -69,8 +67,6 @@ const PERSONAL_MARKETPLACE_RELATIVE_PATH: &str = ".agents/plugins/marketplace.js
 const REMOTE_LOADING_TAB_ID_PREFIX: &str = "remote-loading:";
 const REMOTE_EMPTY_TAB_ID_PREFIX: &str = "remote-empty:";
 const REMOTE_ERROR_TAB_ID_PREFIX: &str = "remote-error:";
-const OPENAI_CURATED_LOADING_DESCRIPTION: &str =
-    "This updates when OpenAI Curated plugins finish loading.";
 const WORKSPACE_SECTION_TAB_ORDER: u8 = 0;
 const SHARED_WITH_ME_SECTION_TAB_ORDER: u8 = 1;
 const SHARED_WITH_ME_LINK_SECTION_TAB_ORDER: u8 = 2;
@@ -82,7 +78,6 @@ struct PreferredLocalPluginSource {
     marketplace_path: AbsolutePathBuf,
     plugin_name: String,
     installed: bool,
-    install_policy: PluginInstallPolicy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,9 +153,7 @@ struct RemoteMarketplaceSection {
     id: &'static str,
     label: &'static str,
     loading_tab_id: &'static str,
-    loading_item_description: &'static str,
     marketplace_names: &'static [&'static str],
-    show_empty_tab: bool,
     empty_item_name: &'static str,
     empty_item_description: &'static str,
     tab_order: u8,
@@ -171,9 +164,7 @@ const REMOTE_MARKETPLACE_SECTIONS: [RemoteMarketplaceSection; 2] = [
         id: "workspace",
         label: "Workspace",
         loading_tab_id: "workspace-loading",
-        loading_item_description: "This updates when workspace plugins finish loading.",
         marketplace_names: &[REMOTE_WORKSPACE_MARKETPLACE_NAME],
-        show_empty_tab: true,
         empty_item_name: "No workspace plugins available",
         empty_item_description: "No workspace directory plugins are available.",
         tab_order: WORKSPACE_SECTION_TAB_ORDER,
@@ -182,13 +173,11 @@ const REMOTE_MARKETPLACE_SECTIONS: [RemoteMarketplaceSection; 2] = [
         id: "shared-with-me",
         label: "Shared with me",
         loading_tab_id: "shared-with-me-loading",
-        loading_item_description: "This updates when shared plugins finish loading.",
         marketplace_names: &[
             REMOTE_WORKSPACE_SHARED_WITH_ME_MARKETPLACE_NAME,
             REMOTE_WORKSPACE_SHARED_WITH_ME_PRIVATE_MARKETPLACE_NAME,
             REMOTE_WORKSPACE_SHARED_WITH_ME_UNLISTED_MARKETPLACE_NAME,
         ],
-        show_empty_tab: false,
         empty_item_name: "No shared plugins available",
         empty_item_description: "No plugins have been shared with you.",
         tab_order: SHARED_WITH_ME_SECTION_TAB_ORDER,
@@ -211,16 +200,10 @@ impl RemoteMarketplaceSection {
         }
 
         let tab = if remote_sections_loading {
-            remote_section_loading_tab(
-                self.loading_tab_id,
-                self.label,
-                self.loading_item_description,
-            )
+            remote_section_loading_tab(self.loading_tab_id, self.label)
         } else if remote_sections_loaded {
             if let Some(section_error) = plugin_remote_section_error(section_errors, self.id) {
                 remote_section_error_tab(section_error)
-            } else if !self.show_empty_tab {
-                return None;
             } else {
                 remote_section_empty_tab(
                     self.id,
@@ -816,7 +799,7 @@ impl ChatWidget {
             if curated_loading && !curated_has_entries {
                 (
                     "Loading OpenAI Curated plugins...",
-                    OPENAI_CURATED_LOADING_DESCRIPTION,
+                    "This section updates when app-server returns it.",
                 )
             } else if let Some(section_error) = by_openai_section_error
                 && !curated_has_entries
@@ -836,10 +819,7 @@ impl ChatWidget {
             curated_empty_description,
         );
         if curated_loading && curated_has_entries {
-            curated_items.push(remote_section_loading_item(
-                "OpenAI Curated",
-                OPENAI_CURATED_LOADING_DESCRIPTION,
-            ));
+            curated_items.push(remote_section_loading_item("OpenAI Curated"));
         }
         if let Some(section_error) = by_openai_section_error
             && curated_has_entries
@@ -1044,16 +1024,7 @@ impl ChatWidget {
         }];
 
         if plugin.summary.installed {
-            if plugin.summary.install_policy == PluginInstallPolicy::InstalledByDefault {
-                items.push(SelectionItem {
-                    name: "Installed by admin".to_string(),
-                    description: Some(
-                        "This plugin is installed by your workspace admin.".to_string(),
-                    ),
-                    is_disabled: true,
-                    ..Default::default()
-                });
-            } else if let Some(plugin_id) = plugin_uninstall_id(&plugin.summary) {
+            if let Some(plugin_id) = plugin_uninstall_id(&plugin.summary) {
                 let uninstall_cwd = self.config.cwd.to_path_buf();
                 let plugin_display_name = display_name;
                 items.push(SelectionItem {
@@ -1193,9 +1164,7 @@ impl ChatWidget {
                 plugin_detail_request_for_entry(marketplace, plugin, preferred_local_sources);
             let can_view_details = plugin_detail_request.is_some();
             let disabled_by_admin = plugin.availability == PluginAvailability::DisabledByAdmin;
-            let can_toggle_plugin = plugin.installed
-                && plugin.install_policy != PluginInstallPolicy::InstalledByDefault
-                && !disabled_by_admin;
+            let can_toggle_plugin = plugin.installed && !disabled_by_admin;
             let selected_status_label = format!("{status_label:<status_label_width$}");
             let selected_description = if can_toggle_plugin {
                 let toggle_action = if plugin.enabled { "disable" } else { "enable" };
@@ -1206,26 +1175,20 @@ impl ChatWidget {
                 } else {
                     format!("{selected_status_label}   Space to {toggle_action}.")
                 }
-            } else if disabled_by_admin && can_view_details {
-                format!("{selected_status_label}   Press Enter to view plugin details.")
-            } else if disabled_by_admin {
-                format!("{selected_status_label}   Plugin details are unavailable.")
             } else if plugin.installed && can_view_details {
                 format!("{selected_status_label}   Press Enter to view plugin details.")
             } else if plugin.installed {
                 format!("{selected_status_label}   Plugin details are unavailable.")
+            } else if disabled_by_admin && can_view_details {
+                format!("{selected_status_label}   Press Enter to view plugin details.")
             } else if can_view_details {
                 format!("{selected_status_label}   Press Enter to install or view plugin details.")
             } else {
                 format!("{selected_status_label}   Remote plugin details are not available yet.")
             };
             let search_value = format!(
-                "{display_name} {} {} {} {} {}",
-                plugin.id,
-                plugin.name,
-                marketplace_label,
-                plugin_description(plugin).unwrap_or_default(),
-                plugin.keywords.join(" ")
+                "{display_name} {} {} {}",
+                plugin.id, plugin.name, marketplace_label
             );
             let cwd = self.config.cwd.to_path_buf();
             let plugin_display_name = display_name.clone();
@@ -1267,13 +1230,7 @@ impl ChatWidget {
             items.push(SelectionItem {
                 name: display_name,
                 toggle,
-                toggle_placeholder: if plugin.availability == PluginAvailability::DisabledByAdmin {
-                    Some(SELECTION_TOGGLE_BLOCKED_PREFIX)
-                } else if can_toggle_plugin {
-                    None
-                } else {
-                    Some(SELECTION_TOGGLE_UNAVAILABLE_PREFIX)
-                },
+                toggle_placeholder: (!can_toggle_plugin).then_some("[-] "),
                 description: Some(description),
                 selected_description: Some(selected_description),
                 search_value: Some(search_value),
@@ -1360,14 +1317,6 @@ fn plugin_entry_preferred(
         return candidate.1.installed;
     }
 
-    let candidate_is_admin_managed =
-        candidate.1.install_policy == PluginInstallPolicy::InstalledByDefault;
-    let existing_is_admin_managed =
-        existing.1.install_policy == PluginInstallPolicy::InstalledByDefault;
-    if candidate_is_admin_managed != existing_is_admin_managed {
-        return candidate_is_admin_managed;
-    }
-
     let candidate_is_local_share =
         candidate.1.share_context.is_some() && !matches!(&candidate.1.source, PluginSource::Remote);
     let existing_is_local_share =
@@ -1401,7 +1350,6 @@ fn preferred_local_plugin_sources(
                     marketplace_path: marketplace_path.clone(),
                     plugin_name: plugin.name.clone(),
                     installed: plugin.installed,
-                    install_policy: plugin.install_policy,
                 });
         }
     }
@@ -1411,13 +1359,6 @@ fn preferred_local_plugin_sources(
 fn plugin_detail_status_label(plugin: &PluginSummary) -> &'static str {
     if plugin.availability == PluginAvailability::DisabledByAdmin {
         return "Disabled by admin";
-    }
-    if plugin.install_policy == PluginInstallPolicy::InstalledByDefault {
-        return if plugin.installed {
-            "Installed by admin"
-        } else {
-            "Enabled by Admin"
-        };
     }
     if plugin.installed {
         if plugin.enabled {
@@ -1429,7 +1370,7 @@ fn plugin_detail_status_label(plugin: &PluginSummary) -> &'static str {
         match plugin.install_policy {
             PluginInstallPolicy::NotAvailable => "Not installable",
             PluginInstallPolicy::Available => "Can be installed",
-            PluginInstallPolicy::InstalledByDefault => "Installed by admin",
+            PluginInstallPolicy::InstalledByDefault => "Available by default",
         }
     }
 }
@@ -1473,12 +1414,6 @@ fn plugin_source_summary(plugin: &PluginDetail) -> String {
         PluginSource::Git { url, ref_name, .. } => match ref_name {
             Some(ref_name) => format!("Git · {url}@{ref_name}"),
             None => format!("Git · {url}"),
-        },
-        PluginSource::Npm {
-            package, version, ..
-        } => match version {
-            Some(version) => format!("npm · {package}@{version}"),
-            None => format!("npm · {package}"),
         },
         PluginSource::Remote => {
             let marketplace_label =
@@ -1708,10 +1643,10 @@ fn is_personal_marketplace_path(marketplace_path: &AbsolutePathBuf) -> bool {
         .is_some_and(|personal_path| personal_path.as_path() == marketplace_path.as_path())
 }
 
-fn remote_section_loading_item(label: &str, description: &str) -> SelectionItem {
+fn remote_section_loading_item(label: &str) -> SelectionItem {
     SelectionItem {
         name: format!("Loading {label} plugins..."),
-        description: Some(description.to_string()),
+        description: Some("This section updates when app-server returns it.".to_string()),
         is_disabled: true,
         ..Default::default()
     }
@@ -1735,7 +1670,7 @@ fn plugin_remote_section_error<'a>(
         .find(|section_error| section_error.section_id == section_id)
 }
 
-fn remote_section_loading_tab(id: &str, label: &str, item_description: &str) -> SelectionTab {
+fn remote_section_loading_tab(id: &str, label: &str) -> SelectionTab {
     SelectionTab {
         id: format!("{REMOTE_LOADING_TAB_ID_PREFIX}{id}"),
         label: label.to_string(),
@@ -1743,7 +1678,7 @@ fn remote_section_loading_tab(id: &str, label: &str, item_description: &str) -> 
             format!("Loading {label} plugins."),
             "Local plugin functionality is already available.".to_string(),
         ),
-        items: vec![remote_section_loading_item(label, item_description)],
+        items: vec![remote_section_loading_item(label)],
     }
 }
 
@@ -1881,10 +1816,7 @@ fn plugin_brief_description_without_marketplace(
 
 fn plugin_status_label(plugin: &PluginSummary) -> &'static str {
     if plugin.availability == PluginAvailability::DisabledByAdmin {
-        return "Disabled";
-    }
-    if !plugin.installed && plugin.install_policy == PluginInstallPolicy::InstalledByDefault {
-        return "Admin assigned";
+        return "Disabled by admin";
     }
     if plugin.installed {
         if plugin.enabled {
@@ -1896,7 +1828,7 @@ fn plugin_status_label(plugin: &PluginSummary) -> &'static str {
         match plugin.install_policy {
             PluginInstallPolicy::NotAvailable => "Not installable",
             PluginInstallPolicy::Available => "Available",
-            PluginInstallPolicy::InstalledByDefault => "Installed",
+            PluginInstallPolicy::InstalledByDefault => "Available by default",
         }
     }
 }
@@ -1931,7 +1863,6 @@ fn plugin_detail_request_for_entry(
         && let Some(remote_plugin_id) = plugin_remote_identity(plugin)
         && let Some(preferred_source) = preferred_local_sources.get(remote_plugin_id)
         && preferred_source.installed == plugin.installed
-        && preferred_source.install_policy == plugin.install_policy
     {
         return Some((
             PluginLocation::Local {

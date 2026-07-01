@@ -1284,8 +1284,6 @@ async fn submit_user_message_ignores_inaccessible_app_mentions_from_bindings() {
                 description: Some("Directory-only app".to_string()),
                 logo_url: None,
                 logo_url_dark: None,
-                icon_assets: None,
-                icon_dark_assets: None,
                 distribution_channel: None,
                 branding: None,
                 app_metadata: None,

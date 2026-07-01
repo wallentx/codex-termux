@@ -113,10 +113,7 @@ async fn detect_home_lists_config_skills_and_agents_md() {
                 agents_skills.display()
             ),
             cwd: None,
-            details: Some(MigrationDetails {
-                skills: named_migrations(vec!["skill-a".to_string()]),
-                ..Default::default()
-            }),
+            details: None,
         },
         ExternalAgentConfigMigrationItem {
             item_type: ExternalAgentConfigMigrationItemType::AgentsMd,
@@ -308,10 +305,7 @@ async fn detect_repo_still_reports_non_plugin_items_when_home_config_is_invalid(
                     repo_root.join(".agents").join("skills").display()
                 ),
                 cwd: Some(repo_root.clone()),
-                details: Some(MigrationDetails {
-                    skills: named_migrations(vec!["skill-a".to_string()]),
-                    ..Default::default()
-                }),
+                details: None,
             },
             ExternalAgentConfigMigrationItem {
                 item_type: ExternalAgentConfigMigrationItemType::AgentsMd,

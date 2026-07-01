@@ -64,7 +64,6 @@ pub(crate) enum GuardianApprovalRequest {
         connector_id: Option<String>,
         connector_name: Option<String>,
         connector_description: Option<String>,
-        connected_account_email: Option<String>,
         tool_title: Option<String>,
         tool_description: Option<String>,
         annotations: Option<GuardianMcpAnnotations>,
@@ -141,8 +140,6 @@ struct McpToolCallApprovalAction<'a> {
     connector_name: Option<&'a String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     connector_description: Option<&'a String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    connected_account_email: Option<&'a String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_title: Option<&'a String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -346,7 +343,6 @@ pub(crate) fn guardian_approval_request_to_json(
             connector_id,
             connector_name,
             connector_description,
-            connected_account_email,
             tool_title,
             tool_description,
             annotations,
@@ -358,7 +354,6 @@ pub(crate) fn guardian_approval_request_to_json(
             connector_id: connector_id.as_ref(),
             connector_name: connector_name.as_ref(),
             connector_description: connector_description.as_ref(),
-            connected_account_email: connected_account_email.as_ref(),
             tool_title: tool_title.as_ref(),
             tool_description: tool_description.as_ref(),
             annotations: annotations.as_ref(),

@@ -1,5 +1,10 @@
-use codex_connectors::AppInfo;
-use codex_protocol::approvals::ElicitationRequest;
+use std::collections::BTreeMap;
+
+use codex_app_server_protocol::AppInfo;
+use codex_app_server_protocol::McpElicitationObjectType;
+use codex_app_server_protocol::McpElicitationSchema;
+use codex_app_server_protocol::McpServerElicitationRequest;
+use codex_app_server_protocol::McpServerElicitationRequestParams;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
@@ -49,21 +54,31 @@ pub struct RequestPluginInstallMeta<'a> {
 }
 
 pub fn build_request_plugin_install_elicitation_request(
+    server_name: &str,
+    thread_id: String,
+    turn_id: String,
     suggest_reason: &str,
     tool: &DiscoverableTool,
-) -> ElicitationRequest {
+) -> McpServerElicitationRequestParams {
     let message = suggest_reason.to_string();
 
-    ElicitationRequest::Form {
-        meta: Some(json!(build_request_plugin_install_meta(
-            suggest_reason,
-            tool,
-        ))),
-        message,
-        requested_schema: json!({
-            "type": "object",
-            "properties": {},
-        }),
+    McpServerElicitationRequestParams {
+        thread_id,
+        turn_id: Some(turn_id),
+        server_name: server_name.to_string(),
+        request: McpServerElicitationRequest::Form {
+            meta: Some(json!(build_request_plugin_install_meta(
+                suggest_reason,
+                tool,
+            ))),
+            message,
+            requested_schema: McpElicitationSchema {
+                schema_uri: None,
+                type_: McpElicitationObjectType::Object,
+                properties: BTreeMap::new(),
+                required: None,
+            },
+        },
     }
 }
 
