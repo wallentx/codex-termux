@@ -92,6 +92,7 @@ mod app_backtrack;
 mod app_command;
 mod app_event;
 mod app_event_sender;
+mod app_info;
 mod app_server_approval_conversions;
 mod app_server_session;
 mod approval_events;
@@ -137,6 +138,7 @@ mod line_truncation;
 pub(crate) mod live_wrap;
 pub use live_wrap::RowBuilder;
 mod local_chatgpt_auth;
+mod managed_new_thread_defaults;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
@@ -201,6 +203,7 @@ mod width;
 #[cfg(any(target_os = "windows", test))]
 mod windows_sandbox;
 mod workspace_command;
+mod workspace_messages;
 
 mod wrapping;
 
