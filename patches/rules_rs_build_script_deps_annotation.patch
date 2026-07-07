@@ -5,6 +5,23 @@
 diff --git a/rs/extensions.bzl b/rs/extensions.bzl
 --- a/rs/extensions.bzl
 +++ b/rs/extensions.bzl
+@@ -428,7 +428,7 @@ def _generate_hub_and_spokes(
+             dependencies = [
+-                _spec_to_dep_dict(dep, spec, annotation, {})
++                _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json)
+                 for dep, spec in cargo_toml_json.get("dependencies", {}).items()
+             ] + [
+-                _spec_to_dep_dict(dep, spec, annotation, {}, is_build = True)
++                _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json, is_build = True)
+                 for dep, spec in cargo_toml_json.get("build-dependencies", {}).items()
+             ]
+@@ -436,5 +436,5 @@ def _generate_hub_and_spokes(
+             for target, value in cargo_toml_json.get("target", {}).items():
+                 for dep, spec in value.get("dependencies", {}).items():
+-                    converted = _spec_to_dep_dict(dep, spec, annotation, {})
++                    converted = _spec_to_dep_dict(dep, spec, annotation, workspace_cargo_toml_json)
+                     converted["target"] = target
+                     dependencies.append(converted)
 @@ -737,7 +737,7 @@ def _generate_hub_and_spokes(
              additive_build_file = annotation.additive_build_file,
              additive_build_file_content = annotation.additive_build_file_content,
