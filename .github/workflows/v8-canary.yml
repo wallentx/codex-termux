@@ -291,6 +291,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - uses: ./.github/actions/setup-ci
+
       - name: Configure git for upstream checkout
         shell: bash
         run: git config --global core.symlinks true
