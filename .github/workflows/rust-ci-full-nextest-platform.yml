@@ -48,6 +48,11 @@ on:
         default: false
         type: boolean
 
+# Caller workflow-level env does not flow through workflow_call, so keep the
+# Cargo git transport hardening on the archive and shard jobs directly here.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
 jobs:
   archive:
     name: Build nextest archive
@@ -76,8 +81,6 @@ jobs:
         shell: pwsh
         run: ../.github/scripts/setup-dev-drive.ps1
 
-      - uses: ./.github/actions/setup-ci
-
       - name: Install Linux build dependencies
         if: ${{ runner.os == 'Linux' }}
         shell: bash
@@ -88,7 +91,10 @@ jobs:
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap
           fi
 
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Install DotSlash
+        uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
           targets: ${{ inputs.target }}
 
@@ -300,8 +306,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-ci
-
       - name: Install Linux build dependencies
         if: ${{ runner.os == 'Linux' }}
         shell: bash
@@ -312,7 +316,10 @@ jobs:
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap
           fi
 
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Install DotSlash
+        uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
           targets: ${{ inputs.target }}
 
@@ -336,9 +343,7 @@ jobs:
           set -euo pipefail
           export CODEX_TEST_REMOTE_ENV_CONTAINER_NAME="codex-remote-test-env-${{ github.run_id }}-${{ matrix.shard }}"
           source "${GITHUB_WORKSPACE}/scripts/test-remote-env.sh"
-          echo "CODEX_TEST_ENVIRONMENT=${CODEX_TEST_ENVIRONMENT}" >> "$GITHUB_ENV"
           echo "CODEX_TEST_REMOTE_ENV=${CODEX_TEST_REMOTE_ENV}" >> "$GITHUB_ENV"
-          echo "CODEX_TEST_REMOTE_ENV_CONTAINER_NAME=${CODEX_TEST_REMOTE_ENV_CONTAINER_NAME}" >> "$GITHUB_ENV"
           echo "CODEX_TEST_REMOTE_EXEC_SERVER_URL=${CODEX_TEST_REMOTE_EXEC_SERVER_URL}" >> "$GITHUB_ENV"
 
       - name: Download nextest archive
@@ -432,9 +437,9 @@ jobs:
         run: |
           set +e
           if [[ "${STEPS_TEST_OUTCOME}" != "success" ]]; then
-            docker logs "${CODEX_TEST_REMOTE_ENV_CONTAINER_NAME}" || true
+            docker logs "${CODEX_TEST_REMOTE_ENV}" || true
           fi
-          docker rm -f "${CODEX_TEST_REMOTE_ENV_CONTAINER_NAME}" >/dev/null 2>&1 || true
+          docker rm -f "${CODEX_TEST_REMOTE_ENV}" >/dev/null 2>&1 || true
         env:
           STEPS_TEST_OUTCOME: ${{ steps.test.outcome }}
 
