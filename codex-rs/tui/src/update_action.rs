@@ -14,6 +14,8 @@ pub enum UpdateAction {
     NpmGlobalLatest,
     /// Update via `bun install -g @openai/codex@latest`.
     BunGlobalLatest,
+    /// Update via `pnpm add -g @openai/codex@latest`.
+    PnpmGlobalLatest,
     /// Update via `brew upgrade codex`.
     BrewUpgrade,
     /// Update via `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`.
@@ -32,6 +34,7 @@ impl UpdateAction {
         match &context.method {
             InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
             InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
+            InstallMethod::Pnpm => Some(UpdateAction::PnpmGlobalLatest),
             InstallMethod::Brew => Some(UpdateAction::BrewUpgrade),
             InstallMethod::Standalone { platform, .. } => Some(match platform {
                 StandalonePlatform::Unix => UpdateAction::StandaloneUnix,
@@ -47,6 +50,7 @@ impl UpdateAction {
             UpdateAction::TermuxSelfUpdate => ("codex", &["update"]),
             UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
             UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
+            UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
             UpdateAction::StandaloneUnix => (
                 "sh",
@@ -123,6 +127,13 @@ mod tests {
                 package_layout: None,
             }),
             Some(UpdateAction::BunGlobalLatest)
+        );
+        assert_eq!(
+            UpdateAction::from_install_context(&InstallContext {
+                method: InstallMethod::Pnpm,
+                package_layout: None,
+            }),
+            Some(UpdateAction::PnpmGlobalLatest)
         );
         assert_eq!(
             UpdateAction::from_install_context(&InstallContext {
