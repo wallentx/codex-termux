@@ -49,6 +49,7 @@ mod app_cmd;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
+mod exec_server_telemetry;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod plugin_cmd;
@@ -728,7 +729,7 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
 }
 
 /// Handle the app exit and print the results. Optionally run the update action.
-fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+async fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
     let is_fatal = match &exit_info.exit_reason {
         ExitReason::Fatal(message) => {
             eprintln!("ERROR: {message}");
@@ -747,13 +748,18 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
         std::process::exit(1);
     }
     if let Some(action) = update_action {
-        run_update_action(action)?;
+        run_update_action(action).await?;
     }
     Ok(())
 }
 
 /// Run the update action and print the result.
-fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
+async fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
+    if matches!(action, UpdateAction::TermuxSelfUpdate) {
+        run_termux_update().await?;
+        return Ok(());
+    }
+
     println!();
     let cmd_str = action.command_str();
     println!("Updating Codex via `{cmd_str}`...");
@@ -795,7 +801,7 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_update_command() -> anyhow::Result<()> {
+async fn run_update_command() -> anyhow::Result<()> {
     #[cfg(debug_assertions)]
     {
         anyhow::bail!(
@@ -805,13 +811,38 @@ fn run_update_command() -> anyhow::Result<()> {
 
     #[cfg(not(debug_assertions))]
     {
+        if cfg!(target_os = "android") {
+            return run_termux_update().await;
+        }
+
         let Some(action) = codex_tui::get_update_action() else {
             anyhow::bail!(
                 "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
             );
         };
-        run_update_action(action)
+        run_update_action(action).await
     }
+}
+
+async fn run_termux_update() -> anyhow::Result<()> {
+    println!();
+    println!("Checking wallentx/codex-termux releases...");
+    let outcome = codex_tui::termux_update::update_current_exe(env!("CARGO_PKG_VERSION")).await?;
+
+    if outcome.updated {
+        println!(
+            "Updated Codex from {} to {} using {}.",
+            outcome.previous_version, outcome.latest_version, outcome.tag_name
+        );
+        println!(
+            "Replaced {}. Restart Codex to use the new version.",
+            outcome.executable.display()
+        );
+    } else {
+        println!("Codex is already up to date ({}).", outcome.latest_version);
+    }
+
+    Ok(())
 }
 
 fn run_execpolicycheck(cmd: ExecPolicyCheckCommand) -> anyhow::Result<()> {
@@ -996,7 +1027,7 @@ async fn cli_main(
                 arg0_paths.clone(),
             )
             .await?;
-            handle_app_exit(exit_info)?;
+            handle_app_exit(exit_info).await?;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1266,7 +1297,7 @@ async fn cli_main(
                 arg0_paths.clone(),
             )
             .await?;
-            handle_app_exit(exit_info)?;
+            handle_app_exit(exit_info).await?;
         }
         Some(Subcommand::Archive(cmd)) => {
             let output = run_session_archive_cli_command(
@@ -1333,7 +1364,7 @@ async fn cli_main(
                 arg0_paths.clone(),
             )
             .await?;
-            handle_app_exit(exit_info)?;
+            handle_app_exit(exit_info).await?;
         }
         Some(Subcommand::Login(mut login_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1405,7 +1436,7 @@ async fn cli_main(
                 root_remote_auth_token_env.as_deref(),
                 "update",
             )?;
-            run_update_command()?;
+            run_update_command().await?;
         }
         Some(Subcommand::Doctor(doctor_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1692,6 +1723,7 @@ async fn run_exec_server_command(
             .environment_id
             .ok_or_else(|| anyhow::anyhow!("--environment-id is required when --remote is set"))?;
         let config = load_exec_server_config(root_config_overrides, strict_config).await?;
+        let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
         let auth_provider =
             load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
                 .await?;
@@ -1703,22 +1735,28 @@ async fn run_exec_server_command(
         if let Some(name) = cmd.name {
             remote_config.name = name;
         }
-        codex_exec_server::run_remote_environment(remote_config, runtime_paths).await?;
+        let remote_config = remote_config.with_telemetry(telemetry);
+        exec_server_telemetry::run_until_shutdown(async move {
+            codex_exec_server::run_remote_environment(remote_config, runtime_paths).await
+        })
+        .await?;
         Ok(())
     } else {
-        if strict_config {
-            // Local exec-server startup does not consume Config, but strict
-            // mode should still reject unknown fields before opening a listener.
-            let _validated_config =
-                load_exec_server_config(root_config_overrides, strict_config).await?;
-        }
+        let config_result = load_exec_server_config(root_config_overrides, strict_config).await;
+        let config = if strict_config {
+            Some(config_result?)
+        } else {
+            config_result.ok()
+        };
+        let (_otel, telemetry) = exec_server_telemetry::init(config.as_ref());
         let listen_url = cmd
             .listen
-            .as_deref()
-            .unwrap_or(codex_exec_server::DEFAULT_LISTEN_URL);
-        codex_exec_server::run_main(listen_url, runtime_paths)
-            .await
-            .map_err(anyhow::Error::from_boxed)
+            .unwrap_or_else(|| codex_exec_server::DEFAULT_LISTEN_URL.to_string());
+        exec_server_telemetry::run_until_shutdown(async move {
+            codex_exec_server::run_main_with_telemetry(&listen_url, runtime_paths, telemetry).await
+        })
+        .await
+        .map_err(anyhow::Error::from_boxed)
     }
 }
 
@@ -1731,10 +1769,11 @@ async fn load_exec_server_remote_auth_provider(
         let agent_identity_jwt = read_codex_access_token_from_env().ok_or_else(|| {
             anyhow::anyhow!("CODEX_ACCESS_TOKEN is required when --use-agent-identity-auth is set")
         })?;
+        let auth_route_config = config.auth_route_config();
         let auth = CodexAuth::from_agent_identity_jwt(
             &agent_identity_jwt,
             Some(&config.chatgpt_base_url),
-            /*agent_identity_authapi_base_url_override*/ None,
+            auth_route_config.as_ref(),
         )
         .await?;
         return Ok(codex_model_provider::auth_provider_from_auth(&auth));
@@ -1994,7 +2033,10 @@ async fn run_debug_models_command(
             AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
         let models_manager = build_models_manager(&config, auth_manager);
         models_manager
-            .raw_model_catalog(RefreshStrategy::OnlineIfUncached)
+            .raw_model_catalog(
+                RefreshStrategy::OnlineIfUncached,
+                config.http_client_factory(),
+            )
             .await
     };
 
@@ -2957,7 +2999,28 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
-    fn sandbox_parses_permissions_profile() {
+    fn sandbox_parses_permission_profile() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "sandbox",
+            "--permission-profile",
+            ":workspace",
+            "--",
+            "echo",
+        ])
+        .expect("parse");
+
+        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+            panic!("expected sandbox command");
+        };
+
+        assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
+        assert_eq!(command.command, vec!["echo"]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn sandbox_parses_legacy_permissions_profile_alias() {
         let cli = MultitoolCli::try_parse_from([
             "codex",
             "sandbox",
@@ -2974,6 +3037,14 @@ mod tests {
 
         assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
         assert_eq!(command.command, vec!["echo"]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn sandbox_help_only_shows_singular_permission_profile() {
+        let help = help_from_args(&["codex", "sandbox", "--help"]);
+        assert!(help.contains("--permission-profile"), "{help}");
+        assert!(!help.contains("--permissions-profile"), "{help}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -3549,6 +3620,15 @@ mod tests {
         .expect_err("remote-control should reject root --remote");
 
         assert!(err.to_string().contains("remote-control"));
+    }
+
+    #[test]
+    fn remote_control_pair_parses() {
+        let cli = MultitoolCli::try_parse_from(["codex", "remote-control", "pair"]).expect("parse");
+        let Some(Subcommand::RemoteControl(remote_control)) = &cli.subcommand else {
+            panic!("expected remote-control subcommand");
+        };
+        assert_eq!(remote_control.subcommand_name(), "remote-control pair");
     }
 
     #[test]

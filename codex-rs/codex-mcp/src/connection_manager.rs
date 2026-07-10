@@ -14,6 +14,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::McpAuthStatusEntry;
+use crate::codex_apps::prepare_openai_file_params_for_model;
 use crate::codex_apps_cache::CodexAppsToolsCache;
 use crate::codex_apps_cache::CodexAppsToolsCacheKey;
 use crate::codex_apps_cache::CodexAppsToolsFetchSource;
@@ -36,7 +37,6 @@ use crate::server::McpServerMetadata;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
 use crate::tools::normalize_tools_for_model_with_prefix;
-use crate::tools::tool_with_model_visible_input_schema;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -504,18 +504,14 @@ impl McpConnectionManager {
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.clients.len()))]
     pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
         let mut tools = Vec::new();
+        let mut available_server_count = 0;
+        let mut unavailable_server_count = 0;
         for (server_name, managed_client) in &self.clients {
             managed_client.reconnect_failed_startup().await;
             let has_cached_tools = managed_client.has_cached_tools();
             let startup_complete = managed_client
                 .startup_complete
                 .load(std::sync::atomic::Ordering::Acquire);
-            trace!(
-                server_name = %server_name,
-                has_cached_tools,
-                startup_complete,
-                "waiting for MCP server tools while building tool list"
-            );
             let Some(server_tools) = managed_client
                 .listed_tools()
                 .instrument(trace_span!(
@@ -526,20 +522,30 @@ impl McpConnectionManager {
                 ))
                 .await
             else {
+                unavailable_server_count += 1;
+                trace!(
+                    server_name = %server_name,
+                    has_cached_tools,
+                    startup_complete,
+                    "MCP server tools unavailable while building tool list"
+                );
                 continue;
             };
-            trace!(
-                server_name = %server_name,
-                tool_count = server_tools.len(),
-                "listed MCP server tools while building tool list"
-            );
+            available_server_count += 1;
             tools.extend(
                 server_tools
                     .into_iter()
                     .map(|tool| self.with_server_metadata(tool)),
             );
         }
-        normalize_tools_for_model_with_prefix(tools, self.prefix_mcp_tool_names)
+        let tools = normalize_tools_for_model_with_prefix(tools, self.prefix_mcp_tool_names);
+        trace!(
+            available_server_count,
+            unavailable_server_count,
+            tool_count = tools.len(),
+            "built MCP tool list"
+        );
+        tools
     }
 
     /// Force-refresh codex apps tools by bypassing the in-process cache.
@@ -593,7 +599,7 @@ impl McpConnectionManager {
         let tools = filter_tools(tools, &managed_client.tool_filter)
             .into_iter()
             .map(|mut tool| {
-                tool.tool = tool_with_model_visible_input_schema(&tool.tool);
+                prepare_openai_file_params_for_model(&mut tool);
                 self.with_server_metadata(tool)
             });
         let tools = normalize_tools_for_model_with_prefix(tools, self.prefix_mcp_tool_names);
