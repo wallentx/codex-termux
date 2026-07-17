@@ -5,6 +5,16 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 script="${repo_root}/scripts/termux-create-release-pr.sh"
 tmp_dir="$(mktemp -d)"
+release_code_patch="${tmp_dir}/termux-release-code.patch"
+
+cat > "${release_code_patch}" <<'PATCH'
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -1 +1 @@
+-upstream release code
++termux release code
+PATCH
 
 cleanup() {
   rm -rf "${tmp_dir}"
@@ -71,6 +81,7 @@ run_release_pr_script() {
   REVIEWER="wallentx" \
   RUNNER_TEMP="${runner_temp}" \
   GITHUB_OUTPUT="${github_output}" \
+  TERMUX_RELEASE_CODE_PATCH="${release_code_patch}" \
   GH_TOKEN="test-token" \
   bash "${script}"
 }
@@ -139,13 +150,17 @@ cd "${work}"
 git config user.name "Termux Release Test"
 git config user.email "termux-release-test@example.invalid"
 
-mkdir -p codex-rs src
+mkdir -p codex-rs/cli/src codex-rs/tui/src src
 cat > codex-rs/Cargo.toml <<'TOML'
 [workspace.package]
 version = "1.0.0"
 TOML
+printf 'upstream release code\n' > codex-rs/cli/src/main.rs
+for path in lib.rs termux_update.rs update_action.rs update_prompt.rs update_versions.rs updates.rs; do
+  printf 'fixture\n' > "codex-rs/tui/src/${path}"
+done
 printf 'release\n' > src/shared.txt
-git add codex-rs/Cargo.toml src/shared.txt
+git add codex-rs src/shared.txt
 git commit -m "upstream release" >/dev/null
 git tag rust-v1.0.0
 git branch -M main
@@ -162,7 +177,8 @@ mkdir -p termux
 perl -0pi -e 's/version = "1\.0\.0"/version = "1.0.0-alpha.target"/' codex-rs/Cargo.toml
 printf 'compat\n' > termux/compat.txt
 printf 'termux\n' > src/shared.txt
-git add codex-rs/Cargo.toml termux/compat.txt src/shared.txt
+printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
+git add codex-rs/Cargo.toml codex-rs/cli/src/main.rs termux/compat.txt src/shared.txt
 git commit -m "termux compatibility changes" >/dev/null
 git push origin wallentx/termux-target >/dev/null
 
@@ -183,11 +199,13 @@ run_release_pr_script "${runner_temp}" "${github_output}" > "${tmp_dir}/stdout" 
 git fetch origin release/1.0.0 release-train/1.0.0 >/dev/null
 
 assert_ref_file_equals origin/release/1.0.0 src/shared.txt "release"
+assert_ref_file_equals origin/release/1.0.0 codex-rs/cli/src/main.rs "termux release code"
 assert_ref_lacks_file origin/release/1.0.0 src/upstream-after-tag.txt
 assert_ref_lacks_file origin/release/1.0.0 termux/compat.txt
 assert_ref_has_file origin/release/1.0.0 scripts/termux-download-release-artifact.sh
 
 assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "termux"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code with target drift"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
 version = \"1.0.0\""
 assert_ref_has_file origin/release-train/1.0.0 src/upstream-after-tag.txt
@@ -215,13 +233,17 @@ cd "${work_update}"
 git config user.name "Termux Release Test"
 git config user.email "termux-release-test@example.invalid"
 
-mkdir -p codex-rs src
+mkdir -p codex-rs/cli/src codex-rs/tui/src src
 cat > codex-rs/Cargo.toml <<'TOML'
 [workspace.package]
 version = "1.0.0-alpha.1"
 TOML
+printf 'upstream release code\n' > codex-rs/cli/src/main.rs
+for path in lib.rs termux_update.rs update_action.rs update_prompt.rs update_versions.rs updates.rs; do
+  printf 'fixture\n' > "codex-rs/tui/src/${path}"
+done
 printf 'old-release\n' > src/shared.txt
-git add codex-rs/Cargo.toml src/shared.txt
+git add codex-rs src/shared.txt
 git commit -m "old upstream release" >/dev/null
 git tag rust-v1.0.0-alpha.1
 git branch -M main
@@ -248,7 +270,8 @@ mkdir -p termux
 perl -0pi -e 's/version = "1\.0\.0-alpha\.2"/version = "1.0.0-alpha.target"/' codex-rs/Cargo.toml
 printf 'termux\n' > src/shared.txt
 printf 'compat\n' > termux/compat.txt
-git add codex-rs/Cargo.toml src/shared.txt termux/compat.txt
+printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
+git add codex-rs/Cargo.toml codex-rs/cli/src/main.rs src/shared.txt termux/compat.txt
 git commit -m "termux compatibility changes" >/dev/null
 git push origin wallentx/termux-target >/dev/null
 
@@ -275,11 +298,13 @@ run_release_pr_script \
 git fetch origin release/1.0.0 release-train/1.0.0 >/dev/null
 
 assert_ref_file_equals origin/release/1.0.0 src/shared.txt "new-release"
+assert_ref_file_equals origin/release/1.0.0 codex-rs/cli/src/main.rs "termux release code"
 assert_ref_file_equals origin/release/1.0.0 codex-rs/Cargo.toml "[workspace.package]
 version = \"1.0.0-alpha.2\""
 assert_ref_lacks_file origin/release/1.0.0 stale-release-branch.txt
 
 assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "termux"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code with target drift"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
 version = \"1.0.0-alpha.2\""
 assert_ref_has_file origin/release-train/1.0.0 termux/compat.txt

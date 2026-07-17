@@ -61,7 +61,7 @@ seed_release_branch_workflows() {
 }
 
 apply_seeded_release_code_patches() {
-  local patch_path="${seed_dir}/scripts/termux-release-self-update.patch"
+  local patch_path="${TERMUX_RELEASE_CODE_PATCH:-${seed_dir}/scripts/termux-release-self-update.patch}"
 
   if git apply --reverse --check "${patch_path}" >/dev/null 2>&1; then
     echo "Termux release code patch is already applied."
@@ -354,7 +354,9 @@ else
   git checkout -B "${WORK_BRANCH}" "origin/${PATCH_BRANCH}"
 fi
 seed_release_branch_workflows
-apply_seeded_release_code_patches
+# The patch branch is the authoritative Termux code source. Reapplying the
+# release code patch here can conflict when that branch contains newer upstream
+# context around the same Termux changes.
 normalize_workspace_version_to_upstream_tag
 
 mkdir -p .github
