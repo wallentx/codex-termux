@@ -83,6 +83,7 @@ impl UpdateAction {
             UpdateAction::TermuxSelfUpdate => crate::termux_update::TERMUX_RELEASES_URL,
             UpdateAction::NpmGlobalLatest
             | UpdateAction::BunGlobalLatest
+            | UpdateAction::PnpmGlobalLatest
             | UpdateAction::BrewUpgrade
             | UpdateAction::StandaloneUnix
             | UpdateAction::StandaloneWindows => "https://github.com/openai/codex/releases/latest",
