@@ -24,6 +24,7 @@ pub const EXEC_OUTPUT_DELTA_METHOD: &str = "process/output";
 pub const EXEC_EXITED_METHOD: &str = "process/exited";
 pub const EXEC_CLOSED_METHOD: &str = "process/closed";
 pub const ENVIRONMENT_INFO_METHOD: &str = "environment/info";
+pub const ENVIRONMENT_STATUS_METHOD: &str = "environment/status";
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
 pub const FS_OPEN_METHOD: &str = "fs/open";
 pub const FS_READ_BLOCK_METHOD: &str = "fs/readBlock";
@@ -40,6 +41,8 @@ pub const FS_COPY_METHOD: &str = "fs/copy";
 pub const HTTP_REQUEST_METHOD: &str = "http/request";
 /// JSON-RPC notification method for streamed executor HTTP response bodies.
 pub const HTTP_REQUEST_BODY_DELTA_METHOD: &str = "http/request/bodyDelta";
+/// Maximum decoded response-body bytes carried by one streamed HTTP notification.
+pub const MAX_HTTP_BODY_DELTA_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -79,6 +82,25 @@ pub struct EnvironmentInfo {
     /// Working directory inherited by the exec-server process.
     #[serde(default)]
     pub cwd: Option<PathUri>,
+}
+
+/// Status returned by an initialized exec-server connection.
+///
+/// The response is intentionally small today. New status details can be added
+/// without changing the method used by clients to verify that an initialized
+/// exec-server connection is still responsive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentStatus {
+    pub status: EnvironmentStatusKind,
+}
+
+/// High-level status reported by exec-server itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvironmentStatusKind {
+    /// The connection is initialized and exec-server can handle requests.
+    Ready,
 }
 
 impl EnvironmentInfo {
@@ -575,6 +597,11 @@ mod tests {
     use codex_file_system::FileSystemSandboxContext;
     use codex_network_proxy::ManagedNetworkSandboxContext;
     use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
@@ -670,6 +697,38 @@ mod tests {
             "sandbox": native_path_sandbox,
         }))
         .expect_err("native absolute sandbox cwd should not deserialize as a URI");
+    }
+
+    #[test]
+    fn filesystem_protocol_round_trips_permission_paths_as_uris() {
+        let native_cwd = std::env::current_dir().expect("current directory");
+        let cwd = PathUri::from_host_native_path(&native_cwd).expect("cwd URI");
+        let mut file_system_policy =
+            FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: native_cwd.try_into().expect("absolute cwd"),
+                },
+                access: FileSystemAccessMode::Read,
+            }]);
+        file_system_policy.glob_scan_max_depth = Some(2);
+        let permissions = PermissionProfile::from_runtime_permissions(
+            &file_system_policy,
+            NetworkSandboxPolicy::Restricted,
+        );
+        let sandbox =
+            FileSystemSandboxContext::from_permission_profile_with_cwd(permissions, cwd.clone());
+
+        let serialized = serde_json::to_value(&sandbox).expect("serialize sandbox");
+
+        assert_eq!(
+            serialized["permissions"]["file_system"]["entries"][0]["path"]["path"],
+            serde_json::json!(cwd.to_string())
+        );
+        assert_eq!(
+            serde_json::from_value::<FileSystemSandboxContext>(serialized)
+                .expect("deserialize sandbox"),
+            sandbox
+        );
     }
 
     #[test]

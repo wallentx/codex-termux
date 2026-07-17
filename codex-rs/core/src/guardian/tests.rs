@@ -6,6 +6,9 @@ use crate::config::ManagedFeatures;
 use crate::config::NetworkProxySpec;
 use crate::config::test_config;
 use crate::guardian::approval_request::guardian_request_target_item_id;
+use crate::guardian::prompt::BUNDLED_GUARDIAN_POLICY;
+use crate::guardian::prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
+use crate::guardian::prompt::guardian_policy_prompt_with_config_and_template;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::test_support;
@@ -1743,6 +1746,16 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     ));
     let request = request_log.single_request();
     let request_body = request.body_json();
+    let guardian_tool_names = request_body["tools"]
+        .as_array()
+        .expect("guardian request tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("guardian request tool name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        guardian_tool_names,
+        vec!["exec_command", "write_stdin", "view_image"]
+    );
     let guardian_user_text = request.message_input_texts("user").join("\n");
     assert!(
         guardian_user_text.contains(&format!("${GUARDIAN_SKILL_NAME}")),
@@ -2216,10 +2229,12 @@ async fn guardian_reused_trunk_ignores_stale_prior_turn_completion() -> anyhow::
             id: "stale-turn".to_string(),
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "stale-turn".to_string(),
+                started_at: None,
                 last_agent_message: Some(
                     "{\"risk_level\":\"high\",\"user_authorization\":\"low\",\"outcome\":\"deny\",\"rationale\":\"stale guardian rationale\"}"
                         .to_string(),
                 ),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: Some(1),
@@ -2937,7 +2952,10 @@ async fn guardian_review_session_config_clears_parent_developer_instructions() {
     assert_eq!(guardian_config.developer_instructions, None);
     assert_eq!(
         guardian_config.base_instructions,
-        Some(guardian_policy_prompt())
+        Some(guardian_policy_prompt_with_config_and_template(
+            BUNDLED_GUARDIAN_POLICY,
+            BUNDLED_GUARDIAN_POLICY_TEMPLATE,
+        ))
     );
 }
 
@@ -3163,8 +3181,9 @@ async fn guardian_review_session_config_uses_requirements_guardian_policy_config
     assert_eq!(guardian_config.developer_instructions, None);
     assert_eq!(
         guardian_config.base_instructions,
-        Some(guardian_policy_prompt_with_config(
-            "Use the workspace-managed guardian policy."
+        Some(guardian_policy_prompt_with_config_and_template(
+            "Use the workspace-managed guardian policy.",
+            BUNDLED_GUARDIAN_POLICY_TEMPLATE,
         ))
     );
 }
@@ -3202,6 +3221,9 @@ async fn guardian_review_session_config_uses_default_guardian_policy_without_req
     assert_eq!(guardian_config.developer_instructions, None);
     assert_eq!(
         guardian_config.base_instructions,
-        Some(guardian_policy_prompt())
+        Some(guardian_policy_prompt_with_config_and_template(
+            BUNDLED_GUARDIAN_POLICY,
+            BUNDLED_GUARDIAN_POLICY_TEMPLATE,
+        ))
     );
 }

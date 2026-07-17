@@ -111,6 +111,7 @@ use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemGuardianApprovalReviewCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::McpToolCallAppContext;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::NonSteerableTurnKind;
 use codex_app_server_protocol::PatchApplyStatus;
@@ -311,6 +312,8 @@ fn sample_thread_resume_response_with_source(
         reasoning_effort: None,
         multi_agent_mode: Default::default(),
         initial_turns_page: None,
+        turns_backwards_cursor: None,
+        items_backwards_cursor: None,
     })
 }
 
@@ -374,6 +377,7 @@ fn sample_turn_token_usage_fact(thread_id: &str, turn_id: &str) -> TurnTokenUsag
             total_tokens: 321,
             input_tokens: 123,
             cached_input_tokens: 45,
+            cache_write_input_tokens: 7,
             output_tokens: 140,
             reasoning_output_tokens: 13,
         },
@@ -1314,6 +1318,7 @@ fn compaction_event_serializes_expected_shape() {
                 retained_image_count: None,
                 compaction_summary_tokens: None,
                 cached_input_tokens: None,
+                cache_write_input_tokens: Some(456),
                 started_at: 100,
                 completed_at: 106,
                 duration_ms: Some(6543),
@@ -1366,6 +1371,7 @@ fn compaction_event_serializes_expected_shape() {
                 "retained_image_count": null,
                 "compaction_summary_tokens": null,
                 "cached_input_tokens": null,
+                "cache_write_input_tokens": 456,
                 "started_at": 100,
                 "completed_at": 106,
                 "duration_ms": 6543
@@ -1477,6 +1483,7 @@ fn command_execution_event_serializes_expected_shape() {
         event_params: CodexCommandExecutionEventParams {
             base: CodexToolItemEventBase {
                 thread_id: "thread-1".to_string(),
+                session_id: "session-thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item_id: "item-1".to_string(),
                 app_server_client: CodexAppServerClientMetadata {
@@ -1526,6 +1533,7 @@ fn command_execution_event_serializes_expected_shape() {
             "event_type": "codex_command_execution_event",
             "event_params": {
                 "thread_id": "thread-1",
+                "session_id": "session-thread-1",
                 "turn_id": "turn-1",
                 "item_id": "item-1",
                 "app_server_client": {
@@ -1862,6 +1870,7 @@ async fn thread_originator_overrides_shared_connection_across_thread_events() {
                     retained_image_count: None,
                     compaction_summary_tokens: None,
                     cached_input_tokens: None,
+                    cache_write_input_tokens: None,
                     started_at: 100,
                     completed_at: 101,
                     duration_ms: Some(1200),
@@ -2040,6 +2049,7 @@ async fn compaction_event_ingests_custom_fact() {
                     retained_image_count: None,
                     compaction_summary_tokens: None,
                     cached_input_tokens: None,
+                    cache_write_input_tokens: None,
                     started_at: 100,
                     completed_at: 101,
                     duration_ms: Some(1200),
@@ -2181,6 +2191,7 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
                     completed_at: Some(190),
                     input_tokens: None,
                     cached_input_tokens: None,
+                    cache_write_input_tokens: None,
                     output_tokens: None,
                     reasoning_output_tokens: None,
                     total_tokens: None,
@@ -2337,6 +2348,7 @@ async fn item_lifecycle_notifications_publish_command_execution_event() {
     assert_eq!(payload.as_array().expect("events array").len(), 1);
     assert_eq!(payload[0]["event_type"], "codex_command_execution_event");
     assert_eq!(payload[0]["event_params"]["thread_id"], "thread-1");
+    assert_eq!(payload[0]["event_params"]["session_id"], "session-thread-1");
     assert_eq!(payload[0]["event_params"]["turn_id"], "turn-1");
     assert_eq!(payload[0]["event_params"]["item_id"], "item-1");
     assert_eq!(payload[0]["event_params"]["tool_name"], "shell");
@@ -3005,6 +3017,7 @@ async fn subagent_events_keep_thread_originator_with_explicit_turn_connection() 
                     retained_image_count: None,
                     compaction_summary_tokens: None,
                     cached_input_tokens: None,
+                    cache_write_input_tokens: None,
                     started_at: 100,
                     completed_at: 101,
                     duration_ms: Some(1200),
@@ -3104,7 +3117,7 @@ async fn subagent_tool_items_inherit_parent_connection_metadata() {
         .ingest(
             AnalyticsFact::Custom(CustomAnalyticsFact::SubAgentThreadStarted(
                 SubAgentThreadStartedInput {
-                    session_id: "session-root".to_string(),
+                    session_id: "session-thread-1".to_string(),
                     thread_id: "thread-subagent".to_string(),
                     parent_thread_id: Some("thread-1".to_string()),
                     forked_from_thread_id: None,
@@ -3169,6 +3182,8 @@ async fn subagent_tool_items_inherit_parent_connection_metadata() {
     let payload = serde_json::to_value(&events).expect("serialize events");
     assert_eq!(payload.as_array().expect("events array").len(), 1);
     assert_eq!(payload[0]["event_type"], "codex_command_execution_event");
+    assert_eq!(payload[0]["event_params"]["thread_id"], "thread-subagent");
+    assert_eq!(payload[0]["event_params"]["session_id"], "session-thread-1");
     assert_eq!(payload[0]["event_params"]["thread_source"], "subagent");
     assert_eq!(payload[0]["event_params"]["subagent_source"], "review");
     assert_eq!(payload[0]["event_params"]["parent_thread_id"], "thread-1");
@@ -3245,6 +3260,7 @@ fn plugin_install_failed_event_serializes_expected_shape() {
             plugin: codex_plugin_metadata(sample_plugin_metadata()),
             source: PluginInstallSource::Manual,
             error_type: "store_io".to_string(),
+            sub_error_type: Some("failed_to_copy_plugin_file".to_string()),
         },
     });
 
@@ -3264,7 +3280,8 @@ fn plugin_install_failed_event_serializes_expected_shape() {
                 "connector_ids": ["calendar", "drive"],
                 "product_client_id": originator().value,
                 "source": "manual",
-                "error_type": "store_io"
+                "error_type": "store_io",
+                "sub_error_type": "failed_to_copy_plugin_file"
             }
         })
     );
@@ -3697,6 +3714,7 @@ async fn reducer_ingests_plugin_install_failed_fact() {
                     plugin: sample_plugin_metadata(),
                     source: PluginInstallSource::ExternalAgentMigration,
                     error_type: "invalid_plugin".to_string(),
+                    sub_error_type: Some("failed_to_copy_plugin_file".to_string()),
                 },
             )),
             &mut events,
@@ -3718,7 +3736,8 @@ async fn reducer_ingests_plugin_install_failed_fact() {
                 "connector_ids": ["calendar", "drive"],
                 "product_client_id": originator().value,
                 "source": "external_agent_migration",
-                "error_type": "invalid_plugin"
+                "error_type": "invalid_plugin",
+                "sub_error_type": "failed_to_copy_plugin_file"
             }
         }])
     );
@@ -3741,6 +3760,7 @@ async fn reducer_ingests_plugin_install_failed_fact_without_detail() {
                     plugin,
                     source: PluginInstallSource::Manual,
                     error_type: "remote_catalog_unexpected_status".to_string(),
+                    sub_error_type: None,
                 },
             )),
             &mut events,
@@ -3762,7 +3782,8 @@ async fn reducer_ingests_plugin_install_failed_fact_without_detail() {
                 "connector_ids": null,
                 "product_client_id": originator().value,
                 "source": "manual",
-                "error_type": "remote_catalog_unexpected_status"
+                "error_type": "remote_catalog_unexpected_status",
+                "sub_error_type": null
             }
         }])
     );
@@ -3813,9 +3834,10 @@ fn external_agent_config_import_failure_event_serializes_expected_shape() {
             event_params: CodexOnboardingExternalAgentImportFailureMetadata {
                 import_id: "import-1".to_string(),
                 source: "app_server".to_string(),
-                item_type: "SESSIONS".to_string(),
-                failure_stage: "session_missing".to_string(),
-                error_type: "session_missing".to_string(),
+                item_type: "PLUGINS".to_string(),
+                failure_stage: "plugin_import".to_string(),
+                error_type: "plugin_import".to_string(),
+                sub_error_type: Some("failed_to_copy_plugin_file".to_string()),
                 product_client_id: Some(originator().value),
             },
         },
@@ -3830,9 +3852,10 @@ fn external_agent_config_import_failure_event_serializes_expected_shape() {
             "event_params": {
                 "import_id": "import-1",
                 "source": "app_server",
-                "type": "SESSIONS",
-                "failure_stage": "session_missing",
-                "error_type": "session_missing",
+                "type": "PLUGINS",
+                "failure_stage": "plugin_import",
+                "error_type": "plugin_import",
+                "sub_error_type": "failed_to_copy_plugin_file",
                 "product_client_id": originator().value,
             }
         })
@@ -3850,9 +3873,10 @@ async fn reducer_ingests_external_agent_config_import_failure_fact() {
                 ExternalAgentConfigImportFailureInput {
                     import_id: "import-1".to_string(),
                     source: "app_server".to_string(),
-                    item_type: "SESSIONS".to_string(),
-                    failure_stage: "session_missing".to_string(),
-                    error_type: "session_missing".to_string(),
+                    item_type: "PLUGINS".to_string(),
+                    failure_stage: "plugin_import".to_string(),
+                    error_type: "plugin_import".to_string(),
+                    sub_error_type: Some("failed_to_copy_plugin_file".to_string()),
                 },
             )),
             &mut events,
@@ -3867,9 +3891,10 @@ async fn reducer_ingests_external_agent_config_import_failure_fact() {
             "event_params": {
                 "import_id": "import-1",
                 "source": "app_server",
-                "type": "SESSIONS",
-                "failure_stage": "session_missing",
-                "error_type": "session_missing",
+                "type": "PLUGINS",
+                "failure_stage": "plugin_import",
+                "error_type": "plugin_import",
+                "sub_error_type": "failed_to_copy_plugin_file",
                 "product_client_id": originator().value,
             }
         }])
@@ -3921,6 +3946,7 @@ fn turn_event_serializes_expected_shape() {
             image_generation_count: None,
             input_tokens: None,
             cached_input_tokens: None,
+            cache_write_input_tokens: None,
             output_tokens: None,
             reasoning_output_tokens: None,
             total_tokens: None,
@@ -3993,6 +4019,7 @@ fn turn_event_serializes_expected_shape() {
                 "image_generation_count": null,
                 "input_tokens": null,
                 "cached_input_tokens": null,
+                "cache_write_input_tokens": null,
                 "output_tokens": null,
                 "reasoning_output_tokens": null,
                 "total_tokens": null,
@@ -4324,6 +4351,10 @@ async fn turn_lifecycle_emits_turn_event() {
     assert_eq!(payload["event_params"]["duration_ms"], json!(1234));
     assert_eq!(payload["event_params"]["input_tokens"], json!(123));
     assert_eq!(payload["event_params"]["cached_input_tokens"], json!(45));
+    assert_eq!(
+        payload["event_params"]["cache_write_input_tokens"],
+        json!(7)
+    );
     assert_eq!(payload["event_params"]["output_tokens"], json!(140));
     assert_eq!(
         payload["event_params"]["reasoning_output_tokens"],
@@ -4353,27 +4384,19 @@ async fn turn_event_counts_completed_tool_items() {
         tool: "search".to_string(),
         status,
         arguments: json!({}),
-        app_context: None,
+        app_context: Some(McpToolCallAppContext {
+            connector_id: "connector-test".to_string(),
+            link_id: None,
+            resource_uri: None,
+            app_name: None,
+            action_name: None,
+        }),
         mcp_app_resource_uri: None,
         plugin_id: Some("sample@test".to_string()),
         result: None,
         error: None,
         duration_ms,
     };
-    reducer
-        .ingest(
-            AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
-                ItemStartedNotification {
-                    thread_id: "thread-2".to_string(),
-                    turn_id: "turn-2".to_string(),
-                    started_at_ms: 998,
-                    item: mcp_tool_call_item(McpToolCallStatus::InProgress, None),
-                },
-            ))),
-            &mut out,
-        )
-        .await;
-
     let completed_tool_items = vec![
         sample_command_execution_item(CommandExecutionStatus::Completed, Some(0), Some(1)),
         ThreadItem::FileChange {
@@ -4413,6 +4436,7 @@ async fn turn_event_counts_completed_tool_items() {
             id: "web-1".to_string(),
             query: "codex".to_string(),
             action: None,
+            results: None,
         }),
         ThreadItem::ImageGeneration(ImageGenerationItem {
             id: "image-1".to_string(),
@@ -4422,6 +4446,22 @@ async fn turn_event_counts_completed_tool_items() {
             saved_path: None,
         }),
     ];
+
+    for item in &completed_tool_items {
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                    ItemStartedNotification {
+                        thread_id: "thread-2".to_string(),
+                        turn_id: "turn-2".to_string(),
+                        started_at_ms: 998,
+                        item: item.clone(),
+                    },
+                ))),
+                &mut out,
+            )
+            .await;
+    }
 
     for item in completed_tool_items {
         reducer
@@ -4439,12 +4479,43 @@ async fn turn_event_counts_completed_tool_items() {
             .await;
     }
 
+    let payload = serde_json::to_value(&out).expect("serialize tool item events");
+    let emitted_tool_events = payload
+        .as_array()
+        .expect("tool item events array")
+        .iter()
+        .map(|event| {
+            (
+                event["event_type"].as_str().expect("tool item event type"),
+                event["event_params"]["session_id"]
+                    .as_str()
+                    .expect("tool item event session ID"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        emitted_tool_events,
+        vec![
+            ("codex_command_execution_event", "session-thread-2"),
+            ("codex_file_change_event", "session-thread-2"),
+            ("codex_mcp_tool_call_event", "session-thread-2"),
+            ("codex_dynamic_tool_call_event", "session-thread-2"),
+            ("codex_collab_agent_tool_call_event", "session-thread-2"),
+            ("codex_web_search_event", "session-thread-2"),
+            ("codex_image_generation_event", "session-thread-2"),
+        ]
+    );
+
     let mcp_tool_call_event = out
         .iter()
         .find(|event| matches!(event, TrackEventRequest::McpToolCall(_)))
         .expect("MCP tool call event should be emitted");
     let payload = serde_json::to_value(mcp_tool_call_event).expect("serialize MCP tool call event");
     assert_eq!(payload["event_params"]["plugin_id"], json!("sample@test"));
+    assert_eq!(
+        payload["event_params"]["connector_id"],
+        json!("connector-test")
+    );
 
     reducer
         .ingest(

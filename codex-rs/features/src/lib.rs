@@ -134,6 +134,8 @@ pub enum Feature {
     RuntimeMetrics,
     /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
+    /// Enable importing project-scoped memory from external agents.
+    ExternalAgentMemoryImport,
     /// Compress cold local thread-store rollout files.
     LocalThreadStoreCompression,
     /// Enable the Chronicle sidecar for passive screen-context memories.
@@ -206,6 +208,8 @@ pub enum Feature {
     ConcurrentReasoningSummaries,
     /// Allow prompting and installing missing MCP dependencies.
     SkillMcpDependencyInstall,
+    /// Run cheap skill-search methods in shadow mode and emit experiment metrics.
+    SkillSearch,
     /// Removed compatibility flag for deleted skill env var dependency prompting.
     SkillEnvVarDependencyPrompt,
     /// Enable the unified mention popup used by default in the TUI.
@@ -929,6 +933,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ExternalAgentMemoryImport,
+        key: "external_agent_memory_import",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::LocalThreadStoreCompression,
         key: "local_thread_store_compression",
         stage: Stage::UnderDevelopment,
@@ -1187,6 +1197,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::SkillMcpDependencyInstall,
         key: "skill_mcp_dependency_install",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::SkillSearch,
+        key: "skill_search",
         stage: Stage::Stable,
         default_enabled: true,
     },

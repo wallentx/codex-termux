@@ -26,6 +26,11 @@ impl ChatWidget {
             };
             self.clear_active_stream_tail();
             let (cell, source) = controller.finalize();
+            // Match newline-committed streaming behavior: once assistant output is ready to be
+            // committed into history, hide the inline status row so transcript content replaces it.
+            if cell.is_some() {
+                self.bottom_pane.hide_status_indicator();
+            }
             let deferred_history_cell =
                 if scrollback_reflow == crate::app_event::ConsolidationScrollbackReflow::Required {
                     cell
@@ -115,9 +120,6 @@ impl ChatWidget {
     pub(super) fn on_plan_delta(&mut self, delta: String) {
         if self.active_mode_kind() != ModeKind::Plan {
             return;
-        }
-        if !delta.is_empty() {
-            self.record_visible_turn_activity();
         }
         if !self.transcript.plan_item_active {
             self.transcript.plan_item_active = true;
@@ -389,7 +391,6 @@ impl ChatWidget {
     #[inline]
     pub(super) fn handle_streaming_delta(&mut self, delta: String) {
         if !delta.is_empty() {
-            self.record_visible_turn_activity();
             self.mark_safety_buffering_agent_message_started();
         }
         if self.stream_controller.is_none() {
