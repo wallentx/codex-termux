@@ -15,6 +15,7 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -995,6 +996,7 @@ pub(crate) fn build_guardian_review_session_config(
     live_network_config: Option<codex_network_proxy::NetworkProxyConfig>,
     active_model: &str,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    model_messages: Option<&ModelMessages>,
 ) -> anyhow::Result<Config> {
     let mut guardian_config = parent_config.clone();
     guardian_config.model = Some(active_model.to_string());
@@ -1002,13 +1004,16 @@ pub(crate) fn build_guardian_review_session_config(
     guardian_config.model_provider.request_max_retries = Some(1);
     guardian_config.model_provider.stream_max_retries = Some(1);
     guardian_config.include_skill_instructions = false;
-    guardian_config.include_permissions_instructions = false;
     guardian_config.memories.use_memories = false;
     guardian_config.memories.dedicated_tools = false;
+    let catalog_policy = model_messages
+        .and_then(|messages| messages.auto_review.as_ref())
+        .and_then(|messages| messages.policy.as_deref());
     guardian_config.base_instructions = Some(
         parent_config
             .guardian_policy_config
             .as_deref()
+            .or(catalog_policy)
             .map(guardian_policy_prompt_with_config)
             .unwrap_or_else(guardian_policy_prompt),
     );
@@ -1047,8 +1052,6 @@ pub(crate) fn build_guardian_review_session_config(
         Feature::SpawnCsv,
         Feature::Collab,
         Feature::MultiAgentV2,
-        Feature::CodeMode,
-        Feature::CodeModeOnly,
         Feature::CodexHooks,
         Feature::Apps,
         Feature::Plugins,
@@ -1127,6 +1130,7 @@ async fn interrupt_and_drain_turn(codex: &Codex, expected_turn_id: &str) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::openai_models::AutoReviewMessages;
     use codex_protocol::protocol::AgentStatus;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Submission;
@@ -1214,6 +1218,7 @@ mod tests {
             /*live_network_config*/ None,
             model.as_str(),
             reasoning_effort.clone(),
+            /*model_messages*/ None,
         )
         .expect("guardian config");
 
@@ -1252,6 +1257,7 @@ mod tests {
             /*live_network_config*/ None,
             "active-model",
             /*reasoning_effort*/ None,
+            /*model_messages*/ None,
         )
         .expect("cached guardian config");
         let cached_reuse_key = GuardianReviewSessionReuseKey::from_spawn_config(
@@ -1267,6 +1273,7 @@ mod tests {
             /*live_network_config*/ None,
             "active-model",
             /*reasoning_effort*/ None,
+            /*model_messages*/ None,
         )
         .expect("next guardian config");
         let next_reuse_key = GuardianReviewSessionReuseKey::from_spawn_config(
@@ -1332,6 +1339,7 @@ mod tests {
             /*live_network_config*/ None,
             "active-model",
             /*reasoning_effort*/ None,
+            /*model_messages*/ None,
         )
         .expect("cached guardian config");
         let cached_reuse_key = GuardianReviewSessionReuseKey::from_spawn_config(
@@ -1347,6 +1355,7 @@ mod tests {
             /*live_network_config*/ None,
             "active-model",
             /*reasoning_effort*/ None,
+            /*model_messages*/ None,
         )
         .expect("next guardian config");
         let next_reuse_key = GuardianReviewSessionReuseKey::from_spawn_config(
@@ -1370,6 +1379,7 @@ mod tests {
             /*live_network_config*/ None,
             "active-model",
             /*reasoning_effort*/ None,
+            /*model_messages*/ None,
         )
         .expect("guardian config");
 
@@ -1386,10 +1396,71 @@ mod tests {
             /*live_network_config*/ None,
             "active-model",
             /*reasoning_effort*/ None,
+            /*model_messages*/ None,
         )
         .expect("guardian config");
 
         assert!(!guardian_config.include_skill_instructions);
+    }
+
+    #[tokio::test]
+    async fn guardian_review_session_config_prefers_managed_policy_over_catalog_policy() {
+        let mut parent_config = crate::config::test_config().await;
+        let managed_policy = "Use the managed Guardian policy.";
+        parent_config.guardian_policy_config = Some(managed_policy.to_string());
+        let model_messages = ModelMessages {
+            instructions_template: None,
+            instructions_variables: None,
+            approvals: None,
+            auto_review: Some(AutoReviewMessages {
+                policy: Some("Use the catalog Guardian policy.".to_string()),
+            }),
+        };
+
+        let guardian_config = build_guardian_review_session_config(
+            &parent_config,
+            /*live_network_config*/ None,
+            "active-model",
+            /*reasoning_effort*/ None,
+            Some(&model_messages),
+        )
+        .expect("guardian config");
+
+        assert_eq!(
+            guardian_config.base_instructions,
+            Some(guardian_policy_prompt_with_config(managed_policy))
+        );
+    }
+
+    #[tokio::test]
+    async fn guardian_review_session_config_preserves_explicit_empty_catalog_policy() {
+        let parent_config = crate::config::test_config().await;
+        let model_messages = ModelMessages {
+            instructions_template: None,
+            instructions_variables: None,
+            approvals: None,
+            auto_review: Some(AutoReviewMessages {
+                policy: Some(String::new()),
+            }),
+        };
+
+        let guardian_config = build_guardian_review_session_config(
+            &parent_config,
+            /*live_network_config*/ None,
+            "active-model",
+            /*reasoning_effort*/ None,
+            Some(&model_messages),
+        )
+        .expect("guardian config");
+
+        assert_eq!(
+            guardian_config.base_instructions,
+            Some(guardian_policy_prompt_with_config(""))
+        );
+        assert_ne!(
+            guardian_config.base_instructions,
+            Some(guardian_policy_prompt())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
