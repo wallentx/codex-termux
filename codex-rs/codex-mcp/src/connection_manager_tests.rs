@@ -1,6 +1,4 @@
 use super::*;
-use crate::codex_apps_cache::CodexAppsToolsCache;
-use crate::codex_apps_cache::CodexAppsToolsCacheContext;
 use crate::elicitation::ElicitationLifecycle;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
@@ -21,9 +19,14 @@ use crate::tools::normalize_tools_for_model_with_prefix;
 use codex_config::AppToolApproval;
 use codex_config::Constrained;
 use codex_config::McpServerConfig;
+use codex_config::McpServerEnvVar;
 use codex_config::McpServerToolConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_connectors::ConnectorRuntimeContext;
+use codex_connectors::ConnectorRuntimeContextKey;
+use codex_connectors::ConnectorRuntimeFetchSource;
+use codex_connectors::ConnectorRuntimeManager;
 use codex_exec_server::EnvironmentManager;
 use codex_protocol::ToolName;
 use codex_protocol::mcp::McpServerInfo;
@@ -72,15 +75,22 @@ fn create_codex_apps_tools_cache_context(
     codex_home: PathBuf,
     account_id: Option<&str>,
     chatgpt_user_id: Option<&str>,
-) -> CodexAppsToolsCacheContext {
-    CodexAppsToolsCache::default().context(
+) -> ConnectorRuntimeContext<ToolInfo> {
+    ConnectorRuntimeManager::<ToolInfo>::default().context(
         codex_home,
-        CodexAppsToolsCacheKey {
-            account_id: account_id.map(ToOwned::to_owned),
-            chatgpt_user_id: chatgpt_user_id.map(ToOwned::to_owned),
-            is_workspace_account: false,
-        },
+        ConnectorRuntimeContextKey::personal(
+            account_id.map(ToOwned::to_owned),
+            chatgpt_user_id.map(ToOwned::to_owned),
+        ),
     )
+}
+
+fn store_current_tools(cache_context: &ConnectorRuntimeContext<ToolInfo>, tools: Vec<ToolInfo>) {
+    let _ = cache_context.publish_if_newest_accepted(
+        cache_context.begin_fetch(ConnectorRuntimeFetchSource::HardRefresh),
+        &create_test_server_info("Codex Apps"),
+        tools,
+    );
 }
 
 fn create_test_server_info(title: &str) -> McpServerInfo {
@@ -133,6 +143,7 @@ async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManaged
         is_codex_apps_mcp_server: false,
         cached_server_info: None,
         codex_apps_tools_cache_context: None,
+        tool_catalog_cache_context: None,
         tool_filter: ToolFilter::default(),
         startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         startup_reconnect: None,
@@ -157,7 +168,7 @@ fn create_test_manager_with_failed_apps_startup(
         Some("reconnect-test-account"),
         Some("reconnect-test-user"),
     );
-    cache_context.store_current_tools_for_test(cached_tools);
+    store_current_tools(&cache_context, cached_tools);
     let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
     let mut manager = McpConnectionManager::new_uninitialized(
@@ -172,6 +183,7 @@ fn create_test_manager_with_failed_apps_startup(
             is_codex_apps_mcp_server: true,
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
+            tool_catalog_cache_context: None,
             tool_filter: ToolFilter::default(),
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             startup_reconnect: Some(Arc::new(CodexAppsStartupReconnect::new(reconnect_factory))),
@@ -689,10 +701,13 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
         Some("account-one"),
         Some("user-one"),
     );
-    cache_context.store_current_tools_for_test(vec![create_test_tool(
-        CODEX_APPS_MCP_SERVER_NAME,
-        "calendar_create_event",
-    )]);
+    store_current_tools(
+        &cache_context,
+        vec![create_test_tool(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "calendar_create_event",
+        )],
+    );
     let pending_client = futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
         .boxed()
         .shared();
@@ -710,6 +725,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
             is_codex_apps_mcp_server: true,
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
+            tool_catalog_cache_context: None,
             tool_filter: ToolFilter::default(),
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             startup_reconnect: None,
@@ -728,6 +744,107 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
         .expect("tool from shared cache");
     assert_eq!(tool.server_name, CODEX_APPS_MCP_SERVER_NAME);
     assert_eq!(tool.callable_name, "calendar_create_event");
+}
+
+#[tokio::test(start_paused = true)]
+async fn tool_catalog_cache_sanitizes_tools_and_tracks_environment_generation() {
+    let cache = McpToolCatalogCache::default();
+    let environment_manager = Arc::new(EnvironmentManager::without_environments());
+    let replace_environment = |url: &str| {
+        environment_manager
+            .upsert_environment(
+                "remote".to_string(),
+                url.to_string(),
+                /*connect_timeout*/ None,
+            )
+            .expect("replace environment");
+    };
+    replace_environment("ws://127.0.0.1:1");
+    let runtime_context =
+        McpRuntimeContext::new(Arc::clone(&environment_manager), PathBuf::from("/tmp"));
+    let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "command": "docs-mcp",
+        "environment_id": "remote"
+    }))
+    .expect("MCP config");
+    let resolve_environment = || {
+        runtime_context
+            .resolve_server_environment("docs", &config)
+            .expect("resolve environment")
+            .expect("remote environment")
+    };
+    let cache_context = |environment: &Arc<codex_exec_server::Environment>| {
+        cache
+            .context(
+                "docs",
+                &config,
+                &runtime_context,
+                Some(environment),
+                &ElicitationCapability::default(),
+                /*supports_openai_form_elicitation*/ false,
+            )
+            .expect("cache context")
+    };
+    let first_environment = resolve_environment();
+    let first_environment_weak = Arc::downgrade(&first_environment);
+    let first_context = cache_context(&first_environment);
+    let mut tool = create_test_tool("docs", "search");
+    tool.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+    first_context.publish_if_newest(first_context.begin_fetch(), &[tool]);
+    assert_eq!(
+        first_context.current_tools().expect("cached tools")[0]
+            .tool
+            .annotations,
+        None
+    );
+
+    drop(first_environment);
+    replace_environment("ws://127.0.0.1:2");
+    assert!(first_environment_weak.upgrade().is_none());
+    let replacement_environment = resolve_environment();
+    assert!(!cache_context(&replacement_environment).has_tools());
+
+    let older = first_context.begin_fetch();
+    let newer = first_context.begin_fetch();
+    first_context.publish_if_newest(newer, &[create_test_tool("docs", "new")]);
+    first_context.publish_if_newest(older, &[create_test_tool("docs", "old")]);
+    assert_eq!(
+        first_context.current_tools().expect("cached tools")[0].callable_name,
+        "new"
+    );
+
+    tokio::time::advance(Duration::from_secs(30 * 60 + 1)).await;
+    assert!(!first_context.has_tools());
+}
+
+#[test]
+fn tool_catalog_cache_bypasses_remote_sourced_environment_variables() {
+    let cache = McpToolCatalogCache::default();
+    let runtime_context = McpRuntimeContext::new(
+        Arc::new(EnvironmentManager::without_environments()),
+        PathBuf::from("/tmp"),
+    );
+    let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "command": "docs-mcp",
+        "env_vars": [McpServerEnvVar::Config {
+            name: "DOCS_TOKEN".to_string(),
+            source: Some("remote".to_string()),
+        }],
+    }))
+    .expect("MCP config");
+
+    assert!(
+        cache
+            .context(
+                "docs",
+                &config,
+                &runtime_context,
+                /*resolved_environment*/ None,
+                &ElicitationCapability::default(),
+                /*supports_openai_form_elicitation*/ false,
+            )
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -750,6 +867,7 @@ async fn list_available_server_infos_uses_cache_while_client_is_pending() {
             is_codex_apps_mcp_server: true,
             cached_server_info: Some(server_info.clone()),
             codex_apps_tools_cache_context: None,
+            tool_catalog_cache_context: None,
             tool_filter: ToolFilter::default(),
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             startup_reconnect: None,
@@ -851,6 +969,7 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
             is_codex_apps_mcp_server: true,
             cached_server_info: None,
             codex_apps_tools_cache_context: None,
+            tool_catalog_cache_context: None,
             tool_filter: ToolFilter::default(),
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             startup_reconnect: None,
@@ -862,6 +981,22 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
     let timeout_result =
         tokio::time::timeout(Duration::from_millis(10), manager.list_all_tools()).await;
     assert!(timeout_result.is_err());
+}
+
+#[tokio::test]
+async fn cancelling_startup_does_not_disable_a_ready_client() {
+    let client = create_ready_async_managed_client(vec![create_test_tool("ready", "search")]).await;
+
+    client.cancel_token.cancel();
+
+    let managed = client
+        .client()
+        .await
+        .expect("startup cancellation should not disable a ready client");
+    assert_eq!(
+        model_tool_names(&managed.tools),
+        HashSet::from([ToolName::namespaced("ready", "search")])
+    );
 }
 
 #[tokio::test]
@@ -890,6 +1025,7 @@ async fn shutdown_cancels_pending_tool_listing() {
             is_codex_apps_mcp_server: true,
             cached_server_info: None,
             codex_apps_tools_cache_context: None,
+            tool_catalog_cache_context: None,
             tool_filter: ToolFilter::default(),
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             startup_reconnect: None,
@@ -937,6 +1073,7 @@ async fn shutdown_continues_after_caller_is_aborted() {
             is_codex_apps_mcp_server: true,
             cached_server_info: None,
             codex_apps_tools_cache_context: None,
+            tool_catalog_cache_context: None,
             tool_filter: ToolFilter::default(),
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             startup_reconnect: None,
@@ -972,7 +1109,7 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
         Some("account-one"),
         Some("user-one"),
     );
-    cache_context.store_current_tools_for_test(Vec::new());
+    store_current_tools(&cache_context, Vec::new());
     let pending_client = futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
         .boxed()
         .shared();
@@ -990,6 +1127,7 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
             is_codex_apps_mcp_server: true,
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
+            tool_catalog_cache_context: None,
             tool_filter: ToolFilter::default(),
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             startup_reconnect: None,
@@ -1012,10 +1150,13 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
         Some("account-one"),
         Some("user-one"),
     );
-    cache_context.store_current_tools_for_test(vec![create_test_tool(
-        CODEX_APPS_MCP_SERVER_NAME,
-        "calendar_create_event",
-    )]);
+    store_current_tools(
+        &cache_context,
+        vec![create_test_tool(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "calendar_create_event",
+        )],
+    );
     let server_info = create_test_server_info("Codex Apps");
     let failed_client = futures::future::ready::<Result<ManagedClient, StartupOutcomeError>>(Err(
         StartupOutcomeError::Failed {
@@ -1040,6 +1181,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
             is_codex_apps_mcp_server: true,
             cached_server_info: Some(server_info.clone()),
             codex_apps_tools_cache_context: Some(cache_context),
+            tool_catalog_cache_context: None,
             tool_filter: ToolFilter::default(),
             startup_complete,
             startup_reconnect: None,
@@ -1461,7 +1603,6 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         &mcp_servers,
         OAuthCredentialsStoreMode::default(),
         AuthKeyringBackendKind::default(),
-        HashMap::new(),
         &approval_policy,
         String::new(),
         tx_event,
@@ -1472,12 +1613,11 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             PathBuf::from("/tmp"),
         ),
         codex_home.path().to_path_buf(),
-        CodexAppsToolsCache::default(),
-        CodexAppsToolsCacheKey {
-            account_id: None,
-            chatgpt_user_id: None,
-            is_workspace_account: false,
-        },
+        ConnectorRuntimeManager::<ToolInfo>::default(),
+        McpToolCatalogCache::default(),
+        ConnectorRuntimeContextKey::personal(
+            /*account_id*/ None, /*chatgpt_user_id*/ None,
+        ),
         /*prefix_mcp_tool_names*/ true,
         ElicitationCapability::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -1492,6 +1632,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
 
     assert!(manager.clients.contains_key("stdio"));
     assert!(manager.clients.contains_key("http"));
+    assert!(manager.clients["http"].tool_catalog_cache_context.is_none());
     assert!(
         !manager
             .wait_for_server_ready("stdio", Duration::from_millis(10))
@@ -1541,35 +1682,32 @@ fn elicitation_capability_advertises_url_support_when_enabled() {
 #[test]
 fn mcp_init_error_display_prompts_for_github_pat() {
     let server_name = "github";
-    let entry = McpAuthStatusEntry {
-        config: Some(McpServerConfig {
-            auth: Default::default(),
-            transport: McpServerTransportConfig::StreamableHttp {
-                url: "https://api.githubcopilot.com/mcp/".to_string(),
-                bearer_token_env_var: None,
-                http_headers: None,
-                env_http_headers: None,
-            },
-            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-            enabled: true,
-            required: false,
-            supports_parallel_tool_calls: false,
-            disabled_reason: None,
-            startup_timeout_sec: None,
-            tool_timeout_sec: None,
-            default_tools_approval_mode: None,
-            enabled_tools: None,
-            disabled_tools: None,
-            scopes: None,
-            oauth: None,
-            oauth_resource: None,
-            tools: HashMap::new(),
-        }),
-        auth_state: McpAuthState::Unsupported,
+    let config = McpServerConfig {
+        auth: Default::default(),
+        transport: McpServerTransportConfig::StreamableHttp {
+            url: "https://api.githubcopilot.com/mcp/".to_string(),
+            bearer_token_env_var: None,
+            http_headers: None,
+            env_http_headers: None,
+        },
+        environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+        enabled: true,
+        required: false,
+        supports_parallel_tool_calls: false,
+        disabled_reason: None,
+        startup_timeout_sec: None,
+        tool_timeout_sec: None,
+        default_tools_approval_mode: None,
+        enabled_tools: None,
+        disabled_tools: None,
+        scopes: None,
+        oauth: None,
+        oauth_resource: None,
+        tools: HashMap::new(),
     };
     let err: StartupOutcomeError = anyhow::anyhow!("OAuth is unsupported").into();
 
-    let display = mcp_init_error_display(server_name, Some(&entry), &err);
+    let display = mcp_init_error_display(server_name, Some(&config), &err);
 
     let expected = format!(
         "GitHub MCP does not support OAuth. Log in by adding a personal access token (https://github.com/settings/personal-access-tokens) to your environment and config.toml:\n[mcp_servers.{server_name}]\nbearer_token_env_var = CODEX_GITHUB_PERSONAL_ACCESS_TOKEN"
@@ -1583,7 +1721,7 @@ fn mcp_init_error_display_prompts_for_login_when_auth_required() {
     let server_name = "example";
     let err: StartupOutcomeError = anyhow::anyhow!("Auth required for server").into();
 
-    let display = mcp_init_error_display(server_name, /*entry*/ None, &err);
+    let display = mcp_init_error_display(server_name, /*config*/ None, &err);
 
     let expected = format!(
         "The {server_name} MCP server is not logged in. Run `codex mcp login {server_name}`."
@@ -1619,17 +1757,13 @@ fn mcp_startup_failure_reason_requires_existing_oauth_and_auth_failure() {
         (Some(McpAuthState::OAuth), true, None),
         (None, true, None),
     ] {
-        let entry = auth_state.map(|auth_state| McpAuthStatusEntry {
-            config: None,
-            auth_state,
-        });
         let error = StartupOutcomeError::Failed {
             error: "startup failed".to_string(),
             is_authentication_required,
         };
 
         assert_eq!(
-            mcp_startup_failure_reason(entry.as_ref(), &error),
+            mcp_startup_failure_reason(auth_state, &error),
             expected,
             "auth_state={auth_state:?}, is_authentication_required={is_authentication_required}"
         );
@@ -1639,35 +1773,32 @@ fn mcp_startup_failure_reason_requires_existing_oauth_and_auth_failure() {
 #[test]
 fn mcp_init_error_display_reports_generic_errors() {
     let server_name = "custom";
-    let entry = McpAuthStatusEntry {
-        config: Some(McpServerConfig {
-            auth: Default::default(),
-            transport: McpServerTransportConfig::StreamableHttp {
-                url: "https://example.com".to_string(),
-                bearer_token_env_var: Some("TOKEN".to_string()),
-                http_headers: None,
-                env_http_headers: None,
-            },
-            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
-            enabled: true,
-            required: false,
-            supports_parallel_tool_calls: false,
-            disabled_reason: None,
-            startup_timeout_sec: None,
-            tool_timeout_sec: None,
-            default_tools_approval_mode: None,
-            enabled_tools: None,
-            disabled_tools: None,
-            scopes: None,
-            oauth: None,
-            oauth_resource: None,
-            tools: HashMap::new(),
-        }),
-        auth_state: McpAuthState::Unsupported,
+    let config = McpServerConfig {
+        auth: Default::default(),
+        transport: McpServerTransportConfig::StreamableHttp {
+            url: "https://example.com".to_string(),
+            bearer_token_env_var: Some("TOKEN".to_string()),
+            http_headers: None,
+            env_http_headers: None,
+        },
+        environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+        enabled: true,
+        required: false,
+        supports_parallel_tool_calls: false,
+        disabled_reason: None,
+        startup_timeout_sec: None,
+        tool_timeout_sec: None,
+        default_tools_approval_mode: None,
+        enabled_tools: None,
+        disabled_tools: None,
+        scopes: None,
+        oauth: None,
+        oauth_resource: None,
+        tools: HashMap::new(),
     };
     let err: StartupOutcomeError = anyhow::anyhow!("boom").into();
 
-    let display = mcp_init_error_display(server_name, Some(&entry), &err);
+    let display = mcp_init_error_display(server_name, Some(&config), &err);
 
     let expected = format!("MCP client for `{server_name}` failed to start: {err:#}");
 
@@ -1677,12 +1808,17 @@ fn mcp_init_error_display_reports_generic_errors() {
 #[test]
 fn mcp_init_error_display_includes_startup_timeout_hint() {
     let server_name = "slow";
-    let err: StartupOutcomeError = anyhow::anyhow!("request timed out").into();
+    for error in [
+        "request timed out",
+        "MCP client startup timed out after 30s",
+    ] {
+        let err: StartupOutcomeError = anyhow::anyhow!(error).into();
 
-    let display = mcp_init_error_display(server_name, /*entry*/ None, &err);
+        let display = mcp_init_error_display(server_name, /*config*/ None, &err);
 
-    assert_eq!(
-        "MCP client for `slow` timed out after 30 seconds. Add or adjust `startup_timeout_sec` in your config.toml:\n[mcp_servers.slow]\nstartup_timeout_sec = XX",
-        display
-    );
+        assert_eq!(
+            "MCP client for `slow` timed out after 30 seconds. Add or adjust `startup_timeout_sec` in your config.toml:\n[mcp_servers.slow]\nstartup_timeout_sec = XX",
+            display
+        );
+    }
 }

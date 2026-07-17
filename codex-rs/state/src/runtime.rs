@@ -13,6 +13,7 @@ use crate::LogRow;
 use crate::MEMORIES_DB_FILENAME;
 use crate::STATE_DB_FILENAME;
 use crate::SortKey;
+use crate::THREAD_HISTORY_DB_FILENAME;
 use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
@@ -22,6 +23,7 @@ use crate::migrations::runtime_goals_migrator;
 use crate::migrations::runtime_logs_migrator;
 use crate::migrations::runtime_memories_migrator;
 use crate::migrations::runtime_state_migrator;
+use crate::migrations::runtime_thread_history_migrator;
 use crate::model::AgentJobRow;
 use crate::model::ThreadRow;
 use crate::model::anchor_from_item;
@@ -144,7 +146,16 @@ const MEMORIES_DB: RuntimeDbSpec = RuntimeDbSpec {
     migrate_phase: "migrate_memories",
 };
 
-const RUNTIME_DBS: [RuntimeDbSpec; 4] = [STATE_DB, LOGS_DB, GOALS_DB, MEMORIES_DB];
+const THREAD_HISTORY_DB: RuntimeDbSpec = RuntimeDbSpec {
+    label: "thread history DB",
+    filename: THREAD_HISTORY_DB_FILENAME,
+    kind: DbKind::ThreadHistory,
+    open_phase: "open_thread_history",
+    migrate_phase: "migrate_thread_history",
+};
+
+const RUNTIME_DBS: [RuntimeDbSpec; 5] =
+    [STATE_DB, LOGS_DB, GOALS_DB, MEMORIES_DB, THREAD_HISTORY_DB];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeDbPath {
@@ -167,9 +178,9 @@ pub struct StateRuntime {
 impl StateRuntime {
     /// Initialize the state runtime using the provided Codex home and default provider.
     ///
-    /// This opens (and migrates) the SQLite databases under `codex_home`,
-    /// keeping logs in a dedicated file to reduce lock contention with the
-    /// rest of the state store.
+    /// This opens (and migrates) the SQLite databases under `codex_home`.
+    /// Logs and paginated thread history live in dedicated files to reduce
+    /// lock contention with the rest of the state store.
     pub async fn init(codex_home: PathBuf, default_provider: String) -> anyhow::Result<Arc<Self>> {
         Self::init_inner(
             codex_home,
@@ -404,6 +415,18 @@ async fn open_memories_sqlite(
     open_sqlite(path, migrator, MEMORIES_DB, telemetry_override).await
 }
 
+/// Open and migrate the rebuildable paginated thread-history database.
+pub async fn open_thread_history_db(sqlite_home: &Path) -> anyhow::Result<SqlitePool> {
+    let migrator = runtime_thread_history_migrator();
+    open_sqlite(
+        thread_history_db_path(sqlite_home).as_path(),
+        &migrator,
+        THREAD_HISTORY_DB,
+        /*telemetry_override*/ None,
+    )
+    .await
+}
+
 async fn open_sqlite(
     path: &Path,
     migrator: &Migrator,
@@ -506,6 +529,14 @@ pub fn memories_db_filename() -> String {
 
 pub fn memories_db_path(codex_home: &Path) -> PathBuf {
     MEMORIES_DB.path(codex_home)
+}
+
+pub fn thread_history_db_filename() -> String {
+    THREAD_HISTORY_DB.filename.to_string()
+}
+
+pub fn thread_history_db_path(codex_home: &Path) -> PathBuf {
+    THREAD_HISTORY_DB.path(codex_home)
 }
 
 pub fn runtime_db_paths(codex_home: &Path) -> Vec<RuntimeDbPath> {
@@ -734,8 +765,7 @@ mod tests {
         .collect::<BTreeSet<_>>();
         assert_eq!(phases, expected);
 
-        runtime.pool.close().await;
-        runtime.logs_pool.close().await;
+        runtime.close().await;
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 }

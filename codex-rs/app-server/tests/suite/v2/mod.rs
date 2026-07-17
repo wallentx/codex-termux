@@ -1,6 +1,7 @@
 mod account;
 mod analytics;
 mod app_list;
+mod app_read;
 mod attestation;
 mod auto_env;
 mod client_metadata;
@@ -16,6 +17,7 @@ mod current_time;
 mod dynamic_tools;
 mod environment_add;
 mod environment_info;
+mod environment_status;
 mod exec_server_test_support;
 #[cfg(not(target_os = "windows"))]
 mod executor_mcp;
@@ -25,6 +27,7 @@ mod experimental_feature_list;
 mod external_agent_config;
 mod fs;
 mod hooks_list;
+mod host_skills;
 mod imagegen_extension;
 mod initialize;
 mod marketplace_add;

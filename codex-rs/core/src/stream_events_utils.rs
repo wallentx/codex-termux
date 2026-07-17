@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use codex_extension_api::ExtensionData;
+use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::TurnItem;
 use codex_utils_stream_parser::strip_citations;
@@ -130,7 +131,7 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
         || {
             completed_item_defers_mailbox_delivery_to_next_turn(
                 item,
-                turn_context.collaboration_mode.mode == ModeKind::Plan,
+                turn_context.mode == ModeKind::Plan,
             )
         },
         |facts| facts.defers_mailbox_delivery_to_next_turn,
@@ -321,7 +322,7 @@ pub(crate) async fn handle_output_item_done(
     previously_active_item: Option<TurnItem>,
 ) -> Result<OutputItemResult> {
     let mut output = OutputItemResult::default();
-    let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
+    let plan_mode = ctx.turn_context.mode == ModeKind::Plan;
 
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
@@ -444,7 +445,11 @@ pub(crate) async fn handle_non_tool_response_item(
         ResponseItem::ContextCompaction { .. } => "context_compaction",
         ResponseItem::Other => "other",
     };
-    debug!(item_type, item_id = item.id(), "Output item");
+    debug!(
+        item_type,
+        item_id = item.id().map(ResponseItemId::as_str),
+        "Output item"
+    );
 
     match item {
         ResponseItem::Message { .. }

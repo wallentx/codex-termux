@@ -589,7 +589,8 @@ async fn view_image_routes_to_selected_remote_environment() -> anyhow::Result<()
     let absolute_image_path = image_path_uri.inferred_native_path_string();
     let remote_selection = TurnEnvironmentSelection {
         environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-        cwd: remote_cwd_uri,
+        cwd: remote_cwd_uri.clone(),
+        workspace_roots: vec![remote_cwd_uri],
     };
     let relative_call_id = "call-view-image-relative-multi-env";
     let absolute_call_id = "call-view-image-absolute-multi-env";
@@ -1375,7 +1376,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         base_instructions: "base instructions".to_string(),
         model_messages: None,
         include_skills_usage_instructions: false,
-        supports_reasoning_summaries: false,
+        supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,

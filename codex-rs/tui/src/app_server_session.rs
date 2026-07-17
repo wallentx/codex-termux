@@ -85,8 +85,6 @@ use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
-use codex_app_server_protocol::ThreadRollbackParams;
-use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
@@ -136,9 +134,14 @@ use uuid::Uuid;
 
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
-pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str =
-    "A previous Claude Code import is still running. Wait for it to finish before importing again.";
+pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str = "A previous external agent import is still running. Wait for it to finish before importing again.";
 const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForkGoalContinuation {
+    StartIfIdle,
+    DeferUntilNextTurn,
+}
 
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
     color_eyre::eyre::eyre!("{context}: {err}")
@@ -407,12 +410,13 @@ impl AppServerSession {
         self.client
             .request_typed(ClientRequest::ExternalAgentConfigDetect { request_id, params })
             .await
-            .wrap_err("externalAgentConfig/detect failed during Claude Code import")
+            .wrap_err("externalAgentConfig/detect failed during external agent import")
     }
 
     pub(crate) async fn external_agent_config_import(
         &mut self,
         migration_items: Vec<ExternalAgentConfigMigrationItem>,
+        migration_source: String,
     ) -> Result<()> {
         // Mark the import active before sending the request so a fast completion notification
         // cannot arrive before the TUI records it.
@@ -429,11 +433,12 @@ impl AppServerSession {
                 request_id,
                 params: ExternalAgentConfigImportParams {
                     migration_items,
-                    source: None,
+                    source: Some(migration_source.clone()),
+                    migration_source: Some(migration_source),
                 },
             })
             .await
-            .wrap_err("externalAgentConfig/import failed during Claude Code import");
+            .wrap_err("externalAgentConfig/import failed during external agent import");
         match response {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -532,18 +537,42 @@ impl AppServerSession {
         config: Config,
         thread_id: ThreadId,
     ) -> Result<AppServerStartedThread> {
+        self.fork_thread_at(
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            /*before_turn_id*/ None,
+            ForkGoalContinuation::StartIfIdle,
+        )
+        .await
+    }
+
+    pub(crate) async fn fork_thread_at(
+        &mut self,
+        config: Config,
+        thread_id: ThreadId,
+        last_turn_id: Option<String>,
+        before_turn_id: Option<String>,
+        goal_continuation: ForkGoalContinuation,
+    ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(&config);
         let response: ThreadForkResponse = self
             .client
             .request_typed(ClientRequest::ThreadFork {
                 request_id,
-                params: thread_fork_params_from_config(
-                    session_config,
-                    thread_id,
-                    self.thread_params_mode(),
-                    self.remote_cwd_override.as_deref(),
-                ),
+                params: ThreadForkParams {
+                    last_turn_id,
+                    before_turn_id,
+                    defer_goal_continuation: goal_continuation
+                        == ForkGoalContinuation::DeferUntilNextTurn,
+                    ..thread_fork_params_from_config(
+                        session_config,
+                        thread_id,
+                        self.thread_params_mode(),
+                        self.remote_cwd_override.as_deref(),
+                    )
+                },
             })
             .await
             .map_err(|err| {
@@ -1091,24 +1120,6 @@ impl AppServerSession {
         Ok(())
     }
 
-    pub(crate) async fn thread_rollback(
-        &mut self,
-        thread_id: ThreadId,
-        num_turns: u32,
-    ) -> Result<ThreadRollbackResponse> {
-        let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::ThreadRollback {
-                request_id,
-                params: ThreadRollbackParams {
-                    thread_id: thread_id.to_string(),
-                    num_turns,
-                },
-            })
-            .await
-            .wrap_err("thread/rollback failed in TUI")
-    }
-
     pub(crate) async fn review_start(
         &mut self,
         thread_id: ThreadId,
@@ -1272,6 +1283,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
         is_default: model.is_default,
         upgrade,
         show_in_picker: !model.hidden,
+        multi_agent_version: None,
         availability_nux: model.availability_nux.map(|nux| ModelAvailabilityNux {
             message: nux.message,
         }),
@@ -1845,6 +1857,7 @@ mod tests {
             secondary: None,
             credits: None,
             individual_limit: None,
+            spend_control_reached: None,
             plan_type: None,
             rate_limit_reached_type: None,
         }
@@ -2532,6 +2545,8 @@ mod tests {
             reasoning_effort: None,
             multi_agent_mode: Default::default(),
             initial_turns_page: None,
+            turns_backwards_cursor: None,
+            items_backwards_cursor: None,
         };
 
         let started = started_thread_from_resume_response(
