@@ -60,7 +60,7 @@ jobs:
   build:
     name: Build ${{ matrix.variant }} ${{ matrix.target }}
     needs: metadata
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runner) || (matrix.runner == 'macos-15-xlarge' && 'macos-latest' || matrix.runner) }}
     permissions:
       contents: read
       actions: read
@@ -177,6 +177,7 @@ jobs:
           toolchain: "1.95.0"
 
       - name: Build Bazel V8 release pair
+        if: github.repository == 'openai/codex'
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
           PLATFORM: ${{ matrix.platform }}
@@ -214,6 +215,7 @@ jobs:
             "--config=${{ matrix.bazel_config }}"
 
       - name: Stage release pair
+        if: github.repository == 'openai/codex'
         env:
           BAZEL_CONFIG: ${{ matrix.bazel_config }}
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
@@ -455,7 +457,7 @@ jobs:
           path: dist
 
       - name: Create GitHub Release
-        if: ${{ steps.release.outputs.exists != 'true' }}
+        if: github.repository == 'openai/codex' && (steps.release.outputs.exists != 'true')
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: ${{ needs.metadata.outputs.release_tag }}
@@ -465,7 +467,7 @@ jobs:
           prerelease: true
 
       - name: Amend existing GitHub Release
-        if: ${{ steps.release.outputs.exists == 'true' }}
+        if: github.repository == 'openai/codex' && (steps.release.outputs.exists == 'true')
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: ${{ needs.metadata.outputs.release_tag }}
