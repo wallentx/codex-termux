@@ -12,6 +12,7 @@ use codex_plugin::PluginHookSource;
 use codex_plugin::PluginId;
 use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -20,8 +21,12 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::request_permissions::PermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile;
+use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::TestTargetOs;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::hooks::trust_hooks;
 use core_test_support::managed_network_requirements_loader;
@@ -40,9 +45,12 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_host_windows;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
+use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -2013,6 +2021,151 @@ async fn permission_request_hook_allows_shell_command_without_user_approval() ->
 }
 
 #[tokio::test]
+async fn permission_request_hook_allow_bypasses_strict_auto_review() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "request_permissions currently requires a host-native cwd"
+    );
+
+    let server = start_mock_server().await;
+    let permission_call_id = "strict-hook-permissions";
+    let command_call_id = "strict-hook-shell-command";
+    let marker_name = "strict-hook-shell-command-marker";
+    let command = match test_target_os() {
+        TestTargetOs::Linux | TestTargetOs::MacOs => format!("rm -f {marker_name}"),
+        TestTargetOs::Windows => {
+            format!("Remove-Item -Force -ErrorAction SilentlyContinue {marker_name}")
+        }
+    };
+    let requested_permissions = RequestPermissionProfile {
+        network: Some(NetworkPermissions {
+            enabled: Some(true),
+        }),
+        ..Default::default()
+    };
+    let request_permissions_args = serde_json::json!({
+        "reason": "Enable strict auto review",
+        "permissions": requested_permissions,
+    });
+    let command_args = serde_json::json!({ "command": command });
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-strict-hook-1"),
+                ev_function_call(
+                    permission_call_id,
+                    "request_permissions",
+                    &serde_json::to_string(&request_permissions_args)?,
+                ),
+                ev_completed("resp-strict-hook-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-strict-hook-2"),
+                ev_function_call(
+                    command_call_id,
+                    "shell_command",
+                    &serde_json::to_string(&command_args)?,
+                ),
+                ev_completed("resp-strict-hook-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-strict-hook-3"),
+                ev_assistant_message("msg-strict-hook", "permission hook allowed it"),
+                ev_completed("resp-strict-hook-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            install_allow_permission_request_hook(home)
+                .expect("failed to write permission request hook test fixture");
+        })
+        .with_config(|config| {
+            trust_discovered_hooks(config);
+            config
+                .features
+                .enable(Feature::RequestPermissionsTool)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let marker = test
+        .executor_environment()
+        .selection()
+        .cwd
+        .join(marker_name)?;
+    test.fs()
+        .write_file(&marker, b"seed".to_vec(), /*sandbox*/ None)
+        .await
+        .context("create strict auto-review marker")?;
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "request strict review, then run the shell command".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::OnRequest),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let request = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RequestPermissions(_))
+    })
+    .await;
+    let EventMsg::RequestPermissions(request) = request else {
+        panic!("expected request permissions event");
+    };
+    assert_eq!(request.call_id, permission_call_id);
+    test.codex
+        .submit(Op::RequestPermissionsResponse {
+            id: permission_call_id.to_string(),
+            response: RequestPermissionsResponse {
+                permissions: request.permissions,
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: true,
+            },
+        })
+        .await?;
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 3);
+    requests[2].function_call_output(command_call_id);
+    assert!(
+        test.fs()
+            .read_file(&marker, /*sandbox*/ None)
+            .await
+            .is_err(),
+        "hook-approved command should remove marker without Guardian review"
+    );
+    assert_single_permission_request_hook_input(
+        test.codex_home_path(),
+        &command,
+        /*description*/ None,
+    )?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn permission_request_hook_allows_apply_patch_with_write_alias() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2163,6 +2316,38 @@ async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()> {
 
 #[tokio::test]
 async fn permission_request_hook_allows_network_approval_without_prompt() -> Result<()> {
+    let command = r#"python3 -c "import urllib.request; opener = urllib.request.build_opener(urllib.request.ProxyHandler()); print('OK:' + opener.open('http://codex-network-test.invalid', timeout=2).read().decode(errors='replace'))""#;
+    run_network_permission_hook_test(
+        "allow",
+        PERMISSION_REQUEST_ALLOW_REASON,
+        "permissionrequest-network-approval",
+        command,
+        /*expected_denial*/ None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn permission_request_hook_denies_network_approval_with_custom_message() -> Result<()> {
+    let denial = "network access denied by the integration-test hook";
+    let command = r#"python3 -c "import urllib.request; opener = urllib.request.build_opener(urllib.request.ProxyHandler()); opener.open('http://codex-network-test.invalid', timeout=2).read()""#;
+    run_network_permission_hook_test(
+        "deny",
+        denial,
+        "permissionrequest-network-denied",
+        command,
+        Some(denial),
+    )
+    .await
+}
+
+async fn run_network_permission_hook_test(
+    hook_mode: &'static str,
+    hook_reason: &'static str,
+    call_id: &'static str,
+    command: &'static str,
+    expected_denial: Option<&'static str>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -2180,21 +2365,19 @@ mode = "limited"
 allow_local_binding = true
 "#,
     )?;
-    let call_id = "permissionrequest-network-approval";
-    let command = r#"python3 -c "import urllib.request; opener = urllib.request.build_opener(urllib.request.ProxyHandler()); print('OK:' + opener.open('http://codex-network-test.invalid', timeout=2).read().decode(errors='replace'))""#;
     let args = serde_json::json!({ "command": command });
-    let _responses = mount_sse_sequence(
+    let responses = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
-                ev_response_created("resp-1"),
+                ev_response_created("resp-network-hook-1"),
                 ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
-                ev_completed("resp-1"),
+                ev_completed("resp-network-hook-1"),
             ]),
             sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "permission request hook allowed network access"),
-                ev_completed("resp-2"),
+                ev_response_created("resp-network-hook-2"),
+                ev_assistant_message("msg-network-hook", "done"),
+                ev_completed("resp-network-hook-2"),
             ]),
         ],
     )
@@ -2205,13 +2388,19 @@ allow_local_binding = true
     let permission_profile_for_config = permission_profile.clone();
     let test = test_codex()
         .with_home(Arc::clone(&home))
-        .with_pre_build_hook(|home| {
-            install_allow_permission_request_hook(home)
-                .expect("failed to write permission request hook test fixture");
+        .with_pre_build_hook(move |home| {
+            write_permission_request_hook(
+                home,
+                Some(PERMISSION_REQUEST_HOOK_MATCHER),
+                hook_mode,
+                hook_reason,
+            )
+            .expect("failed to write permission request hook test fixture");
         })
         .with_cloud_config_bundle(managed_network_requirements_loader())
         .with_config(move |config| {
             trust_discovered_hooks(config);
+            config.approvals_reviewer = codex_config::types::ApprovalsReviewer::AutoReview;
             config.permissions.approval_policy = Constrained::allow_any(approval_policy);
             config
                 .permissions
@@ -2220,65 +2409,71 @@ allow_local_binding = true
         })
         .build(&server)
         .await?;
-    assert!(
-        test.config.managed_network_requirements_enabled(),
-        "expected managed network requirements to be enabled"
-    );
-    assert!(
-        test.config.permissions.network.is_some(),
-        "expected managed network proxy config to be present"
-    );
-    test.session_configured
-        .network_proxy
-        .as_ref()
-        .expect("expected runtime managed network proxy addresses");
 
     test.submit_turn_with_approval_and_permission_profile(
-        "run the shell command after network hook approval",
+        "run the shell command after the network permission hook",
         approval_policy,
         permission_profile,
     )
     .await?;
-
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if test
-                .codex_home_path()
-                .join("permission_request_hook_log.jsonl")
-                .exists()
-            {
-                break;
+    if expected_denial.is_none() {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if test
+                    .codex_home_path()
+                    .join("permission_request_hook_log.jsonl")
+                    .exists()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
             }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("expected network approval hook to run");
-
-    assert!(
-        timeout(
-            Duration::from_secs(2),
-            wait_for_event(&test.codex, |event| matches!(
-                event,
-                EventMsg::ExecApprovalRequest(_)
-            ))
-        )
+        })
         .await
-        .is_err(),
-        "expected the network approval hook to bypass the approval prompt"
-    );
+        .expect("expected network approval hook to run");
+        assert!(
+            timeout(
+                Duration::from_secs(2),
+                wait_for_event(&test.codex, |event| matches!(
+                    event,
+                    EventMsg::ExecApprovalRequest(_)
+                ))
+            )
+            .await
+            .is_err(),
+            "expected the network approval hook to bypass the approval prompt"
+        );
+    }
 
     assert_single_permission_request_hook_input(
         test.codex_home_path(),
         command,
         Some("network-access http://codex-network-test.invalid:80"),
     )?;
-
-    test.codex.submit(Op::Shutdown {}).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ShutdownComplete)
-    })
-    .await;
+    let requests = responses.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.body_json()["client_metadata"]["x-openai-subagent"].as_str()
+                    == Some("guardian")
+            })
+            .count(),
+        0
+    );
+    if let Some(expected_denial) = expected_denial {
+        let tool_output = requests
+            .iter()
+            .find_map(|request| request.function_call_output_text(call_id))
+            .expect("expected denied tool output");
+        assert!(tool_output.contains(expected_denial));
+    } else {
+        test.codex.submit(Op::Shutdown {}).await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::ShutdownComplete)
+        })
+        .await;
+    }
 
     Ok(())
 }

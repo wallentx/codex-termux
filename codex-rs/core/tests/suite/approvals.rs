@@ -53,7 +53,6 @@ use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 use serde_json::Value;
 use serde_json::json;
-use std::env;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -83,9 +82,7 @@ impl TargetPath {
                 (path, name.to_string())
             }
             TargetPath::OutsideWorkspace(name) => {
-                let path = env::current_dir()
-                    .expect("current dir should be available")
-                    .join(name);
+                let path = test.home.path().join(name);
                 (path.clone(), path.display().to_string())
             }
         }
@@ -2003,9 +2000,9 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
         "approval scenario {} result: exit_code={:?} stdout={:?}",
         scenario.name, result.exit_code, result.stdout
     );
-    scenario.expectation.verify(&test, &result)?;
-
-    Ok(())
+    let verification_result = scenario.expectation.verify(&test, &result);
+    test.codex.shutdown_and_wait().await?;
+    verification_result
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3419,6 +3416,12 @@ allow_local_binding = true
         policy_contents.contains(&expected_rule),
         "unexpected policy contents: {policy_contents}"
     );
+    assert!(first_results.requests().iter().any(|request| {
+        request.body_contains_text(&format!(
+            "Denied network rule saved in execpolicy (denylist): {}",
+            deny_network_amendment.host
+        ))
+    }));
 
     let first_output = parse_result(
         &first_results

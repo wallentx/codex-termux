@@ -15,6 +15,7 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
@@ -22,8 +23,11 @@ use tokio_util::task::AbortOnDropHandle;
 use tokio::time::timeout;
 use tracing::Instrument;
 use tracing::debug;
+use tracing::instrument::WithSubscriber;
 
 use crate::ProcessId;
+use crate::client::http_client::response_body_stream::MAX_QUEUED_HTTP_BODY_BYTES;
+use crate::client::http_client::response_body_stream::QueuedHttpBodyDelta;
 use crate::client_api::ExecServerClientConnectOptions;
 use crate::client_api::ExecServerTransportParams;
 use crate::client_api::HttpClient;
@@ -31,10 +35,12 @@ use crate::client_api::RemoteExecServerConnectArgs;
 use crate::client_api::StdioExecServerConnectArgs;
 use crate::client_transport::ExecServerReconnectStrategy;
 use crate::connection::JsonRpcConnection;
+use crate::environment::EnvironmentConnectionState;
 use crate::process::ExecProcessEvent;
 use crate::process::ExecProcessEventLog;
 use crate::process::ExecProcessEventReceiver;
 use crate::protocol::ENVIRONMENT_INFO_METHOD;
+use crate::protocol::ENVIRONMENT_STATUS_METHOD;
 use crate::protocol::EXEC_CLOSED_METHOD;
 use crate::protocol::EXEC_EXITED_METHOD;
 use crate::protocol::EXEC_METHOD;
@@ -44,6 +50,7 @@ use crate::protocol::EXEC_SIGNAL_METHOD;
 use crate::protocol::EXEC_TERMINATE_METHOD;
 use crate::protocol::EXEC_WRITE_METHOD;
 use crate::protocol::EnvironmentInfo;
+use crate::protocol::EnvironmentStatus;
 use crate::protocol::ExecClosedNotification;
 use crate::protocol::ExecExitedNotification;
 use crate::protocol::ExecOutputDeltaNotification;
@@ -86,7 +93,6 @@ use crate::protocol::FsWalkResponse;
 use crate::protocol::FsWriteFileParams;
 use crate::protocol::FsWriteFileResponse;
 use crate::protocol::HTTP_REQUEST_BODY_DELTA_METHOD;
-use crate::protocol::HttpRequestBodyDeltaNotification;
 use crate::protocol::INITIALIZE_METHOD;
 use crate::protocol::INITIALIZED_METHOD;
 use crate::protocol::InitializeParams;
@@ -111,6 +117,7 @@ mod recovery;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const ENVIRONMENT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+const ENVIRONMENT_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_RETAINED_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_PROCESS_EVENTS: usize = 256;
@@ -202,9 +209,10 @@ struct Inner {
     // because they share the same connection-global notification channel as
     // process output. Keep the routing table local to the client so higher
     // layers can consume body chunks like a normal byte stream.
-    http_body_streams: ArcSwap<HashMap<String, mpsc::Sender<HttpRequestBodyDeltaNotification>>>,
+    http_body_streams: ArcSwap<HashMap<String, mpsc::Sender<QueuedHttpBodyDelta>>>,
     http_body_stream_failures: ArcSwap<HashMap<String, String>>,
     http_body_streams_write_lock: Mutex<()>,
+    http_body_stream_byte_budget: Arc<Semaphore>,
     http_body_stream_next_id: AtomicU64,
     session_id: OnceLock<String>,
     reconnect_strategy: Option<ExecServerReconnectStrategy>,
@@ -213,12 +221,41 @@ struct Inner {
 struct ConnectionState {
     status: ConnectionStatus,
     active_process_starts: usize,
+    environment_connection_state_tx: watch::Sender<EnvironmentConnectionState>,
 }
 
 enum ConnectionStatus {
     Connected(Arc<RpcClient>),
     Recovering,
     Failed(String),
+}
+
+impl ConnectionState {
+    fn set_status(&mut self, status: ConnectionStatus) {
+        self.status = status;
+        self.publish_environment_connection_state();
+    }
+
+    fn publish_environment_connection_state(&self) {
+        let state = match &self.status {
+            ConnectionStatus::Connected(rpc_client) if !rpc_client.is_disconnected() => {
+                EnvironmentConnectionState::Connected
+            }
+            ConnectionStatus::Connected(_)
+            | ConnectionStatus::Recovering
+            | ConnectionStatus::Failed(_) => EnvironmentConnectionState::Disconnected,
+        };
+        let _ = self
+            .environment_connection_state_tx
+            .send_if_modified(|current| {
+                if *current == state {
+                    false
+                } else {
+                    *current = state;
+                    true
+                }
+            });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -255,6 +292,7 @@ pub(crate) struct LazyRemoteExecServerClient {
     // The latest successful client, replaced whenever reconnecting succeeds.
     current_client: Arc<StdMutex<Option<ExecServerClient>>>,
     reconnect: Arc<StdMutex<Option<Arc<ConnectionAttempt>>>>,
+    environment_connection_state_tx: watch::Sender<EnvironmentConnectionState>,
 }
 
 impl LazyRemoteExecServerClient {
@@ -265,7 +303,15 @@ impl LazyRemoteExecServerClient {
             startup: Arc::new(ConnectionAttempt::new()),
             current_client: Arc::new(StdMutex::new(None)),
             reconnect: Arc::new(StdMutex::new(None)),
+            environment_connection_state_tx: watch::channel(
+                EnvironmentConnectionState::Disconnected,
+            )
+            .0,
         }
+    }
+
+    pub(crate) fn subscribe_connection_state(&self) -> watch::Receiver<EnvironmentConnectionState> {
+        self.environment_connection_state_tx.subscribe()
     }
 
     pub(crate) fn start_connecting(&self) -> Option<AbortOnDropHandle<()>> {
@@ -296,6 +342,30 @@ impl LazyRemoteExecServerClient {
             Ok(client) => client.readiness_result(),
             Err(error) => Some(Err(ExecServerError::ConnectionAttempt(Arc::clone(error)))),
         })
+    }
+
+    pub(crate) async fn status(&self) -> crate::EnvironmentObservedStatus {
+        // Fail-fast lookup preserves the non-mutating contract: never start or recover a client.
+        let client = match self.fail_fast().get().await {
+            Ok(client) => client,
+            Err(error) => {
+                // Without a completed startup attempt, there is no exec-server connection to probe.
+                if self.cached_client().is_none() && self.startup.get().is_none() {
+                    return crate::EnvironmentObservedStatus::Pending;
+                }
+                // A known connection failure is reported without retrying it as part of status.
+                return crate::EnvironmentObservedStatus::Disconnected {
+                    error: error.to_string(),
+                };
+            }
+        };
+        // Every callable client is probed so callers never receive a cached health result.
+        match client.environment_status().await {
+            Ok(_) => crate::EnvironmentObservedStatus::Ready,
+            Err(error) => crate::EnvironmentObservedStatus::Disconnected {
+                error: error.to_string(),
+            },
+        }
     }
 
     pub(crate) fn fail_fast(&self) -> Self {
@@ -348,10 +418,7 @@ impl LazyRemoteExecServerClient {
 
     async fn initial_client(&self) -> Result<ExecServerClient, ExecServerError> {
         // The first caller starts the work; every other caller waits for that same result.
-        let result = self
-            .startup
-            .get_or_init(|| connect_once(self.transport_params.clone()))
-            .await;
+        let result = self.startup.get_or_init(|| self.connect_once()).await;
         match result {
             Ok(client) => {
                 let mut current_client = self
@@ -383,7 +450,7 @@ impl LazyRemoteExecServerClient {
         };
         let result = attempt
             .get_or_init(|| async {
-                let result = connect_once(self.transport_params.clone()).await;
+                let result = self.connect_once().await;
                 if let Ok(client) = &result {
                     *self
                         .current_client
@@ -422,16 +489,22 @@ impl LazyRemoteExecServerClient {
     fn can_reconnect(&self) -> bool {
         matches!(
             self.transport_params,
-            ExecServerTransportParams::WebSocketUrl { .. }
+            ExecServerTransportParams::Deferred(_)
+                | ExecServerTransportParams::WebSocketUrl { .. }
                 | ExecServerTransportParams::NoiseRendezvous { .. }
         )
     }
-}
 
-async fn connect_once(transport_params: ExecServerTransportParams) -> ConnectionResult {
-    ExecServerClient::connect_for_transport(transport_params)
-        .await
-        .map_err(Arc::new)
+    async fn connect_once(&self) -> ConnectionResult {
+        let result = ExecServerClient::connect_for_transport(self.transport_params.clone())
+            .await
+            .map_err(Arc::new);
+        if let Ok(client) = &result {
+            client
+                .attach_environment_connection_state(self.environment_connection_state_tx.clone());
+        }
+        result
+    }
 }
 
 impl HttpClient for LazyRemoteExecServerClient {
@@ -502,6 +575,19 @@ pub enum ExecServerError {
 }
 
 impl ExecServerClient {
+    fn attach_environment_connection_state(
+        &self,
+        state_tx: watch::Sender<EnvironmentConnectionState>,
+    ) {
+        let mut connection = self
+            .inner
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection.environment_connection_state_tx = state_tx;
+        connection.publish_environment_connection_state();
+    }
+
     fn fail_fast(&self) -> Result<Self, ExecServerError> {
         self.rpc_client_without_recovery()?;
         Ok(Self {
@@ -595,6 +681,16 @@ impl ExecServerClient {
         map_rpc_call_result(
             rpc_client
                 .call_with_timeout(ENVIRONMENT_INFO_METHOD, &(), ENVIRONMENT_INFO_TIMEOUT)
+                .await,
+        )
+    }
+
+    pub async fn environment_status(&self) -> Result<EnvironmentStatus, ExecServerError> {
+        // Health checks only reuse an existing RPC connection and never initiate recovery.
+        let rpc_client = self.rpc_client_without_recovery()?;
+        map_rpc_call_result(
+            rpc_client
+                .call_with_timeout(ENVIRONMENT_STATUS_METHOD, &(), ENVIRONMENT_STATUS_TIMEOUT)
                 .await,
         )
     }
@@ -778,7 +874,11 @@ impl ExecServerClient {
                     }
                 }
             };
-            tokio::spawn(process_start_task.in_current_span());
+            tokio::spawn(
+                process_start_task
+                    .in_current_span()
+                    .with_current_subscriber(),
+            );
             return result_rx.await.map_err(|_| {
                 ExecServerError::Protocol("process start task stopped unexpectedly".to_string())
             })?;
@@ -844,6 +944,10 @@ impl ExecServerClient {
             connection: StdMutex::new(ConnectionState {
                 status: ConnectionStatus::Connected(Arc::clone(&rpc_client)),
                 active_process_starts: 0,
+                environment_connection_state_tx: watch::channel(
+                    EnvironmentConnectionState::Connected,
+                )
+                .0,
             }),
             connection_changed,
             sessions: ArcSwap::from_pointee(HashMap::new()),
@@ -851,6 +955,7 @@ impl ExecServerClient {
             http_body_streams: ArcSwap::from_pointee(HashMap::new()),
             http_body_stream_failures: ArcSwap::from_pointee(HashMap::new()),
             http_body_streams_write_lock: Mutex::new(()),
+            http_body_stream_byte_budget: Arc::new(Semaphore::new(MAX_QUEUED_HTTP_BODY_BYTES)),
             http_body_stream_next_id: AtomicU64::new(1),
             session_id,
             reconnect_strategy,
@@ -1422,6 +1527,7 @@ mod tests {
     use super::ExecServerClient;
     use super::ExecServerClientConnectOptions;
     use super::LazyRemoteExecServerClient;
+    use crate::EnvironmentObservedStatus;
     use crate::ProcessId;
     #[cfg(not(windows))]
     use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT;
@@ -1475,7 +1581,7 @@ mod tests {
             .expect("json-rpc line should write");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn process_start_propagates_caller_trace_context_across_background_task() {
         let (client_stdin, server_reader) = duplex(1 << 20);
         let (mut server_writer, client_stdout) = duplex(1 << 20);
@@ -2401,6 +2507,10 @@ mod tests {
             Ok(_) => panic!("burned environment should stay failed"),
             Err(error) => error,
         };
+        assert!(matches!(
+            client.status().await,
+            EnvironmentObservedStatus::Disconnected { .. }
+        ));
 
         let (
             super::ExecServerError::ConnectionAttempt(first),

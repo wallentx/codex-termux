@@ -17,6 +17,7 @@ use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::SearchThreadsParams;
+use crate::StoredModelContext;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadPage;
@@ -76,6 +77,20 @@ pub trait ThreadStore: Any + Send + Sync {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory>;
 
+    /// Loads the persisted rollout items needed to reconstruct the latest model-visible context.
+    ///
+    /// Implementations that cannot perform a targeted read may return the full persisted history.
+    fn load_latest_model_context(
+        &self,
+        _params: LoadThreadHistoryParams,
+    ) -> ThreadStoreFuture<'_, StoredModelContext> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "load_latest_model_context",
+            })
+        })
+    }
+
     /// Reads a thread summary and optionally its persisted history.
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread>;
 
@@ -89,6 +104,11 @@ pub trait ThreadStore: Any + Send + Sync {
 
     /// Lists stored threads matching the supplied filters.
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage>;
+
+    /// Whether paginated threads can hydrate durable history through turn and item lists.
+    fn supports_paginated_history_lists(&self) -> bool {
+        false
+    }
 
     /// Searches stored threads and returns search-only preview metadata.
     fn search_threads(

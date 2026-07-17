@@ -410,7 +410,7 @@ impl TurnToolCounts {
             | ThreadItem::Plan { .. }
             | ThreadItem::Reasoning { .. }
             | ThreadItem::ImageView { .. }
-            | ThreadItem::Sleep { .. }
+            | ThreadItem::Sleep(_)
             | ThreadItem::EnteredReviewMode { .. }
             | ThreadItem::ExitedReviewMode { .. }
             | ThreadItem::ContextCompaction { .. } => return,
@@ -841,6 +841,7 @@ impl AnalyticsReducer {
             plugin,
             source,
             error_type,
+            sub_error_type,
         } = input;
         out.push(TrackEventRequest::PluginInstallFailed(
             CodexPluginInstallFailedEventRequest {
@@ -849,6 +850,7 @@ impl AnalyticsReducer {
                     plugin: codex_plugin_metadata(plugin),
                     source,
                     error_type,
+                    sub_error_type,
                 },
             },
         ));
@@ -888,6 +890,7 @@ impl AnalyticsReducer {
                     item_type: input.item_type,
                     failure_stage: input.failure_stage,
                     error_type: input.error_type,
+                    sub_error_type: input.sub_error_type,
                     product_client_id: Some(originator().value),
                 },
             },
@@ -1747,7 +1750,7 @@ fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
         | ThreadItem::Reasoning { .. }
         | ThreadItem::SubAgentActivity { .. }
         | ThreadItem::ImageView { .. }
-        | ThreadItem::Sleep { .. }
+        | ThreadItem::Sleep(_)
         | ThreadItem::EnteredReviewMode { .. }
         | ThreadItem::ExitedReviewMode { .. }
         | ThreadItem::ContextCompaction { .. } => None,
@@ -1884,6 +1887,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             error,
             duration_ms,
             plugin_id,
+            app_context,
             ..
         } => {
             let (terminal_status, failure_kind) = mcp_tool_call_outcome(status)?;
@@ -1915,6 +1919,9 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                         mcp_tool_name: tool.clone(),
                         mcp_error_present: error.is_some(),
                         plugin_id: plugin_id.clone(),
+                        connector_id: app_context
+                            .as_ref()
+                            .map(|app_context| app_context.connector_id.clone()),
                     },
                 },
             ))
@@ -2151,6 +2158,7 @@ fn tool_item_base(
     let review_summary = context.review_summary.cloned().unwrap_or_default();
     CodexToolItemEventBase {
         thread_id: thread_id.to_string(),
+        session_id: thread_metadata.session_id.clone(),
         turn_id: turn_id.to_string(),
         item_id,
         app_server_client: context
@@ -2679,6 +2687,9 @@ fn codex_turn_event_params(
         cached_input_tokens: token_usage
             .as_ref()
             .map(|token_usage| token_usage.cached_input_tokens),
+        cache_write_input_tokens: token_usage
+            .as_ref()
+            .map(|token_usage| token_usage.cache_write_input_tokens),
         output_tokens: token_usage
             .as_ref()
             .map(|token_usage| token_usage.output_tokens),

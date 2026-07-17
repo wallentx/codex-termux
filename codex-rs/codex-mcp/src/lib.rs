@@ -12,7 +12,13 @@ pub use resource_client::McpResourceReadResult;
 pub use rmcp_client::MCP_SANDBOX_STATE_META_CAPABILITY;
 pub use runtime::McpRuntimeContext;
 pub use runtime::SandboxState;
+pub use tool_catalog_cache::McpToolCatalogCache;
 pub use tools::ToolInfo;
+
+/// Backward-compatible name for the shared Codex Apps tools runtime.
+pub type CodexAppsToolsCache = codex_connectors::ConnectorRuntimeManager<ToolInfo>;
+/// Backward-compatible name for the Codex Apps runtime context key.
+pub type CodexAppsToolsCacheKey = codex_connectors::ConnectorRuntimeContextKey;
 
 pub use catalog::McpCatalogBuilder;
 pub use catalog::McpPluginAttribution;
@@ -37,9 +43,8 @@ pub use auth_elicitation::auth_elicitation_id;
 pub use auth_elicitation::build_auth_elicitation;
 pub use auth_elicitation::build_auth_elicitation_plan;
 pub use auth_elicitation::connector_auth_failure_from_tool_result;
-pub use codex_apps_cache::CodexAppsToolsCache;
-pub use codex_apps_cache::CodexAppsToolsCacheKey;
-pub use codex_apps_cache::codex_apps_tools_cache_key;
+/// Backward-compatible name for the Codex Apps runtime context key builder.
+pub use codex_connectors::connector_runtime_context_key as codex_apps_tools_cache_key;
 pub use mcp::codex_apps_mcp_server_config;
 pub use mcp::configured_mcp_servers;
 pub use mcp::effective_mcp_servers;
@@ -78,13 +83,14 @@ pub use mcp::qualified_mcp_tool_name_prefix;
 pub(crate) mod auth_elicitation;
 mod catalog;
 pub(crate) mod codex_apps;
-pub(crate) mod codex_apps_cache;
 pub(crate) mod connection_manager;
 pub(crate) mod elicitation;
 pub(crate) mod mcp;
+mod openai_docs_source_attribution;
 mod plugin_config;
 mod resource_client;
 pub(crate) mod rmcp_client;
 pub(crate) mod runtime;
 pub(crate) mod server;
+mod tool_catalog_cache;
 pub(crate) mod tools;
