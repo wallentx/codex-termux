@@ -877,10 +877,10 @@ mod tests {
         let OutgoingEnvelope::Broadcast { message } = envelope else {
             panic!("expected broadcast notification");
         };
-        let OutgoingMessage::AppServerNotification(ServerNotification::ThreadStatusChanged(
-            notification,
-        )) = message
-        else {
+        let OutgoingMessage::AppServerNotification(envelope) = message else {
+            panic!("expected thread/status/changed notification");
+        };
+        let ServerNotification::ThreadStatusChanged(notification) = envelope.notification else {
             panic!("expected thread/status/changed notification");
         };
         notification
@@ -907,6 +907,7 @@ mod tests {
             agent_nickname: None,
             agent_role: None,
             source,
+            can_accept_direct_input: None,
             thread_source: None,
             git_info: None,
             name: None,

@@ -1,7 +1,13 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_network_proxy::CUSTOM_CA_ENV_KEYS;
+use codex_network_proxy::ManagedNetworkSandboxContext;
+use codex_network_proxy::NetworkProxy;
+use codex_network_proxy::NetworkProxyHandle;
+use codex_network_proxy::NetworkProxyState;
+use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
 use codex_network_proxy::is_managed_mitm_ca_trust_bundle_path;
 use codex_protocol::models::PermissionProfile;
 use codex_sandboxing::SandboxCommand;
@@ -16,6 +22,7 @@ use codex_utils_path_uri::PathUri;
 
 use crate::ExecServerRuntimePaths;
 use crate::protocol::ExecParams;
+use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
 
 pub(crate) struct PreparedExecRequest {
@@ -24,13 +31,20 @@ pub(crate) struct PreparedExecRequest {
     pub(crate) env: HashMap<String, String>,
     pub(crate) arg0: Option<String>,
     pub(crate) sandbox: SandboxType,
+    pub(crate) network_proxy_handle: Option<NetworkProxyHandle>,
 }
 
-pub(crate) fn prepare_exec_request(
+pub(crate) async fn prepare_exec_request(
     params: &ExecParams,
     env: HashMap<String, String>,
     runtime_paths: Option<&ExecServerRuntimePaths>,
 ) -> Result<PreparedExecRequest, JSONRPCErrorError> {
+    let (env, managed_network, network_proxy_handle) = prepare_managed_network(
+        params.managed_network.as_ref(),
+        params.network_proxy.as_ref(),
+        env,
+    )
+    .await?;
     let Some(sandbox_context) = params.sandbox.as_ref() else {
         return Ok(PreparedExecRequest {
             command: params.argv.clone(),
@@ -38,6 +52,7 @@ pub(crate) fn prepare_exec_request(
             env,
             arg0: params.arg0.clone(),
             sandbox: SandboxType::None,
+            network_proxy_handle,
         });
     };
     let runtime_paths = runtime_paths
@@ -56,13 +71,9 @@ pub(crate) fn prepare_exec_request(
         .iter()
         .map(|root| native_path(root, "sandbox workspace root"))
         .collect::<Result<Vec<_>, _>>()?;
-    let workspace_roots = if native_workspace_roots.is_empty() {
-        std::slice::from_ref(&native_sandbox_policy_cwd)
-    } else {
-        native_workspace_roots.as_slice()
-    };
+    let workspace_roots = native_workspace_roots.as_slice();
     let permissions = permissions.materialize_project_roots_with_workspace_roots(workspace_roots);
-    let managed_mitm_ca_trust_bundle_path = params.managed_network.as_ref().and_then(|_| {
+    let managed_mitm_ca_trust_bundle_path = managed_network.as_ref().and_then(|_| {
         CUSTOM_CA_ENV_KEYS.iter().find_map(|key| {
             let path = env.get(*key)?;
             if !is_managed_mitm_ca_trust_bundle_path(path) {
@@ -77,6 +88,22 @@ pub(crate) fn prepare_exec_request(
         native_sandbox_policy_cwd.as_path(),
     );
     let (file_system_policy, network_policy) = permissions.to_runtime_permissions();
+    // Bubblewrap launches the configured helper, which may re-enter this executable to apply
+    // seccomp, so the outer filesystem sandbox must expose both paths.
+    #[cfg(target_os = "linux")]
+    let sandbox_helper_paths = std::iter::once(&runtime_paths.codex_self_exe)
+        .chain(runtime_paths.codex_linux_sandbox_exe.as_ref())
+        .cloned()
+        .collect::<Vec<_>>();
+    #[cfg(target_os = "linux")]
+    let file_system_policy = file_system_policy
+        .with_additional_readable_roots(native_sandbox_policy_cwd.as_path(), &sandbox_helper_paths);
+    #[cfg(target_os = "linux")]
+    let permissions = PermissionProfile::from_runtime_permissions_with_enforcement(
+        permissions.enforcement(),
+        &file_system_policy,
+        network_policy,
+    );
     let sandbox_manager = SandboxManager::new();
     let sandbox = sandbox_manager.select_initial(
         &file_system_policy,
@@ -117,7 +144,7 @@ pub(crate) fn prepare_exec_request(
                     args: args.to_vec(),
                     cwd: params.cwd.clone(),
                     env,
-                    managed_network: params.managed_network.clone(),
+                    managed_network,
                     additional_permissions: None,
                 },
                 permissions: &permissions,
@@ -139,7 +166,42 @@ pub(crate) fn prepare_exec_request(
         env: request.env,
         arg0: request.arg0,
         sandbox: request.sandbox,
+        network_proxy_handle,
     })
+}
+
+async fn prepare_managed_network(
+    managed_network: Option<&ManagedNetworkSandboxContext>,
+    network_proxy: Option<&RemoteNetworkProxyLaunchConfig>,
+    env: HashMap<String, String>,
+) -> Result<
+    (
+        HashMap<String, String>,
+        Option<ManagedNetworkSandboxContext>,
+        Option<NetworkProxyHandle>,
+    ),
+    JSONRPCErrorError,
+> {
+    let Some(network_proxy) = network_proxy.cloned() else {
+        return Ok((env, managed_network.cloned(), None));
+    };
+    let state = NetworkProxyState::from_remote_launch_config(network_proxy)
+        .map_err(|err| invalid_params(format!("invalid network proxy config: {err}")))?;
+    let proxy = NetworkProxy::builder()
+        .state(Arc::new(state))
+        .build()
+        .await
+        .map_err(|err| internal_error(format!("failed to build executor network proxy: {err}")))?;
+    let handle = proxy
+        .run()
+        .await
+        .map_err(|err| internal_error(format!("failed to start executor network proxy: {err}")))?;
+    let prepared = proxy
+        .prepare_for_optional_environment(env, /*environment_id*/ None)
+        .map_err(|err| {
+            internal_error(format!("failed to prepare executor network proxy: {err}"))
+        })?;
+    Ok((prepared.env, Some(prepared.sandbox_context), Some(handle)))
 }
 
 fn native_path(path: &PathUri, label: &str) -> Result<AbsolutePathBuf, JSONRPCErrorError> {

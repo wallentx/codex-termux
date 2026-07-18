@@ -26,6 +26,11 @@ impl ChatWidget {
             };
             self.clear_active_stream_tail();
             let (cell, source) = controller.finalize();
+            // Match newline-committed streaming behavior: once assistant output is ready to be
+            // committed into history, hide the inline status row so transcript content replaces it.
+            if cell.is_some() {
+                self.bottom_pane.hide_status_indicator();
+            }
             let deferred_history_cell =
                 if scrollback_reflow == crate::app_event::ConsolidationScrollbackReflow::Required {
                     cell
@@ -115,9 +120,6 @@ impl ChatWidget {
     pub(super) fn on_plan_delta(&mut self, delta: String) {
         if self.active_mode_kind() != ModeKind::Plan {
             return;
-        }
-        if !delta.is_empty() {
-            self.record_visible_turn_activity();
         }
         if !self.transcript.plan_item_active {
             self.transcript.plan_item_active = true;
@@ -226,24 +228,26 @@ impl ChatWidget {
 
     pub(super) fn on_agent_reasoning_final(&mut self) {
         // At the end of a reasoning block, record transcript-only content.
-        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
-        if !self.full_reasoning_buffer.is_empty() {
-            let cell = history_cell::new_reasoning_summary_block(
-                self.full_reasoning_buffer.clone(),
-                &self.config.cwd,
-            );
+        if !self.reasoning_buffer.is_empty() {
+            self.reasoning_summary_parts
+                .push(std::mem::take(&mut self.reasoning_buffer));
+        }
+        if !self.reasoning_summary_parts.is_empty() {
+            let reasoning_parts = std::mem::take(&mut self.reasoning_summary_parts);
+            let cell = history_cell::new_reasoning_summary_block(reasoning_parts, &self.config.cwd);
             self.add_boxed_history(cell);
         }
         self.reasoning_buffer.clear();
-        self.full_reasoning_buffer.clear();
+        self.reasoning_summary_parts.clear();
         self.request_redraw();
     }
 
     pub(super) fn on_reasoning_section_break(&mut self) {
         // Start a new reasoning block for header extraction and accumulate transcript.
-        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
-        self.full_reasoning_buffer.push_str("\n\n");
-        self.reasoning_buffer.clear();
+        if !self.reasoning_buffer.is_empty() {
+            self.reasoning_summary_parts
+                .push(std::mem::take(&mut self.reasoning_buffer));
+        }
     }
 
     pub(super) fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
@@ -387,7 +391,6 @@ impl ChatWidget {
     #[inline]
     pub(super) fn handle_streaming_delta(&mut self, delta: String) {
         if !delta.is_empty() {
-            self.record_visible_turn_activity();
             self.mark_safety_buffering_agent_message_started();
         }
         if self.stream_controller.is_none() {

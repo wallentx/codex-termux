@@ -3,7 +3,6 @@ use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::create_apply_patch_sse_response;
 use app_test_support::create_exec_command_sse_response;
-use app_test_support::create_fake_rollout;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
@@ -37,6 +36,7 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
+use codex_app_server_protocol::RawResponseCompletedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
@@ -48,9 +48,11 @@ use codex_app_server_protocol::ThreadDeletedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TokenUsageBreakdown;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnEnvironmentParams;
 use codex_app_server_protocol::TurnItemsView;
@@ -61,9 +63,8 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_app_server_protocol::WarningNotification;
-use codex_config::config_toml::ConfigToml;
-use codex_core::personality_migration::PERSONALITY_MIGRATION_FILENAME;
 use codex_core::test_support::all_model_presets;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
@@ -100,7 +101,6 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const TEST_ORIGINATOR: &str = "codex_vscode";
-const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const TINY_PNG_BYTES: &[u8] = &[
@@ -768,6 +768,105 @@ async fn turn_start_sends_service_tier_id_to_model_request() -> Result<()> {
 }
 
 #[tokio::test]
+async fn turn_start_emits_raw_response_completed_with_upstream_usage() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "Done"),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "usage": {
+                    "input_tokens": 30,
+                    "input_tokens_details": { "cached_tokens": 11 },
+                    "output_tokens": 7,
+                    "output_tokens_details": { "reasoning_tokens": 3 },
+                    "total_tokens": 37
+                }
+            }
+        }),
+    ]);
+    responses::mount_sse_once(&server, body).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::default(),
+    )?;
+    write_models_cache(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            experimental_raw_events: true,
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "Hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("rawResponse/completed"),
+    )
+    .await??;
+    let notification: codex_app_server_protocol::ServerNotification = notification.try_into()?;
+    let codex_app_server_protocol::ServerNotification::RawResponseCompleted(notification) =
+        notification
+    else {
+        anyhow::bail!("expected rawResponse/completed notification");
+    };
+
+    assert_eq!(
+        notification,
+        RawResponseCompletedNotification {
+            thread_id: thread.id,
+            turn_id: turn.id,
+            response_id: "resp-1".to_string(),
+            usage: Some(TokenUsageBreakdown {
+                total_tokens: 37,
+                input_tokens: 30,
+                cached_input_tokens: 11,
+                cache_write_input_tokens: 0,
+                output_tokens: 7,
+                reasoning_output_tokens: 3,
+            }),
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_omits_empty_instruction_overrides_from_model_request() -> Result<()> {
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![
@@ -1378,6 +1477,7 @@ async fn turn_start_rejects_unknown_environment_before_starting_turn() -> Result
                     codex_home.path().to_path_buf(),
                 )?
                 .into(),
+                runtime_workspace_roots: None,
             }]),
             ..Default::default()
         })
@@ -2091,100 +2191,6 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
 }
 
 #[tokio::test]
-async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let body = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_assistant_message("msg-1", "Done"),
-        responses::ev_completed("resp-1"),
-    ]);
-    let response_mock = responses::mount_sse_once(&server, body).await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        "never",
-        &BTreeMap::from([(Feature::Personality, true)]),
-    )?;
-    create_fake_rollout(
-        codex_home.path(),
-        "2025-01-01T00-00-00",
-        "2025-01-01T00:00:00Z",
-        "history user message",
-        Some("mock_provider"),
-        /*git_info*/ None,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let persisted_toml: ConfigToml = toml::from_str(&std::fs::read_to_string(
-        codex_home.path().join("config.toml"),
-    )?)?;
-    assert_eq!(persisted_toml.personality, Some(Personality::Pragmatic));
-    assert!(
-        codex_home
-            .path()
-            .join(PERSONALITY_MIGRATION_FILENAME)
-            .exists(),
-        "expected personality migration marker to be written on startup"
-    );
-
-    let thread_req = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("gpt-5.4".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
-
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "Hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            personality: None,
-            ..Default::default()
-        })
-        .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let request = response_mock.single_request();
-    let instructions_text = request.instructions_text();
-    assert!(
-        instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE),
-        "expected startup-migrated pragmatic personality in model instructions, got: {instructions_text:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn turn_start_defaults_local_image_detail_to_high() -> Result<()> {
     let input_images = run_local_image_turn(/*detail*/ None).await?;
 
@@ -2531,7 +2537,7 @@ async fn turn_start_exec_approval_decline_v2() -> Result<()> {
 }
 
 #[tokio::test]
-async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
+async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns() -> Result<()> {
     // TODO(anp): Materialize cwd and shell-display fixtures in the selected remote environment.
     skip_if_remote!(Ok(()), "cwd fixtures are only materialized on the host");
     skip_if_no_network!(Ok(()));
@@ -2635,10 +2641,15 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
     .await??;
     mcp.clear_message_buffer();
 
-    // second turn with workspace-write and second_cwd, ensure exec begins in second_cwd
+    // Select a new local cwd without the top-level compatibility parameter. The inherited
+    // workspace-write sandbox must follow the local environment cwd.
     let second_turn = mcp
         .send_turn_start_request(TurnStartParams {
-            environments: None,
+            environments: Some(vec![TurnEnvironmentParams {
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                cwd: second_cwd.abs().into(),
+                runtime_workspace_roots: None,
+            }]),
             thread_id: thread.id.clone(),
             client_user_message_id: None,
             input: vec![V2UserInput::Text {
@@ -2647,11 +2658,11 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             }],
             responsesapi_client_metadata: None,
             additional_context: None,
-            cwd: Some(second_cwd.clone()),
+            cwd: None,
             runtime_workspace_roots: None,
             approval_policy: Some(codex_app_server_protocol::AskForApproval::Never),
             approvals_reviewer: None,
-            sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess),
+            sandbox_policy: None,
             permissions: None,
             model: Some("mock-model".to_string()),
             effort: Some(ReasoningEffort::Medium),
@@ -2668,6 +2679,17 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(second_turn)),
     )
     .await??;
+    let settings_updated = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    let settings_updated: ThreadSettingsUpdatedNotification = serde_json::from_value(
+        settings_updated
+            .params
+            .context("thread/settings/updated should include params")?,
+    )?;
+    assert_eq!(settings_updated.thread_settings.cwd, second_cwd.abs());
 
     let command_exec_item = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -3010,6 +3032,7 @@ fn environment_params(ids: Option<&[&str]>, cwd: &Path) -> Option<Vec<TurnEnviro
             .map(|id| TurnEnvironmentParams {
                 environment_id: (*id).to_string(),
                 cwd: cwd.abs().into(),
+                runtime_workspace_roots: None,
             })
             .collect()
     })

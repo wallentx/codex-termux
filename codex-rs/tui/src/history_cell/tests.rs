@@ -564,8 +564,8 @@ fn final_message_separator_hides_short_worked_label_and_includes_runtime_metrics
         responses_api_inference_time_ms: 1_940,
         responses_api_engine_iapi_ttft_ms: 410,
         responses_api_engine_service_ttft_ms: 460,
-        responses_api_engine_iapi_tbt_ms: 1_180,
-        responses_api_engine_service_tbt_ms: 1_240,
+        responses_api_engine_iapi_tbt_ms: 1_180.0,
+        responses_api_engine_service_tbt_ms: 1_240.0,
         turn_ttft_ms: 0,
         turn_ttfm_ms: 0,
     };
@@ -583,6 +583,17 @@ fn final_message_separator_hides_short_worked_label_and_includes_runtime_metrics
     assert!(rendered[0].contains("Responses API inference: 1.9s"));
     assert!(rendered[0].contains("TTFT: 410ms (iapi) 460ms (service)"));
     assert!(rendered[0].contains("TBT: 1.2s (iapi) 1.2s (service)"));
+}
+
+#[test]
+fn runtime_metrics_label_rounds_fractional_tbt_milliseconds() {
+    let summary = RuntimeMetricsSummary {
+        responses_api_engine_iapi_tbt_ms: 2.450638,
+        responses_api_engine_service_tbt_ms: 5.267279,
+        ..RuntimeMetricsSummary::default()
+    };
+
+    insta::assert_snapshot!(runtime_metrics_label(summary).expect("TBT label"), @"TBT: 2ms (iapi) 5ms (service)");
 }
 
 #[test]
@@ -2249,7 +2260,7 @@ fn plan_update_does_not_split_url_like_tokens_in_note_or_step() {
 #[test]
 fn reasoning_summary_block() {
     let cell = new_reasoning_summary_block(
-        "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
+        vec!["**High level reasoning**\n\nDetailed reasoning goes here.".to_string()],
         &test_cwd(),
     );
 
@@ -2307,8 +2318,10 @@ fn reasoning_summary_height_matches_wrapped_rendering_for_url_like_content() {
 
 #[test]
 fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
-    let cell =
-        new_reasoning_summary_block("Detailed reasoning goes here.".to_string(), &test_cwd());
+    let cell = new_reasoning_summary_block(
+        vec!["Detailed reasoning goes here.".to_string()],
+        &test_cwd(),
+    );
 
     let rendered = render_transcript(cell.as_ref());
     assert_eq!(rendered, vec!["• Detailed reasoning goes here."]);
@@ -2318,9 +2331,8 @@ fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
 async fn reasoning_summary_block_respects_config_overrides() {
     let mut config = test_config().await;
     config.model = Some("gpt-3.5-turbo".to_string());
-    config.model_supports_reasoning_summaries = Some(true);
     let cell = new_reasoning_summary_block(
-        "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
+        vec!["**High level reasoning**\n\nDetailed reasoning goes here.".to_string()],
         &test_cwd(),
     );
 
@@ -2331,7 +2343,7 @@ async fn reasoning_summary_block_respects_config_overrides() {
 #[test]
 fn reasoning_summary_block_falls_back_when_header_is_missing() {
     let cell = new_reasoning_summary_block(
-        "**High level reasoning without closing".to_string(),
+        vec!["**High level reasoning without closing".to_string()],
         &test_cwd(),
     );
 
@@ -2342,7 +2354,7 @@ fn reasoning_summary_block_falls_back_when_header_is_missing() {
 #[test]
 fn reasoning_summary_block_falls_back_when_summary_is_missing() {
     let cell = new_reasoning_summary_block(
-        "**High level reasoning without closing**".to_string(),
+        vec!["**High level reasoning without closing**".to_string()],
         &test_cwd(),
     );
 
@@ -2350,7 +2362,7 @@ fn reasoning_summary_block_falls_back_when_summary_is_missing() {
     assert_eq!(rendered, vec!["• High level reasoning without closing"]);
 
     let cell = new_reasoning_summary_block(
-        "**High level reasoning without closing**\n\n  ".to_string(),
+        vec!["**High level reasoning without closing**\n\n  ".to_string()],
         &test_cwd(),
     );
 
@@ -2361,7 +2373,7 @@ fn reasoning_summary_block_falls_back_when_summary_is_missing() {
 #[test]
 fn reasoning_summary_block_splits_header_and_summary_when_present() {
     let cell = new_reasoning_summary_block(
-        "**High level plan**\n\nWe should fix the bug next.".to_string(),
+        vec!["**High level plan**\n\nWe should fix the bug next.".to_string()],
         &test_cwd(),
     );
 
@@ -2370,6 +2382,100 @@ fn reasoning_summary_block_splits_header_and_summary_when_present() {
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(rendered_transcript, vec!["• We should fix the bug next."]);
+}
+
+#[test]
+fn reasoning_summary_block_hides_empty_html_comment_parts() {
+    let cell = new_reasoning_summary_block(
+        vec![
+            "**Checking the first thing**\n\n<!-- -->".to_string(),
+            "**Checking the second thing**\n\n<!-- -->".to_string(),
+        ],
+        &test_cwd(),
+    );
+
+    let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
+    insta::assert_snapshot!(rendered_display.join("\n"), @"");
+
+    let rendered_transcript = render_transcript(cell.as_ref());
+    assert_eq!(rendered_transcript, Vec::<String>::new());
+}
+
+#[test]
+fn reasoning_summary_block_preserves_bold_content_after_empty_html_comment_part() {
+    let cell = new_reasoning_summary_block(
+        vec![
+            "**Status**\n\n<!-- -->".to_string(),
+            "**Important conclusion**".to_string(),
+            "<!-- -->".to_string(),
+        ],
+        &test_cwd(),
+    );
+
+    let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
+    insta::assert_snapshot!(rendered_display.join("\n"), @"• Important conclusion");
+
+    let rendered_transcript = render_transcript(cell.as_ref());
+    assert_eq!(rendered_transcript, vec!["• Important conclusion"]);
+
+    let cell = new_reasoning_summary_block(
+        vec![
+            "**Status**\n\n<!-- -->".to_string(),
+            "**Result:** keep **this**".to_string(),
+        ],
+        &test_cwd(),
+    );
+
+    let rendered_transcript = render_transcript(cell.as_ref());
+    assert_eq!(rendered_transcript, vec!["• Result: keep this"]);
+}
+
+#[test]
+fn reasoning_summary_block_strips_header_after_leading_empty_part() {
+    let cell = new_reasoning_summary_block(
+        vec![
+            "**Status**\n\n<!-- -->".to_string(),
+            "**Checking tests**\n\nTests passed".to_string(),
+        ],
+        &test_cwd(),
+    );
+
+    let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
+    insta::assert_snapshot!(rendered_display.join("\n"), @"• Tests passed");
+
+    let rendered_transcript = render_transcript(cell.as_ref());
+    assert_eq!(rendered_transcript, vec!["• Tests passed"]);
+}
+
+#[test]
+fn reasoning_summary_block_drops_empty_part_after_real_content() {
+    let cell = new_reasoning_summary_block(
+        vec![
+            "**Plan**\n\ndone".to_string(),
+            "**Checking tests**\n\n<!-- -->".to_string(),
+        ],
+        &test_cwd(),
+    );
+
+    let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
+    insta::assert_snapshot!(rendered_display.join("\n"), @"• done");
+
+    let rendered_transcript = render_transcript(cell.as_ref());
+    assert_eq!(rendered_transcript, vec!["• done"]);
+}
+
+#[test]
+fn reasoning_summary_block_preserves_literal_html_comment() {
+    let cell = new_reasoning_summary_block(
+        vec!["**Plan**\n\nUse `<!-- -->` in JSX.".to_string()],
+        &test_cwd(),
+    );
+
+    let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
+    insta::assert_snapshot!(rendered_display.join("\n"), @"• Use <!-- --> in JSX.");
+
+    let rendered_transcript = render_transcript(cell.as_ref());
+    assert_eq!(rendered_transcript, vec!["• Use <!-- --> in JSX."]);
 }
 
 #[test]
