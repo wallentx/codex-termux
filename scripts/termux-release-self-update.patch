@@ -609,7 +609,7 @@ index 420562f13b..26d7b93a7c 100644
              UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
              UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
              UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
-@@ -66,6 +73,17 @@ impl UpdateAction {
+@@ -66,6 +73,18 @@ impl UpdateAction {
          shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
              .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
      }
@@ -619,6 +619,7 @@ index 420562f13b..26d7b93a7c 100644
 +            UpdateAction::TermuxSelfUpdate => crate::termux_update::TERMUX_RELEASES_URL,
 +            UpdateAction::NpmGlobalLatest
 +            | UpdateAction::BunGlobalLatest
++            | UpdateAction::PnpmGlobalLatest
 +            | UpdateAction::BrewUpgrade
 +            | UpdateAction::StandaloneUnix
 +            | UpdateAction::StandaloneWindows => "https://github.com/openai/codex/releases/latest",
