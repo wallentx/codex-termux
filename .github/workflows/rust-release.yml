@@ -1118,13 +1118,9 @@ jobs:
       - finalize-macos
       - build-windows
       - argument-comment-lint-release-assets
-    if: github.repository == 'openai/codex' && (always() &&
-  needs.tag-check.result == 'success' &&
-  needs.build.result == 'success' &&
-  needs.finalize-macos.result == 'success' &&
-  needs.build-windows.result == 'success' &&
-  needs.argument-comment-lint-release-assets.result == 'success')
+    if: >-
       ${{
+        github.repository == 'openai/codex' &&
         always() &&
         needs.tag-check.result == 'success' &&
         needs.build.result == 'success' &&
