@@ -39,6 +39,9 @@ use crate::environment::EnvironmentConnectionState;
 use crate::process::ExecProcessEvent;
 use crate::process::ExecProcessEventLog;
 use crate::process::ExecProcessEventReceiver;
+use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
+use crate::protocol::CapabilityRootsDiscoverParams;
+use crate::protocol::CapabilityRootsDiscoverResponse;
 use crate::protocol::ENVIRONMENT_INFO_METHOD;
 use crate::protocol::ENVIRONMENT_STATUS_METHOD;
 use crate::protocol::EXEC_CLOSED_METHOD;
@@ -693,6 +696,13 @@ impl ExecServerClient {
                 .call_with_timeout(ENVIRONMENT_STATUS_METHOD, &(), ENVIRONMENT_STATUS_TIMEOUT)
                 .await,
         )
+    }
+
+    pub async fn discover_capability_roots(
+        &self,
+        params: CapabilityRootsDiscoverParams,
+    ) -> Result<CapabilityRootsDiscoverResponse, ExecServerError> {
+        self.call(CAPABILITY_ROOTS_DISCOVER_METHOD, &params).await
     }
 
     pub async fn read(&self, params: ReadParams) -> Result<ReadResponse, ExecServerError> {
@@ -1671,6 +1681,7 @@ mod tests {
                 sandbox: None,
                 enforce_managed_network: false,
                 managed_network: None,
+                network_proxy: None,
             })
             .instrument(parent_span)
             .await

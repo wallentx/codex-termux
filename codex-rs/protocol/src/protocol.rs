@@ -213,10 +213,9 @@ pub struct ConversationStartParams {
     pub codex_responses_as_items: bool,
     /// Optional prefix added to automatic Codex response items when `codex_responses_as_items` is set.
     pub codex_response_item_prefix: Option<String>,
-    /// Optional prefix added to automatic V1 or V3 Codex commentary sent through the selected
-    /// Bidi handoff wire event when `codex_responses_as_items` is not set. Final answers are sent
-    /// without the prefix.
-    pub codex_response_handoff_prefix: Option<String>,
+    /// Selects how automatic Codex handoffs are routed in Frameless Bidi sessions.
+    /// Realtime V1 and V2 ignore this setting.
+    pub codex_response_handoff_mode: CodexResponseHandoffMode,
     /// Overrides the configured realtime model for this session only.
     pub model: Option<String>,
     /// Selects whether the realtime session should produce text or audio output.
@@ -1499,6 +1498,7 @@ pub enum HookEventName {
     PreCompact,
     PostCompact,
     SessionStart,
+    SessionEnd,
     UserPromptSubmit,
     SubagentStart,
     SubagentStop,
@@ -1624,6 +1624,16 @@ pub enum RealtimeConversationVersion {
     #[default]
     V2,
     V3,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub enum CodexResponseHandoffMode {
+    #[default]
+    Thinking,
+    Commentary,
+    BemTags,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
