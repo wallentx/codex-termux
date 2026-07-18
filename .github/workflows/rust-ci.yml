@@ -167,7 +167,7 @@ jobs:
 
   argument_comment_lint_prebuilt:
     name: Argument comment lint - ${{ matrix.name }}
-    runs-on: ${{ matrix.runs_on || matrix.runner }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.runner) || (matrix.runner == 'macos-15-xlarge' && 'macos-latest' || matrix.runner == 'windows-x64' && 'windows-latest' || matrix.runner) }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     needs: changed
     environment:
@@ -210,7 +210,7 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Run argument comment lint on codex-rs via Bazel
-        if: ${{ steps.argument_comment_lint_gate.outputs.run == 'true' }}
+        if: github.repository == 'openai/codex' && (steps.argument_comment_lint_gate.outputs.run == 'true')
         uses: ./.github/actions/run-argument-comment-lint
         with:
           target: ${{ runner.os }}

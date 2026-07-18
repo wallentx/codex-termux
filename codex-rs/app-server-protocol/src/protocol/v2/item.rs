@@ -14,6 +14,7 @@ use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_extension_items::ExtensionItem;
 pub use codex_extension_items::image_generation::ImageGenerationItem;
+pub use codex_extension_items::sleep::SleepItem;
 pub use codex_extension_items::web_search::WebSearchAction;
 pub use codex_extension_items::web_search::WebSearchItem;
 use codex_protocol::approvals::GuardianAssessmentAction as CoreGuardianAssessmentAction;
@@ -368,13 +369,7 @@ pub enum ThreadItem {
         id: String,
         path: LegacyAppPathString,
     },
-    #[serde(rename_all = "camelCase")]
-    #[ts(rename_all = "camelCase")]
-    Sleep {
-        id: String,
-        #[ts(type = "number")]
-        duration_ms: u64,
-    },
+    Sleep(SleepItem),
     ImageGeneration(ImageGenerationItem),
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -403,7 +398,6 @@ pub struct McpToolCallAppContext {
     pub link_id: Option<String>,
     pub resource_uri: Option<String>,
     pub app_name: Option<String>,
-    pub template_id: Option<String>,
     pub action_name: Option<String>,
 }
 
@@ -430,11 +424,11 @@ impl ThreadItem {
             | ThreadItem::CollabAgentToolCall { id, .. }
             | ThreadItem::SubAgentActivity { id, .. }
             | ThreadItem::ImageView { id, .. }
-            | ThreadItem::Sleep { id, .. }
             | ThreadItem::EnteredReviewMode { id, .. }
             | ThreadItem::ExitedReviewMode { id, .. }
             | ThreadItem::ContextCompaction { id, .. } => id,
             ThreadItem::WebSearch(item) => &item.id,
+            ThreadItem::Sleep(item) => &item.id,
             ThreadItem::ImageGeneration(item) => &item.id,
         }
     }
@@ -902,17 +896,15 @@ impl From<CoreTurnItem> for ThreadItem {
                 id: search.id,
                 query: search.query,
                 action: Some(web_search_action_from_core(search.action)),
+                results: search.results,
             }),
             CoreTurnItem::ImageView(image) => ThreadItem::ImageView {
                 id: image.id,
                 path: image.path.into(),
             },
-            CoreTurnItem::Sleep(sleep) => ThreadItem::Sleep {
-                id: sleep.id,
-                duration_ms: sleep.duration_ms,
-            },
             CoreTurnItem::Extension(extension) => match extension {
                 ExtensionItem::ImageGeneration(item) => ThreadItem::ImageGeneration(item),
+                ExtensionItem::Sleep(item) => ThreadItem::Sleep(item),
                 ExtensionItem::WebSearch(item) => ThreadItem::WebSearch(item),
             },
             CoreTurnItem::ImageGeneration(image) => {
@@ -957,7 +949,6 @@ impl From<CoreTurnItem> for ThreadItem {
                         link_id: mcp.link_id,
                         resource_uri: mcp.mcp_app_resource_uri.clone(),
                         app_name: mcp.app_name,
-                        template_id: mcp.template_id,
                         action_name: mcp.action_name,
                     }),
                     mcp_app_resource_uri: mcp.mcp_app_resource_uri,
