@@ -56,7 +56,7 @@ jobs:
   build:
     needs: tag-check
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }}
-    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.runner) || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.runs_on || matrix.runner }}
     # Release builds can take a long time, so leave some headroom to avoid
     # having to restart the full workflow due to a timeout.
     timeout-minutes: 90
@@ -532,7 +532,6 @@ jobs:
           path: ${{ runner.temp }}/unsigned-macos
 
       - name: Set up AKV PKCS11 macOS signing
-        if: github.repository == 'openai/codex'
         uses: ./.github/actions/setup-akv-pkcs11-codesigning
         with:
           rcodesign-blob-uri: ${{ secrets.AKV_CODESIGN_RCODESIGN_BLOB_URI }}
@@ -548,7 +547,6 @@ jobs:
           certificate-sha256: ${{ secrets.AKV_CODESIGN_CERTIFICATE_SHA256 || '' }}
 
       - name: Sign and notarize macOS binaries
-        if: github.repository == 'openai/codex'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -617,7 +615,7 @@ jobs:
   package-macos:
     needs: sign-macos-binaries
     name: Package macOS artifacts - ${{ matrix.target }} - ${{ matrix.bundle }}
-    runs-on: ${{ github.repository == 'openai/codex' && 'macos-15-xlarge' || 'macos-latest' }}
+    runs-on: macos-15-xlarge
     timeout-minutes: 45
     permissions:
       contents: read
@@ -850,7 +848,6 @@ jobs:
           path: ${{ runner.temp }}/unsigned-dmg
 
       - name: Set up AKV PKCS11 macOS signing
-        if: github.repository == 'openai/codex'
         uses: ./.github/actions/setup-akv-pkcs11-codesigning
         with:
           rcodesign-blob-uri: ${{ secrets.AKV_CODESIGN_RCODESIGN_BLOB_URI }}
@@ -866,7 +863,6 @@ jobs:
           certificate-sha256: ${{ secrets.AKV_CODESIGN_CERTIFICATE_SHA256 || '' }}
 
       - name: Sign, notarize, and staple macOS DMG
-        if: github.repository == 'openai/codex'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -920,7 +916,7 @@ jobs:
       - package-macos
       - sign-macos-dmg
     name: Verify macOS artifacts - ${{ matrix.target }} - ${{ matrix.bundle }}
-    runs-on: ${{ github.repository == 'openai/codex' && 'macos-15-xlarge' || 'macos-latest' }}
+    runs-on: macos-15-xlarge
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1099,7 +1095,6 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    if: github.repository == 'openai/codex'
     needs: tag-check
     uses: ./.github/workflows/rust-release-windows.yml
     secrets: inherit
@@ -1120,7 +1115,6 @@ jobs:
       - argument-comment-lint-release-assets
     if: >-
       ${{
-        github.repository == 'openai/codex' &&
         always() &&
         needs.tag-check.result == 'success' &&
         needs.build.result == 'success' &&
@@ -1267,7 +1261,6 @@ jobs:
           cp scripts/install/install.ps1 dist/install.ps1
 
       - name: Create GitHub Release
-        if: github.repository == 'openai/codex'
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           name: ${{ steps.release_name.outputs.name }}
@@ -1360,7 +1353,6 @@ jobs:
 
       # No NODE_AUTH_TOKEN needed because we use OIDC.
       - name: Publish to npm
-        if: github.repository == 'openai/codex'
         env:
           VERSION: ${{ needs.release.outputs.version }}
           NPM_TAG: ${{ needs.release.outputs.npm_tag }}
@@ -1490,7 +1482,6 @@ jobs:
 
     steps:
       - name: Trigger developers.openai.com deploy
-        if: github.repository == 'openai/codex'
         continue-on-error: true
         env:
           DEV_WEBSITE_VERCEL_DEPLOY_HOOK_URL: ${{ secrets.DEV_WEBSITE_VERCEL_DEPLOY_HOOK_URL }}
@@ -1522,7 +1513,6 @@ jobs:
 
     steps:
       - name: Publish to WinGet
-        if: github.repository == 'openai/codex'
         uses: vedantmgoyal9/winget-releaser@7bd472be23763def6e16bd06cc8b1cdfab0e2fd5
         with:
           identifier: OpenAI.Codex

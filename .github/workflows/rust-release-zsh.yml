@@ -104,7 +104,7 @@ jobs:
   darwin:
     name: Build zsh (macOS) - ${{ matrix.variant }} - ${{ matrix.target }}
     needs: metadata
-    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runner) || (matrix.runner == 'macos-15-large' && 'macos-latest' || matrix.runner == 'macos-15-xlarge' && 'macos-latest' || matrix.runner) }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
 
     strategy:
@@ -165,7 +165,6 @@ jobs:
           path: dist
 
       - name: Create GitHub Release
-        if: github.repository == 'openai/codex'
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: ${{ needs.metadata.outputs.release_tag }}

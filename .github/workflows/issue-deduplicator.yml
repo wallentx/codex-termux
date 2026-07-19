@@ -156,7 +156,7 @@ jobs:
     name: Identify potential duplicates (open issues fallback)
     # Pass 1 Codex execution drops sudo on its runner, so run the fallback in a fresh job.
     needs: normalize-duplicates-all
-    if: github.repository == 'openai/codex' && (needs.normalize-duplicates-all.result == 'success' && needs.normalize-duplicates-all.outputs.has_matches != 'true')
+    if: ${{ needs.normalize-duplicates-all.result == 'success' && needs.normalize-duplicates-all.outputs.has_matches != 'true' }}
     runs-on: ubuntu-latest
     environment: issue-triage
     permissions:
@@ -201,7 +201,6 @@ jobs:
           echo "open_issue_count=$(jq 'length' "$EXISTING_OPEN_FILE")"
 
       - id: codex-open
-        if: github.repository == 'openai/codex'
         name: Find duplicates (pass 2, open issues)
         uses: openai/codex-action@5c3f4ccdb2b8790f73d6b21751ac00e602aa0c02 # v1.7
         with:
@@ -302,7 +301,7 @@ jobs:
     needs:
       - normalize-duplicates-all
       - normalize-duplicates-open
-    if: github.repository == 'openai/codex' && (always() && needs.normalize-duplicates-all.result == 'success' && (needs.normalize-duplicates-open.result == 'success' || needs.normalize-duplicates-open.result == 'skipped'))
+    if: ${{ always() && needs.normalize-duplicates-all.result == 'success' && (needs.normalize-duplicates-open.result == 'success' || needs.normalize-duplicates-open.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -356,7 +355,7 @@ jobs:
   comment-on-issue:
     name: Comment with potential duplicates
     needs: select-final
-    if: github.repository == 'openai/codex' && (always() && needs.select-final.result == 'success')
+    if: ${{ always() && needs.select-final.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

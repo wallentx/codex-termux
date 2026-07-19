@@ -5,7 +5,6 @@ on:
 
 jobs:
   python-sdk:
-    if: github.repository == 'openai/codex'
     runs-on:
       group: ${{ github.event.repository.name }}-runners
       labels: ${{ github.event.repository.name }}-linux-x64
@@ -45,7 +44,6 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   sdks:
-    if: github.repository == 'openai/codex'
     runs-on:
       group: ${{ github.event.repository.name }}-runners
       labels: ${{ github.event.repository.name }}-linux-x64
@@ -85,7 +83,6 @@ jobs:
           target: x86_64-unknown-linux-gnu
 
       - name: Build codex with Bazel
-        if: github.repository == 'openai/codex'
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash

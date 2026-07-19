@@ -22,7 +22,7 @@ jobs:
   build:
     if: ${{ inputs.publish }}
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
-    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runs_on || matrix.runner) || (matrix.runner == 'macos-15-xlarge' && 'macos-latest' || matrix.runner == 'windows-x64' && 'windows-latest' || matrix.runner) }}
+    runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: 60
     env:
       CARGO_DYLINT_VERSION: 5.0.0
