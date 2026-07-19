@@ -29,7 +29,7 @@
 //!
 //! ## Invariants
 //!
-//! - `emitted_stable_len <= enqueued_stable_len <= rendered_lines.len()`.
+//! - `emitted_stable_len <= enqueued_stable_len <= render.lines.len()`.
 //! - `raw_source` is append-only until `reset()`; never modified mid-stream.
 //! - Tail starts exactly at `enqueued_stable_len`.
 //! - During confirmed table streaming, only lines from the table header onward
@@ -37,12 +37,11 @@
 
 use crate::history_cell::HistoryCell;
 use crate::history_cell::HistoryRenderMode;
-use crate::history_cell::raw_lines_from_source;
 use crate::history_cell::{self};
-use crate::markdown::render_markdown_agent_with_links_and_cwd;
+use crate::inline_visualization::InlineVisualizationContext;
+use crate::markdown::render_markdown_agent_with_links_cwd_and_visualizations;
 use crate::style::proposed_plan_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
-use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use ratatui::prelude::Stylize;
 use ratatui::text::Line;
@@ -52,6 +51,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::StreamState;
+use super::render::StreamingRender;
+use super::render::render_source;
 use super::table_holdback::TableHoldbackScanner;
 use super::table_holdback::TableHoldbackState;
 #[cfg(test)]
@@ -76,14 +77,15 @@ struct StreamCore {
     width: Option<usize>,
     /// Accumulated raw markdown source for the current stream.
     raw_source: String,
-    /// Full re-render of `raw_source` at `width`. Rebuilt on every committed delta.
-    rendered_lines: Vec<HyperlinkLine>,
+    /// Incremental render of `raw_source` at `width`.
+    render: StreamingRender,
     /// Lines enqueued into the commit-animation queue.
     enqueued_stable_len: usize,
     /// Lines actually emitted to scrollback.
     emitted_stable_len: usize,
     /// Session cwd used to keep local file-link display stable during stream re-renders.
     cwd: PathBuf,
+    inline_visualization_context: Option<InlineVisualizationContext>,
     render_mode: HistoryRenderMode,
     /// Cached rendered line count for prefix-before-table keyed by source start and width.
     stable_prefix_len_cache: Option<StablePrefixLenCache>,
@@ -104,15 +106,21 @@ struct StablePrefixLenCache {
 }
 
 impl StreamCore {
-    fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+    fn new(
+        width: Option<usize>,
+        cwd: &Path,
+        render_mode: HistoryRenderMode,
+        inline_visualization_context: Option<InlineVisualizationContext>,
+    ) -> Self {
         Self {
             state: StreamState::new(width, cwd),
             width,
             raw_source: String::with_capacity(1024),
-            rendered_lines: Vec::with_capacity(64),
+            render: StreamingRender::new(),
             enqueued_stable_len: 0,
             emitted_stable_len: 0,
             cwd: cwd.to_path_buf(),
+            inline_visualization_context,
             render_mode,
             stable_prefix_len_cache: None,
             holdback_scanner: TableHoldbackScanner::new(),
@@ -138,7 +146,14 @@ impl StreamCore {
         {
             self.raw_source.push_str(&committed_source);
             self.holdback_scanner.push_source_chunk(&committed_source);
-            self.recompute_streaming_render();
+            self.render.append(
+                &self.raw_source,
+                &committed_source,
+                self.width,
+                self.cwd.as_path(),
+                self.render_mode,
+                self.inline_visualization_context.as_ref(),
+            );
             enqueued = self.sync_stable_queue();
         }
         enqueued
@@ -157,7 +172,13 @@ impl StreamCore {
             self.raw_source.push_str(&remainder_source);
             self.holdback_scanner.push_source_chunk(&remainder_source);
         }
-        let rendered = self.render_source(&self.raw_source);
+        let rendered = render_source(
+            &self.raw_source,
+            self.width,
+            self.cwd.as_path(),
+            self.render_mode,
+            self.inline_visualization_context.as_ref(),
+        );
         if self.emitted_stable_len >= rendered.len() {
             Vec::new()
         } else {
@@ -212,13 +233,13 @@ impl StreamCore {
     /// reappear in the active cell and duplicate content on screen.
     #[inline]
     fn current_tail_lines(&self) -> Vec<HyperlinkLine> {
-        let start = self.enqueued_stable_len.min(self.rendered_lines.len());
-        self.rendered_lines[start..].to_vec()
+        let start = self.enqueued_stable_len.min(self.render.lines.len());
+        self.render.lines[start..].to_vec()
     }
 
     #[inline]
     fn has_tail(&self) -> bool {
-        self.enqueued_stable_len < self.rendered_lines.len()
+        self.enqueued_stable_len < self.render.lines.len()
     }
 
     /// Update rendering width and rebuild queued stable lines for the new layout.
@@ -242,10 +263,16 @@ impl StreamCore {
             return;
         }
 
-        self.recompute_streaming_render();
-        self.emitted_stable_len = self.emitted_stable_len.min(self.rendered_lines.len());
+        self.render.recompute(
+            &self.raw_source,
+            self.width,
+            self.cwd.as_path(),
+            self.render_mode,
+            self.inline_visualization_context.as_ref(),
+        );
+        self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
         if had_pending_queue
-            && self.emitted_stable_len == self.rendered_lines.len()
+            && self.emitted_stable_len == self.render.lines.len()
             && self.emitted_stable_len > 0
         {
             // If wrapped remainder compresses into fewer lines at the new width,
@@ -258,7 +285,7 @@ impl StreamCore {
             // Avoid replaying already-emitted content after resize when no
             // stable lines were waiting in the queue and there was no mutable
             // tail to preserve.
-            self.enqueued_stable_len = self.rendered_lines.len();
+            self.enqueued_stable_len = self.render.lines.len();
             return;
         }
         self.rebuild_stable_queue_from_render();
@@ -268,26 +295,11 @@ impl StreamCore {
     fn reset(&mut self) {
         self.state.clear();
         self.raw_source.clear();
-        self.rendered_lines.clear();
+        self.render.clear();
         self.enqueued_stable_len = 0;
         self.emitted_stable_len = 0;
         self.stable_prefix_len_cache = None;
         self.holdback_scanner.reset();
-    }
-
-    fn render_source(&self, source: &str) -> Vec<HyperlinkLine> {
-        match self.render_mode {
-            HistoryRenderMode::Rich => render_markdown_agent_with_links_and_cwd(
-                source,
-                self.width,
-                Some(self.cwd.as_path()),
-            ),
-            HistoryRenderMode::Raw => plain_hyperlink_lines(raw_lines_from_source(source)),
-        }
-    }
-
-    fn recompute_streaming_render(&mut self) {
-        self.rendered_lines = self.render_source(&self.raw_source);
     }
 
     fn set_render_mode(&mut self, render_mode: HistoryRenderMode) {
@@ -302,17 +314,23 @@ impl StreamCore {
             return;
         }
 
-        self.recompute_streaming_render();
-        self.emitted_stable_len = self.emitted_stable_len.min(self.rendered_lines.len());
+        self.render.recompute(
+            &self.raw_source,
+            self.width,
+            self.cwd.as_path(),
+            self.render_mode,
+            self.inline_visualization_context.as_ref(),
+        );
+        self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
         if had_pending_queue
-            && self.emitted_stable_len == self.rendered_lines.len()
+            && self.emitted_stable_len == self.render.lines.len()
             && self.emitted_stable_len > 0
         {
             self.emitted_stable_len -= 1;
         }
         self.state.clear_queue();
         if self.emitted_stable_len > 0 && !had_pending_queue && !had_live_tail {
-            self.enqueued_stable_len = self.rendered_lines.len();
+            self.enqueued_stable_len = self.render.lines.len();
             return;
         }
         self.rebuild_stable_queue_from_render();
@@ -321,7 +339,8 @@ impl StreamCore {
     /// Compute how many rendered lines should be in the stable region.
     fn compute_target_stable_len(&mut self) -> usize {
         let tail_budget = self.active_tail_budget_lines();
-        self.rendered_lines
+        self.render
+            .lines
             .len()
             .saturating_sub(tail_budget)
             .max(self.emitted_stable_len)
@@ -338,7 +357,7 @@ impl StreamCore {
             self.state.clear_queue();
             if self.emitted_stable_len < target_stable_len {
                 self.state.enqueue(
-                    self.rendered_lines[self.emitted_stable_len..target_stable_len].to_vec(),
+                    self.render.lines[self.emitted_stable_len..target_stable_len].to_vec(),
                 );
             }
             self.enqueued_stable_len = target_stable_len;
@@ -350,7 +369,7 @@ impl StreamCore {
         }
 
         self.state
-            .enqueue(self.rendered_lines[self.enqueued_stable_len..target_stable_len].to_vec());
+            .enqueue(self.render.lines[self.enqueued_stable_len..target_stable_len].to_vec());
         self.enqueued_stable_len = target_stable_len;
         true
     }
@@ -365,7 +384,7 @@ impl StreamCore {
         self.state.clear_queue();
         if self.emitted_stable_len < target_stable_len {
             self.state
-                .enqueue(self.rendered_lines[self.emitted_stable_len..target_stable_len].to_vec());
+                .enqueue(self.render.lines[self.emitted_stable_len..target_stable_len].to_vec());
         }
         self.enqueued_stable_len = target_stable_len;
     }
@@ -407,11 +426,11 @@ impl StreamCore {
     /// the only place where those coordinate systems are bridged.
     fn tail_budget_from_source_start(&mut self, source_start: usize) -> usize {
         if source_start == 0 {
-            return self.rendered_lines.len();
+            return self.render.lines.len();
         }
         let source_start = source_start.min(self.raw_source.len());
         let stable_prefix_len = self.stable_prefix_len_for_source_start(source_start);
-        self.rendered_lines.len().saturating_sub(stable_prefix_len)
+        self.render.lines.len().saturating_sub(stable_prefix_len)
     }
 
     /// Render the stable prefix before `source_start` and return its line count.
@@ -434,10 +453,11 @@ impl StreamCore {
         }
 
         let render_start = Instant::now();
-        let stable_prefix_render = render_markdown_agent_with_links_and_cwd(
+        let stable_prefix_render = render_markdown_agent_with_links_cwd_and_visualizations(
             &self.raw_source[..source_start.min(self.raw_source.len())],
             self.width,
             Some(self.cwd.as_path()),
+            self.inline_visualization_context.as_ref(),
         );
         let stable_prefix_len = stable_prefix_render.len();
         tracing::trace!(
@@ -470,9 +490,24 @@ impl StreamController {
     /// `width` is the content width available to markdown rendering, not necessarily the full
     /// terminal width. Passing a stale width after resize will keep queued live output wrapped for
     /// the old viewport until app-level reflow repairs the finalized transcript.
+    #[cfg(test)]
     pub(crate) fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+        Self::new_with_inline_visualizations(
+            width,
+            cwd,
+            render_mode,
+            /*inline_visualization_context*/ None,
+        )
+    }
+
+    pub(crate) fn new_with_inline_visualizations(
+        width: Option<usize>,
+        cwd: &Path,
+        render_mode: HistoryRenderMode,
+        inline_visualization_context: Option<InlineVisualizationContext>,
+    ) -> Self {
         Self {
-            core: StreamCore::new(width, cwd, render_mode),
+            core: StreamCore::new(width, cwd, render_mode, inline_visualization_context),
             header_emitted: false,
         }
     }
@@ -585,7 +620,12 @@ impl PlanStreamController {
     /// callers must update it when the terminal width changes.
     pub(crate) fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
         Self {
-            core: StreamCore::new(width, cwd, render_mode),
+            core: StreamCore::new(
+                width,
+                cwd,
+                render_mode,
+                /*inline_visualization_context*/ None,
+            ),
             header_emitted: false,
             top_padding_emitted: false,
         }
@@ -786,6 +826,31 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn queued_heading_is_emitted_once_after_incremental_append() {
+        let mut ctrl = stream_controller(Some(80));
+        assert!(ctrl.push("Paragraph.\n\n# Heading\n\n"));
+        ctrl.push("Next paragraph.\n");
+
+        let (cell, _) = ctrl.on_commit_tick_batch(usize::MAX);
+        let mut streamed = cell
+            .into_iter()
+            .flat_map(|cell| cell.transcript_lines(u16::MAX))
+            .collect::<Vec<_>>();
+        if let (Some(cell), _source) = ctrl.finalize() {
+            streamed.extend(cell.transcript_lines(u16::MAX));
+        }
+        let streamed = lines_to_plain_strings(&streamed);
+        assert_eq!(
+            streamed
+                .iter()
+                .filter(|line| line.contains("# Heading"))
+                .count(),
+            1,
+            "expected the streamed heading to be emitted once: {streamed:?}",
+        );
+    }
+
     fn collect_plan_streamed_lines(deltas: &[&str], width: Option<usize>) -> Vec<String> {
         let mut ctrl = plan_stream_controller(width);
         let mut lines = Vec::new();
@@ -866,7 +931,7 @@ mod tests {
         let mut ctrl = stream_controller(Some(80));
         assert!(!ctrl.has_live_tail());
 
-        ctrl.core.rendered_lines = vec![Line::from("tail line").into()];
+        ctrl.core.render.lines = vec![Line::from("tail line").into()];
         ctrl.core.enqueued_stable_len = 0;
         assert!(ctrl.has_live_tail());
 
@@ -879,7 +944,7 @@ mod tests {
         let mut ctrl = plan_stream_controller(Some(80));
         assert!(!ctrl.has_live_tail());
 
-        ctrl.core.rendered_lines = vec![Line::from("tail line").into()];
+        ctrl.core.render.lines = vec![Line::from("tail line").into()];
         ctrl.core.enqueued_stable_len = 0;
         assert!(ctrl.has_live_tail());
 

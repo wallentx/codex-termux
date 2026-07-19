@@ -222,6 +222,8 @@ pub struct ConversationStartParams {
     pub output_modality: RealtimeOutputModality,
     /// Whether to append Codex's startup context to the realtime backend prompt.
     pub include_startup_context: bool,
+    /// Complete role-bearing text items to include in the initial realtime session history.
+    pub initial_items: Vec<ConversationTextParams>,
     pub prompt: Option<Option<String>>,
     pub realtime_session_id: Option<String>,
     pub transport: Option<ConversationStartTransport>,
@@ -428,7 +430,7 @@ pub struct ConversationAudioParams {
     pub frame: RealtimeAudioFrame,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationTextParams {
     pub text: String,
     pub role: ConversationTextRole,
@@ -3049,6 +3051,16 @@ impl SessionContextWindow {
     }
 }
 
+/// Exclusive position in another thread's paginated rollout history.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct HistoryPosition {
+    pub thread_id: ThreadId,
+    /// First rollout ordinal not included from the prefix file.
+    pub end_ordinal_exclusive: u64,
+    /// Byte offset immediately after the last included JSONL record from the prefix file.
+    pub end_byte_offset: u64,
+}
+
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
 ///
 /// NOTE: There used to be an `instructions` field here, which stored user_instructions, but we
@@ -3098,6 +3110,9 @@ pub struct SessionMeta {
     pub memory_mode: Option<String>,
     #[serde(default)]
     pub history_mode: ThreadHistoryMode,
+    /// Exclusive prefix of another paginated rollout inherited by this thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_base: Option<HistoryPosition>,
     /// First rollout ordinal that belongs to this subagent's own projected history.
     ///
     /// Earlier rollout records are inherited model context and stay out of child
@@ -3134,6 +3149,7 @@ impl Default for SessionMeta {
             selected_capability_roots: Vec::new(),
             memory_mode: None,
             history_mode: ThreadHistoryMode::default(),
+            history_base: None,
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
             context_window: None,
@@ -5854,6 +5870,7 @@ mod tests {
         }))?;
 
         assert_eq!(session_meta.history_mode, ThreadHistoryMode::Legacy);
+        assert_eq!(session_meta.history_base, None);
         let serialized = serde_json::to_value(&session_meta)?;
         assert_eq!(serialized["history_mode"], json!("legacy"));
         let mut unknown = serialized;
