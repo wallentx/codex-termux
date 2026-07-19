@@ -13,6 +13,8 @@ use crate::legacy_core::config::resolve_bootstrap_auth_route_config;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_profile_v2_config_path;
 use crate::session_resume::ResolveCwdOutcome;
+use crate::session_resume::ResumeCwdContext;
+use crate::session_resume::effective_resume_cwd_mode;
 use crate::session_resume::resolve_cwd_for_resume_or_fork;
 pub use crate::startup_error::LocalStateDbStartupError;
 use additional_dirs::add_dir_warning_message;
@@ -41,6 +43,7 @@ use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
+use codex_config::types::ResumeCwdMode;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_login::AuthConfig;
@@ -116,6 +119,7 @@ mod exec_command;
 mod external_agent_config_migration;
 mod external_agent_config_migration_flow;
 mod external_agent_config_migration_model;
+mod external_agent_config_migration_source;
 mod external_editor;
 mod file_search;
 mod frames;
@@ -126,6 +130,7 @@ mod goal_files;
 mod history_cell;
 mod hooks_rpc;
 mod ide_context;
+mod inline_visualization;
 pub(crate) mod insert_history;
 pub use insert_history::insert_history_lines;
 mod key_hint;
@@ -756,11 +761,7 @@ fn config_cwd_for_app_server_target(
     app_server_target: &AppServerTarget,
     environment_manager: &EnvironmentManager,
 ) -> std::io::Result<Option<AbsolutePathBuf>> {
-    if app_server_target.uses_remote_workspace()
-        || environment_manager
-            .default_environment()
-            .is_some_and(|environment| environment.is_remote())
-    {
+    if uses_remote_workspace_or_environment(app_server_target, environment_manager) {
         return Ok(None);
     }
 
@@ -771,6 +772,65 @@ fn config_cwd_for_app_server_target(
         None => AbsolutePathBuf::current_dir(),
     }?;
     Ok(Some(cwd))
+}
+
+fn uses_remote_workspace_or_environment(
+    app_server_target: &AppServerTarget,
+    environment_manager: &EnvironmentManager,
+) -> bool {
+    app_server_target.uses_remote_workspace()
+        || environment_manager
+            .default_environment()
+            .is_some_and(|environment| environment.is_remote())
+}
+
+async fn resolve_startup_resume_or_fork_cwd(
+    tui: &mut Tui,
+    config: &Config,
+    state_db: Option<&codex_state::StateRuntime>,
+    session_selection: &resume_picker::SessionSelection,
+    cwd_override: Option<&Path>,
+    uses_remote_workspace: bool,
+    uses_remote_workspace_or_environment: bool,
+) -> color_eyre::Result<ResolveCwdOutcome> {
+    let Some((action, target_session)) = (match session_selection {
+        resume_picker::SessionSelection::Resume(target_session) => {
+            Some((CwdPromptAction::Resume, target_session))
+        }
+        resume_picker::SessionSelection::Fork(target_session) => {
+            Some((CwdPromptAction::Fork, target_session))
+        }
+        _ => None,
+    }) else {
+        return Ok(ResolveCwdOutcome::Continue(None));
+    };
+    let resume_cwd_mode = effective_resume_cwd_mode(config.tui_resume_cwd, cwd_override);
+    if uses_remote_workspace_or_environment
+        && cwd_override.is_none()
+        && matches!(resume_cwd_mode, Some(ResumeCwdMode::Current))
+    {
+        color_eyre::eyre::bail!(
+            "`tui.resume_cwd = \"current\"` requires `--cd` when using a remote workspace"
+        );
+    }
+    if uses_remote_workspace {
+        return Ok(ResolveCwdOutcome::Continue(Some(config.cwd.to_path_buf())));
+    }
+
+    resolve_cwd_for_resume_or_fork(
+        tui,
+        config,
+        state_db,
+        target_session,
+        action,
+        ResumeCwdContext {
+            current_cwd: config.cwd.as_path(),
+            remembered_current_cwd: config.cwd.as_path(),
+            allow_remember_current: !uses_remote_workspace_or_environment || cwd_override.is_some(),
+            mode: resume_cwd_mode,
+        },
+    )
+    .await
 }
 
 fn should_load_configured_environments(
@@ -1060,7 +1120,7 @@ pub async fn run_main(
         ..Default::default()
     };
 
-    let mut config = load_config_or_exit(
+    let config = load_config_or_exit(
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),
@@ -1104,36 +1164,6 @@ pub async fn run_main(
     }
     let state_db = init_state_db_for_app_server_target(&config, &app_server_target).await?;
 
-    let effective_toml = config.config_layer_stack.effective_config();
-    match effective_toml.try_into() {
-        Ok(config_toml) => {
-            match codex_app_server_client::migrate_personality_if_needed(
-                &config.codex_home,
-                &config_toml,
-                state_db.clone(),
-            )
-            .await
-            {
-                Ok(true) => {
-                    config = load_config_or_exit(
-                        cli_kv_overrides.clone(),
-                        overrides.clone(),
-                        loader_overrides.clone(),
-                        cloud_config_bundle.clone(),
-                        strict_config,
-                    )
-                    .await;
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to run personality migration");
-                }
-            }
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to deserialize config for personality migration");
-        }
-    }
     let config_toml_log_dir_configured = config
         .config_layer_stack
         .effective_config()
@@ -1595,48 +1625,34 @@ async fn run_ratatui_app(
     };
 
     let current_cwd = config.cwd.clone();
-    let allow_prompt = !uses_remote_workspace && cli.cwd.is_none();
-    let action_and_target_session_if_resume_or_fork = match &session_selection {
-        resume_picker::SessionSelection::Resume(target_session) => {
-            Some((CwdPromptAction::Resume, target_session))
+    let fallback_cwd = match resolve_startup_resume_or_fork_cwd(
+        &mut tui,
+        &config,
+        state_db.as_deref(),
+        &session_selection,
+        cli.cwd.as_deref(),
+        uses_remote_workspace,
+        uses_remote_workspace_or_environment(&app_server_target, &environment_manager),
+    )
+    .await
+    {
+        Ok(ResolveCwdOutcome::Continue(cwd)) => cwd,
+        Ok(ResolveCwdOutcome::Exit) => {
+            terminal_restore_guard.restore_silently();
+            session_log::log_session_end();
+            return Ok(AppExitInfo {
+                token_usage: crate::token_usage::TokenUsage::default(),
+                thread_id: None,
+                resume_hint: None,
+                update_action: None,
+                exit_reason: ExitReason::UserRequested,
+            });
         }
-        resume_picker::SessionSelection::Fork(target_session) => {
-            Some((CwdPromptAction::Fork, target_session))
+        Err(err) => {
+            terminal_restore_guard.restore_silently();
+            session_log::log_session_end();
+            return Err(err);
         }
-        _ => None,
-    };
-    let fallback_cwd = match action_and_target_session_if_resume_or_fork {
-        Some((action, target_session)) => {
-            if uses_remote_workspace {
-                Some(current_cwd.to_path_buf())
-            } else {
-                match resolve_cwd_for_resume_or_fork(
-                    &mut tui,
-                    state_db.as_deref(),
-                    &current_cwd,
-                    target_session.thread_id,
-                    target_session.path.as_deref(),
-                    action,
-                    allow_prompt,
-                )
-                .await?
-                {
-                    ResolveCwdOutcome::Continue(cwd) => cwd,
-                    ResolveCwdOutcome::Exit => {
-                        terminal_restore_guard.restore_silently();
-                        session_log::log_session_end();
-                        return Ok(AppExitInfo {
-                            token_usage: crate::token_usage::TokenUsage::default(),
-                            thread_id: None,
-                            resume_hint: None,
-                            update_action: None,
-                            exit_reason: ExitReason::UserRequested,
-                        });
-                    }
-                }
-            }
-        }
-        None => None,
     };
 
     let picker_cancelled_without_selection = matches!(
@@ -1773,6 +1789,7 @@ async fn run_ratatui_app(
         &mut tui,
         app_server,
         config,
+        current_cwd.to_path_buf(),
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),

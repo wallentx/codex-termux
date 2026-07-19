@@ -27,7 +27,6 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::WarningEvent;
-use codex_sandboxing::SandboxType;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -415,14 +414,6 @@ impl NetworkApprovalService {
         (created, true)
     }
 
-    async fn record_outcome_for_single_active_call(&self, outcome: NetworkApprovalOutcome) {
-        let Some(owner_call) = self.resolve_single_active_call().await else {
-            return;
-        };
-        self.record_call_outcome(&owner_call.registration_id, outcome)
-            .await;
-    }
-
     #[cfg(test)]
     async fn take_call_outcome(&self, registration_id: &str) -> Option<NetworkApprovalOutcome> {
         let mut calls = self.calls.lock().await;
@@ -467,12 +458,29 @@ impl NetworkApprovalService {
             return;
         };
 
-        let outcome = NetworkApprovalOutcome::DeniedByPolicy(message);
-        if let Some(execution_id) = blocked.execution_id.as_deref() {
-            self.record_call_outcome(execution_id, outcome).await;
+        let owner_call = if let Some(execution_id) = blocked.execution_id.as_deref() {
+            self.resolve_active_call_by_execution_id(execution_id).await
         } else {
-            self.record_outcome_for_single_active_call(outcome).await;
+            self.resolve_single_active_call().await
+        };
+        let Some(owner_call) = owner_call else {
+            return;
+        };
+
+        let mut calls = self.calls.lock().await;
+        if calls
+            .call_outcomes
+            .contains_key(&owner_call.registration_id)
+        {
+            return;
         }
+        calls.call_outcomes.insert(
+            owner_call.registration_id.clone(),
+            NetworkApprovalOutcome::DeniedByPolicy(message),
+        );
+
+        drop(calls);
+        owner_call.cancellation_token.cancel();
     }
 
     async fn active_turn_context(
@@ -657,8 +665,7 @@ impl NetworkApprovalService {
             } else {
                 turn_context
                     .environments
-                    .turn_environments
-                    .iter()
+                    .turn_environments()
                     .find(|environment| environment.environment_id == environment_id)
                     .and_then(|environment| environment.cwd().to_abs_path().ok())
                     .unwrap_or_else(|| {
@@ -851,7 +858,6 @@ pub(crate) async fn begin_network_approval(
     session: &Session,
     turn_id: &str,
     managed_network_active: bool,
-    selected_sandbox: SandboxType,
     spec: Option<NetworkApprovalSpec>,
 ) -> Result<Option<ActiveNetworkApproval>, ToolError> {
     let NetworkApprovalSpec {
@@ -872,18 +878,14 @@ pub(crate) async fn begin_network_approval(
     }
 
     let registration_id = Uuid::new_v4().to_string();
-    let execution_proxy = if selected_sandbox == SandboxType::LinuxSeccomp {
-        let attribution_token = Uuid::new_v4().to_string();
-        network
-            .for_execution(&environment_id, &registration_id, attribution_token)
-            .map_err(|err| {
-                ToolError::Codex(codex_protocol::error::CodexErr::Io(io::Error::other(
-                    format!("failed to create execution-scoped network proxy: {err}"),
-                )))
-            })?
-    } else {
-        network.clone()
-    };
+    let attribution_token = Uuid::new_v4().to_string();
+    let execution_proxy = network
+        .for_execution(&environment_id, &registration_id, attribution_token)
+        .map_err(|err| {
+            ToolError::Codex(codex_protocol::error::CodexErr::Io(io::Error::other(
+                format!("failed to create execution-scoped network proxy: {err}"),
+            )))
+        })?;
     let cancellation_token = CancellationToken::new();
     session
         .services

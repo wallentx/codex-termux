@@ -2,6 +2,7 @@ use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
 use app_test_support::create_apply_patch_sse_response;
+use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_fake_rollout_with_token_usage;
@@ -34,6 +35,7 @@ use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadGoalClearResponse;
 use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
@@ -59,10 +61,14 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::Settings;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ImageGenerationEndEvent;
@@ -119,6 +125,91 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
+
+#[tokio::test]
+async fn thread_resume_paginated_uses_model_context_without_history() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
+
+    let full_resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let full_resume_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_error_message(RequestId::Integer(full_resume_id)),
+    )
+    .await??;
+    assert_eq!(full_resume_err.error.code, -32600);
+    assert_eq!(
+        full_resume_err.error.message,
+        "paginated threads do not support full-history thread/resume; pass excludeTurns=true"
+    );
+
+    let initial_page_resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: None,
+                sort_direction: None,
+                items_view: None,
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let initial_page_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_error_message(RequestId::Integer(initial_page_resume_id)),
+    )
+    .await??;
+    assert_eq!(initial_page_err.error.code, -32600);
+    assert_eq!(
+        initial_page_err.error.message,
+        "paginated threads do not support initialTurnsPage; use turnsBackwardsCursor and itemsBackwardsCursor"
+    );
+
+    // LocalThreadStore rejects paginated full-history reads, so this cold resume only succeeds
+    // when app-server asks for the bounded latest model context.
+    let resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(resumed.id, conversation_id);
+    assert_eq!(resumed.history_mode, ThreadHistoryMode::Paginated);
+    assert!(resumed.turns.is_empty());
+
+    Ok(())
+}
 
 fn normalized_existing_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(AbsolutePathBuf::from_absolute_path(path.as_ref().canonicalize()?)?.into_path_buf())
@@ -529,21 +620,30 @@ async fn thread_resume_preserves_persisted_approvals_reviewer() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_resume_preserves_acknowledged_approvals_reviewer_update() -> Result<()> {
+async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewer_update()
+-> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config_toml = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config_toml.replace(
+            "model = \"gpt-5.4\"",
+            "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"",
+        ),
+    )?;
 
     let thread_id = {
         let mut mcp = TestAppServer::builder()
             .with_codex_home(codex_home.path())
-            .without_auto_env()
             .build()
             .await?;
         timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
         let start_id = mcp
-            .send_thread_start_request(ThreadStartParams {
+            .send_thread_start_request_with_auto_env(ThreadStartParams {
                 model: Some("gpt-5.4".to_string()),
                 ..Default::default()
             })
@@ -580,6 +680,8 @@ async fn thread_resume_preserves_acknowledged_approvals_reviewer_update() -> Res
         let update_id = mcp
             .send_thread_settings_update_request(ThreadSettingsUpdateParams {
                 thread_id: thread.id.clone(),
+                model: Some("gpt-5.2-codex".to_string()),
+                effort: Some(ReasoningEffort::Ultra),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 ..Default::default()
             })
@@ -601,7 +703,60 @@ async fn thread_resume_preserves_acknowledged_approvals_reviewer_update() -> Res
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        model,
+        reasoning_effort,
+        approvals_reviewer,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(model, "gpt-5.2-codex");
+    assert_eq!(reasoning_effort, Some(ReasoningEffort::Ultra));
+    assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
+
+    let update_id = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: thread_id.clone(),
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: "gpt-5.2-codex".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let update_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(update_id)),
+    )
+    .await??;
+    let _: ThreadSettingsUpdateResponse = to_response(update_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    drop(mcp);
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
         .build()
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -617,10 +772,10 @@ async fn thread_resume_preserves_acknowledged_approvals_reviewer_update() -> Res
     )
     .await??;
     let ThreadResumeResponse {
-        approvals_reviewer, ..
+        reasoning_effort, ..
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
 
-    assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
+    assert_eq!(reasoning_effort, None);
 
     Ok(())
 }
@@ -1061,7 +1216,6 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
                     link_id: Some("link_calendar".to_string()),
                     resource_uri: Some("ui://widget/lookup.html".to_string()),
                     app_name: Some("Calendar".to_string()),
-                    template_id: Some("calendar_template".to_string()),
                     action_name: Some("lookup".to_string()),
                 })
             );
@@ -1114,7 +1268,6 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
             link_id: Some("link_calendar".to_string()),
             resource_uri: Some("ui://widget/lookup.html".to_string()),
             app_name: Some("Calendar".to_string()),
-            template_id: Some("calendar_template".to_string()),
             action_name: Some("lookup".to_string()),
         })
     );
@@ -1223,7 +1376,6 @@ fn append_resume_redaction_history(
             mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
             link_id: Some("link_calendar".to_string()),
             app_name: Some("Calendar".to_string()),
-            template_id: Some("calendar_template".to_string()),
             action_name: Some("lookup".to_string()),
             plugin_id: None,
             duration: Duration::from_millis(8),
@@ -2246,6 +2398,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                     total_token_usage: TokenUsage {
                         input_tokens: 180,
                         cached_input_tokens: 40,
+                        cache_write_input_tokens: 0,
                         output_tokens: 50,
                         reasoning_output_tokens: 15,
                         total_tokens: 230,
@@ -2253,6 +2406,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                     last_token_usage: TokenUsage {
                         input_tokens: 90,
                         cached_input_tokens: 30,
+                        cache_write_input_tokens: 0,
                         output_tokens: 40,
                         reasoning_output_tokens: 12,
                         total_tokens: 130,
@@ -2268,6 +2422,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(interrupted_turn_id.to_string()),
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
@@ -2433,6 +2588,8 @@ stream_max_retries = 0
         selected_capability_roots: Vec::new(),
         memory_mode: None,
         history_mode: Default::default(),
+        history_base: None,
+        subagent_history_start_ordinal: None,
         multi_agent_version: None,
         context_window: None,
     };

@@ -365,6 +365,7 @@ impl HistoryCell for AgentMessageCell {
 pub(crate) struct AgentMarkdownCell {
     markdown_source: String,
     cwd: PathBuf,
+    inline_visualization_context: Option<crate::inline_visualization::InlineVisualizationContext>,
 }
 
 impl AgentMarkdownCell {
@@ -373,10 +374,26 @@ impl AgentMarkdownCell {
     /// `markdown_source` must be the raw source accumulated by the stream controller, not already
     /// wrapped terminal lines. Passing rendered lines here would make future resize reflow preserve
     /// stale wrapping instead of repairing it.
+    #[cfg(test)]
     pub(crate) fn new(markdown_source: String, cwd: &Path) -> Self {
+        Self::new_with_inline_visualizations(
+            markdown_source,
+            cwd,
+            /*inline_visualization_context*/ None,
+        )
+    }
+
+    pub(crate) fn new_with_inline_visualizations(
+        markdown_source: String,
+        cwd: &Path,
+        inline_visualization_context: Option<
+            crate::inline_visualization::InlineVisualizationContext,
+        >,
+    ) -> Self {
         Self {
             markdown_source,
             cwd: cwd.to_path_buf(),
+            inline_visualization_context,
         }
     }
 }
@@ -399,10 +416,11 @@ impl HistoryCell for AgentMarkdownCell {
 
         // Re-render markdown from source at the current width. Reserve 2 columns for the "• " /
         // " " prefix prepended below.
-        let lines = crate::markdown::render_markdown_agent_with_links_and_cwd(
+        let lines = crate::markdown::render_markdown_agent_with_links_cwd_and_visualizations(
             &self.markdown_source,
             Some(wrap_width),
             Some(self.cwd.as_path()),
+            self.inline_visualization_context.as_ref(),
         );
         prefix_hyperlink_lines(lines, "• ".dim(), "  ".into())
     }
@@ -420,8 +438,8 @@ impl HistoryCell for AgentMarkdownCell {
 ///
 /// During streaming, lines that have not yet been committed to scrollback because they belong to
 /// an in-progress table are displayed via this cell in the `active_cell` slot. It is replaced on
-/// every delta and cleared when the stream finalizes.
-#[derive(Debug)]
+/// deltas that change the visible tail and cleared when the stream finalizes.
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct StreamingAgentTailCell {
     lines: Vec<HyperlinkLine>,
     is_first_line: bool,
@@ -495,37 +513,70 @@ pub(crate) fn new_user_prompt(
 /// Create the reasoning history cell emitted at the end of a reasoning block.
 ///
 /// The helper snapshots `cwd` into the returned cell so local file links render the same way they
-/// did while the turn was live, even if rendering happens after other app state has advanced.
+/// did while the turn was live, even if rendering happens after other app state has advanced. Part
+/// boundaries are preserved so standalone empty placeholders can be removed without changing
+/// literal HTML comments or bold-only summary content.
 pub(crate) fn new_reasoning_summary_block(
-    full_reasoning_buffer: String,
+    reasoning_parts: Vec<String>,
     cwd: &Path,
 ) -> Box<dyn HistoryCell> {
-    let cwd = cwd.to_path_buf();
-    let full_reasoning_buffer = full_reasoning_buffer.trim();
-    if let Some(open) = full_reasoning_buffer.find("**") {
-        let after_open = &full_reasoning_buffer[(open + 2)..];
-        if let Some(close) = after_open.find("**") {
-            let after_close_idx = open + 2 + close + 2;
-            // if we don't have anything beyond `after_close_idx`
-            // then we don't have a summary to inject into history
-            if after_close_idx < full_reasoning_buffer.len() {
-                let header_buffer = full_reasoning_buffer[..after_close_idx].to_string();
-                let summary_buffer = full_reasoning_buffer[after_close_idx..].to_string();
-                // Preserve the session cwd so local file links render the same way in the
-                // collapsed reasoning block as they did while streaming live content.
-                return Box::new(ReasoningSummaryCell::new(
-                    header_buffer,
-                    summary_buffer,
-                    &cwd,
-                    /*transcript_only*/ false,
-                ));
+    let (header, content) = split_reasoning_summary_parts(&reasoning_parts);
+    let transcript_only = header.is_empty();
+    Box::new(ReasoningSummaryCell::new(
+        header,
+        content,
+        cwd,
+        transcript_only,
+    ))
+}
+
+/// Split structured reasoning-summary parts into the status header and renderable content.
+pub(crate) fn split_reasoning_summary_parts(reasoning_parts: &[String]) -> (String, String) {
+    let mut leading_empty_part_header = None;
+    let mut content_parts = Vec::with_capacity(reasoning_parts.len());
+
+    for part in reasoning_parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        let header_end = part.strip_prefix("**").and_then(|after_open| {
+            after_open
+                .find("**")
+                .and_then(|close| (close > 0).then_some(close + 4))
+        });
+        let body = header_end.map_or(part, |header_end| &part[header_end..]);
+        if body.trim() == "<!-- -->" {
+            if content_parts.is_empty()
+                && leading_empty_part_header.is_none()
+                && let Some(header_end) = header_end
+            {
+                leading_empty_part_header = Some(part[..header_end].to_string());
             }
+            continue;
+        }
+
+        content_parts.push(part);
+    }
+
+    let content = content_parts.join("\n\n");
+    if content.is_empty() {
+        return (leading_empty_part_header.unwrap_or_default(), content);
+    }
+
+    if let Some(after_open) = content.strip_prefix("**")
+        && let Some(close) = after_open.find("**")
+    {
+        let after_close_idx = 2 + close + 2;
+        let after_close = &content[after_close_idx..];
+        if after_close.starts_with('\n') || after_close.starts_with('\r') {
+            return (
+                content[..after_close_idx].to_string(),
+                after_close.to_string(),
+            );
         }
     }
-    Box::new(ReasoningSummaryCell::new(
-        "".to_string(),
-        full_reasoning_buffer.to_string(),
-        &cwd,
-        /*transcript_only*/ true,
-    ))
+
+    (leading_empty_part_header.unwrap_or_default(), content)
 }
