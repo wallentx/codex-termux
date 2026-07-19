@@ -2379,6 +2379,7 @@ dependencies = [
  "which 8.0.0",
  "windows-sys 0.52.0",
  "wiremock",
+ "zstd",
 ]
 
 [[package]]
@@ -3988,11 +3989,13 @@ dependencies = [
  "clap",
  "codex-git-utils",
  "codex-protocol",
+ "codex-utils-absolute-path",
  "dirs",
  "libsqlite3-sys",
  "log",
  "owo-colors",
  "pretty_assertions",
+ "scopeguard",
  "serde",
  "serde_json",
  "sqlx",
