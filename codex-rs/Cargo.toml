@@ -129,7 +129,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.144.6"
+version = "0.145.0-alpha.24"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -396,6 +396,7 @@ serde_with = "3.17"
 serde_yaml = "0.9"
 serial_test = "3.2.0"
 sha1 = "0.10.6"
+scopeguard = "1.2.0"
 sha2 = "0.10"
 shlex = "1.3.0"
 similar = "2.7.0"
