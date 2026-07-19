@@ -92,6 +92,24 @@ upstream_releases_json() {
   printf '%s\n' "${upstream_releases_cache}"
 }
 
+# Scheduled runs track channel heads only. Older tags remain available through REQUESTED_TAG.
+scheduled_upstream_releases_json() {
+  upstream_releases_json \
+    | jq -c '
+        ([.[] | select(.tagName | startswith("rust-v")) | select(.isPrerelease == false)][0].tagName // "") as $latest_stable
+        | ([.[] | select(.tagName | startswith("rust-v")) | select(.isPrerelease == true)][0].tagName // "") as $latest_prerelease
+        | ([.[] | select(.tagName | startswith("rusty-v8-v"))][0].tagName // "") as $latest_rusty_v8
+        | [
+            .[]
+            | select(
+                .tagName == $latest_stable
+                or .tagName == $latest_prerelease
+                or .tagName == $latest_rusty_v8
+              )
+          ]
+      '
+}
+
 release_branch_current_tag() {
   local release_branch="$1"
   release_branch_current_metadata "${release_branch}" \
@@ -518,7 +536,7 @@ else
         echo "Skipping unsupported upstream release tag: ${upstream_tag}"
         ;;
     esac
-  done < <(upstream_releases_json | jq -c '.[]')
+  done < <(scheduled_upstream_releases_json | jq -c '.[]')
 fi
 
 echo "No upstream Codex or rusty_v8 release needs a Termux mirror."
