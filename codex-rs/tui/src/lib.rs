@@ -1163,6 +1163,7 @@ pub async fn run_main(
         let _ = codex_state::install_process_db_telemetry(telemetry);
     }
     let state_db = init_state_db_for_app_server_target(&config, &app_server_target).await?;
+
     let config_toml_log_dir_configured = config
         .config_layer_stack
         .effective_config()
