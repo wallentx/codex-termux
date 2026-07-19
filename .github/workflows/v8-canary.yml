@@ -75,7 +75,7 @@ jobs:
     needs: metadata
     # Metadata always runs; only relevant changes pay for the large matrix.
     if: ${{ needs.metadata.outputs.canary_required == 'true' }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ github.repository == 'openai/codex' && (matrix.runner) || (matrix.runner == 'macos-15-xlarge' && 'macos-latest' || matrix.runner) }}
     permissions:
       contents: read
       actions: read
@@ -192,6 +192,7 @@ jobs:
           toolchain: "1.95.0"
 
       - name: Build Bazel V8 release pair
+        if: github.repository == 'openai/codex'
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
           PLATFORM: ${{ matrix.platform }}
@@ -227,6 +228,7 @@ jobs:
             "--config=${{ matrix.bazel_config }}"
 
       - name: Stage release pair
+        if: github.repository == 'openai/codex'
         env:
           BAZEL_CONFIG: ${{ matrix.bazel_config }}
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}

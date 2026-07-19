@@ -876,6 +876,7 @@ async fn plugin_detail_unmaterialized_default_uses_remote_install_path() {
                 apps: Vec::new(),
                 app_templates: Vec::new(),
                 mcp_servers: Vec::new(),
+                scheduled_tasks: None,
             },
         }),
     );
@@ -3127,6 +3128,7 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
         is_default: false,
         upgrade: None,
         show_in_picker,
+        multi_agent_version: None,
         availability_nux: None,
         supported_in_api: true,
         input_modalities: default_input_modalities(),
@@ -3622,6 +3624,7 @@ async fn single_reasoning_option_skips_selection() {
         is_default: false,
         upgrade: None,
         show_in_picker: true,
+        multi_agent_version: None,
         availability_nux: None,
         supported_in_api: true,
         input_modalities: default_input_modalities(),
@@ -3672,7 +3675,7 @@ async fn advanced_only_reasoning_option_requires_explicit_selection() {
 #[tokio::test]
 async fn auto_model_advertising_advanced_effort_opens_reasoning_picker() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let mut preset = get_available_model(&chat, "gpt-5.4");
+    let mut preset = get_available_model(&chat, "gpt-5.6-terra");
     preset.id = "codex-auto-test".to_string();
     preset.model = "codex-auto-test".to_string();
     preset.display_name = "codex-auto-test".to_string();

@@ -1,6 +1,8 @@
 mod common;
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,11 +13,27 @@ use codex_exec_server::ExecOutputStream;
 use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
+#[cfg(unix)]
+use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::ProcessId;
 use codex_exec_server::ProcessSignal;
 use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteStatus;
+#[cfg(unix)]
+use codex_protocol::models::PermissionProfile;
+#[cfg(unix)]
+use codex_protocol::permissions::FileSystemAccessMode;
+#[cfg(unix)]
+use codex_protocol::permissions::FileSystemPath;
+#[cfg(unix)]
+use codex_protocol::permissions::FileSystemSandboxEntry;
+#[cfg(unix)]
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+#[cfg(unix)]
+use codex_protocol::permissions::FileSystemSpecialPath;
+#[cfg(unix)]
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -84,6 +102,7 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), "proc-1");
@@ -92,6 +111,185 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
         collect_process_output_from_reads(session.process, wake_rx).await?;
 
     assert_eq!(exit_code, Some(0));
+    assert!(closed);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_process_keeps_sandbox_helper_visible_with_restricted_reads() -> Result<()> {
+    if let Some(warning) = codex_sandboxing::system_bwrap_warning(&PermissionProfile::read_only()) {
+        eprintln!("skipping bwrap test: {warning}");
+        return Ok(());
+    }
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let workspace = TempDir::new()?;
+    let file = workspace.path().join("allowed.txt");
+    std::fs::write(&file, b"allowed")?;
+    let cwd = PathUri::from_host_native_path(workspace.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Read,
+        },
+    ]);
+    let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+
+    let session = context
+        .backend
+        .start(ExecParams {
+            process_id: ProcessId::from("proc-restricted-helper"),
+            argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
+            cwd,
+            env_policy: /*env_policy*/ None,
+            env: HashMap::from([("PATH".to_string(), std::env::var("PATH")?)]),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    let output = collect_process_output_from_events(session.process).await?;
+
+    assert_eq!(
+        output,
+        ("allowed".to_string(), String::new(), Some(0), true)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_tty_process_uses_configured_sandbox_helper_with_hostile_path() -> Result<()> {
+    if let Some(warning) = codex_sandboxing::system_bwrap_warning(&PermissionProfile::read_only()) {
+        eprintln!("skipping bwrap test: {warning}");
+        return Ok(());
+    }
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let workspace = TempDir::new()?;
+    let file = workspace.path().join("allowed.txt");
+    std::fs::write(&file, b"allowed")?;
+    let hostile_helper = workspace.path().join("codex-linux-sandbox");
+    std::fs::write(&hostile_helper, b"#!/bin/sh\nprintf hostile")?;
+    let mut permissions = std::fs::metadata(&hostile_helper)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hostile_helper, permissions)?;
+    let path = std::env::var_os("PATH").context("PATH is not set")?;
+    let hostile_path = std::env::join_paths(
+        std::iter::once(workspace.path().to_path_buf()).chain(std::env::split_paths(&path)),
+    )?;
+    let cwd = PathUri::from_host_native_path(workspace.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Read,
+        },
+    ]);
+    let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+
+    let session = context
+        .backend
+        .start(ExecParams {
+            process_id: ProcessId::from("proc-hostile-helper-path"),
+            argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
+            cwd,
+            env_policy: /*env_policy*/ None,
+            env: HashMap::from([(
+                "PATH".to_string(),
+                hostile_path.to_string_lossy().into_owned(),
+            )]),
+            tty: true,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    let output = collect_process_output_from_events(session.process).await?;
+
+    assert_eq!(
+        output,
+        ("allowed".to_string(), String::new(), Some(0), true)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_process_preserves_empty_workspace_roots() -> Result<()> {
+    if let Some(warning) = codex_sandboxing::system_bwrap_warning(&PermissionProfile::read_only()) {
+        eprintln!("skipping bwrap test: {warning}");
+        return Ok(());
+    }
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let tmp = TempDir::new()?;
+    let file = tmp.path().join("excluded.txt");
+    std::fs::write(&file, b"excluded")?;
+    let cwd = PathUri::from_host_native_path(tmp.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+        path: FileSystemPath::Special {
+            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+        },
+        access: FileSystemAccessMode::Read,
+    }]);
+    let mut sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+    sandbox.workspace_roots.clear();
+
+    let session = context
+        .backend
+        .start(ExecParams {
+            process_id: ProcessId::from("proc-empty-workspace-roots"),
+            argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
+            cwd,
+            env_policy: None,
+            env: HashMap::new(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    let (stdout, _stderr, exit_code, closed) =
+        collect_process_output_from_events(session.process).await?;
+
+    assert!(!stdout.contains("excluded"), "unexpected stdout: {stdout}");
+    assert_ne!(exit_code, Some(0));
     assert!(closed);
     Ok(())
 }
@@ -229,6 +427,7 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -263,6 +462,7 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -313,6 +513,7 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -364,6 +565,7 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -440,6 +642,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -480,6 +683,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -516,6 +720,7 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -553,6 +758,7 @@ async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Resu
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -609,6 +815,7 @@ async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: b
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
 
@@ -652,6 +859,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
 
@@ -713,6 +921,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
 
