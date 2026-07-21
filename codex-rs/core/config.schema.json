@@ -56,12 +56,6 @@
           "description": "Whether to record a model-visible message when an agent turn is interrupted. Defaults to true.",
           "type": "boolean"
         },
-        "job_max_runtime_seconds": {
-          "description": "Default maximum runtime in seconds for agent job workers.",
-          "format": "uint64",
-          "minimum": 1.0,
-          "type": "integer"
-        },
         "max_concurrent_threads_per_session": {
           "description": "Maximum number of spawned agent threads that can be open concurrently per session. When unset, the selected multi-agent backend uses its default.",
           "format": "uint",
@@ -463,6 +457,9 @@
             },
             "code_mode": {
               "$ref": "#/definitions/FeatureToml_for_CodeModeConfigToml"
+            },
+            "code_mode_buffered_exec": {
+              "type": "boolean"
             },
             "code_mode_host": {
               "type": "boolean"
@@ -1198,6 +1195,12 @@
       "oneOf": [
         {
           "properties": {
+            "additionalContextLimit": {
+              "description": "Approximate token threshold for spilling this hook's `additionalContext` to disk. Unset uses 2,500 tokens; `0` disables spilling for this hook. The threshold is evaluated against the original context; a spilled preview also includes recovery metadata.",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
             "async": {
               "default": false,
               "type": "boolean"
@@ -4895,6 +4898,9 @@
         },
         "code_mode": {
           "$ref": "#/definitions/FeatureToml_for_CodeModeConfigToml"
+        },
+        "code_mode_buffered_exec": {
+          "type": "boolean"
         },
         "code_mode_host": {
           "type": "boolean"

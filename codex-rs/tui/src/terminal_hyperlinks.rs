@@ -19,6 +19,7 @@ use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 use url::Url;
 
+use crate::render::line_utils::line_to_borrowed;
 use crate::render::line_utils::line_to_static;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
@@ -127,6 +128,13 @@ pub(crate) fn visible_lines(lines: Vec<HyperlinkLine>) -> Vec<Line<'static>> {
     lines.into_iter().map(|line| line.line).collect()
 }
 
+pub(crate) fn visible_lines_ref(lines: &[HyperlinkLine]) -> Vec<Line<'_>> {
+    lines
+        .iter()
+        .map(|line| line_to_borrowed(&line.line))
+        .collect()
+}
+
 pub(crate) fn plain_hyperlink_lines(lines: Vec<Line<'static>>) -> Vec<HyperlinkLine> {
     lines.into_iter().map(HyperlinkLine::new).collect()
 }
@@ -207,9 +215,14 @@ pub(crate) fn remap_wrapped_line(
     wrapped: Vec<Line<'static>>,
 ) -> Vec<HyperlinkLine> {
     let mut out = plain_hyperlink_lines(wrapped);
+    if source.hyperlinks.is_empty() {
+        return out;
+    }
+
     let source_text = line_text(&source.line);
     let mut source_byte = 0usize;
     let mut source_column = 0usize;
+    let mut link_index = 0usize;
     for (index, line) in out.iter_mut().enumerate() {
         if index > 0 {
             let trimmed = source_text[source_byte..].trim_start_matches(char::is_whitespace);
@@ -227,10 +240,17 @@ pub(crate) fn remap_wrapped_line(
         let mut output_column = rendered[..rendered_start].width();
         for ch in mapped.chars() {
             let width = ch.width().unwrap_or(/*default*/ 0);
+            while source
+                .hyperlinks
+                .get(link_index)
+                .is_some_and(|link| link.columns.end <= source_column)
+            {
+                link_index += 1;
+            }
             if let Some(link) = source
                 .hyperlinks
-                .iter()
-                .find(|link| link.columns.contains(&source_column))
+                .get(link_index)
+                .filter(|link| link.columns.contains(&source_column))
             {
                 push_link_range(line, output_column..output_column + width, link);
             }
@@ -471,7 +491,8 @@ pub(crate) fn mark_buffer_hyperlinks(
     }
     let mut logical_row = 0usize;
     for line in lines {
-        let paragraph = Paragraph::new(Text::from(line.line.clone())).wrap(Wrap { trim: false });
+        let paragraph =
+            Paragraph::new(Text::from(line_to_borrowed(&line.line))).wrap(Wrap { trim: false });
         let rendered_height = paragraph.line_count(area.width).max(/*other*/ 1);
         if line.hyperlinks.is_empty() {
             logical_row += rendered_height;
@@ -633,6 +654,50 @@ mod tests {
                 /*columns*/ 5..9,
                 "https://example.com".to_string(),
             )]
+        );
+    }
+
+    #[test]
+    fn wrapping_maps_multiple_links_across_indented_unicode_lines() {
+        let text = "alpha 😀here middle there end";
+        let first_start = text.find("here").expect("first link");
+        let second_start = text.find("there").expect("second link");
+        let mut source = HyperlinkLine::new(Line::from(text));
+        source.hyperlinks.push(TerminalHyperlink::web(
+            text[..first_start].width()..text[..first_start].width() + "here".width(),
+            "https://example.com/first".to_string(),
+        ));
+        source.hyperlinks.push(TerminalHyperlink::web(
+            text[..second_start].width()..text[..second_start].width() + "there".width(),
+            "https://example.com/second".to_string(),
+        ));
+
+        let wrapped = remap_wrapped_line(
+            &source,
+            vec![
+                Line::from("  alpha 😀here"),
+                Line::from("    middle there end"),
+            ],
+        );
+
+        assert_eq!(
+            wrapped,
+            vec![
+                HyperlinkLine {
+                    line: Line::from("  alpha 😀here"),
+                    hyperlinks: vec![TerminalHyperlink::web(
+                        /*columns*/ 10..14,
+                        "https://example.com/first".to_string(),
+                    )],
+                },
+                HyperlinkLine {
+                    line: Line::from("    middle there end"),
+                    hyperlinks: vec![TerminalHyperlink::web(
+                        /*columns*/ 11..16,
+                        "https://example.com/second".to_string(),
+                    )],
+                },
+            ]
         );
     }
 

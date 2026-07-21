@@ -166,6 +166,41 @@ fn incremental_raw_render_preserves_blank_lines() {
 }
 
 #[test]
+fn inline_visualization_context_without_directives_keeps_stable_prefix() {
+    let cwd = test_cwd();
+    let context = InlineVisualizationContext::new(&cwd, ThreadId::new())
+        .expect("UUIDv7 thread id should provide a timestamp");
+    let width = Some(80);
+    let mut source = String::new();
+    let mut render = StreamingRender::new();
+
+    for chunk in ["First paragraph.\n\n", "Second paragraph.\n\n"] {
+        source.push_str(chunk);
+        render.append(
+            &source,
+            chunk,
+            width,
+            &cwd,
+            HistoryRenderMode::Rich,
+            Some(&context),
+        );
+        assert_eq!(
+            render.lines,
+            render_source(
+                &source,
+                width,
+                &cwd,
+                HistoryRenderMode::Rich,
+                Some(&context),
+            ),
+        );
+    }
+
+    assert!(render.stable_source_len > 0);
+    assert!(!render.has_inline_visualization_directive);
+}
+
+#[test]
 fn inline_visualizations_use_canonical_full_render() {
     let cwd = test_cwd();
     let context = InlineVisualizationContext::new(&cwd, ThreadId::new())
@@ -196,6 +231,8 @@ fn inline_visualizations_use_canonical_full_render() {
         );
         assert_eq!(render.stable_source_len, 0);
     }
+
+    assert!(render.has_inline_visualization_directive);
 }
 
 #[test]
@@ -206,10 +243,52 @@ fn inline_visualizations_without_context_use_canonical_full_render() {
     );
 
     assert_eq!(render.stable_source_len, 0);
+    assert!(render.has_inline_visualization_directive);
     assert_debug_snapshot!(
         "inline_visualizations_without_context_use_canonical_full_render",
         render.lines
     );
+}
+
+#[test]
+fn inline_visualization_directive_survives_raw_to_rich_render_mode_switch() {
+    let cwd = test_cwd();
+    let width = Some(80);
+    let mut source = String::new();
+    let mut render = StreamingRender::new();
+
+    append(
+        &mut render,
+        &mut source,
+        "::codex-inline-vis{file=\"missing.html\"}\n",
+        width,
+        &cwd,
+        HistoryRenderMode::Raw,
+    );
+    assert!(!render.has_inline_visualization_directive);
+
+    render.recompute(
+        &source,
+        width,
+        &cwd,
+        HistoryRenderMode::Rich,
+        /*inline_visualization_context*/ None,
+    );
+
+    assert!(render.has_inline_visualization_directive);
+    assert_eq!(
+        render.lines,
+        render_source(
+            &source,
+            width,
+            &cwd,
+            HistoryRenderMode::Rich,
+            /*inline_visualization_context*/ None,
+        ),
+    );
+
+    render.clear();
+    assert!(!render.has_inline_visualization_directive);
 }
 
 #[test]
