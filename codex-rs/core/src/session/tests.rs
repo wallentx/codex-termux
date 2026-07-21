@@ -1503,6 +1503,7 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
                     timeout_sec: Some(600),
                     r#async: false,
                     status_message: None,
+                    additional_context_limit: None,
                 }],
             },
         };
@@ -5338,7 +5339,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         session_telemetry: session_telemetry.clone(),
         models_manager: Arc::clone(&models_manager),
         tool_approvals: Mutex::new(ApprovalStore::default()),
-        guardian_rejections: Mutex::new(std::collections::HashMap::new()),
         guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
         runtime_handle: tokio::runtime::Handle::current(),
         skills_service,
@@ -5385,9 +5385,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
-        code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::new(
-            codex_code_mode::InProcessCodeModeSessionProvider,
-        )),
+        code_mode_service: crate::tools::code_mode::CodeModeService::new(
+            Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+            &config.features,
+        ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
     };
@@ -7496,7 +7497,6 @@ where
         session_telemetry: session_telemetry.clone(),
         models_manager: Arc::clone(&models_manager),
         tool_approvals: Mutex::new(ApprovalStore::default()),
-        guardian_rejections: Mutex::new(std::collections::HashMap::new()),
         guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
         runtime_handle: tokio::runtime::Handle::current(),
         skills_service,
@@ -7543,9 +7543,10 @@ where
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
-        code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::new(
-            codex_code_mode::InProcessCodeModeSessionProvider,
-        )),
+        code_mode_service: crate::tools::code_mode::CodeModeService::new(
+            Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+            &config.features,
+        ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
     };

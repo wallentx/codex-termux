@@ -1,3 +1,4 @@
+use codex_utils_absolute_path::test_support::PathExt;
 use sqlx::Connection;
 use sqlx::Row;
 use sqlx::migrate::Migration;
@@ -27,6 +28,99 @@ fn migrator_through(version: i64) -> Migrator {
 }
 
 #[tokio::test]
+async fn agent_job_tables_are_dropped_when_upgrading() {
+    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+    tokio::fs::create_dir_all(&sqlite_home)
+        .await
+        .expect("sqlite home should be created");
+    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
+        let _ = std::fs::remove_dir_all(sqlite_home);
+    });
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let pool = sqlite
+        .open_read_write_pool(&state_db_path(&sqlite_home))
+        .await
+        .expect("sqlite database should open");
+    migrator_through(/*version*/ 15)
+        .run(&pool)
+        .await
+        .expect("agent job migrations should apply");
+
+    sqlx::query(
+        r#"
+INSERT INTO agent_jobs (
+    id,
+    name,
+    status,
+    instruction,
+    input_headers_json,
+    input_csv_path,
+    output_csv_path,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("job-1")
+    .bind("legacy job")
+    .bind("running")
+    .bind("process rows")
+    .bind(r#"["path"]"#)
+    .bind("/tmp/input.csv")
+    .bind("/tmp/output.csv")
+    .bind(1_700_000_000_i64)
+    .bind(1_700_000_000_i64)
+    .execute(&pool)
+    .await
+    .expect("legacy agent job should insert");
+    sqlx::query(
+        r#"
+INSERT INTO agent_job_items (
+    job_id,
+    item_id,
+    row_index,
+    row_json,
+    status,
+    result_json,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("job-1")
+    .bind("item-1")
+    .bind(0_i64)
+    .bind(r#"{"path":"secret.csv"}"#)
+    .bind("completed")
+    .bind(r#"{"result":"legacy"}"#)
+    .bind(1_700_000_000_i64)
+    .bind(1_700_000_000_i64)
+    .execute(&pool)
+    .await
+    .expect("legacy agent job item should insert");
+
+    STATE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("current migrations should apply");
+
+    let agent_job_tables = sqlx::query_scalar::<_, String>(
+        r#"
+SELECT name
+FROM sqlite_master
+WHERE type = 'table' AND name IN ('agent_jobs', 'agent_job_items')
+ORDER BY name
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("remaining agent job tables should load");
+    assert_eq!(agent_job_tables, Vec::<String>::new());
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn recency_migration_backfills_and_seeds_old_binary_inserts() {
     let sqlite_home = crate::runtime::test_support::unique_temp_dir();
     tokio::fs::create_dir_all(&sqlite_home)
@@ -35,7 +129,7 @@ async fn recency_migration_backfills_and_seeds_old_binary_inserts() {
     let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
         let _ = std::fs::remove_dir_all(sqlite_home);
     });
-    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.clone());
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
     let pool = sqlite
         .open_read_write_pool(&state_db_path(&sqlite_home))
         .await
@@ -148,7 +242,7 @@ async fn repairs_recency_migration_that_was_applied_as_version_38() {
     let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
         let _ = std::fs::remove_dir_all(sqlite_home);
     });
-    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.clone());
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
     let pool = sqlite
         .open_read_write_pool(&state_db_path(&sqlite_home))
         .await
@@ -224,7 +318,7 @@ async fn repair_recency_migration_succeeds_while_another_connection_holds_writer
     let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
         let _ = std::fs::remove_dir_all(sqlite_home);
     });
-    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.clone());
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
     let state_path = state_db_path(&sqlite_home);
     let pool = sqlite
         .open_read_write_pool(&state_path)

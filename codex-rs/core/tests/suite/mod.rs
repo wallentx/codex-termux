@@ -31,12 +31,12 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
 mod abort_tasks;
 mod additional_context;
 mod agent_execution;
-mod agent_jobs;
 mod agent_websocket;
 mod agents_md;
 mod apply_patch_cli;
 #[cfg(not(target_os = "windows"))]
 mod approvals;
+mod audio_truncation;
 mod auto_review;
 mod catalog_permission_messages;
 mod cli_stream;

@@ -4129,11 +4129,26 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "description": "User has denied this command and the agent should not execute it, but it should continue the session and try something else.",
-          "enum": [
+          "properties": {
+            "denied": {
+              "properties": {
+                "rejection": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "rejection"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
             "denied"
           ],
-          "type": "string"
+          "title": "DeniedReviewDecision",
+          "type": "object"
         },
         {
           "description": "Automatic approval review timed out before reaching a decision.",
@@ -8761,6 +8776,15 @@
         "oneOf": [
           {
             "properties": {
+              "additionalContextLimit": {
+                "description": "Approximate token threshold for spilling this hook's `additionalContext` to disk. `null` uses 2,500 tokens; `0` disables spilling for this hook. The threshold is evaluated against the original context; a spilled preview also includes recovery metadata.",
+                "format": "uint",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "async": {
                 "type": "boolean"
               },
@@ -8866,7 +8890,19 @@
               "null"
             ]
           },
+          "distributionChannel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "iconUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "iconUrlDark": {
             "type": [
               "string",
               "null"
@@ -8875,8 +8911,21 @@
           "id": {
             "type": "string"
           },
+          "installUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
+          },
+          "pluginDisplayNames": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "toolSummaries": {
             "items": {
@@ -9162,6 +9211,26 @@
               "type"
             ],
             "title": "InputImageDynamicToolCallOutputContentItem",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "audioUrl": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "inputAudio"
+                ],
+                "title": "InputAudioDynamicToolCallOutputContentItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "audioUrl",
+              "type"
+            ],
+            "title": "InputAudioDynamicToolCallOutputContentItem",
             "type": "object"
           }
         ]
@@ -11191,6 +11260,15 @@
       },
       "HookMetadata": {
         "properties": {
+          "additionalContextLimit": {
+            "description": "Configured `additionalContext` spill threshold. `null` uses 2,500 tokens; `0` disables spilling.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "command": {
             "type": [
               "string",

@@ -1952,7 +1952,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "app_test_support",
- "async-channel",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -2667,6 +2666,7 @@ dependencies = [
  "codex-sandboxing",
  "codex-shell-command",
  "codex-shell-escalation",
+ "codex-skills",
  "codex-state",
  "codex-terminal-detection",
  "codex-test-binary-support",
@@ -2688,7 +2688,6 @@ dependencies = [
  "codex-web-search-extension",
  "codex-windows-sandbox",
  "core_test_support",
- "csv",
  "ctor 0.6.3",
  "dirs",
  "dunce",
@@ -2717,6 +2716,7 @@ dependencies = [
  "sha1 0.10.6",
  "shlex",
  "similar",
+ "symphonia",
  "tempfile",
  "test-case",
  "test-log",
@@ -2780,6 +2780,7 @@ dependencies = [
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
+ "codex-skills",
  "codex-tools",
  "codex-utils-absolute-path",
  "codex-utils-path",
@@ -2972,6 +2973,7 @@ dependencies = [
  "starlark",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -3873,6 +3875,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
+ "codex-utils-pty",
  "codex-windows-sandbox",
  "dunce",
  "libc",
@@ -3952,7 +3955,9 @@ dependencies = [
 name = "codex-skills"
 version = "0.0.0"
 dependencies = [
+ "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-path-uri",
  "include_dir",
  "thiserror 2.0.18",
 ]
@@ -3967,6 +3972,7 @@ dependencies = [
  "codex-mcp",
  "codex-otel",
  "codex-protocol",
+ "codex-skills",
  "codex-tools",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
@@ -4116,7 +4122,6 @@ dependencies = [
  "codex-config",
  "codex-connectors",
  "codex-core-plugins",
- "codex-core-skills",
  "codex-exec-server",
  "codex-features",
  "codex-feedback",
@@ -4159,6 +4164,7 @@ dependencies = [
  "diffy",
  "dirs",
  "dunce",
+ "futures",
  "image",
  "insta",
  "itertools 0.14.0",
@@ -4187,6 +4193,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tokio-util",
  "toml 0.9.11+spec-1.1.0",
  "tracing",
@@ -4409,8 +4416,6 @@ dependencies = [
 name = "codex-utils-sandbox-summary"
 version = "0.0.0"
 dependencies = [
- "codex-core",
- "codex-model-provider-info",
  "codex-protocol",
  "codex-utils-absolute-path",
  "pretty_assertions",
@@ -5888,6 +5893,12 @@ dependencies = [
  "nom 7.1.3",
  "pin-project-lite",
 ]
+
+[[package]]
+name = "extended"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
 name = "eyre"
@@ -8915,7 +8926,6 @@ dependencies = [
  "os_info",
  "pretty_assertions",
  "rmcp",
- "serde",
  "serde_json",
  "shlex",
  "tokio",
@@ -12778,6 +12788,119 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c64fc7232dd8d2e4ac5ce4ef302b1d81e0b80d055b9d77c7c4f51f6aa4c867d6"
 dependencies = [
  "is_ci",
+]
+
+[[package]]
+name = "symphonia"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1758d6c853020a7244de03cc3e0185eaea3f58715122422dd3cc7452e6d4c16a"
+dependencies = [
+ "lazy_static",
+ "symphonia-bundle-mp3",
+ "symphonia-core",
+ "symphonia-format-isomp4",
+ "symphonia-format-mkv",
+ "symphonia-format-ogg",
+ "symphonia-format-riff",
+ "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-bundle-mp3"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "350f1f2f2e19ad4dd315db94304d1eb361b29af070681f94e51b8fdaad769546"
+dependencies = [
+ "lazy_static",
+ "log",
+ "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-common"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8257891ffa7f05e02b58f4761e2abf7e5278c8744fd59e981559e050f86eef55"
+dependencies = [
+ "log",
+ "symphonia-core",
+ "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-core"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95ec293b5f288383b72a7bffcade6b2860b642cf66f28b3bd5967349a49938b1"
+dependencies = [
+ "bitflags 2.10.0",
+ "bytemuck",
+ "lazy_static",
+ "log",
+ "num-complex",
+ "smallvec",
+]
+
+[[package]]
+name = "symphonia-format-isomp4"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d179a01305b3505940135a9f0180d6ef4b487912748fe97554756f120fbd05e"
+dependencies = [
+ "log",
+ "symphonia-common",
+ "symphonia-core",
+ "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-format-mkv"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb17713e134f5ad316c2690fa3104590ccc85842cdbcf82c3cd1a845cb08aa74"
+dependencies = [
+ "lazy_static",
+ "log",
+ "symphonia-common",
+ "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-format-ogg"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b05a67e02b1e4fca1a261ba4fe06910a9357489ad8c36aafdd2960e9c6559433"
+dependencies = [
+ "log",
+ "symphonia-common",
+ "symphonia-core",
+ "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-format-riff"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17424452a777666d3eaf09a5c651029b15b6a333812fcc5b5474f2a3f0cff3f0"
+dependencies = [
+ "extended",
+ "log",
+ "symphonia-core",
+ "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-metadata"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31acf5cd623398a6208e2225d18f4b20f761c55098a796a5247ad516a4a8681"
+dependencies = [
+ "lazy_static",
+ "log",
+ "regex-lite",
+ "smallvec",
+ "symphonia-core",
 ]
 
 [[package]]

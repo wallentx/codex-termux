@@ -2345,6 +2345,15 @@ pub struct UserMessageEvent {
     /// imply default image detail behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_image_details: Vec<Option<ImageDetail>>,
+    /// Audio URLs sourced from `UserInput::Audio`. These are safe to replay in
+    /// legacy UI history events and correspond to audio sent to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<Vec<String>>,
+    /// Local file paths sourced from `UserInput::LocalAudio`. These are kept so
+    /// clients can reattach audio when editing history and should not be
+    /// treated as API-ready URLs.
+    #[serde(default)]
+    pub local_audio: Vec<std::path::PathBuf>,
     /// UI-defined spans within `message` used to render or persist special elements.
     #[serde(default)]
     pub text_elements: Vec<crate::user_input::TextElement>,
@@ -2363,6 +2372,9 @@ pub fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
         || !user.local_images.is_empty()
     {
         return Some("[Image]".to_string());
+    }
+    if user.audio.as_ref().is_some_and(|audio| !audio.is_empty()) || !user.local_audio.is_empty() {
+        return Some("[Audio]".to_string());
     }
     None
 }
@@ -4089,7 +4101,7 @@ pub struct ThreadGoalUpdatedEvent {
 }
 
 /// User's decision in response to an ExecApprovalRequest.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq, Display, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Display, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
     /// User has approved this command and the agent should execute it.
@@ -4114,8 +4126,7 @@ pub enum ReviewDecision {
 
     /// User has denied this command and the agent should not execute it, but
     /// it should continue the session and try something else.
-    #[default]
-    Denied,
+    Denied { rejection: String },
 
     /// Automatic approval review timed out before reaching a decision.
     TimedOut,
@@ -4125,7 +4136,21 @@ pub enum ReviewDecision {
     Abort,
 }
 
+impl Default for ReviewDecision {
+    fn default() -> Self {
+        Self::Denied {
+            rejection: "denied".to_string(),
+        }
+    }
+}
+
 impl ReviewDecision {
+    pub fn denied(rejection: impl Into<String>) -> Self {
+        Self::Denied {
+            rejection: rejection.into(),
+        }
+    }
+
     /// Returns an opaque version of the decision without PII. We can't use an ignored flag
     /// on `serde` because the serialization is required by some surfaces.
     pub fn to_opaque_string(&self) -> &'static str {
@@ -4139,7 +4164,7 @@ impl ReviewDecision {
                 NetworkPolicyRuleAction::Allow => "approved_with_network_policy_allow",
                 NetworkPolicyRuleAction::Deny => "denied_with_network_policy_deny",
             },
-            ReviewDecision::Denied => "denied",
+            ReviewDecision::Denied { .. } => "denied",
             ReviewDecision::TimedOut => "timed_out",
             ReviewDecision::Abort => "abort",
         }
@@ -4457,6 +4482,18 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
+
+    #[test]
+    fn review_decision_denied_round_trip() -> Result<()> {
+        let decision = ReviewDecision::Denied {
+            rejection: "denied reason".to_string(),
+        };
+        let value = json!({"denied": {"rejection": "denied reason"}});
+
+        assert_eq!(serde_json::to_value(&decision)?, value);
+        assert_eq!(serde_json::from_value::<ReviewDecision>(value)?, decision);
+        Ok(())
+    }
 
     #[test]
     fn feature_thread_source_serializes_as_its_app_owned_label() -> Result<()> {
@@ -5771,6 +5808,7 @@ mod tests {
             json!({
                 "message": "hello",
                 "local_images": [],
+                "local_audio": [],
                 "text_elements": [],
             })
         );
@@ -5795,14 +5833,17 @@ mod tests {
         assert_eq!(event.image_details, Vec::<Option<ImageDetail>>::new());
         assert_eq!(event.local_images, vec![PathBuf::from("/tmp/local.png")]);
         assert_eq!(event.local_image_details, Vec::<Option<ImageDetail>>::new());
+        assert_eq!(event.audio, None);
+        assert_eq!(event.local_audio, Vec::<PathBuf>::new());
         assert_eq!(event.text_elements, Vec::new());
 
         Ok(())
     }
 
     #[test]
-    fn user_message_item_legacy_event_preserves_image_details() {
+    fn user_message_item_legacy_event_preserves_attachments() {
         let local_path = PathBuf::from("/tmp/local.png");
+        let local_audio_path = PathBuf::from("/tmp/local.wav");
         let mut item = UserMessageItem::new(&[
             crate::user_input::UserInput::Image {
                 image_url: "https://example.com/first.png".to_string(),
@@ -5815,6 +5856,12 @@ mod tests {
             crate::user_input::UserInput::LocalImage {
                 path: local_path.clone(),
                 detail: Some(ImageDetail::Original),
+            },
+            crate::user_input::UserInput::Audio {
+                audio_url: "https://example.com/remote.mp3".to_string(),
+            },
+            crate::user_input::UserInput::LocalAudio {
+                path: local_audio_path.clone(),
             },
         ]);
         item.client_id = Some("client-message-1".to_string());
@@ -5834,6 +5881,21 @@ mod tests {
         assert_eq!(event.image_details, vec![Some(ImageDetail::Original)]);
         assert_eq!(event.local_images, vec![local_path]);
         assert_eq!(event.local_image_details, vec![Some(ImageDetail::Original)]);
+        assert_eq!(
+            event.audio,
+            Some(vec!["https://example.com/remote.mp3".to_string()])
+        );
+        assert_eq!(event.local_audio, vec![local_audio_path]);
+    }
+
+    #[test]
+    fn audio_only_user_message_has_placeholder_preview() {
+        let event = UserMessageEvent {
+            audio: Some(vec!["https://example.com/remote.mp3".to_string()]),
+            ..Default::default()
+        };
+
+        assert_eq!(user_message_preview(&event), Some("[Audio]".to_string()));
     }
 
     #[test]
