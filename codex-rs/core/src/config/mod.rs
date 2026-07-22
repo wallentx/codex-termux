@@ -153,6 +153,7 @@ mod network_proxy_spec;
 mod otel;
 mod permission_profile_catalog;
 mod permissions;
+mod requirements;
 mod resolved_permission_profile;
 #[cfg(test)]
 mod schema;
@@ -1249,7 +1250,7 @@ impl AuthManagerConfig for Config {
         self.chatgpt_base_url.clone()
     }
 
-    fn auth_route_config(&self) -> Option<AuthRouteConfig> {
+    fn auth_route_config(&self) -> AuthRouteConfig {
         Config::auth_route_config(self)
     }
 }
@@ -1513,9 +1514,9 @@ impl Config {
         }
     }
 
-    pub fn auth_route_config(&self) -> Option<AuthRouteConfig> {
-        self.respect_system_proxy
-            .then(AuthRouteConfig::respect_system_proxy)
+    /// Returns auth routing resolved from the effective feature configuration.
+    pub fn auth_route_config(&self) -> AuthRouteConfig {
+        AuthRouteConfig::from_http_client_factory(self.http_client_factory())
     }
 
     /// Creates the HTTP client factory resolved from the effective feature configuration.
@@ -1535,6 +1536,7 @@ impl Config {
             self.features.enabled(Feature::Plugins),
             self.features.enabled(Feature::RemotePlugin),
             self.chatgpt_base_url.clone(),
+            self.http_client_factory(),
         )
     }
 
@@ -2408,6 +2410,7 @@ fn apply_managed_filesystem_constraints(
                     pattern: deny_read.as_str().to_string(),
                 },
                 access: codex_protocol::permissions::FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             }
         } else {
             let Ok(path) = AbsolutePathBuf::try_from(deny_read.as_str()) else {
@@ -2416,6 +2419,7 @@ fn apply_managed_filesystem_constraints(
             codex_protocol::permissions::FileSystemSandboxEntry {
                 path: codex_protocol::permissions::FileSystemPath::Path { path },
                 access: codex_protocol::permissions::FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             }
         };
         if !file_system_sandbox_policy
@@ -2895,9 +2899,15 @@ pub fn resolve_bootstrap_respect_system_proxy(
 pub fn resolve_bootstrap_auth_route_config(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
-) -> std::io::Result<Option<AuthRouteConfig>> {
-    resolve_bootstrap_respect_system_proxy(cfg, feature_requirements)
-        .map(|enabled| enabled.then(AuthRouteConfig::respect_system_proxy))
+) -> std::io::Result<AuthRouteConfig> {
+    resolve_bootstrap_respect_system_proxy(cfg, feature_requirements).map(|respect_system_proxy| {
+        let outbound_proxy_policy = if respect_system_proxy {
+            OutboundProxyPolicy::RespectSystemProxy
+        } else {
+            OutboundProxyPolicy::ReqwestDefault
+        };
+        AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(outbound_proxy_policy))
+    })
 }
 
 pub(crate) fn resolve_web_search_mode_for_turn(
@@ -3036,7 +3046,7 @@ impl Config {
 
     pub(crate) async fn load_config_with_layer_stack(
         fs: &dyn ExecutorFileSystem,
-        cfg: ConfigToml,
+        mut cfg: ConfigToml,
         overrides: ConfigOverrides,
         codex_home: AbsolutePathBuf,
         config_layer_stack: ConfigLayerStack,
@@ -3057,13 +3067,31 @@ impl Config {
             resolve_orchestrator_feature_enabled(orchestrator.and_then(|value| value.skills.as_ref()));
         let orchestrator_mcp_enabled =
             resolve_orchestrator_feature_enabled(orchestrator.and_then(|value| value.mcp.as_ref()));
-        // Ensure that every field of ConfigRequirements is applied to the final
-        // Config.
+        let mut startup_warnings = config_layer_stack
+            .startup_warnings()
+            .unwrap_or_default()
+            .to_vec();
+        let configured_sqlite_home = cfg.sqlite_home.clone();
+        requirements::apply_to_config(
+            &mut cfg,
+            config_layer_stack.requirements(),
+            &mut startup_warnings,
+        );
+
+        // Destructure every field to ensure ConfigRequirements additions are
+        // either applied above or handled while constructing the final Config.
         let ConfigRequirements {
+            sqlite_home: _,
+            log_dir: _,
+            model_catalog_json: _,
+            check_for_update_on_startup: _,
+            allow_login_shell: _,
+            feedback: _,
             approval_policy: mut constrained_approval_policy,
             approvals_reviewer: mut constrained_approvals_reviewer,
             permission_profile: mut constrained_permission_profile,
             windows_sandbox_mode: mut constrained_windows_sandbox_mode,
+            windows_sandbox_private_desktop: _,
             web_search_mode: mut constrained_web_search_mode,
             allow_managed_hooks_only: _,
             allow_appshots: _,
@@ -3080,11 +3108,6 @@ impl Config {
             filesystem: filesystem_requirements,
             guardian_policy_config_source: _,
         } = config_layer_stack.requirements().clone();
-
-        let mut startup_warnings = config_layer_stack
-            .startup_warnings()
-            .unwrap_or_default()
-            .to_vec();
 
         // Destructure ConfigOverrides fully to ensure all overrides are applied.
         let ConfigOverrides {
@@ -3753,11 +3776,18 @@ impl Config {
             .as_ref()
             .map(AbsolutePathBuf::to_path_buf)
             .unwrap_or_else(|| codex_home.join("log").to_path_buf());
+        let sqlite_home_env = resolve_sqlite_home_env(&resolved_cwd);
+        requirements::push_sqlite_home_env_override_warning(
+            configured_sqlite_home.as_ref(),
+            sqlite_home_env.as_deref(),
+            config_layer_stack.requirements().sqlite_home.as_ref(),
+            &mut startup_warnings,
+        );
         let sqlite_home = cfg
             .sqlite_home
             .as_ref()
             .map(AbsolutePathBuf::to_path_buf)
-            .or_else(|| resolve_sqlite_home_env(&resolved_cwd))
+            .or(sqlite_home_env)
             .unwrap_or_else(|| codex_home.to_path_buf());
         let original_permission_profile = permission_profile.clone();
         apply_requirement_constrained_value(
