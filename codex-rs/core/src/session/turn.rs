@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -79,7 +78,8 @@ use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
-use codex_git_utils::get_git_repo_root_with_fs;
+use codex_file_system::FindUpErrorPolicy;
+use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
@@ -109,6 +109,7 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_tools::ToolName;
 use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
+use codex_utils_path_uri::PathUri;
 use codex_utils_stream_parser::AssistantTextChunk;
 use codex_utils_stream_parser::AssistantTextStreamParser;
 use codex_utils_stream_parser::ProposedPlanSegment;
@@ -171,7 +172,7 @@ pub(crate) async fn run_turn(
     // Keep the exact model-visible state used by this turn and its inline compactions.
     let (mut world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
-        turn_diff_display_roots(turn_context.as_ref()),
+        turn_diff_display_roots(first_step_context.as_ref()),
     );
 
     let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
@@ -357,7 +358,10 @@ pub(crate) async fn run_turn(
                         Arc::clone(&step_context),
                         /*fallback_step_context*/ None,
                         &mut client_session,
-                        InitialContextInjection::BeforeLastUserMessage(Arc::clone(&world_state)),
+                        InitialContextInjection::BeforeLastUserMessage {
+                            world_state: Arc::clone(&world_state),
+                            step_context: Arc::clone(&step_context),
+                        },
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
                     )
@@ -465,19 +469,23 @@ pub(crate) async fn run_turn(
 }
 
 #[instrument(level = "trace", skip_all)]
-async fn turn_diff_display_roots(turn_context: &TurnContext) -> Vec<(String, PathBuf)> {
+async fn turn_diff_display_roots(step_context: &StepContext) -> Vec<(String, PathUri)> {
     let mut display_roots = Vec::new();
-    for turn_environment in turn_context.environments.turn_environments() {
-        // TODO(anp): Migrate git-root discovery and diff display roots to PathUri so foreign
-        // environment roots can participate without host-native conversion.
-        let Ok(cwd) = turn_environment.cwd().to_abs_path() else {
-            continue;
-        };
-        let root =
-            get_git_repo_root_with_fs(turn_environment.environment.get_filesystem().as_ref(), &cwd)
-                .await
-                .unwrap_or(cwd)
-                .into_path_buf();
+    for turn_environment in step_context.environments.turn_environments() {
+        let cwd = turn_environment.cwd();
+        // A turn cwd is expected to be a directory. If it is a file, the failed `<cwd>/.git` probe
+        // is ignored and ancestor search continues from its parent.
+        let root = find_nearest_ancestor_with_markers(
+            turn_environment.environment.get_filesystem().as_ref(),
+            cwd,
+            vec![".git".to_string()],
+            FindUpErrorPolicy::Ignore,
+            /*sandbox*/ None,
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| cwd.clone());
         display_roots.push((turn_environment.environment_id.clone(), root));
     }
     display_roots
@@ -584,7 +592,7 @@ async fn build_skills_and_plugins(
     let skills_outcome = turn_context.turn_skills.snapshot.outcome();
     let connector_slug_counts = build_connector_slug_counts(&available_connectors);
     let extension_injection_items =
-        build_extension_turn_input_items(sess, turn_context, &user_input, cancellation_token)
+        build_extension_turn_input_items(sess, step_context, &user_input, cancellation_token)
             .await?;
     let skill_name_counts_lower =
         build_skill_name_counts(&skills_outcome.skills, &skills_outcome.disabled_paths).1;
@@ -687,10 +695,11 @@ async fn build_skills_and_plugins(
 )]
 async fn build_extension_turn_input_items(
     sess: &Arc<Session>,
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     user_input: &[UserInput],
     cancellation_token: &CancellationToken,
 ) -> Option<Vec<ResponseItem>> {
+    let turn_context = step_context.turn.as_ref();
     let contributors = sess.services.extensions.turn_input_contributors().to_vec();
     if contributors.is_empty() {
         return Some(Vec::new());
@@ -725,6 +734,7 @@ async fn build_extension_turn_input_items(
                 &sess.services.session_extension_data,
                 &sess.services.thread_extension_data,
                 turn_context.extension_data.as_ref(),
+                &step_context.extension_data,
             )
             .or_cancel(cancellation_token)
             .await
@@ -1341,7 +1351,7 @@ pub(crate) async fn built_tools(
         ToolRouterParams {
             tool_runtimes: mcp_tool_runtimes,
             tool_suggest_candidates,
-            extension_tool_executors: extension_tool_executors(sess),
+            extension_tool_executors: extension_tool_executors(sess, step_context),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
         },
         &sess.services.tool_search_handler_cache,
@@ -1925,7 +1935,9 @@ fn assign_missing_streamed_response_item_id(
         return;
     }
 
-    let active_item_id = active_item.map(|item| ResponseItemId::from_server(item.id()));
+    let active_item_id = active_item
+        .map(|item| ResponseItemId::from_server(item.id()))
+        .filter(|item_id| !item_id.is_empty());
     item.set_id(active_item_id);
     Session::assign_missing_response_item_id(item);
 }
@@ -2046,9 +2058,7 @@ async fn try_run_sampling_request(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(mut item) => {
-                if turn_context.item_ids_enabled() {
-                    assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
-                }
+                assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                     && let Ok(Some(event)) = consumer.finish()
                 {
@@ -2143,9 +2153,7 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::OutputItemAdded(mut item) => {
-                if turn_context.item_ids_enabled() {
-                    assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
-                }
+                assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
                 if let ResponseItem::CustomToolCall {
                     call_id,
                     name,

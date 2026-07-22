@@ -436,6 +436,7 @@ fn external_agent_config_import_params_accept_legacy_plugin_details() {
                 }),
             }],
             source: None,
+            provider_id: None,
             migration_source: None,
         }
     );
@@ -590,12 +591,14 @@ fn additional_file_system_permissions_preserves_canonical_entries() {
                     value: CoreFileSystemSpecialPath::Root,
                 },
                 access: CoreFileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
             CoreFileSystemSandboxEntry {
                 path: CoreFileSystemPath::GlobPattern {
                     pattern: "**/*.env".to_string(),
                 },
                 access: CoreFileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             },
         ],
         glob_scan_max_depth: NonZeroUsize::new(2),
@@ -1806,9 +1809,44 @@ fn config_requirements_granular_allowed_approval_policy_is_marked_experimental()
             enforce_residency: None,
             network: None,
             models: None,
+            sqlite_home: None,
+            log_dir: None,
+            model_catalog_json: None,
+            check_for_update_on_startup: None,
+            allow_login_shell: None,
+            feedback: None,
+            windows_sandbox_private_desktop: None,
         });
 
     assert_eq!(reason, Some("askForApproval.granular"));
+}
+
+#[test]
+fn config_requirements_read_accepts_foreign_path_uris() {
+    let response: ConfigRequirementsReadResponse = serde_json::from_value(json!({
+        "requirements": {
+            "sqliteHome": "file:///C:/Users/alice/.codex/state",
+            "logDir": "file:///C:/Users/alice/.codex/logs",
+            "modelCatalogJson": "file:///C:/Users/alice/.codex/models.json"
+        }
+    }))
+    .expect("requirements response with foreign paths should deserialize");
+    let requirements = response
+        .requirements
+        .expect("requirements should be present");
+
+    assert_eq!(
+        requirements.sqlite_home,
+        Some(PathUri::parse("file:///C:/Users/alice/.codex/state").expect("valid URI"))
+    );
+    assert_eq!(
+        requirements.log_dir,
+        Some(PathUri::parse("file:///C:/Users/alice/.codex/logs").expect("valid URI"))
+    );
+    assert_eq!(
+        requirements.model_catalog_json,
+        Some(PathUri::parse("file:///C:/Users/alice/.codex/models.json").expect("valid URI"))
+    );
 }
 
 #[test]
@@ -3353,6 +3391,22 @@ fn plugin_list_params_ignore_removed_force_remote_sync_field() {
         PluginListParams {
             cwds: None,
             marketplace_kinds: None,
+            force_refetch: false,
+        },
+    );
+}
+
+#[test]
+fn plugin_list_params_deserializes_force_refetch() {
+    assert_eq!(
+        serde_json::from_value::<PluginListParams>(json!({
+            "forceRefetch": true,
+        }))
+        .unwrap(),
+        PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+            force_refetch: true,
         },
     );
 }
@@ -3369,6 +3423,7 @@ fn plugin_list_params_serializes_marketplace_kind_filter() {
                 PluginListMarketplaceKind::SharedWithMe,
                 PluginListMarketplaceKind::CreatedByMeRemote,
             ]),
+            force_refetch: false,
         })
         .unwrap(),
         json!({

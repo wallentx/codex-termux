@@ -10,6 +10,8 @@ mod safety_buffering;
 mod session_lifecycle_requests;
 mod session_summary;
 mod startup;
+#[path = "tests/turn_submission.rs"]
+mod turn_submission;
 
 use super::*;
 use crate::app_backtrack::BacktrackSelection;
@@ -2512,7 +2514,7 @@ async fn update_feature_flags_disabling_guardian_clears_review_policy_and_restor
     app.config.config_layer_stack = app
         .config
         .config_layer_stack
-        .with_user_config(&config_toml_path, user_config);
+        .with_user_config(&config_toml_path, user_config)?;
     app.config
         .features
         .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
@@ -2608,7 +2610,7 @@ async fn update_feature_flags_enabling_guardian_overrides_explicit_manual_review
     app.config.config_layer_stack = app
         .config
         .config_layer_stack
-        .with_user_config(&config_toml_path, user_config);
+        .with_user_config(&config_toml_path, user_config)?;
     app.config.approvals_reviewer = ApprovalsReviewer::User;
     app.chat_widget
         .set_approvals_reviewer(ApprovalsReviewer::User);
@@ -2677,7 +2679,7 @@ async fn update_feature_flags_disabling_guardian_clears_manual_review_policy_wit
     app.config.config_layer_stack = app
         .config
         .config_layer_stack
-        .with_user_config(&config_toml_path, user_config);
+        .with_user_config(&config_toml_path, user_config)?;
     app.config
         .features
         .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
