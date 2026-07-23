@@ -1397,7 +1397,7 @@ fn should_backfill_turn_completed_items(
         return false;
     };
 
-    !thread_ephemeral && payload.turn.items.is_empty()
+    !thread_ephemeral && payload.turn.items_view != codex_app_server_protocol::TurnItemsView::Full
 }
 
 fn turn_items_for_thread(
@@ -1479,6 +1479,7 @@ async fn resolve_resume_thread_id(
                         model_providers: model_providers.clone(),
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
+                        is_pinned: None,
                         parent_thread_id: None,
                         ancestor_thread_id: None,
                         cwd: None,
@@ -1546,6 +1547,7 @@ async fn resolve_resume_thread_id(
                     model_providers: model_providers.clone(),
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
+                    is_pinned: None,
                     parent_thread_id: None,
                     ancestor_thread_id: None,
                     cwd: None,

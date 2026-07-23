@@ -7,7 +7,6 @@ use std::borrow::Cow;
 
 use super::STATE_MIGRATOR;
 use super::repair_legacy_recency_migration_version;
-use crate::state_db_path;
 
 fn migrator_through(version: i64) -> Migrator {
     Migrator {
@@ -28,7 +27,7 @@ fn migrator_through(version: i64) -> Migrator {
 }
 
 #[tokio::test]
-async fn agent_job_tables_are_dropped_when_upgrading() {
+async fn pinned_threads_migration_defaults_existing_and_legacy_rows_to_unpinned() {
     let sqlite_home = crate::runtime::test_support::unique_temp_dir();
     tokio::fs::create_dir_all(&sqlite_home)
         .await
@@ -39,6 +38,80 @@ async fn agent_job_tables_are_dropped_when_upgrading() {
     let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
     let pool = sqlite
         .open_read_write_pool(&state_db_path(&sqlite_home))
+        .await
+        .expect("sqlite database should open");
+    migrator_through(/*version*/ 42)
+        .run(&pool)
+        .await
+        .expect("pre-pin migrations should apply");
+
+    for thread_id in [
+        "00000000-0000-0000-0000-000000000043",
+        "00000000-0000-0000-0000-000000000044",
+    ] {
+        if thread_id.ends_with("44") {
+            STATE_MIGRATOR
+                .run(&pool)
+                .await
+                .expect("pin migration should apply");
+        }
+        sqlx::query(
+            r#"
+INSERT INTO threads (
+    id,
+    rollout_path,
+    created_at,
+    updated_at,
+    created_at_ms,
+    updated_at_ms,
+    source,
+    model_provider,
+    cwd,
+    title,
+    sandbox_policy,
+    approval_mode
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(thread_id)
+        .bind("/tmp/legacy.jsonl")
+        .bind(1_700_000_000_i64)
+        .bind(1_700_000_000_i64)
+        .bind(1_700_000_000_000_i64)
+        .bind(1_700_000_000_000_i64)
+        .bind("cli")
+        .bind("openai")
+        .bind("/tmp")
+        .bind("")
+        .bind("read-only")
+        .bind("on-request")
+        .execute(&pool)
+        .await
+        .expect("legacy thread insert should succeed");
+    }
+
+    let pinned_values = sqlx::query_scalar::<_, bool>("SELECT is_pinned FROM threads ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("pin states should load");
+    assert_eq!(pinned_values, vec![false, false]);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn agent_job_tables_are_dropped_when_upgrading() {
+    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+    tokio::fs::create_dir_all(&sqlite_home)
+        .await
+        .expect("sqlite home should be created");
+    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
+        let _ = std::fs::remove_dir_all(sqlite_home);
+    });
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let state_path = sqlite.state_db_path();
+    let pool = sqlite
+        .open_read_write_pool(&state_path)
         .await
         .expect("sqlite database should open");
     migrator_through(/*version*/ 15)
@@ -130,8 +203,9 @@ async fn recency_migration_backfills_and_seeds_old_binary_inserts() {
         let _ = std::fs::remove_dir_all(sqlite_home);
     });
     let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let state_path = sqlite.state_db_path();
     let pool = sqlite
-        .open_read_write_pool(&state_db_path(&sqlite_home))
+        .open_read_write_pool(&state_path)
         .await
         .expect("sqlite database should open");
     migrator_through(/*version*/ 37)
@@ -243,8 +317,9 @@ async fn repairs_recency_migration_that_was_applied_as_version_38() {
         let _ = std::fs::remove_dir_all(sqlite_home);
     });
     let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let state_path = sqlite.state_db_path();
     let pool = sqlite
-        .open_read_write_pool(&state_db_path(&sqlite_home))
+        .open_read_write_pool(&state_path)
         .await
         .expect("sqlite database should open");
     migrator_through(/*version*/ 37)
@@ -319,7 +394,7 @@ async fn repair_recency_migration_succeeds_while_another_connection_holds_writer
         let _ = std::fs::remove_dir_all(sqlite_home);
     });
     let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
-    let state_path = state_db_path(&sqlite_home);
+    let state_path = sqlite.state_db_path();
     let pool = sqlite
         .open_read_write_pool(&state_path)
         .await

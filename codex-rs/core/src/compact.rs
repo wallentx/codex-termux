@@ -63,7 +63,6 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
 /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
 /// initial context into the replacement history just above the last real user message.
-#[derive(Debug)]
 pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage {
         world_state: Arc<WorldState>,
@@ -97,7 +96,6 @@ pub(crate) async fn build_compaction_initial_context(
                     step_context.turn.as_ref(),
                     world_state.as_ref(),
                     step_context.mcp.as_ref(),
-                    &step_context.extension_data,
                 )
                 .await;
             (items, Some(Arc::clone(world_state)))
