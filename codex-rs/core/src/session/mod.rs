@@ -74,7 +74,7 @@ use codex_hooks::HooksConfig;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
-use codex_mcp::McpConnectionManager;
+use codex_mcp::McpConnectionSet;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpRuntime;
 use codex_mcp::McpRuntimeContext;
@@ -405,6 +405,12 @@ pub(crate) struct SessionIo {
 
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitEnrichmentPolicy {
+    Fresh,
+    Skip,
+}
+
 pub(crate) struct SessionSpawnArgs {
     pub(crate) config: Config,
     pub(crate) allow_provider_model_fallback: bool,
@@ -445,6 +451,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
+    pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
 }
 
 pub(crate) fn resolve_multi_agent_version(
@@ -533,6 +540,7 @@ impl Session {
             attestation_provider,
             external_time_provider,
             inherited_multi_agent_version,
+            git_enrichment_policy,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -720,6 +728,7 @@ impl Session {
             attestation_provider,
             external_time_provider,
             multi_agent_version,
+            git_enrichment_policy,
         ))
         .await
         .map_err(|e| {
@@ -2911,7 +2920,8 @@ impl Session {
     pub(crate) async fn capture_step_context(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
-    ) -> Arc<StepContext> {
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<Arc<StepContext>> {
         // Keep selections fixed for the turn while allowing their startup work to finish.
         let environments = turn_context.environments.refresh_readiness();
         self.services
@@ -2938,14 +2948,24 @@ impl Session {
                 executor_capability_discovery.as_deref(),
             )
             .await;
-        Arc::new(StepContext::new(
-            turn_context,
+        let (mcp_tools, tool_router) = turn::built_tools(
+            self.as_ref(),
+            turn_context.as_ref(),
+            &environments,
+            mcp.as_ref(),
+            cancellation_token,
+        )
+        .await?;
+        Ok(Arc::new(StepContext {
+            turn: turn_context,
             environments,
             selected_capability_roots,
             executor_capability_discovery,
             mcp,
+            mcp_tools,
+            tool_router,
             loaded_agents_md,
-        ))
+        }))
     }
 
     pub(crate) async fn record_inter_agent_communication(
@@ -3173,7 +3193,6 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
-                    step_store: &step_context.extension_data,
                     model_context_window: turn_context.model_context_window(),
                 })
                 .await
@@ -3215,14 +3234,8 @@ impl Session {
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
         let mcp = self.services.latest_mcp_runtime();
-        let step_store = codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
-        self.build_initial_context_with_world_state_and_mcp(
-            turn_context,
-            world_state,
-            &mcp,
-            &step_store,
-        )
-        .await
+        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, &mcp)
+            .await
     }
 
     pub(crate) async fn build_initial_context_with_world_state_and_mcp(
@@ -3230,7 +3243,6 @@ impl Session {
         turn_context: &TurnContext,
         world_state: &WorldState,
         mcp: &McpRuntimeSnapshot,
-        step_store: &codex_extension_api::ExtensionData,
     ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
@@ -3345,7 +3357,6 @@ impl Session {
                 .contribute_thread_context(
                     &self.services.session_extension_data,
                     &self.services.thread_extension_data,
-                    step_store,
                 )
                 .await
             {
@@ -3365,7 +3376,6 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
-                    step_store,
                     model_context_window: turn_context.model_context_window(),
                 })
                 .await
@@ -3540,7 +3550,6 @@ impl Session {
                 turn_context,
                 world_state.as_ref(),
                 step_context.mcp.as_ref(),
-                &step_context.extension_data,
             )
             .await;
         let turn_context_item = turn_context.to_turn_context_item();
@@ -3598,7 +3607,6 @@ impl Session {
                     turn_context,
                     world_state.as_ref(),
                     step_context.mcp.as_ref(),
-                    &step_context.extension_data,
                 )
                 .await;
             let snapshot = world_state.snapshot();
