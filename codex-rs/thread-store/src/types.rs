@@ -399,8 +399,21 @@ pub struct ListItemsParams {
     pub cursor: Option<String>,
     /// Maximum number of items to return.
     pub page_size: usize,
-    /// Sort direction requested by the caller.
+    /// Direction to sort items by the selected ordinal.
     pub sort_direction: SortDirection,
+    /// Ordinal to sort items by. Update-ordinal sorting requires an update watermark.
+    pub sort_key: ItemSortKey,
+    /// Filters out items with an update ordinal less than or equal to the provided value.
+    pub after_updated_at_ordinal: Option<u64>,
+}
+
+/// The ordinal to use when listing persisted items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ItemSortKey {
+    /// Sort by the ordinal where the item was first projected.
+    CreatedAtOrdinal,
+    /// Sort by the ordinal where the item was last updated.
+    UpdatedAtOrdinal,
 }
 
 /// A projected app-server `ThreadItem` snapshot within a turn.
@@ -410,6 +423,8 @@ pub struct StoredThreadItem {
     pub turn_id: String,
     /// Stable item identifier within the turn.
     pub item_id: String,
+    /// Rollout ordinal of the latest persisted update to this item.
+    pub updated_at_ordinal: u64,
     /// Unix timestamp (milliseconds) when this logical item was first projected.
     pub created_at_ms: i64,
     /// Serialized app-server ThreadItem snapshot.
@@ -789,6 +804,17 @@ pub struct UpdateThreadMetadataParams {
 pub struct ArchiveThreadParams {
     /// Thread id to archive or unarchive.
     pub thread_id: ThreadId,
+}
+
+/// Parameters for archiving a set of threads as one store operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveThreadsParams {
+    /// Thread ids to archive, in the order their persisted data should be moved.
+    pub thread_ids: Vec<ThreadId>,
+    /// Thread ids whose paginated writer ownership must be checked before archiving, including
+    /// descendants whose rollout has not materialized yet.
+    #[serde(default)]
+    pub writer_lock_thread_ids: Vec<ThreadId>,
 }
 
 /// Parameters for deleting a thread.

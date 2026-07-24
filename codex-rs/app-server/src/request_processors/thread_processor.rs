@@ -5,6 +5,7 @@ use crate::error_code::method_not_found;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::config_types::MultiAgentMode;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -1253,10 +1254,12 @@ impl ThreadRequestProcessor {
                 thread_start.dynamic_tool_count = dynamic_tool_count,
             ))
             .await
-            .map_err(|err| match err {
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                CodexErr::UnsupportedOperation(message) => method_not_found(message),
-                err => internal_error(format!("error creating thread: {err}")),
+            .map_err(|err| match err.details() {
+                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                CodexErrorDetails::UnsupportedOperation(message) => {
+                    method_not_found(message.clone())
+                }
+                _ => internal_error(format!("error creating thread: {err}")),
             })?;
         let session_telemetry = thread.session_telemetry();
         session_telemetry.record_startup_phase(
@@ -1427,7 +1430,7 @@ impl ThreadRequestProcessor {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
 
-        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
+        let subtree_thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
 
         let mut archive_thread_ids = Vec::new();
         match self
@@ -1446,7 +1449,7 @@ impl ThreadRequestProcessor {
             }
             Err(err) => return Err(thread_store_archive_error("archive", err)),
         }
-        for descendant_thread_id in thread_ids.into_iter().skip(1) {
+        for descendant_thread_id in subtree_thread_ids.iter().copied().skip(1) {
             match self
                 .thread_store
                 .read_thread(StoreReadThreadParams {
@@ -1469,46 +1472,26 @@ impl ThreadRequestProcessor {
             }
         }
 
-        let mut archived_thread_ids = Vec::new();
-        let Some((parent_thread_id, descendant_thread_ids)) = archive_thread_ids.split_first()
-        else {
-            return Ok((ThreadArchiveResponse {}, archived_thread_ids));
-        };
+        if archive_thread_ids.is_empty() {
+            return Ok((ThreadArchiveResponse {}, Vec::new()));
+        }
 
-        self.prepare_thread_for_archive(*parent_thread_id).await;
-        match self
+        archive_thread_ids[1..].reverse();
+        for &thread_id_to_archive in &archive_thread_ids {
+            self.prepare_thread_for_archive(thread_id_to_archive).await;
+        }
+
+        let archived_thread_ids = self
             .thread_store
-            .archive_thread(StoreArchiveThreadParams {
-                thread_id: *parent_thread_id,
+            .archive_threads(StoreArchiveThreadsParams {
+                thread_ids: archive_thread_ids,
+                writer_lock_thread_ids: subtree_thread_ids,
             })
             .await
-        {
-            Ok(()) => {
-                archived_thread_ids.push(parent_thread_id.to_string());
-            }
-            Err(err) => return Err(thread_store_archive_error("archive", err)),
-        }
-
-        for descendant_thread_id in descendant_thread_ids.iter().rev().copied() {
-            self.prepare_thread_for_archive(descendant_thread_id).await;
-            match self
-                .thread_store
-                .archive_thread(StoreArchiveThreadParams {
-                    thread_id: descendant_thread_id,
-                })
-                .await
-            {
-                Ok(()) => {
-                    archived_thread_ids.push(descendant_thread_id.to_string());
-                }
-                Err(err) => {
-                    warn!(
-                        "failed to archive spawned descendant thread {descendant_thread_id} while archiving {thread_id}: {err}"
-                    );
-                }
-            }
-        }
-
+            .map_err(|err| thread_store_archive_error("archive", err))?
+            .into_iter()
+            .map(|thread_id| thread_id.to_string())
+            .collect();
         Ok((ThreadArchiveResponse {}, archived_thread_ids))
     }
 
@@ -1553,9 +1536,9 @@ impl ThreadRequestProcessor {
         let count = thread
             .decrement_out_of_band_elicitation_count()
             .await
-            .map_err(|err| match err {
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                err => internal_error(format!(
+            .map_err(|err| match err.details() {
+                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                _ => internal_error(format!(
                     "failed to decrement out-of-band elicitation counter: {err}"
                 )),
             })?;
@@ -2712,6 +2695,8 @@ impl ThreadRequestProcessor {
                     cursor: cursor.clone(),
                     page_size: THREAD_ITEMS_MAX_LIMIT,
                     sort_direction: StoreSortDirection::Asc,
+                    sort_key: StoreItemSortKey::CreatedAtOrdinal,
+                    after_updated_at_ordinal: None,
                 })
                 .await
                 .map_err(paginated_history_list_error)?;
@@ -2826,6 +2811,8 @@ impl ThreadRequestProcessor {
                 cursor: None,
                 page_size: 1,
                 sort_direction: StoreSortDirection::Desc,
+                sort_key: StoreItemSortKey::CreatedAtOrdinal,
+                after_updated_at_ordinal: None,
             })
             .await
             .map_err(paginated_history_list_error)?;
@@ -2861,6 +2848,8 @@ impl ThreadRequestProcessor {
                     SortDirection::Asc => StoreSortDirection::Asc,
                     SortDirection::Desc => StoreSortDirection::Desc,
                 },
+                sort_key: StoreItemSortKey::CreatedAtOrdinal,
+                after_updated_at_ordinal: None,
             })
             .await
             .map_err(|err| match err {
@@ -3399,9 +3388,9 @@ impl ThreadRequestProcessor {
                     .await;
             }
             Err(err) => {
-                let error = match err {
-                    CodexErr::InvalidRequest(message) => invalid_request(message),
-                    err => internal_error(format!("error resuming thread: {err}")),
+                let error = match err.details() {
+                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                    _ => internal_error(format!("error resuming thread: {err}")),
                 };
                 self.outgoing.send_error(request_id, error).await;
             }
@@ -4129,12 +4118,12 @@ impl ThreadRequestProcessor {
                 supports_openai_form_elicitation,
             )
             .await
-            .map_err(|err| match err {
-                CodexErr::Io(_) | CodexErr::Json(_) => {
+            .map_err(|err| match err.details() {
+                CodexErrorDetails::Io(_) | CodexErrorDetails::Json(_) => {
                     invalid_request(format!("failed to load thread {source_thread_id}: {err}"))
                 }
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                err => internal_error(format!("error forking thread: {err}")),
+                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                _ => internal_error(format!("error forking thread: {err}")),
             })?;
 
         Self::set_app_server_client_info(
@@ -4932,19 +4921,21 @@ fn conversation_summary_rollout_path_read_error(
 }
 
 pub(super) fn core_thread_write_error(operation: &str, err: CodexErr) -> JSONRPCErrorError {
-    match err {
-        CodexErr::ThreadNotFound(thread_id) => {
+    match err.details() {
+        CodexErrorDetails::ThreadNotFound(thread_id) => {
             invalid_request(format!("thread not found: {thread_id}"))
         }
-        CodexErr::InvalidRequest(message) => invalid_request(message),
-        CodexErr::UnsupportedOperation(message) => method_not_found(message),
-        err => internal_error(format!("failed to {operation}: {err}")),
+        CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+        CodexErrorDetails::UnsupportedOperation(message) => method_not_found(message.clone()),
+        _ => internal_error(format!("failed to {operation}: {err}")),
     }
 }
 
 fn thread_store_archive_error(operation: &str, err: ThreadStoreError) -> JSONRPCErrorError {
     match err {
-        ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+        ThreadStoreError::InvalidRequest { message } | ThreadStoreError::Conflict { message } => {
+            invalid_request(message)
+        }
         ThreadStoreError::Unsupported {
             operation: unsupported_operation,
         } => unsupported_thread_store_operation(unsupported_operation),
