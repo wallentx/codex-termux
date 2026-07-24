@@ -467,6 +467,22 @@ async fn request_user_input_tool_respects_experimental_config_gate() {
 }
 
 #[tokio::test]
+async fn update_plan_tool_respects_config_gate() {
+    let enabled = probe(|_| {}).await;
+    enabled.assert_visible_contains(&["update_plan"]);
+    enabled.assert_registered_contains(&["update_plan"]);
+
+    let disabled = probe(|turn| {
+        update_config(turn, |config| {
+            config.update_plan_enabled = false;
+        });
+    })
+    .await;
+    disabled.assert_visible_lacks(&["update_plan"]);
+    disabled.assert_registered_lacks(&["update_plan"]);
+}
+
+#[tokio::test]
 async fn request_user_input_stays_direct_in_code_mode_only() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
@@ -944,6 +960,50 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     };
     assert!(second_description.contains("- second: Tools from second."));
     assert!(!second_description.contains("- first: Tools from first."));
+}
+
+#[tokio::test]
+async fn tool_search_cache_rebuilds_when_deferred_world_state_changes() {
+    let cache = ToolSearchHandlerCache::default();
+
+    for world_state_enabled in [false, true, false] {
+        let (_session, mut turn) = make_session_and_context().await;
+        turn.model_info.supports_search_tool = true;
+        set_feature(
+            &mut turn,
+            Feature::DeferredToolWorldState,
+            world_state_enabled,
+        );
+        let turn = Arc::new(turn);
+        let step_context = StepContext::for_test(Arc::clone(&turn));
+        let router = ToolRouter::from_context(
+            step_context.turn.as_ref(),
+            &step_context.environments,
+            step_context.mcp.as_ref(),
+            ToolRouterParams {
+                tool_runtimes: vec![mcp_runtime(
+                    "calendar",
+                    "mcp__calendar",
+                    "lookup",
+                    ToolExposure::Deferred,
+                )],
+                tool_suggest_candidates: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+            },
+            &cache,
+        );
+        let plan = ToolPlanProbe::from_router(router);
+        let ToolSpec::ToolSearch { description, .. } = plan.visible_spec("tool_search") else {
+            panic!("expected visible tool_search spec");
+        };
+
+        assert_eq!(
+            description.contains("- calendar: Tools from calendar."),
+            !world_state_enabled,
+            "tool search cache should follow the deferred world-state feature"
+        );
+    }
 }
 
 #[tokio::test]

@@ -17,7 +17,7 @@ use codex_connectors::ConnectorRuntimeManager;
 use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::HttpClient;
-use codex_exec_server::ReqwestHttpClient;
+use codex_exec_server::RouteAwareHttpClient;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -141,13 +141,24 @@ impl McpRuntime {
     /// Reconciles configured servers and publishes their immutable runtime snapshot.
     pub async fn replace(&self, input: McpRuntimeInput) {
         let current = self.current.load_full();
+        self.publish(input, Some(current.connections.as_ref()))
+            .await;
+    }
+
+    /// Starts fresh connections and returns their complete, refreshed Apps catalog.
+    pub async fn replace_fresh(&self, input: McpRuntimeInput) -> anyhow::Result<Vec<ToolInfo>> {
+        self.publish(input, /*previous*/ None).await;
+        self.latest_hard_refresh_codex_apps_tools_cache().await
+    }
+
+    async fn publish(&self, input: McpRuntimeInput, previous: Option<&McpConnectionSet>) {
         let (publish, publication_gate) = McpPublicationGate::pending();
         let config = Arc::clone(&input.config);
         let plugins_available = input.plugins_available;
         let ready_selected_capability_roots = input.ready_selected_capability_roots.clone();
         let connections = Arc::new(
             McpConnectionSet::new(
-                Some(current.connections.as_ref()),
+                previous,
                 publication_gate,
                 input,
                 self.elicitation_router.clone(),
@@ -295,6 +306,12 @@ impl McpRuntimeContext {
         self.local_stdio_fallback_cwd.clone()
     }
 
+    pub(crate) fn local_http_client(&self) -> Arc<dyn HttpClient> {
+        Arc::new(RouteAwareHttpClient::new(
+            self.environment_manager.http_client_factory().clone(),
+        ))
+    }
+
     pub(crate) fn resolve_server_environment(
         &self,
         server_name: &str,
@@ -334,7 +351,7 @@ impl McpRuntimeContext {
         Ok(self
             .resolve_server_environment(server_name, config)?
             .map_or_else(
-                || Arc::new(ReqwestHttpClient) as Arc<dyn HttpClient>,
+                || self.local_http_client(),
                 |environment| environment.get_http_client(),
             ))
     }
@@ -354,6 +371,7 @@ mod tests {
     use codex_config::McpServerConfig;
     use codex_config::McpServerTransportConfig;
     use codex_exec_server::EnvironmentManager;
+    use codex_exec_server_test_support::environment_manager_without_environments;
     use codex_utils_path_uri::LegacyAppPathString;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
@@ -475,7 +493,7 @@ mod tests {
     #[test]
     fn local_stdio_requires_local_stdio_availability() {
         let runtime_context = McpRuntimeContext::new(
-            Arc::new(EnvironmentManager::without_environments()),
+            Arc::new(environment_manager_without_environments()),
             PathBuf::from("/tmp"),
         );
 
@@ -494,7 +512,7 @@ mod tests {
     #[test]
     fn local_http_does_not_require_local_stdio_availability() {
         let runtime_context = McpRuntimeContext::new(
-            Arc::new(EnvironmentManager::without_environments()),
+            Arc::new(environment_manager_without_environments()),
             PathBuf::from("/tmp"),
         );
 
@@ -510,7 +528,7 @@ mod tests {
     #[test]
     fn unknown_explicit_environment_is_rejected() {
         let runtime_context = McpRuntimeContext::new(
-            Arc::new(EnvironmentManager::without_environments()),
+            Arc::new(environment_manager_without_environments()),
             PathBuf::from("/tmp"),
         );
 

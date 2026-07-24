@@ -1853,6 +1853,7 @@ version = "0.0.0"
 dependencies = [
  "codex-protocol",
  "codex-state",
+ "codex-utils-absolute-path",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -1965,6 +1966,7 @@ dependencies = [
  "codex-backend-client",
  "codex-chatgpt",
  "codex-cloud-config",
+ "codex-code-mode",
  "codex-config",
  "codex-connectors",
  "codex-core",
@@ -2487,12 +2489,15 @@ name = "codex-code-mode"
 version = "0.0.0"
 dependencies = [
  "codex-code-mode-protocol",
+ "codex-http-client",
  "codex-protocol",
+ "codex-websocket-client",
  "deno_core_icudata",
  "futures",
  "pretty_assertions",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "v8",
@@ -2503,15 +2508,21 @@ name = "codex-code-mode-host"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "clap",
  "codex-code-mode",
  "codex-code-mode-protocol",
  "codex-protocol",
  "codex-utils-cargo-bin",
+ "futures",
  "pretty_assertions",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2647,6 +2658,7 @@ dependencies = [
  "codex-core-plugins",
  "codex-core-skills",
  "codex-exec-server",
+ "codex-exec-server-test-support",
  "codex-execpolicy",
  "codex-extension-api",
  "codex-extension-items",
@@ -2769,6 +2781,7 @@ dependencies = [
  "codex-model-provider-info",
  "codex-models-manager",
  "codex-protocol",
+ "codex-state",
  "codex-utils-absolute-path",
 ]
 
@@ -2784,6 +2797,7 @@ dependencies = [
  "codex-connectors",
  "codex-core-skills",
  "codex-exec-server",
+ "codex-exec-server-test-support",
  "codex-git-utils",
  "codex-hooks",
  "codex-http-client",
@@ -2793,6 +2807,7 @@ dependencies = [
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
+ "codex-shell-command",
  "codex-skills",
  "codex-tools",
  "codex-utils-absolute-path",
@@ -2915,6 +2930,7 @@ dependencies = [
  "clatter",
  "codex-api",
  "codex-exec-server-protocol",
+ "codex-exec-server-test-support",
  "codex-file-system",
  "codex-http-client",
  "codex-network-proxy",
@@ -2926,6 +2942,7 @@ dependencies = [
  "codex-utils-path-uri",
  "codex-utils-pty",
  "codex-utils-rustls-provider",
+ "codex-websocket-client",
  "ctor 0.6.3",
  "futures",
  "http 1.4.0",
@@ -2935,7 +2952,6 @@ dependencies = [
  "pretty_assertions",
  "prost",
  "rcgen",
- "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
@@ -2950,6 +2966,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "uuid",
  "windows-sys 0.52.0",
  "wiremock",
@@ -2968,6 +2985,14 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "codex-exec-server-test-support"
+version = "0.0.0"
+dependencies = [
+ "codex-exec-server",
+ "codex-http-client",
 ]
 
 [[package]]
@@ -3171,6 +3196,7 @@ dependencies = [
  "codex-protocol",
  "codex-state",
  "codex-tools",
+ "codex-utils-absolute-path",
  "codex-utils-template",
  "pretty_assertions",
  "serde",
@@ -3392,6 +3418,7 @@ dependencies = [
  "codex-config",
  "codex-connectors",
  "codex-exec-server",
+ "codex-exec-server-test-support",
  "codex-login",
  "codex-model-provider",
  "codex-otel",
@@ -3824,6 +3851,7 @@ dependencies = [
  "codex-api",
  "codex-config",
  "codex-exec-server",
+ "codex-http-client",
  "codex-keyring-store",
  "codex-protocol",
  "codex-secrets",

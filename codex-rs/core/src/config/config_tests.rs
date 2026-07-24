@@ -361,6 +361,7 @@ web_search = true
         Some(ToolsToml {
             web_search: None,
             experimental_request_user_input: None,
+            update_plan: None,
         })
     );
 }
@@ -380,6 +381,7 @@ web_search = false
         Some(ToolsToml {
             web_search: None,
             experimental_request_user_input: None,
+            update_plan: None,
         })
     );
 }
@@ -398,6 +400,7 @@ fn tools_experimental_request_user_input_defaults_to_enabled() {
         Some(ToolsToml {
             web_search: None,
             experimental_request_user_input: Some(ExperimentalRequestUserInput { enabled: true }),
+            update_plan: None,
         })
     );
 }
@@ -417,6 +420,7 @@ enabled = false
         Some(ToolsToml {
             web_search: None,
             experimental_request_user_input: Some(ExperimentalRequestUserInput { enabled: false }),
+            update_plan: None,
         })
     );
 }
@@ -431,6 +435,7 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
                 experimental_request_user_input: Some(ExperimentalRequestUserInput {
                     enabled: false,
                 }),
+                update_plan: None,
             }),
             ..ConfigToml::default()
         },
@@ -499,6 +504,27 @@ async fn load_config_resolves_non_prefixed_mcp_tool_servers() -> std::io::Result
             expected_servers.unwrap_or_default()
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_resolves_update_plan_enabled() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config_toml = toml::from_str(
+        r#"
+[tools.update_plan]
+enabled = false
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert!(!config.update_plan_enabled);
     Ok(())
 }
 
@@ -5414,7 +5440,7 @@ async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Re
     )
     .await?;
 
-    assert_eq!(config.sqlite_home, codex_home.path().to_path_buf());
+    assert_eq!(config.sqlite.home(), codex_home.path());
 
     Ok(())
 }
@@ -9219,6 +9245,7 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
         allow_appshots: None,
         allow_remote_control: None,
         computer_use: None,
+        browser_use: None,
         windows: None,
         feature_requirements: None,
         hooks: None,
@@ -11933,7 +11960,7 @@ sandbox_private_desktop = false
     );
     let config = load_with_enterprise_requirement(&codex_home, requirements).await?;
 
-    assert_eq!(config.sqlite_home, required_sqlite_home);
+    assert_eq!(config.sqlite.home(), required_sqlite_home.as_path());
     assert_eq!(config.log_dir, required_log_dir);
     assert_eq!(config.model_catalog, Some(catalog));
     assert!(!config.check_for_update_on_startup);
