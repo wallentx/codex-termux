@@ -199,6 +199,7 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
@@ -305,6 +306,7 @@ pub(crate) struct PreviousTurnSettings {
 use crate::SkillMetadata;
 use crate::SkillsService;
 use crate::exec_policy::ExecPolicyUpdateError;
+use crate::guardian::GuardianReviewOptions;
 use crate::guardian::GuardianReviewSessionManager;
 use crate::mcp::McpManager;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
@@ -333,6 +335,7 @@ use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttfm_metric;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
+use codex_core_plugins::PluginCommandAttribution;
 use codex_core_plugins::PluginsManager;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
@@ -452,6 +455,8 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
     pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
+    pub(crate) windows_sandbox_proxy_settings_mode:
+        codex_sandboxing::WindowsSandboxProxySettingsMode,
 }
 
 pub(crate) fn resolve_multi_agent_version(
@@ -541,6 +546,7 @@ impl Session {
             external_time_provider,
             inherited_multi_agent_version,
             git_enrichment_policy,
+            windows_sandbox_proxy_settings_mode,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -729,6 +735,7 @@ impl Session {
             external_time_provider,
             multi_agent_version,
             git_enrichment_policy,
+            windows_sandbox_proxy_settings_mode,
         ))
         .await
         .map_err(|e| {
@@ -819,7 +826,7 @@ impl SessionIo {
         let session_loop_termination = self.session_loop_termination.clone();
         match self.submit(Op::Shutdown).await {
             Ok(_) => {}
-            Err(CodexErr::InternalAgentDied) => {}
+            Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
             Err(err) => return Err(err),
         }
         session_loop_termination.await;
@@ -2275,6 +2282,7 @@ impl Session {
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
         additional_permissions: Option<AdditionalPermissionProfile>,
         available_decisions: Option<Vec<ReviewDecision>>,
+        plugin_attribution_override: Option<PluginCommandAttribution>,
     ) -> ReviewDecision {
         let _elicitation = self.services.elicitations.register();
         //  command-level approvals use `call_id`.
@@ -2317,8 +2325,16 @@ impl Session {
                 additional_permissions.as_ref(),
             )
         });
+        let plugin_attribution = plugin_attribution_override
+            .or_else(|| turn_context.plugin_attribution_for_command(&command, &cwd));
+        let (plugin_id, script_path) = plugin_attribution
+            .as_ref()
+            .map(PluginCommandAttribution::serialized_fields)
+            .unzip();
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id,
+            plugin_id,
+            script_path,
             approval_id,
             turn_id: turn_context.sub_id.clone(),
             environment_id,
@@ -2447,8 +2463,12 @@ impl Session {
                 review_id,
                 request,
                 /*retry_reason*/ None,
-                codex_analytics::GuardianApprovalRequestSource::MainTurn,
-                cancellation_token.clone(),
+                GuardianReviewOptions {
+                    plugin_attribution_override: None,
+                    approval_request_source:
+                        codex_analytics::GuardianApprovalRequestSource::MainTurn,
+                    external_cancel: Some(cancellation_token.clone()),
+                },
             );
             let decision = tokio::select! {
                 biased;

@@ -24,7 +24,6 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::StateDbHandle;
 use codex_state::SqliteConfig;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
@@ -35,6 +34,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
+use crate::ArchiveThreadsParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::DeleteThreadsParams;
@@ -92,7 +92,7 @@ struct LiveRecorderEntry {
     // canonical SessionMeta is durable. Retain the mode captured when live persistence was opened
     // so missing SQLite rows can still be seeded.
     history_mode: ThreadHistoryMode,
-    _writer_lock: Option<WriterLockGuard>,
+    writer_lock: Option<WriterLockGuard>,
 }
 
 #[derive(Default)]
@@ -128,17 +128,10 @@ pub struct LocalThreadStoreConfig {
 }
 
 impl LocalThreadStoreConfig {
-    #[expect(
-        clippy::expect_used,
-        reason = "resolved Codex configuration paths must be absolute"
-    )]
     pub fn from_config(config: &impl codex_rollout::RolloutConfigView) -> Self {
         Self {
             codex_home: config.codex_home().to_path_buf(),
-            sqlite: SqliteConfig::from_sqlite_home(
-                AbsolutePathBuf::from_absolute_path_checked(config.sqlite_home())
-                    .expect("sqlite home from resolved config should be absolute"),
-            ),
+            sqlite: config.sqlite_config().clone(),
             default_model_provider_id: config.model_provider_id().to_string(),
         }
     }
@@ -174,7 +167,7 @@ impl LocalThreadStore {
     async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {
         self.thread_history_db
             .get_or_try_init(|| async {
-                codex_state::open_thread_history_db(self.config.sqlite.home()).await
+                codex_state::open_thread_history_db(&self.config.sqlite).await
             })
             .await
             .map_err(|err| ThreadStoreError::Internal {
@@ -215,6 +208,42 @@ impl LocalThreadStore {
         Ok(())
     }
 
+    async fn acquire_paginated_writer_locks(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> ThreadStoreResult<Vec<WriterLockGuard>> {
+        let mut writer_locks = Vec::new();
+        for &thread_id in thread_ids {
+            if self
+                .live_recorders
+                .lock()
+                .await
+                .get(&thread_id)
+                .is_some_and(|entry| entry.writer_lock.is_some())
+            {
+                continue;
+            }
+
+            // Only a readable legacy header proves no paginated writer can own this id. Missing
+            // lazy rollouts and damaged headers must conservatively try the lock.
+            let history_mode = match read_thread::resolve_rollout_path(
+                self, thread_id, /*include_archived*/ true,
+            )
+            .await?
+            {
+                Some(rollout_path) => codex_rollout::read_session_meta_line(rollout_path.as_path())
+                    .await
+                    .ok()
+                    .map(|meta_line| meta_line.meta.history_mode),
+                None => None,
+            };
+            if !matches!(history_mode, Some(ThreadHistoryMode::Legacy)) {
+                writer_locks.push(self.writer_lock_coordinator.acquire(thread_id)?);
+            }
+        }
+        Ok(writer_locks)
+    }
+
     async fn insert_live_recorder(
         &self,
         thread_id: ThreadId,
@@ -230,7 +259,7 @@ impl LocalThreadStore {
                 entry.insert(LiveRecorderEntry {
                     recorder,
                     history_mode,
-                    _writer_lock: writer_lock,
+                    writer_lock,
                 });
                 Ok(())
             }
@@ -410,7 +439,24 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { archive_thread::archive_thread(self, params).await })
+        Box::pin(async move {
+            archive_thread::archive_threads(
+                self,
+                ArchiveThreadsParams {
+                    thread_ids: vec![params.thread_id],
+                    writer_lock_thread_ids: Vec::new(),
+                },
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+
+    fn archive_threads(
+        &self,
+        params: ArchiveThreadsParams,
+    ) -> ThreadStoreFuture<'_, Vec<ThreadId>> {
+        Box::pin(async move { archive_thread::archive_threads(self, params).await })
     }
 
     fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
@@ -517,7 +563,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -552,7 +598,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -587,7 +633,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -655,7 +701,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -744,7 +790,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -780,7 +826,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -820,7 +866,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -864,7 +910,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -919,7 +965,7 @@ mod tests {
         let external_home = TempDir::new().expect("external temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
