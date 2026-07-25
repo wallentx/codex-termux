@@ -1,3 +1,4 @@
+use super::mcp_refresh::McpRefreshInvalidationGuard;
 use super::*;
 use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
@@ -42,21 +43,6 @@ enum GuardianElicitationReview {
 
 struct GuardianMcpElicitationReviewer {
     session: std::sync::Weak<Session>,
-}
-
-/// Restores a claimed refresh when its task is cancelled before publication.
-struct McpRefreshInvalidationGuard<'a> {
-    pending: &'a std::sync::atomic::AtomicBool,
-    published: bool,
-}
-
-impl Drop for McpRefreshInvalidationGuard<'_> {
-    fn drop(&mut self) {
-        if !self.published {
-            self.pending
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-    }
 }
 
 pub(crate) struct McpServerElicitationOutcome {
@@ -147,22 +133,36 @@ impl Session {
 
     /// Publishes changed MCP state, waiting for any refresh already in progress.
     pub(crate) async fn refresh_mcp_if_dirty(self: &Arc<Self>) {
-        let Ok(_refresh) = self.mcp_refresh_lock.acquire().await else {
+        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
             error!("MCP runtime refresh semaphore closed");
             return;
         };
         loop {
-            if !self
-                .mcp_refresh_pending
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            let auth = self.services.auth_manager.auth_cached();
+            if self
+                .services
+                .plugins_manager
+                .set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode))
+                || !self
+                    .services
+                    .mcp_runtime
+                    .current_auth_matches(auth.as_ref())
             {
+                self.mark_mcp_runtime_dirty();
+            }
+
+            if !self.mcp_refresh.claim() {
                 return;
             }
             let mut refresh_invalidation = McpRefreshInvalidationGuard {
-                pending: &self.mcp_refresh_pending,
+                refresh: &self.mcp_refresh,
                 published: false,
             };
-            let desired = self.latest_mcp_desired_state().await;
+            let auth = self.services.auth_manager.auth().await;
+            self.services
+                .plugins_manager
+                .set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
+            let desired = self.latest_mcp_desired_state(auth).await;
             let selected_capability_roots = self
                 .resolve_selected_capability_roots_for_step(&desired.environments)
                 .await;
@@ -194,10 +194,7 @@ impl Session {
             )
             .await;
             refresh_invalidation.published = true;
-            if !self
-                .mcp_refresh_pending
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if !self.mcp_refresh.is_pending() {
                 return;
             }
         }
@@ -209,11 +206,15 @@ impl Session {
     ) -> anyhow::Result<Vec<codex_mcp::ToolInfo>> {
         self.refresh_mcp_if_dirty().await;
         let _refresh = self
-            .mcp_refresh_lock
+            .mcp_refresh
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("MCP runtime refresh semaphore closed"))?;
-        let desired = self.latest_mcp_desired_state().await;
+        let auth = self.services.auth_manager.auth().await;
+        self.services
+            .plugins_manager
+            .set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
+        let desired = self.latest_mcp_desired_state(auth).await;
         let selected_capability_roots = self
             .resolve_selected_capability_roots_for_step(&desired.environments)
             .await;
@@ -237,14 +238,12 @@ impl Session {
                 executor_capability_discovery.as_deref(),
             )
             .await;
-        let input = self
-            .build_mcp_runtime_input(
-                &desired,
-                mcp_projection,
-                &ready_selected_capability_roots,
-                Some(self.mcp_elicitation_reviewer()),
-            )
-            .await;
+        let input = self.build_mcp_runtime_input(
+            &desired,
+            mcp_projection,
+            &ready_selected_capability_roots,
+            Some(self.mcp_elicitation_reviewer()),
+        );
         anyhow::ensure!(
             input.mcp_servers.contains_key(CODEX_APPS_MCP_SERVER_NAME),
             "unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"
@@ -253,8 +252,7 @@ impl Session {
     }
 
     pub(super) fn mark_mcp_runtime_dirty(&self) {
-        self.mcp_refresh_pending
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.mcp_refresh.invalidate();
     }
 
     #[tracing::instrument(name = "mcp.runtime.resolve_for_step", skip_all)]
@@ -502,7 +500,7 @@ impl Session {
         self.services
             .supports_openai_form_elicitation
             .store(supported, std::sync::atomic::Ordering::Relaxed);
-        self.mark_mcp_runtime_dirty();
+        self.request_mcp_runtime_refresh();
         Ok(())
     }
 
@@ -512,10 +510,14 @@ impl Session {
         refresh_config: &Config,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
     ) {
-        let Ok(_refresh) = self.mcp_refresh_lock.acquire().await else {
+        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
             error!("MCP runtime refresh semaphore closed");
             return;
         };
+        let auth = self.services.auth_manager.auth().await;
+        self.services
+            .plugins_manager
+            .set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
         {
             let mut state = self.state.lock().await;
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
@@ -544,7 +546,7 @@ impl Session {
                 executor_capability_discovery.as_deref(),
             )
             .await;
-        let mut desired = self.latest_mcp_desired_state().await;
+        let mut desired = self.latest_mcp_desired_state(auth).await;
         desired.config = Arc::new(refresh_config.clone());
         self.publish_mcp_runtime(
             &desired,
@@ -579,15 +581,46 @@ async fn review_guardian_mcp_elicitation(
         return Ok(None);
     };
 
-    let approvals_reviewer = crate::connectors::mcp_approvals_reviewer(
-        turn_context.config.as_ref(),
+    let Some(mcp_config) = session.services.mcp_runtime.current_config() else {
+        return Ok(None);
+    };
+    let approval_policy = mcp_config.approval_policy.value();
+    match approval_policy {
+        AskForApproval::Never => {
+            if codex_mcp::mcp_permission_prompt_is_auto_approved(
+                approval_policy,
+                &mcp_config.permission_profile,
+                codex_mcp::McpPermissionPromptAutoApproveContext::default(),
+            ) && matches!(
+                &request.elicitation,
+                Elicitation::Mcp(
+                    rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
+                        requested_schema,
+                        ..
+                    }
+                ) if requested_schema.properties.is_empty()
+            ) {
+                return Ok(Some(ElicitationResponse {
+                    action: ElicitationAction::Accept,
+                    content: Some(serde_json::json!({})),
+                    meta: None,
+                }));
+            }
+            return Ok(Some(mcp_elicitation_decline_without_message()));
+        }
+        AskForApproval::Granular(config) if !config.allows_mcp_elicitations() => {
+            return Ok(Some(mcp_elicitation_decline_without_message()));
+        }
+        AskForApproval::OnRequest | AskForApproval::UnlessTrusted | AskForApproval::Granular(_) => {
+        }
+    }
+    let approvals_reviewer = crate::connectors::mcp_approvals_reviewer_from_layers(
+        &mcp_config.config_layer_stack,
+        mcp_config.approvals_reviewer,
         request.server_name.as_str(),
         elicitation_connector_id(&request.elicitation),
     );
-    if !crate::guardian::routes_approval_to_guardian_with_reviewer(
-        turn_context.as_ref(),
-        approvals_reviewer,
-    ) {
+    if !crate::guardian::routes_approval_policy_to_guardian(approval_policy, approvals_reviewer) {
         return Ok(None);
     }
 
