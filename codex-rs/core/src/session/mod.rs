@@ -115,6 +115,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
@@ -194,9 +195,7 @@ use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStackOrdering;
-use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::McpServerConfig;
-use codex_config::types::OAuthCredentialsStoreMode;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
@@ -211,6 +210,8 @@ mod handlers;
 mod inject;
 mod input_queue;
 mod mcp;
+mod mcp_prewarm;
+mod mcp_refresh;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
 mod review;
@@ -363,7 +364,6 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::InitialHistory;
-use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::ModelRerouteEvent;
 use codex_protocol::protocol::ModelRerouteReason;
 use codex_protocol::protocol::ModelVerification;
@@ -414,6 +414,15 @@ pub(crate) enum GitEnrichmentPolicy {
     Skip,
 }
 
+/// Controls which fork history belongs in the newly created thread's own rollout.
+pub(crate) enum ForkPersistence {
+    Copied,
+    Referenced {
+        history_base: Option<HistoryPosition>,
+        inherited_item_count: usize,
+    },
+}
+
 pub(crate) struct SessionSpawnArgs {
     pub(crate) config: Config,
     pub(crate) allow_provider_model_fallback: bool,
@@ -429,6 +438,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
     pub(crate) conversation_history: InitialHistory,
     pub(crate) requested_history_mode: Option<ThreadHistoryMode>,
+    pub(crate) fork_persistence: ForkPersistence,
     pub(crate) session_source: SessionSource,
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -524,6 +534,7 @@ impl Session {
             extensions,
             conversation_history,
             requested_history_mode,
+            fork_persistence,
             session_source,
             forked_from_thread_id,
             parent_thread_id,
@@ -717,6 +728,7 @@ impl Session {
             tx_event.clone(),
             agent_status_tx.clone(),
             conversation_history,
+            fork_persistence,
             session_source_clone,
             skills_service,
             plugins_manager,
@@ -1353,16 +1365,29 @@ impl Session {
 
                 let thread_settings_applied =
                     RolloutItem::EventMsg(handlers::thread_settings_applied_event(self).await);
-                if is_paginated_subagent {
-                    // Paginated subagents persist inherited model context while creating the live
-                    // thread so the copied prefix is not observed as child-owned metadata.
-                    self.persist_rollout_items(&[thread_settings_applied]).await;
-                } else {
-                    // Keep the copied prefix and the child's effective settings in one append so a
-                    // cold resume cannot observe inherited settings as the child's latest value.
-                    rollout_items.push(thread_settings_applied);
-                    self.persist_rollout_items(&rollout_items).await;
+                match &self.fork_persistence {
+                    ForkPersistence::Referenced {
+                        inherited_item_count,
+                        ..
+                    } => {
+                        // Ancestor records remain behind history_base; only effective child
+                        // settings and boundaries synthesized by snapshot processing are local.
+                        rollout_items.drain(..*inherited_item_count);
+                        rollout_items.insert(0, thread_settings_applied);
+                    }
+                    ForkPersistence::Copied if is_paginated_subagent => {
+                        // Paginated subagents already persist inherited context when their live
+                        // thread is created.
+                        rollout_items.clear();
+                        rollout_items.push(thread_settings_applied);
+                    }
+                    ForkPersistence::Copied => {
+                        // Keep the copied prefix and effective child settings in one append so a
+                        // cold resume cannot observe inherited settings as the latest value.
+                        rollout_items.push(thread_settings_applied);
+                    }
                 }
+                self.persist_rollout_items(&rollout_items).await;
 
                 // Forked threads should remain file-backed immediately after startup.
                 self.ensure_rollout_materialized().await;
@@ -1483,7 +1508,7 @@ impl Session {
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let (previous_config, new_config, permission_profile_changed) = {
+        let (previous_config, new_config, permission_profile_changed, mcp_inputs_changed) = {
             let mut state = self.state.lock().await;
             let updated = match state.session_configuration.apply(&updates) {
                 Ok(updated) => updated,
@@ -1507,16 +1532,24 @@ impl Session {
                     .turn_environments
                     .update_selections(updated.environment_selections());
             }
+            state.session_configuration = updated;
             if mcp_inputs_changed {
                 self.mark_mcp_runtime_dirty();
             }
-            state.session_configuration = updated;
-            (previous_config, new_config, permission_profile_changed)
+            (
+                previous_config,
+                new_config,
+                permission_profile_changed,
+                mcp_inputs_changed,
+            )
         };
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
         if permission_profile_changed {
             self.refresh_managed_network_proxy_for_current_permission_profile()
                 .await;
+        }
+        if mcp_inputs_changed {
+            self.schedule_mcp_prewarm();
         }
         Ok(())
     }
@@ -1633,6 +1666,7 @@ impl Session {
             (previous_config, new_config, config)
         };
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
+        self.schedule_mcp_prewarm();
         let environments = self.services.turn_environments.snapshot().await;
         let hooks = build_hooks_for_config(
             config.as_ref(),
@@ -1652,52 +1686,24 @@ impl Session {
         }
     }
 
-    pub(crate) async fn refresh_mcp_config(&self, next_config: McpServerRefreshConfig) {
-        let McpServerRefreshConfig {
-            mcp_servers,
-            mcp_oauth_credentials_store_mode,
-            auth_keyring_backend_kind,
-        } = next_config;
-        let mcp_servers =
-            match serde_json::from_value::<HashMap<String, McpServerConfig>>(mcp_servers) {
-                Ok(servers) => servers,
-                Err(err) => {
-                    warn!("failed to parse MCP server refresh config: {err}");
-                    return;
-                }
-            };
-        let store_mode = match serde_json::from_value::<OAuthCredentialsStoreMode>(
-            mcp_oauth_credentials_store_mode,
-        ) {
-            Ok(mode) => mode,
-            Err(err) => {
-                warn!("failed to parse MCP OAuth refresh config: {err}");
-                return;
-            }
-        };
-        let keyring_backend_kind =
-            match serde_json::from_value::<AuthKeyringBackendKind>(auth_keyring_backend_kind) {
-                Ok(kind) => kind,
-                Err(err) => {
-                    warn!("failed to parse MCP auth keyring backend refresh config: {err}");
-                    return;
-                }
-            };
+    pub(crate) async fn refresh_mcp_config(&self, next_config: Config) {
         let mut state = self.state.lock().await;
         let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-        if let Err(err) = config.mcp_servers.set(mcp_servers) {
-            warn!("failed to apply MCP server refresh config: {err}");
-            return;
-        }
-        config.mcp_oauth_credentials_store_mode = store_mode;
+        config.config_layer_stack = next_config
+            .config_layer_stack
+            .with_user_layer_from(&config.config_layer_stack);
+        config.mcp_servers = next_config.mcp_servers;
+        config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
         if let Err(err) = config.features.set_enabled(
             Feature::SecretAuthStorage,
-            matches!(keyring_backend_kind, AuthKeyringBackendKind::Secrets),
+            next_config.features.enabled(Feature::SecretAuthStorage),
         ) {
             warn!("failed to refresh MCP auth storage config: {err}");
         }
         state.session_configuration.original_config_do_not_use = Arc::new(config);
         self.mark_mcp_runtime_dirty();
+        drop(state);
+        self.schedule_mcp_prewarm();
     }
 
     fn emit_config_changed_contributors(
@@ -3019,6 +3025,8 @@ impl Session {
                 &ready_selected_capability_roots,
             )
             .await;
+        let extension_data = codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
+        extension_data.insert(selected_capability_roots.clone());
         let mcp = self
             .mcp_runtime_for_step(turn_context.as_ref(), &selected_capability_roots)
             .or_cancel(cancellation_token)
@@ -3028,6 +3036,7 @@ impl Session {
             turn_context.as_ref(),
             &environments,
             mcp.as_ref(),
+            &extension_data,
         )
         .or_cancel(cancellation_token)
         .await?;
@@ -4042,14 +4051,16 @@ impl Session {
     }
 
     pub(crate) async fn hook_transcript_path(&self) -> Option<PathBuf> {
-        self.ensure_rollout_materialized().await;
-        match self.current_rollout_path().await {
-            Ok(path) => path,
+        let rollout_path = match self.current_rollout_path().await {
+            Ok(Some(path)) => path,
+            Ok(None) => return None,
             Err(err) => {
                 warn!("{err}");
-                None
+                return None;
             }
-        }
+        };
+        self.ensure_rollout_materialized().await;
+        Some(rollout_path)
     }
 
     pub(crate) async fn take_pending_session_start_source(
