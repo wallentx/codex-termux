@@ -26,8 +26,8 @@ use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::context::ApprovedCommandPrefixSaved;
 use crate::context::AvailableSkillsInstructions;
 use crate::context::ContextualUserFragment;
+use crate::context::ModelSwitchInstructions;
 use crate::context::NetworkRuleSaved;
-use crate::context::PersonalitySpecInstructions;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::world_state::WorldState;
 use crate::current_time::TimeProvider;
@@ -1807,27 +1807,6 @@ impl Session {
         self.refresh_runtime_config(next_config).await;
     }
 
-    async fn build_settings_update_items(
-        &self,
-        reference_context_item: Option<&TurnContextItem>,
-        current_context: &TurnContext,
-    ) -> Vec<ResponseItem> {
-        // TODO: Make context updates a pure diff of persisted previous/current TurnContextItem
-        // state so replay/backtracking is deterministic. Runtime inputs that affect model-visible
-        // context (feature gates and the previous-turn bridge) should be persisted
-        // state or explicit non-state replay events.
-        let previous_turn_settings = {
-            let state = self.state.lock().await;
-            state.previous_turn_settings()
-        };
-        crate::context_manager::updates::build_settings_update_items(
-            reference_context_item,
-            previous_turn_settings.as_ref(),
-            current_context,
-            self.features.enabled(Feature::Personality),
-        )
-    }
-
     /// Record a terminal CodexErr before the app-server completion notification is reduced.
     pub(crate) fn track_turn_codex_error(&self, turn_context: &TurnContext, error: &CodexErr) {
         self.services
@@ -2092,13 +2071,17 @@ impl Session {
     }
 
     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {
+        let started_at_ms = turn_context
+            .turn_timing_state
+            .record_item_started(item.id(), now_unix_timestamp_ms())
+            .await;
         self.send_event(
             turn_context,
             EventMsg::ItemStarted(ItemStartedEvent {
                 thread_id: self.thread_id,
                 turn_id: turn_context.sub_id.clone(),
                 item: item.clone(),
-                started_at_ms: now_unix_timestamp_ms(),
+                started_at_ms,
             }),
         )
         .await;
@@ -2110,13 +2093,29 @@ impl Session {
         item: TurnItem,
     ) {
         record_turn_ttfm_metric(turn_context, &item).await;
+        let completed_at_ms = now_unix_timestamp_ms();
+        let item_id = item.id();
+        let started_at_ms = turn_context
+            .turn_timing_state
+            .take_item_started(&item_id)
+            .await
+            .unwrap_or_else(|| {
+                warn!(
+                    thread_id = %self.thread_id,
+                    turn_id = %turn_context.sub_id,
+                    item_id = %item_id,
+                    "item completed without a recorded start timestamp"
+                );
+                completed_at_ms
+            });
         self.send_event(
             turn_context,
             EventMsg::ItemCompleted(ItemCompletedEvent {
                 thread_id: self.thread_id,
                 turn_id: turn_context.sub_id.clone(),
                 item,
-                completed_at_ms: now_unix_timestamp_ms(),
+                started_at_ms: Some(started_at_ms),
+                completed_at_ms,
             }),
         )
         .await;
@@ -3331,23 +3330,13 @@ impl Session {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
         let mut separate_developer_sections = Vec::<String>::new();
-        let (previous_turn_settings, base_instructions, session_source, auto_compact_window_ids) = {
+        let (session_source, auto_compact_window_ids) = {
             let state = self.state.lock().await;
             (
-                state.previous_turn_settings(),
-                state.session_configuration.base_instructions.clone(),
                 state.session_configuration.session_source.clone(),
                 state.auto_compact_window_ids(),
             )
         };
-        if let Some(model_switch_message) =
-            crate::context_manager::updates::build_model_instructions_update_item(
-                previous_turn_settings.as_ref(),
-                turn_context,
-            )
-        {
-            developer_sections.push(model_switch_message);
-        }
         let separate_guardian_developer_message =
             crate::guardian::is_guardian_reviewer_source(&session_source);
         // Keep the guardian policy prompt out of the aggregated developer bundle so it
@@ -3357,23 +3346,6 @@ impl Session {
             && !developer_instructions.is_empty()
         {
             developer_sections.push(developer_instructions.to_string());
-        }
-        if self.features.enabled(Feature::Personality)
-            && let Some(personality) = turn_context.personality
-        {
-            let model_info = turn_context.model_info.clone();
-            let has_baked_personality = model_info.supports_personality()
-                && base_instructions == model_info.get_model_instructions(Some(personality));
-            if !has_baked_personality
-                && let Some(personality_message) =
-                    crate::context_manager::updates::personality_message_for(
-                        &model_info,
-                        personality,
-                    )
-            {
-                developer_sections
-                    .push(PersonalitySpecInstructions::new(personality_message).render());
-            }
         }
         if turn_context.config.include_skill_instructions {
             let host_catalog_in_world_state = turn_context
@@ -3526,6 +3498,12 @@ impl Session {
         let mut initial_multi_agent_mode = None;
         for fragment in world_state.render_full() {
             match fragment.role() {
+                "developer"
+                    if fragment.markers().0 == ModelSwitchInstructions::type_markers().0 =>
+                {
+                    // New-model instructions must precede the rest of the developer context.
+                    developer_sections.insert(0, fragment.render());
+                }
                 "developer" if fragment.markers().0 == MULTI_AGENT_MODE_OPEN_TAG => {
                     initial_multi_agent_mode = Some(fragment);
                 }
@@ -3700,11 +3678,6 @@ impl Session {
                 Some(WorldStateItem::full(snapshot.into_value())),
             )
         } else {
-            // Steady-state path: append only built-in context diffs here; turn-scoped extension
-            // context is added below.
-            let mut context_items = self
-                .build_settings_update_items(reference_context_item.as_ref(), turn_context)
-                .await;
             let (world_state_items, world_state_item) = {
                 let mut state = self.state.lock().await;
                 let (fragments, rollout_item) =
@@ -3714,8 +3687,7 @@ impl Session {
                     rollout_item,
                 )
             };
-            context_items.extend(world_state_items);
-            (context_items, world_state_item)
+            (world_state_items, world_state_item)
         };
         if !should_inject_full_context && turn_context_changed {
             context_items.extend(
