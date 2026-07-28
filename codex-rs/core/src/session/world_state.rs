@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::session::Session;
 use super::step_context::StepContext;
 use crate::connectors;
@@ -5,6 +7,7 @@ use crate::context::ApprovalPromptContext;
 use crate::context::world_state::AgentsMdState;
 use crate::context::world_state::AppsInstructionsState;
 use crate::context::world_state::CollaborationModeState;
+use crate::context::world_state::ContextWindowGuidanceState;
 use crate::context::world_state::EnvironmentsInstructionsState;
 use crate::context::world_state::EnvironmentsState;
 use crate::context::world_state::ModelInstructionsState;
@@ -79,6 +82,17 @@ impl Session {
                 personality_instructions,
                 personality_is_baked,
             ));
+        }
+        if turn_context.config.features.enabled(Feature::TokenBudget)
+            && turn_context.model_context_window().is_some()
+            && let Some(guidance) = turn_context
+                .config
+                .token_budget
+                .as_ref()
+                .and_then(|config| config.guidance_message.as_deref())
+                .filter(|message| !message.trim().is_empty())
+        {
+            world_state.add_section(ContextWindowGuidanceState::new(guidance));
         }
         world_state.add_section(RealtimeState::new(
             turn_context.realtime_active,
@@ -165,6 +179,9 @@ impl Session {
             .iter()
             .map(|root| root.selected_root().clone())
             .collect::<Vec<_>>();
+        let extension_metrics = super::extension_metrics::from_session_telemetry(
+            turn_context.session_telemetry.clone(),
+        );
         for contributor in self.services.extensions.context_contributors() {
             for section in contributor
                 .contribute_world_state(WorldStateContributionInput {
@@ -175,6 +192,7 @@ impl Session {
                     executor_capability_discovery: step_context
                         .executor_capability_discovery
                         .as_deref(),
+                    extension_metrics: Some(Arc::clone(&extension_metrics)),
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
