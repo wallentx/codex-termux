@@ -206,6 +206,7 @@ use codex_protocol::exec_output::StreamOutput;
 mod code_mode_warning;
 mod config_lock;
 pub(crate) mod context_window;
+mod extension_metrics;
 mod handlers;
 mod inject;
 mod input_queue;
@@ -601,7 +602,7 @@ impl Session {
             )
         };
 
-        let config = Arc::new(config);
+        let mut config = Arc::new(config);
         let refresh_strategy = if session_source.is_non_root_agent() {
             codex_models_manager::manager::RefreshStrategy::Offline
         } else {
@@ -644,6 +645,11 @@ impl Session {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        if config.config_lock_export_dir.is_some()
+            && config.config_lock_save_fields_resolved_from_model_catalog
+        {
+            self::token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
+        }
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
         });
@@ -3352,12 +3358,17 @@ impl Session {
                 .extension_data
                 .get::<HostSkillsCatalogInWorldState>()
                 .is_some();
+            let side_effects = if host_catalog_in_world_state {
+                SkillRenderSideEffects::None
+            } else {
+                SkillRenderSideEffects::ThreadStart {
+                    session_telemetry: &self.services.session_telemetry,
+                }
+            };
             let available_skills = build_available_skills(
                 turn_context.turn_skills.snapshot.outcome(),
                 default_skill_metadata_budget(turn_context.model_info.context_window),
-                SkillRenderSideEffects::ThreadStart {
-                    session_telemetry: &self.services.session_telemetry,
-                },
+                side_effects,
             );
             if let Some(available_skills) = available_skills {
                 let warning_message = available_skills.warning_message.clone();
@@ -3483,16 +3494,6 @@ impl Session {
                 )
                 .render(),
             );
-            if let Some(guidance_message) = turn_context
-                .config
-                .token_budget
-                .as_ref()
-                .and_then(|config| config.guidance_message.as_deref())
-                .filter(|message| !message.trim().is_empty())
-            {
-                developer_sections
-                    .push(crate::context::ContextWindowGuidance::new(guidance_message).render());
-            }
         }
         // Render the active mode after the usage hint so it can override that hint.
         let mut initial_multi_agent_mode = None;
