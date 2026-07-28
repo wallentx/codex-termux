@@ -57,6 +57,15 @@ assert_ref_file_equals() {
   fi
 }
 
+assert_ref_is_ancestor() {
+  local ancestor="$1"
+  local descendant="$2"
+
+  if ! git merge-base --is-ancestor "${ancestor}" "${descendant}"; then
+    fail "${ancestor} is not an ancestor of ${descendant}"
+  fi
+}
+
 run_release_pr_script() {
   local runner_temp="$1"
   local github_output="$2"
@@ -204,8 +213,9 @@ assert_ref_lacks_file origin/release/1.0.0 src/upstream-after-tag.txt
 assert_ref_lacks_file origin/release/1.0.0 termux/compat.txt
 assert_ref_has_file origin/release/1.0.0 scripts/termux-download-release-artifact.sh
 
+assert_ref_is_ancestor origin/release/1.0.0 origin/release-train/1.0.0
 assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "termux"
-assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code with target drift"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
 version = \"1.0.0\""
 assert_ref_has_file origin/release-train/1.0.0 src/upstream-after-tag.txt
@@ -219,7 +229,7 @@ if [[ "$(cat "${github_output}")" != "pr_url=https://github.com/wallentx/codex-t
   fail "release PR URL was not written to GITHUB_OUTPUT"
 fi
 
-echo "ok - release PR head is created from Termux target and release base stays on upstream tag"
+echo "ok - release PR head merges the release base and preserves Termux target changes"
 
 origin_update="${tmp_dir}/origin-update.git"
 work_update="${tmp_dir}/work-update"
@@ -303,8 +313,9 @@ assert_ref_file_equals origin/release/1.0.0 codex-rs/Cargo.toml "[workspace.pack
 version = \"1.0.0-alpha.2\""
 assert_ref_lacks_file origin/release/1.0.0 stale-release-branch.txt
 
+assert_ref_is_ancestor origin/release/1.0.0 origin/release-train/1.0.0
 assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "termux"
-assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code with target drift"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
 version = \"1.0.0-alpha.2\""
 assert_ref_has_file origin/release-train/1.0.0 termux/compat.txt
@@ -315,4 +326,4 @@ if [[ "$(cat "${github_output_update}")" != "pr_url=https://github.com/wallentx/
   fail "existing release PR URL was not written to GITHUB_OUTPUT"
 fi
 
-echo "ok - newer upstream tag rebuilds stale open release train from Termux target"
+echo "ok - newer upstream tag rebuilds and merges the release base into the open train"

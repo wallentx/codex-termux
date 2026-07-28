@@ -110,6 +110,49 @@ normalize_workspace_version_to_upstream_tag() {
   ' codex-rs/Cargo.toml
 }
 
+restore_release_authoritative_paths() {
+  local release_ref="origin/${RELEASE_BRANCH}"
+  local path
+  local -a restore_paths=()
+
+  for path in "${TERMUX_RELEASE_MERGE_AUTHORITATIVE_PATHS[@]}"; do
+    if git cat-file -e "${release_ref}:${path}" 2>/dev/null \
+      || git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
+      restore_paths+=("${path}")
+    fi
+  done
+
+  if (( ${#restore_paths[@]} > 0 )); then
+    git restore \
+      --source="${release_ref}" \
+      --staged \
+      --worktree \
+      -- "${restore_paths[@]}"
+  fi
+}
+
+merge_release_branch_into_work_branch() {
+  local release_ref="origin/${RELEASE_BRANCH}"
+  local unresolved_paths
+
+  if ! git merge --no-ff --no-commit "${release_ref}"; then
+    echo "Release merge reported conflicts; resolving release-authoritative paths."
+  fi
+
+  restore_release_authoritative_paths
+
+  unresolved_paths="$(git diff --name-only --diff-filter=U)"
+  if [[ -n "${unresolved_paths}" ]]; then
+    echo "Unable to merge ${RELEASE_BRANCH} into ${WORK_BRANCH}; unresolved paths remain:" >&2
+    printf '%s\n' "${unresolved_paths}" >&2
+    exit 1
+  fi
+
+  if [[ -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; then
+    git commit -m "Merge ${RELEASE_BRANCH} into ${WORK_BRANCH}"
+  fi
+}
+
 open_prs_cache_loaded=false
 open_prs_cache="[]"
 open_prs_json() {
@@ -353,6 +396,7 @@ if [[ "${work_branch_exists}" == true && -n "${existing_open_train_pr_url}" && "
 else
   git checkout -B "${WORK_BRANCH}" "origin/${PATCH_BRANCH}"
 fi
+merge_release_branch_into_work_branch
 seed_release_branch_workflows
 # The patch branch is the authoritative Termux code source. Reapplying the
 # release code patch here can conflict when that branch contains newer upstream

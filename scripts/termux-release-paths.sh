@@ -41,6 +41,22 @@ readonly -a TERMUX_RELEASE_CODE_PATHS=(
   codex-rs/tui/src/updates.rs
 )
 
+# These upstream-owned files have repeatedly retained stale checkpoint-side
+# content when a new release branch was merged into the release work branch.
+readonly -a TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS=(
+  .github/scripts/build-codex-package-archive.sh
+  .github/scripts/publish_r2_release.py
+  .github/scripts/run-argument-comment-lint-bazel.sh
+  .github/workflows/python-runtime-build.yml
+  .github/workflows/python-runtime-release.yml
+  .github/workflows/r2-release.yml
+)
+
+readonly -a TERMUX_RELEASE_MERGE_AUTHORITATIVE_PATHS=(
+  "${TERMUX_RELEASE_CODE_PATHS[@]}"
+  "${TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS[@]}"
+)
+
 readonly -a TERMUX_RELEASE_AUTOMATION_PATHS=(
   "${TERMUX_RELEASE_WORKFLOW_PATHS[@]}"
   "${TERMUX_RELEASE_GITHUB_SCRIPT_PATHS[@]}"
