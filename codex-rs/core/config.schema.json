@@ -389,7 +389,7 @@
       "additionalProperties": false,
       "properties": {
         "disable_in_process_fallback": {
-          "description": "Fail instead of running embedded V8 when the standalone host is unavailable.",
+          "description": "Keep code mode fail-closed when the standalone host is unavailable.",
           "type": "boolean"
         },
         "enabled": {
@@ -531,6 +531,9 @@
             "exec_permission_approvals": {
               "type": "boolean"
             },
+            "executed_tool_call_metadata": {
+              "type": "boolean"
+            },
             "executor_capability_discovery": {
               "type": "boolean"
             },
@@ -631,6 +634,9 @@
               "type": "boolean"
             },
             "realtime_conversation": {
+              "type": "boolean"
+            },
+            "recommended_plugins": {
               "type": "boolean"
             },
             "remote_compaction_v2": {
@@ -5088,6 +5094,9 @@
         "exec_permission_approvals": {
           "type": "boolean"
         },
+        "executed_tool_call_metadata": {
+          "type": "boolean"
+        },
         "executor_capability_discovery": {
           "type": "boolean"
         },
@@ -5188,6 +5197,9 @@
           "type": "boolean"
         },
         "realtime_conversation": {
+          "type": "boolean"
+        },
+        "recommended_plugins": {
           "type": "boolean"
         },
         "remote_compaction_v2": {

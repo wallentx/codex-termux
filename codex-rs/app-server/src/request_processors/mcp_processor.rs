@@ -172,7 +172,7 @@ impl McpRequestProcessor {
             })?;
 
         let discovered_scopes = if scopes.is_none() && server.scopes.is_none() {
-            discover_supported_scopes_with_http_client(
+            discover_supported_scopes(
                 &server.transport,
                 Arc::clone(&http_client),
                 codex_rmcp_client::OAuthDiscoveryTimeout::Requested,
@@ -183,9 +183,10 @@ impl McpRequestProcessor {
         };
         let resolved_scopes =
             resolve_oauth_scopes(scopes, server.scopes.clone(), discovered_scopes);
+        let oauth_credential_name = server.oauth_credential_name(&name);
 
-        let handle = perform_oauth_login_return_url_with_http_client(
-            &name,
+        let handle = perform_oauth_login_return_url(
+            oauth_credential_name.as_ref(),
             &url,
             mcp_config.mcp_oauth_credentials_store_mode,
             mcp_config.auth_keyring_backend_kind,

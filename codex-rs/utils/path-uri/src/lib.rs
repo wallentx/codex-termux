@@ -4,6 +4,7 @@
 
 use base64::Engine;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_absolute_path::normalize_windows_device_path;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -324,14 +325,17 @@ impl PathUri {
     /// Path text is interpreted using the POSIX or Windows convention inferred
     /// from the base URI. An absolute path replaces the base URI's path, while a
     /// relative path is appended lexically. Windows root-relative paths retain
-    /// the base drive or UNC share, while drive-relative paths are rejected.
+    /// the base drive or UNC share. Same-drive relative paths are appended to
+    /// the base, while other-drive relative paths are rejected because their
+    /// current directory belongs to the executor.
     /// Empty and `.` segments are ignored, while `..` removes one segment
     /// without escaping the POSIX root, Windows drive, or UNC share. Literal
     /// `%`, `?`, and `#` characters are percent-encoded as filename text. Paths
     /// containing a null character are rejected because they cannot be safely
     /// converted to native paths.
     /// Opaque fallback URIs created by [`Self::from_abs_path`] reject non-empty
-    /// joins.
+    /// joins. Home-directory expansion also requires executor-native context
+    /// and is intentionally not performed.
     pub fn join(&self, path: &str) -> Result<Self, PathUriParseError> {
         if path.contains('\0') {
             return Err(PathUriParseError::InvalidFileUriPath {
@@ -352,13 +356,26 @@ impl PathUri {
             return Ok(absolute);
         }
         let path_bytes = path.as_bytes();
-        if convention == PathConvention::Windows
+        let path = if convention == PathConvention::Windows
             && matches!(path_bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
         {
-            return Err(PathUriParseError::InvalidFileUriPath {
-                path: path.to_string(),
-            });
-        }
+            let same_drive = self
+                .0
+                .path_segments()
+                .and_then(|mut segments| segments.find(|segment| !segment.is_empty()))
+                .is_some_and(|segment| {
+                    matches!(segment.as_bytes(), [drive, b':'] if drive.eq_ignore_ascii_case(&path_bytes[0]))
+                });
+            if !same_drive {
+                return Err(PathUriParseError::InvalidFileUriPath {
+                    path: path.to_string(),
+                });
+            }
+            &path[2..]
+        } else {
+            path
+        };
+        let path_bytes = path.as_bytes();
         if decode_bad_path_uri(&self.0).is_some() {
             return Err(PathUriParseError::InvalidFileUriPath {
                 path: self.to_string(),
@@ -661,6 +678,30 @@ fn parse_posix_path(path: &str) -> Option<PathUri> {
 }
 
 fn parse_windows_path(path: &str) -> Option<PathUri> {
+    if let Some(normalized_path) = normalize_windows_device_path(path) {
+        if let Some(unc_path) = normalized_path.strip_prefix(r"\\") {
+            let mut components = unc_path.split(is_windows_separator_char);
+            if matches!(components.next(), None | Some("" | "." | ".."))
+                || matches!(components.next(), None | Some("" | "." | ".."))
+            {
+                return Some(windows_opaque_path_uri(path));
+            }
+        }
+        return Some(
+            parse_unnormalized_windows_path(&normalized_path)
+                .filter(|uri| {
+                    uri.infer_path_convention() == Some(PathConvention::Windows)
+                        && uri.opaque_fallback_bytes().is_none()
+                        && (!normalized_path.starts_with(r"\\")
+                            || uri.0.host_str().is_some_and(|host| !host.is_empty()))
+                })
+                .unwrap_or_else(|| windows_opaque_path_uri(path)),
+        );
+    }
+    parse_unnormalized_windows_path(path)
+}
+
+fn parse_unnormalized_windows_path(path: &str) -> Option<PathUri> {
     let bytes = path.as_bytes();
     let uses_namespace = matches!(
         bytes,

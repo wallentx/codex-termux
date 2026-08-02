@@ -567,7 +567,7 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
     assert_eq!(warning.thread_id.as_deref(), Some(thread.id.as_str()));
     assert_eq!(
         warning.message,
-        "Exceeded skills context budget of 2%. All skill descriptions were removed and 7 additional skills were not included in the model-visible skills list."
+        "Exceeded skills context budget. All skill descriptions were removed and 7 additional skills were not included in the model-visible skills list."
     );
 
     timeout(
@@ -2747,9 +2747,11 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
         create_apply_patch_sse_response(patch, "patch-call")?,
         create_final_assistant_message_sse_response("patch applied")?,
     ];
-    let server = create_mock_responses_server_sequence(responses).await;
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
     MockResponsesConfig::new(&server.uri())
         .with_approval_policy("untrusted")
+        // Snapshot startup is unrelated to the file-approval behavior under test.
+        .disable_feature(Feature::ShellSnapshot)
         .write(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
@@ -2879,6 +2881,20 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    let status = timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    anyhow::ensure!(
+        status.success(),
+        "app-server exited unsuccessfully: {status}"
+    );
+    let response_requests = server
+        .received_requests()
+        .await
+        .expect("mock server should record requests")
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.url.path().ends_with("/responses"))
+        .count();
+    assert_eq!(response_requests, 2);
 
     Ok(())
 }
@@ -3415,6 +3431,44 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
     })
     .await??;
 
+    let listed: codex_app_server_protocol::ThreadListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadList {
+            request_id,
+            params: codex_app_server_protocol::ThreadListParams {
+                cursor: None,
+                limit: Some(10),
+                sort_key: None,
+                sort_direction: None,
+                model_providers: None,
+                source_kinds: Some(vec![
+                    codex_app_server_protocol::ThreadSourceKind::SubAgentThreadSpawn,
+                ]),
+                archived: None,
+                section_id: None,
+                cwd: None,
+                use_state_db_only: true,
+                search_term: None,
+                parent_thread_id: None,
+                ancestor_thread_id: None,
+            },
+        })
+        .await?;
+    let listed_child = listed
+        .data
+        .iter()
+        .find(|listed| listed.id == child_thread_id)
+        .context("spawned child is missing from thread/list")?;
+    assert!(matches!(
+        &listed_child.source,
+        codex_app_server_protocol::SessionSource::SubAgent(
+            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                agent_path: Some(_),
+                ..
+            }
+        )
+    ));
+    assert_eq!(listed_child.can_accept_direct_input, Some(false));
+
     let direct_turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: child_thread_id.clone(),
@@ -3725,6 +3779,7 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     assert_eq!(params.thread_id, thread.id);
     assert_eq!(params.turn_id, turn_1.id);
 
+    let resolved_request_id = request_id.clone();
     mcp.send_response(
         request_id,
         serde_json::to_value(FileChangeRequestApprovalResponse {
@@ -3733,11 +3788,36 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     )
     .await?;
 
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("item/completed"),
-    )
-    .await??;
+    let mut approval_resolved = false;
+    let mut patch_completed = false;
+    while !approval_resolved || !patch_completed {
+        let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
+        let JSONRPCMessage::Notification(notification) = message else {
+            continue;
+        };
+        match notification.method.as_str() {
+            "serverRequest/resolved" => {
+                let resolved: ServerRequestResolvedNotification = serde_json::from_value(
+                    notification.params.expect("serverRequest/resolved params"),
+                )?;
+                if resolved.request_id == resolved_request_id {
+                    assert_eq!(resolved.thread_id, thread.id);
+                    approval_resolved = true;
+                }
+            }
+            "item/completed" => {
+                let completed: ItemCompletedNotification =
+                    serde_json::from_value(notification.params.expect("item/completed params"))?;
+                if matches!(completed.item, ThreadItem::FileChange { ref id, .. } if id == "patch-call-1")
+                {
+                    assert_eq!(completed.thread_id, thread.id);
+                    assert_eq!(completed.turn_id, turn_1.id);
+                    patch_completed = true;
+                }
+            }
+            _ => {}
+        }
+    }
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -3748,7 +3828,7 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     assert_eq!(std::fs::read_to_string(&readme_path)?, "new line\n");
 
     // Second turn: apply a patch to the same file. Approval should be skipped due to AcceptForSession.
-    let _: TurnStartResponse = mcp
+    let TurnStartResponse { turn: turn_2 } = mcp
         .request(|request_id| ClientRequest::TurnStart {
             request_id,
             params: TurnStartParams {
@@ -3779,13 +3859,30 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     assert_eq!(id, "patch-call-2");
     assert_eq!(status, PatchApplyStatus::InProgress);
 
-    // If the server incorrectly emits FileChangeRequestApproval, the helper below will error
-    // (it bails on unexpected JSONRPCMessage::Request), causing the test to fail.
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("item/completed"),
-    )
+    let completed_file_change = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            match mcp.read_next_message().await? {
+                JSONRPCMessage::Request(request) => {
+                    anyhow::bail!("unexpected approval request for session-approved patch: {request:?}");
+                }
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == "item/completed" =>
+                {
+                    let completed: ItemCompletedNotification = serde_json::from_value(
+                        notification.params.expect("item/completed params"),
+                    )?;
+                    if matches!(completed.item, ThreadItem::FileChange { ref id, .. } if id == "patch-call-2")
+                    {
+                        return Ok::<ItemCompletedNotification, anyhow::Error>(completed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
     .await??;
+    assert_eq!(completed_file_change.thread_id, thread.id);
+    assert_eq!(completed_file_change.turn_id, turn_2.id);
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -3793,6 +3890,11 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     .await??;
 
     assert_eq!(std::fs::read_to_string(readme_path)?, "updated line\n");
+    let status = timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    anyhow::ensure!(
+        status.success(),
+        "app-server exited unsuccessfully: {status}"
+    );
 
     Ok(())
 }
