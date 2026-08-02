@@ -136,9 +136,11 @@ merge_release_branch_into_work_branch() {
   local unresolved_paths
 
   if ! git merge --no-ff --no-commit "${release_ref}"; then
-    echo "Release merge reported conflicts; resolving release-authoritative paths."
+    echo "Release merge reported conflicts; resolving authoritative paths."
   fi
 
+  seed_release_branch_workflows
+  git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
   restore_release_authoritative_paths
 
   unresolved_paths="$(git diff --name-only --diff-filter=U)"
@@ -395,6 +397,11 @@ if [[ "${work_branch_exists}" == true && -n "${existing_open_train_pr_url}" && "
   git checkout -B "${WORK_BRANCH}" "origin/${WORK_BRANCH}"
 else
   git checkout -B "${WORK_BRANCH}" "origin/${PATCH_BRANCH}"
+fi
+normalize_workspace_version_to_upstream_tag
+git add -- codex-rs/Cargo.toml
+if ! git diff --cached --quiet; then
+  git commit -m "Normalize workspace version for ${UPSTREAM_TAG}"
 fi
 merge_release_branch_into_work_branch
 seed_release_branch_workflows
