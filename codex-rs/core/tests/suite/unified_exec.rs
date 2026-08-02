@@ -386,6 +386,78 @@ async fn unified_exec_intercepts_apply_patch_exec_command() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_exec_rejects_justification_without_sandbox_permissions() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let call_id = "uexec-missing-sandbox-permissions";
+    let args = json!({
+        "cmd": "echo should not run",
+        "justification": "Allow this command",
+    });
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "finished"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    submit_unified_exec_turn(
+        &test,
+        "run the command with escalation",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let mut saw_exec_begin = false;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::ExecCommandBegin(event) if event.call_id == call_id => {
+            saw_exec_begin = true;
+            false
+        }
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+    assert!(
+        !saw_exec_begin,
+        "rejected exec_command should not emit ExecCommandBegin"
+    );
+
+    let request = mock
+        .last_request()
+        .expect("model should receive the rejected tool call output");
+    let output_item = request.function_call_output(call_id);
+    let output = extract_output_text(&output_item)
+        .expect("rejected tool call should include model-visible text");
+    assert_eq!(
+        output,
+        "`justification` requires an explicit `sandbox_permissions`; use `sandbox_permissions: \"require_escalated\"` for unsandboxed execution, or omit `justification`."
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_emits_exec_command_begin_event() -> Result<()> {
     // TODO(anp): Remove after unified-exec fixtures use target-native commands.
     skip_if_target_windows!(
@@ -2199,9 +2271,14 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(not(windows), ignore = "Windows-only unified exec interrupt test")]
-async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+async fn write_stdin_ctrl_c_terminates_non_tty_session_on_windows() -> Result<()> {
+    if core_test_support::test_target_os() != core_test_support::TestTargetOs::Windows {
+        return Ok(());
+    }
+    skip_if_wine_exec!(
+        Ok(()),
+        "Wine exits Windows non-TTY shell processes immediately"
+    );
     skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
@@ -2218,8 +2295,7 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
     let interrupt_call_id = "uexec-windows-interrupt";
 
     let start_args = serde_json::json!({
-        "shell": "cmd",
-        "cmd": "echo READY && ping -n 30 127.0.0.1 >NUL",
+        "cmd": "Start-Sleep -Seconds 30",
         "yield_time_ms": 250,
         "tty": false,
     });
@@ -2263,9 +2339,11 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
     )
     .await?;
 
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(20),
+    )
     .await;
 
     let start_output = request_log
@@ -2277,23 +2355,15 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
         Some("1000"),
         "exec_command should leave a running non-TTY session"
     );
-    assert!(
-        start_output.output.contains("READY"),
-        "start output should include command readiness marker, got {:?}",
-        start_output.output
-    );
-
     let interrupt_output = request_log
         .function_call_output_text(interrupt_call_id)
         .expect("missing interrupt output for write_stdin");
+    let interrupt_output = parse_unified_exec_output(&interrupt_output)?;
     assert!(
-        interrupt_output.contains("write_stdin failed"),
-        "model-visible write_stdin output should report failure, got {interrupt_output:?}"
+        interrupt_output.process_id.is_none(),
+        "interrupted process should be cleared from the session map"
     );
-    assert!(
-        interrupt_output.contains("process interrupt is not supported by this process backend"),
-        "model-visible write_stdin output should explain unsupported interrupt, got {interrupt_output:?}"
-    );
+    assert_eq!(interrupt_output.exit_code, Some(1));
 
     Ok(())
 }

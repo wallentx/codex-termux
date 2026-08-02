@@ -34,6 +34,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::SortDirection;
+use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadGoalClearResponse;
@@ -55,6 +56,7 @@ use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -77,6 +79,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::McpInvocation;
@@ -135,7 +138,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
 #[tokio::test]
-async fn thread_resume_paginated_metadata_only_uses_model_context() -> Result<()> {
+async fn thread_resume_paginated_model_context_preserves_original_metadata() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
@@ -147,6 +150,19 @@ async fn thread_resume_paginated_metadata_only_uses_model_context() -> Result<()
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
+    let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    append_rollout_item_to_path(
+        &path,
+        &RolloutItem::Compacted(CompactedItem {
+            message: "compacted history".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+    )
+    .await?;
 
     let mut primary = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -166,7 +182,76 @@ async fn thread_resume_paginated_metadata_only_uses_model_context() -> Result<()
     } = timeout(DEFAULT_READ_TIMEOUT, primary.read_response(resume_id)).await??;
     assert_eq!(resumed.id, conversation_id);
     assert_eq!(resumed.history_mode, ThreadHistoryMode::Paginated);
+    assert_eq!(resumed.preview, "Saved user message");
     assert!(resumed.turns.is_empty());
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: conversation_id.clone(),
+            input: vec![UserInput::Text {
+                text: "bounded suffix user message".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
+    timeout(DEFAULT_READ_TIMEOUT, primary.shutdown_gracefully()).await??;
+
+    let mut secondary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let resume_id = secondary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            path: Some(path),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = timeout(DEFAULT_READ_TIMEOUT, secondary.read_response(resume_id)).await??;
+    assert_eq!(resumed.preview, "Saved user message");
+    assert!(resumed.turns.is_empty());
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: conversation_id.clone(),
+            input: vec![UserInput::Text {
+                text: "resumed user message".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
+
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
+    let metadata = state_db
+        .get_thread(ThreadId::from_string(&conversation_id)?)
+        .await?
+        .expect("thread metadata should exist");
+    assert_eq!(
+        (
+            metadata.preview.as_deref(),
+            metadata.title.as_str(),
+            metadata.first_user_message.as_deref(),
+        ),
+        (
+            Some("Saved user message"),
+            "Saved user message",
+            Some("Saved user message"),
+        )
+    );
     Ok(())
 }
 
@@ -1274,6 +1359,7 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
             let ThreadItem::McpToolCall {
                 arguments,
                 app_context,
+                read_only_hint,
                 result,
                 error,
                 ..
@@ -1292,6 +1378,7 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
                     action_name: Some("lookup".to_string()),
                 })
             );
+            assert_eq!(read_only_hint, &Some(false));
             let result = result.as_ref().expect("redacted MCP result");
             assert_eq!(
                 result.content,
@@ -1327,6 +1414,7 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
     let ThreadItem::McpToolCall {
         arguments,
         app_context,
+        read_only_hint,
         result,
         ..
     } = normal_mcp_item
@@ -1344,6 +1432,7 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
             action_name: Some("lookup".to_string()),
         })
     );
+    assert_eq!(read_only_hint, &Some(false));
     let result = result.as_ref().expect("normal MCP result");
     assert_eq!(
         result.content,
@@ -1451,6 +1540,7 @@ fn append_resume_redaction_history(
             app_name: Some("Calendar".to_string()),
             action_name: Some("lookup".to_string()),
             plugin_id: None,
+            read_only_hint: Some(false),
             duration: Duration::from_millis(8),
             result: Ok(CallToolResult {
                 content: vec![json!({
@@ -2610,7 +2700,6 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
     let update_id = mcp
         .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
             thread_id: thread_id.clone(),
-            is_pinned: None,
             git_info: Some(ThreadMetadataGitInfoUpdateParams {
                 sha: None,
                 branch: Some(Some("feature/pr-branch".to_string())),
@@ -2640,7 +2729,6 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
             .and_then(|git| git.branch.as_deref()),
         Some("feature/pr-branch")
     );
-
     Ok(())
 }
 
@@ -2938,7 +3026,6 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, secondary.read_response(resume_id)).await??;
     assert_ne!(resumed_thread.status, ThreadStatus::NotLoaded);
-
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/completed"),
@@ -3615,7 +3702,9 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
         create_final_assistant_message_sse_response("done")?,
     ];
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
-    mock_responses_config(&server.uri()).write(&codex_home)?;
+    mock_responses_config(&server.uri())
+        .disable_feature(Feature::ShellSnapshot)
+        .write(&codex_home)?;
 
     let mut primary = TestAppServer::builder()
         .with_codex_home(&codex_home)
@@ -3708,7 +3797,23 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     let ServerRequest::FileChangeRequestApproval { .. } = &original_request else {
         panic!("expected FileChangeRequestApproval request, got {original_request:?}");
     };
-    primary.clear_message_buffer();
+
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification: ThreadStatusChangedNotification =
+                primary.read_notification("thread/status/changed").await?;
+            if notification.thread_id == thread.id
+                && matches!(
+                    notification.status,
+                    ThreadStatus::Active { active_flags }
+                        if active_flags.contains(&ThreadActiveFlag::WaitingOnApproval)
+                )
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
 
     let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
@@ -3753,6 +3858,11 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     )
     .await??;
     wait_for_responses_request_count(&server, /*expected_count*/ 3).await?;
+    let status = timeout(DEFAULT_READ_TIMEOUT, primary.shutdown_gracefully()).await??;
+    anyhow::ensure!(
+        status.success(),
+        "app-server exited unsuccessfully: {status}"
+    );
 
     Ok(())
 }

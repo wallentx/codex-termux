@@ -214,12 +214,20 @@ impl McpRuntime {
 
     /// Captures the latest published configuration and live client handles.
     pub async fn current_binding(&self) -> Option<Arc<McpBinding>> {
+        self.current_binding_with_required_servers(&[]).await
+    }
+
+    /// Captures the latest runtime, waiting for servers explicitly required by this turn.
+    pub async fn current_binding_with_required_servers(
+        &self,
+        required_servers: &[String],
+    ) -> Option<Arc<McpBinding>> {
         let current = self.current.load_full();
         let config = Arc::clone(current.config.as_ref()?);
         Some(Arc::new(
             current
                 .connections
-                .capture_binding_with_metadata(config, current.plugins_available)
+                .capture_binding_with_metadata(config, current.plugins_available, required_servers)
                 .await,
         ))
     }
@@ -238,6 +246,30 @@ impl McpRuntime {
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
         }
+    }
+
+    /// Waits for the selected server without capturing an execution binding.
+    pub async fn wait_for_server_startup(&self, server: &str) {
+        self.current
+            .load_full()
+            .connections
+            .wait_for_server_startup(server)
+            .await;
+    }
+
+    /// Captures the current runtime after its selected server has finished startup.
+    pub async fn current_binding_for_call(&self, server: &str) -> Option<Arc<McpBinding>> {
+        let current = self.current.load_full();
+        let config = Arc::clone(current.config.as_ref()?);
+        if !current.connections.wait_for_server_startup(server).await {
+            return None;
+        }
+        Some(Arc::new(
+            current
+                .connections
+                .capture_binding_with_metadata(config, current.plugins_available, &[])
+                .await,
+        ))
     }
 
     /// Returns the latest published configuration without waiting for clients.

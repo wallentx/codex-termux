@@ -54,8 +54,10 @@ fn model_with_approval_messages(
             never: None,
             unless_trusted: None,
         }),
+        collaboration_modes: None,
         auto_review: None,
         permissions: None,
+        token_budget: None,
     });
     model
 }
@@ -69,8 +71,10 @@ fn model_with_permission_messages(
         instructions_template: None,
         instructions_variables: None,
         approvals: None,
+        collaboration_modes: None,
         auto_review: None,
         permissions: Some(permissions),
+        token_budget: None,
     });
     model
 }
@@ -221,8 +225,10 @@ async fn catalog_non_on_request_approval_messages_are_sent_in_initial_permission
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(approvals),
+            collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            token_budget: None,
         });
         let mut builder = test_codex()
             .with_model(model_slug)

@@ -34,7 +34,7 @@ impl FeatureConfig for CodeModeConfigToml {
 pub struct CodeModeHostConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Fail instead of running embedded V8 when the standalone host is unavailable.
+    /// Keep code mode fail-closed when the standalone host is unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_in_process_fallback: Option<bool>,
 }
@@ -95,6 +95,9 @@ pub struct MultiAgentV2ConfigToml {
     pub root_agent_usage_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_usage_hint_text: Option<String>,
+    /// Overrides inherited developer instructions for subagents without role-specific instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_developer_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

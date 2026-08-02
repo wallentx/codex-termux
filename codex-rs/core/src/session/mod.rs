@@ -206,6 +206,7 @@ use codex_protocol::exec_output::StreamOutput;
 mod code_mode_warning;
 mod config_lock;
 pub(crate) mod context_window;
+mod extension_metrics;
 mod handlers;
 mod inject;
 mod input_queue;
@@ -601,7 +602,7 @@ impl Session {
             )
         };
 
-        let config = Arc::new(config);
+        let mut config = Arc::new(config);
         let refresh_strategy = if session_source.is_non_root_agent() {
             codex_models_manager::manager::RefreshStrategy::Offline
         } else {
@@ -644,6 +645,11 @@ impl Session {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        if config.config_lock_export_dir.is_some()
+            && config.config_lock_save_fields_resolved_from_model_catalog
+        {
+            self::token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
+        }
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
         });
@@ -785,13 +791,15 @@ impl Session {
 impl SessionIo {
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
     pub(crate) async fn submit(&self, op: Op) -> CodexResult<String> {
-        self.submit_with_trace(op, /*trace*/ None).await
+        self.submit_with_trace(op, /*trace*/ None, /*parent_turn_id*/ None)
+            .await
     }
 
     pub(crate) async fn submit_with_trace(
         &self,
         op: Op,
         trace: Option<W3cTraceContext>,
+        parent_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let id = new_submission_id();
         let sub = Submission {
@@ -799,6 +807,7 @@ impl SessionIo {
             op,
             client_user_message_id: None,
             trace,
+            parent_turn_id,
         };
         self.submit_with_id(sub).await?;
         Ok(id)
@@ -817,6 +826,7 @@ impl SessionIo {
             op,
             client_user_message_id,
             trace,
+            parent_turn_id: None,
         };
         self.submit_with_id(sub).await?;
         Ok(id)
@@ -1102,11 +1112,9 @@ impl Session {
             current_exec_policy.as_ref(),
             &session_configuration.permission_profile(),
             /*network_policy_decider*/ None,
-            self.services
-                .managed_network_requirements_configured
-                .then(|| {
-                    build_blocked_request_observer(Arc::clone(&self.services.network_approval))
-                }),
+            Some(build_blocked_request_observer(Arc::clone(
+                &self.services.network_approval,
+            ))),
             self.services.managed_network_requirements_configured,
             self.services.network_proxy_audit_metadata.clone(),
         )
@@ -1205,6 +1213,7 @@ impl Session {
                 thread_settings: Default::default(),
             },
             /*client_user_message_id*/ None,
+            /*parent_turn_id*/ None,
         )
         .await;
     }
@@ -1955,7 +1964,12 @@ impl Session {
         if let Err(err) = self
             .services
             .agent_control
-            .send_inter_agent_communication(parent_thread_id, communication, context)
+            .send_inter_agent_communication(
+                parent_thread_id,
+                communication,
+                context,
+                /*parent_turn_id*/ None,
+            )
             .await
         {
             debug!("failed to notify parent thread {parent_thread_id}: {err}");
@@ -2976,10 +2990,10 @@ impl Session {
         &self,
         previous_world_state: &Arc<WorldState>,
         step_context: &step_context::StepContext,
-    ) -> Arc<WorldState> {
+    ) -> CodexResult<Arc<WorldState>> {
         let turn_context = step_context.turn.as_ref();
         // Render model-visible state from the same step used to build and run tools.
-        let world_state = Arc::new(self.build_world_state_for_step(step_context).await);
+        let world_state = Arc::new(self.build_world_state_for_step(step_context).await?);
         // Derive the model update and persisted patch from the same two snapshots.
         let previous_snapshot = previous_world_state.snapshot();
         let world_state_snapshot = world_state.snapshot();
@@ -3004,7 +3018,7 @@ impl Session {
             self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
                 .await;
         }
-        world_state
+        Ok(world_state)
     }
 
     /// Captures one request-scoped view of dynamic state.
@@ -3017,6 +3031,20 @@ impl Session {
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         cancellation_token: &CancellationToken,
+    ) -> CodexResult<Arc<StepContext>> {
+        self.capture_step_context_with_required_mcp_servers(
+            turn_context,
+            cancellation_token,
+            /*required_servers*/ &[],
+        )
+        .await
+    }
+
+    pub(crate) async fn capture_step_context_with_required_mcp_servers(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+        required_servers: &[String],
     ) -> CodexResult<Arc<StepContext>> {
         // Keep selections fixed for the turn while allowing their startup work to finish.
         let environments = turn_context.environments.refresh_readiness();
@@ -3034,20 +3062,56 @@ impl Session {
             .executor_capability_discovery_for_step(
                 &turn_context.config,
                 &ready_selected_capability_roots,
+                &environments,
+                turn_context.windows_sandbox_level,
             )
             .await;
         let extension_data = codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
         extension_data.insert(selected_capability_roots.clone());
-        let mcp = self
-            .mcp_runtime_for_step(turn_context.as_ref(), &selected_capability_roots)
-            .or_cancel(cancellation_token)
-            .await?;
-        let (mcp_tools, tool_router) = turn::built_tools(
+        if let Some(discovery) = &executor_capability_discovery {
+            extension_data.insert(discovery.as_ref().clone());
+            if !discovery.sandbox_contexts().is_empty() {
+                extension_data.insert(discovery.sandbox_contexts().clone());
+            }
+        } else if !turn_context
+            .config
+            .permissions
+            .file_system_sandbox_policy()
+            .has_full_disk_read_access()
+        {
+            let sandbox_contexts = environments
+                .turn_environments()
+                .map(|environment| {
+                    (
+                        environment.environment_id.clone(),
+                        turn_context.file_system_sandbox_context(
+                            /*additional_permissions*/ None,
+                            environment,
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            extension_data.insert(sandbox_contexts);
+        }
+        let (mcp, prepared_recommendations) = async {
+            tokio::join!(
+                self.mcp_runtime_for_step(
+                    turn_context.as_ref(),
+                    &selected_capability_roots,
+                    required_servers,
+                ),
+                turn::prepare_tool_recommendations(self.as_ref(), turn_context.as_ref()),
+            )
+        }
+        .or_cancel(cancellation_token)
+        .await?;
+        let tool_router = turn::built_tools(
             self.as_ref(),
             turn_context.as_ref(),
             &environments,
             mcp.as_ref(),
             &extension_data,
+            prepared_recommendations,
         )
         .or_cancel(cancellation_token)
         .await?;
@@ -3057,7 +3121,6 @@ impl Session {
             selected_capability_roots,
             executor_capability_discovery,
             mcp,
-            mcp_tools,
             tool_router,
             loaded_agents_md,
         }))
@@ -3347,11 +3410,12 @@ impl Session {
         {
             developer_sections.push(developer_instructions.to_string());
         }
-        if turn_context.config.include_skill_instructions {
-            let host_catalog_in_world_state = turn_context
+        if turn_context.config.include_skill_instructions
+            && turn_context
                 .extension_data
                 .get::<HostSkillsCatalogInWorldState>()
-                .is_some();
+                .is_none()
+        {
             let available_skills = build_available_skills(
                 turn_context.turn_skills.snapshot.outcome(),
                 default_skill_metadata_budget(turn_context.model_info.context_window),
@@ -3374,9 +3438,7 @@ impl Session {
                     })
                     .await;
                 }
-                if !host_catalog_in_world_state {
-                    developer_sections.push(skills_instructions.render());
-                }
+                developer_sections.push(skills_instructions.render());
             }
         }
         let loaded_plugins = self
@@ -3384,23 +3446,27 @@ impl Session {
             .plugins_manager
             .plugins_for_config(&turn_context.config.plugins_config_input())
             .await;
-        let recommended_plugin_candidates =
-            if crate::tools::spec_plan::tool_suggest_enabled(turn_context) {
-                let auth = self.services.auth_manager.auth().await;
-                let plugins_config = turn_context.config.plugins_config_input();
-                self.services
-                    .plugins_manager
-                    .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
-                        plugins_config: &plugins_config,
-                        loaded_plugins: &loaded_plugins,
-                        auth: auth.as_ref(),
-                        disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
-                        app_server_client_name: turn_context.app_server_client_name.as_deref(),
-                    })
-                    .await
-            } else {
-                None
-            };
+        let features = turn_context.config.features.get();
+        let recommended_plugin_candidates = if features.enabled(Feature::Apps)
+            && features.enabled(Feature::Plugins)
+            && (features.enabled(Feature::ToolSuggest)
+                || features.enabled(Feature::RecommendedPlugins))
+        {
+            let auth = self.services.auth_manager.auth().await;
+            let plugins_config = turn_context.config.plugins_config_input();
+            self.services
+                .plugins_manager
+                .recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
+                    plugins_config: &plugins_config,
+                    loaded_plugins: &loaded_plugins,
+                    auth: auth.as_ref(),
+                    disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
+                    app_server_client_name: turn_context.app_server_client_name.as_deref(),
+                })
+                .await
+        } else {
+            None
+        };
         if let Some(recommended_plugins) = recommended_plugin_candidates
             .as_deref()
             .and_then(RecommendedPluginsInstructions::from_plugins)
@@ -3483,16 +3549,6 @@ impl Session {
                 )
                 .render(),
             );
-            if let Some(guidance_message) = turn_context
-                .config
-                .token_budget
-                .as_ref()
-                .and_then(|config| config.guidance_message.as_deref())
-                .filter(|message| !message.trim().is_empty())
-            {
-                developer_sections
-                    .push(crate::context::ContextWindowGuidance::new(guidance_message).render());
-            }
         }
         // Render the active mode after the usage hint so it can override that hint.
         let mut initial_multi_agent_mode = None;
@@ -3652,7 +3708,7 @@ impl Session {
     pub(crate) async fn record_context_updates_and_set_reference_context_item(
         &self,
         step_context: &StepContext,
-    ) -> Arc<WorldState> {
+    ) -> CodexResult<Arc<WorldState>> {
         let turn_context = step_context.turn.as_ref();
         let reference_context_item = {
             let state = self.state.lock().await;
@@ -3661,7 +3717,7 @@ impl Session {
         let turn_context_item = turn_context.to_turn_context_item();
         let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
         let should_inject_full_context = reference_context_item.is_none();
-        let world_state = Arc::new(self.build_world_state_for_step(step_context).await);
+        let world_state = Arc::new(self.build_world_state_for_step(step_context).await?);
         // Full initial context resets the baseline; later turns persist only its changes.
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let context_items = self
@@ -3698,7 +3754,7 @@ impl Session {
         // A snapshot can change without producing model-visible or TurnContext updates.
         let only_world_state_changed = !turn_context_changed && context_items.is_empty();
         if only_world_state_changed && world_state_item.is_none() {
-            return world_state;
+            return Ok(world_state);
         }
         if !context_items.is_empty() {
             self.record_conversation_items(turn_context, &context_items)
@@ -3711,7 +3767,7 @@ impl Session {
         }
         // A snapshot-only change does not require a duplicate TurnContext record.
         if only_world_state_changed {
-            return world_state;
+            return Ok(world_state);
         }
         // Persist one `TurnContextItem` per real user turn so resume/lazy replay can recover the
         // latest durable baseline even when this turn emitted no model-visible context diffs.
@@ -3722,7 +3778,7 @@ impl Session {
         // context items.
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
-        world_state
+        Ok(world_state)
     }
 
     pub(crate) async fn update_token_usage_info(

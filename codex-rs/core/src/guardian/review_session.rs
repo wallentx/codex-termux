@@ -806,10 +806,8 @@ async fn run_review_on_session(
         .and_then(|environment| environment.cwd().to_abs_path().ok())
         .unwrap_or_else(|| params.parent_turn.config.cwd.clone());
 
-    let submit_result = run_before_review_deadline(
-        deadline,
-        params.external_cancel.as_ref(),
-        Box::pin(review_session.io.submit(Op::UserInput {
+    let submission = review_session.io.submit_with_trace(
+        Op::UserInput {
             items: prompt_items.items,
             final_output_json_schema: Some(params.schema.clone()),
             responsesapi_client_metadata: None,
@@ -834,7 +832,14 @@ async fn run_review_on_session(
                 }),
                 ..Default::default()
             },
-        })),
+        },
+        /*trace*/ None,
+        Some(params.parent_turn.sub_id.clone()),
+    );
+    let submit_result = run_before_review_deadline(
+        deadline,
+        params.external_cancel.as_ref(),
+        Box::pin(submission),
     )
     .await;
     let child_turn_id = match submit_result {
@@ -1448,11 +1453,13 @@ mod tests {
             instructions_template: None,
             instructions_variables: None,
             approvals: None,
+            collaboration_modes: None,
             auto_review: Some(AutoReviewMessages {
                 policy: Some("Use the catalog Guardian policy.".to_string()),
                 policy_template: Some(catalog_template.to_string()),
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(
@@ -1480,11 +1487,13 @@ mod tests {
             instructions_template: None,
             instructions_variables: None,
             approvals: None,
+            collaboration_modes: None,
             auto_review: Some(AutoReviewMessages {
                 policy: Some(String::new()),
                 policy_template: None,
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(
@@ -1520,11 +1529,13 @@ mod tests {
             instructions_template: None,
             instructions_variables: None,
             approvals: None,
+            collaboration_modes: None,
             auto_review: Some(AutoReviewMessages {
                 policy: Some(catalog_policy.to_string()),
                 policy_template: Some(String::new()),
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(

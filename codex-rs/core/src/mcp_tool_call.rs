@@ -140,12 +140,7 @@ pub(crate) async fn handle_mcp_tool_call(
         arguments: arguments_value.clone(),
     };
 
-    sess.refresh_mcp_if_dirty().await;
-    let current_binding = sess.services.mcp_runtime.current_binding().await;
-    let Some(prepared_call) = current_binding
-        .as_ref()
-        .and_then(|binding| binding.prepare_call(&server, &tool_name))
-    else {
+    let Some(prepared_call) = sess.prepare_mcp_call(&server, &tool_name).await else {
         let item_metadata =
             McpToolCallItemMetadata::from_tool_metadata(&server, /*metadata*/ None);
         let result = notify_mcp_tool_call_skip(
@@ -336,6 +331,7 @@ struct McpToolCallItemMetadata {
     app_name: Option<String>,
     action_name: Option<String>,
     plugin_id: Option<String>,
+    read_only_hint: Option<bool>,
 }
 
 impl McpToolCallItemMetadata {
@@ -360,6 +356,9 @@ impl McpToolCallItemMetadata {
                 .filter(|action_name| !action_name.is_empty())
                 .map(str::to_string),
             plugin_id: metadata.and_then(|metadata| metadata.plugin_id.clone()),
+            read_only_hint: metadata
+                .and_then(|metadata| metadata.annotations.as_ref())
+                .and_then(|annotations| annotations.read_only_hint),
         }
     }
 }
@@ -424,7 +423,7 @@ async fn handle_approved_mcp_tool_call(
                         .await;
                     let rewritten_arguments = rewrite_mcp_tool_arguments_for_openai_files(
                         sess,
-                        turn_context,
+                        step_context,
                         arguments_value,
                         metadata.openai_file_input_optional_fields.as_ref(),
                     )
@@ -914,6 +913,7 @@ async fn notify_mcp_tool_call_started(
         app_name: item_metadata.app_name,
         action_name: item_metadata.action_name,
         plugin_id: item_metadata.plugin_id,
+        read_only_hint: item_metadata.read_only_hint,
         status: McpToolCallStatus::InProgress,
         result: None,
         error: None,
@@ -958,6 +958,7 @@ async fn notify_mcp_tool_call_completed(
         app_name: item_metadata.app_name,
         action_name: item_metadata.action_name,
         plugin_id: item_metadata.plugin_id,
+        read_only_hint: item_metadata.read_only_hint,
         status,
         result,
         error,
@@ -1846,6 +1847,7 @@ fn parse_mcp_tool_approval_elicitation_response(
         }
         ElicitationAction::Decline => McpToolApprovalDecision::Decline { message: None },
         ElicitationAction::Cancel => McpToolApprovalDecision::Cancel,
+        _ => McpToolApprovalDecision::Cancel,
     }
 }
 

@@ -15,6 +15,8 @@ mod config_rpc;
 mod connection_handling_websocket;
 #[cfg(unix)]
 mod connection_handling_websocket_unix;
+#[cfg(unix)]
+mod curated_mcp_sync;
 mod current_time;
 mod dynamic_tools;
 mod environment_add;
@@ -27,6 +29,7 @@ mod executor_skills;
 mod experimental_api;
 mod experimental_feature_list;
 mod external_agent_config;
+mod external_agent_import_sync;
 mod fs;
 mod git_attribution;
 mod hooks_list;
@@ -43,6 +46,7 @@ mod mcp_tool;
 mod memory_reset;
 mod model_list;
 mod model_provider_capabilities_read;
+mod multi_agent_v2_developer_instructions;
 mod output_schema;
 mod permission_profile_list;
 mod plan_item;
