@@ -594,14 +594,14 @@ jobs:
             export CARGO_BUILD_JOBS=4
             export CARGO_PROFILE_RELEASE_LTO=thin
             export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
-            cargo build --target ${{ matrix.target }} --release --bin codex
+            cargo build --target ${{ matrix.target }} --release --bin codex --bin codex-code-mode-host
             exit 0
           fi
 
           if [[ "${{ contains(matrix.target, 'windows') }}" == 'true' ]]; then
-            cargo build --target ${{ matrix.target }} --release --bin codex --bin codex-responses-api-proxy --bin codex-windows-sandbox-setup --bin codex-command-runner
+            cargo build --target ${{ matrix.target }} --release --bin codex --bin codex-code-mode-host --bin codex-responses-api-proxy --bin codex-windows-sandbox-setup --bin codex-command-runner
           else
-            cargo build --target ${{ matrix.target }} --release --bin codex --bin codex-responses-api-proxy
+            cargo build --target ${{ matrix.target }} --release --bin codex --bin codex-code-mode-host --bin codex-responses-api-proxy
           fi
       - name: sccache stats (Android)
         if: ${{ matrix.target == 'aarch64-linux-android' }}
@@ -613,16 +613,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for binary in codex codex-responses-api-proxy; do
+          for binary in codex codex-code-mode-host; do
             binary_path="target/${{ matrix.target }}/release/${binary}"
-            if [[ -f "${binary_path}" ]]; then
-              termux-elf-cleaner --api-level 24 "${binary_path}"
-              chmod +x "${binary_path}"
-              # if [[ "${binary}" == "codex" ]]; then
-              #   # Patch PT_TLS (0x7) to PT_NULL (0x0) at offset 400 to bypass Bionic alignment checks.
-              #   printf '\x00\x00\x00\x00' | dd of="${binary_path}" bs=1 seek=400 count=4 conv=notrunc
-              # fi
+            if [[ ! -f "${binary_path}" ]]; then
+              echo "Required Android binary not found: ${binary_path}" >&2
+              exit 1
             fi
+            termux-elf-cleaner --api-level 24 "${binary_path}"
+            chmod +x "${binary_path}"
           done
 
       - if: ${{ contains(matrix.target, 'linux') && !contains(matrix.target, 'android') && github.repository_owner == 'openai' }}
@@ -724,15 +722,18 @@ jobs:
 
           if [[ "${{ matrix.runner }}" == windows* ]]; then
             cp target/${{ matrix.target }}/release/codex.exe "$dest/codex-${{ matrix.target }}.exe"
+            cp target/${{ matrix.target }}/release/codex-code-mode-host.exe "$dest/codex-code-mode-host-${{ matrix.target }}.exe"
             cp target/${{ matrix.target }}/release/codex-responses-api-proxy.exe "$dest/codex-responses-api-proxy-${{ matrix.target }}.exe"
             cp target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe "$dest/codex-windows-sandbox-setup-${{ matrix.target }}.exe"
             cp target/${{ matrix.target }}/release/codex-command-runner.exe "$dest/codex-command-runner-${{ matrix.target }}.exe"
           else
-            # For Android, we want the binary to be named just 'codex' in the archive.
+            # Android resolves the code-mode host next to the codex executable.
             if [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
               cp target/${{ matrix.target }}/release/codex "$dest/codex"
+              cp target/${{ matrix.target }}/release/codex-code-mode-host "$dest/codex-code-mode-host"
             else
               cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
+              cp target/${{ matrix.target }}/release/codex-code-mode-host "$dest/codex-code-mode-host-${{ matrix.target }}"
             fi
             if [[ -f target/${{ matrix.target }}/release/codex-responses-api-proxy ]]; then
               cp target/${{ matrix.target }}/release/codex-responses-api-proxy "$dest/codex-responses-api-proxy-${{ matrix.target }}"
@@ -792,13 +793,19 @@ jobs:
               continue
             fi
 
-            # Create per-binary tar.gz
-            # For Android, we want the archive to have the target suffix even though the binary is just 'codex'.
+            # Create per-binary tar.gz. The Android codex archive also carries
+            # its required code-mode host sibling.
             archive_name="${base}"
-            if [[ "${{ matrix.target }}" == "aarch64-linux-android" && "${base}" == "codex" ]]; then
-              archive_name="codex-${{ matrix.target }}"
+            tar_inputs=("$base")
+            if [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
+              if [[ "${base}" == "codex" ]]; then
+                archive_name="codex-${{ matrix.target }}"
+                tar_inputs+=("codex-code-mode-host")
+              elif [[ "${base}" == "codex-code-mode-host" ]]; then
+                archive_name="codex-code-mode-host-${{ matrix.target }}"
+              fi
             fi
-            tar -C "$dest" -czf "$dest/${archive_name}.tar.gz" "$base"
+            tar -C "$dest" -czf "$dest/${archive_name}.tar.gz" "${tar_inputs[@]}"
 
             # Create zip archive for Windows binaries
             # Must run from inside the dest dir so 7z won't
