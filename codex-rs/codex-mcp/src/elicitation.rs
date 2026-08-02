@@ -32,7 +32,6 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use rmcp::model::ElicitationAction;
 use rmcp::model::RequestId;
-use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
 static NEXT_ELICITATION_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -87,8 +86,25 @@ struct ActiveElicitation {
 /// the same server request ID without colliding.
 #[derive(Clone, Default)]
 pub(crate) struct ElicitationRequestRouter {
-    requests: Arc<Mutex<ResponderMap>>,
+    requests: Arc<StdMutex<ResponderMap>>,
     auto_deny: Arc<AtomicBool>,
+}
+
+struct PendingElicitationRequest {
+    router: ElicitationRequestRouter,
+    key: (String, RequestId),
+}
+
+impl Drop for PendingElicitationRequest {
+    fn drop(&mut self) {
+        let responder = self
+            .router
+            .requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.remove(&self.key));
+        drop(responder);
+    }
 }
 
 impl ElicitationRequestRouter {
@@ -106,11 +122,13 @@ impl ElicitationRequestRouter {
         id: RequestId,
         response: ElicitationResponse,
     ) -> Result<()> {
-        self.requests
+        let responder = self
+            .requests
             .lock()
-            .await
+            .map_err(|_| anyhow!("elicitation request router unavailable"))?
             .remove(&(server_name, id))
-            .ok_or_else(|| anyhow!("elicitation request not found"))?
+            .ok_or_else(|| anyhow!("elicitation request not found"))?;
+        responder
             .send(response)
             .map_err(|e| anyhow!("failed to send elicitation response: {e:?}"))
     }
@@ -248,13 +266,11 @@ impl ElicitationRequestManager {
                 );
                 let routed_request_id = RequestId::String(public_request_id.clone().into());
                 let request = match elicitation {
-                    Elicitation::Mcp(
-                        rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
-                            meta,
-                            message,
-                            requested_schema,
-                        },
-                    ) => ElicitationRequest::Form {
+                    Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
+                        meta,
+                        message,
+                        requested_schema,
+                    }) => ElicitationRequest::Form {
                         meta: meta
                             .map(serde_json::to_value)
                             .transpose()
@@ -263,14 +279,12 @@ impl ElicitationRequestManager {
                         requested_schema: serde_json::to_value(requested_schema)
                             .context("failed to serialize MCP elicitation schema")?,
                     },
-                    Elicitation::Mcp(
-                        rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
-                            meta,
-                            message,
-                            url,
-                            elicitation_id,
-                        },
-                    ) => ElicitationRequest::Url {
+                    Elicitation::Mcp(rmcp::model::ElicitRequestParams::UrlElicitationParams {
+                        meta,
+                        message,
+                        url,
+                        elicitation_id,
+                    }) => ElicitationRequest::Url {
                         meta: meta
                             .map(serde_json::to_value)
                             .transpose()
@@ -279,6 +293,13 @@ impl ElicitationRequestManager {
                         url,
                         elicitation_id,
                     },
+                    Elicitation::Mcp(_) => {
+                        return Ok(ElicitationResponse {
+                            action: ElicitationAction::Decline,
+                            content: None,
+                            meta: None,
+                        });
+                    }
                     Elicitation::OpenAiForm {
                         meta,
                         message,
@@ -291,10 +312,16 @@ impl ElicitationRequestManager {
                 };
                 let (tx, rx) = oneshot::channel();
                 let _active_elicitation = lifecycle.as_ref().map(ElicitationLifecycle::start);
-                {
-                    let mut lock = router.requests.lock().await;
-                    lock.insert((server_name.clone(), routed_request_id), tx);
-                }
+                let request_key = (server_name.clone(), routed_request_id);
+                router
+                    .requests
+                    .lock()
+                    .map_err(|_| anyhow!("elicitation request router unavailable"))?
+                    .insert(request_key.clone(), tx);
+                let _pending_request = PendingElicitationRequest {
+                    router: router.clone(),
+                    key: request_key,
+                };
                 let _ = tx_event
                     .send(Event {
                         id: "mcp_elicitation_request".to_string(),
@@ -327,16 +354,13 @@ type ResponderMap = HashMap<(String, RequestId), oneshot::Sender<ElicitationResp
 
 fn can_auto_accept_elicitation(elicitation: &Elicitation) -> bool {
     match elicitation {
-        Elicitation::Mcp(rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
+        Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
             requested_schema,
             ..
         }) => {
             // Auto-accept confirm/approval elicitations without schema requirements.
             requested_schema.properties.is_empty()
         }
-        Elicitation::Mcp(rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
-            ..
-        })
-        | Elicitation::OpenAiForm { .. } => false,
+        Elicitation::Mcp(_) | Elicitation::OpenAiForm { .. } => false,
     }
 }

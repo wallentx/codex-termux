@@ -114,6 +114,7 @@ enabled = true
 async fn list_discovers_local_oauth_server_through_environment_proxy() -> Result<()> {
     let codex_home = TempDir::new()?;
     configure_http_oauth_server(codex_home.path(), "http://mcp-proxy.invalid/mcp").await?;
+    std::fs::write(codex_home.path().join("environments.toml"), "invalid = [")?;
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
@@ -164,6 +165,7 @@ async fn list_discovers_local_oauth_server_through_environment_proxy() -> Result
                     Err(error) => return Err(error.into()),
                 }
             };
+            stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut request = Vec::new();
             let mut buffer = [0_u8; 1024];
@@ -227,6 +229,36 @@ async fn list_discovers_local_oauth_server_through_environment_proxy() -> Result
         "OAuth discovery failed after proxy requests {proxy_requests:?}; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_reports_unknown_auth_status_when_oauth_discovery_is_rate_limited() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/mcp"))
+        .respond_with(wiremock::ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&server)
+        .await;
+    configure_http_oauth_server(codex_home.path(), &format!("{}/mcp", server.uri())).await?;
+
+    codex_command(codex_home.path())?
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "-c",
+            "mcp_oauth_credentials_store=\"file\"",
+            "mcp",
+            "list",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains(r#""auth_status": "unknown""#));
+    server.verify().await;
+
     Ok(())
 }
 

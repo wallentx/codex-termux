@@ -63,6 +63,7 @@ codex-rmcp-client = { workspace = true }
 codex-rollout = { workspace = true }
 codex-rollout-trace = { workspace = true }
 codex-sandboxing = { workspace = true }
+codex-skills-extension = { workspace = true }
 codex-state = { workspace = true }
 codex-stdio-to-uds = { workspace = true }
 codex-terminal-detection = { workspace = true }
@@ -109,10 +110,12 @@ app_test_support = { workspace = true }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
+futures = { workspace = true }
 insta = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 sqlx = { workspace = true }
+tokio-tungstenite = { workspace = true }
 wiremock = { workspace = true }
 zstd = { workspace = true }
 

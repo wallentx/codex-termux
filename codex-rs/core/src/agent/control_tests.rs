@@ -120,6 +120,7 @@ fn spawn_agent_call(call_id: &str) -> ResponseItem {
         namespace: None,
         arguments: "{}".to_string(),
         call_id: call_id.to_string(),
+        encrypted_function_args: None,
         internal_chat_message_metadata_passthrough: None,
     }
 }
@@ -369,6 +370,7 @@ async fn send_input_errors_when_manager_dropped() {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*parent_turn_id*/ None,
         )
         .await
         .expect_err("send_input should fail without a manager");
@@ -483,6 +485,7 @@ async fn send_input_errors_when_thread_missing() {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*parent_turn_id*/ None,
         )
         .await
         .expect_err("send_input should fail for missing thread");
@@ -555,6 +558,7 @@ async fn send_input_submits_user_message() {
                 text: "hello from tests".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*parent_turn_id*/ None,
         )
         .await
         .expect("send_input should succeed");
@@ -598,6 +602,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
             thread_id,
             communication.clone(),
             AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
+            /*parent_turn_id*/ None,
         )
         .await
         .expect("send_inter_agent_communication should succeed");
@@ -729,6 +734,7 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
             spawned_agent.thread_id,
             communication.clone(),
             AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
+            /*parent_turn_id*/ None,
         )
         .await
         .expect("send_inter_agent_communication should succeed after reload");
@@ -783,6 +789,9 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
         )
         .await
         .expect("reviewer spawn should succeed");
+    let sibling_thread_id = harness
+        .spawn_anonymous_child(parent_thread_id, SpawnAgentOptions::default())
+        .await;
 
     let worker_thread = harness
         .manager
@@ -794,11 +803,21 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
         .get_thread(reviewer_thread_id)
         .await
         .expect("reviewer thread should exist");
+    let sibling_thread = harness
+        .manager
+        .get_thread(sibling_thread_id)
+        .await
+        .expect("sibling thread should exist");
     persist_thread_for_tree_resume(&parent_thread, "parent persisted").await;
     persist_thread_for_tree_resume(&worker_thread, "worker persisted").await;
     persist_thread_for_tree_resume(&reviewer_thread, "reviewer persisted").await;
-    wait_for_live_thread_spawn_children(&harness.control, parent_thread_id, &[worker_thread_id])
-        .await;
+    persist_thread_for_tree_resume(&sibling_thread, "sibling persisted").await;
+    wait_for_live_thread_spawn_children(
+        &harness.control,
+        parent_thread_id,
+        &[worker_thread_id, sibling_thread_id],
+    )
+    .await;
     wait_for_live_thread_spawn_children(&harness.control, worker_thread_id, &[reviewer_thread_id])
         .await;
 
@@ -832,6 +851,24 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
     );
     assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
     assert_thread_not_loaded(&resumed_manager, reviewer_thread_id).await;
+    assert_thread_not_loaded(&resumed_manager, sibling_thread_id).await;
+    resumed_control
+        .restore_v2_agent_metadata(&harness.config, parent_thread_id)
+        .await;
+    for thread_id in [worker_thread_id, sibling_thread_id] {
+        assert!(resumed_control.ensure_agent_known(thread_id).is_ok());
+    }
+
+    resumed_control
+        .close_agent(worker_thread_id)
+        .await
+        .expect("closing a restored sibling should succeed");
+
+    let closed_worker = resumed_control.ensure_agent_known(worker_thread_id);
+    let surviving_sibling = resumed_control.ensure_agent_known(sibling_thread_id);
+    assert!(closed_worker.is_err());
+    assert!(surviving_sibling.is_ok());
+    assert_thread_not_loaded(&resumed_manager, sibling_thread_id).await;
 }
 
 #[tokio::test]
@@ -1516,6 +1553,13 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     let parent_thread = new_thread.thread;
     let turn_context = parent_thread.session.new_default_turn().await;
     let parent_spawn_call_id = "spawn-call-compacted-usage-hints".to_string();
+    let parent_task = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root().join("worker").expect("valid worker path"),
+        Vec::new(),
+        "compacted parent delegated task".to_string(),
+        /*trigger_turn*/ true,
+    );
     let replacement_history = vec![
         ResponseItem::Message {
             id: None,
@@ -1526,6 +1570,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
+        parent_task.to_model_input_item(),
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
@@ -1604,6 +1649,13 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     assert!(
         history_contains_text(history.raw_items(), "compacted parent summary"),
         "forked child history should retain compacted non-hint content"
+    );
+    assert!(
+        !history
+            .raw_items()
+            .iter()
+            .any(|item| matches!(item, ResponseItem::AgentMessage { .. })),
+        "forked child history should not inherit compacted parent agent messages"
     );
     assert!(
         !history_contains_text(history.raw_items(), "Parent root guidance."),
