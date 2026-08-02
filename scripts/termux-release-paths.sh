@@ -50,7 +50,6 @@ readonly -a TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS=(
   .github/workflows/python-runtime-build.yml
   .github/workflows/python-runtime-release.yml
   .github/workflows/r2-release.yml
-  codex-rs/Cargo.toml
 )
 
 readonly -a TERMUX_RELEASE_MERGE_AUTHORITATIVE_PATHS=(
