@@ -26,9 +26,11 @@ use crate::elicitation::ElicitationRequestManager;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::openai_docs_source_attribution::maybe_with_openai_docs_source_attribution;
+use crate::pagination::collect_paginated;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
 use crate::server::EffectiveMcpServer;
+use crate::server::has_explicit_http_authorization;
 use crate::tool_catalog_cache::McpToolCatalogCacheContext;
 use crate::tool_catalog_cache::McpToolCatalogFetchTicket;
 use crate::tools::ToolInfo;
@@ -38,6 +40,7 @@ use async_channel::Sender;
 use codex_api::SharedAuthProvider;
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
+use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::types::AuthKeyringBackendKind;
@@ -52,6 +55,7 @@ use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_rmcp_client::ExecutorStdioServerLauncher;
 use codex_rmcp_client::LocalStdioServerLauncher;
+use codex_rmcp_client::McpProtocolMode;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::StdioServerLauncher;
 use codex_rmcp_client::ToolWithConnectorId;
@@ -280,6 +284,7 @@ struct ManagedClientStartup {
     runtime_auth_provider: Option<SharedAuthProvider>,
     client_elicitation_capability: ElicitationCapability,
     supports_openai_form_elicitation: bool,
+    protocol_mode: McpProtocolMode,
     cancel_token: CancellationToken,
     startup_complete: Arc<AtomicBool>,
 }
@@ -300,6 +305,7 @@ impl ManagedClientStartup {
             runtime_auth_provider,
             client_elicitation_capability,
             supports_openai_form_elicitation,
+            protocol_mode,
             cancel_token,
             startup_complete,
         } = self.clone();
@@ -329,6 +335,7 @@ impl ManagedClientStartup {
                         runtime_context,
                         resolved_environment,
                         runtime_auth_provider,
+                        protocol_mode,
                     ),
                 )
                 .await
@@ -415,6 +422,7 @@ impl AsyncManagedClient {
         runtime_auth_provider: Option<SharedAuthProvider>,
         client_elicitation_capability: ElicitationCapability,
         supports_openai_form_elicitation: bool,
+        protocol_mode: McpProtocolMode,
     ) -> Self {
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let reconnect_server_name = server_name.clone();
@@ -441,6 +449,7 @@ impl AsyncManagedClient {
             runtime_auth_provider,
             client_elicitation_capability,
             supports_openai_form_elicitation,
+            protocol_mode,
             cancel_token: cancel_token.clone(),
             startup_complete: Arc::clone(&startup_complete),
         });
@@ -584,21 +593,31 @@ pub(crate) async fn list_tools_for_client_uncached(
     server_instructions: Option<&str>,
 ) -> Result<Vec<ToolInfo>> {
     let fetch_start = Instant::now();
-    let resp = client
-        .list_tools_with_connector_ids(/*params*/ None, timeout)
-        .await?;
-    let tools = resp
-        .tools
-        .into_iter()
-        .map(|tool| {
-            tool_info_from_listed_tool(
-                server_name,
-                is_codex_apps_mcp_server,
-                server_instructions,
-                tool,
-            )
-        })
-        .collect();
+    let protocol_mode = client.protocol_mode();
+    let tools = collect_paginated("tools/list", timeout, |params| {
+        let client = Arc::clone(client);
+        async move {
+            let response = client
+                .list_tools_with_connector_ids(params, timeout)
+                .await?;
+            let next_cursor = match protocol_mode {
+                McpProtocolMode::Legacy => None,
+                McpProtocolMode::V20260728 => response.next_cursor,
+            };
+            Ok((response.tools, next_cursor))
+        }
+    })
+    .await?
+    .into_iter()
+    .map(|tool| {
+        tool_info_from_listed_tool(
+            server_name,
+            is_codex_apps_mcp_server,
+            server_instructions,
+            tool,
+        )
+    })
+    .collect();
     if is_codex_apps_mcp_server {
         emit_duration(
             MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC,
@@ -876,7 +895,8 @@ async fn start_server_task(
     )
     .await
     .map_err(StartupOutcomeError::from)?;
-    let server_info = mcp_server_info_from_implementation(initialize_result.server_info);
+    let server_info =
+        mcp_server_info_from_implementation(&server_name, initialize_result.server_info);
     let shared_tools = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
         (Some(cache_context), Some(fetch_ticket)) => cache_context.publish_if_newest_accepted(
             fetch_ticket,
@@ -932,7 +952,11 @@ fn mcp_initialize_request_params(
     .with_protocol_version(ProtocolVersion::V_2025_06_18)
 }
 
-fn mcp_server_info_from_implementation(server_info: Implementation) -> McpServerInfo {
+fn mcp_server_info_from_implementation(
+    server_name: &str,
+    server_info: Option<Implementation>,
+) -> McpServerInfo {
+    let server_info = server_info.unwrap_or_else(|| Implementation::new(server_name, ""));
     McpServerInfo {
         name: server_info.name,
         title: server_info.title,
@@ -960,6 +984,7 @@ struct StartServerTaskParams {
     supports_openai_form_elicitation: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
 async fn make_rmcp_client(
     server_name: &str,
@@ -969,11 +994,21 @@ async fn make_rmcp_client(
     runtime_context: McpRuntimeContext,
     resolved_environment: std::result::Result<Option<Arc<Environment>>, String>,
     runtime_auth_provider: Option<SharedAuthProvider>,
+    protocol_mode: McpProtocolMode,
 ) -> Result<RmcpClient, StartupOutcomeError> {
     let config = server.config().clone();
+    if matches!(config.auth, McpServerAuth::ChatGpt)
+        && !config.is_local_environment()
+        && !has_explicit_http_authorization(&config)
+    {
+        return Err(StartupOutcomeError::from(anyhow!(
+            "executor-owned MCP server `{server_name}` cannot use hosted ChatGPT authentication; configure executor-owned credentials instead"
+        )));
+    }
     let resolved_environment =
         resolved_environment.map_err(|err| StartupOutcomeError::from(anyhow!(err)))?;
     let is_local_environment = config.is_local_environment();
+    let oauth_credential_name = config.oauth_credential_name(server_name);
     let McpServerConfig { transport, .. } = config;
 
     match transport {
@@ -1010,9 +1045,17 @@ async fn make_rmcp_client(
             };
 
             let cwd = cwd.map(codex_utils_path_uri::LegacyAppPathString::into_string);
-            RmcpClient::new_stdio_client(command_os, args_os, env_os, &env_vars, cwd, launcher)
-                .await
-                .map_err(|err| StartupOutcomeError::from(anyhow!(err)))
+            RmcpClient::new_stdio_client_with_protocol_mode(
+                command_os,
+                args_os,
+                env_os,
+                &env_vars,
+                cwd,
+                launcher,
+                protocol_mode,
+            )
+            .await
+            .map_err(|err| StartupOutcomeError::from(anyhow!(err)))
         }
         McpServerTransportConfig::StreamableHttp {
             url,
@@ -1030,8 +1073,8 @@ async fn make_rmcp_client(
                     Ok(token) => token,
                     Err(error) => return Err(error.into()),
                 };
-            RmcpClient::new_streamable_http_client(
-                server_name,
+            RmcpClient::new_streamable_http_client_with_protocol_mode(
+                oauth_credential_name.as_ref(),
                 &url,
                 resolved_bearer_token,
                 http_headers,
@@ -1040,6 +1083,7 @@ async fn make_rmcp_client(
                 keyring_backend_kind,
                 http_client,
                 runtime_auth_provider,
+                protocol_mode,
             )
             .await
             .map_err(StartupOutcomeError::from)
@@ -1052,7 +1096,7 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rmcp::model::JsonObject;
-    use rmcp::model::Meta;
+    use rmcp::model::MetaObject;
     use rmcp::transport::auth::AuthError;
 
     #[test]
@@ -1063,6 +1107,44 @@ mod tests {
         let error = StartupOutcomeError::from(error);
 
         assert!(error.is_authentication_required());
+    }
+
+    #[test]
+    fn missing_server_implementation_uses_configured_server_name() {
+        assert_eq!(
+            mcp_server_info_from_implementation("configured-server", /*server_info*/ None),
+            McpServerInfo {
+                name: "configured-server".to_string(),
+                title: None,
+                version: String::new(),
+                description: None,
+                icons: None,
+                website_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn advertised_server_implementation_takes_precedence_over_configured_name() {
+        assert_eq!(
+            mcp_server_info_from_implementation(
+                "configured-server",
+                Some(
+                    Implementation::new("advertised-server", "1.2.3")
+                        .with_title("Advertised server")
+                        .with_description("Advertised description")
+                        .with_website_url("https://example.com"),
+                ),
+            ),
+            McpServerInfo {
+                name: "advertised-server".to_string(),
+                title: Some("Advertised server".to_string()),
+                version: "1.2.3".to_string(),
+                description: Some("Advertised description".to_string()),
+                icons: None,
+                website_url: Some("https://example.com".to_string()),
+            }
+        );
     }
 
     #[test]
@@ -1092,7 +1174,7 @@ mod tests {
             "test tool",
             Arc::new(JsonObject::default()),
         )
-        .with_meta(Meta(
+        .with_meta(MetaObject(
             serde_json::json!({
                 "connector_id": "connector_gmail",
                 "connector_name": "Gmail",

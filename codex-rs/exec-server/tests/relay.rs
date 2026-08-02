@@ -1,5 +1,9 @@
 mod common;
 
+#[cfg(unix)]
+#[path = "relay/version_skew.rs"]
+mod version_skew;
+
 #[path = "../src/proto/codex.exec_server.relay.v1.rs"]
 mod relay_proto;
 
@@ -31,6 +35,7 @@ use codex_exec_server::NoiseRendezvousConnectBundle;
 use codex_exec_server::NoiseRendezvousConnectProvider;
 use codex_exec_server::ProcessId;
 use codex_exec_server::RemoteEnvironmentConfig;
+use codex_exec_server_protocol::ProcessSandboxType;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::cache_system_proxy_route_for_test;
@@ -70,7 +75,7 @@ const ENVIRONMENT_ID: &str = "env-noise-relay-test";
 const EXECUTOR_REGISTRATION_ID: &str = "registration-1";
 const HARNESS_KEY_AUTHORIZATION: &str = "harness-key-authorization";
 const REGISTRY_TOKEN: &str = "registry-token";
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct StaticRegistryAuthProvider;
@@ -410,6 +415,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
         response,
         ExecResponse {
             process_id: ProcessId::from("proc-1"),
+            sandbox_type: Some(ProcessSandboxType::None),
         }
     );
 

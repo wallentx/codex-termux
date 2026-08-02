@@ -30,7 +30,6 @@ use crate::original_image_detail::sanitize_original_image_detail as sanitize_ima
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
-use crate::tools::ToolRouter;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
@@ -76,9 +75,11 @@ pub(crate) struct ExecContext {
 pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
+    availability: Result<(), String>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     default_exec_yield_time_override_ms: Option<u64>,
     shutting_down: AtomicBool,
+    unavailable_warning_emitted: AtomicBool,
 }
 
 impl CodeModeService {
@@ -87,13 +88,36 @@ impl CodeModeService {
         features: &Features,
     ) -> Self {
         let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
+        let availability = session_provider.availability();
         Self {
             session: OnceCell::new(),
             session_provider,
+            availability,
             dispatch_broker,
             default_exec_yield_time_override_ms: default_exec_yield_time_override_ms(features),
             shutting_down: AtomicBool::new(false),
+            unavailable_warning_emitted: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.availability.is_ok()
+    }
+
+    pub(crate) fn take_unavailable_warning(&self, tool_mode: ToolMode) -> Option<String> {
+        let error = self.availability.as_ref().err()?;
+        let behavior = match tool_mode {
+            ToolMode::Direct => "Falling back to direct tools",
+            ToolMode::CodeMode | ToolMode::CodeModeOnly => "Code mode will fail closed",
+        };
+        (!self
+            .unavailable_warning_emitted
+            .swap(true, Ordering::Relaxed))
+        .then(|| {
+            format!(
+                "Code Mode is unavailable because {error}. {behavior}; enable `features.code_mode_host` and install `codex-code-mode-host`."
+            )
+        })
     }
 
     pub(crate) fn session_provider(&self) -> Arc<dyn CodeModeSessionProvider> {
@@ -153,7 +177,6 @@ impl CodeModeService {
         &self,
         session: &Arc<Session>,
         step_context: Arc<StepContext>,
-        router: Arc<ToolRouter>,
         tracker: SharedTurnDiffTracker,
     ) -> Option<CodeModeDispatchWorker> {
         let turn = &step_context.turn;
@@ -168,7 +191,7 @@ impl CodeModeService {
         };
         Some(
             self.dispatch_broker
-                .start_turn_worker(exec, router, step_context, tracker),
+                .start_turn_worker(exec, step_context, tracker),
         )
     }
 
@@ -318,6 +341,7 @@ async fn call_nested_tool(
         tool_name,
         call_id: format!("{PUBLIC_TOOL_NAME}-{}", uuid::Uuid::new_v4()),
         payload,
+        encrypted_function_args: None,
     };
     let result = tool_runtime
         .handle_tool_call_with_source(
@@ -377,18 +401,10 @@ fn build_freeform_tool_payload(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::CodeModeService;
     use super::build_nested_tool_payload;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
     use codex_code_mode::CodeModeToolKind;
-    use codex_code_mode::ExecuteRequest;
-    use codex_code_mode::FunctionCallOutputContentItem as CodeModeOutputContentItem;
-    use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
-    use codex_code_mode::RuntimeResponse;
-    use codex_features::Features;
     use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_tools::ToolName;
     use serde_json::json;
@@ -458,41 +474,5 @@ mod tests {
                 text: "[omitted 1 audio items ...]".to_string(),
             }]
         );
-    }
-
-    #[tokio::test]
-    async fn missing_process_host_falls_back_to_in_process_session() {
-        let service = CodeModeService::new(
-            Arc::new(ProcessOwnedCodeModeSessionProvider::with_host_program(
-                "codex-code-mode-host-does-not-exist".into(),
-            )),
-            &Features::with_defaults(),
-        );
-
-        let response = service
-            .execute(ExecuteRequest {
-                tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new(),
-                source: "text('fallback')".to_string(),
-                yield_time_ms: None,
-                max_output_tokens: None,
-            })
-            .await
-            .expect("missing host should fall back to an in-process session")
-            .initial_response()
-            .await
-            .expect("read fallback response");
-
-        assert_eq!(
-            response,
-            RuntimeResponse::Result {
-                cell_id: codex_code_mode::CellId::new("1".to_string()),
-                content_items: vec![CodeModeOutputContentItem::InputText {
-                    text: "fallback".to_string(),
-                }],
-                error_text: None,
-            }
-        );
-        service.shutdown().await.expect("shutdown service");
     }
 }

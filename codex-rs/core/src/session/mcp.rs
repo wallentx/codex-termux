@@ -2,12 +2,14 @@ use super::mcp_refresh::McpRefreshInvalidationGuard;
 use super::*;
 use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
+use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::MAX_SELECTED_CAPABILITY_ROOTS;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ElicitationReviewRequest;
 use codex_mcp::ElicitationReviewer;
 use codex_mcp::ElicitationReviewerHandle;
+use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY as MCP_ELICITATION_APPROVAL_KIND_KEY;
@@ -25,7 +27,7 @@ use codex_protocol::mcp_approval_meta::TOOL_PARAMS_KEY as MCP_ELICITATION_TOOL_P
 use codex_protocol::mcp_approval_meta::TOOL_TITLE_KEY as MCP_ELICITATION_TOOL_TITLE_KEY;
 use codex_rmcp_client::Elicitation;
 use rmcp::model::ElicitationAction;
-use rmcp::model::Meta;
+use rmcp::model::RequestMetaObject;
 use serde_json::Map;
 
 const MCP_ELICITATION_DECLINE_MESSAGE_KEY: &str = "message";
@@ -90,6 +92,12 @@ impl Session {
         config: &Config,
     ) -> (McpConfig, McpRuntimeContext) {
         let originator = self.originator().await;
+        let windows_sandbox_level = self
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .windows_sandbox_level;
         let environments = self.services.turn_environments.snapshot().await;
         let selected_capability_roots = self
             .resolve_selected_capability_roots_for_step(&environments)
@@ -97,7 +105,12 @@ impl Session {
         let ready_selected_capability_roots =
             Self::ready_selected_capability_roots(&selected_capability_roots);
         let executor_capability_discovery = self
-            .executor_capability_discovery_for_step(config, &ready_selected_capability_roots)
+            .executor_capability_discovery_for_step(
+                config,
+                &ready_selected_capability_roots,
+                &environments,
+                windows_sandbox_level,
+            )
             .await;
         let mcp_config = self
             .services
@@ -172,6 +185,8 @@ impl Session {
                 .executor_capability_discovery_for_step(
                     &desired.config,
                     &ready_selected_capability_roots,
+                    &desired.environments,
+                    desired.windows_sandbox_level,
                 )
                 .await;
             let mcp_projection = self
@@ -224,6 +239,8 @@ impl Session {
             .executor_capability_discovery_for_step(
                 &desired.config,
                 &ready_selected_capability_roots,
+                &desired.environments,
+                desired.windows_sandbox_level,
             )
             .await;
         let mcp_projection = self
@@ -260,6 +277,7 @@ impl Session {
         self: &Arc<Self>,
         turn_context: &TurnContext,
         selected_capability_roots: &[ResolvedSelectedCapabilityRoot],
+        required_servers: &[String],
     ) -> Arc<codex_mcp::McpBinding> {
         let ready_selected_capability_roots =
             Self::ready_selected_capability_roots(selected_capability_roots);
@@ -272,7 +290,12 @@ impl Session {
             self.mark_mcp_runtime_dirty();
         }
         self.refresh_mcp_if_dirty().await;
-        if let Some(binding) = self.services.mcp_runtime.current_binding().await {
+        if let Some(binding) = self
+            .services
+            .mcp_runtime
+            .current_binding_with_required_servers(required_servers)
+            .await
+        {
             return binding;
         }
         let config = Arc::new(self.runtime_mcp_config(&turn_context.config).await);
@@ -288,20 +311,67 @@ impl Session {
         &self,
         config: &Config,
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
+        environments: &TurnEnvironmentSnapshot,
+        windows_sandbox_level: WindowsSandboxLevel,
     ) -> Option<Arc<ExecutorCapabilityDiscoverySnapshot>> {
-        if !config
-            .features
-            .enabled(Feature::ExecutorCapabilityDiscovery)
+        let restricted_file_system = !config
+            .permissions
+            .file_system_sandbox_policy()
+            .has_full_disk_read_access();
+        if !restricted_file_system
+            && !config
+                .features
+                .enabled(Feature::ExecutorCapabilityDiscovery)
         {
             return None;
         }
+        let sandbox_contexts = if restricted_file_system {
+            environments
+                .turn_environments()
+                .map(|environment| {
+                    let mut sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+                        config.permissions.permission_profile().clone(),
+                        environment.cwd().clone(),
+                    );
+                    sandbox.workspace_roots = environment.workspace_roots().to_vec();
+                    sandbox.windows_sandbox_level = windows_sandbox_level;
+                    sandbox.windows_sandbox_private_desktop =
+                        config.permissions.windows_sandbox_private_desktop;
+                    sandbox.use_legacy_landlock = config.features.use_legacy_landlock();
+                    (environment.environment_id.clone(), sandbox)
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
         let environment_manager = self.services.turn_environments.environment_manager();
         let cache = self
             .services
             .thread_extension_data
             .get_or_init(|| ExecutorCapabilityDiscoveryCache::new(environment_manager));
+        let selected_capability_roots = ready_selected_capability_roots
+            .iter()
+            .filter(|selected_root| {
+                if !restricted_file_system {
+                    return true;
+                }
+                let CapabilityRootLocation::Environment { environment_id, .. } =
+                    &selected_root.location;
+                if sandbox_contexts.contains_key(environment_id) {
+                    return true;
+                }
+                warn!(
+                    selected_root = selected_root.id,
+                    environment_id, "skipping capability root without a filesystem sandbox context"
+                );
+                false
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         Some(Arc::new(
-            cache.snapshot(ready_selected_capability_roots).await,
+            cache
+                .snapshot(&selected_capability_roots, &sandbox_contexts)
+                .await,
         ))
     }
 
@@ -317,6 +387,7 @@ impl Session {
             .services
             .selected_capability_roots
             .iter()
+            .cloned()
             .chain(
                 environments
                     .turn_environments()
@@ -346,7 +417,7 @@ impl Session {
                 ready_environment_root_count += 1;
             }
             root_locations_by_id.insert(root.id.clone(), root.location.clone());
-            selected_capability_roots.push(root.clone());
+            selected_capability_roots.push(root);
         }
         self.services
             .turn_environments
@@ -528,10 +599,13 @@ impl Session {
             .services
             .mcp_runtime
             .current_ready_selected_capability_roots();
+        let environments = self.services.turn_environments.snapshot().await;
         let executor_capability_discovery = self
             .executor_capability_discovery_for_step(
                 refresh_config,
                 &ready_selected_capability_roots,
+                &environments,
+                turn_context.windows_sandbox_level,
             )
             .await;
         let mcp_projection = self
@@ -594,7 +668,7 @@ async fn review_guardian_mcp_elicitation(
             ) && matches!(
                 &request.elicitation,
                 Elicitation::Mcp(
-                    rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
+                    rmcp::model::ElicitRequestParams::FormElicitationParams {
                         requested_schema,
                         ..
                     }
@@ -656,14 +730,13 @@ fn guardian_elicitation_review_request(
     request: &ElicitationReviewRequest,
 ) -> GuardianElicitationReview {
     let (meta, requested_schema) = match &request.elicitation {
-        Elicitation::Mcp(rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
+        Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
             meta,
             requested_schema,
             ..
         }) => (meta, Some(requested_schema)),
-        Elicitation::Mcp(rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
-            meta,
-            ..
+        Elicitation::Mcp(rmcp::model::ElicitRequestParams::UrlElicitationParams {
+            meta, ..
         }) => {
             return if meta_requests_approval_request(meta) {
                 GuardianElicitationReview::Decline(
@@ -673,10 +746,15 @@ fn guardian_elicitation_review_request(
                 GuardianElicitationReview::NotRequested
             };
         }
+        Elicitation::Mcp(_) => {
+            return GuardianElicitationReview::Decline(
+                "guardian MCP elicitation review does not support this elicitation mode",
+            );
+        }
         Elicitation::OpenAiForm { .. } => return GuardianElicitationReview::NotRequested,
     };
 
-    let Some(meta) = meta.as_ref().map(|meta| &meta.0) else {
+    let Some(meta) = meta.as_ref().map(|meta| &meta.0.0) else {
         return GuardianElicitationReview::NotRequested;
     };
     if metadata_str(meta, MCP_ELICITATION_REQUEST_TYPE_KEY)
@@ -742,7 +820,7 @@ fn elicitation_connector_id(elicitation: &Elicitation) -> Option<&str> {
         .and_then(|meta| metadata_str(meta, MCP_ELICITATION_CONNECTOR_ID_KEY))
 }
 
-fn meta_requests_approval_request(meta: &Option<Meta>) -> bool {
+fn meta_requests_approval_request(meta: &Option<RequestMetaObject>) -> bool {
     meta.as_ref()
         .and_then(|meta| metadata_str(&meta.0, MCP_ELICITATION_REQUEST_TYPE_KEY))
         == Some(MCP_ELICITATION_REQUEST_TYPE_APPROVAL_REQUEST)

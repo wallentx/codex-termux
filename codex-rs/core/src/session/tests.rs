@@ -18,6 +18,7 @@ use crate::skills::SkillRenderSideEffects;
 use crate::skills::render::SkillMetadataBudget;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::format_exec_output_str;
+use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolRegistry;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
@@ -36,8 +37,10 @@ use codex_core_skills::HostSkillsSnapshot;
 use core_test_support::test_codex::local_selections;
 
 use codex_features::Feature;
+use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
@@ -72,6 +75,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
+use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
 use tracing::Span;
 
@@ -80,7 +84,6 @@ use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
-use crate::tasks::SessionTaskContext;
 use crate::tasks::SessionTaskResult;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::execute_user_shell_command;
@@ -214,13 +217,22 @@ impl StepContext {
             mcp: Arc::new(codex_mcp::McpBinding::empty(mcp_config_for_test(
                 &turn.config,
             ))),
-            mcp_tools: Vec::new(),
             tool_router: Arc::new(ToolRouter::from_parts(
                 ToolRegistry::empty_for_test(),
                 Vec::new(),
             )),
             loaded_agents_md: None,
         })
+    }
+
+    pub(crate) fn with_tool_router_for_test(
+        mut self: Arc<Self>,
+        tool_router: Arc<ToolRouter>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("test step context must not be shared before its tool router is set")
+            .tool_router = tool_router;
+        self
     }
 }
 
@@ -813,23 +825,38 @@ async fn preview_session_start_hooks(
     )
 }
 
-fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> ToolCallRuntime {
-    let step_context = StepContext::for_test(Arc::clone(&turn_context));
-    let router = Arc::new(ToolRouter::from_context(
+pub(crate) fn tool_runtimes_for_test_step(
+    step_context: &StepContext,
+) -> (Vec<Arc<dyn CoreToolRuntime>>, Vec<ToolSpec>) {
+    let mut tool_runtimes = crate::tools::spec_plan::build_core_tool_runtimes(
         step_context.turn.as_ref(),
         &step_context.environments,
         step_context.mcp.as_ref(),
-        crate::tools::router::ToolRouterParams {
-            tool_suggest_candidates: None,
-            tool_runtimes: Vec::new(),
-            extension_tool_executors: Vec::new(),
-            wait_for_environment_tool_config: None,
-            dynamic_tools: turn_context.dynamic_tools.as_slice(),
-        },
+        /*tool_suggest_candidates*/ None,
+        /*wait_for_environment_tool_config*/ None,
+    );
+    let hosted_specs = crate::tools::spec_plan::append_source_tool_runtimes(
+        step_context.turn.as_ref(),
+        &mut tool_runtimes,
+        Vec::new(),
+        Vec::new(),
+        &step_context.turn.dynamic_tools,
+    );
+    (tool_runtimes, hosted_specs)
+}
+
+fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> ToolCallRuntime {
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let (tool_runtimes, hosted_specs) = tool_runtimes_for_test_step(step_context.as_ref());
+    let router = Arc::new(ToolRouter::from_tools(
+        step_context.turn.as_ref(),
+        tool_runtimes,
+        hosted_specs,
         &Default::default(),
     ));
+    let step_context = step_context.with_tool_router_for_test(router);
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    ToolCallRuntime::new(router, session, step_context, tracker)
+    ToolCallRuntime::new(session, step_context, tracker)
 }
 
 fn make_connector(id: &str, name: &str) -> AppInfo {
@@ -2036,6 +2063,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
         phase: None,
         internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
             turn_id: Some("compact-turn".to_string()),
+            ..Default::default()
         }),
     };
     let replacement_history = vec![
@@ -2556,7 +2584,8 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
     let initial_context = build_initial_context(&session, &turn_context).await;
     expected.extend(initial_context);
     let history_after_seed = session.clone_history().await;
@@ -2567,7 +2596,8 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
 
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
     let history_after_second_seed = session.clone_history().await;
     assert_eq!(
         history_after_seed.raw_items(),
@@ -3189,7 +3219,12 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
         .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
         .await
         .expect("a fresh cancellation token cannot be cancelled");
-    let world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
+    let world_state = Arc::new(
+        session
+            .build_world_state_for_step(&step_context)
+            .await
+            .expect("world state should build"),
+    );
 
     session
         .start_new_context_window(&step_context, world_state)
@@ -5553,7 +5588,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         skills_service,
         plugins_manager,
         mcp_manager,
-        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -5597,7 +5632,10 @@ pub(crate) async fn build_world_state_from_turn_context(
     turn_context: &Arc<TurnContext>,
 ) -> WorldState {
     let step_context = StepContext::for_test(Arc::clone(turn_context));
-    session.build_world_state_for_step(&step_context).await
+    session
+        .build_world_state_for_step(&step_context)
+        .await
+        .expect("world state should build")
 }
 
 // todo: use online model info
@@ -5699,6 +5737,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     ));
     let network_approval = Arc::new(NetworkApprovalService::default());
     let mcp_runtime = Arc::new(codex_mcp::McpRuntime::empty(config.prefix_mcp_tool_names()));
+    let executed_tool_calls = config
+        .features
+        .enabled(Feature::ExecutedToolCallMetadata)
+        .then(|| Arc::new(crate::state::ExecutedToolCallRecorder::default()));
     let services = SessionServices {
         mcp_runtime,
         unified_exec_manager: UnifiedExecProcessManager::new(
@@ -5721,6 +5763,11 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
         exec_policy,
         auth_manager: auth_manager.clone(),
+        openai_file_upload_client_pool: RouteAwareClientPool::new_without_request_logging(
+            config.http_client_factory(),
+            ClientRouteClass::Api,
+        )
+        .with_legacy_custom_ca_fallback(),
         session_telemetry: session_telemetry.clone(),
         models_manager: Arc::clone(&models_manager),
         tool_approvals: Mutex::new(ApprovalStore::default()),
@@ -5769,8 +5816,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
+        executed_tool_calls,
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
-            Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+            Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
             &config.features,
         ),
         tool_search_handler_cache: Default::default(),
@@ -5946,7 +5994,7 @@ async fn make_session_with_config_and_rx(
         skills_service,
         plugins_manager,
         mcp_manager,
-        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -6056,7 +6104,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         skills_service,
         plugins_manager,
         mcp_manager,
-        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -6797,6 +6845,7 @@ async fn submit_with_id_captures_current_span_trace_context() {
             id: "sub-1".into(),
             op: Op::Interrupt,
             client_user_message_id: None,
+            parent_turn_id: None,
             trace: None,
         })
         .await
@@ -6869,6 +6918,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
             id: "sub-1".into(),
             op: Op::Interrupt,
             client_user_message_id: None,
+            parent_turn_id: None,
             trace: Some(submission_trace),
         })
     });
@@ -6896,6 +6946,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
             },
         }),
         client_user_message_id: None,
+        parent_turn_id: None,
         trace: None,
     });
 
@@ -6961,6 +7012,7 @@ async fn user_turn_updates_approvals_reviewer() {
             },
         },
         /*client_user_message_id*/ None,
+        /*parent_turn_id*/ None,
     )
     .await;
 
@@ -7210,7 +7262,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
 
         async fn run(
             self: Arc<Self>,
-            _session: Arc<SessionTaskContext>,
+            _session: Arc<Session>,
             _ctx: Arc<TurnContext>,
             _input: Vec<TurnInput>,
             _cancellation_token: CancellationToken,
@@ -7245,6 +7297,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
         id: "sub-1".into(),
         op: Op::Interrupt,
         client_user_message_id: None,
+        parent_turn_id: None,
         trace: Some(submission_trace.clone()),
     });
     let dispatch_span_id = dispatch_span.context().span().span_context().span_id();
@@ -7872,6 +7925,10 @@ where
     ));
     let network_approval = Arc::new(NetworkApprovalService::default());
     let mcp_runtime = Arc::new(codex_mcp::McpRuntime::empty(config.prefix_mcp_tool_names()));
+    let executed_tool_calls = config
+        .features
+        .enabled(Feature::ExecutedToolCallMetadata)
+        .then(|| Arc::new(crate::state::ExecutedToolCallRecorder::default()));
     let services = SessionServices {
         mcp_runtime,
         unified_exec_manager: UnifiedExecProcessManager::new(
@@ -7894,6 +7951,11 @@ where
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
         exec_policy,
         auth_manager: Arc::clone(&auth_manager),
+        openai_file_upload_client_pool: RouteAwareClientPool::new_without_request_logging(
+            config.http_client_factory(),
+            ClientRouteClass::Api,
+        )
+        .with_legacy_custom_ca_fallback(),
         session_telemetry: session_telemetry.clone(),
         models_manager: Arc::clone(&models_manager),
         tool_approvals: Mutex::new(ApprovalStore::default()),
@@ -7942,8 +8004,9 @@ where
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
+        executed_tool_calls,
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
-            Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+            Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
             &config.features,
         ),
         tool_search_handler_cache: Default::default(),
@@ -8083,7 +8146,11 @@ async fn refresh_mcp_servers_uses_latest_state_for_existing_turns() {
         .await
         .expect("a fresh cancellation token cannot be cancelled");
     let rematerialized_old = session
-        .mcp_runtime_for_step(&turn_context, /*selected_capability_roots*/ &[])
+        .mcp_runtime_for_step(
+            &turn_context,
+            /*selected_capability_roots*/ &[],
+            /*required_servers*/ &[],
+        )
         .await;
 
     let configured_servers = codex_mcp::configured_mcp_servers(new_step.mcp.config());
@@ -8178,12 +8245,14 @@ async fn mcp_elicitation_reviewer_uses_latest_runtime_authority() {
         server_name: "browser-use".to_string(),
         request_id: rmcp::model::NumberOrString::Number(7),
         elicitation: codex_rmcp_client::Elicitation::Mcp(
-            rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
-                meta: Some(rmcp::model::Meta(serde_json::Map::from_iter([
-                    ("codex_approval_kind".to_string(), json!("mcp_tool_call")),
-                    ("codex_request_type".to_string(), json!("approval_request")),
-                    ("tool_name".to_string(), json!("access_browser_origin")),
-                ]))),
+            rmcp::model::ElicitRequestParams::FormElicitationParams {
+                meta: Some(rmcp::model::RequestMetaObject::from(
+                    serde_json::Map::from_iter([
+                        ("codex_approval_kind".to_string(), json!("mcp_tool_call")),
+                        ("codex_request_type".to_string(), json!("approval_request")),
+                        ("tool_name".to_string(), json!("access_browser_origin")),
+                    ]),
+                )),
                 message: "Allow origin?".to_string(),
                 requested_schema: rmcp::model::ElicitationSchema::builder()
                     .build()
@@ -8666,7 +8735,6 @@ async fn record_context_updates_emits_environment_item_for_time_changes() {
             &session.services.models_manager,
         )
         .await;
-    current_context.current_date = Some("2026-02-27".to_string());
     current_context.timezone = Some("Europe/Berlin".to_string());
 
     let update_items =
@@ -8676,7 +8744,8 @@ async fn record_context_updates_emits_environment_item_for_time_changes() {
         .into_iter()
         .find(|text| text.contains("<environment_context>"))
         .expect("environment update item should be emitted");
-    assert!(environment_update.contains("<current_date>2026-02-27</current_date>"));
+    let current_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    assert!(environment_update.contains(&format!("<current_date>{current_date}</current_date>")));
     assert!(environment_update.contains("<timezone>Europe/Berlin</timezone>"));
 }
 
@@ -8727,13 +8796,15 @@ async fn record_context_update_items(
     let previous_step = StepContext::for_test(previous_context);
     session
         .record_context_updates_and_set_reference_context_item(&previous_step)
-        .await;
+        .await
+        .expect("world state should build");
     let previous_len = session.clone_history().await.raw_items().len();
 
     let current_step = StepContext::for_test(Arc::new(current_context));
     session
         .record_context_updates_and_set_reference_context_item(&current_step)
-        .await;
+        .await
+        .expect("world state should build");
     let history = session.clone_history().await;
     history.raw_items()[previous_len..].to_vec()
 }
@@ -8959,7 +9030,8 @@ async fn record_context_updates_includes_turn_context_fragments_on_steady_state_
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
 
     let history = session.clone_history().await;
     let developer_messages = developer_message_texts(history.raw_items());
@@ -9417,7 +9489,8 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
     let history = session.clone_history().await;
     let initial_context = build_initial_context(&session, &turn_context).await;
     assert_eq!(
@@ -9453,7 +9526,8 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
         .await;
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
     {
         let mut state = session.state.lock().await;
         state.set_reference_context_item(/*item*/ None);
@@ -9467,7 +9541,8 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
 
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
 
     let history = session.clone_history().await;
     let mut expected_history = vec![compacted_summary];
@@ -9512,7 +9587,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
 
     assert_eq!(
         session.clone_history().await.raw_items().to_vec(),
@@ -9561,7 +9637,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
 
@@ -9648,7 +9725,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
-        .await;
+        .await
+        .expect("world state should build");
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
 
@@ -9760,7 +9838,7 @@ impl SessionTask for CompletingTask {
 
     async fn run(
         self: Arc<Self>,
-        _session: Arc<SessionTaskContext>,
+        _session: Arc<Session>,
         _ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         _cancellation_token: CancellationToken,
@@ -9908,7 +9986,7 @@ impl SessionTask for NeverEndingTask {
 
     async fn run(
         self: Arc<Self>,
-        _session: Arc<SessionTaskContext>,
+        _session: Arc<Session>,
         _ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
@@ -9937,12 +10015,11 @@ impl SessionTask for GuardianDeniedApprovalTask {
 
     async fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        let session = session.clone_session();
         for _ in 0..3 {
             crate::guardian::record_guardian_denial_for_test(&session, &ctx, &ctx.sub_id).await;
         }
@@ -10403,13 +10480,16 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
     session.services.extensions = Arc::new(builder.build());
     session
         .input_queue
-        .enqueue_mailbox_communication(InterAgentCommunication::new(
-            AgentPath::root(),
-            AgentPath::root(),
-            Vec::new(),
-            "pending trigger".to_string(),
-            /*trigger_turn*/ true,
-        ))
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "pending trigger".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            /*parent_turn_id*/ None,
+        )
         .await;
 
     session.emit_thread_idle_lifecycle_if_idle().await;
@@ -10439,7 +10519,7 @@ async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
     assert_eq!(TryStartTurnIfIdleRejectionReason::Busy, err.reason());
     assert_eq!(vec![item], err.into_input());
     assert_eq!(
-        Vec::<TurnInput>::new(),
+        (Vec::<TurnInput>::new(), None),
         sess.input_queue.get_pending_input(&sess.active_turn).await
     );
 
@@ -10466,7 +10546,7 @@ async fn try_start_turn_if_idle_rejects_plan_mode_without_injecting() {
     assert_eq!(vec![item], err.into_input());
     assert!(sess.active_turn.lock().await.is_none());
     assert_eq!(
-        Vec::<TurnInput>::new(),
+        (Vec::<TurnInput>::new(), None),
         sess.input_queue.get_pending_input(&sess.active_turn).await
     );
 }
@@ -10475,13 +10555,16 @@ async fn try_start_turn_if_idle_rejects_plan_mode_without_injecting() {
 async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     sess.input_queue
-        .enqueue_mailbox_communication(InterAgentCommunication::new(
-            AgentPath::root(),
-            AgentPath::root(),
-            Vec::new(),
-            "pending trigger".to_string(),
-            /*trigger_turn*/ true,
-        ))
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "pending trigger".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            /*parent_turn_id*/ None,
+        )
         .await;
 
     let item = user_message("synthetic idle input");
@@ -10521,7 +10604,7 @@ async fn try_start_turn_if_idle_rejects_active_review_turn_without_injecting() {
     assert_eq!(TryStartTurnIfIdleRejectionReason::Busy, err.reason());
     assert_eq!(vec![item], err.into_input());
     assert_eq!(
-        Vec::<TurnInput>::new(),
+        (Vec::<TurnInput>::new(), None),
         sess.input_queue.get_pending_input(&sess.active_turn).await
     );
 
@@ -10749,7 +10832,7 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(communication.clone())
+        .enqueue_mailbox_communication(communication.clone(), /*parent_turn_id*/ None)
         .await;
 
     assert!(
@@ -10758,13 +10841,13 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     );
     assert_eq!(
         sess.input_queue.get_pending_input(&sess.active_turn).await,
-        Vec::new()
+        (Vec::new(), None)
     );
 
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
     assert_eq!(
-        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
         vec![TurnInput::InterAgentCommunication(communication)],
     );
 }
@@ -10786,13 +10869,16 @@ async fn trigger_turn_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(InterAgentCommunication::new(
-            AgentPath::try_from("/root/worker").expect("worker path should parse"),
-            AgentPath::root(),
-            Vec::new(),
-            "late trigger update".to_string(),
-            /*trigger_turn*/ true,
-        ))
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
+                AgentPath::root(),
+                Vec::new(),
+                "late trigger update".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            /*parent_turn_id*/ None,
+        )
         .await;
 
     assert!(
@@ -10829,7 +10915,7 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(communication.clone())
+        .enqueue_mailbox_communication(communication.clone(), /*parent_turn_id*/ None)
         .await;
     sess.steer_input(
         vec![UserInput::Text {
@@ -10845,7 +10931,7 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
     .expect("steered input should be accepted");
 
     assert_eq!(
-        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
         vec![
             TurnInput::UserInput {
                 content: vec![UserInput::Text {
@@ -10883,7 +10969,7 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(communication.clone())
+        .enqueue_mailbox_communication(communication.clone(), /*parent_turn_id*/ None)
         .await;
     sess.steer_input(
         vec![UserInput::Text {
@@ -10903,7 +10989,7 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
         .await;
 
     assert_eq!(
-        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
         vec![
             TurnInput::UserInput {
                 content: vec![UserInput::Text {
@@ -10941,7 +11027,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(communication.clone())
+        .enqueue_mailbox_communication(communication.clone(), /*parent_turn_id*/ None)
         .await;
 
     let item = ResponseItem::FunctionCall {
@@ -10950,6 +11036,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         namespace: None,
         arguments: "{}".to_string(),
         call_id: "call-1".to_string(),
+        encrypted_function_args: None,
         internal_chat_message_metadata_passthrough: None,
     };
     let mut ctx = HandleOutputCtx {
@@ -10967,7 +11054,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_some());
     assert_eq!(
-        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
         vec![TurnInput::InterAgentCommunication(communication)],
     );
 }
@@ -11053,17 +11140,11 @@ async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
 async fn fatal_tool_error_stops_turn_and_reports_error() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
-    let router = ToolRouter::from_context(
+    let (tool_runtimes, hosted_specs) = tool_runtimes_for_test_step(step_context.as_ref());
+    let router = ToolRouter::from_tools(
         step_context.turn.as_ref(),
-        &step_context.environments,
-        step_context.mcp.as_ref(),
-        crate::tools::router::ToolRouterParams {
-            tool_suggest_candidates: None,
-            tool_runtimes: Vec::new(),
-            extension_tool_executors: Vec::new(),
-            wait_for_environment_tool_config: None,
-            dynamic_tools: turn_context.dynamic_tools.as_slice(),
-        },
+        tool_runtimes,
+        hosted_specs,
         &Default::default(),
     );
     let item = ResponseItem::CustomToolCall {
@@ -11413,6 +11494,7 @@ while :; do sleep 1; done"#,
         })
         .to_string(),
         call_id: "shell-cleanup-call".to_string(),
+        encrypted_function_args: None,
         internal_chat_message_metadata_passthrough: None,
     };
     let call = ToolRouter::build_tool_call(item)?

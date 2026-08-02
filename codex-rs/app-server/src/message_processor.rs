@@ -1114,6 +1114,12 @@ impl MessageProcessor {
             ClientRequest::ThreadMetadataUpdate { params, .. } => {
                 self.thread_processor.thread_metadata_update(params).await
             }
+            ClientRequest::ThreadSectionMove { params, .. } => {
+                self.thread_processor.thread_section_move(params).await
+            }
+            ClientRequest::ThreadSectionList { params, .. } => {
+                self.thread_processor.thread_section_list(params).await
+            }
             ClientRequest::ThreadSettingsUpdate { params, .. } => {
                 self.turn_processor
                     .thread_settings_update(&request_id, params)

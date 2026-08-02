@@ -8,7 +8,7 @@ use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
 use crate::app_server_session::ForkGoalContinuation;
 use crate::config_update::format_config_error;
-use crate::external_agent_config_migration_flow::ExternalAgentConfigMigrationFlowOutcome;
+use crate::external_agent_config_migration::flow::ExternalAgentConfigMigrationFlowOutcome;
 #[cfg(target_os = "windows")]
 use codex_config::types::WindowsSandboxModeToml;
 
@@ -80,6 +80,7 @@ impl App {
                         self.chat_widget.add_error_message(format!(
                             "Failed to start TUI session picker: {err}"
                         ));
+                        self.chat_widget.maybe_send_next_queued_input();
                         return Ok(AppRunControl::Continue);
                     }
                 };
@@ -112,11 +113,12 @@ impl App {
                     SessionSelection::Fork(_) => {}
                 }
 
+                self.chat_widget.maybe_send_next_queued_input();
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::OpenExternalAgentConfigMigration => {
-                match crate::external_agent_config_migration_flow::handle_external_agent_config_migration_prompt(
+                match crate::external_agent_config_migration::flow::handle_external_agent_config_migration_prompt(
                     tui,
                     app_server,
                     &self.config,
@@ -128,7 +130,7 @@ impl App {
                     }
                     Ok(ExternalAgentConfigMigrationFlowOutcome::NoItems) => {
                         self.chat_widget.add_info_message(
-                            crate::external_agent_config_migration_flow::EXTERNAL_AGENT_CONFIG_MIGRATION_NO_ITEMS_MESSAGE
+                            crate::external_agent_config_migration::flow::EXTERNAL_AGENT_CONFIG_MIGRATION_NO_ITEMS_MESSAGE
                                 .to_string(),
                             /*hint*/ None,
                         );
@@ -160,7 +162,7 @@ impl App {
             AppEvent::DeleteCurrentThread => {
                 return Ok(self.delete_current_thread(app_server).await);
             }
-            AppEvent::ForkCurrentSession => {
+            AppEvent::ForkCurrentSession { name } => {
                 self.session_telemetry.counter(
                     "codex.thread.fork",
                     /*inc*/ 1,
@@ -182,7 +184,23 @@ impl App {
                     fork_config.model_reasoning_effort =
                         self.chat_widget.current_reasoning_effort();
                     match app_server.fork_thread(fork_config, thread_id).await {
-                        Ok(forked) => {
+                        Ok(mut forked) => {
+                            let name_error = if let Some(name) = name {
+                                match app_server
+                                    .thread_set_name(forked.session.thread_id, name.clone())
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        forked.session.thread_name = Some(name);
+                                        None
+                                    }
+                                    Err(err) => {
+                                        Some(format!("Failed to name the forked session: {err}"))
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             self.shutdown_current_thread(app_server).await;
                             match self
                                 .replace_chat_widget_with_app_server_thread(
@@ -194,6 +212,9 @@ impl App {
                                 .await
                             {
                                 Ok(()) => {
+                                    if let Some(err) = name_error {
+                                        self.chat_widget.add_error_message(err);
+                                    }
                                     if let Some(summary) = summary {
                                         let mut lines: Vec<Line<'static>> = Vec::new();
                                         if let Some(usage_line) = summary.usage_line {
@@ -229,6 +250,7 @@ impl App {
                     );
                 }
 
+                self.chat_widget.maybe_send_next_queued_input();
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::ForkSessionForPromptEdit {
