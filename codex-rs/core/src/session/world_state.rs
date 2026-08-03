@@ -96,12 +96,19 @@ impl Session {
         {
             world_state.add_section(ContextWindowGuidanceState::new(guidance));
         }
+        let realtime_mode_instructions = self.conversation.mode_instructions().await;
         world_state.add_section(RealtimeState::new(
             turn_context.realtime_active,
-            turn_context
-                .config
-                .experimental_realtime_start_instructions
-                .as_deref(),
+            realtime_mode_instructions
+                .as_ref()
+                .and_then(|instructions| instructions.start.as_deref())
+                .or(turn_context
+                    .config
+                    .experimental_realtime_start_instructions
+                    .as_deref()),
+            realtime_mode_instructions
+                .as_ref()
+                .and_then(|instructions| instructions.end.as_deref()),
         ));
         world_state.add_section(AgentsMdState::new(step_context.loaded_agents_md.as_deref()));
         if turn_context.config.include_permissions_instructions {
@@ -177,8 +184,10 @@ impl Session {
                 false
             };
         world_state.add_section(AppsInstructionsState::new(apps_available));
+        let plugins_usage_instructions_available = step_context.mcp.plugins_available()
+            && turn_context.model_info.include_plugin_usage_instructions;
         world_state.add_section(PluginsInstructionsState::new(
-            step_context.mcp.plugins_available(),
+            plugins_usage_instructions_available,
         ));
         if turn_context
             .config

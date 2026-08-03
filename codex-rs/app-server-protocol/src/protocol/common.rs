@@ -633,8 +633,23 @@ client_request_definitions! {
     },
     ThreadSectionList => "threadSection/list" {
         params: v2::ThreadSectionListParams,
-        serialization: None,
+        serialization: global_shared_read("thread-sections"),
         response: v2::ThreadSectionListResponse,
+    },
+    ThreadSectionCreate => "threadSection/create" {
+        params: v2::ThreadSectionCreateParams,
+        serialization: global("thread-sections"),
+        response: v2::ThreadSectionCreateResponse,
+    },
+    ThreadSectionUpdate => "threadSection/update" {
+        params: v2::ThreadSectionUpdateParams,
+        serialization: global("thread-sections"),
+        response: v2::ThreadSectionUpdateResponse,
+    },
+    ThreadSectionDelete => "threadSection/delete" {
+        params: v2::ThreadSectionDeleteParams,
+        serialization: global("thread-sections"),
+        response: v2::ThreadSectionDeleteResponse,
     },
     #[experimental("thread/search")]
     ThreadSearch => "thread/search" {
@@ -713,6 +728,12 @@ client_request_definitions! {
         params: v2::PluginListParams,
         serialization: None,
         response: v2::PluginListResponse,
+    },
+    #[experimental("plugin/search")]
+    PluginSearch => "plugin/search" {
+        params: v2::PluginSearchParams,
+        serialization: None,
+        response: v2::PluginSearchResponse,
     },
     PluginInstalled => "plugin/installed" {
         params: v2::PluginInstalledParams,
@@ -3585,6 +3606,7 @@ mod tests {
             request_id: RequestId::Integer(9),
             params: v2::ThreadRealtimeStartParams {
                 client_managed_handoffs: Some(true),
+                delegation_ack_filler: Some(false),
                 flush_transcript_tail_on_session_end: Some(true),
                 codex_responses_as_items: None,
                 codex_response_item_prefix: None,
@@ -3611,6 +3633,8 @@ mod tests {
                         text: "Understood.".to_string(),
                     },
                 ]),
+                realtime_start_instructions: Some("Use realtime output channels.".to_string()),
+                realtime_end_instructions: Some("Resume normal text responses.".to_string()),
                 prompt: Some(Some("You are on a call".to_string())),
                 realtime_session_id: Some("sess_456".to_string()),
                 transport: None,
@@ -3625,6 +3649,7 @@ mod tests {
                 "params": {
                     "threadId": "thr_123",
                     "clientManagedHandoffs": true,
+                    "delegationAckFiller": false,
                     "flushTranscriptTailOnSessionEnd": true,
                     "codexResponsesAsItems": null,
                     "codexResponseItemPrefix": null,
@@ -3647,6 +3672,8 @@ mod tests {
                             "text": "Understood."
                         }
                     ],
+                    "realtimeStartInstructions": "Use realtime output channels.",
+                    "realtimeEndInstructions": "Resume normal text responses.",
                     "prompt": "You are on a call",
                     "realtimeSessionId": "sess_456",
                     "transport": null,
@@ -3665,6 +3692,7 @@ mod tests {
             request_id: RequestId::Integer(9),
             params: v2::ThreadRealtimeStartParams {
                 client_managed_handoffs: None,
+                delegation_ack_filler: None,
                 flush_transcript_tail_on_session_end: None,
                 codex_responses_as_items: None,
                 codex_response_item_prefix: None,
@@ -3675,6 +3703,8 @@ mod tests {
                 output_modality: RealtimeOutputModality::Audio,
                 include_startup_context: None,
                 initial_items: None,
+                realtime_start_instructions: None,
+                realtime_end_instructions: None,
                 prompt: None,
                 realtime_session_id: None,
                 transport: None,
@@ -3689,6 +3719,7 @@ mod tests {
                 "params": {
                     "threadId": "thr_123",
                     "clientManagedHandoffs": null,
+                    "delegationAckFiller": null,
                     "flushTranscriptTailOnSessionEnd": null,
                     "codexResponsesAsItems": null,
                     "codexResponseItemPrefix": null,
@@ -3698,6 +3729,8 @@ mod tests {
                     "outputModality": "audio",
                     "includeStartupContext": null,
                     "initialItems": null,
+                    "realtimeStartInstructions": null,
+                    "realtimeEndInstructions": null,
                     "realtimeSessionId": null,
                     "transport": null,
                     "version": null,
@@ -3711,6 +3744,7 @@ mod tests {
             request_id: RequestId::Integer(9),
             params: v2::ThreadRealtimeStartParams {
                 client_managed_handoffs: None,
+                delegation_ack_filler: None,
                 flush_transcript_tail_on_session_end: None,
                 codex_responses_as_items: None,
                 codex_response_item_prefix: None,
@@ -3721,6 +3755,8 @@ mod tests {
                 output_modality: RealtimeOutputModality::Audio,
                 include_startup_context: None,
                 initial_items: None,
+                realtime_start_instructions: None,
+                realtime_end_instructions: None,
                 prompt: Some(None),
                 realtime_session_id: None,
                 transport: None,
@@ -3735,6 +3771,7 @@ mod tests {
                 "params": {
                     "threadId": "thr_123",
                     "clientManagedHandoffs": null,
+                    "delegationAckFiller": null,
                     "flushTranscriptTailOnSessionEnd": null,
                     "codexResponsesAsItems": null,
                     "codexResponseItemPrefix": null,
@@ -3744,6 +3781,8 @@ mod tests {
                     "outputModality": "audio",
                     "includeStartupContext": null,
                     "initialItems": null,
+                    "realtimeStartInstructions": null,
+                    "realtimeEndInstructions": null,
                     "prompt": null,
                     "realtimeSessionId": null,
                     "transport": null,
@@ -3957,6 +3996,7 @@ mod tests {
             request_id: RequestId::Integer(1),
             params: v2::ThreadRealtimeStartParams {
                 client_managed_handoffs: None,
+                delegation_ack_filler: None,
                 flush_transcript_tail_on_session_end: None,
                 codex_responses_as_items: None,
                 codex_response_item_prefix: None,
@@ -3967,6 +4007,8 @@ mod tests {
                 output_modality: RealtimeOutputModality::Audio,
                 include_startup_context: None,
                 initial_items: None,
+                realtime_start_instructions: None,
+                realtime_end_instructions: None,
                 prompt: Some(Some("You are on a call".to_string())),
                 realtime_session_id: None,
                 transport: None,

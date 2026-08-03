@@ -14,14 +14,10 @@ use crate::function_tool::FunctionCallError;
 use crate::session::step_context::StepContext;
 use crate::shell::default_user_shell;
 use crate::shell_snapshot::ShellSnapshot;
-use crate::skills::SkillRenderSideEffects;
-use crate::skills::render::SkillMetadataBudget;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::format_exec_output_str;
-use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolRegistry;
 use codex_config::ConfigLayerStack;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::LoaderOverrides;
 use codex_config::NetworkConstraints;
@@ -33,7 +29,6 @@ use codex_config::loader::project_trust_key;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::ToolSuggestDisabledTool;
-use codex_core_skills::HostSkillsSnapshot;
 use core_test_support::test_codex::local_selections;
 
 use codex_features::Feature;
@@ -109,10 +104,6 @@ use codex_execpolicy::Policy;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
-use codex_otel::THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC;
-use codex_otel::THREAD_SKILLS_ENABLED_TOTAL_METRIC;
-use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
-use codex_otel::THREAD_SKILLS_TRUNCATED_METRIC;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -143,7 +134,6 @@ use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
-use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -294,7 +284,7 @@ async fn default_turn_context_assigns_missing_response_item_ids() {
     let (session, turn_context) = make_session_and_context().await;
     let response_item = user_message("hello");
 
-    let items = session.prepare_conversation_items_for_history(
+    let (items, _) = session.prepare_conversation_items_for_history(
         &turn_context,
         std::slice::from_ref(&response_item),
     );
@@ -318,28 +308,6 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
-fn test_session_telemetry_without_metadata() -> SessionTelemetry {
-    let exporter = InMemoryMetricExporter::default();
-    let metrics = MetricsClient::new(
-        MetricsConfig::in_memory("test", "codex-core", env!("CARGO_PKG_VERSION"), exporter)
-            .with_runtime_reader(),
-    )
-    .expect("in-memory metrics client");
-    SessionTelemetry::new(
-        ThreadId::new(),
-        "gpt-5.4",
-        "gpt-5.4",
-        /*account_id*/ None,
-        /*account_email*/ None,
-        /*auth_mode*/ None,
-        "test_originator".to_string(),
-        /*log_user_prompts*/ false,
-        "tty".to_string(),
-        SessionSource::Cli,
-    )
-    .with_metrics_without_metadata_tags(metrics)
-}
-
 fn find_metric<'a>(resource_metrics: &'a ResourceMetrics, name: &str) -> &'a Metric {
     for scope_metrics in resource_metrics.scope_metrics() {
         for metric in scope_metrics.metrics() {
@@ -349,21 +317,6 @@ fn find_metric<'a>(resource_metrics: &'a ResourceMetrics, name: &str) -> &'a Met
         }
     }
     panic!("metric {name} missing");
-}
-
-fn histogram_sum(resource_metrics: &ResourceMetrics, name: &str) -> u64 {
-    let metric = find_metric(resource_metrics, name);
-    match metric.data() {
-        AggregatedMetrics::F64(data) => match data {
-            MetricData::Histogram(histogram) => {
-                let points: Vec<_> = histogram.data_points().collect();
-                assert_eq!(points.len(), 1);
-                points[0].sum().round() as u64
-            }
-            _ => panic!("unexpected histogram aggregation"),
-        },
-        _ => panic!("unexpected metric data type"),
-    }
 }
 
 fn single_histogram_attributes(
@@ -825,32 +778,32 @@ async fn preview_session_start_hooks(
     )
 }
 
-pub(crate) fn tool_runtimes_for_test_step(
+pub(crate) fn tool_registry_for_test_step(
     step_context: &StepContext,
-) -> (Vec<Arc<dyn CoreToolRuntime>>, Vec<ToolSpec>) {
-    let mut tool_runtimes = crate::tools::spec_plan::build_core_tool_runtimes(
+) -> (ToolRegistry, Vec<ToolSpec>) {
+    let mut registry = crate::tools::spec_plan::build_core_tool_registry(
         step_context.turn.as_ref(),
         &step_context.environments,
         step_context.mcp.as_ref(),
         /*tool_suggest_candidates*/ None,
         /*wait_for_environment_tool_config*/ None,
     );
-    let hosted_specs = crate::tools::spec_plan::append_source_tool_runtimes(
+    let hosted_specs = crate::tools::spec_plan::append_source_tools(
         step_context.turn.as_ref(),
-        &mut tool_runtimes,
+        &mut registry,
         Vec::new(),
         Vec::new(),
         &step_context.turn.dynamic_tools,
     );
-    (tool_runtimes, hosted_specs)
+    (registry, hosted_specs)
 }
 
 fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> ToolCallRuntime {
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
-    let (tool_runtimes, hosted_specs) = tool_runtimes_for_test_step(step_context.as_ref());
-    let router = Arc::new(ToolRouter::from_tools(
+    let (registry, hosted_specs) = tool_registry_for_test_step(step_context.as_ref());
+    let router = Arc::new(ToolRouter::from_registry(
         step_context.turn.as_ref(),
-        tool_runtimes,
+        registry,
         hosted_specs,
         &Default::default(),
     ));
@@ -1315,11 +1268,7 @@ async fn danger_full_access_tool_attempts_do_not_enforce_managed_network() -> an
 
         let layers = config
             .config_layer_stack
-            .get_layers(
-                ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                /*include_disabled*/ true,
-            )
-            .into_iter()
+            .all_layers_low_to_high()
             .cloned()
             .collect();
         let mut requirements = config.config_layer_stack.requirements().clone();
@@ -1516,20 +1465,21 @@ async fn get_base_instructions_no_user_content() {
 
     for test_case in test_cases {
         let model_info = model_info_for_slug(test_case.slug, &config);
+        let model_instructions = model_info.get_model_instructions(config.personality);
         if test_case.expects_apply_patch_description {
             assert_eq!(
-                model_info.base_instructions.as_str(),
+                model_instructions.as_str(),
                 prompt_with_apply_patch_instructions
             );
         }
 
         {
             let mut state = session.state.lock().await;
-            state.session_configuration.base_instructions = model_info.base_instructions.clone();
+            state.session_configuration.base_instructions = model_instructions.clone();
         }
 
         let base_instructions = session.get_base_instructions().await;
-        assert_eq!(base_instructions.text, model_info.base_instructions);
+        assert_eq!(base_instructions.text, model_instructions);
     }
 }
 
@@ -1945,11 +1895,7 @@ async fn refresh_mcp_config_replaces_managed_server_and_plugin_requirements() {
     requirements_toml.plugins = Some(plugin_requirements.clone());
     let layers = next_config
         .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
+        .all_layers_low_to_high()
         .cloned()
         .collect();
     next_config.config_layer_stack = ConfigLayerStack::new(layers, requirements, requirements_toml)
@@ -2618,6 +2564,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             output_tokens: 20,
             reasoning_output_tokens: 0,
             total_tokens: 30,
+            codex_rollout_budget_units: None,
         },
         last_token_usage: TokenUsage {
             input_tokens: 3,
@@ -2626,6 +2573,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             output_tokens: 4,
             reasoning_output_tokens: 0,
             total_tokens: 7,
+            codex_rollout_budget_units: None,
         },
         model_context_window: Some(1_000),
     };
@@ -2637,6 +2585,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             output_tokens: 200,
             reasoning_output_tokens: 25,
             total_tokens: 375,
+            codex_rollout_budget_units: None,
         },
         last_token_usage: TokenUsage {
             input_tokens: 10,
@@ -2645,6 +2594,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             output_tokens: 20,
             reasoning_output_tokens: 5,
             total_tokens: 35,
+            codex_rollout_budget_units: None,
         },
         model_context_window: Some(2_000),
     };
@@ -2814,6 +2764,7 @@ async fn record_token_usage_info_notifies_extension_contributors() {
         output_tokens: 20,
         reasoning_output_tokens: 3,
         total_tokens: 33,
+        codex_rollout_budget_units: None,
     };
     let second_usage = TokenUsage {
         input_tokens: 7,
@@ -2822,6 +2773,7 @@ async fn record_token_usage_info_notifies_extension_contributors() {
         output_tokens: 8,
         reasoning_output_tokens: 5,
         total_tokens: 20,
+        codex_rollout_budget_units: None,
     };
 
     session
@@ -2942,6 +2894,7 @@ async fn turn_start_lifecycle_exposes_turn_metadata_and_token_baseline() {
         output_tokens: 25,
         reasoning_output_tokens: 5,
         total_tokens: 130,
+        codex_rollout_budget_units: None,
     };
     set_total_token_usage(&session, token_usage_at_turn_start.clone()).await;
 
@@ -5275,20 +5228,15 @@ enabled = false
     let child_turn = session
         .new_default_turn_with_sub_id("role-skill-turn".to_string())
         .await;
-    let child_skill = child_turn
-        .turn_skills
-        .snapshot
+    let skills_snapshot = child_turn.skills_snapshot();
+    let child_skill = skills_snapshot
         .outcome()
         .skills
         .iter()
         .find(|skill| skill.name == "demo-skill")
         .expect("demo skill should be discovered");
     assert_eq!(
-        child_turn
-            .turn_skills
-            .snapshot
-            .outcome()
-            .is_skill_enabled(child_skill),
+        skills_snapshot.outcome().is_skill_enabled(child_skill),
         false
     );
 }
@@ -5881,6 +5829,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         mcp_prewarm_task: std::sync::Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        pending_user_message_admissions: Default::default(),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -8069,6 +8018,7 @@ where
         mcp_prewarm_task: std::sync::Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        pending_user_message_admissions: Default::default(),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -8553,6 +8503,7 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
@@ -8659,11 +8610,7 @@ async fn record_context_updates_emits_environment_item_for_network_changes() {
     ));
     let layers = config
         .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
+        .all_layers_low_to_high()
         .cloned()
         .collect();
     config.config_layer_stack = ConfigLayerStack::new(
@@ -8852,7 +8799,7 @@ async fn record_context_updates_emits_realtime_end_when_session_stops_being_live
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("Reason: inactive")),
+            .any(|text| text.contains("<realtime_conversation>")),
         "expected a realtime end update, got {developer_texts:?}"
     );
 }
@@ -9166,220 +9113,6 @@ async fn build_initial_context_omits_multi_agent_v2_usage_hints_when_hint_is_emp
         }),
         "did not expect multi-agent v2 usage hint developer messages, got {developer_messages:?}"
     );
-}
-
-#[tokio::test]
-async fn build_initial_context_trims_skill_metadata_from_context_window_budget() {
-    let (session, mut turn_context) = make_session_and_context().await;
-    let mut outcome = SkillLoadOutcome::default();
-    outcome.skills = vec![
-        SkillMetadata {
-            name: "admin-skill".to_string(),
-            description: "desc".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: test_path_buf("/tmp/admin-skill/SKILL.md").abs(),
-            scope: SkillScope::Admin,
-            plugin_id: None,
-            remote_plugin_id: None,
-        },
-        SkillMetadata {
-            name: "repo-skill".to_string(),
-            description: "desc".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: test_path_buf("/tmp/repo-skill/SKILL.md").abs(),
-            scope: SkillScope::Repo,
-            plugin_id: None,
-            remote_plugin_id: None,
-        },
-    ];
-    turn_context.model_info.context_window = Some(100);
-    turn_context.turn_skills = TurnSkillsContext::new(HostSkillsSnapshot::new(Arc::new(outcome)));
-    let turn_context = Arc::new(turn_context);
-
-    let initial_context = build_initial_context(&session, &turn_context).await;
-    let developer_texts = developer_input_texts(&initial_context);
-
-    assert!(
-        developer_texts
-            .iter()
-            .all(|text| !text.contains("Exceeded skills context budget")),
-        "expected skill budget warning to stay out of the initial context, got {developer_texts:?}"
-    );
-    assert!(
-        developer_texts
-            .iter()
-            .all(|text| !text.contains("- admin-skill:") && !text.contains("- repo-skill:")),
-        "expected no skill metadata entries to fit the tiny budget, got {developer_texts:?}"
-    );
-}
-
-#[test]
-fn emit_thread_start_skill_metrics_records_enabled_kept_and_truncated_values() {
-    let session_telemetry = test_session_telemetry_without_metadata();
-    let mut outcome = SkillLoadOutcome::default();
-    outcome.skills = vec![SkillMetadata {
-        name: "repo-skill".to_string(),
-        description: "desc".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        policy: None,
-        path_to_skills_md: test_path_buf("/tmp/repo-skill/SKILL.md").abs(),
-        scope: SkillScope::Repo,
-        plugin_id: None,
-        remote_plugin_id: None,
-    }];
-    let rendered = build_available_skills(
-        &outcome,
-        SkillMetadataBudget::Characters(1),
-        SkillRenderSideEffects::ThreadStart {
-            session_telemetry: &session_telemetry,
-        },
-    )
-    .expect("skills should render");
-
-    assert_eq!(
-        rendered.warning_message,
-        Some(
-            "Exceeded skills context budget. All skill descriptions were removed and 1 additional skill was not included in the model-visible skills list."
-                .to_string()
-        )
-    );
-    let snapshot = session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    assert_eq!(
-        histogram_sum(&snapshot, THREAD_SKILLS_ENABLED_TOTAL_METRIC),
-        1
-    );
-    assert_eq!(histogram_sum(&snapshot, THREAD_SKILLS_KEPT_TOTAL_METRIC), 0);
-    assert_eq!(histogram_sum(&snapshot, THREAD_SKILLS_TRUNCATED_METRIC), 1);
-    assert_eq!(
-        histogram_sum(&snapshot, THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC),
-        4
-    );
-}
-
-#[test]
-fn emit_thread_start_skill_metrics_records_description_truncated_chars_without_omitted_skills() {
-    let session_telemetry = test_session_telemetry_without_metadata();
-    let alpha = SkillMetadata {
-        name: "alpha-skill".to_string(),
-        description: "abcdef".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        policy: None,
-        path_to_skills_md: test_path_buf("/tmp/alpha-skill/SKILL.md").abs(),
-        scope: SkillScope::Repo,
-        plugin_id: None,
-        remote_plugin_id: None,
-    };
-    let beta = SkillMetadata {
-        name: "beta-skill".to_string(),
-        description: "uvwxyz".to_string(),
-        short_description: None,
-        interface: None,
-        dependencies: None,
-        policy: None,
-        path_to_skills_md: test_path_buf("/tmp/beta-skill/SKILL.md").abs(),
-        scope: SkillScope::Repo,
-        plugin_id: None,
-        remote_plugin_id: None,
-    };
-    let minimum_skill_line_cost = |skill: &SkillMetadata| {
-        let path = skill.path_to_skills_md.to_string_lossy().replace('\\', "/");
-        format!("- {}: (file: {})\n", skill.name, path)
-            .chars()
-            .count()
-    };
-    let minimum_budget = minimum_skill_line_cost(&alpha) + minimum_skill_line_cost(&beta);
-    let mut outcome = SkillLoadOutcome::default();
-    outcome.skills = vec![alpha, beta];
-
-    let rendered = build_available_skills(
-        &outcome,
-        SkillMetadataBudget::Characters(minimum_budget + 6),
-        SkillRenderSideEffects::ThreadStart {
-            session_telemetry: &session_telemetry,
-        },
-    )
-    .expect("skills should render");
-
-    assert_eq!(rendered.report.omitted_count, 0);
-    assert_eq!(rendered.report.truncated_description_chars, 8);
-    let snapshot = session_telemetry
-        .snapshot_metrics()
-        .expect("runtime metrics snapshot");
-    assert_eq!(histogram_sum(&snapshot, THREAD_SKILLS_TRUNCATED_METRIC), 0);
-    assert_eq!(
-        histogram_sum(&snapshot, THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC),
-        8
-    );
-}
-
-#[tokio::test]
-async fn build_initial_context_emits_thread_start_skill_warning_on_repeated_builds() {
-    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
-    let mut turn_context = Arc::into_inner(turn_context).expect("sole thread settings owner");
-    let mut outcome = SkillLoadOutcome::default();
-    outcome.skills = vec![
-        SkillMetadata {
-            name: "admin-skill".to_string(),
-            description: "desc".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: test_path_buf("/tmp/admin-skill/SKILL.md").abs(),
-            scope: SkillScope::Admin,
-            plugin_id: None,
-            remote_plugin_id: None,
-        },
-        SkillMetadata {
-            name: "repo-skill".to_string(),
-            description: "desc".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: test_path_buf("/tmp/repo-skill/SKILL.md").abs(),
-            scope: SkillScope::Repo,
-            plugin_id: None,
-            remote_plugin_id: None,
-        },
-    ];
-    turn_context.model_info.context_window = Some(100);
-    turn_context.turn_skills = TurnSkillsContext::new(HostSkillsSnapshot::new(Arc::new(outcome)));
-    let turn_context = Arc::new(turn_context);
-
-    let _ = build_initial_context(&session, &turn_context).await;
-    let warning_event = timeout(Duration::from_secs(1), rx.recv())
-        .await
-        .expect("warning event should arrive")
-        .expect("warning event should be readable");
-    assert!(matches!(
-        warning_event.msg,
-        EventMsg::Warning(WarningEvent { message })
-            if message == "Exceeded skills context budget of 2%. All skill descriptions were removed and 2 additional skills were not included in the model-visible skills list."
-    ));
-
-    let _ = build_initial_context(&session, &turn_context).await;
-    let warning_event = timeout(Duration::from_secs(1), rx.recv())
-        .await
-        .expect("warning event should arrive on repeated build")
-        .expect("warning event should be readable");
-    assert!(matches!(
-        warning_event.msg,
-        EventMsg::Warning(WarningEvent { message })
-            if message == "Exceeded skills context budget of 2%. All skill descriptions were removed and 2 additional skills were not included in the model-visible skills list."
-    ));
 }
 
 #[tokio::test]
@@ -11140,10 +10873,10 @@ async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
 async fn fatal_tool_error_stops_turn_and_reports_error() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
-    let (tool_runtimes, hosted_specs) = tool_runtimes_for_test_step(step_context.as_ref());
-    let router = ToolRouter::from_tools(
+    let (registry, hosted_specs) = tool_registry_for_test_step(step_context.as_ref());
+    let router = ToolRouter::from_registry(
         step_context.turn.as_ref(),
-        tool_runtimes,
+        registry,
         hosted_specs,
         &Default::default(),
     );

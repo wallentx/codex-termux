@@ -2889,6 +2889,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -2919,7 +2920,6 @@ dependencies = [
  "codex-shell-command",
  "codex-skills",
  "codex-utils-absolute-path",
- "codex-utils-output-truncation",
  "codex-utils-path-uri",
  "codex-utils-plugins",
  "dirs",
@@ -3234,6 +3234,7 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "codex-utils-pty",
  "futures",
  "gix",
  "once_cell",
@@ -4213,6 +4214,7 @@ dependencies = [
 name = "codex-tools"
 version = "0.0.0"
 dependencies = [
+ "bitflags 2.13.1",
  "codex-code-mode",
  "codex-connectors",
  "codex-extension-items",
