@@ -760,6 +760,7 @@ mod tests {
                 login_id: Some(Uuid::nil().to_string()),
                 success: true,
                 error: None,
+                onboarding_entrypoint: None,
             });
 
         let jsonrpc_notification =
@@ -774,6 +775,7 @@ mod tests {
                     "loginId": Uuid::nil().to_string(),
                     "success": true,
                     "error": null,
+                    "onboardingEntrypoint": null,
                 },
                 "emittedAtMs": 1_234,
             }),
@@ -790,6 +792,7 @@ mod tests {
                 login_id: Some(Uuid::nil().to_string()),
                 success: true,
                 error: None,
+                onboarding_entrypoint: None,
             });
 
         assert_eq!(
@@ -799,6 +802,7 @@ mod tests {
                     "loginId": Uuid::nil().to_string(),
                     "success": true,
                     "error": null,
+                    "onboardingEntrypoint": null,
                 },
             }),
             serde_json::to_value(notification)
@@ -1334,6 +1338,7 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
                     auto_resolution_ms: None,
                 },
             ))
@@ -1397,6 +1402,7 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
                     auto_resolution_ms: None,
                 },
             ))

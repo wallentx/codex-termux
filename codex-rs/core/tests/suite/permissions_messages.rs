@@ -110,6 +110,7 @@ async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()>
     )
     .await;
     let model_slug = "catalog-approvals-model";
+    let override_instructions = "literal {{ personality }} override";
     let model = model_with_approval_messages(
         model_slug,
         "catalog user approval instructions",
@@ -118,16 +119,19 @@ async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()>
     let mut builder = test_codex()
         .with_model(model_slug)
         .with_config(move |config| {
+            config.base_instructions = Some(override_instructions.to_string());
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.model_catalog = Some(ModelsResponse {
                 models: vec![model],
             });
         });
-    let test = builder.build(&server).await?;
+    let test = builder.build_with_auto_env(&server).await?;
 
     submit_text_turn(&test, "hello").await?;
 
-    let permissions = permissions_texts(&req.single_request());
+    let request = req.single_request();
+    assert_eq!(request.instructions_text(), override_instructions);
+    let permissions = permissions_texts(&request);
     assert_eq!(permissions.len(), 1);
     assert!(permissions[0].contains("catalog user approval instructions"));
     assert!(permissions[0].contains("Filesystem sandboxing defines"));
@@ -631,12 +635,6 @@ async fn resume_replays_permissions_messages() -> Result<()> {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let initial = builder.build(&server).await?;
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
-    let home = initial.home.clone();
 
     initial
         .codex
@@ -677,7 +675,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let resumed = builder.resume(&server, home, rollout_path).await?;
+    let resumed = builder.restart(&server, &initial).await?;
     resumed
         .codex
         .submit(Op::UserInput {
@@ -736,7 +734,6 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
         .rollout_path
         .clone()
         .expect("rollout path");
-    let home = initial.home.clone();
 
     initial
         .codex
@@ -783,7 +780,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     builder = builder.with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
     });
-    let resumed = builder.resume(&server, home, rollout_path.clone()).await?;
+    let resumed = builder.restart(&server, &initial).await?;
     resumed
         .codex
         .submit(Op::UserInput {

@@ -18,20 +18,17 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
 use crate::audio_preparation::prepare_response_items as prepare_audio_response_items;
-use crate::build_available_skills;
 use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::context::ApprovedCommandPrefixSaved;
-use crate::context::AvailableSkillsInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
 use crate::context::NetworkRuleSaved;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::world_state::WorldState;
 use crate::current_time::TimeProvider;
-use crate::default_skill_metadata_budget;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::BANNED_PREFIX_SUGGESTIONS;
 use crate::exec_policy::ExecPolicyManager;
@@ -42,7 +39,6 @@ use crate::realtime_conversation::RealtimeConversationManager;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::session_prefix::format_inter_agent_completion_message;
-use crate::skills::SkillRenderSideEffects;
 use crate::skills_load_input_from_config;
 use crate::turn_metadata::TurnMetadataState;
 use crate::turn_timing::now_unix_timestamp_ms;
@@ -51,11 +47,12 @@ use async_channel::Sender;
 use chrono::Local;
 use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
+use codex_analytics::ImagePreparationFact;
+use codex_analytics::ImagePreparationMetadata;
 use codex_analytics::SubAgentThreadStartedInput;
 use codex_analytics::TurnCodexErrorFact;
 use codex_async_utils::OrCancelExt;
 use codex_connectors::connector_runtime_context_key;
-use codex_core_skills::injection::HostSkillsCatalogInWorldState;
 use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
 use codex_execpolicy::prefix_rule_migration;
@@ -194,7 +191,6 @@ use crate::context_manager::ContextManager;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::types::McpServerConfig;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
@@ -247,7 +243,6 @@ use self::turn::agent_message_text;
 use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
-use self::turn_context::TurnSkillsContext;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
@@ -304,8 +299,6 @@ pub(crate) struct PreviousTurnSettings {
     pub(crate) realtime_active: Option<bool>,
 }
 
-#[cfg(test)]
-use crate::SkillMetadata;
 use crate::SkillsService;
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::guardian::GuardianReviewOptions;
@@ -315,8 +308,6 @@ use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::rollout::map_session_init_error;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::shell;
-#[cfg(test)]
-use crate::skills::SkillLoadOutcome;
 use crate::state::AutoCompactWindowIds;
 use crate::state::AutoCompactWindowSnapshot;
 use crate::state::PendingRequestPermissions;
@@ -641,7 +632,7 @@ impl Session {
         // Resolve base instructions for the session. Priority order:
         // 1. config.base_instructions override
         // 2. conversation history => session_meta.base_instructions
-        // 3. base_instructions for current model
+        // 3. rendered instructions_template for current model
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
@@ -874,7 +865,7 @@ impl SessionIo {
 ///
 /// Some use cases take advantage of the fact that these are UUID7 which
 /// encodes a timestamp, so think carefully before changing this.
-fn new_submission_id() -> String {
+pub(crate) fn new_submission_id() -> String {
     Uuid::now_v7().to_string()
 }
 
@@ -1199,7 +1190,7 @@ impl Session {
     }
 
     pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
-        handlers::user_input_or_turn_inner(
+        handlers::user_input_or_turn(
             self,
             Uuid::now_v7().to_string(),
             Op::UserInput {
@@ -1748,11 +1739,7 @@ impl Session {
             let config = &state.session_configuration.original_config_do_not_use;
             let user_config_paths = config
                 .config_layer_stack
-                .get_user_layers(
-                    ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                    /*include_disabled*/ true,
-                )
-                .into_iter()
+                .all_layers_low_to_high()
                 .filter_map(|layer| match &layer.name {
                     ConfigLayerSource::User { file, .. } => Some(file.clone()),
                     _ => None,
@@ -2670,6 +2657,7 @@ impl Session {
             call_id,
             turn_id: turn_context.sub_id.clone(),
             questions: args.questions,
+            is_blocking: args.is_blocking,
             auto_resolution_ms: args.auto_resolution_ms,
         });
         turn_context
@@ -2916,15 +2904,18 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         items: &'a [ResponseItem],
-    ) -> Cow<'a, [ResponseItem]> {
+    ) -> (Cow<'a, [ResponseItem]>, Vec<ImagePreparationMetadata>) {
         let mut items = Cow::Borrowed(items);
-        prepare_image_response_items(items.to_mut());
+        let image_preparations = prepare_image_response_items(items.to_mut());
         prepare_audio_response_items(items.to_mut());
         // Most response items get their passthrough turn ID at the durable history boundary.
         for item in items.to_mut() {
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
-        Self::assign_missing_response_item_ids(items)
+        (
+            Self::assign_missing_response_item_ids(items),
+            image_preparations,
+        )
     }
 
     fn assign_missing_response_item_ids(items: Cow<'_, [ResponseItem]>) -> Cow<'_, [ResponseItem]> {
@@ -2972,7 +2963,8 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
-        let items = self.prepare_conversation_items_for_history(turn_context, items);
+        let (items, image_preparations) =
+            self.prepare_conversation_items_for_history(turn_context, items);
         let items = items.as_ref();
         {
             let mut state = self.state.lock().await;
@@ -2981,6 +2973,14 @@ impl Session {
                 items.iter(),
                 turn_context.model_info.truncation_policy.into(),
             );
+        }
+        for image in image_preparations {
+            self.services
+                .analytics_events_client
+                .track_image_preparation(ImagePreparationFact {
+                    turn_id: turn_context.sub_id.clone(),
+                    metadata: image,
+                });
         }
         self.persist_rollout_response_items(items).await;
         self.send_raw_response_items(turn_context, items).await;
@@ -3133,7 +3133,7 @@ impl Session {
     ) {
         communication.set_turn_id_if_missing(&turn_context.sub_id);
         let response_item = communication.to_model_input_item();
-        let items = self.prepare_conversation_items_for_history(
+        let (items, _) = self.prepare_conversation_items_for_history(
             turn_context,
             std::slice::from_ref(&response_item),
         );
@@ -3409,37 +3409,6 @@ impl Session {
             && !developer_instructions.is_empty()
         {
             developer_sections.push(developer_instructions.to_string());
-        }
-        if turn_context.config.include_skill_instructions
-            && turn_context
-                .extension_data
-                .get::<HostSkillsCatalogInWorldState>()
-                .is_none()
-        {
-            let available_skills = build_available_skills(
-                turn_context.turn_skills.snapshot.outcome(),
-                default_skill_metadata_budget(turn_context.model_info.context_window),
-                SkillRenderSideEffects::ThreadStart {
-                    session_telemetry: &self.services.session_telemetry,
-                },
-            );
-            if let Some(available_skills) = available_skills {
-                let warning_message = available_skills.warning_message.clone();
-                let skills_instructions = AvailableSkillsInstructions::from_available_skills(
-                    &available_skills,
-                    turn_context.model_info.include_skills_usage_instructions,
-                );
-                if let Some(warning_message) = warning_message {
-                    self.send_event_raw(Event {
-                        id: String::new(),
-                        msg: EventMsg::Warning(WarningEvent {
-                            message: warning_message,
-                        }),
-                    })
-                    .await;
-                }
-                developer_sections.push(skills_instructions.render());
-            }
         }
         let loaded_plugins = self
             .services
@@ -3852,6 +3821,7 @@ impl Session {
                 output_tokens: 0,
                 reasoning_output_tokens: 0,
                 total_tokens: estimated_total_tokens.max(0),
+                codex_rollout_budget_units: None,
             };
 
             if let Some(model_context_window) = turn_context.model_context_window() {
