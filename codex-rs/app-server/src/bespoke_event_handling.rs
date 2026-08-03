@@ -741,6 +741,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 turn_id: request.turn_id,
                 item_id: request.call_id,
                 questions,
+                is_blocking: request.is_blocking,
                 auto_resolution_ms: request.auto_resolution_ms,
             };
             let (pending_request_id, rx) = outgoing
@@ -3842,6 +3843,7 @@ mod tests {
                 output_tokens: 50,
                 reasoning_output_tokens: 9,
                 total_tokens: 200,
+                codex_rollout_budget_units: None,
             },
             last_token_usage: TokenUsage {
                 input_tokens: 10,
@@ -3850,6 +3852,7 @@ mod tests {
                 output_tokens: 7,
                 reasoning_output_tokens: 1,
                 total_tokens: 23,
+                codex_rollout_budget_units: None,
             },
             model_context_window: Some(4096),
         };
