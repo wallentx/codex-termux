@@ -1,0 +1,15 @@
+{
+  "upstream_repo": "openai/codex",
+  "upstream_tag": "rust-v0.147.0-alpha.6",
+  "upstream_name": "0.147.0-alpha.6",
+  "upstream_html_url": "https://github.com/openai/codex/releases/tag/rust-v0.147.0-alpha.6",
+  "upstream_target": "14dbd8708b608ca1a8f2475668e51e31d0c36062",
+  "upstream_release_id": "364505482",
+  "upstream_prerelease": true,
+  "release_train": "0.147.0",
+  "release_branch": "release/0.147.0",
+  "work_branch": "upstream/rust-v0.147.0",
+  "patch_branch": "wallentx/thread-store-lock-fallback",
+  "patch_source_sha": "f1e2644be5648e7823cf1481078cbf2a9114531b",
+  "termux_tag": "rust-v0.147.0-beta.6-termux"
+}
