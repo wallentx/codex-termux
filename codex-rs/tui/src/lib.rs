@@ -9,12 +9,10 @@ use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::ConfigTomlLoadResult;
 use crate::legacy_core::config::load_config_toml_with_layer_stack;
 use crate::legacy_core::config::resolve_bootstrap_auth_keyring_backend_kind;
-use crate::legacy_core::config::resolve_bootstrap_http_client_factory;
+use crate::legacy_core::config::resolve_bootstrap_auth_route_config;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_profile_v2_config_path;
 use crate::session_resume::ResolveCwdOutcome;
-use crate::session_resume::ResumeCwdContext;
-use crate::session_resume::effective_resume_cwd_mode;
 use crate::session_resume::resolve_cwd_for_resume_or_fork;
 pub use crate::startup_error::LocalStateDbStartupError;
 use additional_dirs::add_dir_warning_message;
@@ -43,11 +41,9 @@ use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
-use codex_config::types::ResumeCwdMode;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_login::AuthConfig;
-use codex_login::AuthRouteConfig;
 use codex_login::default_client::originator;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::enforce_login_restrictions;
@@ -118,6 +114,8 @@ mod diff_render;
 mod exec_cell;
 mod exec_command;
 mod external_agent_config_migration;
+mod external_agent_config_migration_flow;
+mod external_agent_config_migration_model;
 mod external_editor;
 mod file_search;
 mod frames;
@@ -128,7 +126,6 @@ mod goal_files;
 mod history_cell;
 mod hooks_rpc;
 mod ide_context;
-mod inline_visualization;
 pub(crate) mod insert_history;
 pub use insert_history::insert_history_lines;
 mod key_hint;
@@ -289,7 +286,7 @@ async fn init_state_db_for_app_server_target(
     match app_server_target {
         AppServerTarget::Embedded => state_db::try_init(config).await.map(Some).map_err(|err| {
             let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
-                .unwrap_or_else(|| config.sqlite_config().state_db_path());
+                .unwrap_or_else(|| codex_state::state_db_path(config.sqlite_home.as_path()));
             std::io::Error::other(LocalStateDbStartupError::new(
                 database_path,
                 format!("{err:#}"),
@@ -755,9 +752,13 @@ fn latest_session_lookup_params(
 fn config_cwd_for_app_server_target(
     cwd: Option<&Path>,
     app_server_target: &AppServerTarget,
-    default_environment_is_remote: bool,
+    environment_manager: &EnvironmentManager,
 ) -> std::io::Result<Option<AbsolutePathBuf>> {
-    if app_server_target.uses_remote_workspace() || default_environment_is_remote {
+    if app_server_target.uses_remote_workspace()
+        || environment_manager
+            .default_environment()
+            .is_some_and(|environment| environment.is_remote())
+    {
         return Ok(None);
     }
 
@@ -768,65 +769,6 @@ fn config_cwd_for_app_server_target(
         None => AbsolutePathBuf::current_dir(),
     }?;
     Ok(Some(cwd))
-}
-
-fn uses_remote_workspace_or_environment(
-    app_server_target: &AppServerTarget,
-    environment_manager: &EnvironmentManager,
-) -> bool {
-    app_server_target.uses_remote_workspace()
-        || environment_manager
-            .default_environment()
-            .is_some_and(|environment| environment.is_remote())
-}
-
-async fn resolve_startup_resume_or_fork_cwd(
-    tui: &mut Tui,
-    config: &Config,
-    state_db: Option<&codex_state::StateRuntime>,
-    session_selection: &resume_picker::SessionSelection,
-    cwd_override: Option<&Path>,
-    uses_remote_workspace: bool,
-    uses_remote_workspace_or_environment: bool,
-) -> color_eyre::Result<ResolveCwdOutcome> {
-    let Some((action, target_session)) = (match session_selection {
-        resume_picker::SessionSelection::Resume(target_session) => {
-            Some((CwdPromptAction::Resume, target_session))
-        }
-        resume_picker::SessionSelection::Fork(target_session) => {
-            Some((CwdPromptAction::Fork, target_session))
-        }
-        _ => None,
-    }) else {
-        return Ok(ResolveCwdOutcome::Continue(None));
-    };
-    let resume_cwd_mode = effective_resume_cwd_mode(config.tui_resume_cwd, cwd_override);
-    if uses_remote_workspace_or_environment
-        && cwd_override.is_none()
-        && matches!(resume_cwd_mode, Some(ResumeCwdMode::Current))
-    {
-        color_eyre::eyre::bail!(
-            "`tui.resume_cwd = \"current\"` requires `--cd` when using a remote workspace"
-        );
-    }
-    if uses_remote_workspace {
-        return Ok(ResolveCwdOutcome::Continue(Some(config.cwd.to_path_buf())));
-    }
-
-    resolve_cwd_for_resume_or_fork(
-        tui,
-        config,
-        state_db,
-        target_session,
-        action,
-        ResumeCwdContext {
-            current_cwd: config.cwd.as_path(),
-            remembered_current_cwd: config.cwd.as_path(),
-            allow_remember_current: !uses_remote_workspace_or_environment || cwd_override.is_some(),
-            mode: resume_cwd_mode,
-        },
-    )
-    .await
 }
 
 fn should_load_configured_environments(
@@ -987,19 +929,17 @@ pub async fn run_main(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
-    let prepared_environment_manager =
+    let environment_manager =
         if should_load_configured_environments(&loader_overrides, &app_server_target) {
-            EnvironmentManager::prepare_from_codex_home(&codex_home).await
+            EnvironmentManager::from_codex_home(codex_home.clone(), Some(local_runtime_paths)).await
         } else {
-            EnvironmentManager::prepare_from_env().await
+            EnvironmentManager::from_env(Some(local_runtime_paths)).await
         }
+        .map(Arc::new)
         .map_err(std::io::Error::other)?;
     let cwd = cli.cwd.clone();
-    let config_cwd = config_cwd_for_app_server_target(
-        cwd.as_deref(),
-        &app_server_target,
-        prepared_environment_manager.default_environment_is_remote(),
-    )?;
+    let config_cwd =
+        config_cwd_for_app_server_target(cwd.as_deref(), &app_server_target, &environment_manager)?;
     let mut loader_overrides = loader_overrides;
     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
         let user_config_path = resolve_profile_v2_config_path(&codex_home, profile_v2);
@@ -1022,7 +962,7 @@ pub async fn run_main(
         .chatgpt_base_url
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
-    let bootstrap_http_client_factory = resolve_bootstrap_http_client_factory(
+    let auth_route_config = resolve_bootstrap_auth_route_config(
         bootstrap_config_toml,
         bootstrap_config
             .config_layer_stack
@@ -1030,8 +970,6 @@ pub async fn run_main(
             .feature_requirements
             .as_ref(),
     )?;
-    let auth_route_config =
-        AuthRouteConfig::from_http_client_factory(bootstrap_http_client_factory);
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
         codex_home.to_path_buf(),
         /*enable_codex_api_key_env*/ false,
@@ -1123,7 +1061,7 @@ pub async fn run_main(
         ..Default::default()
     };
 
-    let config = load_config_or_exit(
+    let mut config = load_config_or_exit(
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),
@@ -1131,21 +1069,6 @@ pub async fn run_main(
         strict_config,
     )
     .await;
-
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-        config.codex_home.to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        config.cli_auth_credentials_store_mode,
-        config.auth_keyring_backend_kind(),
-        config.chatgpt_base_url.clone(),
-        config.auth_route_config(),
-    )
-    .await;
-    let environment_manager = Arc::new(
-        prepared_environment_manager
-            .build(Some(local_runtime_paths), config.http_client_factory())
-            .map_err(std::io::Error::other)?,
-    );
 
     remove_legacy_tui_log_file(config.codex_home.as_path());
 
@@ -1181,16 +1104,42 @@ pub async fn run_main(
         let _ = codex_state::install_process_db_telemetry(telemetry);
     }
     let state_db = init_state_db_for_app_server_target(&config, &app_server_target).await?;
+
+    let effective_toml = config.config_layer_stack.effective_config();
+    match effective_toml.try_into() {
+        Ok(config_toml) => {
+            match codex_app_server_client::migrate_personality_if_needed(
+                &config.codex_home,
+                &config_toml,
+                state_db.clone(),
+            )
+            .await
+            {
+                Ok(true) => {
+                    config = load_config_or_exit(
+                        cli_kv_overrides.clone(),
+                        overrides.clone(),
+                        loader_overrides.clone(),
+                        cloud_config_bundle.clone(),
+                        strict_config,
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to run personality migration");
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to deserialize config for personality migration");
+        }
+    }
     let config_toml_log_dir_configured = config
         .config_layer_stack
         .effective_config()
         .as_table()
-        .is_some_and(|table| table.contains_key("log_dir"))
-        || config
-            .config_layer_stack
-            .requirements_toml()
-            .log_dir
-            .is_some();
+        .is_some_and(|table| table.contains_key("log_dir"));
 
     set_default_client_residency_requirement(config.enforce_residency.value());
 
@@ -1647,34 +1596,48 @@ async fn run_ratatui_app(
     };
 
     let current_cwd = config.cwd.clone();
-    let fallback_cwd = match resolve_startup_resume_or_fork_cwd(
-        &mut tui,
-        &config,
-        state_db.as_deref(),
-        &session_selection,
-        cli.cwd.as_deref(),
-        uses_remote_workspace,
-        uses_remote_workspace_or_environment(&app_server_target, &environment_manager),
-    )
-    .await
-    {
-        Ok(ResolveCwdOutcome::Continue(cwd)) => cwd,
-        Ok(ResolveCwdOutcome::Exit) => {
-            terminal_restore_guard.restore_silently();
-            session_log::log_session_end();
-            return Ok(AppExitInfo {
-                token_usage: crate::token_usage::TokenUsage::default(),
-                thread_id: None,
-                resume_hint: None,
-                update_action: None,
-                exit_reason: ExitReason::UserRequested,
-            });
+    let allow_prompt = !uses_remote_workspace && cli.cwd.is_none();
+    let action_and_target_session_if_resume_or_fork = match &session_selection {
+        resume_picker::SessionSelection::Resume(target_session) => {
+            Some((CwdPromptAction::Resume, target_session))
         }
-        Err(err) => {
-            terminal_restore_guard.restore_silently();
-            session_log::log_session_end();
-            return Err(err);
+        resume_picker::SessionSelection::Fork(target_session) => {
+            Some((CwdPromptAction::Fork, target_session))
         }
+        _ => None,
+    };
+    let fallback_cwd = match action_and_target_session_if_resume_or_fork {
+        Some((action, target_session)) => {
+            if uses_remote_workspace {
+                Some(current_cwd.to_path_buf())
+            } else {
+                match resolve_cwd_for_resume_or_fork(
+                    &mut tui,
+                    state_db.as_deref(),
+                    &current_cwd,
+                    target_session.thread_id,
+                    target_session.path.as_deref(),
+                    action,
+                    allow_prompt,
+                )
+                .await?
+                {
+                    ResolveCwdOutcome::Continue(cwd) => cwd,
+                    ResolveCwdOutcome::Exit => {
+                        terminal_restore_guard.restore_silently();
+                        session_log::log_session_end();
+                        return Ok(AppExitInfo {
+                            token_usage: crate::token_usage::TokenUsage::default(),
+                            thread_id: None,
+                            resume_hint: None,
+                            update_action: None,
+                            exit_reason: ExitReason::UserRequested,
+                        });
+                    }
+                }
+            }
+        }
+        None => None,
     };
 
     let picker_cancelled_without_selection = matches!(
@@ -1811,7 +1774,6 @@ async fn run_ratatui_app(
         &mut tui,
         app_server,
         config,
-        current_cwd.to_path_buf(),
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),
@@ -2046,7 +2008,6 @@ mod tests {
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_config::config_toml::ProjectConfig;
-    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
     use tempfile::TempDir;
@@ -2152,77 +2113,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn startup_services_use_final_cloud_managed_http_policy() -> color_eyre::Result<()> {
-        for (configured_respect_system_proxy, managed_respect_system_proxy) in
-            [(true, false), (false, true)]
-        {
-            let codex_home = TempDir::new()?;
-            std::fs::write(
-                codex_home.path().join("config.toml"),
-                format!("[features]\nrespect_system_proxy = {configured_respect_system_proxy}\n"),
-            )?;
-            let prepared_environment_manager =
-                EnvironmentManager::prepare_from_codex_home(codex_home.path()).await?;
-            let loader_overrides = LoaderOverrides::without_managed_config_for_tests();
-            let bootstrap_config = load_config_toml_with_layer_stack(
-                codex_home.path(),
-                /*cwd*/ None,
-                Vec::new(),
-                codex_config::ConfigLoadOptions {
-                    loader_overrides: loader_overrides.clone(),
-                    ..Default::default()
-                },
-            )
-            .await?;
-            let bootstrap_http_client_factory = resolve_bootstrap_http_client_factory(
-                &bootstrap_config.config_toml,
-                bootstrap_config
-                    .config_layer_stack
-                    .requirements()
-                    .feature_requirements
-                    .as_ref(),
-            )?;
-            let cloud_config_bundle =
-                codex_config::test_support::CloudConfigBundleFixture::loader_with_enterprise_requirement(
-                    format!("[features]\nrespect_system_proxy = {managed_respect_system_proxy}\n"),
-                );
-            let config = ConfigBuilder::default()
-                .codex_home(codex_home.path().to_path_buf())
-                .loader_overrides(loader_overrides)
-                .cloud_config_bundle(cloud_config_bundle)
-                .build()
-                .await?;
-            let runtime_paths = ExecServerRuntimePaths::new(
-                std::env::current_exe()?,
-                /*codex_linux_sandbox_exe*/ None,
-            )?;
-            let environment_manager = prepared_environment_manager
-                .build(Some(runtime_paths), config.http_client_factory())?;
-
-            assert_ne!(
-                bootstrap_http_client_factory.outbound_proxy_policy(),
-                config.http_client_factory().outbound_proxy_policy()
-            );
-            assert_eq!(
-                environment_manager
-                    .http_client_factory()
-                    .outbound_proxy_policy(),
-                config.http_client_factory().outbound_proxy_policy()
-            );
-            assert_eq!(
-                config
-                    .auth_route_config()
-                    .http_client_factory()
-                    .outbound_proxy_policy(),
-                config.http_client_factory().outbound_proxy_policy()
-            );
-            assert_eq!(config.respect_system_proxy, managed_respect_system_proxy);
-        }
-
-        Ok(())
-    }
-
     async fn start_test_embedded_app_server(
         config: Config,
     ) -> color_eyre::Result<InProcessAppServerClient> {
@@ -2241,194 +2131,6 @@ mod tests {
             Arc::new(EnvironmentManager::default_for_tests()),
         )
         .await
-    }
-
-    #[tokio::test]
-    async fn startup_resume_and_fork_use_configured_or_explicit_cwd() -> color_eyre::Result<()> {
-        for (action, configured_mode, has_explicit_cwd, expected_directory) in [
-            (CwdPromptAction::Resume, "current", false, "launch"),
-            (CwdPromptAction::Resume, "session", false, "session"),
-            (CwdPromptAction::Resume, "session", true, "explicit"),
-            (CwdPromptAction::Fork, "current", false, "launch"),
-            (CwdPromptAction::Fork, "session", false, "session"),
-            (CwdPromptAction::Fork, "session", true, "explicit"),
-        ] {
-            let temp_dir = TempDir::new()?;
-            let codex_home = temp_dir.path().join("codex-home");
-            let launch_cwd = temp_dir.path().join("launch");
-            let session_cwd = temp_dir.path().join("session");
-            let explicit_cwd = temp_dir.path().join("explicit");
-            std::fs::create_dir_all(&codex_home)?;
-            std::fs::create_dir_all(&launch_cwd)?;
-            std::fs::create_dir_all(&session_cwd)?;
-            std::fs::create_dir_all(&explicit_cwd)?;
-            std::fs::write(
-                codex_home.join("config.toml"),
-                format!("[tui]\nresume_cwd = \"{configured_mode}\"\n"),
-            )?;
-            let cwd_override = has_explicit_cwd.then_some(explicit_cwd.as_path());
-            let config = ConfigBuilder::default()
-                .codex_home(codex_home.clone())
-                .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
-                .harness_overrides(ConfigOverrides {
-                    cwd: Some(cwd_override.unwrap_or(launch_cwd.as_path()).to_path_buf()),
-                    ..Default::default()
-                })
-                .build()
-                .await?;
-            let filename_timestamp = "2025-01-05T12-00-00";
-            let thread_id = write_session_rollout(
-                &codex_home,
-                filename_timestamp,
-                "2025-01-05T12:00:00Z",
-                "Saved user message",
-                &config.model_provider_id,
-                &session_cwd,
-            )?;
-            let rollout_path = codex_home
-                .join("sessions/2025/01/05")
-                .join(format!("rollout-{filename_timestamp}-{thread_id}.jsonl"));
-            let state_db =
-                init_state_db_for_app_server_target(&config, &AppServerTarget::Embedded).await?;
-            let target_session = resume_picker::SessionTarget {
-                path: Some(rollout_path),
-                thread_id,
-            };
-            let session_selection = match action {
-                CwdPromptAction::Resume => resume_picker::SessionSelection::Resume(target_session),
-                CwdPromptAction::Fork => resume_picker::SessionSelection::Fork(target_session),
-            };
-            let mut tui = tui::test_support::make_test_tui()?;
-
-            let fallback_cwd = match resolve_startup_resume_or_fork_cwd(
-                &mut tui,
-                &config,
-                state_db.as_deref(),
-                &session_selection,
-                cwd_override,
-                /*uses_remote_workspace*/ false,
-                /*uses_remote_workspace_or_environment*/ false,
-            )
-            .await?
-            {
-                ResolveCwdOutcome::Continue(cwd) => cwd,
-                ResolveCwdOutcome::Exit => panic!("configured cwd should not exit startup"),
-            };
-            let final_config = ConfigBuilder::default()
-                .codex_home(codex_home)
-                .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
-                .harness_overrides(ConfigOverrides {
-                    cwd: cwd_override.map(Path::to_path_buf),
-                    ..Default::default()
-                })
-                .fallback_cwd(fallback_cwd)
-                .build()
-                .await?;
-            let expected_cwd = temp_dir.path().join(expected_directory);
-            assert!(!session_resume::cwds_differ(
-                final_config.cwd.as_path(),
-                &expected_cwd,
-            ));
-            let mut app_server = start_app_server_for_picker(
-                &final_config,
-                &AppServerTarget::Embedded,
-                state_db,
-                Arc::new(EnvironmentManager::default_for_tests()),
-            )
-            .await?;
-            let started = match action {
-                CwdPromptAction::Resume => {
-                    app_server
-                        .resume_thread(
-                            final_config,
-                            thread_id,
-                            app_server_session::ResumeModelSettings::RestoreFromThread,
-                        )
-                        .await?
-                }
-                CwdPromptAction::Fork => app_server.fork_thread(final_config, thread_id).await?,
-            };
-
-            assert!(!session_resume::cwds_differ(
-                started.session.cwd.as_path(),
-                &expected_cwd,
-            ));
-            app_server.shutdown().await?;
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn startup_remote_current_cwd_without_override_is_rejected() -> color_eyre::Result<()> {
-        let temp_dir = TempDir::new()?;
-        std::fs::write(
-            temp_dir.path().join("config.toml"),
-            "[tui]\nresume_cwd = \"current\"\n",
-        )?;
-        let config = ConfigBuilder::default()
-            .codex_home(temp_dir.path().to_path_buf())
-            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
-            .build()
-            .await?;
-        let mut tui = tui::test_support::make_test_tui()?;
-
-        let error = resolve_startup_resume_or_fork_cwd(
-            &mut tui,
-            &config,
-            /*state_db*/ None,
-            &resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
-                path: None,
-                thread_id: ThreadId::new(),
-            }),
-            /*cwd_override*/ None,
-            /*uses_remote_workspace*/ false,
-            /*uses_remote_workspace_or_environment*/ true,
-        )
-        .await
-        .expect_err("remote current cwd should require an explicit override");
-
-        assert_eq!(
-            error.to_string(),
-            "`tui.resume_cwd = \"current\"` requires `--cd` when using a remote workspace"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn startup_session_cwd_without_metadata_is_rejected() -> color_eyre::Result<()> {
-        let temp_dir = TempDir::new()?;
-        std::fs::write(
-            temp_dir.path().join("config.toml"),
-            "[tui]\nresume_cwd = \"session\"\n",
-        )?;
-        let config = ConfigBuilder::default()
-            .codex_home(temp_dir.path().to_path_buf())
-            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
-            .build()
-            .await?;
-        let mut tui = tui::test_support::make_test_tui()?;
-
-        let error = resolve_startup_resume_or_fork_cwd(
-            &mut tui,
-            &config,
-            /*state_db*/ None,
-            &resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
-                path: None,
-                thread_id: ThreadId::new(),
-            }),
-            /*cwd_override*/ None,
-            /*uses_remote_workspace*/ false,
-            /*uses_remote_workspace_or_environment*/ false,
-        )
-        .await
-        .expect_err("session cwd should require saved metadata");
-
-        assert_eq!(
-            error.to_string(),
-            "failed to determine the working directory recorded for the selected session"
-        );
-        Ok(())
     }
 
     #[test]
@@ -2963,13 +2665,8 @@ mod tests {
         };
         let environment_manager = EnvironmentManager::default_for_tests();
 
-        let config_cwd = config_cwd_for_app_server_target(
-            Some(remote_only_cwd),
-            &target,
-            environment_manager
-                .default_environment()
-                .is_some_and(|environment| environment.is_remote()),
-        )?;
+        let config_cwd =
+            config_cwd_for_app_server_target(Some(remote_only_cwd), &target, &environment_manager)?;
 
         assert_eq!(config_cwd, None);
         Ok(())
@@ -2982,13 +2679,8 @@ mod tests {
         let target = AppServerTarget::Embedded;
         let environment_manager = EnvironmentManager::default_for_tests();
 
-        let config_cwd = config_cwd_for_app_server_target(
-            Some(temp_dir.path()),
-            &target,
-            environment_manager
-                .default_environment()
-                .is_some_and(|environment| environment.is_remote()),
-        )?;
+        let config_cwd =
+            config_cwd_for_app_server_target(Some(temp_dir.path()), &target, &environment_manager)?;
 
         assert_eq!(
             config_cwd,
@@ -3010,13 +2702,8 @@ mod tests {
         };
         let environment_manager = EnvironmentManager::default_for_tests();
 
-        let config_cwd = config_cwd_for_app_server_target(
-            Some(temp_dir.path()),
-            &target,
-            environment_manager
-                .default_environment()
-                .is_some_and(|environment| environment.is_remote()),
-        )?;
+        let config_cwd =
+            config_cwd_for_app_server_target(Some(temp_dir.path()), &target, &environment_manager)?;
 
         assert_eq!(
             config_cwd,
@@ -3035,14 +2722,8 @@ mod tests {
         let target = AppServerTarget::Embedded;
         let environment_manager = EnvironmentManager::default_for_tests();
 
-        let err = config_cwd_for_app_server_target(
-            Some(&missing),
-            &target,
-            environment_manager
-                .default_environment()
-                .is_some_and(|environment| environment.is_remote()),
-        )
-        .expect_err("missing embedded cwd should fail");
+        let err = config_cwd_for_app_server_target(Some(&missing), &target, &environment_manager)
+            .expect_err("missing embedded cwd should fail");
 
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         Ok(())
@@ -3066,13 +2747,8 @@ mod tests {
         )
         .await;
 
-        let config_cwd = config_cwd_for_app_server_target(
-            Some(remote_only_cwd),
-            &target,
-            environment_manager
-                .default_environment()
-                .is_some_and(|environment| environment.is_remote()),
-        )?;
+        let config_cwd =
+            config_cwd_for_app_server_target(Some(remote_only_cwd), &target, &environment_manager)?;
 
         assert_eq!(config_cwd, None);
         Ok(())
@@ -3130,7 +2806,7 @@ mod tests {
             std::fs::write(&rollout_path, "")?;
 
             let state_runtime = codex_state::StateRuntime::init(
-                codex_state::SqliteConfig::new_for_testing(config.codex_home.as_path().abs()),
+                config.codex_home.to_path_buf(),
                 config.model_provider_id.clone(),
             )
             .await
@@ -3217,9 +2893,7 @@ mod tests {
         let mut config = build_config(&temp_dir).await?;
         let occupied_sqlite_home = temp_dir.path().join("sqlite-home");
         std::fs::write(&occupied_sqlite_home, "occupied")?;
-        let sqlite =
-            codex_state::SqliteConfig::new_for_testing(occupied_sqlite_home.as_path().abs());
-        config.sqlite = sqlite.clone();
+        config.sqlite_home = occupied_sqlite_home.clone();
 
         let err =
             match init_state_db_for_app_server_target(&config, &AppServerTarget::Embedded).await {
@@ -3233,7 +2907,7 @@ mod tests {
 
         assert_eq!(
             startup_error.state_db_path(),
-            sqlite.state_db_path().as_path()
+            codex_state::state_db_path(occupied_sqlite_home.as_path()).as_path()
         );
         assert!(
             startup_error
@@ -3251,10 +2925,9 @@ mod tests {
         let mut config = build_config(&temp_dir).await?;
         let sqlite_home = temp_dir.path().join("sqlite-home");
         std::fs::create_dir_all(&sqlite_home)?;
-        let sqlite = codex_state::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
-        let logs_db_path = sqlite.logs_db_path();
+        let logs_db_path = codex_state::logs_db_path(&sqlite_home);
         std::fs::write(&logs_db_path, "not a sqlite database")?;
-        config.sqlite = sqlite;
+        config.sqlite_home = sqlite_home;
 
         let err =
             match init_state_db_for_app_server_target(&config, &AppServerTarget::Embedded).await {

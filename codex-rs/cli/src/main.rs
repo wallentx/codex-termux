@@ -27,6 +27,7 @@ use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_rollout_trace::REDUCED_STATE_FILE_NAME;
 use codex_rollout_trace::replay_bundle;
 use codex_state::StateRuntime;
+use codex_state::memories_db_path;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
 use codex_tui::ExitReason;
@@ -150,7 +151,7 @@ enum Subcommand {
     /// [experimental] Manage the app-server daemon with remote control enabled.
     RemoteControl(RemoteControlCommand),
 
-    /// Launch the Desktop app (opens the app installer if missing).
+    /// Launch the Codex desktop app (opens the app installer if missing).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     App(app_cmd::AppCommand),
 
@@ -516,9 +517,6 @@ struct AppServerCommand {
     /// Omit to run the app server; specify a subcommand for tooling.
     #[command(subcommand)]
     subcommand: Option<AppServerSubcommand>,
-
-    #[command(flatten)]
-    code_mode_host: codex_app_server::AppServerCodeModeHostArgs,
 
     /// Error out when config.toml contains fields that are not recognized by this version of Codex.
     #[arg(long = "strict-config", default_value_t = false)]
@@ -1144,7 +1142,6 @@ async fn cli_main(
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
                 subcommand,
-                code_mode_host,
                 strict_config: app_server_strict_config,
                 listen,
                 stdio,
@@ -1168,7 +1165,6 @@ async fn cli_main(
                     };
                     let auth = auth.try_into_settings()?;
                     let runtime_options = codex_app_server::AppServerRuntimeOptions {
-                        code_mode_host_transport: code_mode_host.into(),
                         remote_control_startup_mode: match (remote_control, remote_control_disabled)
                         {
                             (true, _) => {
@@ -1228,16 +1224,7 @@ async fn cli_main(
                         print_app_server_daemon_output(AppServerLifecycleCommand::Version).await?;
                     }
                     AppServerDaemonSubcommand::PidUpdateLoop => {
-                        let cli_overrides = root_config_overrides
-                            .parse_overrides()
-                            .map_err(anyhow::Error::msg)?;
-                        let config = ConfigBuilder::default()
-                            .cli_overrides(cli_overrides)
-                            .build()
-                            .await
-                            .map_err(anyhow::Error::from);
-                        let http_client_factory = updater_http_client_factory(config);
-                        codex_app_server_daemon::run_pid_update_loop(http_client_factory).await?;
+                        codex_app_server_daemon::run_pid_update_loop().await?;
                     }
                 },
                 Some(AppServerSubcommand::Proxy(proxy_cli)) => {
@@ -1491,14 +1478,6 @@ async fn cli_main(
                 .await?;
         }
         Some(Subcommand::Sandbox(mut sandbox_cli)) => {
-            let config_profile = sandbox_cli
-                .config_profile
-                .as_ref()
-                .or(interactive.config_profile_v2.as_ref());
-            prepend_config_flags(
-                &mut sandbox_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
             #[cfg(target_os = "windows")]
             if let Some(setup_cli) = sandbox_setup::parse_setup_command(&sandbox_cli.command)? {
                 reject_remote_mode_for_subcommand(
@@ -1506,11 +1485,7 @@ async fn cli_main(
                     root_remote_auth_token_env.as_deref(),
                     "sandbox setup",
                 )?;
-                let cli_overrides = sandbox_cli
-                    .config_overrides
-                    .parse_overrides()
-                    .map_err(anyhow::Error::msg)?;
-                sandbox_setup::run(setup_cli, config_profile.cloned(), cli_overrides).await?;
+                sandbox_setup::run(setup_cli).await?;
                 return Ok(());
             }
             reject_remote_mode_for_subcommand(
@@ -1518,7 +1493,15 @@ async fn cli_main(
                 root_remote_auth_token_env.as_deref(),
                 "sandbox",
             )?;
+            let config_profile = sandbox_cli
+                .config_profile
+                .as_ref()
+                .or(interactive.config_profile_v2.as_ref());
             let loader_overrides = loader_overrides_for_profile(config_profile)?;
+            prepend_config_flags(
+                &mut sandbox_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
             #[cfg(target_os = "macos")]
             codex_cli::run_command_under_seatbelt(
                 sandbox_cli,
@@ -1760,7 +1743,6 @@ async fn run_exec_server_command(
             base_url,
             environment_id,
             auth_provider,
-            config.http_client_factory(),
         )?;
         if let Some(name) = cmd.name {
             remote_config.name = name;
@@ -1796,14 +1778,6 @@ async fn run_exec_server_command(
             config_result.ok()
         };
         let (_otel, telemetry) = exec_server_telemetry::init(config.as_ref());
-        let http_client_factory = config
-            .as_ref()
-            .map(codex_core::config::Config::http_client_factory)
-            .unwrap_or_else(|| {
-                codex_http_client::HttpClientFactory::new(
-                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-                )
-            });
         let listen_url = cmd
             .listen
             .unwrap_or_else(|| codex_exec_server::DEFAULT_LISTEN_URL.to_string());
@@ -1838,7 +1812,7 @@ async fn load_exec_server_remote_auth_provider(
         let auth = CodexAuth::from_agent_identity_jwt(
             &agent_identity_jwt,
             Some(&config.chatgpt_base_url),
-            &auth_route_config,
+            auth_route_config.as_ref(),
         )
         .await?;
         return Ok(codex_model_provider::auth_provider_from_auth(&auth));
@@ -1965,26 +1939,13 @@ fn loader_overrides_for_profile(
     match profile_v2 {
         Some(profile_v2) => {
             let codex_home = find_codex_home()?;
-            Ok(loader_overrides_for_profile_at_codex_home(
-                Some(profile_v2),
-                &codex_home,
-            ))
+            Ok(LoaderOverrides {
+                user_config_path: Some(resolve_profile_v2_config_path(&codex_home, profile_v2)),
+                user_config_profile: Some(profile_v2.clone()),
+                ..Default::default()
+            })
         }
         None => Ok(LoaderOverrides::default()),
-    }
-}
-
-fn loader_overrides_for_profile_at_codex_home(
-    profile_v2: Option<&ProfileV2Name>,
-    codex_home: &std::path::Path,
-) -> LoaderOverrides {
-    match profile_v2 {
-        Some(profile_v2) => LoaderOverrides {
-            user_config_path: Some(resolve_profile_v2_config_path(codex_home, profile_v2)),
-            user_config_profile: Some(profile_v2.clone()),
-            ..Default::default()
-        },
-        None => LoaderOverrides::default(),
     }
 }
 
@@ -2104,7 +2065,6 @@ async fn run_debug_prompt_input_command(
         config,
         input,
         /*state_db*/ None,
-        Arc::new(extensions.build()),
         user_instructions_provider,
     )
     .await?;
@@ -2154,9 +2114,9 @@ async fn run_debug_clear_memories_command(
         .build()
         .await?;
 
-    let memories_path = config.sqlite_config().memories_db_path();
+    let memories_path = memories_db_path(config.sqlite_home.as_path());
     let cleared_memories_db =
-        StateRuntime::clear_memory_data_in_sqlite_home(config.sqlite_config()).await?;
+        StateRuntime::clear_memory_data_in_sqlite_home(config.sqlite_home.as_path()).await?;
 
     clear_memory_roots_contents(&config.codex_home).await?;
 
@@ -2331,20 +2291,6 @@ async fn print_app_server_daemon_output(command: AppServerLifecycleCommand) -> a
     let output = codex_app_server_daemon::run(command).await?;
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
-}
-
-fn updater_http_client_factory(
-    config: anyhow::Result<codex_core::config::Config>,
-) -> codex_http_client::HttpClientFactory {
-    match config {
-        Ok(config) => config.http_client_factory(),
-        Err(error) => {
-            eprintln!("warning: failed to load updater network configuration: {error}");
-            codex_http_client::HttpClientFactory::new(
-                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-            )
-        }
-    }
 }
 
 async fn print_app_server_remote_control_output(
@@ -2649,34 +2595,6 @@ mod tests {
     use codex_tui::TokenUsage;
     use pretty_assertions::assert_eq;
 
-    #[tokio::test]
-    async fn updater_http_client_factory_honors_respect_system_proxy() {
-        let codex_home = tempfile::tempdir().expect("temporary Codex home");
-        let config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .cli_overrides(vec![(
-                "features.respect_system_proxy".to_string(),
-                toml::Value::Boolean(true),
-            )])
-            .build()
-            .await
-            .expect("config should load");
-
-        assert_eq!(
-            updater_http_client_factory(Ok(config)).outbound_proxy_policy(),
-            codex_http_client::OutboundProxyPolicy::RespectSystemProxy
-        );
-    }
-
-    #[test]
-    fn updater_http_client_factory_falls_back_when_config_load_fails() {
-        assert_eq!(
-            updater_http_client_factory(Err(anyhow::anyhow!("invalid config")))
-                .outbound_proxy_policy(),
-            codex_http_client::OutboundProxyPolicy::ReqwestDefault
-        );
-    }
-
     #[test]
     fn exec_server_remote_auth_accepts_api_key_auth() {
         let auth = CodexAuth::from_api_key("sk-test");
@@ -2851,22 +2769,6 @@ mod tests {
                 .map(std::string::ToString::to_string));
         };
         Ok(profile_v2_for_subcommand(&cli.interactive, subcommand)?.map(ToString::to_string))
-    }
-
-    #[test]
-    fn profile_loader_overrides_use_explicit_codex_home() -> anyhow::Result<()> {
-        let codex_home = tempfile::tempdir()?;
-        let profile: ProfileV2Name = "work".parse()?;
-
-        let overrides =
-            loader_overrides_for_profile_at_codex_home(Some(&profile), codex_home.path());
-
-        assert_eq!(
-            overrides.user_config_path,
-            Some(resolve_profile_v2_config_path(codex_home.path(), &profile))
-        );
-        assert_eq!(overrides.user_config_profile, Some(profile));
-        Ok(())
     }
 
     #[test]
@@ -3323,10 +3225,9 @@ mod tests {
 
     #[test]
     fn delete_force_requires_uuid() {
-        assert!(delete_action("123e4567-e89b-12d3-a456-426614174000", /*force*/ true).is_ok());
+        assert!(delete_action("123e4567-e89b-12d3-a456-426614174000", true).is_ok());
 
-        let err =
-            delete_action("my-thread", /*force*/ true).expect_err("name should require prompt");
+        let err = delete_action("my-thread", true).expect_err("name should require prompt");
         assert_eq!(
             err.to_string(),
             "--force requires a session UUID; names must be confirmed interactively"
@@ -4047,50 +3948,6 @@ mod tests {
     }
 
     #[test]
-    fn app_server_code_mode_host_url_parses_independently_of_listen_transport() {
-        let app_server = app_server_from_args(
-            [
-                "codex",
-                "app-server",
-                "--code-mode-host",
-                "wss://example.test/code-mode",
-                "--listen",
-                "ws://127.0.0.1:4500",
-            ]
-            .as_ref(),
-        );
-
-        assert_eq!(
-            app_server.code_mode_host.code_mode_host,
-            Some(
-                url::Url::parse("wss://example.test/code-mode")
-                    .expect("test endpoint should parse")
-            )
-        );
-        assert_eq!(
-            app_server.listen,
-            codex_app_server::AppServerTransport::WebSocket {
-                bind_address: "127.0.0.1:4500".parse().expect("valid socket address"),
-            }
-        );
-    }
-
-    #[test]
-    fn app_server_rejects_invalid_code_mode_host_urls() {
-        for endpoint in [
-            "http://127.0.0.1:8765",
-            "ws://",
-            "wss://example.test/code-mode#fragment",
-        ] {
-            let error =
-                MultitoolCli::try_parse_from(["codex", "app-server", "--code-mode-host", endpoint])
-                    .expect_err("invalid code-mode host endpoint should fail argument parsing");
-
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-        }
-    }
-
-    #[test]
     fn app_server_listen_websocket_url_parses() {
         let app_server = app_server_from_args(
             ["codex", "app-server", "--listen", "ws://127.0.0.1:4500"].as_ref(),
@@ -4419,26 +4276,6 @@ mod tests {
             overrides,
             vec!["features.image_detail_original=true".to_string(),]
         );
-    }
-
-    #[test]
-    fn feature_toggles_accept_removed_enable_fanout_flag() {
-        let toggles = FeatureToggles {
-            enable: vec!["enable_fanout".to_string()],
-            disable: Vec::new(),
-        };
-        let overrides = toggles.to_overrides().expect("valid features");
-        assert_eq!(overrides, vec!["features.enable_fanout=true".to_string(),]);
-    }
-
-    #[test]
-    fn feature_toggles_accept_removed_item_ids_flag() {
-        let toggles = FeatureToggles {
-            enable: vec!["item_ids".to_string()],
-            disable: Vec::new(),
-        };
-        let overrides = toggles.to_overrides().expect("valid features");
-        assert_eq!(overrides, vec!["features.item_ids=true".to_string()]);
     }
 
     #[test]
