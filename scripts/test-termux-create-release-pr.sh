@@ -216,7 +216,7 @@ assert_ref_has_file origin/release/1.0.0 scripts/termux-download-release-artifac
 
 assert_ref_is_ancestor origin/release/1.0.0 origin/release-train/1.0.0
 assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "termux"
-assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code with target drift"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
 version = \"1.0.0\""
 assert_ref_has_file origin/release-train/1.0.0 src/upstream-after-tag.txt
@@ -331,7 +331,7 @@ assert_ref_lacks_file origin/release/1.0.0 stale-release-branch.txt
 
 assert_ref_is_ancestor origin/release/1.0.0 origin/release-train/1.0.0
 assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "new-release"
-assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code with target drift"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
 version = \"1.0.0-alpha.2\"
 
