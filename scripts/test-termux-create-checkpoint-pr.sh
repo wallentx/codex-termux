@@ -110,10 +110,11 @@ cd "${work}"
 git config user.name "Termux Checkpoint Test"
 git config user.email "termux-checkpoint-test@example.invalid"
 
-mkdir -p scripts src
+mkdir -p codex-rs/cli/src scripts src
+printf 'target code\n' > codex-rs/cli/src/main.rs
 printf 'target-helper\n' > scripts/termux-configure-git.sh
 printf 'target\n' > src/app.txt
-git add scripts/termux-configure-git.sh src/app.txt
+git add codex-rs/cli/src/main.rs scripts/termux-configure-git.sh src/app.txt
 git commit -m "target baseline" >/dev/null
 git branch -M wallentx/termux-target
 git remote add origin "${origin}"
@@ -124,9 +125,10 @@ mkdir -p .github scripts
 git rm scripts/termux-configure-git.sh >/dev/null
 mkdir -p scripts
 printf '{"termux_tag":"rust-v1.0.0-termux"}\n' > .github/termux-release.json
+printf 'tested release code\n' > codex-rs/cli/src/main.rs
 printf 'release-helper\n' > scripts/termux-download-release-artifact.sh
 printf 'release\n' > src/app.txt
-git add .github/termux-release.json scripts/termux-download-release-artifact.sh src/app.txt
+git add .github/termux-release.json codex-rs/cli/src/main.rs scripts/termux-download-release-artifact.sh src/app.txt
 git commit -m "release branch state" >/dev/null
 git push origin release/1.0.0 >/dev/null
 
@@ -148,6 +150,7 @@ git fetch origin checkpoint/wallentx_termux-target_from_release_1.0.0_$(git rev-
 checkpoint_ref="origin/checkpoint/wallentx_termux-target_from_release_1.0.0_$(git rev-parse --short=12 origin/release/1.0.0)"
 
 assert_ref_file_equals "${checkpoint_ref}" src/app.txt "release"
+assert_ref_file_equals "${checkpoint_ref}" codex-rs/cli/src/main.rs "tested release code"
 assert_ref_file_equals "${checkpoint_ref}" scripts/termux-configure-git.sh "target-helper"
 assert_ref_lacks_file "${checkpoint_ref}" scripts/termux-download-release-artifact.sh
 assert_ref_lacks_file "${checkpoint_ref}" .github/termux-release.json
@@ -157,4 +160,4 @@ if [[ "$(cat "${github_output}")" != "pr_url=https://github.com/wallentx/codex-t
   fail "checkpoint PR URL was not written to GITHUB_OUTPUT"
 fi
 
-echo "ok - checkpoint restores destination release-only paths and removes source-only release metadata"
+echo "ok - checkpoint carries tested code while restoring release-only automation paths"

@@ -23,7 +23,6 @@ fi
 
 release_only_checkpoint_paths() {
   printf '%s\n' "${TERMUX_RELEASE_BRANCH_SCRIPT_PATHS[@]}"
-  printf '%s\n' "${TERMUX_RELEASE_CODE_PATHS[@]}"
 }
 
 resolve_source_version_conflicts() {

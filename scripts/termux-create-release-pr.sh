@@ -110,24 +110,50 @@ normalize_workspace_version_to_upstream_tag() {
   ' codex-rs/Cargo.toml
 }
 
-restore_release_authoritative_paths() {
+restore_merge_authoritative_paths() {
   local release_ref="origin/${RELEASE_BRANCH}"
   local path
-  local -a restore_paths=()
+  local -a patch_remove_paths=()
+  local -a patch_restore_paths=()
+  local -a release_remove_paths=()
+  local -a release_restore_paths=()
 
-  for path in "${TERMUX_RELEASE_MERGE_AUTHORITATIVE_PATHS[@]}"; do
-    if git cat-file -e "${release_ref}:${path}" 2>/dev/null \
-      || git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
-      restore_paths+=("${path}")
+  for path in "${TERMUX_RELEASE_CODE_PATHS[@]}"; do
+    if git cat-file -e "HEAD:${path}" 2>/dev/null; then
+      patch_restore_paths+=("${path}")
+    elif git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
+      patch_remove_paths+=("${path}")
     fi
   done
 
-  if (( ${#restore_paths[@]} > 0 )); then
+  if (( ${#patch_restore_paths[@]} > 0 )); then
+    git restore \
+      --source=HEAD \
+      --staged \
+      --worktree \
+      -- "${patch_restore_paths[@]}"
+  fi
+  if (( ${#patch_remove_paths[@]} > 0 )); then
+    git rm -f --ignore-unmatch -- "${patch_remove_paths[@]}"
+  fi
+
+  for path in "${TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS[@]}"; do
+    if git cat-file -e "${release_ref}:${path}" 2>/dev/null; then
+      release_restore_paths+=("${path}")
+    elif git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
+      release_remove_paths+=("${path}")
+    fi
+  done
+
+  if (( ${#release_restore_paths[@]} > 0 )); then
     git restore \
       --source="${release_ref}" \
       --staged \
       --worktree \
-      -- "${restore_paths[@]}"
+      -- "${release_restore_paths[@]}"
+  fi
+  if (( ${#release_remove_paths[@]} > 0 )); then
+    git rm -f --ignore-unmatch -- "${release_remove_paths[@]}"
   fi
 }
 
@@ -141,7 +167,7 @@ merge_release_branch_into_work_branch() {
 
   seed_release_branch_workflows
   git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
-  restore_release_authoritative_paths
+  restore_merge_authoritative_paths
 
   unresolved_paths="$(git diff --name-only --diff-filter=U)"
   if [[ -n "${unresolved_paths}" ]]; then
