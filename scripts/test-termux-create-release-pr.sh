@@ -177,13 +177,16 @@ git branch -M main
 git remote add origin "${origin}"
 git push origin main rust-v1.0.0 >/dev/null
 
+mkdir -p .github/scripts
+printf 'target-only upstream file\n' > .github/scripts/build-codex-package-archive.sh
 printf 'upstream-after-tag\n' > src/upstream-after-tag.txt
-git add src/upstream-after-tag.txt
+git add .github/scripts/build-codex-package-archive.sh src/upstream-after-tag.txt
 git commit -m "upstream after release tag" >/dev/null
 git push origin main >/dev/null
 
 git checkout -B wallentx/termux-target main >/dev/null
 mkdir -p termux
+git rm codex-rs/tui/src/update_versions.rs >/dev/null
 perl -0pi -e 's/version = "1\.0\.0"/version = "1.0.0-alpha.target"/' codex-rs/Cargo.toml
 printf 'compat\n' > termux/compat.txt
 printf 'termux\n' > src/shared.txt
@@ -221,6 +224,8 @@ assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspac
 version = \"1.0.0\""
 assert_ref_has_file origin/release-train/1.0.0 src/upstream-after-tag.txt
 assert_ref_has_file origin/release-train/1.0.0 termux/compat.txt
+assert_ref_lacks_file origin/release-train/1.0.0 codex-rs/tui/src/update_versions.rs
+assert_ref_lacks_file origin/release-train/1.0.0 .github/scripts/build-codex-package-archive.sh
 assert_ref_has_file origin/release-train/1.0.0 .github/termux-release.json
 assert_ref_has_file origin/release-train/1.0.0 scripts/termux-download-release-artifact.sh
 assert_ref_lacks_file origin/release-train/1.0.0 stale-work-branch.txt
