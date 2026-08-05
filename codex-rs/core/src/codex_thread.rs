@@ -5,6 +5,7 @@ use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
 use crate::session::SteerInputError;
 use crate::session::session::Session;
+use crate::user_message_admission::UserMessageAdmission;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
@@ -275,7 +276,9 @@ impl CodexThread {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
-        self.io.submit_with_trace(op, trace).await
+        self.io
+            .submit_with_trace(op, trace, /*parent_turn_id*/ None)
+            .await
     }
 
     pub async fn submit_user_input_with_client_user_message_id(
@@ -292,6 +295,44 @@ impl CodexThread {
         self.io
             .submit_user_input_with_client_user_message_id(op, trace, client_user_message_id)
             .await
+    }
+
+    /// Waits until Core has actually started a turn or steered the active turn.
+    pub async fn submit_user_input_and_wait_for_admission(
+        &self,
+        op: Op,
+        trace: Option<W3cTraceContext>,
+        client_user_message_id: Option<String>,
+    ) -> CodexResult<UserMessageAdmission> {
+        if !matches!(op, Op::UserInput { .. }) {
+            return Err(CodexErr::InvalidRequest(
+                "user message admission requires user input".to_string(),
+            ));
+        }
+        self.session
+            .services
+            .agent_control
+            .ensure_execution_capacity_for_op(self.session.thread_id(), &op)
+            .await?;
+        let submission_id = crate::session::new_submission_id();
+        let (_pending_admission, admission) = self
+            .session
+            .pending_user_message_admissions
+            .register(submission_id.clone());
+        self.io
+            .submit_with_id(Submission {
+                id: submission_id.clone(),
+                op,
+                client_user_message_id,
+                trace,
+                parent_turn_id: None,
+            })
+            .await?;
+        tokio::select! {
+            biased;
+            result = admission => result.map_err(|_| CodexErr::InternalAgentDied)?,
+            () = self.io.session_loop_termination.clone() => Err(CodexErr::InternalAgentDied),
+        }
     }
 
     /// Persist whether this thread is eligible for future memory generation.
@@ -427,7 +468,8 @@ impl CodexThread {
     }
 
     /// Use sparingly: this is intended to be removed soon.
-    pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
+    pub async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
+        sub.parent_turn_id = None;
         self.io.submit_with_id(sub).await
     }
 
@@ -493,7 +535,7 @@ impl CodexThread {
                 .await?;
             self.session
                 .record_context_updates_and_set_reference_context_item(step_context.as_ref())
-                .await;
+                .await?;
         }
         self.session
             .inject_no_new_turn(items, Some(turn_context.as_ref()))

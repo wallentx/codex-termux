@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -12,6 +13,7 @@ use tokio::task::JoinHandle;
 use crate::responses_metadata::CODE_MODE_TOOL_NAMES_KEY;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
+use crate::responses_metadata::PARENT_TURN_ID_KEY;
 use crate::responses_metadata::TurnMetadataWorkspace;
 use crate::responses_metadata::filter_extra_metadata;
 use crate::responses_metadata::subagent_header_value;
@@ -84,7 +86,7 @@ pub async fn detached_memory_responses_metadata(
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct TurnMetadataState {
     cwd: AbsolutePathBuf,
     repo_root: Option<String>,
@@ -92,17 +94,18 @@ pub(crate) struct TurnMetadataState {
     thread_id: String,
     forked_from_thread_id: Option<ThreadId>,
     parent_thread_id: Option<ThreadId>,
+    parent_turn_id: OnceLock<String>,
     subagent_header: Option<String>,
     subagent_kind: Option<String>,
     thread_source: Option<ThreadSource>,
     turn_id: String,
     sandbox: Option<String>,
-    enriched_workspaces: Arc<RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>>,
-    code_mode_tool_names: Arc<RwLock<Option<BTreeMap<String, ToolName>>>>,
-    turn_started_at_unix_ms: Arc<RwLock<Option<i64>>>,
-    responsesapi_client_metadata: Arc<RwLock<BTreeMap<String, String>>>,
-    user_input_requested_during_turn: Arc<AtomicBool>,
-    enrichment_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    enriched_workspaces: RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>,
+    code_mode_tool_names: RwLock<Option<BTreeMap<String, ToolName>>>,
+    turn_started_at_unix_ms: RwLock<Option<i64>>,
+    responsesapi_client_metadata: RwLock<BTreeMap<String, String>>,
+    user_input_requested_during_turn: AtomicBool,
+    enrichment_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl TurnMetadataState {
@@ -136,17 +139,18 @@ impl TurnMetadataState {
             thread_id,
             forked_from_thread_id,
             parent_thread_id,
+            parent_turn_id: OnceLock::new(),
             subagent_header: subagent_header_value(session_source),
             subagent_kind: subagent_metadata_kind(session_source),
             thread_source,
             turn_id,
             sandbox,
-            enriched_workspaces: Arc::new(RwLock::new(None)),
-            code_mode_tool_names: Arc::new(RwLock::new(None)),
-            turn_started_at_unix_ms: Arc::new(RwLock::new(None)),
-            responsesapi_client_metadata: Arc::new(RwLock::new(BTreeMap::new())),
-            user_input_requested_during_turn: Arc::new(AtomicBool::new(false)),
-            enrichment_task: Arc::new(Mutex::new(None)),
+            enriched_workspaces: RwLock::new(None),
+            code_mode_tool_names: RwLock::new(None),
+            turn_started_at_unix_ms: RwLock::new(None),
+            responsesapi_client_metadata: RwLock::new(BTreeMap::new()),
+            user_input_requested_during_turn: AtomicBool::new(false),
+            enrichment_task: Mutex::new(None),
         }
     }
 
@@ -160,6 +164,7 @@ impl TurnMetadataState {
             return None;
         };
         metadata.remove(CODE_MODE_TOOL_NAMES_KEY); // Precaution: avoid exposing tool data to external MCPs.
+        metadata.remove(PARENT_TURN_ID_KEY);
         metadata.insert(
             MODEL_KEY.to_string(),
             Value::String(context.model.to_string()),
@@ -219,6 +224,13 @@ impl TurnMetadataState {
             (!code_mode_tool_names.is_empty()).then_some(code_mode_tool_names);
     }
 
+    pub(crate) fn set_parent_turn_id(&self, parent_turn_id: String) {
+        if parent_turn_id.trim().is_empty() {
+            return;
+        }
+        let _ = self.parent_turn_id.set(parent_turn_id);
+    }
+
     pub(crate) fn set_responsesapi_client_metadata(
         &self,
         responsesapi_client_metadata: HashMap<String, String>,
@@ -243,6 +255,7 @@ impl TurnMetadataState {
             turn_id: Some(self.turn_id.clone()),
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
+            parent_turn_id: self.parent_turn_id.get().cloned(),
             subagent_header: self.subagent_header.clone(),
             subagent_kind: self.subagent_kind.clone(),
             thread_source: self.thread_source.clone(),
@@ -290,7 +303,7 @@ impl TurnMetadataState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(turn_started_at_unix_ms);
     }
 
-    pub(crate) fn spawn_git_enrichment_task(&self) {
+    pub(crate) fn spawn_git_enrichment_task(self: &Arc<Self>) {
         if self.repo_root.is_none() {
             return;
         }
@@ -303,7 +316,7 @@ impl TurnMetadataState {
             return;
         }
 
-        let state = self.clone();
+        let state = Arc::clone(self);
         *task_guard = Some(tokio::spawn(async move {
             let workspace_git_metadata = state.fetch_workspace_git_metadata().await;
             let Some(repo_root) = state.repo_root.clone() else {

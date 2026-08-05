@@ -91,12 +91,15 @@ impl ModelsCacheManager {
         }
     }
 
-    /// Renew the cache TTL by updating the fetched_at timestamp to now.
+    /// Renew the cache TTL once more than half its lifetime has elapsed.
     pub(crate) async fn renew_cache_ttl(&self) -> io::Result<()> {
         let mut cache = match self.load().await? {
             Some(cache) => cache,
             None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
         };
+        if cache.is_fresh(self.cache_ttl / 2) {
+            return Ok(());
+        }
         cache.fetched_at = Utc::now();
         self.save_internal(&cache).await
     }
@@ -165,6 +168,9 @@ pub(crate) struct ModelsCache {
     pub(crate) etag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) client_version: Option<String>,
+    #[serde(
+        deserialize_with = "codex_protocol::openai_models::deserialize_model_infos_with_legacy_base"
+    )]
     pub(crate) models: Vec<ModelInfo>,
 }
 

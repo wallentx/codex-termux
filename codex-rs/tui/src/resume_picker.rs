@@ -12,8 +12,10 @@ use crate::git_action_directives::parse_assistant_markdown;
 use crate::inline_visualization::InlineVisualizationContext;
 use crate::key_hint::KeyBindingListExt;
 use crate::key_hint::is_plain_text_key_event;
+use crate::keymap::ListAction;
 use crate::keymap::ListKeymap;
 use crate::keymap::PagerKeymap;
+use crate::keymap::RuntimeChordKeymap;
 use crate::keymap::RuntimeKeymap;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::edit::ConfigEditsBuilder;
@@ -50,6 +52,7 @@ use crossterm::event::KeyModifiers;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
+use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::style::Styled as _;
@@ -63,6 +66,11 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 use unicode_width::UnicodeWidthStr;
+
+mod page_loading;
+
+use page_loading::PageLoadMode;
+use page_loading::PaginationState;
 
 const PAGE_SIZE: usize = 25;
 const LOAD_NEAR_THRESHOLD: usize = 5;
@@ -143,6 +151,7 @@ struct PageLoadRequest {
     cursor: Option<PageCursor>,
     request_token: usize,
     search_token: Option<usize>,
+    mode: PageLoadMode,
     cwd_filter: Option<PathBuf>,
     provider_filter: ProviderFilter,
     sort_key: ThreadSortKey,
@@ -284,6 +293,8 @@ struct SessionPickerRunOptions {
     view_persistence: Option<SessionPickerViewPersistence>,
     pager_keymap: PagerKeymap,
     list_keymap: ListKeymap,
+    initial_page_mode: PageLoadMode,
+    chord_keymap: Arc<RuntimeChordKeymap>,
 }
 
 /// Interactive session picker that lists app-server threads with simple search,
@@ -370,6 +381,12 @@ async fn run_resume_picker_with_launch_context(
         }),
         pager_keymap: runtime_keymap.pager,
         list_keymap: runtime_keymap.list,
+        initial_page_mode: if uses_remote_workspace {
+            PageLoadMode::StoreDefault
+        } else {
+            PageLoadMode::StateDbOnly
+        },
+        chord_keymap: runtime_keymap.chords,
     };
     run_session_picker_with_loader(
         tui,
@@ -416,6 +433,12 @@ pub async fn run_fork_picker_with_app_server(
         }),
         pager_keymap: runtime_keymap.pager,
         list_keymap: runtime_keymap.list,
+        initial_page_mode: if uses_remote_workspace {
+            PageLoadMode::StoreDefault
+        } else {
+            PageLoadMode::StateDbOnly
+        },
+        chord_keymap: runtime_keymap.chords,
     };
     run_session_picker_with_loader(
         tui,
@@ -452,7 +475,9 @@ async fn run_session_picker_with_loader(
     state.view_persistence = options.view_persistence;
     state.pager_keymap = options.pager_keymap;
     state.list_keymap = options.list_keymap;
+    state.chord_keymap = options.chord_keymap;
     state.launch_context = options.launch_context;
+    state.initial_page_mode = options.initial_page_mode;
     state.start_initial_load();
     state.request_frame();
 
@@ -462,6 +487,15 @@ async fn run_session_picker_with_loader(
     loop {
         tokio::select! {
             Some(ev) = tui_events.next() => {
+                let screen_size = alt.tui.screen_size_for_event(&ev)?;
+                let ev = if let TuiEvent::Key(key) = ev {
+                    let Some(key) = state.route_key_chord(key) else {
+                        continue;
+                    };
+                    TuiEvent::Key(key)
+                } else {
+                    ev
+                };
                 if state.overlay.is_some() {
                     state.handle_overlay_event(alt.tui, ev)?;
                     continue;
@@ -478,14 +512,13 @@ async fn run_session_picker_with_loader(
                     TuiEvent::Paste(pasted) => {
                         state.handle_paste(pasted);
                     }
-                    TuiEvent::Draw | TuiEvent::Resize => {
-                        if let Ok(size) = alt.tui.terminal.size() {
-                            let list_height =
-                                size.height.saturating_sub(PICKER_CHROME_HEIGHT) as usize;
-                            state.update_viewport(list_height, list_viewport_width(size.width));
-                            state.ensure_minimum_rows_for_view(list_height);
-                        }
-                        draw_picker(alt.tui, &state)?;
+                    TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
+                        let list_width = list_viewport_width(screen_size.width);
+                        let list_height =
+                            usize::from(screen_size.height.saturating_sub(PICKER_CHROME_HEIGHT));
+                        state.update_viewport(list_height, list_width);
+                        state.ensure_minimum_rows_for_view(list_height);
+                        draw_picker(alt.tui, &state, screen_size)?;
                         if state.note_transcript_loading_frame_drawn() {
                             state.open_pending_transcript_if_ready();
                         }
@@ -572,6 +605,7 @@ fn spawn_app_server_page_loader(
                         request.provider_filter,
                         request.sort_key,
                         include_non_interactive,
+                        matches!(request.mode, PageLoadMode::StateDbOnly),
                     )
                     .await;
                     let _ = bg_tx.send(BackgroundEvent::Page {
@@ -615,7 +649,9 @@ fn spawn_app_server_page_loader(
 fn sort_key_label(sort_key: ThreadSortKey) -> &'static str {
     match sort_key {
         ThreadSortKey::CreatedAt => "Created",
-        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => "Updated",
+        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt | ThreadSortKey::SectionPosition => {
+            "Updated"
+        }
     }
 }
 
@@ -674,25 +710,9 @@ struct PickerState {
     overlay: Option<Overlay>,
     pager_keymap: PagerKeymap,
     list_keymap: ListKeymap,
-}
-
-struct PaginationState {
-    next_cursor: Option<PageCursor>,
-    num_scanned_files: usize,
-    reached_scan_cap: bool,
-    loading: LoadingState,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum LoadingState {
-    Idle,
-    Pending(PendingLoad),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PendingLoad {
-    request_token: usize,
-    search_token: Option<usize>,
+    initial_page_mode: PageLoadMode,
+    chord_keymap: Arc<RuntimeChordKeymap>,
+    chord_matcher: crate::keymap::KeyChordMatcher,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -731,12 +751,6 @@ enum LoadTrigger {
     Search { token: usize },
 }
 
-impl LoadingState {
-    fn is_pending(&self) -> bool {
-        matches!(self, LoadingState::Pending(_))
-    }
-}
-
 async fn load_app_server_page(
     app_server: &mut AppServerSession,
     cursor: Option<String>,
@@ -744,6 +758,7 @@ async fn load_app_server_page(
     provider_filter: ProviderFilter,
     sort_key: ThreadSortKey,
     include_non_interactive: bool,
+    use_state_db_only: bool,
 ) -> std::io::Result<PickerPage> {
     let response = app_server
         .thread_list(thread_list_params(
@@ -752,6 +767,7 @@ async fn load_app_server_page(
             provider_filter,
             sort_key,
             include_non_interactive,
+            use_state_db_only,
         ))
         .await
         .map_err(std::io::Error::other)?;
@@ -932,12 +948,7 @@ impl PickerState {
         Self {
             requester,
             relative_time_reference: None,
-            pagination: PaginationState {
-                next_cursor: None,
-                num_scanned_files: 0,
-                reached_scan_cap: false,
-                loading: LoadingState::Idle,
-            },
+            pagination: PaginationState::new(),
             all_rows: Vec::new(),
             filtered_rows: Vec::new(),
             seen_rows: HashSet::new(),
@@ -971,6 +982,29 @@ impl PickerState {
             overlay: None,
             pager_keymap: RuntimeKeymap::defaults().pager,
             list_keymap: RuntimeKeymap::defaults().list,
+            initial_page_mode: PageLoadMode::StoreDefault,
+            chord_keymap: Arc::default(),
+            chord_matcher: crate::keymap::KeyChordMatcher::default(),
+        }
+    }
+
+    fn route_key_chord(&mut self, key: KeyEvent) -> Option<KeyEvent> {
+        let context = if self.overlay.is_some() {
+            crate::keymap::KeymapContext::Pager
+        } else {
+            crate::keymap::KeymapContext::List
+        };
+        match self.chord_matcher.advance(
+            key,
+            &self.chord_keymap,
+            crate::keymap::KeymapContextSet::new(context),
+            tokio::time::Instant::now(),
+        ) {
+            crate::keymap::KeyChordMatch::PassThrough => Some(key),
+            crate::keymap::KeyChordMatch::Completed(dispatch_event) => Some(dispatch_event),
+            crate::keymap::KeyChordMatch::Pending(_)
+            | crate::keymap::KeyChordMatch::Cancelled
+            | crate::keymap::KeyChordMatch::Ignored => None,
         }
     }
 
@@ -1293,16 +1327,16 @@ impl PickerState {
         };
 
         let request_token = self.allocate_request_token();
-        self.pagination.loading = LoadingState::Pending(PendingLoad {
-            request_token,
-            search_token,
-        });
+        let mode = self.initial_page_mode;
+        self.pagination
+            .start_load(request_token, search_token, mode);
         self.request_frame();
 
         (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
             cursor: None,
             request_token,
             search_token,
+            mode,
             cwd_filter: self.active_cwd_filter(),
             provider_filter: self.provider_filter.clone(),
             sort_key: self.sort_key,
@@ -1316,14 +1350,35 @@ impl PickerState {
                 search_token,
                 page,
             } => {
-                let pending = match self.pagination.loading {
-                    LoadingState::Pending(pending) => pending,
-                    LoadingState::Idle => return Ok(()),
+                let Some(pending) = self.pagination.finish_load(request_token) else {
+                    return Ok(());
                 };
-                if pending.request_token != request_token {
+                let page_has_rows = matches!(&page, Ok(page) if !page.rows.is_empty());
+                // Fall back only when the initial DB listing is unusable. Once SQLite returns
+                // rows, its pagination is authoritative and an empty later page ends the list.
+                let should_restart_from_store = pending.mode == PageLoadMode::StateDbOnly
+                    && self.all_rows.is_empty()
+                    && !page_has_rows;
+                if should_restart_from_store {
+                    let request_token = self.allocate_request_token();
+                    let search_token = pending.search_token.or(search_token);
+                    self.pagination.reset();
+                    self.pagination.start_load(
+                        request_token,
+                        search_token,
+                        PageLoadMode::StoreDefault,
+                    );
+                    (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
+                        cursor: None,
+                        request_token,
+                        search_token,
+                        mode: PageLoadMode::StoreDefault,
+                        cwd_filter: self.active_cwd_filter(),
+                        provider_filter: self.provider_filter.clone(),
+                        sort_key: self.sort_key,
+                    }));
                     return Ok(());
                 }
-                self.pagination.loading = LoadingState::Idle;
                 let page = page.map_err(color_eyre::Report::from)?;
                 self.ingest_page(page);
                 self.complete_pending_page_down();
@@ -1369,28 +1424,21 @@ impl PickerState {
     }
 
     fn reset_pagination(&mut self) {
-        self.pagination.next_cursor = None;
-        self.pagination.num_scanned_files = 0;
-        self.pagination.reached_scan_cap = false;
-        self.pagination.loading = LoadingState::Idle;
+        self.pagination.reset();
         self.frozen_footer_percent = None;
     }
 
     fn ingest_page(&mut self, page: PickerPage) {
-        if let Some(cursor) = page.next_cursor.clone() {
-            self.pagination.next_cursor = Some(cursor);
-        } else {
-            self.pagination.next_cursor = None;
-        }
-        self.pagination.num_scanned_files = self
-            .pagination
-            .num_scanned_files
-            .saturating_add(page.num_scanned_files);
-        if page.reached_scan_cap {
-            self.pagination.reached_scan_cap = true;
-        }
+        let PickerPage {
+            rows,
+            next_cursor,
+            num_scanned_files,
+            reached_scan_cap,
+        } = page;
+        self.pagination
+            .complete_page(next_cursor, num_scanned_files, reached_scan_cap);
 
-        for row in page.rows {
+        for row in rows {
             if let Some(seen_key) = row.seen_key() {
                 if self.seen_rows.insert(seen_key) {
                     self.all_rows.push(row);
@@ -1550,7 +1598,7 @@ impl PickerState {
         if minimum_rows == 0 {
             return;
         }
-        if self.pagination.loading.is_pending() || self.pagination.next_cursor.is_none() {
+        if self.pagination.is_loading() || self.pagination.next_cursor.is_none() {
             return;
         }
         let rendered_rows = if self.filtered_rows.is_empty() {
@@ -1575,10 +1623,7 @@ impl PickerState {
     }
 
     fn maybe_load_more_for_scroll(&mut self) {
-        if self.pagination.loading.is_pending() {
-            return;
-        }
-        if self.pagination.next_cursor.is_none() {
+        if self.pagination.is_loading() || self.pagination.next_cursor.is_none() {
             return;
         }
         if self.filtered_rows.is_empty() {
@@ -1591,10 +1636,7 @@ impl PickerState {
     }
 
     fn load_more_if_needed(&mut self, trigger: LoadTrigger) {
-        if self.pagination.loading.is_pending() {
-            return;
-        }
-        let Some(cursor) = self.pagination.next_cursor.clone() else {
+        let Some((cursor, mode)) = self.pagination.next_page() else {
             return;
         };
         self.freeze_footer_percent();
@@ -1603,16 +1645,15 @@ impl PickerState {
             LoadTrigger::Scroll => None,
             LoadTrigger::Search { token } => Some(token),
         };
-        self.pagination.loading = LoadingState::Pending(PendingLoad {
-            request_token,
-            search_token,
-        });
+        self.pagination
+            .start_load(request_token, search_token, mode);
         self.request_frame();
 
         (self.picker_loader)(PickerLoadRequest::Page(PageLoadRequest {
             cursor: Some(cursor),
             request_token,
             search_token,
+            mode,
             cwd_filter: self.active_cwd_filter(),
             provider_filter: self.provider_filter.clone(),
             sort_key: self.sort_key,
@@ -1644,7 +1685,9 @@ impl PickerState {
     fn toggle_sort_key(&mut self) {
         self.sort_key = match self.sort_key {
             ThreadSortKey::CreatedAt => ThreadSortKey::UpdatedAt,
-            ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => ThreadSortKey::CreatedAt,
+            ThreadSortKey::UpdatedAt
+            | ThreadSortKey::RecencyAt
+            | ThreadSortKey::SectionPosition => ThreadSortKey::CreatedAt,
         };
         self.start_initial_load();
     }
@@ -1839,6 +1882,7 @@ fn thread_list_params(
     provider_filter: ProviderFilter,
     sort_key: ThreadSortKey,
     include_non_interactive: bool,
+    use_state_db_only: bool,
 ) -> ThreadListParams {
     ThreadListParams {
         cursor,
@@ -1851,11 +1895,11 @@ fn thread_list_params(
         },
         source_kinds: Some(crate::resume_source_kinds(include_non_interactive)),
         archived: Some(false),
-        is_pinned: None,
+        section_id: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
-        use_state_db_only: false,
+        use_state_db_only,
         search_term: None,
     }
 }
@@ -1871,10 +1915,9 @@ fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
-fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
+fn draw_picker(tui: &mut Tui, state: &PickerState, screen_size: Size) -> std::io::Result<()> {
     // Render full-screen overlay
-    let height = tui.terminal.size()?.height;
-    tui.draw(height, |frame| {
+    tui.draw(screen_size.height, |frame| {
         let area = frame.area();
         let [header, _header_gap, search, _search_gap, list, footer] = Layout::vertical([
             Constraint::Length(1),
@@ -1902,11 +1945,11 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
             state.action.title().bold().cyan()
         };
         let header_line: Line = vec![header_title].into();
-        frame.render_widget_ref(header_line, chrome(header));
+        frame.render_widget_ref(&header_line, chrome(header));
 
         // Search line
         let search = chrome(search);
-        frame.render_widget_ref(search_line(state, search.width), search);
+        frame.render_widget_ref(&search_line(state, search.width), search);
 
         let list = Rect::new(
             list.x.saturating_add(2),
@@ -2047,7 +2090,7 @@ fn filter_mode_label(filter_mode: SessionFilterMode) -> &'static str {
 }
 
 struct PickerFooterHint {
-    key: &'static str,
+    key: String,
     wide_label: String,
     compact_label: String,
     priority: u8,
@@ -2076,7 +2119,7 @@ fn render_picker_footer(
         if y >= area.bottom() {
             break;
         }
-        frame.render_widget_ref(line, Rect::new(area.x, y, area.width, 1));
+        frame.render_widget_ref(&line, Rect::new(area.x, y, area.width, 1));
     }
 }
 
@@ -2090,7 +2133,7 @@ fn render_picker_footer_separator(
     }
 
     let separator = "─".repeat(area.width as usize);
-    frame.render_widget_ref(Line::from(separator.dim()), area);
+    frame.render_widget_ref(&Line::from(separator.dim()), area);
 
     let progress_width = UnicodeWidthStr::width(progress_label.as_str()) as u16;
     if progress_width < area.width {
@@ -2100,7 +2143,7 @@ fn render_picker_footer_separator(
             progress_width,
             1,
         );
-        frame.render_widget_ref(Line::from(progress_label.dim()), percent_area);
+        frame.render_widget_ref(&Line::from(progress_label.dim()), percent_area);
     }
 }
 
@@ -2110,7 +2153,7 @@ fn picker_footer_progress_label(state: &PickerState, list_height: u16, width: u1
     } else {
         state.selected.saturating_add(1)
     };
-    let total = if state.pagination.loading.is_pending() {
+    let total = if state.pagination.is_loading() {
         format!("{}…", state.filtered_rows.len())
     } else {
         state.filtered_rows.len().to_string()
@@ -2128,7 +2171,7 @@ fn picker_footer_progress_label(state: &PickerState, list_height: u16, width: u1
 }
 
 fn picker_footer_percent(state: &PickerState, list_height: u16) -> u8 {
-    if state.pagination.loading.is_pending() {
+    if state.pagination.is_loading() {
         return state.frozen_footer_percent.unwrap_or_else(|| {
             if state.filtered_rows.is_empty() {
                 0
@@ -2171,13 +2214,13 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     if state.is_transcript_loading() {
         let hints = [
             PickerFooterHint {
-                key: "loading",
+                key: "loading".to_string(),
                 wide_label: String::from("transcript"),
                 compact_label: String::from("transcript"),
                 priority: 0,
             },
             PickerFooterHint {
-                key: "ctrl+c",
+                key: "ctrl+c".to_string(),
                 wide_label: String::from("quit"),
                 compact_label: String::from("quit"),
                 priority: 1,
@@ -2211,64 +2254,85 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
         SessionListDensity::Comfortable => "dense",
         SessionListDensity::Dense => "comfy",
     };
-    let first_row_hints = vec![
-        PickerFooterHint {
-            key: "enter",
+    let mut first_row_hints = Vec::new();
+    if let Some(accept) = state.list_keymap.primary_hint(ListAction::Accept) {
+        first_row_hints.push(PickerFooterHint {
+            key: accept.display_label(),
             wide_label: action_label.to_string(),
             compact_label: action_label.to_string(),
             priority: 0,
-        },
-        PickerFooterHint {
-            key: "esc",
+        });
+    }
+    if let Some(cancel) = state.list_keymap.primary_hint(ListAction::Cancel) {
+        first_row_hints.push(PickerFooterHint {
+            key: cancel.display_label(),
             wide_label: esc_label.to_string(),
             compact_label: esc_compact_label.to_string(),
             priority: 1,
-        },
+        });
+    }
+    first_row_hints.extend([
         PickerFooterHint {
-            key: "ctrl+c",
+            key: "ctrl+c".to_string(),
             wide_label: ctrl_c_label.to_string(),
             compact_label: ctrl_c_label.to_string(),
             priority: 2,
         },
         PickerFooterHint {
-            key: "tab",
+            key: "tab".to_string(),
             wide_label: String::from("focus sort/filter"),
             compact_label: String::from("focus"),
             priority: 7,
         },
-        PickerFooterHint {
-            key: "←/→",
+    ]);
+    let option_keys = [ListAction::MoveLeft, ListAction::MoveRight]
+        .into_iter()
+        .filter_map(|action| state.list_keymap.primary_hint(action))
+        .map(super::key_hint::ShortcutHint::display_label)
+        .collect::<Vec<_>>()
+        .join("/");
+    if !option_keys.is_empty() {
+        first_row_hints.push(PickerFooterHint {
+            key: option_keys,
             wide_label: String::from("change option"),
             compact_label: String::from("option"),
             priority: 8,
-        },
-    ];
-    let second_row_hints = vec![
+        });
+    }
+    let mut second_row_hints = vec![
         PickerFooterHint {
-            key: "ctrl+o",
+            key: "ctrl+o".to_string(),
             wide_label: density_label.to_string(),
             compact_label: density_compact_label.to_string(),
             priority: 3,
         },
         PickerFooterHint {
-            key: "ctrl+t",
+            key: "ctrl+t".to_string(),
             wide_label: String::from("transcript"),
             compact_label: String::from("preview"),
             priority: 4,
         },
         PickerFooterHint {
-            key: "ctrl+e",
+            key: "ctrl+e".to_string(),
             wide_label: String::from("expand"),
             compact_label: String::from("exp"),
             priority: 6,
         },
-        PickerFooterHint {
-            key: "↑/↓",
+    ];
+    let browse_keys = [ListAction::MoveUp, ListAction::MoveDown]
+        .into_iter()
+        .filter_map(|action| state.list_keymap.primary_hint(action))
+        .map(super::key_hint::ShortcutHint::display_label)
+        .collect::<Vec<_>>()
+        .join("/");
+    if !browse_keys.is_empty() {
+        second_row_hints.push(PickerFooterHint {
+            key: browse_keys,
             wide_label: String::from("browse"),
             compact_label: String::from("browse"),
             priority: 5,
-        },
-    ];
+        });
+    }
 
     vec![
         hint_line_for_row(&first_row_hints, width),
@@ -2339,7 +2403,7 @@ fn render_transcript_loading_overlay(frame: &mut crate::custom_terminal::Frame, 
         message_width.min(overlay.width),
         1,
     );
-    frame.render_widget_ref(Line::from(message.bold()), line);
+    frame.render_widget_ref(&Line::from(message.bold()), line);
 }
 
 fn transcript_loading_overlay_style() -> Style {
@@ -2388,7 +2452,7 @@ fn fit_footer_hint_refs(
         if idx > 0 {
             spans.push(" ".repeat(gap_width).set_style(footer_hint_label_style()));
         }
-        spans.push(hint.key.set_style(footer_hint_key_style()));
+        spans.push(hint.key.clone().set_style(footer_hint_key_style()));
         let label = match mode {
             FooterHintLabelMode::Wide => Some(hint.wide_label.as_str()),
             FooterHintLabelMode::Compact => Some(hint.compact_label.as_str()),
@@ -2437,7 +2501,7 @@ fn footer_hints_width(
                     }
                     FooterHintLabelMode::KeyOnly => 0,
                 };
-                let hint_width = UnicodeWidthStr::width(hint.key) + label_width;
+                let hint_width = UnicodeWidthStr::width(hint.key.as_str()) + label_width;
                 if idx == 0 {
                     hint_width
                 } else {
@@ -2456,7 +2520,7 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
     let rows = &state.filtered_rows;
     if rows.is_empty() {
         let message = render_empty_state_line(state);
-        frame.render_widget_ref(message, area);
+        frame.render_widget_ref(&message, area);
         return;
     }
 
@@ -2472,7 +2536,7 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
     );
     if show_more_above {
         frame.render_widget_ref(
-            more_line("↑ more"),
+            &more_line("↑ more"),
             Rect::new(area.x, area.y, area.width, 1),
         );
     }
@@ -2493,7 +2557,7 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
             if y >= content_area.y.saturating_add(content_area.height) {
                 break;
             }
-            frame.render_widget_ref(line, Rect::new(area.x, y, area.width, 1));
+            frame.render_widget_ref(&line, Rect::new(area.x, y, area.width, 1));
             y = y.saturating_add(1);
         }
         if state.density == SessionListDensity::Comfortable
@@ -2504,21 +2568,19 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
         }
     }
 
-    if state.pagination.loading.is_pending()
-        && y < content_area.y.saturating_add(content_area.height)
-    {
+    if state.pagination.is_loading() && y < content_area.y.saturating_add(content_area.height) {
         let loading_line: Line = vec!["  ".into(), "Loading older sessions…".italic().dim()].into();
         let rect = Rect::new(area.x, y, area.width, 1);
-        frame.render_widget_ref(loading_line, rect);
+        frame.render_widget_ref(&loading_line, rect);
     }
     if show_more_below {
-        let label = if state.pagination.loading.is_pending() {
+        let label = if state.pagination.is_loading() {
             "↓ loading more"
         } else {
             "↓ more"
         };
         frame.render_widget_ref(
-            more_line(label),
+            &more_line(label),
             Rect::new(
                 area.x,
                 area.y.saturating_add(area.height.saturating_sub(1)),
@@ -2645,7 +2707,9 @@ fn render_dense_session_lines(
     let updated = format_relative_time(reference, row.updated_at.or(row.created_at));
     let date = match state.sort_key {
         ThreadSortKey::CreatedAt => created,
-        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => updated,
+        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt | ThreadSortKey::SectionPosition => {
+            updated
+        }
     };
     let mut lines = vec![dense_summary_line(DenseSummaryInput {
         marker,
@@ -2774,7 +2838,9 @@ fn render_footer_lines(
 ) -> Vec<Line<'static>> {
     let date = match sort_key {
         ThreadSortKey::CreatedAt => created,
-        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt => updated,
+        ThreadSortKey::UpdatedAt | ThreadSortKey::RecencyAt | ThreadSortKey::SectionPosition => {
+            updated
+        }
     };
     let mut parts = vec![FooterPart::Date(date.to_string())];
     if show_cwd {
@@ -3201,7 +3267,7 @@ fn format_timestamp(ts: DateTime<Utc>) -> String {
 fn render_empty_state_line(state: &PickerState) -> Line<'static> {
     if !state.query.is_empty() {
         if state.search_state.is_active()
-            || (state.pagination.loading.is_pending() && state.pagination.next_cursor.is_some())
+            || (state.pagination.is_loading() && state.pagination.next_cursor.is_some())
         {
             return vec!["Searching…".italic().dim()].into();
         }
@@ -3215,7 +3281,7 @@ fn render_empty_state_line(state: &PickerState) -> Line<'static> {
         return vec!["No results for your search".italic().dim()].into();
     }
 
-    if state.pagination.loading.is_pending() {
+    if state.pagination.is_loading() {
         if state.all_rows.is_empty() && state.pagination.num_scanned_files == 0 {
             return vec!["Loading sessions…".italic().dim()].into();
         }
@@ -3268,6 +3334,26 @@ mod tests {
         })
     }
 
+    async fn deliver_page(
+        state: &mut PickerState,
+        request: &PageLoadRequest,
+        page: std::io::Result<PickerPage>,
+    ) {
+        state
+            .handle_background_event(BackgroundEvent::Page {
+                request_token: request.request_token,
+                search_token: request.search_token,
+                page,
+            })
+            .await
+            .expect("page event");
+    }
+
+    fn ok_page(rows: Vec<Row>, next_cursor: Option<&str>) -> std::io::Result<PickerPage> {
+        let n = rows.len();
+        Ok(page(rows, next_cursor, n, /*reached_scan_cap*/ false))
+    }
+
     fn make_row(path: &str, ts: &str, preview: &str) -> Row {
         let timestamp = parse_timestamp_str(ts).expect("timestamp should parse");
         Row {
@@ -3280,6 +3366,24 @@ mod tests {
             cwd: None,
             git_branch: None,
         }
+    }
+
+    fn local_db_first_state() -> (PickerState, Arc<Mutex<Vec<PageLoadRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = Arc::clone(&requests);
+        let loader = page_only_loader(move |request| {
+            request_sink.lock().unwrap().push(request);
+        });
+        let mut state = PickerState::new(
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::MatchDefault(String::from("openai")),
+            /*show_all*/ true,
+            /*filter_cwd*/ None,
+            SessionPickerAction::Resume,
+        );
+        state.initial_page_mode = PageLoadMode::StateDbOnly;
+        (state, requests)
     }
 
     fn footer_lines_text(state: &PickerState, width: u16) -> String {
@@ -3344,12 +3448,165 @@ mod tests {
             ProviderFilter::MatchDefault(String::from("openai")),
             ThreadSortKey::UpdatedAt,
             /*include_non_interactive*/ false,
+            /*use_state_db_only*/ true,
         );
 
         assert_eq!(
             params.cwd,
             Some(ThreadListCwdFilter::One(String::from("/tmp/project")))
         );
+        assert!(params.use_state_db_only);
+    }
+
+    #[tokio::test]
+    async fn local_db_first_treats_empty_later_page_as_end_of_db_listing() {
+        let (mut state, requests) = local_db_first_state();
+        state.start_initial_load();
+        let db_request = requests.lock().unwrap()[0].clone();
+        deliver_page(
+            &mut state,
+            &db_request,
+            ok_page(
+                vec![make_row(
+                    "/tmp/indexed.jsonl",
+                    "2025-01-03T00:00:00Z",
+                    "indexed metadata",
+                )],
+                Some("db-cursor"),
+            ),
+        )
+        .await;
+
+        state.maybe_load_more_for_scroll();
+        let later_db_request = requests.lock().unwrap()[1].clone();
+        assert_eq!(later_db_request.mode, PageLoadMode::StateDbOnly);
+        deliver_page(
+            &mut state,
+            &later_db_request,
+            ok_page(Vec::new(), /*next_cursor*/ None),
+        )
+        .await;
+
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(state.all_rows[0].preview, "indexed metadata");
+        assert!(state.pagination.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_db_first_falls_back_when_initial_db_page_is_empty() {
+        let (mut state, requests) = local_db_first_state();
+        state.start_initial_load();
+        let db_request = requests.lock().unwrap()[0].clone();
+        deliver_page(
+            &mut state,
+            &db_request,
+            ok_page(Vec::new(), /*next_cursor*/ None),
+        )
+        .await;
+
+        let fallback_request = requests.lock().unwrap()[1].clone();
+        assert_eq!(fallback_request.mode, PageLoadMode::StoreDefault);
+        assert!(fallback_request.cursor.is_none());
+        state.relative_time_reference =
+            Some(parse_timestamp_str("2025-01-04T00:00:00Z").expect("timestamp"));
+        state.update_viewport(/*rows*/ 12, /*width*/ 80);
+        let render_state = |state: &PickerState| {
+            use crate::custom_terminal::Terminal;
+            use crate::test_backend::VT100Backend;
+
+            let backend = VT100Backend::new(/*width*/ 80, /*height*/ 12);
+            let mut terminal = Terminal::with_options(backend).expect("terminal");
+            terminal.set_viewport_area(Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 12,
+            ));
+            {
+                let mut frame = terminal.get_frame();
+                let area = frame.area();
+                render_list(&mut frame, area, state);
+            }
+            terminal.flush().expect("flush");
+            terminal.backend().to_string()
+        };
+        let loading_snapshot = render_state(&state);
+
+        deliver_page(
+            &mut state,
+            &fallback_request,
+            ok_page(
+                vec![
+                    make_row(
+                        "/tmp/first.jsonl",
+                        "2025-01-03T00:00:00Z",
+                        "first store result",
+                    ),
+                    make_row(
+                        "/tmp/repaired.jsonl",
+                        "2025-01-03T00:00:00Z",
+                        "repaired store result",
+                    ),
+                    make_row(
+                        "/tmp/third.jsonl",
+                        "2025-01-03T00:00:00Z",
+                        "third store result",
+                    ),
+                ],
+                /*next_cursor*/ None,
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .all_rows
+                .iter()
+                .map(|row| row.preview.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "first store result",
+                "repaired store result",
+                "third store result"
+            ]
+        );
+        assert_eq!(state.pagination.num_scanned_files, 3);
+        let repaired_snapshot = render_state(&state);
+        assert_snapshot!(
+            "resume_picker_db_fallback_transition",
+            format!(
+                "---- loading fallback ----\n{loading_snapshot}\n---- repaired results ----\n{repaired_snapshot}"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn local_db_first_accepts_db_thread_id_without_rollout_validation() {
+        let (mut state, requests) = local_db_first_state();
+        state.start_initial_load();
+        let db_request = requests.lock().unwrap()[0].clone();
+        let thread_id = ThreadId::new();
+        let mut row = make_row(
+            "/tmp/missing-rollout.jsonl",
+            "2025-01-01T00:00:00Z",
+            "indexed metadata",
+        );
+        row.thread_id = Some(thread_id);
+        deliver_page(
+            &mut state,
+            &db_request,
+            ok_page(vec![row], /*next_cursor*/ None),
+        )
+        .await;
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .expect("enter should not abort the picker");
+        assert!(matches!(
+            selection,
+            Some(SessionSelection::Resume(SessionTarget {
+                thread_id: selected_thread_id,
+                ..
+            })) if selected_thread_id == thread_id
+        ));
     }
 
     #[test]
@@ -3569,6 +3826,7 @@ mod tests {
             ProviderFilter::Any,
             ThreadSortKey::UpdatedAt,
             /*include_non_interactive*/ false,
+            /*use_state_db_only*/ false,
         );
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
@@ -3591,6 +3849,7 @@ mod tests {
             ProviderFilter::Any,
             ThreadSortKey::UpdatedAt,
             /*include_non_interactive*/ true,
+            /*use_state_db_only*/ false,
         );
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
@@ -3624,6 +3883,7 @@ mod tests {
             let guard = recorded_requests.lock().unwrap();
             assert_eq!(guard.len(), 1);
             assert_eq!(guard[0].cwd_filter, remote_cwd);
+            assert_eq!(guard[0].mode, PageLoadMode::StoreDefault);
         }
 
         let row = Row {
@@ -3764,7 +4024,7 @@ mod tests {
         {
             let mut frame = terminal.get_frame();
             let line = search_line(&state, frame.area().width);
-            frame.render_widget_ref(line, frame.area());
+            frame.render_widget_ref(&line, frame.area());
         }
         terminal.flush().expect("flush");
 
@@ -3832,6 +4092,16 @@ mod tests {
         assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+o dense view"));
         assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+t transcript"));
         assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+e expand"));
+        state.list_keymap.move_left = vec![crate::key_hint::ctrl(KeyCode::Char('h'))];
+        state.list_keymap.move_right = vec![crate::key_hint::ctrl(KeyCode::Char('l'))];
+        let remapped_footer = footer_lines_text(&state, /*width*/ 220);
+        assert!(
+            remapped_footer.contains("ctrl + h/ctrl + l change option"),
+            "{remapped_footer}"
+        );
+        state.list_keymap.move_left.clear();
+        state.list_keymap.move_right.clear();
+        assert!(!footer_lines_text(&state, /*width*/ 220).contains("change option"));
 
         state.density = SessionListDensity::Dense;
 
@@ -4057,10 +4327,11 @@ mod tests {
         state.selected = 9;
         state.scroll_top = 9;
         state.pagination.next_cursor = Some(PageCursor::AppServer(String::from("cursor-1")));
-        state.pagination.loading = LoadingState::Pending(PendingLoad {
-            request_token: 1,
-            search_token: None,
-        });
+        state.pagination.start_load(
+            /*request_token*/ 1,
+            /*search_token*/ None,
+            PageLoadMode::StoreDefault,
+        );
         state.frozen_footer_percent = Some(37);
 
         let label = picker_footer_progress_label(&state, /*list_height*/ 6, /*width*/ 80);
@@ -4663,7 +4934,7 @@ session_picker_view = "dense"
         {
             let mut frame = terminal.get_frame();
             let line = search_line(&state, frame.area().width);
-            frame.render_widget_ref(line, frame.area());
+            frame.render_widget_ref(&line, frame.area());
         }
         terminal.flush().expect("flush");
 
@@ -5661,7 +5932,7 @@ session_picker_view = "dense"
             .unwrap();
 
         assert_eq!(state.selected, 9);
-        assert!(state.pagination.loading.is_pending());
+        assert!(state.pagination.is_loading());
         assert_eq!(recorded_requests.lock().unwrap().len(), 1);
         assert_eq!(
             picker_footer_progress_label(&state, /*list_height*/ 5, /*width*/ 80),
@@ -5758,7 +6029,8 @@ session_picker_view = "dense"
             parent_thread_id: None,
             preview: String::from("remote thread"),
             ephemeral: false,
-            is_pinned: false,
+            section: None,
+            section_entered_at: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             created_at: 1,
@@ -5798,7 +6070,8 @@ session_picker_view = "dense"
             parent_thread_id: None,
             preview: String::from("preview"),
             ephemeral: false,
-            is_pinned: false,
+            section: None,
+            section_entered_at: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             created_at: 1,
@@ -5876,7 +6149,8 @@ session_picker_view = "dense"
             parent_thread_id: None,
             preview: String::from("preview"),
             ephemeral: false,
-            is_pinned: false,
+            section: None,
+            section_entered_at: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             created_at: 1,
@@ -5947,7 +6221,8 @@ session_picker_view = "dense"
             parent_thread_id: None,
             preview: String::from("preview"),
             ephemeral: false,
-            is_pinned: false,
+            section: None,
+            section_entered_at: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             created_at: 1,

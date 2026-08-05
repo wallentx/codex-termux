@@ -1,7 +1,6 @@
-use codex_core_skills::HostSkillsSnapshot;
-use codex_core_skills::build_available_skills;
-use codex_core_skills::render::SkillRenderSideEffects;
-use codex_extension_api::ContextualUserFragment;
+use std::sync::Arc;
+
+use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
 use codex_extension_api::WorldStateSectionContribution;
@@ -9,8 +8,8 @@ use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use serde_json::json;
 
-use crate::fragments::AvailableSkillsInstructions;
-use crate::render::SkillMetadataBudget;
+use crate::render_observability::CatalogSurface;
+use crate::render_observability::record_catalog_metrics;
 
 pub(crate) const SKILLS_WORLD_STATE_ID: &str = "skills";
 pub(crate) const HOST_SKILLS_WORLD_STATE_ID: &str = "host_skills";
@@ -20,6 +19,9 @@ const HIDDEN_EXECUTOR_SKILLS_BODY: &str = "\n## Skills update\nSelected-environm
 const NO_HOST_SKILLS_BODY: &str =
     "\n## Host skills update\nNo host skills are currently available.\n";
 const HIDDEN_HOST_SKILLS_BODY: &str = "\n## Host skills update\nHost skills are not listed automatically. Explicit skill mentions can still be resolved when available.\n";
+const OMITTED_HOST_SKILLS_BODY: &str = "\n## Host skills update\nHost skills are available but omitted from the model-visible skills list because the skills context budget was exceeded.\n";
+
+pub(crate) type HostSkillsWarningEmitter = Arc<dyn Fn(String) + Send + Sync>;
 
 pub(crate) fn executor_skills_world_state_section(
     body: Option<String>,
@@ -74,29 +76,19 @@ pub(crate) fn executor_skills_world_state_section(
 }
 
 pub(crate) fn host_skills_world_state_section(
-    host_snapshot: &HostSkillsSnapshot,
+    body: Option<String>,
     include_instructions: bool,
-    include_skills_usage_instructions: bool,
-    metadata_budget: SkillMetadataBudget,
+    render_metrics: Option<(usize, usize, usize, usize)>,
+    extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
+    warning_message: Option<String>,
+    warning_emitter: HostSkillsWarningEmitter,
 ) -> WorldStateSectionContribution {
-    let outcome = host_snapshot.outcome();
-    let metadata_budget = match metadata_budget {
-        SkillMetadataBudget::Tokens(limit) => codex_core_skills::SkillMetadataBudget::Tokens(limit),
-        SkillMetadataBudget::Characters(limit) => {
-            codex_core_skills::SkillMetadataBudget::Characters(limit)
-        }
-    };
-    let available = if include_instructions {
-        build_available_skills(outcome, metadata_budget, SkillRenderSideEffects::None)
-    } else {
-        None
-    };
-    let body = available.map(|available| {
-        AvailableSkillsInstructions::from_available_skills(
-            available,
-            include_skills_usage_instructions,
-        )
-        .body()
+    let body = body.or_else(|| {
+        render_metrics
+            .is_some_and(|(total_count, included_count, omitted_count, _)| {
+                total_count > 0 && included_count == 0 && omitted_count > 0
+            })
+            .then(|| OMITTED_HOST_SKILLS_BODY.to_string())
     });
     let snapshot = json!({
         "body": body,
@@ -121,12 +113,27 @@ pub(crate) fn host_skills_world_state_section(
                 }
             }
 
+            if let Some((total_count, included_count, omitted_count, truncated_description_chars)) =
+                render_metrics
+            {
+                record_catalog_metrics(
+                    extension_metrics.as_deref(),
+                    CatalogSurface::HostWorldState,
+                    total_count,
+                    included_count,
+                    omitted_count,
+                    truncated_description_chars,
+                );
+            }
             let body = match body.as_deref() {
                 Some(body) => body,
                 None if previous_is_absent => return None,
                 None if !include_instructions => HIDDEN_HOST_SKILLS_BODY,
                 None => NO_HOST_SKILLS_BODY,
             };
+            if let Some(message) = warning_message.as_ref() {
+                warning_emitter(message.clone());
+            }
             Some(RenderedWorldStateFragment::new(
                 "developer",
                 (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG),

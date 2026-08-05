@@ -7,11 +7,12 @@ use codex_tools::ToolExposure;
 use codex_tools::ToolName;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
-use rmcp::model::Meta;
+use rmcp::model::MetaObject;
 use rmcp::model::Tool;
 
 use super::*;
 use crate::config::CONFIG_TOML_FILE;
+use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::config::test_config;
 use crate::connectors::AppInfo;
@@ -90,15 +91,28 @@ fn expected_runtimes(
         .collect()
 }
 
-fn runtimes_by_name(runtimes: &[Arc<dyn CoreToolRuntime>]) -> HashMap<ToolName, ToolExposure> {
-    runtimes
-        .iter()
-        .map(|runtime| (runtime.tool_name(), runtime.exposure()))
+fn runtimes_by_name(
+    tools: &[ToolInfo],
+    connectors: Option<&[AppInfo]>,
+    config: &Config,
+    search_tool_enabled: bool,
+) -> HashMap<ToolName, ToolExposure> {
+    let mut registry = ToolRegistry::default();
+    append_mcp_tools(
+        tools,
+        connectors,
+        config,
+        search_tool_enabled,
+        &mut registry,
+    );
+    registry
+        .entries()
+        .map(|tool| (tool.runtime.tool_name(), tool.exposure))
         .collect()
 }
 
 fn with_visibility(mut tool: ToolInfo, visibility: &[&str]) -> ToolInfo {
-    tool.tool.meta = Some(Meta(
+    tool.tool.meta = Some(MetaObject(
         serde_json::json!({ "ui": { "visibility": visibility } })
             .as_object()
             .expect("metadata object")
@@ -112,12 +126,12 @@ async fn directly_exposes_effective_tool_sets_when_search_is_unavailable() {
     let config = test_config().await;
     let mcp_tools = numbered_mcp_tools(/*count*/ 2);
 
-    let runtimes = build_mcp_tool_runtimes(
+    let runtimes = runtimes_by_name(
         &mcp_tools, /*connectors*/ None, &config, /*search_tool_enabled*/ false,
     );
 
     assert_eq!(
-        runtimes_by_name(&runtimes),
+        runtimes,
         expected_runtimes(&mcp_tools, ToolExposure::Direct)
     );
 }
@@ -186,7 +200,7 @@ async fn excludes_tools_hidden_from_model_exposure() {
     ];
     let connectors = vec![make_connector("calendar", "Calendar")];
 
-    let runtimes = build_mcp_tool_runtimes(
+    let runtimes = runtimes_by_name(
         &mcp_tools,
         Some(connectors.as_slice()),
         &config,
@@ -194,7 +208,7 @@ async fn excludes_tools_hidden_from_model_exposure() {
     );
 
     assert_eq!(
-        runtimes_by_name(&runtimes),
+        runtimes,
         expected_runtimes(&[visible_tool, visible_app_tool], ToolExposure::Direct)
     );
 }
@@ -236,15 +250,16 @@ enabled = true
     );
     let connectors = vec![make_connector("calendar", "Calendar")];
 
-    let runtimes = build_mcp_tool_runtimes(
-        &[enabled_tool.clone(), disabled_tool],
+    let mcp_tools = [enabled_tool.clone(), disabled_tool];
+    let runtimes = runtimes_by_name(
+        &mcp_tools,
         Some(connectors.as_slice()),
         &config,
         /*search_tool_enabled*/ false,
     );
 
     assert_eq!(
-        runtimes_by_name(&runtimes),
+        runtimes,
         expected_runtimes(&[enabled_tool], ToolExposure::Direct)
     );
 }
@@ -254,12 +269,12 @@ async fn defers_effective_tool_sets_when_search_is_available() {
     let config = test_config().await;
     let mcp_tools = numbered_mcp_tools(/*count*/ 2);
 
-    let runtimes = build_mcp_tool_runtimes(
+    let runtimes = runtimes_by_name(
         &mcp_tools, /*connectors*/ None, &config, /*search_tool_enabled*/ true,
     );
 
     assert_eq!(
-        runtimes_by_name(&runtimes),
+        runtimes,
         expected_runtimes(&mcp_tools, ToolExposure::Deferred)
     );
 }
@@ -287,7 +302,7 @@ async fn defers_apps_and_non_app_mcp_tools() {
     ];
     let connectors = vec![make_connector("calendar", "Calendar")];
 
-    let runtimes = build_mcp_tool_runtimes(
+    let runtimes = runtimes_by_name(
         &mcp_tools,
         Some(connectors.as_slice()),
         &config,
@@ -295,7 +310,7 @@ async fn defers_apps_and_non_app_mcp_tools() {
     );
 
     assert_eq!(
-        runtimes_by_name(&runtimes),
+        runtimes,
         expected_runtimes(&mcp_tools, ToolExposure::Deferred)
     );
 }

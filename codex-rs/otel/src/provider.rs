@@ -39,6 +39,8 @@ use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProces
 use opentelemetry_semantic_conventions as semconv;
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::debug;
 use tracing_subscriber::Layer;
@@ -58,12 +60,17 @@ pub struct OtelProvider {
     pub tracer_provider: Option<SdkTracerProvider>,
     pub tracer: Option<Tracer>,
     pub metrics: Option<MetricsClient>,
+    shutdown_started: AtomicBool,
 }
 
 impl OtelProvider {
+    /// Flushes and shuts down configured exporters at most once.
     pub fn shutdown(&self) {
+        if self.shutdown_started.swap(/*val*/ true, Ordering::AcqRel) {
+            return;
+        }
+
         if let Some(tracer_provider) = &self.tracer_provider {
-            let _ = tracer_provider.force_flush();
             let _ = tracer_provider.shutdown();
         }
         if let Some(metrics) = &self.metrics {
@@ -104,7 +111,7 @@ impl OtelProvider {
                 settings.environment.clone(),
                 settings.service_name.clone(),
                 settings.service_version.clone(),
-                metric_exporter,
+                settings.metrics_exporter.clone(),
             );
             if settings.runtime_metrics {
                 config = config.with_runtime_reader();
@@ -150,6 +157,7 @@ impl OtelProvider {
             tracer_provider,
             tracer,
             metrics,
+            shutdown_started: AtomicBool::default(),
         }))
     }
 
@@ -196,16 +204,7 @@ impl OtelProvider {
 
 impl Drop for OtelProvider {
     fn drop(&mut self) {
-        if let Some(tracer_provider) = &self.tracer_provider {
-            let _ = tracer_provider.force_flush();
-            let _ = tracer_provider.shutdown();
-        }
-        if let Some(metrics) = &self.metrics {
-            let _ = metrics.shutdown();
-        }
-        if let Some(logger) = &self.logger {
-            let _ = logger.shutdown();
-        }
+        self.shutdown();
     }
 }
 
@@ -457,8 +456,16 @@ fn build_tracer_provider(
 }
 
 #[cfg(test)]
+#[path = "provider_shutdown_tests.rs"]
+mod shutdown_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::MetricsExporter;
+    use crate::metrics::TOOL_CALL_COUNT_METRIC;
+    use crate::metrics::TOOL_CALL_DURATION_METRIC;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -523,6 +530,37 @@ mod tests {
         assert!(is_trace_safe_target("codex_otel.trace_safe.summary"));
         assert!(!is_trace_safe_target("codex_otel.log_only"));
         assert!(!is_trace_safe_target("codex_otel.network_proxy"));
+    }
+
+    #[test]
+    fn statsig_runtime_only_metrics_are_not_exported() -> Result<(), Box<dyn Error>> {
+        let exporter = InMemoryMetricExporter::default();
+        let mut config = MetricsConfig::otlp(
+            "test",
+            "codex-cli",
+            env!("CARGO_PKG_VERSION"),
+            OtelExporter::Statsig,
+        );
+        config.exporter = MetricsExporter::InMemory(exporter.clone());
+        let metrics = MetricsClient::new(config)?;
+
+        metrics.counter(TOOL_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
+        metrics.record_duration(TOOL_CALL_DURATION_METRIC, Duration::from_millis(25), &[])?;
+        metrics.counter("codex.turns", /*inc*/ 1, &[])?;
+        metrics.shutdown()?;
+
+        let exported_metrics = exporter.get_finished_metrics()?;
+        let mut names: Vec<_> = exported_metrics
+            .iter()
+            .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .map(opentelemetry_sdk::metrics::data::Metric::name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names, vec!["codex.turns"]);
+
+        Ok(())
     }
 
     fn test_otel_settings() -> OtelSettings {

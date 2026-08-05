@@ -1,10 +1,12 @@
 pub mod catalog;
+mod catalog_prompt;
 mod config;
 mod dynamic_skill_selector;
 mod extension;
 mod fragments;
 pub mod provider;
 mod render;
+mod render_observability;
 mod selection;
 mod shadow_selection_experiment;
 mod sources;

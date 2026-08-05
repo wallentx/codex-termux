@@ -177,8 +177,8 @@ pub async fn update_current_exe(current_version: &str) -> Result<UpdateOutcome> 
         .await
         .context("failed to create update extraction directory")?;
     extract_archive(&archive_path, &extract_dir).await?;
-    let extracted_codex = find_extracted_codex(&extract_dir)?;
-    let executable = replace_current_exe(&extracted_codex)?;
+    let (extracted_codex, extracted_code_mode_host) = find_extracted_binaries(&extract_dir)?;
+    let executable = replace_install_binaries(&extracted_codex, &extracted_code_mode_host)?;
 
     Ok(UpdateOutcome {
         previous_version: current.to_string(),
@@ -280,9 +280,11 @@ async fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> 
     Ok(())
 }
 
-fn find_extracted_codex(root: &Path) -> Result<PathBuf> {
+fn find_extracted_binaries(root: &Path) -> Result<(PathBuf, PathBuf)> {
     let target_asset_stem = termux_asset_stem();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut codex = None;
+    let mut code_mode_host = None;
 
     while let Some((dir, depth)) = stack.pop() {
         for entry in fs::read_dir(&dir)
@@ -293,10 +295,15 @@ fn find_extracted_codex(root: &Path) -> Result<PathBuf> {
             let file_type = entry.file_type()?;
             if file_type.is_file() {
                 let name = entry.file_name();
-                if let Some(name) = name.to_str()
-                    && (name == "codex" || name == target_asset_stem)
-                {
-                    return Ok(path);
+                if let Some(name) = name.to_str() {
+                    if name == "codex-code-mode-host" {
+                        code_mode_host = Some(path);
+                    } else if name == "codex" || name == target_asset_stem {
+                        codex = Some(path);
+                    }
+                    if let (Some(codex), Some(code_mode_host)) = (&codex, &code_mode_host) {
+                        return Ok((codex.clone(), code_mode_host.clone()));
+                    }
                 }
             } else if file_type.is_dir() && depth < 4 {
                 stack.push((path, depth + 1));
@@ -304,14 +311,28 @@ fn find_extracted_codex(root: &Path) -> Result<PathBuf> {
         }
     }
 
-    bail!("could not find a codex executable in the downloaded update archive")
+    match (codex, code_mode_host) {
+        (None, None) => bail!(
+            "could not find codex or codex-code-mode-host executables in the downloaded update archive"
+        ),
+        (None, Some(_)) => {
+            bail!("could not find a codex executable in the downloaded update archive")
+        }
+        (Some(_), None) => bail!(
+            "could not find a codex-code-mode-host executable in the downloaded update archive"
+        ),
+        (Some(codex), Some(code_mode_host)) => Ok((codex, code_mode_host)),
+    }
 }
 
 fn termux_asset_stem() -> String {
     format!("codex-{}-linux-android", termux_arch())
 }
 
-fn replace_current_exe(extracted_codex: &Path) -> Result<PathBuf> {
+fn replace_install_binaries(
+    extracted_codex: &Path,
+    extracted_code_mode_host: &Path,
+) -> Result<PathBuf> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let install_dir = current_exe
         .parent()
@@ -321,6 +342,8 @@ fn replace_current_exe(extracted_codex: &Path) -> Result<PathBuf> {
         .tempdir_in(install_dir)
         .with_context(|| format!("failed to create temp file in {}", install_dir.display()))?;
     let staged_exe = temp_dir.path().join("codex.new");
+    let staged_code_mode_host = temp_dir.path().join("codex-code-mode-host.new");
+    let code_mode_host = install_dir.join("codex-code-mode-host");
 
     fs::copy(extracted_codex, &staged_exe).with_context(|| {
         format!(
@@ -333,6 +356,23 @@ fn replace_current_exe(extracted_codex: &Path) -> Result<PathBuf> {
         .permissions();
     fs::set_permissions(&staged_exe, current_permissions)
         .with_context(|| format!("failed to set permissions on {}", staged_exe.display()))?;
+    fs::copy(extracted_code_mode_host, &staged_code_mode_host).with_context(|| {
+        format!(
+            "failed to stage downloaded codex-code-mode-host binary from {}",
+            extracted_code_mode_host.display()
+        )
+    })?;
+    let host_permissions = fs::metadata(&staged_exe)
+        .with_context(|| format!("failed to read metadata for {}", staged_exe.display()))?
+        .permissions();
+    fs::set_permissions(&staged_code_mode_host, host_permissions).with_context(|| {
+        format!(
+            "failed to set permissions on {}",
+            staged_code_mode_host.display()
+        )
+    })?;
+    fs::rename(&staged_code_mode_host, &code_mode_host)
+        .with_context(|| format!("failed to replace {}", code_mode_host.display()))?;
     fs::rename(&staged_exe, &current_exe)
         .with_context(|| format!("failed to replace {}", current_exe.display()))?;
 
@@ -436,5 +476,36 @@ mod tests {
             select_newer_candidate(&releases, &current, "codex-aarch64-linux-android.tar.gz")
                 .unwrap();
         assert_eq!(candidate.tag_name, "rust-v0.141.0-alpha.7-termux");
+    }
+
+    #[test]
+    fn finds_bundled_termux_binaries() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let nested = root.path().join("bundle");
+        fs::create_dir(&nested)?;
+        let codex = nested.join("codex");
+        let code_mode_host = nested.join("codex-code-mode-host");
+        fs::write(&codex, "codex")?;
+        fs::write(&code_mode_host, "host")?;
+
+        assert_eq!(
+            find_extracted_binaries(root.path())?,
+            (codex, code_mode_host)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_update_archive_without_code_mode_host() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("codex"), "codex")?;
+
+        assert_eq!(
+            find_extracted_binaries(root.path())
+                .expect_err("host should be required")
+                .to_string(),
+            "could not find a codex-code-mode-host executable in the downloaded update archive"
+        );
+        Ok(())
     }
 }

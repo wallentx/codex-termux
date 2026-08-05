@@ -110,9 +110,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         .expect("current dir")
         .try_into()
         .expect("absolute path");
-    let file_system_sandbox_policy =
-        codex_protocol::permissions::FileSystemSandboxPolicy::unrestricted();
-    let network_sandbox_policy = codex_protocol::permissions::NetworkSandboxPolicy::Restricted;
     let permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     let managed_network = ManagedNetworkSandboxContext {
         loopback_ports: vec![43123],
@@ -167,8 +164,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
         permission_profile: permission_profile.clone(),
-        file_system_sandbox_policy,
-        network_sandbox_policy,
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
         exec_server_sandbox: None,
@@ -229,6 +224,14 @@ fn initial_exec_yield_time_uses_windows_floor() {
 
     assert_eq!(
         clamp_yield_time(/*yield_time_ms*/ 1_000),
+        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+    );
+    assert_eq!(
+        clamp_yield_time(/*yield_time_ms*/ 2_000),
+        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+    );
+    assert_eq!(
+        clamp_yield_time(/*yield_time_ms*/ 5_000),
         crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
     );
     assert_eq!(clamp_yield_time(/*yield_time_ms*/ 10_000), 10_000);
@@ -509,6 +512,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
             /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
         )
         .await,
     );
@@ -520,6 +524,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
             /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
         )
         .await,
     );

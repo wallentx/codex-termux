@@ -12,15 +12,15 @@ use codex_login::CodexAuth;
 use codex_rmcp_client::McpAuthState;
 use codex_rmcp_client::OAuthDiscoveryTimeout;
 use codex_rmcp_client::OAuthProviderError;
-use codex_rmcp_client::determine_streamable_http_auth_status_with_http_client;
+use codex_rmcp_client::determine_streamable_http_auth_status;
 use codex_rmcp_client::discover_streamable_http_oauth;
-use codex_rmcp_client::discover_streamable_http_oauth_with_http_client;
 use futures::FutureExt;
 use futures::future::join_all;
 use tracing::warn;
 
 use crate::runtime::McpRuntimeContext;
 use crate::server::EffectiveMcpServer;
+use crate::server::has_explicit_http_authorization;
 
 #[derive(Debug, Clone)]
 pub struct McpOAuthLoginConfig {
@@ -57,27 +57,7 @@ pub struct McpAuthStatusEntry {
     pub auth_state: McpAuthState,
 }
 
-pub async fn oauth_login_support(transport: &McpServerTransportConfig) -> McpOAuthLoginSupport {
-    let Some(mut config) = oauth_login_candidate(transport) else {
-        return McpOAuthLoginSupport::Unsupported;
-    };
-    match discover_streamable_http_oauth(
-        &config.url,
-        config.http_headers.clone(),
-        config.env_http_headers.clone(),
-    )
-    .await
-    {
-        Ok(Some(discovery)) => {
-            config.discovered_scopes = discovery.scopes_supported;
-            McpOAuthLoginSupport::Supported(config)
-        }
-        Ok(None) => McpOAuthLoginSupport::Unsupported,
-        Err(err) => McpOAuthLoginSupport::Unknown(err),
-    }
-}
-
-pub async fn oauth_login_support_with_http_client(
+pub async fn oauth_login_support(
     transport: &McpServerTransportConfig,
     http_client: Arc<dyn HttpClient>,
     discovery_timeout: OAuthDiscoveryTimeout,
@@ -85,7 +65,7 @@ pub async fn oauth_login_support_with_http_client(
     let Some(mut config) = oauth_login_candidate(transport) else {
         return McpOAuthLoginSupport::Unsupported;
     };
-    match discover_streamable_http_oauth_with_http_client(
+    match discover_streamable_http_oauth(
         &config.url,
         config.http_headers.clone(),
         config.env_http_headers.clone(),
@@ -126,19 +106,10 @@ fn oauth_login_candidate(transport: &McpServerTransportConfig) -> Option<McpOAut
 
 pub async fn discover_supported_scopes(
     transport: &McpServerTransportConfig,
-) -> Option<Vec<String>> {
-    match oauth_login_support(transport).await {
-        McpOAuthLoginSupport::Supported(config) => config.discovered_scopes,
-        McpOAuthLoginSupport::Unsupported | McpOAuthLoginSupport::Unknown(_) => None,
-    }
-}
-
-pub async fn discover_supported_scopes_with_http_client(
-    transport: &McpServerTransportConfig,
     http_client: Arc<dyn HttpClient>,
     discovery_timeout: OAuthDiscoveryTimeout,
 ) -> Option<Vec<String>> {
-    match oauth_login_support_with_http_client(transport, http_client, discovery_timeout).await {
+    match oauth_login_support(transport, http_client, discovery_timeout).await {
         McpOAuthLoginSupport::Supported(config) => config.discovered_scopes,
         McpOAuthLoginSupport::Unsupported | McpOAuthLoginSupport::Unknown(_) => None,
     }
@@ -220,7 +191,7 @@ where
                 Ok(status) => status,
                 Err(error) => {
                     warn!("failed to determine auth status for MCP server `{name}`: {error:?}");
-                    McpAuthState::Unsupported
+                    McpAuthState::Unknown
                 }
             };
             let entry = McpAuthStatusEntry {
@@ -246,6 +217,14 @@ async fn compute_auth_status(
         return Ok(McpAuthState::Unsupported);
     }
 
+    if matches!(config.auth, McpServerAuth::ChatGpt) && !config.is_local_environment() {
+        return Ok(if has_explicit_http_authorization(config) {
+            McpAuthState::BearerToken
+        } else {
+            McpAuthState::Unsupported
+        });
+    }
+
     if has_runtime_auth {
         return Ok(McpAuthState::BearerToken);
     }
@@ -266,8 +245,9 @@ async fn compute_auth_status(
             } else {
                 OAuthDiscoveryTimeout::Requested
             };
-            determine_streamable_http_auth_status_with_http_client(
-                server_name,
+            let oauth_credential_name = config.oauth_credential_name(server_name);
+            determine_streamable_http_auth_status(
+                oauth_credential_name.as_ref(),
                 url,
                 bearer_token_env_var.as_deref(),
                 http_headers.clone(),

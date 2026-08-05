@@ -135,6 +135,7 @@ fn token_usage_delta(start: &TokenUsage, end: &TokenUsage) -> TokenUsage {
         reasoning_output_tokens: (end.reasoning_output_tokens - start.reasoning_output_tokens)
             .max(0),
         total_tokens: (end.total_tokens - start.total_tokens).max(0),
+        codex_rollout_budget_units: None,
     }
 }
 
@@ -806,10 +807,8 @@ async fn run_review_on_session(
         .and_then(|environment| environment.cwd().to_abs_path().ok())
         .unwrap_or_else(|| params.parent_turn.config.cwd.clone());
 
-    let submit_result = run_before_review_deadline(
-        deadline,
-        params.external_cancel.as_ref(),
-        Box::pin(review_session.io.submit(Op::UserInput {
+    let submission = review_session.io.submit_with_trace(
+        Op::UserInput {
             items: prompt_items.items,
             final_output_json_schema: Some(params.schema.clone()),
             responsesapi_client_metadata: None,
@@ -834,7 +833,14 @@ async fn run_review_on_session(
                 }),
                 ..Default::default()
             },
-        })),
+        },
+        /*trace*/ None,
+        Some(params.parent_turn.sub_id.clone()),
+    );
+    let submit_result = run_before_review_deadline(
+        deadline,
+        params.external_cancel.as_ref(),
+        Box::pin(submission),
     )
     .await;
     let child_turn_id = match submit_result {
@@ -1448,11 +1454,13 @@ mod tests {
             instructions_template: None,
             instructions_variables: None,
             approvals: None,
+            collaboration_modes: None,
             auto_review: Some(AutoReviewMessages {
                 policy: Some("Use the catalog Guardian policy.".to_string()),
                 policy_template: Some(catalog_template.to_string()),
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(
@@ -1480,11 +1488,13 @@ mod tests {
             instructions_template: None,
             instructions_variables: None,
             approvals: None,
+            collaboration_modes: None,
             auto_review: Some(AutoReviewMessages {
                 policy: Some(String::new()),
                 policy_template: None,
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(
@@ -1520,11 +1530,13 @@ mod tests {
             instructions_template: None,
             instructions_variables: None,
             approvals: None,
+            collaboration_modes: None,
             auto_review: Some(AutoReviewMessages {
                 policy: Some(catalog_policy.to_string()),
                 policy_template: Some(String::new()),
             }),
             permissions: None,
+            token_budget: None,
         };
 
         let guardian_config = build_guardian_review_session_config(
@@ -1673,6 +1685,7 @@ mod tests {
             output_tokens: 6,
             reasoning_output_tokens: 4,
             total_tokens: 28,
+            codex_rollout_budget_units: None,
         };
         let end = TokenUsage {
             input_tokens: 15,
@@ -1681,6 +1694,7 @@ mod tests {
             output_tokens: 10,
             reasoning_output_tokens: 2,
             total_tokens: 34,
+            codex_rollout_budget_units: None,
         };
 
         assert_eq!(
@@ -1692,6 +1706,7 @@ mod tests {
                 output_tokens: 4,
                 reasoning_output_tokens: 0,
                 total_tokens: 6,
+                codex_rollout_budget_units: None,
             }
         );
     }
