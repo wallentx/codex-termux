@@ -138,6 +138,22 @@ jobs:
           exit 1
         fi
 
+        code_mode_host=""
+        for candidate in \
+          codex-smoke/codex-code-mode-host \
+          codex-smoke/bin/codex-code-mode-host
+        do
+          if [[ -x "$candidate" ]]; then
+            code_mode_host="$candidate"
+            break
+          fi
+        done
+
+        if [[ -z "$code_mode_host" ]]; then
+          echo "Could not find executable codex-code-mode-host in $archive." >&2
+          exit 1
+        fi
+
         export CODEX_HOME="$PWD/codex-home"
         export RUST_BACKTRACE=1
         mkdir -p "$CODEX_HOME"
@@ -149,3 +165,5 @@ jobs:
         "$codex" exec --help | tee codex-exec-help.txt
         grep -Eiq 'exec' codex-exec-help.txt
         grep -Eiq 'usage' codex-exec-help.txt
+        "$code_mode_host" --help | tee codex-code-mode-host-help.txt
+        grep -Eiq 'usage' codex-code-mode-host-help.txt
