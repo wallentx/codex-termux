@@ -60,7 +60,6 @@ readonly -a TERMUX_RELEASE_AUTOMATION_PATHS=(
 
 readonly -a TERMUX_CHECKPOINT_RELEASE_ONLY_PATHS=(
   "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
-  "${TERMUX_RELEASE_CODE_PATHS[@]}"
   .github/termux-release.json
 )
 
