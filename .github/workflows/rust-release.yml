@@ -594,7 +594,7 @@ jobs:
             export CARGO_BUILD_JOBS=4
             export CARGO_PROFILE_RELEASE_LTO=thin
             export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
-            cargo build --target ${{ matrix.target }} --release --bin codex
+            cargo build --target ${{ matrix.target }} --release --bin codex --bin codex-code-mode-host
             exit 0
           fi
 
@@ -613,7 +613,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for binary in codex codex-responses-api-proxy; do
+          for binary in codex codex-code-mode-host codex-responses-api-proxy; do
             binary_path="target/${{ matrix.target }}/release/${binary}"
             if [[ -f "${binary_path}" ]]; then
               termux-elf-cleaner --api-level 24 "${binary_path}"
@@ -731,6 +731,7 @@ jobs:
             # For Android, we want the binary to be named just 'codex' in the archive.
             if [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
               cp target/${{ matrix.target }}/release/codex "$dest/codex"
+              cp target/${{ matrix.target }}/release/codex-code-mode-host "$dest/codex-code-mode-host"
             else
               cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
             fi
@@ -798,7 +799,16 @@ jobs:
             if [[ "${{ matrix.target }}" == "aarch64-linux-android" && "${base}" == "codex" ]]; then
               archive_name="codex-${{ matrix.target }}"
             fi
-            tar -C "$dest" -czf "$dest/${archive_name}.tar.gz" "$base"
+            if [[ "${{ matrix.target }}" == "aarch64-linux-android" && "${base}" == "codex" ]]; then
+              code_mode_host="codex-code-mode-host"
+              if [[ ! -x "$dest/$code_mode_host" ]]; then
+                echo "missing executable $dest/$code_mode_host" >&2
+                exit 1
+              fi
+              tar -C "$dest" -czf "$dest/${archive_name}.tar.gz" "$base" "$code_mode_host"
+            else
+              tar -C "$dest" -czf "$dest/${archive_name}.tar.gz" "$base"
+            fi
 
             # Create zip archive for Windows binaries
             # Must run from inside the dest dir so 7z won't
