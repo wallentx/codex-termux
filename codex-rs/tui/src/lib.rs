@@ -412,10 +412,6 @@ async fn connect_remote_app_server(
 #[cfg(unix)]
 async fn maybe_probe_default_daemon_socket(codex_home: &Path) -> Option<AbsolutePathBuf> {
     let socket_path = codex_app_server_client::app_server_control_socket_path(codex_home).ok()?;
-    if !socket_path.as_path().try_exists().unwrap_or(false) {
-        return None;
-    }
-
     match tokio::time::timeout(
         AUTO_CONNECT_DAEMON_CONNECT_TIMEOUT,
         tokio::net::UnixStream::connect(socket_path.as_path()),
@@ -626,6 +622,7 @@ async fn lookup_session_target_by_name_with_app_server(
                 model_providers: None,
                 source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
                 archived: Some(false),
+                section_id: None,
                 parent_thread_id: None,
                 ancestor_thread_id: None,
                 cwd: None,
@@ -740,6 +737,7 @@ fn latest_session_lookup_params(
         },
         source_kinds: Some(resume_source_kinds(include_non_interactive)),
         archived: Some(false),
+        section_id: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().to_string())),
@@ -864,6 +862,9 @@ pub async fn run_main(
             cli.approval_policy.map(Into::into),
         )
     };
+
+    cli.shared
+        .take_auto_review_config_overrides(&mut cli.config_overrides);
 
     // Map the legacy --search flag to the canonical web_search mode.
     if cli.web_search {
@@ -1286,7 +1287,7 @@ async fn run_ratatui_app(
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
     color_eyre::install()?;
 
-    tooltips::announcement::prewarm();
+    tooltips::announcement::prewarm(initial_config.http_client_factory());
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.
