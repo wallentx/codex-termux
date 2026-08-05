@@ -218,11 +218,16 @@ if ! git merge --no-ff --no-edit "${source_sha}"; then
     conflict_summary="$(
       printf '%s\n' "${remaining_conflicts[@]}" | awk '{ print "- `" $0 "`" }'
     )"
-    echo "Automatic checkpoint merge failed; creating a manual-resolution PR instead." >&2
-    if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-      git merge --abort
-    fi
-    git checkout -B "${checkpoint_branch}" "${source_sha}"
+    echo "Automatic checkpoint merge needs manual resolution; keeping destination versions for conflicted paths." >&2
+    for remaining_conflict in "${remaining_conflicts[@]}"; do
+      if git cat-file -e "HEAD:${remaining_conflict}" 2>/dev/null; then
+        git checkout --ours -- "${remaining_conflict}"
+        git add "${remaining_conflict}"
+      else
+        git rm -f --ignore-unmatch "${remaining_conflict}"
+      fi
+    done
+    git commit --no-edit
   fi
 fi
 
@@ -287,7 +292,9 @@ body_path="${RUNNER_TEMP}/termux-checkpoint-pr.md"
     echo
     echo "## Merge conflicts"
     echo
-    echo "GitHub Actions could not create the checkpoint merge commit automatically, so this PR was created from the source branch state for manual conflict resolution."
+    echo "GitHub Actions kept the destination branch versions of the conflicted paths so the PR remains a focused, mergeable checkpoint instead of exposing the entire source branch as a replacement tree."
+    echo
+    echo "Review these paths and manually carry over any source-side changes that the destination still needs. Auto-merge is disabled until that review is complete."
     echo
     echo "Conflicted paths from the failed merge attempt:"
     if [[ -n "${conflict_summary}" ]]; then
