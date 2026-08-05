@@ -114,7 +114,8 @@ mkdir -p codex-rs/cli/src scripts src
 printf 'target code\n' > codex-rs/cli/src/main.rs
 printf 'target-helper\n' > scripts/termux-configure-git.sh
 printf 'target\n' > src/app.txt
-git add codex-rs/cli/src/main.rs scripts/termux-configure-git.sh src/app.txt
+printf 'shared\n' > src/conflict.txt
+git add codex-rs/cli/src/main.rs scripts/termux-configure-git.sh src/app.txt src/conflict.txt
 git commit -m "target baseline" >/dev/null
 git branch -M wallentx/termux-target
 git remote add origin "${origin}"
@@ -128,9 +129,16 @@ printf '{"termux_tag":"rust-v1.0.0-termux"}\n' > .github/termux-release.json
 printf 'tested release code\n' > codex-rs/cli/src/main.rs
 printf 'release-helper\n' > scripts/termux-download-release-artifact.sh
 printf 'release\n' > src/app.txt
-git add .github/termux-release.json codex-rs/cli/src/main.rs scripts/termux-download-release-artifact.sh src/app.txt
+printf 'release conflict\n' > src/conflict.txt
+git add .github/termux-release.json codex-rs/cli/src/main.rs scripts/termux-download-release-artifact.sh src/app.txt src/conflict.txt
 git commit -m "release branch state" >/dev/null
 git push origin release/1.0.0 >/dev/null
+
+git checkout wallentx/termux-target >/dev/null
+printf 'target conflict\n' > src/conflict.txt
+git add src/conflict.txt
+git commit -m "target branch follow-up" >/dev/null
+git push origin wallentx/termux-target >/dev/null
 
 PATH="${bin_dir}:${PATH}" \
 GITHUB_REPOSITORY="wallentx/codex-termux" \
@@ -150,14 +158,22 @@ git fetch origin checkpoint/wallentx_termux-target_from_release_1.0.0_$(git rev-
 checkpoint_ref="origin/checkpoint/wallentx_termux-target_from_release_1.0.0_$(git rev-parse --short=12 origin/release/1.0.0)"
 
 assert_ref_file_equals "${checkpoint_ref}" src/app.txt "release"
+assert_ref_file_equals "${checkpoint_ref}" src/conflict.txt "target conflict"
 assert_ref_file_equals "${checkpoint_ref}" codex-rs/cli/src/main.rs "tested release code"
 assert_ref_file_equals "${checkpoint_ref}" scripts/termux-configure-git.sh "target-helper"
 assert_ref_lacks_file "${checkpoint_ref}" scripts/termux-download-release-artifact.sh
 assert_ref_lacks_file "${checkpoint_ref}" .github/termux-release.json
+
+if ! git merge-base --is-ancestor origin/wallentx/termux-target "${checkpoint_ref}"; then
+  fail "checkpoint did not retain the destination branch as an ancestor"
+fi
+if ! git merge-base --is-ancestor origin/release/1.0.0 "${checkpoint_ref}"; then
+  fail "checkpoint did not retain the source branch as an ancestor"
+fi
 
 if [[ "$(cat "${github_output}")" != "pr_url=https://github.com/wallentx/codex-termux/pull/2" ]]; then
   cat "${github_output}" >&2
   fail "checkpoint PR URL was not written to GITHUB_OUTPUT"
 fi
 
-echo "ok - checkpoint carries tested code while restoring release-only automation paths"
+echo "ok - checkpoint carries tested code and keeps conflicted paths on the destination baseline"
