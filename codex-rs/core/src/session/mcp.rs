@@ -95,12 +95,13 @@ impl Session {
         config: &Config,
     ) -> (McpConfig, McpRuntimeContext) {
         let originator = self.originator().await;
-        let windows_sandbox_level = self
-            .state
-            .lock()
-            .await
-            .session_configuration
-            .windows_sandbox_level;
+        let (windows_sandbox_level, session_source) = {
+            let state = self.state.lock().await;
+            (
+                state.session_configuration.windows_sandbox_level,
+                state.session_configuration.session_source.clone(),
+            )
+        };
         let environments = self.services.turn_environments.snapshot().await;
         let selected_capability_roots = self
             .resolve_selected_capability_roots_for_step(&environments)
@@ -122,7 +123,10 @@ impl Session {
                 config,
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
-                &originator,
+                McpThreadIdentity {
+                    session_source: &session_source,
+                    originator: &originator,
+                },
                 &ready_selected_capability_roots,
                 executor_capability_discovery.as_deref(),
             )
@@ -199,7 +203,10 @@ impl Session {
                     &desired.config,
                     &self.services.mcp_thread_init,
                     &self.services.thread_extension_data,
-                    &desired.originator,
+                    McpThreadIdentity {
+                        session_source: &desired.session_source,
+                        originator: &desired.originator,
+                    },
                     &ready_selected_capability_roots,
                     executor_capability_discovery.as_deref(),
                 )
@@ -253,7 +260,10 @@ impl Session {
                 &desired.config,
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
-                &desired.originator,
+                McpThreadIdentity {
+                    session_source: &desired.session_source,
+                    originator: &desired.originator,
+                },
                 &ready_selected_capability_roots,
                 executor_capability_discovery.as_deref(),
             )
@@ -317,10 +327,28 @@ impl Session {
         environments: &TurnEnvironmentSnapshot,
         windows_sandbox_level: WindowsSandboxLevel,
     ) -> Option<Arc<ExecutorCapabilityDiscoverySnapshot>> {
-        let restricted_file_system = !config
-            .permissions
-            .file_system_sandbox_policy()
-            .has_full_disk_read_access();
+        // Capability roots can currently be selected independently of turn environments, so a
+        // root may be ready when there is no primary `TurnEnvironment`. Keep using the thread
+        // policy in that case so restricted discovery fails closed below. Once every selected
+        // root belongs to a thread/environment attachment whose `EnvironmentConfig` is installed
+        // before the root becomes ready, discovery can use the root owner's policy and this
+        // fallback can be removed.
+        let restricted_file_system = environments.primary().map_or_else(
+            || {
+                !config
+                    .permissions
+                    .file_system_sandbox_policy()
+                    .has_full_disk_read_access()
+            },
+            |_| {
+                environments.turn_environments().any(|environment| {
+                    !environment
+                        .permission_profile()
+                        .file_system_sandbox_policy()
+                        .has_full_disk_read_access()
+                })
+            },
+        );
         if !restricted_file_system
             && !config
                 .features
@@ -333,7 +361,7 @@ impl Session {
                 .turn_environments()
                 .map(|environment| {
                     let mut sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
-                        config.permissions.permission_profile().clone(),
+                        environment.permission_profile().clone(),
                         environment.cwd().clone(),
                     );
                     sandbox.workspace_roots = environment.workspace_roots().to_vec();
@@ -558,26 +586,6 @@ impl Session {
             .await
     }
 
-    pub(crate) async fn set_openai_form_elicitation_support(
-        &self,
-        supported: bool,
-    ) -> anyhow::Result<()> {
-        if self
-            .services
-            .supports_openai_form_elicitation
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == supported
-        {
-            return Ok(());
-        }
-
-        self.services
-            .supports_openai_form_elicitation
-            .store(supported, std::sync::atomic::Ordering::Relaxed);
-        self.request_mcp_runtime_refresh();
-        Ok(())
-    }
-
     pub(crate) async fn refresh_mcp_servers_now(
         &self,
         turn_context: &TurnContext,
@@ -618,7 +626,10 @@ impl Session {
                 refresh_config,
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
-                &turn_context.originator,
+                McpThreadIdentity {
+                    session_source: &turn_context.session_source,
+                    originator: &turn_context.originator,
+                },
                 &ready_selected_capability_roots,
                 executor_capability_discovery.as_deref(),
             )
@@ -816,7 +827,7 @@ async fn review_guardian_mcp_elicitation(
         &turn_context,
         review_id.clone(),
         guardian_request,
-        /*retry_reason*/ None,
+        Default::default(),
     )
     .await;
     Ok(Some(mcp_elicitation_response_from_guardian_decision(

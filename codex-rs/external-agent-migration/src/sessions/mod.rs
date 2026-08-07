@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 pub use crate::detect::sessions::ImportedSessionConnectorAttribution;
 pub use crate::detect::sessions::detect_imported_cla_session_connectors;
+pub use crate::detect::sessions::detect_imported_cla_session_connectors_by_source_path;
 pub use crate::detect::sessions::detect_recent_cla_sessions;
 pub use crate::detect::sessions::detect_recent_cur_sessions;
 pub use append::ExistingSessionAppend;
@@ -24,9 +25,11 @@ pub use append::append_existing_session;
 use export::load_session_for_import_with_content_sha256;
 pub use ledger::CompletedExternalAgentSessionImport;
 pub use ledger::ImportedConnectorCandidate;
+pub use ledger::append_imported_session_connector_names;
 pub use ledger::has_current_session_been_imported;
 pub use ledger::read_imported_connector_candidates;
 pub use ledger::record_completed_session_imports;
+pub use ledger::record_detected_session_connectors;
 pub use records_cla::summarize_session;
 
 const SESSION_TITLE_MAX_LEN: usize = 120;

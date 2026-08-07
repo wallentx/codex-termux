@@ -40,13 +40,16 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
 
 #[test]
 fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
-    let mut incompatible = model_preset("incompatible", /*show_in_picker*/ true);
-    incompatible.multi_agent_version = Some(MultiAgentVersion::V1);
+    let mut legacy = model_preset("legacy", /*show_in_picker*/ true);
+    legacy.multi_agent_version = Some(MultiAgentVersion::V1);
+    let mut disabled = model_preset("disabled", /*show_in_picker*/ true);
+    disabled.multi_agent_version = Some(MultiAgentVersion::Disabled);
     let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
         available_models: vec![
             model_preset("visible", /*show_in_picker*/ true),
             model_preset("hidden", /*show_in_picker*/ false),
-            incompatible,
+            legacy,
+            disabled,
         ],
         agent_type_description: "role help".to_string(),
         expose_agent_type: true,
@@ -84,8 +87,11 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(description.contains(
         "- `visible-model`: visible description Reasoning efforts: medium (default). Service tiers: priority."
     ));
+    assert!(description.contains(
+        "- `legacy-model`: legacy description Reasoning efforts: medium (default). Service tiers: priority."
+    ));
     assert!(!description.contains("hidden-model"));
-    assert!(!description.contains("incompatible-model"));
+    assert!(!description.contains("disabled-model"));
     assert!(properties.contains_key("task_name"));
     assert!(properties.contains_key("message"));
     assert_eq!(
@@ -415,9 +421,7 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
         properties
             .get("timeout_ms")
             .and_then(|schema| schema.description.as_deref()),
-        Some(
-            "Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000. Prefer longer waits (minutes) to avoid busy polling."
-        )
+        Some("Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000.")
     );
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(

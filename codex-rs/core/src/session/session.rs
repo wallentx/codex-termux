@@ -5,6 +5,7 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::session::turn_context::EnvironmentConfig;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
 use crate::state::ActiveTurn;
@@ -12,10 +13,12 @@ use codex_extension_api::ExtensionDataInit;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::auth::AgentIdentityAuthPolicy;
+use codex_model_provider::SharedModelProvider;
 use codex_protocol::SessionId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -64,8 +67,8 @@ pub(crate) struct Session {
 
 #[derive(Clone)]
 pub(crate) struct SessionConfiguration {
-    /// Provider identifier ("openai", "openrouter", ...).
-    pub(super) provider: ModelProviderInfo,
+    /// Runtime provider and its provider-specific execution policy.
+    pub(super) provider: SharedModelProvider,
 
     pub(super) collaboration_mode: CollaborationMode,
     pub(super) model_reasoning_summary: Option<ReasoningSummaryConfig>,
@@ -151,6 +154,16 @@ impl SessionConfiguration {
 
     pub(super) fn permission_profile_state(&self) -> &PermissionProfileState {
         &self.permission_profile_state
+    }
+
+    pub(super) fn environment_config(&self) -> EnvironmentConfig {
+        EnvironmentConfig {
+            allow_login_shell: self
+                .original_config_do_not_use
+                .permissions
+                .allow_login_shell,
+            permission_profile: self.permission_profile_state.snapshot(),
+        }
     }
 
     pub(super) fn permission_profile(&self) -> PermissionProfile {
@@ -459,7 +472,7 @@ pub(crate) struct AppServerClientMetadata {
 async fn warm_plugins_and_skills_for_session_init(
     config: Arc<Config>,
     plugins_manager: Arc<PluginsManager>,
-    skills_service: Arc<SkillsService>,
+    skills_service: Arc<HostSkillsService>,
     turn_environments: &TurnEnvironmentSnapshot,
 ) -> Vec<SkillError> {
     let fs = turn_environments.primary_filesystem();
@@ -508,13 +521,13 @@ impl Session {
         mut initial_history: InitialHistory,
         fork_persistence: ForkPersistence,
         session_source: SessionSource,
-        skills_service: Arc<SkillsService>,
+        skills_service: Arc<HostSkillsService>,
         plugins_manager: Arc<PluginsManager>,
         mcp_manager: Arc<McpManager>,
         code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
         extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
         mut thread_extension_init: ExtensionDataInit,
-        supports_openai_form_elicitation: bool,
+        client_mcp_extensions: ClientMcpExtensions,
         agent_control: AgentControl,
         environment_manager: Arc<EnvironmentManager>,
         inherited_environments: Option<TurnEnvironmentSnapshot>,
@@ -725,6 +738,7 @@ impl Session {
         let mcp_thread_init_for_startup = &mcp_thread_init;
         let thread_extension_data_for_mcp = &thread_extension_data;
         let mcp_originator = session_configuration.originator.clone();
+        let mcp_session_source = session_configuration.session_source.clone();
         let mcp_runtime_cwd = session_configuration
             .environment_selections()
             .first()
@@ -738,7 +752,10 @@ impl Session {
                     &config_for_mcp,
                     mcp_thread_init_for_startup,
                     thread_extension_data_for_mcp,
-                    &mcp_originator,
+                    McpThreadIdentity {
+                        session_source: &mcp_session_source,
+                        originator: &mcp_originator,
+                    },
                     /*ready_selected_capability_roots*/ &[],
                     /*executor_capability_discovery*/ None,
                 )
@@ -839,7 +856,7 @@ impl Session {
             let terminal_type = user_agent();
             let session_model = session_configuration.collaboration_mode.model().to_string();
             let auth_env_telemetry = collect_auth_env_telemetry(
-                &session_configuration.provider,
+                session_configuration.provider.info(),
                 auth_manager.codex_api_key_env_enabled(),
             );
             let mut session_telemetry = SessionTelemetry::new(
@@ -939,11 +956,16 @@ impl Session {
             let turn_environments = Arc::new(ThreadEnvironments::new(
                 environment_manager,
                 default_shell.clone(),
+                // Temporary: preserve thread-level behavior until environments supply config.
+                session_configuration.environment_config(),
                 shell_snapshot,
                 inherited_environments.unwrap_or_default(),
                 config.features.enabled(Feature::DeferredExecutor),
             ));
-            turn_environments.update_selections(session_configuration.environment_selections());
+            turn_environments.update_selections(
+                session_configuration.environment_selections(),
+                &session_configuration.environment_config(),
+            );
             let resolved_environments = turn_environments.snapshot().await;
             let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
             let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
@@ -1121,9 +1143,7 @@ impl Session {
                 thread_extension_data,
                 selected_capability_roots,
                 mcp_thread_init,
-                supports_openai_form_elicitation: std::sync::atomic::AtomicBool::new(
-                    supports_openai_form_elicitation,
-                ),
+                client_mcp_extensions,
                 agent_control,
                 network_proxy: arc_swap::ArcSwapOption::from(network_proxy.map(Arc::new)),
                 network_proxy_audit_metadata,
@@ -1142,7 +1162,7 @@ impl Session {
                         AgentIdentityAuthPolicy::JwtOnly
                     },
                     thread_id,
-                    session_configuration.provider.clone(),
+                    session_configuration.provider.info().clone(),
                     session_configuration.session_source.clone(),
                     session_configuration.originator.clone(),
                     config.model_verbosity,
@@ -1255,7 +1275,10 @@ impl Session {
                         config.as_ref(),
                         &sess.services.mcp_thread_init,
                         &sess.services.thread_extension_data,
-                        &session_configuration.originator,
+                        McpThreadIdentity {
+                            session_source: &session_configuration.session_source,
+                            originator: &session_configuration.originator,
+                        },
                         /*ready_selected_capability_roots*/ &[],
                         /*executor_capability_discovery*/ None,
                     )

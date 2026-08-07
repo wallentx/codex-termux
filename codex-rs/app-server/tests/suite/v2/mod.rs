@@ -68,6 +68,7 @@ mod request_permissions;
 mod request_user_input;
 mod request_validation;
 mod review;
+mod rollout_migration;
 mod safety_check_downgrade;
 #[cfg(not(target_os = "windows"))]
 mod selected_capability_stack;
@@ -99,5 +100,6 @@ mod turn_interrupt;
 mod turn_start;
 mod turn_start_zsh_fork;
 mod turn_steer;
+mod view_image;
 mod web_search;
 mod windows_sandbox_setup;

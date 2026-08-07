@@ -1,5 +1,5 @@
 use super::*;
-use crate::SkillsService;
+use crate::HostSkillsService;
 use crate::config::ConfigBuilder;
 use crate::skills_load_input_from_config;
 use codex_core_plugins::PluginsManager;
@@ -161,6 +161,7 @@ async fn apply_role_preserves_unspecified_keys() {
     .await;
     config.codex_linux_sandbox_exe = Some(PathBuf::from("/tmp/codex-linux-sandbox"));
     config.main_execve_wrapper_exe = Some(PathBuf::from("/tmp/codex-execve-wrapper"));
+    config.psp = true;
     let role_path = write_role_config(
         &home,
         "instructions-only.toml",
@@ -195,6 +196,7 @@ async fn apply_role_preserves_unspecified_keys() {
         config.main_execve_wrapper_exe,
         Some(PathBuf::from("/tmp/codex-execve-wrapper"))
     );
+    assert!(config.psp);
 }
 
 #[tokio::test]
@@ -398,7 +400,7 @@ enabled = false
 
     let plugins_manager = Arc::new(PluginsManager::new(home.path().to_path_buf()));
     let skills_service =
-        SkillsService::new(home.path().abs(), /*bundled_skills_enabled*/ true);
+        HostSkillsService::new(home.path().abs(), /*bundled_skills_enabled*/ true);
     let plugins_input = config.plugins_config_input();
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
