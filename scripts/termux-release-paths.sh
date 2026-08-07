@@ -41,6 +41,14 @@ readonly -a TERMUX_RELEASE_CODE_PATHS=(
   codex-rs/tui/src/updates.rs
 )
 
+# This file is implemented entirely by the downstream patch branch and can
+# contain checkpointed improvements that are newer than the seeded patch.
+# Other release code paths mix Termux changes into upstream-owned files, so
+# their post-merge versions must come from the newly patched release branch.
+readonly -a TERMUX_RELEASE_PATCH_AUTHORITATIVE_CODE_PATHS=(
+  codex-rs/tui/src/termux_update.rs
+)
+
 # These upstream-owned files have repeatedly retained stale checkpoint-side
 # content when a new release branch was merged into the release work branch.
 readonly -a TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS=(
