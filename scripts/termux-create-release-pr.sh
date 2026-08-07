@@ -110,6 +110,32 @@ normalize_workspace_version_to_upstream_tag() {
   ' codex-rs/Cargo.toml
 }
 
+restore_release_workspace_manifest() {
+  local release_ref="origin/${RELEASE_BRANCH}"
+  local manifest="codex-rs/Cargo.toml"
+
+  git restore --source="${release_ref}" --staged --worktree -- "${manifest}"
+
+  if git cat-file -e "HEAD:codex-rs/utils/file-lock/Cargo.toml" 2>/dev/null; then
+    if ! grep -q '^[[:space:]]*"utils/file-lock",[[:space:]]*$' "${manifest}"; then
+      perl -0pi -e '
+        s{(^\s*"utils/elapsed",\n)}{$1    "utils/file-lock",\n}m
+          || s{(members = \[\n)}{$1    "utils/file-lock",\n}
+          || die "workspace members array not found\n";
+      ' "${manifest}"
+    fi
+    if ! grep -q '^codex-utils-file-lock[[:space:]]*=' "${manifest}"; then
+      perl -0pi -e '
+        s{(^codex-utils-elapsed = .*\n)}{$1codex-utils-file-lock = { path = "utils/file-lock" }\n}m
+          || s{(\[workspace\.dependencies\]\n)}{$1codex-utils-file-lock = { path = "utils/file-lock" }\n}
+          || die "workspace dependencies section not found\n";
+      ' "${manifest}"
+    fi
+  fi
+
+  git add -- "${manifest}"
+}
+
 restore_merge_authoritative_paths() {
   local release_ref="origin/${RELEASE_BRANCH}"
   local path
@@ -174,6 +200,7 @@ merge_release_branch_into_work_branch() {
   seed_release_branch_workflows
   git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
   restore_merge_authoritative_paths
+  restore_release_workspace_manifest
 
   unresolved_paths="$(git diff --name-only --diff-filter=U)"
   if [[ -n "${unresolved_paths}" ]]; then

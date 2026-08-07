@@ -57,6 +57,19 @@ assert_ref_file_equals() {
   fi
 }
 
+assert_ref_file_contains() {
+  local ref="$1"
+  local path="$2"
+  local expected="$3"
+  local actual
+
+  actual="$(git show "${ref}:${path}")"
+  if [[ "${actual}" != *"${expected}"* ]]; then
+    printf 'expected %s:%s to contain:\n%s\nactual:\n%s\n' "${ref}" "${path}" "${expected}" "${actual}" >&2
+    fail "${ref}:${path} did not contain expected content"
+  fi
+}
+
 assert_ref_is_ancestor() {
   local ancestor="$1"
   local descendant="$2"
@@ -162,8 +175,17 @@ git config user.email "termux-release-test@example.invalid"
 mkdir -p .github/workflows codex-rs/cli/src codex-rs/tui/src src
 printf 'base workflow\n' > .github/workflows/rust-release.yml
 cat > codex-rs/Cargo.toml <<'TOML'
+[workspace]
+members = [
+    "cli",
+    "tui",
+]
+
 [workspace.package]
 version = "1.0.0"
+
+[workspace.dependencies]
+base = "1"
 TOML
 printf 'upstream release code\n' > codex-rs/cli/src/main.rs
 for path in lib.rs termux_update.rs update_action.rs update_prompt.rs update_versions.rs updates.rs; do
@@ -188,11 +210,15 @@ git checkout -B wallentx/termux-target main >/dev/null
 mkdir -p termux
 git rm codex-rs/tui/src/update_versions.rs >/dev/null
 perl -0pi -e 's/version = "1\.0\.0"/version = "1.0.0-alpha.target"/' codex-rs/Cargo.toml
+perl -0pi -e 's/(    "tui",\n)/$1    "utils\/file-lock",\n/' codex-rs/Cargo.toml
+perl -0pi -e 's/(base = "1"\n)/$1codex-utils-file-lock = { path = "utils\/file-lock" }\n/' codex-rs/Cargo.toml
+mkdir -p codex-rs/utils/file-lock
+printf '[package]\nname = "codex-utils-file-lock"\nversion.workspace = true\n' > codex-rs/utils/file-lock/Cargo.toml
 printf 'compat\n' > termux/compat.txt
 printf 'termux\n' > src/shared.txt
 printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
 printf 'termux updater with target drift\n' > codex-rs/tui/src/termux_update.rs
-git add codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/tui/src/termux_update.rs termux/compat.txt src/shared.txt
+git add codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml termux/compat.txt src/shared.txt
 git commit -m "termux compatibility changes" >/dev/null
 git push origin wallentx/termux-target >/dev/null
 
@@ -222,8 +248,9 @@ assert_ref_is_ancestor origin/release/1.0.0 origin/release-train/1.0.0
 assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "termux"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/tui/src/termux_update.rs "termux updater with target drift"
-assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
-version = \"1.0.0\""
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'version = "1.0.0"'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml '"utils/file-lock",'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'codex-utils-file-lock = { path = "utils/file-lock" }'
 assert_ref_has_file origin/release-train/1.0.0 src/upstream-after-tag.txt
 assert_ref_has_file origin/release-train/1.0.0 termux/compat.txt
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/tui/src/update_versions.rs "fixture"
@@ -254,6 +281,12 @@ git config user.email "termux-release-test@example.invalid"
 mkdir -p .github/workflows codex-rs/cli/src codex-rs/tui/src src
 printf 'base workflow\n' > .github/workflows/rust-release.yml
 cat > codex-rs/Cargo.toml <<'TOML'
+[workspace]
+members = [
+    "cli",
+    "tui",
+]
+
 [workspace.package]
 version = "1.0.0-alpha.1"
 
@@ -284,9 +317,13 @@ git push origin release/1.0.0 >/dev/null
 git checkout main >/dev/null
 perl -0pi -e 's/version = "1\.0\.0-alpha\.1"/version = "1.0.0-alpha.2"/' codex-rs/Cargo.toml
 perl -0pi -e 's/release = "old"/release = "new"/' codex-rs/Cargo.toml
+perl -0pi -e 's/(    "tui",\n)/$1    "utils\/audio",\n/' codex-rs/Cargo.toml
+perl -0pi -e 's/(base = "1"\n)/$1codex-utils-audio = { path = "utils\/audio" }\n/' codex-rs/Cargo.toml
+mkdir -p codex-rs/utils/audio
+printf '[package]\nname = "codex-utils-audio"\nversion.workspace = true\n' > codex-rs/utils/audio/Cargo.toml
 printf 'new-release\n' > src/shared.txt
 printf 'new-tag\n' > src/new-tag.txt
-git add codex-rs/Cargo.toml src/shared.txt src/new-tag.txt
+git add codex-rs/Cargo.toml codex-rs/utils/audio/Cargo.toml src/shared.txt src/new-tag.txt
 git commit -m "new upstream release" >/dev/null
 git tag rust-v1.0.0-alpha.2
 git push origin main rust-v1.0.0-alpha.2 >/dev/null
@@ -294,12 +331,15 @@ git push origin main rust-v1.0.0-alpha.2 >/dev/null
 git checkout -B wallentx/termux-target rust-v1.0.0-alpha.1 >/dev/null
 mkdir -p termux
 perl -0pi -e 's/version = "1\.0\.0-alpha\.1"/version = "1.0.0-alpha.target"/' codex-rs/Cargo.toml
-perl -0pi -e 's/base = "1"/base = "1"\ntarget-only = "1"/' codex-rs/Cargo.toml
+perl -0pi -e 's/(    "tui",\n)/$1    "utils\/file-lock",\n/' codex-rs/Cargo.toml
+perl -0pi -e 's/(base = "1"\n)/$1codex-utils-file-lock = { path = "utils\/file-lock" }\n/' codex-rs/Cargo.toml
+mkdir -p codex-rs/utils/file-lock
+printf '[package]\nname = "codex-utils-file-lock"\nversion.workspace = true\n' > codex-rs/utils/file-lock/Cargo.toml
 printf 'termux workflow\n' > .github/workflows/rust-release.yml
 printf 'compat\n' > termux/compat.txt
 printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
 printf 'termux updater with target drift\n' > codex-rs/tui/src/termux_update.rs
-git add .github/workflows/rust-release.yml codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/tui/src/termux_update.rs termux/compat.txt
+git add .github/workflows/rust-release.yml codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml termux/compat.txt
 git commit -m "termux compatibility changes" >/dev/null
 git push origin wallentx/termux-target >/dev/null
 
@@ -327,29 +367,22 @@ git fetch origin release/1.0.0 release-train/1.0.0 >/dev/null
 
 assert_ref_file_equals origin/release/1.0.0 src/shared.txt "new-release"
 assert_ref_file_equals origin/release/1.0.0 codex-rs/cli/src/main.rs "termux release code"
-assert_ref_file_equals origin/release/1.0.0 codex-rs/Cargo.toml "[workspace.package]
-version = \"1.0.0-alpha.2\"
-
-[workspace.dependencies]
-base = \"1\"
-
-[workspace.metadata.fixture]
-release = \"new\""
+assert_ref_file_contains origin/release/1.0.0 codex-rs/Cargo.toml 'version = "1.0.0-alpha.2"'
+assert_ref_file_contains origin/release/1.0.0 codex-rs/Cargo.toml '"utils/audio",'
+assert_ref_file_contains origin/release/1.0.0 codex-rs/Cargo.toml 'codex-utils-audio = { path = "utils/audio" }'
+assert_ref_file_contains origin/release/1.0.0 codex-rs/Cargo.toml 'release = "new"'
 assert_ref_lacks_file origin/release/1.0.0 stale-release-branch.txt
 
 assert_ref_is_ancestor origin/release/1.0.0 origin/release-train/1.0.0
 assert_ref_file_equals origin/release-train/1.0.0 src/shared.txt "new-release"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/cli/src/main.rs "termux release code"
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/tui/src/termux_update.rs "termux updater with target drift"
-assert_ref_file_equals origin/release-train/1.0.0 codex-rs/Cargo.toml "[workspace.package]
-version = \"1.0.0-alpha.2\"
-
-[workspace.dependencies]
-base = \"1\"
-target-only = \"1\"
-
-[workspace.metadata.fixture]
-release = \"new\""
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'version = "1.0.0-alpha.2"'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml '"utils/audio",'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'codex-utils-audio = { path = "utils/audio" }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml '"utils/file-lock",'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'codex-utils-file-lock = { path = "utils/file-lock" }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'release = "new"'
 assert_ref_file_equals \
   origin/release-train/1.0.0 \
   .github/workflows/rust-release.yml \
