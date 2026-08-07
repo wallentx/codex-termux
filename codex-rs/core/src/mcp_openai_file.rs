@@ -228,7 +228,6 @@ mod tests {
 
     fn set_primary_environment_cwd(turn_context: &mut TurnContext, cwd: &Path) {
         let cwd = AbsolutePathBuf::try_from(cwd).expect("absolute path");
-        turn_context.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
         let TurnEnvironmentState::Ready(primary) = &mut turn_context.environments.environments[0]
         else {
             panic!("expected ready primary environment");
@@ -239,6 +238,7 @@ mod tests {
             PathUri::from_abs_path(&cwd),
             Vec::new(),
             primary.shell.clone(),
+            primary.config.clone(),
         );
     }
 
@@ -315,19 +315,21 @@ mod tests {
             .await
             .expect("write local file");
         set_primary_environment_cwd(&mut turn_context, dir.path());
-        let selection = turn_context
+        let environment = turn_context
             .environments
             .primary()
-            .expect("ready primary environment")
-            .selection();
+            .expect("ready primary environment");
+        let selection = environment.selection();
+        let environment_config = environment.config.clone();
         let environments = crate::environment_selection::ThreadEnvironments::new(
             session.services.turn_environments.environment_manager(),
             crate::shell::default_user_shell(),
+            environment_config.clone(),
             crate::shell_snapshot::ShellSnapshot::disabled(),
             Default::default(),
             /*non_blocking_snapshots*/ true,
         );
-        environments.update_selections(std::slice::from_ref(&selection));
+        environments.update_selections(std::slice::from_ref(&selection), &environment_config);
         turn_context.environments = environments.snapshot().await;
         turn_context
             .environments
