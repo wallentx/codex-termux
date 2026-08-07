@@ -4,6 +4,7 @@ use super::session::Session;
 use super::step_context::StepContext;
 use crate::connectors;
 use crate::context::ApprovalPromptContext;
+use crate::context::TokenBudgetContext;
 use crate::context::world_state::AgentsMdState;
 use crate::context::world_state::AppsInstructionsState;
 use crate::context::world_state::CollaborationModeState;
@@ -37,19 +38,27 @@ impl Session {
             selected_capability_root_count = step_context.selected_capability_roots.len(),
             "building step world state"
         );
-        let (previous_model, previous_context, base_instructions) = {
-            let state = self.state.lock().await;
-            (
-                state
-                    .previous_turn_settings()
-                    .map(|previous| previous.model),
-                state.reference_context_item(),
-                state.session_configuration.base_instructions.clone(),
-            )
-        };
         let model_instructions = turn_context
             .model_info
             .get_model_instructions(turn_context.personality);
+        let (previous_model, previous_context, base_instructions) = {
+            let state = self.state.lock().await;
+            let base_instructions = state.session_configuration.base_instructions.clone();
+            (
+                state
+                    .previous_turn_settings()
+                    .map(|previous| previous.model)
+                    .or_else(|| {
+                        state
+                            .base_instructions_model
+                            .as_ref()
+                            .filter(|_| base_instructions != model_instructions)
+                            .cloned()
+                    }),
+                state.reference_context_item(),
+                base_instructions,
+            )
+        };
         let personality_is_baked = turn_context.model_info.supports_personality()
             && base_instructions == model_instructions;
         let environment_subagents = if turn_context.config.include_environment_context {
@@ -80,7 +89,8 @@ impl Session {
                 turn_context.personality,
                 previous_context
                     .as_ref()
-                    .map(|previous| previous.model.as_str()),
+                    .map(|previous| previous.model.as_str())
+                    .or(previous_model.as_deref()),
                 previous_context
                     .as_ref()
                     .and_then(|previous| previous.personality),
@@ -90,14 +100,27 @@ impl Session {
         }
         if turn_context.config.features.enabled(Feature::TokenBudget)
             && turn_context.model_context_window().is_some()
-            && let Some(guidance) = turn_context
+        {
+            let window_ids = self.state.lock().await.auto_compact_window_ids();
+            world_state.add_section(TokenBudgetContext::new(
+                turn_context
+                    .session_source
+                    .get_agent_path()
+                    .unwrap_or_else(codex_protocol::AgentPath::root),
+                window_ids.first_window_id,
+                window_ids.previous_window_id,
+                window_ids.window_id,
+                /*mcp_result*/ None,
+            ));
+            if let Some(guidance) = turn_context
                 .config
                 .token_budget
                 .as_ref()
                 .and_then(|config| config.guidance_message.as_deref())
                 .filter(|message| !message.trim().is_empty())
-        {
-            world_state.add_section(ContextWindowGuidanceState::new(guidance));
+            {
+                world_state.add_section(ContextWindowGuidanceState::new(guidance));
+            }
         }
         let realtime_mode_instructions = self.conversation.mode_instructions().await;
         world_state.add_section(RealtimeState::new(

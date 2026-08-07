@@ -30,7 +30,6 @@ pub use feature_configs::NonPrefixedMcpToolNamesConfigToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
 pub use feature_configs::RolloutBudgetConfigToml;
 pub use feature_configs::TokenBudgetConfigToml;
-pub use feature_configs::TokenBudgetMode;
 pub use feature_configs::ToolRegistryConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
@@ -100,7 +99,7 @@ pub enum Feature {
     ExecutedToolCallMetadata,
     /// Enable JavaScript code mode backed by the standalone host process.
     CodeMode,
-    /// Use a 30-second default yield timeout for code mode exec calls.
+    /// Removed compatibility flag for the configurable code-mode exec yield timeout.
     CodeModeBufferedExec,
     /// Run JavaScript code mode in the standalone host process.
     CodeModeHost,
@@ -148,6 +147,8 @@ pub enum Feature {
     ExternalAgentMemoryImport,
     /// Compress cold local thread-store rollout files.
     LocalThreadStoreCompression,
+    /// Migrate legacy local rollout files to paginated history in the background.
+    BackgroundPaginatedRolloutMigration,
     /// Enable the Chronicle sidecar for passive screen-context memories.
     Chronicle,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
@@ -224,6 +225,8 @@ pub enum Feature {
     ImageGeneration,
     /// Tell the model when a prompt image was resized and include its dimensions.
     ImageResizeNotice,
+    /// Apply one shared pixel and token budget to every image, regardless of legacy detail hints.
+    UnifiedImageBudget,
     /// Removed compatibility flag for always-on centralized image preparation.
     ResizeAllImages,
     /// Removed compatibility flag for always-on response item IDs.
@@ -921,7 +924,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::CodeModeBufferedExec,
         key: "code_mode_buffered_exec",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1005,6 +1008,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::LocalThreadStoreCompression,
         key: "local_thread_store_compression",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::BackgroundPaginatedRolloutMigration,
+        key: "background_paginated_rollout_migration",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1273,6 +1282,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ImageResizeNotice,
         key: "image_resize_notice",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::UnifiedImageBudget,
+        key: "unified_image_budget",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

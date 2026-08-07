@@ -43,8 +43,10 @@ use crate::rmcp_client::prepare_codex_apps_tools_for_model;
 use crate::rmcp_client::prepare_regular_mcp_tools_for_model;
 use crate::runtime::McpPublicationGate;
 use crate::runtime::McpRuntimeInput;
+use crate::runtime::McpStartupPolicy;
 use crate::server::McpServerConnectionIdentity;
 use crate::server::McpServerMetadata;
+use crate::tool_catalog_cache::McpToolCatalogCacheContext;
 use crate::tools::ToolFilter;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
@@ -65,12 +67,14 @@ use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_rmcp_client::determine_streamable_http_auth_status_from_credentials;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::warn;
 
 pub(crate) struct McpServerConnection {
     identity: Option<McpServerConnectionIdentity>,
     client: AsyncManagedClient,
+    startup_trigger: Option<watch::Sender<bool>>,
 }
 
 impl McpServerConnection {
@@ -93,7 +97,7 @@ impl McpServerConnection {
             return Some(client);
         };
         let reusable = match client.client.managed_oauth_credentials().await {
-            Some(live_credentials) => &live_credentials == desired_credentials,
+            Some(live_credentials) => live_credentials.as_ref() == desired_credentials,
             None => current
                 .oauth_credentials()
                 .is_ok_and(|startup_credentials| startup_credentials == desired_credentials),
@@ -102,6 +106,9 @@ impl McpServerConnection {
     }
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
+        if let Some(startup_trigger) = &self.startup_trigger {
+            startup_trigger.send_replace(true);
+        }
         self.client.client().await
     }
 
@@ -110,9 +117,15 @@ impl McpServerConnection {
     }
 
     fn cancel_startup(&self) {
-        if !self.client.startup_complete.load(Ordering::Acquire) {
+        if !self.startup_is_dormant() && !self.client.startup_complete.load(Ordering::Acquire) {
             self.client.cancel_token.cancel();
         }
+    }
+
+    fn startup_is_dormant(&self) -> bool {
+        self.startup_trigger
+            .as_ref()
+            .is_some_and(|startup_trigger| !*startup_trigger.borrow())
     }
 }
 
@@ -170,6 +183,7 @@ impl McpConnectionSet {
         elicitation_router: ElicitationRequestRouter,
     ) -> Self {
         let McpRuntimeInput {
+            startup_policy,
             config,
             plugins_available: _,
             ready_selected_capability_roots: _,
@@ -207,6 +221,9 @@ impl McpConnectionSet {
         required_servers.sort();
         let mut reused_ready = Vec::new();
         let mut join_set = JoinSet::new();
+        // Explicit reconnects have no previous set and must replace their clients eagerly.
+        let allow_deferred_startup =
+            startup_policy == McpStartupPolicy::LazyWhenCached && previous.is_some();
         let reusable_previous = previous.filter(|previous| {
             !previous.servers.is_empty()
                 && previous.elicitation_requests.update(
@@ -397,12 +414,32 @@ impl McpConnectionSet {
                 protocol_mode,
                 catalog_item_limit,
             );
+            let defer_startup = allow_deferred_startup
+                && !configured_config.required
+                && !tool_plugin_provenance.is_selected_plugin_mcp_server(&server_name)
+                && async_managed_client
+                    .tool_catalog_cache_context
+                    .as_ref()
+                    .and_then(McpToolCatalogCacheContext::current_tools)
+                    .is_some_and(|tools| {
+                        tools.into_iter().any(|tool| {
+                            configured_tool_filter.allows(&tool.tool.name)
+                                && tool_is_model_visible(&tool)
+                        })
+                    });
+            let (startup_trigger, startup_receiver) = if defer_startup {
+                let (trigger, receiver) = watch::channel(false);
+                (Some(trigger), Some(receiver))
+            } else {
+                (None, None)
+            };
             servers.insert(
                 server_name.clone(),
                 McpServerView {
                     connection: Arc::new(McpServerConnection {
                         identity: Some(connection_identity),
                         client: async_managed_client.clone(),
+                        startup_trigger,
                     }),
                     metadata,
                     tool_filter: configured_tool_filter,
@@ -413,7 +450,15 @@ impl McpConnectionSet {
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let publication_gate = publication_gate.clone();
-            join_set.spawn(async move {
+            let startup = async move {
+                if let Some(mut startup_receiver) = startup_receiver
+                    && tokio::select! {
+                        started = startup_receiver.wait_for(|started| *started) => started.is_err(),
+                        () = cancel_token.cancelled() => true,
+                    }
+                {
+                    return (server_name, Err(StartupOutcomeError::Cancelled));
+                }
                 if !publication_gate.wait().await {
                     return (server_name, Err(StartupOutcomeError::Cancelled));
                 }
@@ -506,7 +551,13 @@ impl McpConnectionSet {
                 }
 
                 (server_name, outcome)
-            });
+            };
+            if defer_startup {
+                // Dormant servers must not hold the initial startup summary open.
+                tokio::spawn(startup);
+            } else {
+                join_set.spawn(startup);
+            }
         }
         let manager = Self {
             servers,
@@ -592,6 +643,60 @@ impl McpConnectionSet {
 
     pub(crate) fn contains_server(&self, server_name: &str) -> bool {
         self.servers.contains_key(server_name)
+    }
+
+    pub(crate) async fn authentication_failed_servers(&self) -> Vec<String> {
+        let mut failed_servers = Vec::new();
+        for (server_name, view) in &self.servers {
+            if view
+                .connection
+                .client
+                .startup_complete
+                .load(Ordering::Acquire)
+                && let Err(error) = view.connection.client().await
+                && error.is_authentication_required()
+            {
+                failed_servers.push(server_name.clone());
+            }
+        }
+        failed_servers
+    }
+
+    pub(crate) async fn updated_oauth_credentials_after_auth_failure(
+        &self,
+        config: &crate::McpConfig,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+        for server_name in self.authentication_failed_servers().await {
+            if let Some(view) = self.servers.get(&server_name)
+                && let Some(identity) = view.connection.identity.as_ref()
+                && let Some(server) = config.mcp_server_catalog.server(&server_name)
+            {
+                candidates.push((server_name, identity.clone(), server.config().clone()));
+            }
+        }
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        match tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter_map(|(server_name, identity, config)| {
+                    identity
+                        .oauth_credentials_changed(&server_name, &config)
+                        .then_some(server_name)
+                })
+                .collect()
+        })
+        .await
+        {
+            Ok(recovered_servers) => recovered_servers,
+            Err(error) => {
+                warn!(%error, "failed to inspect stored MCP OAuth credentials");
+                Vec::new()
+            }
+        }
     }
 
     pub(crate) async fn wait_for_server_startup(&self, server_name: &str) -> bool {
@@ -690,7 +795,7 @@ impl McpConnectionSet {
                 server_infos.insert(server_name.clone(), server_info);
                 continue;
             }
-            match client.client().await {
+            match view.connection.client().await {
                 Ok(managed_client) => {
                     server_infos.insert(server_name.clone(), managed_client.server_info);
                 }
