@@ -41,8 +41,6 @@ use codex_config::RequirementsLayerEntry;
 use codex_config::compose_requirements;
 use codex_config::types::McpServerTransportConfig;
 use codex_core_skills::PluginSkillSnapshots;
-use codex_core_skills::SkillsLoadInput;
-use codex_core_skills::SkillsService;
 use codex_login::CodexAuth;
 use codex_plugin::AppDeclaration;
 use codex_plugin::PluginId;
@@ -52,6 +50,7 @@ use codex_protocol::protocol::Product;
 use codex_skills::SkillConfigRules;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
+use codex_utils_plugins::SkillDiscoveryMode;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::Path;
@@ -675,6 +674,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             PluginCapabilitySummary {
                 config_name: "docs@test".to_string(),
                 display_name: "docs".to_string(),
+                plugin_namespace: Some("docs".to_string()),
                 description: None,
                 has_skills: false,
                 mcp_server_names: vec!["docs".to_string()],
@@ -683,6 +683,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             PluginCapabilitySummary {
                 config_name: "sample@test".to_string(),
                 display_name: "sample".to_string(),
+                plugin_namespace: Some("sample".to_string()),
                 description: None,
                 has_skills: false,
                 mcp_server_names: Vec::new(),
@@ -705,6 +706,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             PluginCapabilitySummary {
                 config_name: "docs@test".to_string(),
                 display_name: "docs".to_string(),
+                plugin_namespace: Some("docs".to_string()),
                 description: None,
                 has_skills: false,
                 mcp_server_names: vec!["docs".to_string()],
@@ -713,6 +715,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
             PluginCapabilitySummary {
                 config_name: "sample@test".to_string(),
                 display_name: "sample".to_string(),
+                plugin_namespace: Some("sample".to_string()),
                 description: None,
                 has_skills: false,
                 mcp_server_names: vec!["sample".to_string()],
@@ -739,7 +742,11 @@ fn write_plugin_with_version(
         format!(r#"{{"name":"{manifest_name}"{version}}}"#),
     )
     .unwrap();
-    fs::write(plugin_root.join("skills/SKILL.md"), "skill").unwrap();
+    fs::write(
+        plugin_root.join("skills/SKILL.md"),
+        format!("---\nname: {manifest_name}-skill\ndescription: test skill\n---\n\n# Test skill\n"),
+    )
+    .unwrap();
     fs::write(plugin_root.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
 }
 
@@ -931,6 +938,7 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
             root: AbsolutePathBuf::try_from(plugin_root.clone()).unwrap(),
             enabled: true,
             skill_roots: vec![plugin_root.join("skills").abs()],
+            skill_discovery_mode: SkillDiscoveryMode::Recursive,
             disabled_skill_paths: HashSet::new(),
             has_enabled_skills: true,
             mcp_servers: HashMap::from([(
@@ -973,6 +981,7 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
         &[PluginCapabilitySummary {
             config_name: "sample@test".to_string(),
             display_name: "sample".to_string(),
+            plugin_namespace: Some("sample".to_string()),
             description: Some("Plugin that includes the sample MCP server and Skills".to_string(),),
             has_skills: true,
             mcp_server_names: vec!["sample".to_string()],
@@ -1232,6 +1241,7 @@ async fn installed_plugin_telemetry_metadata_collects_capabilities() {
             capability_summary: Some(PluginCapabilitySummary {
                 config_name: "sample@test".to_string(),
                 display_name: "sample".to_string(),
+                plugin_namespace: Some("sample".to_string()),
                 description: None,
                 has_skills: true,
                 mcp_server_names: Vec::new(),
@@ -1264,6 +1274,7 @@ async fn installed_plugin_telemetry_metadata_resolves_persisted_remote_identity(
             capability_summary: Some(PluginCapabilitySummary {
                 config_name: "linear@openai-curated-remote".to_string(),
                 display_name: "linear".to_string(),
+                plugin_namespace: Some("linear".to_string()),
                 description: None,
                 has_skills: true,
                 mcp_server_names: Vec::new(),
@@ -1317,6 +1328,7 @@ async fn installed_plugin_telemetry_metadata_prefers_remote_snapshot_identity() 
             capability_summary: Some(PluginCapabilitySummary {
                 config_name: "linear@openai-curated-remote".to_string(),
                 display_name: "linear".to_string(),
+                plugin_namespace: Some("linear".to_string()),
                 description: None,
                 has_skills: true,
                 mcp_server_names: Vec::new(),
@@ -1354,6 +1366,7 @@ fn capability_summary_telemetry_metadata_uses_local_identity() {
     let summary = PluginCapabilitySummary {
         config_name: "linear@openai-curated-remote".to_string(),
         display_name: "Linear".to_string(),
+        plugin_namespace: Some("linear".to_string()),
         description: Some("Track work".to_string()),
         has_skills: true,
         mcp_server_names: vec!["linear".to_string()],
@@ -1387,6 +1400,7 @@ fn capability_summary_telemetry_metadata_resolves_persisted_remote_identity() {
     let summary = PluginCapabilitySummary {
         config_name: "linear@openai-curated-remote".to_string(),
         display_name: "Linear".to_string(),
+        plugin_namespace: Some("linear".to_string()),
         description: Some("Track work".to_string()),
         has_skills: true,
         mcp_server_names: vec!["linear".to_string()],
@@ -1772,6 +1786,7 @@ enabled = true
         &[PluginCapabilitySummary {
             config_name: "sample@test".to_string(),
             display_name: "sample".to_string(),
+            plugin_namespace: Some("sample".to_string()),
             description: None,
             has_skills: true,
             mcp_server_names: Vec::new(),
@@ -1817,6 +1832,7 @@ async fn plugin_telemetry_metadata_uses_default_mcp_config_path() {
         Some(PluginCapabilitySummary {
             config_name: "sample@test".to_string(),
             display_name: "sample".to_string(),
+            plugin_namespace: Some("sample".to_string()),
             description: None,
             has_skills: false,
             mcp_server_names: vec!["sample".to_string()],
@@ -1858,6 +1874,7 @@ async fn plugin_capability_summary_uses_manifest_mcp_server_objects() {
         Some(PluginCapabilitySummary {
             config_name: "counter-sample@test".to_string(),
             display_name: "counter-sample".to_string(),
+            plugin_namespace: Some("counter-sample".to_string()),
             description: None,
             has_skills: false,
             mcp_server_names: vec!["counter".to_string()],
@@ -2273,7 +2290,6 @@ async fn load_plugin_skills_dedupes_overlapping_manifest_roots() {
         interface: None,
     };
     let plugin_id = PluginId::parse("sample@test").expect("plugin id should parse");
-
     let resolved = load_plugin_skills(
         &plugin_root,
         &plugin_id,
@@ -2502,6 +2518,7 @@ async fn load_plugins_preserves_disabled_plugins_without_effective_contributions
             root: AbsolutePathBuf::try_from(plugin_root).unwrap(),
             enabled: false,
             skill_roots: Vec::new(),
+            skill_discovery_mode: SkillDiscoveryMode::Recursive,
             disabled_skill_paths: HashSet::new(),
             has_enabled_skills: false,
             mcp_servers: HashMap::new(),
@@ -2679,6 +2696,7 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
         root: AbsolutePathBuf::try_from(codex_home.path().join(dir_name)).unwrap(),
         enabled: true,
         skill_roots: Vec::new(),
+        skill_discovery_mode: SkillDiscoveryMode::Recursive,
         disabled_skill_paths: HashSet::new(),
         has_enabled_skills: false,
         mcp_servers: HashMap::new(),
@@ -2690,6 +2708,12 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
     let summary = |config_name: &str, display_name: &str| PluginCapabilitySummary {
         config_name: config_name.to_string(),
         display_name: display_name.to_string(),
+        plugin_namespace: Some(
+            config_name
+                .split_once('@')
+                .map_or(config_name, |(name, _)| name)
+                .to_string(),
+        ),
         description: None,
         ..PluginCapabilitySummary::default()
     };
@@ -2854,7 +2878,7 @@ async fn plugin_cache_ignores_unrelated_session_overrides() {
 }
 
 #[tokio::test]
-async fn skill_snapshots_resolve_remote_plugin_identity_from_authoritative_source() {
+async fn skill_roots_resolve_remote_plugin_identity_from_authoritative_source() {
     let mut duplicate_plugin = remote_installed_plugin("sample");
     duplicate_plugin.id = "plugins~Plugin_duplicate".to_string();
 
@@ -2867,7 +2891,6 @@ async fn skill_snapshots_resolve_remote_plugin_identity_from_authoritative_sourc
         ),
     ] {
         let codex_home = TempDir::new().unwrap();
-        let codex_home_abs = codex_home.path().to_path_buf().abs();
         let plugin_root = codex_home
             .path()
             .join("plugins/cache/openai-curated-remote/sample/local");
@@ -2879,8 +2902,10 @@ async fn skill_snapshots_resolve_remote_plugin_identity_from_authoritative_sourc
             "sample/local",
             "sample",
         );
-        let skill_path = plugin_root.join("skills/SKILL.md");
-        write_file(&skill_path, "---\nname: search\ndescription: first\n---\n");
+        write_file(
+            &plugin_root.join("skills/SKILL.md"),
+            "---\nname: search\ndescription: first\n---\n",
+        );
         write_file(
             &codex_home.path().join(CONFIG_TOML_FILE),
             r#"[features]
@@ -2915,39 +2940,21 @@ enabled = true
                 .as_deref(),
             expected_remote_plugin_id
         );
-        write_file(&skill_path, "---\nname: search\ndescription: second\n---\n");
-
-        let skills_input = SkillsLoadInput::new(
-            codex_home_abs.clone(),
-            plugin_outcome.effective_plugin_skill_roots(),
-            config.config_layer_stack.clone(),
-            /*bundled_skills_enabled*/ false,
-        )
-        .with_plugin_skill_snapshots(manager.plugin_skill_snapshots_for_config(&config));
-        let skills_service =
-            SkillsService::new(codex_home_abs, /*bundled_skills_enabled*/ false);
-        let snapshot = skills_service
-            .snapshot_for_config(&skills_input, /*fs*/ None)
-            .await;
-
         assert_eq!(
-            snapshot
-                .outcome()
-                .skills
-                .iter()
-                .map(|skill| {
+            plugin_outcome
+                .effective_plugin_skill_roots()
+                .into_iter()
+                .map(|root| {
                     (
-                        skill.description.as_str(),
-                        skill.plugin_id.as_deref(),
-                        skill.remote_plugin_id.as_deref(),
+                        root.plugin_identity.plugin_id,
+                        root.plugin_identity.remote_plugin_id,
                     )
                 })
                 .collect::<Vec<_>>(),
             vec![(
-                "first",
-                Some("sample@openai-curated-remote"),
-                expected_remote_plugin_id,
-            )]
+                "sample@openai-curated-remote".to_string(),
+                expected_remote_plugin_id.map(str::to_string),
+            )],
         );
     }
 }
@@ -3983,6 +3990,96 @@ plugins = true
         listed_detail.mcp_server_names,
         vec!["sample-mcp".to_string()]
     );
+}
+
+#[tokio::test]
+async fn agent_plugin_read_and_tool_suggestions_use_portable_capabilities_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    let plugin_root = repo_root.join("agent-plugin");
+    fs::create_dir_all(repo_root.join(".git")).unwrap();
+    fs::create_dir_all(repo_root.join(".agents/plugins")).unwrap();
+    write_file(
+        &repo_root.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"debug","plugins":[{"name":"agent-plugin","source":"./agent-plugin"}]}"#,
+    );
+    write_file(
+        &plugin_root.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"agent.tools"}"#,
+    );
+    write_file(
+        &plugin_root.join("skills/direct/SKILL.md"),
+        "---\nname: direct\ndescription: Direct skill\n---\n",
+    );
+    write_file(
+        &plugin_root.join("skills/group/nested/SKILL.md"),
+        "---\nname: nested\ndescription: Nested skill\n---\n",
+    );
+    write_file(
+        &plugin_root.join("mcp.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"portable":{"type":"stdio","command":"echo"}}}"#,
+    );
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"apps":"./.app.json","hooks":"./hooks/hooks.json"}"#,
+    );
+    write_file(
+        &plugin_root.join(".app.json"),
+        r#"{"apps":{"legacy":{"id":"connector_legacy"}}}"#,
+    );
+    write_file(
+        &plugin_root.join("hooks/hooks.json"),
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo legacy"}]}]}}"#,
+    );
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+
+    let config = load_config(tmp.path(), &repo_root).await;
+    let manager = PluginsManager::new(tmp.path().to_path_buf());
+    let plugin = manager
+        .list_marketplaces_for_config(
+            &config,
+            &[AbsolutePathBuf::try_from(repo_root).unwrap()],
+            /*include_openai_curated*/ false,
+        )
+        .unwrap()
+        .marketplaces
+        .into_iter()
+        .find(|marketplace| marketplace.name == "debug")
+        .unwrap()
+        .plugins
+        .into_iter()
+        .find(|plugin| plugin.name == "agent-plugin")
+        .unwrap();
+    let detail = manager
+        .read_plugin_detail_for_marketplace_plugin(&config, "debug", plugin.clone())
+        .await
+        .unwrap();
+    let suggestion = manager
+        .tool_suggest_metadata_for_marketplace_plugin(
+            "debug",
+            &plugin,
+            &SkillConfigRules::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["agent.tools:direct"]
+    );
+    assert_eq!(detail.mcp_server_names, vec!["portable"]);
+    assert!(detail.apps.is_empty());
+    assert!(detail.hooks.is_empty());
+    assert!(suggestion.has_skills);
+    assert_eq!(suggestion.mcp_server_names, vec!["portable"]);
+    assert!(suggestion.app_connector_ids.is_empty());
 }
 
 #[tokio::test]

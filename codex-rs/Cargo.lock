@@ -2142,6 +2142,7 @@ dependencies = [
  "codex-experimental-api-macros",
  "codex-extension-items",
  "codex-protocol",
+ "codex-secrets",
  "codex-shell-command",
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
@@ -2343,6 +2344,7 @@ dependencies = [
  "codex-connectors",
  "codex-core",
  "codex-git-utils",
+ "codex-http-client",
  "codex-login",
  "codex-model-provider",
  "codex-plugin",
@@ -2573,6 +2575,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2763,6 +2766,7 @@ dependencies = [
  "codex-thread-store",
  "codex-tools",
  "codex-utils-absolute-path",
+ "codex-utils-audio",
  "codex-utils-cache",
  "codex-utils-cargo-bin",
  "codex-utils-file-lock",
@@ -2805,7 +2809,6 @@ dependencies = [
  "sha1 0.10.6",
  "shlex",
  "similar",
- "symphonia",
  "tempfile",
  "test-case",
  "test-log",
@@ -2917,19 +2920,17 @@ dependencies = [
  "codex-model-provider",
  "codex-otel",
  "codex-protocol",
- "codex-shell-command",
  "codex-skills",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
  "codex-utils-plugins",
- "dirs",
+ "codex-utils-string",
  "dunce",
  "futures",
  "pretty_assertions",
  "serde",
  "serde_json",
  "serde_yaml",
- "shlex",
  "tempfile",
  "tokio",
  "toml 0.9.11+spec-1.1.0",
@@ -4088,16 +4089,23 @@ name = "codex-skills"
 version = "0.0.0"
 dependencies = [
  "codex-protocol",
+ "codex-shell-command",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
  "include_dir",
+ "pretty_assertions",
+ "serde",
+ "serde_yaml",
+ "shlex",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
 name = "codex-skills-extension"
 version = "0.0.0"
 dependencies = [
+ "codex-config",
  "codex-core-skills",
  "codex-exec-server",
  "codex-extension-api",
@@ -4108,15 +4116,23 @@ dependencies = [
  "codex-skills",
  "codex-tools",
  "codex-utils-absolute-path",
+ "codex-utils-cargo-bin",
  "codex-utils-path-uri",
+ "codex-utils-plugins",
  "codex-utils-string",
+ "dirs",
+ "dunce",
  "futures",
+ "insta",
  "opentelemetry_sdk",
  "pretty_assertions",
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "tempfile",
  "tokio",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
  "url",
 ]
@@ -4197,6 +4213,7 @@ dependencies = [
  "codex-state",
  "codex-utils-absolute-path",
  "codex-utils-path",
+ "codex-utils-path-uri",
  "futures",
  "pretty_assertions",
  "pulldown-cmark",
@@ -4380,6 +4397,20 @@ name = "codex-utils-approval-presets"
 version = "0.0.0"
 dependencies = [
  "codex-protocol",
+]
+
+[[package]]
+name = "codex-utils-audio"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "codex-protocol",
+ "codex-utils-cache",
+ "codex-utils-string",
+ "pretty_assertions",
+ "symphonia",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
