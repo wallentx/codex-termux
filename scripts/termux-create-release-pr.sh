@@ -119,10 +119,16 @@ restore_merge_authoritative_paths() {
   local -a release_restore_paths=()
 
   for path in "${TERMUX_RELEASE_CODE_PATHS[@]}"; do
-    if git cat-file -e "HEAD:${path}" 2>/dev/null; then
-      patch_restore_paths+=("${path}")
+    if termux_path_in_list "${path}" "${TERMUX_RELEASE_PATCH_AUTHORITATIVE_CODE_PATHS[@]}"; then
+      if git cat-file -e "HEAD:${path}" 2>/dev/null; then
+        patch_restore_paths+=("${path}")
+      elif git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
+        patch_remove_paths+=("${path}")
+      fi
+    elif git cat-file -e "${release_ref}:${path}" 2>/dev/null; then
+      release_restore_paths+=("${path}")
     elif git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
-      patch_remove_paths+=("${path}")
+      release_remove_paths+=("${path}")
     fi
   done
 
