@@ -48,8 +48,18 @@ use crate::server::EffectiveMcpServer;
 use crate::tool_catalog_cache::McpToolCatalogCache;
 use crate::tools::ToolInfo;
 
+/// Controls when one task starts its optional MCP servers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpStartupPolicy {
+    /// Start configured servers when their task's MCP runtime is published.
+    Eager,
+    /// Start optional servers with cached tool definitions on first use.
+    LazyWhenCached,
+}
+
 /// Everything needed to materialize one exact MCP configuration.
 pub struct McpRuntimeInput {
+    pub startup_policy: McpStartupPolicy,
     pub config: Arc<McpConfig>,
     pub plugins_available: bool,
     pub ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
@@ -293,6 +303,29 @@ impl McpRuntime {
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
         }
+    }
+
+    /// Detects newly saved credentials for servers whose startup failed authentication.
+    pub async fn updated_oauth_credentials_after_auth_failure(&self) -> Vec<String> {
+        let current = self.current.load_full();
+        let Some(config) = current.config.as_ref() else {
+            return Vec::new();
+        };
+        current
+            .connections
+            .updated_oauth_credentials_after_auth_failure(config)
+            .await
+    }
+
+    /// Checks the current generation before retrying servers detected outside the refresh gate.
+    pub async fn has_authentication_failed_servers(&self, server_names: &[String]) -> bool {
+        self.current
+            .load_full()
+            .connections
+            .authentication_failed_servers()
+            .await
+            .into_iter()
+            .any(|server_name| server_names.contains(&server_name))
     }
 
     /// Waits for the selected server without capturing an execution binding.

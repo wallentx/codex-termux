@@ -2035,6 +2035,7 @@ dependencies = [
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
+ "codex-queue-extension",
  "codex-rmcp-client",
  "codex-rollout",
  "codex-sandboxing",
@@ -2407,6 +2408,7 @@ dependencies = [
  "codex-state",
  "codex-stdio-to-uds",
  "codex-terminal-detection",
+ "codex-thread-store",
  "codex-tui",
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
@@ -2995,6 +2997,7 @@ dependencies = [
  "bytes",
  "clatter",
  "codex-api",
+ "codex-config",
  "codex-exec-server-protocol",
  "codex-exec-server-test-support",
  "codex-file-system",
@@ -3005,11 +3008,13 @@ dependencies = [
  "codex-sandboxing",
  "codex-test-binary-support",
  "codex-utils-absolute-path",
+ "codex-utils-home-dir",
  "codex-utils-path-uri",
  "codex-utils-pty",
  "codex-utils-rustls-provider",
  "codex-websocket-client",
  "ctor 0.6.3",
+ "dirs",
  "futures",
  "http 1.4.0",
  "libc",
@@ -3100,6 +3105,7 @@ dependencies = [
  "codex-protocol",
  "codex-tools",
  "codex-utils-absolute-path",
+ "codex-utils-path-uri",
  "pretty_assertions",
  "serde_json",
  "tokio",
@@ -3882,6 +3888,27 @@ dependencies = [
  "ts-rs",
  "uuid",
  "wildmatch",
+]
+
+[[package]]
+name = "codex-queue-extension"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-core",
+ "codex-extension-api",
+ "codex-protocol",
+ "codex-state",
+ "codex-thread-store",
+ "codex-utils-absolute-path",
+ "core_test_support",
+ "pretty_assertions",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
