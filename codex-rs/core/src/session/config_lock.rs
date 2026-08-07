@@ -154,9 +154,13 @@ fn save_config_resolved_fields(
         .features
         .get_or_insert_with(FeaturesToml::default);
     features.materialize_resolved_enabled(config.features.get());
-    if config.tool_registry.error_on_tool_collisions || features.tool_registry.is_some() {
+    if config.tool_registry.error_on_tool_collisions
+        || config.tool_registry.include_tool_metadata
+        || features.tool_registry.is_some()
+    {
         features.tool_registry = Some(ToolRegistryConfigToml {
             error_on_tool_collisions: Some(config.tool_registry.error_on_tool_collisions),
+            include_tool_metadata: Some(config.tool_registry.include_tool_metadata),
         });
     }
     let mut multi_agent_v2: MultiAgentV2ConfigToml =
@@ -269,10 +273,10 @@ mod tests {
         let mut sc = crate::session::tests::make_session_configuration_for_tests().await;
         let mut config = (*sc.original_config_do_not_use).clone();
         config.tool_registry.error_on_tool_collisions = true;
+        config.tool_registry.include_tool_metadata = true;
         config.multi_agent_v2.subagent_developer_instructions =
             Some("Locked subagent developer instructions.".to_string());
         config.token_budget = Some(crate::config::TokenBudgetConfig {
-            mode: codex_features::TokenBudgetMode::Thread,
             reminder_threshold_tokens: Some(16_000),
             reminder_message_template: "Locked reminder: {n_remaining} tokens.".to_string(),
             guidance_message: Some("Locked context-window guidance.".to_string()),
@@ -330,6 +334,7 @@ mod tests {
             features.tool_registry,
             Some(ToolRegistryConfigToml {
                 error_on_tool_collisions: Some(true),
+                include_tool_metadata: Some(true),
             })
         );
         let feature_entries = features.entries();
@@ -372,7 +377,6 @@ mod tests {
             features.token_budget,
             Some(FeatureToml::Config(TokenBudgetConfigToml {
                 enabled: Some(true),
-                mode: Some(codex_features::TokenBudgetMode::Thread),
                 reminder_threshold_tokens: Some(16_000),
                 reminder_message_template: Some(
                     "Locked reminder: {n_remaining} tokens.".to_string()

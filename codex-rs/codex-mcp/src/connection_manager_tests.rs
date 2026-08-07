@@ -115,6 +115,7 @@ impl McpConnectionSet {
                 connection: Arc::new(McpServerConnection {
                     identity: None,
                     client,
+                    startup_trigger: None,
                 }),
                 metadata: McpServerMetadata {
                     environment_id: String::new(),
@@ -1325,6 +1326,7 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(config),
             plugins_available: false,
             ready_selected_capability_roots: Vec::new(),
@@ -1635,6 +1637,9 @@ async fn tool_catalog_cache_sanitizes_tools_and_tracks_environment_generation() 
     let first_environment = resolve_environment();
     let first_environment_weak = Arc::downgrade(&first_environment);
     let first_context = cache_context(&first_environment);
+    first_context.publish_if_newest(first_context.begin_fetch(), &[]);
+    assert!(!first_context.has_tools());
+
     let mut tool = create_test_tool("docs", "search");
     tool.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
     first_context.publish_if_newest(first_context.begin_fetch(), &[tool]);
@@ -2062,12 +2067,10 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
         deadline_after_publication,
         "publishing a catalog must not install a stale startup deadline"
     );
-    let cached = tokio::time::timeout(
-        Duration::from_millis(1),
-        capture_binding(&create_connection_set()),
-    )
-    .await
-    .expect("cached tools should be immediately available to later threads");
+    let cached_manager = create_connection_set();
+    let cached = tokio::time::timeout(Duration::from_millis(1), capture_binding(&cached_manager))
+        .await
+        .expect("cached tools should be immediately available to later threads");
     assert_eq!(
         cached
             .tools()
@@ -2079,12 +2082,9 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
 
     tokio::time::advance(Duration::from_secs(30 * 60 + 1)).await;
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(1),
-            capture_binding(&create_connection_set()),
-        )
-        .await
-        .is_err(),
+        tokio::time::timeout(Duration::from_millis(1), capture_binding(&cached_manager))
+            .await
+            .is_err(),
         "an expired catalog should receive a fresh startup grace"
     );
 
@@ -3070,6 +3070,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(runtime_config.clone()),
                 plugins_available: false,
                 ready_selected_capability_roots: Vec::new(),
@@ -3182,6 +3183,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(crate::mcp::tests::test_mcp_config(
                 codex_home.path().to_path_buf(),
             )),
@@ -3303,15 +3305,33 @@ fn mcp_init_error_display_prompts_for_github_pat() {
 #[test]
 fn mcp_init_error_display_prompts_for_login_when_auth_required() {
     let server_name = "example";
-    let err: StartupOutcomeError = anyhow::anyhow!("Auth required for server").into();
-
-    let display = mcp_init_error_display(server_name, /*config*/ None, &err);
-
     let expected = format!(
         "The {server_name} MCP server is not logged in. Run `codex mcp login {server_name}`."
     );
+    let executor_config: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "https://example.com/mcp",
+        "environment_id": "executor-1",
+    }))
+    .expect("executor MCP configuration should deserialize");
 
-    assert_eq!(expected, display);
+    for error in [
+        anyhow::anyhow!("Auth required for server").into(),
+        StartupOutcomeError::Failed {
+            error: "OAuth refresh token was rejected: invalid_grant".to_string(),
+            is_authentication_required: true,
+        },
+    ] {
+        let display = mcp_init_error_display(server_name, /*config*/ None, &error);
+        assert_eq!(expected, display);
+
+        let executor_display = mcp_init_error_display(server_name, Some(&executor_config), &error);
+        assert_eq!(
+            format!(
+                "The {server_name} MCP server is not logged in. Use your client's MCP OAuth sign-in flow."
+            ),
+            executor_display
+        );
+    }
 }
 
 #[test]
@@ -3338,7 +3358,12 @@ fn mcp_startup_failure_reason_requires_existing_oauth_and_auth_failure() {
         ),
         (Some(McpAuthState::Unsupported), true, None),
         (Some(McpAuthState::BearerToken), true, None),
-        (Some(McpAuthState::OAuth), true, None),
+        (
+            Some(McpAuthState::OAuth),
+            true,
+            Some(McpStartupFailureReason::ReauthenticationRequired),
+        ),
+        (Some(McpAuthState::OAuth), false, None),
         (None, true, None),
     ] {
         let error = StartupOutcomeError::Failed {
@@ -3482,6 +3507,7 @@ async fn manager_with_reusable_ready_server(
             connection: Arc::new(McpServerConnection {
                 identity: Some(reusable_server_identity(config, runtime_context)),
                 client: create_ready_async_managed_client(tools).await,
+                startup_trigger: None,
             }),
             metadata: McpServerMetadata::from(&server),
             tool_filter: ToolFilter::from_config(config),
@@ -3503,6 +3529,7 @@ async fn reconcile_reusable_server(
         Some(previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(crate::mcp::tests::test_mcp_config(
                 codex_home.path().to_path_buf(),
             )),
@@ -3613,6 +3640,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
                     startup_reconnect: None,
                     cancel_token: CancellationToken::new(),
                 },
+                startup_trigger: None,
             }),
             metadata: McpServerMetadata::from(&server),
             tool_filter: ToolFilter::from_config(&config),
@@ -3726,6 +3754,7 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
         Some(&previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(mcp_config),
             plugins_available: false,
             ready_selected_capability_roots: Vec::new(),
@@ -3783,6 +3812,7 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
         Some(&previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(mcp_config),
             plugins_available: false,
             ready_selected_capability_roots: Vec::new(),
@@ -3917,6 +3947,7 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
             startup_reconnect: None,
             cancel_token: CancellationToken::new(),
         },
+        startup_trigger: None,
     });
 
     assert!(!client.is_closed().await);

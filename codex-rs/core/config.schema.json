@@ -365,6 +365,12 @@
     "CodeModeConfigToml": {
       "additionalProperties": false,
       "properties": {
+        "default_exec_yield_time_ms": {
+          "description": "Default yield timeout for code-mode exec calls, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "direct_only_tool_namespaces": {
           "description": "Exact tool namespaces to expose only as direct model tools. These tools bypass deferral, remain top-level in code-mode-only sessions, and are omitted from the nested code-mode tool surface.",
           "items": {
@@ -454,6 +460,9 @@
               ]
             },
             "auth_elicitation": {
+              "type": "boolean"
+            },
+            "background_paginated_rollout_migration": {
               "type": "boolean"
             },
             "browser_use": {
@@ -754,6 +763,9 @@
               "type": "boolean"
             },
             "unified_exec_zsh_fork": {
+              "type": "boolean"
+            },
+            "unified_image_budget": {
               "type": "boolean"
             },
             "use_agent_identity": {
@@ -1291,6 +1303,43 @@
           },
           "required": [
             "command",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "input": {
+              "additionalProperties": true,
+              "default": {},
+              "type": "object"
+            },
+            "server": {
+              "type": "string"
+            },
+            "statusMessage": {
+              "default": null,
+              "type": "string"
+            },
+            "timeout": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "mcp_tool"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "server",
+            "tool",
             "type"
           ],
           "type": "object"
@@ -3122,14 +3171,6 @@
           "maxLength": 2000,
           "type": "string"
         },
-        "mode": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/TokenBudgetMode"
-            }
-          ],
-          "description": "Select whether context-window metadata identifies the thread or agent name."
-        },
         "reminder_message_template": {
           "description": "Reminder template. `{n_remaining}` is replaced with the tokens remaining before auto-compaction.",
           "maxLength": 2000,
@@ -3144,14 +3185,6 @@
         }
       },
       "type": "object"
-    },
-    "TokenBudgetMode": {
-      "description": "Identity included in the context-window developer message.",
-      "enum": [
-        "thread",
-        "name"
-      ],
-      "type": "string"
     },
     "ToolExposureSurface": {
       "description": "A model-facing surface on which a tool can be exposed.",
@@ -3184,6 +3217,10 @@
       "properties": {
         "error_on_tool_collisions": {
           "description": "Fail the turn when multiple tools share the same effective name.",
+          "type": "boolean"
+        },
+        "include_tool_metadata": {
+          "description": "Include authoritative tool information in request metadata.",
           "type": "boolean"
         }
       },
@@ -5087,6 +5124,9 @@
         "auth_elicitation": {
           "type": "boolean"
         },
+        "background_paginated_rollout_migration": {
+          "type": "boolean"
+        },
         "browser_use": {
           "type": "boolean"
         },
@@ -5385,6 +5425,9 @@
           "type": "boolean"
         },
         "unified_exec_zsh_fork": {
+          "type": "boolean"
+        },
+        "unified_image_budget": {
           "type": "boolean"
         },
         "use_agent_identity": {
