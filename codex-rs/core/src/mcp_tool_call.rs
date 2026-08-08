@@ -1161,6 +1161,10 @@ fn build_mcp_tool_call_request_meta(
     metadata: Option<&McpToolApprovalMetadata>,
 ) -> Option<serde_json::Value> {
     let mut request_meta = serde_json::Map::new();
+    request_meta.insert(
+        "callId".to_string(),
+        serde_json::Value::String(call_id.to_string()),
+    );
 
     if let Some(turn_metadata) = turn_context
         .turn_metadata_state
@@ -1289,6 +1293,7 @@ async fn maybe_request_mcp_tool_approval(
     let approvals_reviewer = connectors::mcp_approvals_reviewer_from_layers(
         &config.config_layer_stack,
         config.approvals_reviewer,
+        Some(turn_context.model_info.slug.as_str()),
         &invocation.server,
         metadata.connector_id.as_deref(),
     );
@@ -1451,6 +1456,7 @@ pub(crate) fn mcp_approvals_reviewer(
 ) -> ApprovalsReviewer {
     connectors::mcp_approvals_reviewer(
         turn_context.config.as_ref(),
+        Some(turn_context.model_info.slug.as_str()),
         server_name,
         metadata.and_then(|metadata| metadata.connector_id.as_deref()),
     )

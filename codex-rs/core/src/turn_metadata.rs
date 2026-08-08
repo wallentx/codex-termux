@@ -12,21 +12,21 @@ use std::sync::atomic::Ordering;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
-use crate::responses_metadata::CODE_MODE_TOOL_NAMES_KEY;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
 use crate::responses_metadata::TurnMetadataWorkspace;
+use crate::responses_metadata::TurnToolNamespacesInfo;
 use crate::responses_metadata::filter_extra_metadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::responses_metadata::subagent_metadata_kind;
+use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
 use codex_git_utils::get_git_remote_urls_assume_git_repo;
 use codex_git_utils::get_git_repo_root;
 use codex_git_utils::get_has_changes_in_repo;
 use codex_git_utils::get_head_commit_hash;
 use codex_protocol::ThreadId;
-use codex_protocol::ToolName;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -77,12 +77,16 @@ pub async fn detached_memory_responses_metadata(
     window_id: String,
     session_source: &SessionSource,
     cwd: &AbsolutePathBuf,
+    permission_profile: &PermissionProfile,
     sandbox: Option<&str>,
 ) -> CodexResponsesMetadata {
     CodexResponsesMetadata {
         request_kind: Some(CodexResponsesRequestKind::Memory),
         subagent_header: subagent_header_value(session_source),
         sandbox: sandbox.map(ToString::to_string),
+        sandbox_mode: Some(
+            permission_profile_policy_tag(permission_profile, cwd.as_path()).to_string(),
+        ),
         workspaces: memory_workspaces(cwd).await,
         ..CodexResponsesMetadata::new(installation_id, session_id, thread_id, window_id)
     }
@@ -102,8 +106,9 @@ pub(crate) struct TurnMetadataState {
     thread_source: Option<ThreadSource>,
     turn_id: String,
     sandbox: Option<String>,
+    sandbox_mode: Option<String>,
     enriched_workspaces: RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>,
-    code_mode_tool_names: RwLock<Option<BTreeMap<String, ToolName>>>,
+    tool_namespaces_info: RwLock<Option<TurnToolNamespacesInfo>>,
     turn_started_at_unix_ms: RwLock<Option<i64>>,
     responsesapi_client_metadata: RwLock<BTreeMap<String, String>>,
     user_input_requested_during_turn: AtomicBool,
@@ -134,6 +139,8 @@ impl TurnMetadataState {
             )
             .to_string(),
         );
+        let sandbox_mode =
+            Some(permission_profile_policy_tag(permission_profile, cwd.as_path()).to_string());
         Self {
             cwd,
             repo_root,
@@ -147,8 +154,9 @@ impl TurnMetadataState {
             thread_source,
             turn_id,
             sandbox,
+            sandbox_mode,
             enriched_workspaces: RwLock::new(None),
-            code_mode_tool_names: RwLock::new(None),
+            tool_namespaces_info: RwLock::new(None),
             turn_started_at_unix_ms: RwLock::new(None),
             responsesapi_client_metadata: RwLock::new(BTreeMap::new()),
             user_input_requested_during_turn: AtomicBool::new(false),
@@ -160,12 +168,12 @@ impl TurnMetadataState {
         &self,
         context: McpTurnMetadataContext<'_>,
     ) -> Option<serde_json::Value> {
-        let Value::Object(mut metadata) =
-            self.responses_metadata_template().turn_metadata_value()?
-        else {
+        let mut responses_metadata = self.responses_metadata_template();
+        // Never serialize harness-owned tool inventory for external MCP servers.
+        responses_metadata.tool_namespaces_info = None;
+        let Value::Object(mut metadata) = responses_metadata.turn_metadata_value()? else {
             return None;
         };
-        metadata.remove(CODE_MODE_TOOL_NAMES_KEY); // Precaution: avoid exposing tool data to external MCPs.
         metadata.remove(PARENT_TURN_ID_KEY);
         metadata.insert(
             MODEL_KEY.to_string(),
@@ -215,15 +223,12 @@ impl TurnMetadataState {
             .store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn set_code_mode_tool_names(
-        &self,
-        code_mode_tool_names: BTreeMap<String, ToolName>,
-    ) {
+    pub(crate) fn set_tool_namespaces_info(&self, tool_namespaces_info: TurnToolNamespacesInfo) {
         *self
-            .code_mode_tool_names
+            .tool_namespaces_info
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            (!code_mode_tool_names.is_empty()).then_some(code_mode_tool_names);
+            (!tool_namespaces_info.is_empty()).then_some(tool_namespaces_info);
     }
 
     pub(crate) fn set_parent_turn_id(&self, parent_turn_id: String) {
@@ -262,9 +267,10 @@ impl TurnMetadataState {
             subagent_kind: self.subagent_kind.clone(),
             thread_source: self.thread_source.clone(),
             sandbox: self.sandbox.clone(),
+            sandbox_mode: self.sandbox_mode.clone(),
             workspaces: self.current_workspaces(),
-            code_mode_tool_names: self
-                .code_mode_tool_names
+            tool_namespaces_info: self
+                .tool_namespaces_info
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),

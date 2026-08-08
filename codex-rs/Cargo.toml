@@ -41,7 +41,7 @@ members = [
     "core",
     "core-api",
     "core-plugins",
-    "core-skills",
+    "diagnostics",
     "hooks",
     "http-client",
     "secrets",
@@ -134,7 +134,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.148.0-alpha.2"
+version = "0.148.0-alpha.5"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -183,7 +183,7 @@ codex-context-fragments = { path = "context-fragments" }
 codex-core = { path = "core" }
 codex-core-api = { path = "core-api" }
 codex-core-plugins = { path = "core-plugins" }
-codex-core-skills = { path = "core-skills" }
+codex-diagnostics = { path = "diagnostics" }
 codex-exec = { path = "exec" }
 codex-file-system = { path = "file-system" }
 codex-exec-server-protocol = { path = "exec-server-protocol" }

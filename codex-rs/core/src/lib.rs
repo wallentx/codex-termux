@@ -74,6 +74,7 @@ pub use mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
 pub use mention_syntax::TOOL_MENTION_SIGIL;
 pub use utils::path_utils;
 pub(crate) mod plugins;
+pub use plugins::plugins_manager_for_config;
 #[doc(hidden)]
 pub(crate) mod prompt_debug;
 #[doc(hidden)]
@@ -91,12 +92,9 @@ mod session_prefix;
 mod session_startup_prewarm;
 pub mod skills;
 pub(crate) use skills::HostSkillsService;
-pub(crate) use skills::SkillInjections;
 pub(crate) use skills::SkillMetadata;
-pub(crate) use skills::build_skill_injections;
 pub(crate) use skills::build_skill_name_counts;
 pub(crate) use skills::collect_explicit_skill_mentions;
-pub(crate) use skills::injection;
 pub(crate) use skills::maybe_emit_implicit_skill_invocation;
 pub(crate) use skills::skills_load_input_from_config;
 mod stream_events_utils;
