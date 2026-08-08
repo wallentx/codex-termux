@@ -104,6 +104,7 @@ use codex_protocol::config_types::WebSearchConfig;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ModelsResponse;
@@ -689,6 +690,9 @@ pub struct Config {
     /// Base instructions override.
     pub base_instructions: Option<String>,
 
+    /// Origin of the configured base instructions when supplied by another session or lockfile.
+    pub base_instructions_provenance: Option<BaseInstructionsProvenance>,
+
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
 
@@ -864,7 +868,7 @@ pub struct Config {
     /// Combined provider map (defaults plus user-defined providers).
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
-    /// Maximum number of bytes to include from an AGENTS.md project doc file.
+    /// Maximum total bytes of project instruction content across all selected environments.
     pub project_doc_max_bytes: usize,
 
     /// Additional filenames to try when looking for project-level docs.
@@ -1115,8 +1119,8 @@ pub struct Config {
 pub struct ToolRegistryConfig {
     /// Fail the turn when multiple tools share the same effective name.
     pub error_on_tool_collisions: bool,
-    /// Include authoritative tool information in request metadata.
-    pub include_tool_metadata: bool,
+    /// Include authoritative tool information in per-turn request metadata.
+    pub turn_metadata_includes_tool_info: bool,
 }
 
 const DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS: u64 = 30_000;
@@ -1539,6 +1543,9 @@ impl ConfigBuilder {
                 lock_config_layer_stack,
             )
             .await?;
+            if let Some(provenance) = lockfile_toml.base_instructions_provenance {
+                config.base_instructions_provenance = Some(provenance);
+            }
             config.config_lock_toml = Some(Arc::new(expected_lock_config));
             config.config_lock_allow_codex_version_mismatch = allow_codex_version_mismatch;
             config.config_lock_save_fields_resolved_from_model_catalog =
@@ -1641,7 +1648,12 @@ impl Config {
             model_context_window: self.model_context_window,
             model_auto_compact_token_limit: self.model_auto_compact_token_limit,
             tool_output_token_limit: self.tool_output_token_limit,
-            base_instructions: self.base_instructions.clone(),
+            base_instructions: self.base_instructions.clone().filter(|_| {
+                !matches!(
+                    self.base_instructions_provenance,
+                    Some(BaseInstructionsProvenance::Model { .. })
+                )
+            }),
             personality_enabled: self.features.enabled(Feature::Personality),
             personality: self.personality,
             model_catalog: self.model_catalog.clone(),
@@ -3258,6 +3270,7 @@ impl Config {
             feedback: _,
             approval_policy: mut constrained_approval_policy,
             approvals_reviewer: mut constrained_approvals_reviewer,
+            auto_review_required_models: _,
             permission_profile: mut constrained_permission_profile,
             windows_sandbox_mode: mut constrained_windows_sandbox_mode,
             windows_sandbox_private_desktop: _,
@@ -3719,11 +3732,11 @@ impl Config {
                 .and_then(|features| features.tool_registry.as_ref())
                 .and_then(|config| config.error_on_tool_collisions)
                 .unwrap_or_default(),
-            include_tool_metadata: cfg
+            turn_metadata_includes_tool_info: cfg
                 .features
                 .as_ref()
                 .and_then(|features| features.tool_registry.as_ref())
-                .and_then(|config| config.include_tool_metadata)
+                .and_then(|config| config.turn_metadata_includes_tool_info)
                 .unwrap_or_default(),
         };
         let code_mode = resolve_code_mode_config(&cfg);
@@ -3922,6 +3935,9 @@ impl Config {
         let base_instructions = base_instructions
             .or(file_base_instructions)
             .or(cfg.instructions.clone());
+        let base_instructions_provenance = base_instructions
+            .as_ref()
+            .map(|_| BaseInstructionsProvenance::Custom);
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
         let include_permissions_instructions = cfg.include_permissions_instructions.unwrap_or(true);
         let include_apps_instructions = cfg.include_apps_instructions.unwrap_or(true);
@@ -4128,6 +4144,7 @@ impl Config {
             enforce_residency: enforce_residency.value,
             notify: cfg.notify,
             base_instructions,
+            base_instructions_provenance,
             personality,
             developer_instructions,
             compact_prompt,

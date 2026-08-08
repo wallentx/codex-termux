@@ -1,6 +1,7 @@
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
+use crate::plugins::plugins_manager_for_config;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
@@ -67,7 +68,6 @@ use codex_config::types::TuiNotificationSettings;
 use codex_config::types::TuiPetAnchor;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_config::types::WindowsToml;
-use codex_core_plugins::PluginsManager;
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
@@ -499,7 +499,7 @@ async fn load_config_resolves_non_prefixed_mcp_tool_servers() -> std::io::Result
 
         assert_eq!(config.non_prefixed_mcp_tool_servers, expected_servers);
         assert_eq!(config.prefix_mcp_tool_names(), expected_prefix);
-        let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+        let plugins_manager = plugins_manager_for_config(&config);
         let mcp_config = config.to_mcp_config(&plugins_manager).await;
         assert_eq!(mcp_config.prefix_mcp_tool_names, expected_prefix);
         assert_eq!(
@@ -574,7 +574,7 @@ disable_in_process_fallback = true
 async fn load_config_resolves_tool_registry_config() -> std::io::Result<()> {
     let codex_home = tempdir()?;
 
-    for (config_toml, error_on_tool_collisions, include_tool_metadata) in [
+    for (config_toml, error_on_tool_collisions, turn_metadata_includes_tool_info) in [
         ("", false, false),
         (
             "[features.tool_registry]\nerror_on_tool_collisions = true\n",
@@ -582,7 +582,7 @@ async fn load_config_resolves_tool_registry_config() -> std::io::Result<()> {
             false,
         ),
         (
-            "[features.tool_registry]\ninclude_tool_metadata = true\n",
+            "[features.tool_registry]\nturn_metadata_includes_tool_info = true\n",
             false,
             true,
         ),
@@ -601,8 +601,8 @@ async fn load_config_resolves_tool_registry_config() -> std::io::Result<()> {
             error_on_tool_collisions
         );
         assert_eq!(
-            config.tool_registry.include_tool_metadata,
-            include_tool_metadata
+            config.tool_registry.turn_metadata_includes_tool_info,
+            turn_metadata_includes_tool_info
         );
         assert!(!config.features.enabled(Feature::CodeMode));
     }
@@ -5214,7 +5214,7 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
     let config = thread_config
         .rebuild_preserving_session_layers(&refreshed_config)
         .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5276,7 +5276,7 @@ enabled = true
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5344,7 +5344,7 @@ url = "https://sample.example/mcp"
         )
         .build()
         .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5446,7 +5446,7 @@ enabled = true
         )
         .build()
         .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -6463,7 +6463,7 @@ async fn to_mcp_config_preserves_apps_feature_from_config() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
 
     config.apps_mcp_product_sku = Some("tpp".to_string());
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
@@ -6490,7 +6490,7 @@ async fn to_mcp_config_flows_mcp_tool_prefix_from_feature() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert!(mcp_config.prefix_mcp_tool_names);
@@ -6526,7 +6526,7 @@ async fn to_mcp_config_flows_mcp_2026_feature_from_config() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert_eq!(mcp_config.protocol_mode, codex_mcp::McpProtocolMode::Legacy);
@@ -6550,7 +6550,7 @@ async fn to_mcp_config_preserves_auth_elicitation_feature_from_config() -> std::
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+    let plugins_manager = plugins_manager_for_config(&config);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert_eq!(
@@ -9480,6 +9480,7 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
         enforce_residency: None,
         network: None,
         permissions: None,
+        auto_review: None,
         models: None,
         guardian_policy_config: None,
     };

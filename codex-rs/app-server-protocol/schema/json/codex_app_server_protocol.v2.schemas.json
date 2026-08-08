@@ -1244,6 +1244,29 @@
       ],
       "type": "string"
     },
+    "AutoReviewRequirements": {
+      "properties": {
+        "ignoreRules": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "requiredOnModels": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "BrowserUseRequirements": {
       "properties": {
         "disableAutoReview": {
@@ -4954,6 +4977,16 @@
           "type": [
             "array",
             "null"
+          ]
+        },
+        "autoReview": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AutoReviewRequirements"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "browserUse": {
@@ -9927,6 +9960,17 @@
             "null"
           ]
         },
+        "multiAgentVersion": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MultiAgentVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Multi-agent runtime declared by this model, when available."
+        },
         "serviceTiers": {
           "default": [],
           "items": {
@@ -10260,6 +10304,15 @@
           "type": "object"
         }
       ]
+    },
+    "MultiAgentVersion": {
+      "description": "Multi-agent runtime supported by a model.",
+      "enum": [
+        "disabled",
+        "v1",
+        "v2"
+      ],
+      "type": "string"
     },
     "NetworkAccess": {
       "enum": [
@@ -14054,6 +14107,52 @@
         "status"
       ],
       "title": "SendAddCreditsNudgeEmailResponse",
+      "type": "object"
+    },
+    "ServerDiagnosticsGauge": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
+    "ServerDiagnosticsProcess": {
+      "properties": {
+        "id": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "physicalFootprintBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "residentMemoryBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
       "type": "object"
     },
     "ServerNotification": {
