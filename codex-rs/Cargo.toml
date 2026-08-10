@@ -94,7 +94,9 @@ members = [
     "tools",
     "v8-poc",
     "websocket-client",
+    "workload-identity",
     "utils/absolute-path",
+    "utils/audio",
     "utils/path-uri",
     "utils/cargo-bin",
     "git-utils",
@@ -249,6 +251,7 @@ codex-tui = { path = "tui" }
 codex-uds = { path = "uds" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-approval-presets = { path = "utils/approval-presets" }
+codex-utils-audio = { path = "utils/audio" }
 codex-utils-cache = { path = "utils/cache" }
 codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }
