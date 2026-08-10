@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::ConfiguredHandler;
+use super::ConfiguredHandlerKind;
 use super::HookListEntry;
 use crate::config_rules::hook_states_from_stack;
 use crate::events::common::matcher_pattern_for_event;
@@ -30,6 +31,7 @@ use crate::events::session_end::SESSION_END_DEFAULT_TIMEOUT_SEC;
 use crate::events::session_end::SESSION_END_MAX_TIMEOUT_SEC;
 use crate::output_spill::AdditionalContextLimit;
 use crate::output_spill::DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT;
+use codex_protocol::protocol::HookExecutionMode;
 use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookTrustStatus;
@@ -49,6 +51,14 @@ struct HookHandlerSource<'a> {
     hook_states: &'a HashMap<String, HookStateToml>,
     env: HashMap<String, String>,
     plugin_id: Option<String>,
+}
+
+struct NormalizedHandler {
+    config: HookHandlerConfig,
+    kind: ConfiguredHandlerKind,
+    timeout_sec: u64,
+    status_message: Option<String>,
+    additional_context_limit: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -459,7 +469,7 @@ fn append_matcher_groups(
             continue;
         }
         for (handler_index, handler) in group.hooks.iter().cloned().enumerate() {
-            match handler {
+            let normalized = match handler {
                 HookHandlerConfig::Command {
                     command,
                     command_windows,
@@ -473,14 +483,6 @@ fn append_matcher_groups(
                     } else {
                         command
                     };
-                    if r#async && event_name != codex_protocol::protocol::HookEventName::SessionEnd
-                    {
-                        warnings.push(format!(
-                            "skipping async hook in {}: async hooks are not supported yet",
-                            source.path.display()
-                        ));
-                        continue;
-                    }
                     if command.trim().is_empty() {
                         warnings.push(format!(
                             "skipping empty hook command in {}",
@@ -494,7 +496,9 @@ fn append_matcher_groups(
                         source.path.as_path(),
                         warnings,
                     );
-                    if r#async {
+                    let runs_async = r#async
+                        && event_name != codex_protocol::protocol::HookEventName::SessionEnd;
+                    if r#async && !runs_async {
                         warnings.push(format!(
                             "running async SessionEnd hook synchronously in {}",
                             source.path.display()
@@ -520,7 +524,7 @@ fn append_matcher_groups(
                     };
                     let normalized_additional_context_limit = additional_context_limit
                         .filter(|limit| *limit != DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT);
-                    let normalized_handler = HookHandlerConfig::Command {
+                    let config = HookHandlerConfig::Command {
                         command: command.clone(),
                         command_windows: None,
                         timeout_sec: Some(timeout_sec),
@@ -528,74 +532,106 @@ fn append_matcher_groups(
                         status_message: status_message.clone(),
                         additional_context_limit: normalized_additional_context_limit,
                     };
-                    let current_hash =
-                        command_hook_hash(event_name, matcher, &group, normalized_handler);
                     let command = source.env.iter().fold(command, |command, (key, value)| {
                         command.replace(&format!("${{{key}}}"), value)
                     });
-                    // TODO(abhinav): replace this positional suffix with a durable hook id.
-                    let key =
-                        crate::hook_key(&source.key_source, event_name, group_index, handler_index);
-                    let state = source.hook_states.get(&key);
-                    let enabled = hook_enabled(source.is_managed, state);
-                    let trusted_hash = hook_trusted_hash(source.is_managed, state);
-                    let trust_status =
-                        hook_trust_status(source.is_managed, &current_hash, trusted_hash);
-                    hook_entries.push(HookListEntry {
-                        key,
-                        event_name,
-                        handler_type: HookHandlerType::Command,
-                        matcher: matcher.map(ToOwned::to_owned),
-                        command: Some(command.clone()),
-                        timeout_sec,
-                        status_message: status_message.clone(),
-                        additional_context_limit,
-                        source_path: source.path.clone(),
-                        source: source.source,
-                        plugin_id: source.plugin_id.clone(),
-                        display_order: *display_order,
-                        enabled,
-                        is_managed: source.is_managed,
-                        current_hash,
-                        trust_status,
-                    });
-                    if enabled
-                        && (source.bypass_hook_trust
-                            || matches!(
-                                trust_status,
-                                HookTrustStatus::Managed | HookTrustStatus::Trusted
-                            ))
-                    {
-                        handlers.push(ConfiguredHandler {
-                            event_name,
-                            matcher: matcher.map(ToOwned::to_owned),
+                    NormalizedHandler {
+                        config,
+                        kind: ConfiguredHandlerKind::Command {
                             command,
-                            timeout_sec,
-                            status_message,
-                            additional_context_limit: AdditionalContextLimit::from_config(
-                                additional_context_limit,
-                            ),
-                            source_path: source.path.clone(),
-                            source: source.source,
-                            display_order: *display_order,
                             env: source.env.clone(),
-                        });
+                            r#async: runs_async,
+                        },
+                        timeout_sec,
+                        status_message,
+                        additional_context_limit,
                     }
-                    *display_order += 1;
                 }
-                HookHandlerConfig::McpTool { .. } => warnings.push(format!(
-                    "skipping MCP tool hook in {}: MCP tool hooks are not supported yet",
-                    source.path.display()
-                )),
-                HookHandlerConfig::Prompt {} => warnings.push(format!(
-                    "skipping prompt hook in {}: prompt hooks are not supported yet",
-                    source.path.display()
-                )),
-                HookHandlerConfig::Agent {} => warnings.push(format!(
-                    "skipping agent hook in {}: agent hooks are not supported yet",
-                    source.path.display()
-                )),
+                HookHandlerConfig::McpTool { .. } => {
+                    warnings.push(format!(
+                        "skipping MCP tool hook in {}: MCP tool hooks are not supported yet",
+                        source.path.display()
+                    ));
+                    continue;
+                }
+                HookHandlerConfig::Prompt {} => {
+                    warnings.push(format!(
+                        "skipping prompt hook in {}: prompt hooks are not supported yet",
+                        source.path.display()
+                    ));
+                    continue;
+                }
+                HookHandlerConfig::Agent {} => {
+                    warnings.push(format!(
+                        "skipping agent hook in {}: agent hooks are not supported yet",
+                        source.path.display()
+                    ));
+                    continue;
+                }
+            };
+
+            let NormalizedHandler {
+                config,
+                kind,
+                timeout_sec,
+                status_message,
+                additional_context_limit,
+            } = normalized;
+            let current_hash = hook_hash(event_name, matcher, &group, config);
+            let key = crate::hook_key(&source.key_source, event_name, group_index, handler_index);
+            let state = source.hook_states.get(&key);
+            let enabled = hook_enabled(source.is_managed, state);
+            let trusted_hash = hook_trusted_hash(source.is_managed, state);
+            let trust_status = hook_trust_status(source.is_managed, &current_hash, trusted_hash);
+            let ConfiguredHandlerKind::Command { command, .. } = &kind;
+            let execution_mode =
+                if matches!(kind, ConfiguredHandlerKind::Command { r#async: true, .. }) {
+                    HookExecutionMode::Async
+                } else {
+                    HookExecutionMode::Sync
+                };
+
+            hook_entries.push(HookListEntry {
+                key,
+                event_name,
+                handler_type: HookHandlerType::Command,
+                matcher: matcher.map(ToOwned::to_owned),
+                command: Some(command.clone()),
+                timeout_sec,
+                status_message: status_message.clone(),
+                additional_context_limit,
+                source_path: source.path.clone(),
+                source: source.source,
+                plugin_id: source.plugin_id.clone(),
+                display_order: *display_order,
+                enabled,
+                is_managed: source.is_managed,
+                current_hash,
+                trust_status,
+                execution_mode,
+            });
+            if enabled
+                && (source.bypass_hook_trust
+                    || matches!(
+                        trust_status,
+                        HookTrustStatus::Managed | HookTrustStatus::Trusted
+                    ))
+            {
+                handlers.push(ConfiguredHandler {
+                    event_name,
+                    matcher: matcher.map(ToOwned::to_owned),
+                    timeout_sec,
+                    status_message,
+                    additional_context_limit: AdditionalContextLimit::from_config(
+                        additional_context_limit,
+                    ),
+                    source_path: source.path.clone(),
+                    source: source.source,
+                    display_order: *display_order,
+                    kind,
+                });
             }
+            *display_order += 1;
         }
     }
 }
@@ -633,7 +669,7 @@ struct NormalizedHookIdentity {
     group: MatcherGroup,
 }
 
-fn command_hook_hash(
+fn hook_hash(
     event_name: codex_protocol::protocol::HookEventName,
     matcher: Option<&str>,
     group: &MatcherGroup,
@@ -731,6 +767,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::ConfiguredHandler;
+    use super::ConfiguredHandlerKind;
     use super::HookListEntry;
     use super::append_matcher_groups;
     use crate::output_spill::AdditionalContextLimit;
@@ -957,14 +994,17 @@ mod tests {
             vec![ConfiguredHandler {
                 event_name: HookEventName::UserPromptSubmit,
                 matcher: None,
-                command: "echo hello".to_string(),
                 timeout_sec: 600,
                 status_message: None,
                 additional_context_limit: Default::default(),
                 source_path: source_path.clone(),
                 source: hook_source(),
                 display_order: 0,
-                env: std::collections::HashMap::new(),
+                kind: ConfiguredHandlerKind::Command {
+                    command: "echo hello".to_string(),
+                    r#async: false,
+                    env: std::collections::HashMap::new(),
+                },
             }]
         );
     }
@@ -993,14 +1033,17 @@ mod tests {
             vec![ConfiguredHandler {
                 event_name: HookEventName::PreToolUse,
                 matcher: Some("^Bash$".to_string()),
-                command: "echo hello".to_string(),
                 timeout_sec: 600,
                 status_message: None,
                 additional_context_limit: Default::default(),
                 source_path: source_path.clone(),
                 source: hook_source(),
                 display_order: 0,
-                env: std::collections::HashMap::new(),
+                kind: ConfiguredHandlerKind::Command {
+                    command: "echo hello".to_string(),
+                    r#async: false,
+                    env: std::collections::HashMap::new(),
+                },
             }]
         );
     }
@@ -1265,11 +1308,16 @@ mod tests {
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(handlers.len(), 1);
         assert_eq!(
-            handlers[0].command,
-            if cfg!(windows) {
-                "echo windows"
-            } else {
-                "echo unix"
+            handlers[0].kind,
+            ConfiguredHandlerKind::Command {
+                command: if cfg!(windows) {
+                    "echo windows"
+                } else {
+                    "echo unix"
+                }
+                .to_string(),
+                env: std::collections::HashMap::new(),
+                r#async: false,
             }
         );
     }

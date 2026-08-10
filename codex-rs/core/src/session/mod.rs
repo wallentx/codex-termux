@@ -1742,7 +1742,7 @@ impl Session {
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
         self.schedule_mcp_prewarm();
         let environments = self.services.turn_environments.snapshot().await;
-        let hooks = build_hooks_for_config(
+        let hooks_config = build_hooks_config(
             config.as_ref(),
             self.services.plugins_manager.as_ref(),
             environments.single_local_environment(),
@@ -1756,6 +1756,7 @@ impl Session {
             &state.session_configuration.original_config_do_not_use,
             &config,
         ) {
+            let hooks = self.hooks().reconfigured(hooks_config);
             self.services.hooks.store(Arc::new(hooks));
         }
     }
@@ -2477,12 +2478,14 @@ impl Session {
     )]
     pub(crate) async fn request_permissions_for_environment(
         self: &Arc<Self>,
-        turn_context: &Arc<TurnContext>,
+        review_context: impl Into<crate::guardian::GuardianReviewContext>,
         call_id: String,
         args: RequestPermissionsArgs,
         environment: TurnEnvironmentSelection,
         cancellation_token: CancellationToken,
     ) -> Option<RequestPermissionsResponse> {
+        let review_context = review_context.into();
+        let turn_context = review_context.turn();
         match turn_context.as_ref().approval_policy() {
             AskForApproval::Never => {
                 return Some(RequestPermissionsResponse {
@@ -2526,7 +2529,6 @@ impl Session {
             };
             let review_id = crate::guardian::new_guardian_review_id();
             let session = Arc::clone(self);
-            let turn = Arc::clone(turn_context);
             let request = crate::guardian::GuardianApprovalRequest::RequestPermissions {
                 id: call_id,
                 turn_id: turn_context.sub_id.clone(),
@@ -2535,7 +2537,7 @@ impl Session {
             };
             let review_rx = crate::guardian::spawn_approval_request_review(
                 session,
-                turn,
+                review_context.clone(),
                 review_id,
                 request,
                 /*retry_reason*/ None,
@@ -4203,12 +4205,12 @@ pub(crate) fn emit_subagent_session_started(
     });
 }
 
-/// Builds the hook engine for one config snapshot, including any enabled plugin hooks.
-async fn build_hooks_for_config(
+/// Builds hook configuration for one config snapshot, including any enabled plugin hooks.
+async fn build_hooks_config(
     config: &Config,
     plugins_manager: &PluginsManager,
     environment: Option<&TurnEnvironment>,
-) -> Hooks {
+) -> HooksConfig {
     let (hook_shell_program, hook_shell_argv) = environment
         .and_then(|environment| environment.shell.as_ref())
         .map(|shell| {
@@ -4222,7 +4224,7 @@ async fn build_hooks_for_config(
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     let plugin_hook_sources = plugin_outcome.effective_plugin_hook_sources();
     let plugin_hook_load_warnings = plugin_outcome.effective_plugin_hook_warnings();
-    Hooks::new(HooksConfig {
+    HooksConfig {
         legacy_notify_argv: config.notify.clone(),
         feature_enabled: config.features.enabled(Feature::CodexHooks),
         bypass_hook_trust: config.bypass_hook_trust,
@@ -4231,7 +4233,7 @@ async fn build_hooks_for_config(
         plugin_hook_load_warnings,
         shell_program: hook_shell_program,
         shell_args: hook_shell_argv,
-    })
+    }
 }
 
 #[cfg(test)]

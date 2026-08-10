@@ -1,5 +1,6 @@
 use super::AppSummary;
 use super::HookEventName;
+use super::HookExecutionMode;
 use super::HookHandlerType;
 use super::HookSource;
 use super::HookTrustStatus;
@@ -524,6 +525,8 @@ pub struct HookMetadata {
     pub key: String,
     pub event_name: HookEventName,
     pub handler_type: HookHandlerType,
+    #[serde(default)]
+    pub execution_mode: HookExecutionMode,
     pub matcher: Option<String>,
     pub command: Option<String>,
     pub timeout_sec: u64,
@@ -890,6 +893,9 @@ pub struct PluginInstallParams {
     pub marketplace_path: Option<AbsolutePathBuf>,
     #[ts(optional = nullable)]
     pub remote_marketplace_name: Option<String>,
+    /// Client-generated identifier used to correlate one installation attempt.
+    #[ts(optional = nullable)]
+    pub install_attempt_id: Option<String>,
     pub plugin_name: String,
 }
 
