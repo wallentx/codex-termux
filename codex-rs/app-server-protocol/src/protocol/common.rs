@@ -1179,7 +1179,7 @@ client_request_definitions! {
     },
     ExternalAgentConfigDetect => "externalAgentConfig/detect" {
         params: v2::ExternalAgentConfigDetectParams,
-        serialization: global("config"),
+        serialization: global("external-agent-detect"),
         response: v2::ExternalAgentConfigDetectResponse,
     },
     ExternalAgentConfigImport => "externalAgentConfig/import" {
@@ -2118,6 +2118,7 @@ mod tests {
             params: v2::PluginInstallParams {
                 marketplace_path: Some(absolute_path("/tmp/marketplace")),
                 remote_marketplace_name: None,
+                install_attempt_id: None,
                 plugin_name: "plugin-a".to_string(),
             },
         };

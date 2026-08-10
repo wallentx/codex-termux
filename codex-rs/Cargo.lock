@@ -2571,11 +2571,14 @@ dependencies = [
  "codex-utils-cargo-bin",
  "futures",
  "pretty_assertions",
+ "prost",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -3289,12 +3292,14 @@ name = "codex-hooks"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "codex-config",
  "codex-plugin",
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-output-truncation",
+ "codex-utils-pty",
  "futures",
  "pretty_assertions",
  "regex",
@@ -4702,6 +4707,21 @@ dependencies = [
  "tracing-appender",
  "windows 0.58.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "codex-workload-identity"
+version = "0.0.0"
+dependencies = [
+ "codex-http-client",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "wiremock",
 ]
 
 [[package]]
