@@ -4,6 +4,8 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirementsToml;
 use codex_exec_server::LOCAL_FS;
@@ -75,7 +77,7 @@ use pretty_assertions::assert_eq;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 static NEXT_CODEX_HOME_ID: AtomicUsize = AtomicUsize::new(0);
-const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `environment resource` locators are owned by an execution environment, `orchestrator resource` locators are opaque non-filesystem resources, and `custom resource` locators use their provider's access mechanism.";
+const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `environment resource` locators are owned by an execution environment, `orchestrator package` locators are opaque package identifiers, and `custom resource` locators use their provider's access mechanism.";
 const DEMO_SKILL_CONTENTS: &str =
     "---\nname: demo\ndescription: Demo skill.\n---\n# Demo\n\nUse the demo skill.\n";
 
@@ -549,7 +551,7 @@ async fn executor_orchestrator_and_host_share_catalog_world_state_flow() -> Test
         ),
         (
             "orchestrator_skills",
-            "- orchestrator-skill: Fix lint errors. (orchestrator resource: skill://orchestrator/orchestrator-skill/SKILL.md)",
+            "- orchestrator-skill: Fix lint errors. (orchestrator package: orchestrator/orchestrator-skill)",
         ),
         (
             "host_skills",
@@ -1186,18 +1188,20 @@ async fn moderate_budget_pressure_keeps_every_catalog_entry() -> TestResult {
     let (executor, orchestrator) =
         skill_world_state_fragments(&registry, &session_store, &thread_store, "turn-1").await?;
     let description_lengths = [
-        ("executor", "environment", executor.body()),
-        ("orchestrator", "orchestrator", orchestrator.body()),
+        ("executor", executor.body()),
+        ("orchestrator", orchestrator.body()),
     ]
     .into_iter()
-    .flat_map(|(source, resource_kind, rendered)| {
-        (0..5).map(move |index| (source, resource_kind, rendered, index))
-    })
-    .map(|(source, resource_kind, rendered, index)| {
+    .flat_map(|(source, rendered)| (0..5).map(move |index| (source, rendered, index)))
+    .map(|(source, rendered, index)| {
         let name = format!("{source}-skill-{index:02}");
         let package_id = format!("{source}/{name}");
         let line_prefix = format!("- {name}: ");
-        let line_suffix = format!(" ({resource_kind} resource: skill://{package_id}/SKILL.md)");
+        let line_suffix = if source == "executor" {
+            format!(" (environment resource: skill://{package_id}/SKILL.md)")
+        } else {
+            format!(" (orchestrator package: {package_id})")
+        };
         rendered
             .lines()
             .find_map(|line| {
@@ -1320,7 +1324,7 @@ async fn extreme_budget_pressure_removes_descriptions_before_omitting_entries() 
     assert!(
         orchestrator
             .body()
-            .contains("- orchestrator-skill-000: (orchestrator resource:")
+            .contains("- orchestrator-skill-000: (orchestrator package:")
     );
     assert!(!orchestrator.body().contains("- orchestrator-skill-159:"));
     for rendered in [executor.body(), orchestrator.body()] {
@@ -1877,7 +1881,10 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
     let root = AbsolutePathBuf::try_from(std::fs::canonicalize(root)?)?;
     let rendered_root = root.to_string_lossy().replace('\\', "/");
     let config_layer_stack = ConfigLayerStack::new(
-        Vec::new(),
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            toml::from_str("[skills.bundled]\nenabled = false\n")?,
+        )],
         Default::default(),
         ConfigRequirementsToml::default(),
     )?;
@@ -1890,12 +1897,7 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
     service.set_extra_roots(vec![root]);
     let snapshot = service
         .snapshot_for_config(
-            &HostSkillsLoadInput::new(
-                codex_home,
-                Vec::new(),
-                config_layer_stack,
-                /*bundled_skills_enabled*/ false,
-            ),
+            &HostSkillsLoadInput::new(codex_home, Vec::new(), config_layer_stack),
             Some(Arc::clone(&LOCAL_FS)),
         )
         .await;

@@ -42,6 +42,7 @@ use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
+use codex_otel::TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -50,6 +51,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::WarningEvent;
+use codex_thread_store::PersistContext;
 
 use codex_features::Feature;
 use codex_protocol::error::CodexErrorDetails;
@@ -626,7 +628,13 @@ impl Session {
                 ts.token_usage_at_turn_start.clone(),
             )
         };
-        run_hooks_and_record_inputs(self, &turn_context, &pending_input).await;
+        run_hooks_and_record_inputs(
+            self,
+            &turn_context,
+            &pending_input,
+            PersistContext::Standard,
+        )
+        .await;
         task_ended_before_persistence |= self
             .pending_user_message_admissions
             .complete_task_end(&turn_context.sub_id);
@@ -760,6 +768,11 @@ impl Session {
             turn_context.config.features.enabled(Feature::MemoryTool),
             turn_context.config.memories.use_memories,
             turn_had_memory_citation,
+        );
+        self.services.session_telemetry.counter(
+            TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC,
+            i64::try_from(self.list_background_terminals().await.len()).unwrap_or(i64::MAX),
+            &[],
         );
         let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;
         let (completed_at, duration_ms, profile) = turn_context

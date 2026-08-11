@@ -6,6 +6,7 @@ members = [
     "agent-identity",
     "backend-client",
     "bwrap",
+    "build-info",
     "ansi-escape",
     "async-utils",
     "app-server",
@@ -43,6 +44,7 @@ members = [
     "core-plugins",
     "diagnostics",
     "hooks",
+    "history",
     "http-client",
     "secrets",
     "exec",
@@ -135,7 +137,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.148.0-alpha.6"
+version = "0.148.0-alpha.7"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -206,6 +208,7 @@ codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
 codex-git-utils = { path = "git-utils" }
 codex-hooks = { path = "hooks" }
+codex-history = { path = "history" }
 codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }

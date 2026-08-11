@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
+use codex_rollout::RolloutItem;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
 use codex_rollout::find_archived_thread_path_by_id_str;
@@ -897,6 +897,7 @@ mod tests {
             Some(codex_state::ThreadSection {
                 id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
                 name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
             })
         );
         let pinned_metadata = runtime
@@ -909,6 +910,7 @@ mod tests {
             Some(codex_state::ThreadSection {
                 id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
                 name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
             })
         );
         assert_eq!(pinned_metadata.preview.as_deref(), Some("Hello from user"));
@@ -951,6 +953,7 @@ mod tests {
             Some(codex_state::ThreadSection {
                 id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
                 name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
             })
         );
         assert_eq!(

@@ -23,6 +23,8 @@ use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandle
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
+use codex_history::InitialHistory;
+use codex_history::RolloutItem;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
@@ -49,11 +51,9 @@ use codex_protocol::protocol::FileSystemAccessMode;
 use codex_protocol::protocol::FileSystemPath;
 use codex_protocol::protocol::FileSystemSandboxEntry;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::NetworkSandboxPolicy;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -2621,27 +2621,31 @@ async fn send_input_accepts_structured_items() {
         .await
         .expect("send_input should succeed");
 
-    let expected = Op::UserInput {
-        items: vec![
-            UserInput::Mention {
-                name: "drive".to_string(),
-                path: "app://google_drive".to_string(),
-            },
-            UserInput::Text {
-                text: "read the folder".to_string(),
-                text_elements: Vec::new(),
-            },
-        ],
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    };
-    let captured = manager
-        .captured_ops()
-        .into_iter()
-        .find(|(id, op)| *id == agent_id && *op == expected);
-    assert_eq!(captured, Some((agent_id, expected)));
+    let expected_items = vec![
+        UserInput::Mention {
+            name: "drive".to_string(),
+            path: "app://google_drive".to_string(),
+        },
+        UserInput::Text {
+            text: "read the folder".to_string(),
+            text_elements: Vec::new(),
+        },
+    ];
+    assert!(manager.captured_ops().iter().any(|(id, op)| {
+        *id == agent_id
+            && matches!(
+                op,
+                Op::UserInput {
+                    items,
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context,
+                    thread_settings,
+                } if items == &expected_items
+                    && additional_context.is_empty()
+                    && thread_settings == &Default::default()
+            )
+    }));
 
     let _ = thread
         .thread
