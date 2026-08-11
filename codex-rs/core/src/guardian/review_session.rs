@@ -9,6 +9,8 @@ use codex_analytics::GuardianReviewAnalyticsResult;
 use codex_analytics::GuardianReviewSessionAnalyticsParams;
 use codex_analytics::GuardianReviewSessionKind;
 use codex_extension_api::UserInstructions;
+use codex_history::InitialHistory;
+use codex_history::RolloutItem;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::Personality;
@@ -23,9 +25,7 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
@@ -51,6 +51,7 @@ use crate::session::turn_context::TurnContext;
 use codex_config::types::McpServerConfig;
 use codex_features::Feature;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_thread_store::PersistContext;
 use codex_utils_path_uri::PathUri;
 
 use super::ApprovalRequestReasons;
@@ -380,7 +381,10 @@ impl GuardianReviewSessionManager {
 
     pub(crate) async fn trunk_rollout_path(&self) -> Option<PathBuf> {
         let trunk = self.state.lock().await.trunk.clone()?;
-        trunk.session.ensure_rollout_materialized().await;
+        trunk
+            .session
+            .ensure_rollout_materialized(PersistContext::Standard)
+            .await;
         match trunk.session.current_rollout_path().await {
             Ok(path) => path,
             Err(err) => {
@@ -966,7 +970,9 @@ async fn append_guardian_followup_reminder(review_session: &GuardianReviewSessio
 async fn load_rollout_items_for_fork(
     session: &Session,
 ) -> anyhow::Result<Option<Vec<RolloutItem>>> {
-    session.try_ensure_rollout_materialized().await?;
+    session
+        .try_ensure_rollout_materialized(PersistContext::Standard)
+        .await?;
     session.flush_rollout().await?;
     let live_thread = session.live_thread_for_persistence("guardian review fork")?;
     let history = live_thread.load_history(/*include_archived*/ true).await?;

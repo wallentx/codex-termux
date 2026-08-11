@@ -5,9 +5,8 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use crate::session::turn_context::EnvironmentConfig;
+use crate::session::turn_context::TurnEnvironmentConfig;
 use crate::shell_snapshot::ShellSnapshot;
-use crate::skills::SkillError;
 use crate::state::ActiveTurn;
 use codex_extension_api::ExtensionDataInit;
 use codex_http_client::ClientRouteClass;
@@ -26,6 +25,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
+use codex_skills::SkillError;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
@@ -84,9 +84,6 @@ pub(crate) struct SessionConfiguration {
 
     /// Base instructions for the session.
     pub(super) base_instructions: String,
-
-    /// Compact prompt override.
-    pub(super) compact_prompt: Option<String>,
 
     /// When to escalate for approval for execution
     pub(super) approval_policy: Constrained<AskForApproval>,
@@ -160,8 +157,8 @@ impl SessionConfiguration {
         &self.permission_profile_state
     }
 
-    pub(super) fn environment_config(&self) -> EnvironmentConfig {
-        EnvironmentConfig {
+    pub(super) fn turn_environment_config(&self) -> TurnEnvironmentConfig {
+        TurnEnvironmentConfig {
             allow_login_shell: self
                 .original_config_do_not_use
                 .permissions
@@ -1060,14 +1057,14 @@ impl Session {
                 environment_manager,
                 default_shell.clone(),
                 // Temporary: preserve thread-level behavior until environments supply config.
-                session_configuration.environment_config(),
+                session_configuration.turn_environment_config(),
                 shell_snapshot,
                 inherited_environments.unwrap_or_default(),
                 config.features.enabled(Feature::DeferredExecutor),
             ));
             turn_environments.update_selections(
                 session_configuration.environment_selections(),
-                &session_configuration.environment_config(),
+                &session_configuration.turn_environment_config(),
             );
             let resolved_environments = turn_environments.snapshot().await;
             let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
@@ -1100,17 +1097,6 @@ impl Session {
                 );
             }
             session_configuration.thread_name = thread_name.clone();
-            validate_config_lock_if_configured(
-                &session_configuration,
-                base_instructions_provenance.as_ref(),
-            )
-            .await?;
-            export_config_lock_if_configured(
-                &session_configuration,
-                thread_id,
-                base_instructions_provenance.as_ref(),
-            )
-            .await?;
             let mut state = SessionState::new_with_auto_compact_window_ids(
                 session_configuration.clone(),
                 initial_auto_compact_window_ids,
@@ -1431,7 +1417,8 @@ impl Session {
             }
             if matches!(&sess.fork_persistence, ForkPersistence::Referenced { .. }) {
                 // Keep the source reserved until the child's history reference is durable.
-                sess.try_ensure_rollout_materialized().await?;
+                sess.try_ensure_rollout_materialized(PersistContext::Standard)
+                    .await?;
             }
             {
                 let mut state = sess.state.lock().await;

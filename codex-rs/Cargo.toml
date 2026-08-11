@@ -6,6 +6,7 @@ members = [
     "agent-identity",
     "backend-client",
     "bwrap",
+    "build-info",
     "ansi-escape",
     "async-utils",
     "app-server",
@@ -43,6 +44,7 @@ members = [
     "core-plugins",
     "diagnostics",
     "hooks",
+    "history",
     "http-client",
     "secrets",
     "exec",
@@ -96,6 +98,7 @@ members = [
     "websocket-client",
     "workload-identity",
     "utils/absolute-path",
+    "utils/audio",
     "utils/path-uri",
     "utils/cargo-bin",
     "git-utils",
@@ -206,6 +209,7 @@ codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
 codex-git-utils = { path = "git-utils" }
 codex-hooks = { path = "hooks" }
+codex-history = { path = "history" }
 codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
@@ -250,6 +254,7 @@ codex-tui = { path = "tui" }
 codex-uds = { path = "uds" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-approval-presets = { path = "utils/approval-presets" }
+codex-utils-audio = { path = "utils/audio" }
 codex-utils-cache = { path = "utils/cache" }
 codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }

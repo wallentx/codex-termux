@@ -11,6 +11,7 @@ use tempfile::TempDir;
 use super::SkillConfigRule;
 use super::SkillConfigRuleSelector;
 use super::SkillConfigRules;
+use super::bundled_skills_enabled_from_stack;
 use super::skill_config_rules_from_stack;
 
 fn user_layer(codex_home: &TempDir, config: &str) -> ConfigLayerEntry {
@@ -41,16 +42,47 @@ fn stack(codex_home: &TempDir, user: &str, session: &str) -> ConfigLayerStack {
 }
 
 fn path_toggle_config(path: &std::path::Path, enabled: bool) -> String {
+    let path = toml::Value::String(path.display().to_string());
     format!(
         r#"[[skills.config]]
-path = "{}"
+path = {path}
 enabled = {enabled}
-"#,
-        path.display()
+"#
     )
 }
 
-#[cfg_attr(windows, ignore)]
+#[test]
+fn bundled_skills_follow_effective_configuration() {
+    let codex_home = TempDir::new().expect("temp dir");
+
+    assert!(bundled_skills_enabled_from_stack(&stack(
+        &codex_home,
+        "",
+        ""
+    )));
+    assert!(!bundled_skills_enabled_from_stack(&stack(
+        &codex_home,
+        "[skills.bundled]\nenabled = false\n",
+        ""
+    )));
+    assert!(bundled_skills_enabled_from_stack(&stack(
+        &codex_home,
+        "[skills.bundled]\nenabled = false\n",
+        "[skills.bundled]\nenabled = true\n"
+    )));
+}
+
+#[test]
+fn malformed_bundled_skills_config_defaults_to_enabled() {
+    let codex_home = TempDir::new().expect("temp dir");
+
+    assert!(bundled_skills_enabled_from_stack(&stack(
+        &codex_home,
+        "[skills]\nbundled = 'invalid'\n",
+        ""
+    )));
+}
+
 #[test]
 fn session_flags_can_reenable_user_disabled_path() {
     let codex_home = TempDir::new().expect("temp dir");
@@ -71,7 +103,6 @@ fn session_flags_can_reenable_user_disabled_path() {
     );
 }
 
-#[cfg_attr(windows, ignore)]
 #[test]
 fn session_flags_can_disable_user_enabled_path() {
     let codex_home = TempDir::new().expect("temp dir");
@@ -115,7 +146,6 @@ enabled = false
     );
 }
 
-#[cfg_attr(windows, ignore)]
 #[test]
 fn preserves_order_across_path_and_name_selectors() {
     let codex_home = TempDir::new().expect("temp dir");

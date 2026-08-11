@@ -1,5 +1,4 @@
 use crate::CodexAppsToolsCache;
-use crate::HostSkillsService;
 use crate::agent::AgentControl;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
@@ -35,6 +34,9 @@ use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::UserInstructionsProvider;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
@@ -49,14 +51,12 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::mcp::OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::ResumedHistory;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -67,6 +67,7 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
+use codex_skills_extension::HostSkillsService;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::LocalThreadStore;
@@ -108,6 +109,32 @@ static FORCE_TEST_THREAD_MANAGER_BEHAVIOR: AtomicBool = AtomicBool::new(false);
 type CapturedOps = Vec<(ThreadId, Op)>;
 type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
 pub(crate) type ThreadIdGenerator = Arc<dyn Fn() -> ThreadId + Send + Sync>;
+
+// `Op` is intentionally not `Clone`. Thread-manager tests only snapshot the
+// small subset of ops they inspect.
+fn capture_test_op(op: &Op) -> Option<Op> {
+    match op {
+        Op::Interrupt => Some(Op::Interrupt),
+        Op::UserInput {
+            items,
+            final_output_json_schema,
+            responsesapi_client_metadata,
+            additional_context,
+            thread_settings,
+        } => Some(Op::UserInput {
+            items: items.clone(),
+            final_output_json_schema: final_output_json_schema.clone(),
+            responsesapi_client_metadata: responsesapi_client_metadata.clone(),
+            additional_context: additional_context.clone(),
+            thread_settings: thread_settings.clone(),
+        }),
+        Op::InterAgentCommunication { communication } => Some(Op::InterAgentCommunication {
+            communication: communication.clone(),
+        }),
+        Op::Shutdown => Some(Op::Shutdown),
+        _ => None,
+    }
+}
 
 pub(crate) fn default_thread_id_generator() -> ThreadIdGenerator {
     Arc::new(ThreadId::new)
@@ -1239,7 +1266,15 @@ impl ThreadManager {
         self.state
             .ops_log
             .as_ref()
-            .and_then(|ops_log| ops_log.lock().ok().map(|log| log.clone()))
+            .and_then(|ops_log| {
+                ops_log.lock().ok().map(|log| {
+                    log.iter()
+                        .filter_map(|(thread_id, op)| {
+                            capture_test_op(op).map(|op| (*thread_id, op))
+                        })
+                        .collect()
+                })
+            })
             .unwrap_or_default()
     }
 }
@@ -1343,8 +1378,9 @@ impl ThreadManagerState {
         let thread = self.get_thread(thread_id).await?;
         if let Some(ops_log) = &self.ops_log
             && let Ok(mut log) = ops_log.lock()
+            && let Some(captured_op) = capture_test_op(&op)
         {
-            log.push((thread_id, op.clone()));
+            log.push((thread_id, captured_op));
         }
         thread
             .io
@@ -1585,10 +1621,15 @@ impl ThreadManagerState {
         } = options;
         let client_mcp_extensions = self.client_mcp_extensions_for_child(parent_thread_id).await;
         let thread_source = initial_history.get_resumed_thread_source();
+        let environments = inherited_environments
+            .as_ref()
+            .filter(|_| initial_history.get_multi_agent_version() == Some(MultiAgentVersion::V2))
+            .map(TurnEnvironmentSnapshot::to_selections);
         let options = StartThreadOptions {
             initial_history,
             session_source: Some(session_source),
             thread_source,
+            environments,
             client_mcp_extensions,
             ..StartThreadOptions::new(config)
         };
@@ -1758,7 +1799,7 @@ impl ThreadManagerState {
             session_source,
             forked_from_thread_id,
             parent_thread_id,
-            thread_source,
+            thread_source: thread_source.clone(),
             originator,
             agent_control,
             dynamic_tools,
@@ -1781,6 +1822,17 @@ impl ThreadManagerState {
                 codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
         }))
         .await?;
+        // Enable Full Access form input only after session startup so a required MCP server cannot
+        // block startup while waiting for form input.
+        if session
+            .services
+            .client_mcp_extensions
+            .contains(OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID)
+            && matches!(thread_source.as_ref(), Some(ThreadSource::User))
+            && !tracked_session_source.is_non_root_agent()
+        {
+            session.services.mcp_runtime.enable_full_access_form_input();
+        }
         let new_thread = self
             .finalize_thread_spawn(session, io, tracked_session_source)
             .await?;

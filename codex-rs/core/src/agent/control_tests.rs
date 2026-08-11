@@ -16,6 +16,9 @@ use assert_matches::assert_matches;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
@@ -34,13 +37,10 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -54,6 +54,7 @@ use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
+use codex_thread_store::PersistContext;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
 use core_test_support::responses::strip_response_item_ids;
@@ -90,6 +91,45 @@ fn text_input(text: &str) -> Vec<UserInput> {
         text: text.to_string(),
         text_elements: Vec::new(),
     }]
+}
+
+fn captured_op_matches(actual: &(ThreadId, Op), expected: &(ThreadId, Op)) -> bool {
+    if actual.0 != expected.0 {
+        return false;
+    }
+    match (&actual.1, &expected.1) {
+        (
+            Op::UserInput {
+                items: actual_items,
+                final_output_json_schema: actual_schema,
+                responsesapi_client_metadata: actual_metadata,
+                additional_context: actual_context,
+                thread_settings: actual_settings,
+            },
+            Op::UserInput {
+                items: expected_items,
+                final_output_json_schema: expected_schema,
+                responsesapi_client_metadata: expected_metadata,
+                additional_context: expected_context,
+                thread_settings: expected_settings,
+            },
+        ) => {
+            actual_items == expected_items
+                && actual_schema == expected_schema
+                && actual_metadata == expected_metadata
+                && actual_context == expected_context
+                && actual_settings == expected_settings
+        }
+        (
+            Op::InterAgentCommunication {
+                communication: actual,
+            },
+            Op::InterAgentCommunication {
+                communication: expected,
+            },
+        ) => actual == expected,
+        _ => false,
+    }
 }
 
 fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
@@ -314,7 +354,10 @@ async fn persist_thread_for_tree_resume(thread: &Arc<CodexThread>, message: &str
     thread
         .inject_user_message_without_turn(message.to_string())
         .await;
-    thread.session.ensure_rollout_materialized().await;
+    thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     thread
         .session
         .flush_rollout()
@@ -580,8 +623,8 @@ async fn send_input_submits_user_message() {
         .manager
         .captured_ops()
         .into_iter()
-        .find(|entry| *entry == expected);
-    assert_eq!(captured, Some(expected));
+        .find(|entry| captured_op_matches(entry, &expected));
+    assert!(captured.is_some());
 }
 
 #[tokio::test]
@@ -618,8 +661,8 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
         .manager
         .captured_ops()
         .into_iter()
-        .find(|entry| *entry == expected);
-    assert_eq!(captured, Some(expected));
+        .find(|entry| captured_op_matches(entry, &expected));
+    assert!(captured.is_some());
 
     timeout(Duration::from_secs(5), async {
         loop {
@@ -779,8 +822,8 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
         .manager
         .captured_ops()
         .into_iter()
-        .find(|entry| *entry == expected);
-    assert_eq!(captured, Some(expected));
+        .find(|entry| captured_op_matches(entry, &expected));
+    assert!(captured.is_some());
 }
 
 #[tokio::test]
@@ -938,8 +981,8 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
         .manager
         .captured_ops()
         .into_iter()
-        .find(|entry| *entry == expected);
-    assert_eq!(captured, Some(expected));
+        .find(|entry| captured_op_matches(entry, &expected));
+    assert!(captured.is_some());
 }
 
 #[tokio::test]
@@ -1380,7 +1423,10 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             parent_reference_context_item.clone(),
         )])
         .await;
-    parent_thread.session.ensure_rollout_materialized().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     parent_thread
         .session
         .flush_rollout()
@@ -1539,8 +1585,8 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .manager
         .captured_ops()
         .into_iter()
-        .find(|entry| *entry == expected);
-    assert_eq!(captured, Some(expected));
+        .find(|entry| captured_op_matches(entry, &expected));
+    assert!(captured.is_some());
 
     let _ = harness
         .control
@@ -1644,7 +1690,10 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
             RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
         ])
         .await;
-    parent_thread.session.ensure_rollout_materialized().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     parent_thread
         .session
         .flush_rollout()
@@ -1804,7 +1853,10 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
             RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
         ])
         .await;
-    parent_thread.session.ensure_rollout_materialized().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     parent_thread
         .session
         .flush_rollout()
@@ -1948,7 +2000,10 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             .session
             .persist_rollout_items(&rollout_items)
             .await;
-        parent_thread.session.ensure_rollout_materialized().await;
+        parent_thread
+            .session
+            .ensure_rollout_materialized(PersistContext::Standard)
+            .await;
         parent_thread
             .session
             .flush_rollout()
@@ -2141,7 +2196,10 @@ async fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
             spawn_turn_context.to_turn_context_item(),
         )])
         .await;
-    parent_thread.session.ensure_rollout_materialized().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     parent_thread
         .session
         .flush_rollout()
@@ -2264,7 +2322,10 @@ async fn spawn_agent_fork_last_n_turns_drops_parent_startup_prefix_when_under_li
             &[spawn_agent_call(&parent_spawn_call_id)],
         )
         .await;
-    parent_thread.session.ensure_rollout_materialized().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     parent_thread
         .session
         .flush_rollout()
@@ -2390,7 +2451,10 @@ async fn spawn_agent_fork_last_n_turns_strips_parent_usage_hints() {
             ],
         )
         .await;
-    parent_thread.session.ensure_rollout_materialized().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     parent_thread
         .session
         .flush_rollout()
@@ -2902,8 +2966,8 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
                 .manager
                 .captured_ops()
                 .into_iter()
-                .find(|entry| *entry == expected);
-            if captured == Some(expected.clone()) {
+                .find(|entry| captured_op_matches(entry, &expected));
+            if captured.is_some() {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
@@ -3181,7 +3245,10 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         .get_thread(child_thread_id)
         .await
         .expect("child thread should exist");
-    child_thread.session.ensure_rollout_materialized().await;
+    child_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     child_thread
         .session
         .flush_rollout()

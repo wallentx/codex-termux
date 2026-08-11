@@ -93,11 +93,15 @@ extended forms, clients must handle the request envelope, including a fallback
 for unsupported field types. `mcpServerOpenaiFormElicitation: true` remains a
 legacy alias for declaring the `openai/form` extension.
 
+`openai/standard-form-input` indicates support for collecting and returning
+input from standard MCP forms.
+
 ```json
 {
   "capabilities": {
     "extensions": {
       "openai/form": {},
+      "openai/standard-form-input": {},
       "io.modelcontextprotocol/ui": {
         "mimeTypes": ["text/html;profile=mcp-app"]
       }
@@ -166,9 +170,9 @@ Example with notification opt-out:
 - `thread/fork` — fork an existing thread into a new thread id by copying the stored history; pass an optional `lastTurnId` to copy history only through that turn, inclusive, and drop later turns from the fork. An in-progress `lastTurnId` boundary is rejected. Experimental `beforeTurnId` instead copies history strictly before the referenced turn, including when that turn is in progress, and cannot be combined with `lastTurnId`. If both boundaries are null while the source thread is mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork, emits `thread/started` (including the current `thread.status`), and auto-subscribes you to turn/item events for the new thread. Experimental clients can pass `excludeTurns: true` when they plan to page fork history via `thread/turns/list` instead of receiving the full turn array immediately, or `deferGoalContinuation: true` to carry the source thread's current goal into the fork and run an explicit turn before automatic continuation resumes. Deferred goal continuation is persisted until that turn starts and cannot be combined with `ephemeral: true`. Accepts the same permission override rules as `thread/start`.
 - `thread/start`, `thread/resume`, and `thread/fork` responses include the legacy `sandbox` compatibility projection. `instructionSources` lists loaded instruction files using each source environment's native absolute path syntax, including files loaded from remote environments. Experimental clients can read `runtimeWorkspaceRoots` for the thread-scoped runtime roots and `activePermissionProfile` for the named or implicit built-in profile identity/provenance when known. Their deprecated experimental `multiAgentMode` field, and the corresponding thread setting, always report `explicitRequestOnly`; Ultra reasoning effort is the source of proactive multi-agent behavior.
 - `thread/list` — page through stored threads; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `sectionId`, `cwd`, and `searchTerm` filters. Set `sortKey` to `"section_position"` when listing a section in its persisted manual order. Experimental clients can use `parentThreadId` for direct spawned children or `ancestorThreadId` for spawned descendants at any depth; the two filters are mutually exclusive. Review and Guardian threads are not included because they do not participate in that spawn-edge lifecycle. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded. Subagent threads also include `parentThreadId` when the immediate parent is known.
-- `threadSection/list` — page through independently persisted thread sections and their display names, including sections that do not currently contain any threads.
-- `threadSection/create` — create a durable custom section with a server-generated UUID and a nonempty display name; returns its `section`.
-- `threadSection/update` — rename an existing custom section while retaining its stable UUID; returns the updated `section`. The built-in pinned section cannot be renamed.
+- `threadSection/list` — page through independently persisted thread sections, including their display names and optional `appearance` (`icon` and `color`).
+- `threadSection/create` — create a durable custom section with a server-generated UUID, nonempty display name, and optional `appearance`; returns its `section`.
+- `threadSection/update` — rename an existing custom section and optionally replace its `appearance`; omit appearance to preserve it or pass `null` to clear it. The built-in pinned section cannot be updated.
 - `threadSection/delete` — delete an existing custom section and atomically return its member threads to the unsectioned list; returns `{}`. The built-in pinned section cannot be deleted.
 - `thread/loaded/list` — list the thread ids currently loaded in memory.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded. For loaded threads, experimental clients can use `canAcceptDirectInput` to determine whether `turn/start` and `turn/steer` are accepted; unloaded stored threads report `null` when that capability is unavailable.
@@ -267,12 +271,12 @@ Example with notification opt-out:
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; pass `threadId` to resolve servers from that thread's selected plugins and executor, and receive an `authorization_url` followed by `mcpServer/oauthLogin/completed` once the browser flow finishes.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
 - `config/mcpServer/reload` — reload MCP server config from disk and queue a refresh for loaded threads (applied on each thread's next active turn); returns `{}`. Use this after editing `config.toml` without restarting the server.
-- `mcpServerStatus/list` — enumerate configured MCP servers with their tools, auth status, server info, plus resources/resource templates for `full` detail; supports optional `threadId` and cursor+limit pagination. If `threadId` is omitted, the server reads from the latest global config directly. If `detail` is omitted, the server defaults to `full`. An `unknown` auth status means OAuth support could not be determined; `unsupported` means OAuth is known not to be supported.
+- `mcpServerStatus/list` — enumerate configured MCP servers with their tools, auth status, server info, owning `pluginId` (`null` for servers not contributed by a plugin), plus resources/resource templates for `full` detail; supports optional `threadId` and cursor+limit pagination. If `threadId` is omitted, the server reads from the latest global config directly. If `detail` is omitted, the server defaults to `full`. An `unknown` auth status means OAuth support could not be determined; `unsupported` means OAuth is known not to be supported.
 - `mcpServer/resource/read` — read a resource from a configured MCP server by optional `threadId`, `server`, and `uri`, returning text/blob resource `contents`. If `threadId` is omitted, the server reads from the latest MCP config directly.
 - `mcpServer/tool/call` — call a tool on a thread's configured MCP server by `threadId`, `server`, `tool`, optional `arguments`, and optional `_meta`, returning the MCP tool result.
 - `windowsSandbox/setupStart` — start Windows sandbox setup for the selected mode (`elevated` or `unelevated`); accepts an optional absolute `cwd` to target setup for a specific workspace, returns `{ started: true }` immediately, and later emits `windowsSandbox/setupCompleted`.
 - `feedback/upload` — submit a feedback report (classification + optional reason/logs, conversation_id, and optional `extraLogFiles` attachments array); returns the tracking thread id.
-- `config/read` — fetch the runtime-effective config after resolving config layering and managed requirements, including opaque `desktop` values stored in `config.toml`.
+- `config/read` — fetch the runtime-effective config after resolving config layering and managed requirements, including opaque `desktop` values stored in `config.toml`. When configured, the `packagedDefaults` layer has the lowest precedence.
 - `externalAgentConfig/detect` — detect migratable external-agent artifacts with `includeHome`, optional `cwds`, and an optional `migrationSource` selector. Omitted, `null`, or unrecognized migration-source values retain the default behavior. The deprecated optional `source` field remains accepted for compatibility but does not select the migration source. Each detected item includes `cwd` (`null` for home), and multi-item migrations may additionally include structured `details` with plugin ids, skill names, memory, session metadata, or other artifact names. The response also includes connector candidates inferred from detected source sessions, with a normalized display `name`, the number of detected sessions that used the connector, and the source metadata field used for detection.
 - `externalAgentConfig/import` — apply selected external-agent migration items by passing explicit `migrationItems` with `cwd` (`null` for home) and any `details` returned by detect. Pass the same optional `migrationSource` used for detection so the server reads from the matching source; omitted, `null`, or unrecognized values retain the default behavior. The optional `source` identifies the product that initiated the import, while the optional opaque `providerId` attributes analytics to the provider selected by that product without affecting migration-source selection. The response acknowledges the synchronous import phase with an `importId`. Expected migration failures are reported as per-item failures rather than JSON-RPC errors, so the server still returns that `importId` and emits `externalAgentConfig/import/completed` with the same ID once all synchronous and background work finishes. The completion notification contains type-level `itemTypeResults` with successes and failures, including raw failure messages for the client to report separately.
 - `externalAgentConfig/import/readHistories` — read completed import histories and connector candidates detected from successfully imported session histories. Successful session entries include the original imported title when one was available. Connector candidates include a normalized display `name`, the number of imported sessions that used the connector, and the source metadata field used for detection.
@@ -712,6 +716,8 @@ Experimental: use `memory/reset` to clear local memory artifacts and sqlite-back
 ### Example: Set and update a thread goal
 
 Use `thread/goal/set` to create or update the current goal for a materialized thread. Clients can set `budgetLimited` when they stop because a token budget is exhausted or nearly exhausted, `blocked` when progress is waiting on outside intervention, and `usageLimited` when usage availability stops further work. The system also sets `budgetLimited` when accounting crosses a configured token budget and `usageLimited` when a turn ends on a hard usage-limit error.
+
+When `goals.max_goal_token_budget` is configured, new goals default to that limit, larger budgets are rejected, and setting `tokenBudget` to `null` resets the budget to the configured limit instead of removing it.
 
 ```json
 { "method": "thread/goal/set", "id": 27, "params": {
@@ -2095,6 +2101,7 @@ instead of failing the whole request.
 ```json
 { "method": "app/read", "id": 51, "params": {
     "appIds": ["demo-app", "missing-app"],
+    "threadId": "thr_123",
     "includeTools": true
 } }
 { "id": 51, "result": {
@@ -2122,11 +2129,13 @@ instead of failing the whole request.
 
 `app/read` reads fresh metadata records from a cache partitioned by backend URL and ChatGPT
 account/workspace identity, then makes at most one `POST /ps/apps/batch` for missing or
-expired ids. `includeTools` defaults to false and is forwarded as `include_tools`; a fresh
-metadata-only cache entry is refetched when tool summaries are requested. Backend or transport
-failures return an RPC error without replacing existing cache records. Its metadata shape can
-include display-only public tool summaries with enabled/read-only state and intentionally excludes
-runtime state, MCP tool state, full actions, and model descriptions.
+expired ids. When `threadId` is provided, app feature gating, workspace policy, and plugin
+attribution use that thread's effective configuration. `includeTools` defaults to false and is
+forwarded as `include_tools`; a fresh metadata-only cache entry is refetched when tool summaries
+are requested. Backend or transport failures return an RPC error without replacing existing cache
+records. Its metadata shape can include display-only public tool summaries with enabled/read-only
+state and intentionally excludes runtime state, MCP tool state, full actions, and model
+descriptions.
 
 Connected apps may override the thread's approval reviewer in `config.toml`.
 Use `apps._default.approvals_reviewer` to set the reviewer for all apps, and a

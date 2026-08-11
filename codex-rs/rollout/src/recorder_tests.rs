@@ -1,6 +1,8 @@
 #![allow(warnings, clippy::all)]
 
 use super::*;
+use crate::RolloutItem;
+use crate::RolloutLine;
 use crate::config::RolloutConfig;
 use chrono::TimeZone;
 use codex_protocol::SessionId;
@@ -10,8 +12,6 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -1461,6 +1461,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         section: Some(codex_state::ThreadSection {
             id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
             name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+            appearance: None,
         }),
         cwd: Some(PathBuf::from("/tmp/state-cwd")),
         git_branch: Some("state-branch".to_string()),
@@ -1487,6 +1488,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         Some(codex_state::ThreadSection {
             id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
             name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+            appearance: None,
         })
     );
     assert_eq!(
