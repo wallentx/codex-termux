@@ -14,6 +14,7 @@ use codex_diagnostics::GaugeGuard;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_extension_api::ThreadIdleCause;
 use codex_features::Feature;
+use codex_history::RolloutItem;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -34,7 +35,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
@@ -48,6 +48,7 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::PersistContext;
 use codex_thread_store::StoredThread;
 use codex_thread_store::StoredThreadHistory;
 use codex_thread_store::ThreadMetadataPatch;
@@ -284,7 +285,9 @@ impl CodexThread {
 
     #[doc(hidden)]
     pub async fn ensure_rollout_materialized(&self) {
-        self.session.ensure_rollout_materialized().await;
+        self.session
+            .ensure_rollout_materialized(PersistContext::Standard)
+            .await;
     }
 
     #[doc(hidden)]

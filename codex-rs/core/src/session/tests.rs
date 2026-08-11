@@ -105,6 +105,10 @@ use codex_config::permissions_toml::PermissionsToml;
 use codex_execpolicy::Decision;
 use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
+use codex_history::CompactedItem;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
@@ -120,11 +124,9 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::GranularApprovalConfig;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NetworkApprovalProtocol;
@@ -134,8 +136,6 @@ use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
-use codex_protocol::protocol::ResumedHistory;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::Submission;
@@ -4099,7 +4099,6 @@ async fn set_rate_limits_retains_previous_credits() {
             .base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-        compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
         permission_profile_state: config.permissions.permission_profile_state().clone(),
@@ -4209,7 +4208,6 @@ async fn set_rate_limits_updates_plan_type_when_present() {
             .base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-        compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
         permission_profile_state: config.permissions.permission_profile_state().clone(),
@@ -4512,7 +4510,9 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
 
 async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
     let rollout_path = open_thread_persistence(session).await;
-    session.ensure_rollout_materialized().await;
+    session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     session
         .flush_rollout()
         .await
@@ -4756,7 +4756,6 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
             .base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-        compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
         permission_profile_state: config.permissions.permission_profile_state().clone(),
@@ -4870,14 +4869,14 @@ async fn resolved_environments_for_configuration(
     let turn_environments = ThreadEnvironments::new(
         Arc::clone(&environment_manager),
         default_user_shell(),
-        session_configuration.environment_config(),
+        session_configuration.turn_environment_config(),
         ShellSnapshot::disabled(),
         TurnEnvironmentSnapshot::default(),
         /*non_blocking_snapshots*/ false,
     );
     turn_environments.update_selections(
         session_configuration.environment_selections(),
-        &session_configuration.environment_config(),
+        &session_configuration.turn_environment_config(),
     );
     (environment_manager, turn_environments.snapshot().await)
 }
@@ -5183,6 +5182,7 @@ async fn new_default_turn_uses_config_aware_skills_for_role_overrides() {
     let parent_snapshot = session
         .services
         .skills_service
+        .for_request()
         .snapshot_for_cwd(
             &crate::skills_load_input_from_config(&parent_config, Vec::new()),
             /*force_reload*/ true,
@@ -5552,7 +5552,6 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
             .base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-        compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
         permission_profile_state: config.permissions.permission_profile_state().clone(),
@@ -5694,7 +5693,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             .base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-        compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
         permission_profile_state: config.permissions.permission_profile_state().clone(),
@@ -5736,7 +5734,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let turn_environments = Arc::new(ThreadEnvironments::new(
         environment_manager,
         default_user_shell(),
-        session_configuration.environment_config(),
+        session_configuration.turn_environment_config(),
         ShellSnapshot::disabled(),
         resolved_environments,
         /*non_blocking_snapshots*/ false,
@@ -5974,7 +5972,6 @@ async fn make_session_with_config_and_rx(
             .base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-        compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
         permission_profile_state: config.permissions.permission_profile_state().clone(),
@@ -6089,7 +6086,6 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
             .base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-        compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
         permission_profile_state: config.permissions.permission_profile_state().clone(),
@@ -7674,7 +7670,7 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
     let (_tx_event, rx_event) = async_channel::unbounded();
     let session_loop_handle = tokio::spawn(async move {
         let shutdown: Submission = rx_sub.recv().await.expect("shutdown submission");
-        assert_eq!(shutdown.op, Op::Shutdown);
+        assert!(matches!(shutdown.op, Op::Shutdown));
         tokio::time::sleep(StdDuration::from_millis(50)).await;
     });
     let io = Arc::new(SessionIo {
@@ -7765,7 +7761,7 @@ async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
             .recv()
             .await
             .expect("child shutdown submission");
-        assert_eq!(shutdown.op, Op::Shutdown);
+        assert!(matches!(shutdown.op, Op::Shutdown));
         child_shutdown_tx
             .send(())
             .expect("child shutdown signal should be delivered");
@@ -7850,7 +7846,7 @@ async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
             .recv()
             .await
             .expect("child shutdown submission");
-        assert_eq!(shutdown.op, Op::Shutdown);
+        assert!(matches!(shutdown.op, Op::Shutdown));
         child_shutdown_tx
             .send(())
             .expect("child shutdown signal should be delivered");
@@ -7954,7 +7950,6 @@ where
             .base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-        compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
         permission_profile_state: config.permissions.permission_profile_state().clone(),
@@ -7995,7 +7990,7 @@ where
     let turn_environments = Arc::new(ThreadEnvironments::new(
         environment_manager,
         default_user_shell(),
-        session_configuration.environment_config(),
+        session_configuration.turn_environment_config(),
         ShellSnapshot::disabled(),
         resolved_turn_environments.clone(),
         /*non_blocking_snapshots*/ false,
@@ -9654,7 +9649,9 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         serde_json::to_value(Some(turn_context.to_turn_context_item()))
             .expect("serialize expected context item")
     );
-    session.ensure_rollout_materialized().await;
+    session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     session.flush_rollout().await.expect("rollout should flush");
 
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
@@ -9697,7 +9694,9 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await
         .expect("world state should build");
-    session.ensure_rollout_materialized().await;
+    session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     session.flush_rollout().await.expect("rollout should flush");
 
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
@@ -9785,7 +9784,9 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await
         .expect("world state should build");
-    session.ensure_rollout_materialized().await;
+    session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     session.flush_rollout().await.expect("rollout should flush");
 
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
@@ -10006,7 +10007,13 @@ async fn failed_user_message_persistence_stops_turn_processing() {
     ];
 
     assert!(
-        super::turn::run_hooks_and_record_inputs(&session, &turn_context, &input).await,
+        super::turn::run_hooks_and_record_inputs(
+            &session,
+            &turn_context,
+            &input,
+            PersistContext::Standard,
+        )
+        .await,
         "a rollout flush failure should stop turn processing"
     );
     assert!(matches!(
