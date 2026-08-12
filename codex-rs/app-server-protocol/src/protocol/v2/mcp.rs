@@ -196,12 +196,25 @@ pub struct McpServerOauthLoginParams {
     pub name: String,
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
+    /// Registration strategy for this login only; omission selects automatic discovery.
+    #[ts(optional = nullable)]
+    pub client_registration: Option<McpServerOauthClientRegistration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub scopes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub timeout_secs: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum McpServerOauthClientRegistration {
+    #[default]
+    Auto,
+    Cimd,
+    Dcr,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

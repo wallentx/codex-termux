@@ -4259,6 +4259,13 @@
           "type": "string"
         },
         {
+          "description": "User has approved this MCP tool call and wants to amend its policy so matching future calls are automatically approved across sessions.",
+          "enum": [
+            "approved_mcp_policy_amendment"
+          ],
+          "type": "string"
+        },
+        {
           "additionalProperties": false,
           "description": "User chose to persist a network policy rule (allow/deny) for future requests to the same host.",
           "properties": {
@@ -13160,6 +13167,14 @@
         ],
         "type": "object"
       },
+      "McpServerOauthClientRegistration": {
+        "enum": [
+          "auto",
+          "cimd",
+          "dcr"
+        ],
+        "type": "string"
+      },
       "McpServerOauthLoginCompletedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -13192,6 +13207,17 @@
       "McpServerOauthLoginParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "clientRegistration": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/McpServerOauthClientRegistration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Registration strategy for this login only; omission selects automatic discovery."
+          },
           "name": {
             "type": "string"
           },

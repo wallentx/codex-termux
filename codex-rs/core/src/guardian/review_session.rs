@@ -221,8 +221,12 @@ impl GuardianReviewSessionReuseKey {
     }
 }
 
-fn encrypted_parent_compaction(items: &[ResponseItem]) -> Option<ResponseItem> {
-    let item = items.iter().rev().find(|item| {
+fn encrypted_parent_compaction<'a, I>(items: I) -> Option<ResponseItem>
+where
+    I: IntoIterator<Item = &'a ResponseItem>,
+    I::IntoIter: DoubleEndedIterator,
+{
+    let item = items.into_iter().rev().find(|item| {
         matches!(
             item,
             ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
@@ -741,7 +745,7 @@ async fn spawn_guardian_review_session(
         ),
         None => (
             parent_compaction
-                .map(|item| InitialHistory::Forked(vec![RolloutItem::ResponseItem(item)])),
+                .map(|item| InitialHistory::Forked(vec![RolloutItem::ResponseItem(item.into())])),
             0,
             None,
         ),

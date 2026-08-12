@@ -9497,6 +9497,14 @@
       ],
       "type": "object"
     },
+    "McpServerOauthClientRegistration": {
+      "enum": [
+        "auto",
+        "cimd",
+        "dcr"
+      ],
+      "type": "string"
+    },
     "McpServerOauthLoginCompletedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -9529,6 +9537,17 @@
     "McpServerOauthLoginParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "clientRegistration": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/McpServerOauthClientRegistration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Registration strategy for this login only; omission selects automatic discovery."
+        },
         "name": {
           "type": "string"
         },

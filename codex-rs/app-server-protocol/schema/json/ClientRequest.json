@@ -1930,8 +1930,27 @@
       ],
       "type": "object"
     },
+    "McpServerOauthClientRegistration": {
+      "enum": [
+        "auto",
+        "cimd",
+        "dcr"
+      ],
+      "type": "string"
+    },
     "McpServerOauthLoginParams": {
       "properties": {
+        "clientRegistration": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/McpServerOauthClientRegistration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Registration strategy for this login only; omission selects automatic discovery."
+        },
         "name": {
           "type": "string"
         },

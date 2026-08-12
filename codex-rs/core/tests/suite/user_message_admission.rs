@@ -1,7 +1,5 @@
 use codex_core::UserMessageAdmission;
 use codex_core::config::Constrained;
-use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
@@ -39,6 +37,70 @@ fn user_input(text: &str) -> Op {
     }
 }
 
+fn empty_user_input() -> Op {
+    Op::UserInput {
+        items: Vec::new(),
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn user_message_admission_starts_turn_for_empty_input() {
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .build_with_auto_env(&server)
+        .await
+        .expect("build empty user-message admission session");
+
+    let admission = test
+        .codex
+        .submit_user_input_and_wait_for_admission(
+            empty_user_input(),
+            /*trace*/ None,
+            Some("clock-wake".to_string()),
+        )
+        .await
+        .expect("empty user input should start a turn");
+    assert!(matches!(admission, UserMessageAdmission::Started { .. }));
+
+    loop {
+        let event = timeout(Duration::from_secs(10), test.codex.next_event())
+            .await
+            .expect("empty-input turn should finish promptly")
+            .expect("empty-input turn event stream should remain available");
+        match event.msg {
+            EventMsg::ItemStarted(event) => {
+                assert!(!matches!(event.item, TurnItem::UserMessage(_)));
+            }
+            EventMsg::ItemCompleted(event) => {
+                assert!(!matches!(event.item, TurnItem::UserMessage(_)));
+            }
+            EventMsg::Error(error) => panic!("empty-input turn failed: {error:?}"),
+            EventMsg::StreamError(error) => {
+                panic!("empty-input turn stream failed: {error:?}")
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    let user_input_groups = response_mock
+        .single_request()
+        .message_input_text_groups("user");
+    assert_eq!(user_input_groups.len(), 1);
+    assert_eq!(user_input_groups[0].len(), 1);
+    assert!(user_input_groups[0][0].starts_with("<environment_context>"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_turn_start_persists_developer_and_user_input_before_model_request() {
     let (release_response, response_gate) = oneshot::channel();
@@ -54,7 +116,7 @@ async fn default_turn_start_persists_developer_and_user_input_before_model_reque
         .await
         .expect("build default thread-store session");
     test.codex
-        .inject_response_items(vec![ResponseItem::Message {
+        .inject_response_items_for_turn(vec![ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -96,7 +158,7 @@ async fn default_turn_start_persists_developer_and_user_input_before_model_reque
     server.shutdown().await;
 }
 
-/// Concurrent submissions must start exactly one turn, steer the other message, and persist both client IDs.
+/// Concurrent submissions must start exactly one turn and steer the other message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_message_admission_reports_started_and_steered_for_concurrent_submissions() {
     let (release_response, response_gate) = oneshot::channel();
@@ -132,7 +194,7 @@ async fn user_message_admission_reports_started_and_steered_for_concurrent_submi
         async move {
             barrier.wait().await;
             codex
-                .submit_user_input_and_wait_for_persisted_admission(
+                .submit_user_input_and_wait_for_admission(
                     user_input("first message"),
                     /*trace*/ None,
                     Some("client-message-1".to_string()),
@@ -146,7 +208,7 @@ async fn user_message_admission_reports_started_and_steered_for_concurrent_submi
         async move {
             barrier.wait().await;
             codex
-                .submit_user_input_and_wait_for_persisted_admission(
+                .submit_user_input_and_wait_for_admission(
                     user_input("second message"),
                     /*trace*/ None,
                     Some("client-message-2".to_string()),
@@ -170,7 +232,7 @@ async fn user_message_admission_reports_started_and_steered_for_concurrent_submi
         tokio::join!(first_submission, second_submission)
     })
     .await
-    .expect("both concurrent admissions should resolve once their messages are persisted");
+    .expect("both concurrent admissions should resolve");
     let first_admission = first_admission
         .expect("first submission task should finish")
         .expect("first user message should be admitted");
@@ -193,33 +255,6 @@ async fn user_message_admission_reports_started_and_steered_for_concurrent_submi
             ),
         };
     assert_eq!(started_turn_id, steered_turn_id);
-
-    let rollout_path = codex.rollout_path().expect("user-message rollout path");
-    let rollout = tokio::fs::read_to_string(rollout_path)
-        .await
-        .expect("read persisted user-message rollout");
-    let mut persisted_client_message_ids: Vec<_> = rollout
-        .lines()
-        .map(serde_json::from_str::<RolloutLine>)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse persisted user-message rollout")
-        .into_iter()
-        .filter_map(|line| match line.item {
-            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match event.item {
-                TurnItem::UserMessage(message) => message.client_id,
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect();
-    persisted_client_message_ids.sort();
-    assert_eq!(
-        persisted_client_message_ids,
-        vec![
-            "client-message-1".to_string(),
-            "client-message-2".to_string()
-        ]
-    );
 
     let mut observed_client_message_ids = Vec::new();
     loop {

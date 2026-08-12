@@ -132,6 +132,10 @@ fn captured_op_matches(actual: &(ThreadId, Op), expected: &(ThreadId, Op)) -> bo
     }
 }
 
+fn rollout_response_item(item: ResponseItem) -> RolloutItem {
+    RolloutItem::ResponseItem(item.into())
+}
+
 fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -273,8 +277,10 @@ async fn persisted_originator(thread: &CodexThread) -> String {
         .expect("session metadata should be persisted")
 }
 
-fn has_subagent_notification(history_items: &[ResponseItem]) -> bool {
-    history_items.iter().any(|item| {
+fn has_subagent_notification<'a>(
+    history_items: impl IntoIterator<Item = &'a ResponseItem>,
+) -> bool {
+    history_items.into_iter().any(|item| {
         let ResponseItem::Message { role, content, .. } = item else {
             return false;
         };
@@ -291,8 +297,11 @@ fn has_subagent_notification(history_items: &[ResponseItem]) -> bool {
 }
 
 /// Returns true when any message item contains `needle` in a text span.
-fn history_contains_text(history_items: &[ResponseItem], needle: &str) -> bool {
-    history_items.iter().any(|item| {
+fn history_contains_text<'a>(
+    history_items: impl IntoIterator<Item = &'a ResponseItem>,
+    needle: &str,
+) -> bool {
+    history_items.into_iter().any(|item| {
         let ResponseItem::Message { content, .. } = item else {
             return false;
         };
@@ -305,11 +314,11 @@ fn history_contains_text(history_items: &[ResponseItem], needle: &str) -> bool {
     })
 }
 
-fn history_contains_assistant_inter_agent_communication(
-    history_items: &[ResponseItem],
+fn history_contains_assistant_inter_agent_communication<'a>(
+    history_items: impl IntoIterator<Item = &'a ResponseItem>,
     expected: &InterAgentCommunication,
 ) -> bool {
-    history_items.iter().any(|item| {
+    history_items.into_iter().any(|item| {
         let ResponseItem::Message { role, content, .. } = item else {
             return false;
         };
@@ -333,13 +342,8 @@ fn history_contains_assistant_inter_agent_communication(
 async fn wait_for_subagent_notification(parent_thread: &Arc<CodexThread>) -> bool {
     let wait = async {
         loop {
-            let history_items = parent_thread
-                .session
-                .clone_history()
-                .await
-                .raw_items()
-                .to_vec();
-            if has_subagent_notification(&history_items) {
+            let history = parent_thread.session.clone_history().await;
+            if has_subagent_notification(history.raw_items()) {
                 return true;
             }
             sleep(Duration::from_millis(25)).await;
@@ -680,9 +684,9 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
     .await
     .expect("inter-agent communication should stay pending");
 
-    let history_items = thread.session.clone_history().await.raw_items().to_vec();
+    let history = thread.session.clone_history().await;
     assert!(!history_contains_assistant_inter_agent_communication(
-        &history_items,
+        history.raw_items(),
         &communication
     ));
 }
@@ -1040,7 +1044,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
     parent_thread
         .session
         .persist_rollout_items(&[
-            RolloutItem::ResponseItem(ResponseItem::Message {
+            rollout_response_item(ResponseItem::Message {
                 id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1141,7 +1145,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
         .iter()
         .find_map(|line| match &line.item {
             RolloutItem::ResponseItem(response_item)
-                if serde_json::to_string(response_item)
+                if serde_json::to_string(&response_item.item)
                     .expect("serialize response item")
                     .contains("id-less inherited context") =>
             {
@@ -1254,21 +1258,24 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
         .persist_rollout_items(&[
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
-                replacement_history: Some(vec![ResponseItem::Message {
-                    id: None,
-                    role: "user".to_string(),
-                    content: vec![ContentItem::InputText {
-                        text: "compacted summary".to_string(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                }]),
+                replacement_history: Some(vec![
+                    ResponseItem::Message {
+                        id: None,
+                        role: "user".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: "compacted summary".to_string(),
+                        }],
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    }
+                    .into(),
+                ]),
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
             }),
-            RolloutItem::ResponseItem(ResponseItem::Message {
+            rollout_response_item(ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1277,7 +1284,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
             }),
-            RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
+            rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
         ])
         .await;
 
@@ -1351,7 +1358,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .clone_history()
         .await
         .raw_items()
-        .first()
+        .next()
         .cloned()
         .expect("parent seed should be recorded");
     let turn_context = parent_thread.session.new_default_turn().await;
@@ -1498,8 +1505,9 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             internal_chat_message_metadata_passthrough: None,
         },
     ];
+    let history_items = history.raw_items().cloned().collect::<Vec<_>>();
     assert_eq!(
-        strip_response_item_ids(history.raw_items()),
+        strip_response_item_ids(&history_items),
         strip_response_item_ids(&expected_history),
         "full-history forked child history should replace parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
     );
@@ -1680,14 +1688,16 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
         .persist_rollout_items(&[
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
-                replacement_history: Some(replacement_history),
+                replacement_history: Some(
+                    replacement_history.into_iter().map(Into::into).collect(),
+                ),
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
             }),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
-            RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
+            rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
         ])
         .await;
     parent_thread
@@ -1735,7 +1745,6 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     assert!(
         !history
             .raw_items()
-            .iter()
             .any(|item| matches!(item, ResponseItem::AgentMessage { .. })),
         "forked child history should not inherit compacted parent agent messages"
     );
@@ -1832,7 +1841,7 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
     parent_thread
         .session
         .persist_rollout_items(&[
-            RolloutItem::ResponseItem(ResponseItem::Message {
+            rollout_response_item(ResponseItem::Message {
                 id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1843,14 +1852,16 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
             }),
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
-                replacement_history: Some(replacement_history),
+                replacement_history: Some(
+                    replacement_history.into_iter().map(Into::into).collect(),
+                ),
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
             }),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
-            RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
+            rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
         ])
         .await;
     parent_thread
@@ -1969,7 +1980,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             )
             .await;
         let mut rollout_items = vec![
-            RolloutItem::ResponseItem(parent_user_message),
+            rollout_response_item(parent_user_message),
             RolloutItem::Compacted(CompactedItem {
                 message: "legacy compacted summary".to_string(),
                 replacement_history: None,
@@ -1980,7 +1991,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             }),
         ];
         if let Some(instructions) = parent_developer_instructions {
-            rollout_items.push(RolloutItem::ResponseItem(ResponseItem::Message {
+            rollout_items.push(rollout_response_item(ResponseItem::Message {
                 id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1993,7 +2004,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
         rollout_items.push(RolloutItem::TurnContext(
             turn_context.to_turn_context_item(),
         ));
-        rollout_items.push(RolloutItem::ResponseItem(spawn_agent_call(
+        rollout_items.push(rollout_response_item(spawn_agent_call(
             parent_spawn_call_id,
         )));
         parent_thread
@@ -2873,14 +2884,9 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
             })
     );
 
-    let root_history_items = root_thread
-        .session
-        .clone_history()
-        .await
-        .raw_items()
-        .to_vec();
+    let root_history = root_thread.session.clone_history().await;
     assert!(!history_contains_assistant_inter_agent_communication(
-        &root_history_items,
+        root_history.raw_items(),
         &InterAgentCommunication::new(
             tester_path,
             AgentPath::root(),
@@ -2889,7 +2895,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
             /*trigger_turn*/ true,
         )
     ));
-    assert!(!has_subagent_notification(&root_history_items));
+    assert!(!has_subagent_notification(root_history.raw_items()));
 }
 
 #[tokio::test]
@@ -2976,14 +2982,9 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     .await
     .expect("completion watcher should queue a direct-parent message");
 
-    let root_history_items = root_thread
-        .session
-        .clone_history()
-        .await
-        .raw_items()
-        .to_vec();
+    let root_history = root_thread.session.clone_history().await;
     assert!(!history_contains_assistant_inter_agent_communication(
-        &root_history_items,
+        root_history.raw_items(),
         &InterAgentCommunication::new(
             tester_path,
             AgentPath::root(),
@@ -3015,21 +3016,16 @@ async fn completion_watcher_notifies_parent_when_child_is_missing() {
 
     assert_eq!(wait_for_subagent_notification(&parent_thread).await, true);
 
-    let history_items = parent_thread
-        .session
-        .clone_history()
-        .await
-        .raw_items()
-        .to_vec();
+    let history = parent_thread.session.clone_history().await;
     assert_eq!(
         history_contains_text(
-            &history_items,
+            history.raw_items(),
             &format!("\"agent_path\":\"{child_thread_id}\"")
         ),
         true
     );
     assert_eq!(
-        history_contains_text(&history_items, "\"status\":\"not_found\""),
+        history_contains_text(history.raw_items(), "\"status\":\"not_found\""),
         true
     );
 }
