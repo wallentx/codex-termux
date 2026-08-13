@@ -35,6 +35,7 @@ use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::body_json;
+use wiremock::matchers::body_partial_json;
 use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -101,7 +102,7 @@ async fn mount_file_upload_mocks(server: &MockServer, file_size_bytes: u64) {
     Mock::given(method("POST"))
         .and(path("/files"))
         .and(header("chatgpt-account-id", "account_id"))
-        .and(body_json(json!({
+        .and(body_partial_json(json!({
             "file_name": "report.txt",
             "file_size": file_size_bytes,
             "use_case": "codex",
@@ -233,6 +234,19 @@ async fn codex_apps_file_params_omit_fields_absent_from_tool_schema() -> Result<
             "connector_id": "calendar",
         }))
     );
+    let requests = server.received_requests().await.expect("capture requests");
+    let upload_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/files")
+        .expect("app tool should create a Files upload");
+    let upload_body: Value =
+        serde_json::from_slice(&upload_request.body).expect("Files request should be JSON");
+    assert_eq!(
+        upload_body.get("codex_connector_id"),
+        Some(&json!("calendar"))
+    );
+    assert_eq!(upload_body.get("upload_source"), None);
+    assert_eq!(upload_body.get("store_in_library"), None);
 
     server.verify().await;
     Ok(())

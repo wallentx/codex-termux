@@ -6,6 +6,7 @@ use codex_core::ModelClient;
 use codex_core::ModelClientSession;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
+use codex_core::TurnInputRequest;
 use codex_core::X_CODEX_ROUTING_HINT_HEADER;
 use codex_core::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 use codex_core::test_support::with_parent_turn;
@@ -33,7 +34,6 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::UserInput;
@@ -1496,14 +1496,15 @@ async fn responses_websocket_emits_rate_limit_events() {
 
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![vec![
+            json!({
+                "type": "codex.response.metadata",
+                "headers": {"x-models-etag": "etag-123"},
+            }),
             rate_limit_event,
             ev_response_created("resp-1"),
             ev_completed("resp-1"),
         ]],
-        response_headers: vec![
-            ("X-Models-Etag".to_string(), "etag-123".to_string()),
-            ("X-Reasoning-Included".to_string(), "true".to_string()),
-        ],
+        response_headers: vec![("X-Reasoning-Included".to_string(), "true".to_string())],
         accept_delay: None,
         close_after_requests: true,
     }])
@@ -1608,18 +1609,12 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         .await
         .expect("build websocket codex");
 
-    let submission_id = test
+    let submission = test
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submission should succeed while emitting usage limit error events");
 
@@ -1666,7 +1661,7 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
     };
     assert!(
         error_event.message.contains("spend cap set by the owner"),
-        "unexpected error message for submission {submission_id}: {}",
+        "unexpected error message for submission {submission:?}: {}",
         error_event.message
     );
 
@@ -1703,18 +1698,12 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
         .await
         .expect("build websocket codex");
 
-    let submission_id = test
+    let submission = test
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submission should succeed while emitting invalid request events");
 
@@ -1727,7 +1716,7 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
             .message
             .to_lowercase()
             .contains("does not support image inputs"),
-        "unexpected error message for submission {submission_id}: {}",
+        "unexpected error message for submission {submission:?}: {}",
         error_event.message
     );
 

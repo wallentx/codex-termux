@@ -423,6 +423,8 @@ mod status_controls;
 mod status_surfaces;
 mod streaming;
 use self::status_surfaces::CachedProjectRootName;
+mod thread_usage;
+pub(crate) use self::thread_usage::ThreadUsageOutcome;
 mod tokens;
 pub(crate) use self::tokens::TokenActivityView;
 mod tool_lifecycle;
@@ -764,6 +766,8 @@ pub(crate) struct ChatWidget {
     status_line_workspace_headline_last_requested_at: Option<Instant>,
     // Set after the backend reports the workspace-message feature gate is disabled.
     status_line_workspace_messages_disabled: bool,
+    // Cached backend-estimated cost and bounded refresh state for the current thread.
+    thread_usage: thread_usage::ThreadUsageState,
     // Current thread-goal status shown in the status line when plan mode is inactive.
     current_goal_status_indicator: Option<GoalStatusIndicator>,
     current_goal_status: Option<GoalStatusState>,
@@ -1216,10 +1220,11 @@ impl ChatWidget {
             self.refresh_terminal_title();
         }
         self.refresh_status_line_if_workspace_headline_due();
+        self.refresh_thread_usage_if_settlement_due();
     }
 
     fn flush_active_cell(&mut self) {
-        if let Some(active) = self.transcript.active_cell.take() {
+        if let Some(active) = self.transcript.take_active_cell() {
             self.transcript.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
             self.request_pending_usage_output_insertion();
@@ -1378,7 +1383,7 @@ impl ChatWidget {
 
     /// Mark the active cell as failed (✗) and flush it into history.
     fn finalize_active_cell_as_failed(&mut self) {
-        if let Some(mut cell) = self.transcript.active_cell.take() {
+        if let Some(mut cell) = self.transcript.take_active_cell() {
             // Insert finalized cell into history and keep grouping consistent.
             if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                 exec.mark_failed();
@@ -1470,7 +1475,7 @@ impl ChatWidget {
     /// Merge the real session info cell with any placeholder header to avoid double boxes.
     fn apply_session_info_cell(&mut self, cell: history_cell::SessionInfoCell) {
         let mut session_info_cell = Some(Box::new(cell) as Box<dyn HistoryCell>);
-        let merged_header = if let Some(active) = self.transcript.active_cell.take() {
+        let merged_header = if let Some(active) = self.transcript.take_active_cell() {
             if active
                 .as_any()
                 .is::<history_cell::SessionHeaderHistoryCell>()

@@ -696,6 +696,9 @@
             "responses_websockets_v2": {
               "type": "boolean"
             },
+            "retain_client_developer_messages": {
+              "type": "boolean"
+            },
             "rollout_budget": {
               "$ref": "#/definitions/FeatureToml_for_RolloutBudgetConfigToml"
             },
@@ -2717,6 +2720,9 @@
             "type": "string"
           },
           "type": "object"
+        },
+        "http_headers_helper": {
+          "type": "string"
         },
         "name": {
           "default": null,
@@ -5333,6 +5339,9 @@
           "type": "boolean"
         },
         "responses_websockets_v2": {
+          "type": "boolean"
+        },
+        "retain_client_developer_messages": {
           "type": "boolean"
         },
         "rollout_budget": {

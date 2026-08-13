@@ -2,6 +2,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use codex_core::ForkSnapshot;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
@@ -90,9 +91,9 @@ fn remove_agents_md_world_state_section(rollout_path: &Path) -> Result<()> {
         .into_iter()
         .map(|mut line| {
             if let RolloutItem::WorldState(world_state) = &mut line.item
-                && let Some(state) = world_state.state.as_object_mut()
+                && world_state.state.remove("agents_md").is_some()
             {
-                removed_section |= state.remove("agents_md").is_some();
+                removed_section = true;
             }
             serde_json::to_string(&line)
         })
@@ -149,16 +150,10 @@ fn assert_single_instruction_fragment(request: &responses::ResponsesRequest, exp
 
 async fn submit_thread_turn(thread: &Arc<codex_core::CodexThread>, prompt: &str) -> Result<()> {
     thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: prompt.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: prompt.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     Ok(())
@@ -496,16 +491,10 @@ async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
 
     no_environment_thread
         .thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "inspect global instructions without an environment".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "inspect global instructions without an environment".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&no_environment_thread.thread, |event| {
         matches!(event, EventMsg::TurnComplete(_))

@@ -6,6 +6,9 @@ use crate::loader::curated_plugin_cache_version;
 use crate::marketplace::MarketplacePluginSource;
 use crate::marketplace::find_marketplace_plugin;
 use crate::marketplace_policy::primary_runtime_marketplace_root;
+use crate::plugin_metrics::PluginMetricsOperation;
+use crate::plugin_metrics::ResolvedPluginMetricsOperation;
+use crate::plugin_metrics::load_plugin_metrics_operations;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::startup_sync::curated_plugins_api_marketplace_path;
 use crate::startup_sync::curated_plugins_repo_path;
@@ -21,6 +24,7 @@ use codex_shell_command::bash::parse_shell_lc_plain_commands;
 use codex_shell_command::parse_command::is_pathish;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::Component;
 use std::path::Path;
@@ -29,6 +33,7 @@ use std::path::Path;
 struct TrustedPluginRoot {
     plugin_id: PluginId,
     root: AbsolutePathBuf,
+    metrics_operations_by_path: BTreeMap<String, PluginMetricsOperation>,
 }
 
 /// Trusted plugin command attribution safe to carry into command analytics.
@@ -79,9 +84,12 @@ impl TrustedPluginRoots {
                     return None;
                 }
                 let root = expected_root.canonicalize().ok()?;
-                root.as_path()
-                    .is_dir()
-                    .then_some(TrustedPluginRoot { plugin_id, root })
+                root.as_path().is_dir().then(|| TrustedPluginRoot {
+                    plugin_id,
+                    metrics_operations_by_path: load_plugin_metrics_operations(&root)
+                        .unwrap_or_default(),
+                    root,
+                })
             })
             .filter(|root| seen.insert((root.plugin_id.as_key(), root.root.clone())))
             .collect();
@@ -193,6 +201,38 @@ impl TrustedPluginRoots {
         matches.next().is_none().then_some(attribution)
     }
 
+    /// Resolves one exact command to one trusted manifest-declared operation.
+    pub fn resolve_metrics_operation(
+        &self,
+        command: &[String],
+        cwd: &AbsolutePathBuf,
+    ) -> Option<ResolvedPluginMetricsOperation> {
+        let attribution = self.resolve_attribution(command, cwd)?;
+        self.metrics_operation_for_attribution(attribution)
+    }
+
+    fn metrics_operation_for_attribution(
+        &self,
+        attribution: PluginCommandAttribution,
+    ) -> Option<ResolvedPluginMetricsOperation> {
+        let mut matches = self.roots.iter().filter_map(|root| {
+            (root.plugin_id == attribution.plugin_id)
+                .then(|| {
+                    root.metrics_operations_by_path
+                        .get(&attribution.normalized_relative_path)
+                })
+                .flatten()
+        });
+        let operation = matches.next()?.clone();
+        matches
+            .next()
+            .is_none()
+            .then_some(ResolvedPluginMetricsOperation {
+                plugin_id: attribution.plugin_id,
+                operation,
+            })
+    }
+
     /// Resolves a trusted script on the selected executor filesystem.
     ///
     /// Remote commands can use a path convention that the app-server host cannot
@@ -227,6 +267,19 @@ impl TrustedPluginRoots {
             .await
             .ok()?;
         (contents == candidate.contents).then_some(candidate.attribution)
+    }
+
+    /// Resolves one trusted executor script to one manifest-declared operation.
+    pub async fn resolve_metrics_operation_in_filesystem(
+        &self,
+        command: &[String],
+        cwd: &PathUri,
+        file_system: &dyn ExecutorFileSystem,
+    ) -> Option<ResolvedPluginMetricsOperation> {
+        let attribution = self
+            .resolve_executor_attribution(command, cwd, file_system)
+            .await?;
+        self.metrics_operation_for_attribution(attribution)
     }
 
     fn local_candidate_for_executor_script(
@@ -306,7 +359,7 @@ pub fn command_script_arguments(command: &[String]) -> Option<Vec<String>> {
 /// Converts a path already proven to be below a trusted plugin root into the
 /// only path shape that may leave the resolver: non-empty, relative, and
 /// slash-separated with no traversal or platform-specific prefixes.
-fn normalized_relative_script_path(relative_path: &Path) -> Option<String> {
+pub(crate) fn normalized_relative_script_path(relative_path: &Path) -> Option<String> {
     let normalized = relative_path
         .components()
         .map(|component| {

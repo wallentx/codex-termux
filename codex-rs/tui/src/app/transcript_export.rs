@@ -24,6 +24,7 @@ use crate::history_cell::ReasoningSummaryCell;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::history_cell::raw_lines_from_source;
+use crate::legacy_core::config::Config;
 use crate::thread_transcript::RawReasoningVisibility;
 use crate::thread_transcript::thread_items_to_transcript_cells;
 
@@ -42,12 +43,11 @@ impl App {
         } else {
             RawReasoningVisibility::Hidden
         };
-        let codex_home = self.config.codex_home.to_path_buf();
         let cells = load_export_transcript(
             app_server,
             thread_id,
             visibility,
-            Some(codex_home.as_path()),
+            Some(&self.config),
             self.transcript_cells.clone(),
         )
         .await?;
@@ -77,7 +77,7 @@ pub(super) async fn load_export_transcript(
     app_server: &mut AppServerSession,
     thread_id: ThreadId,
     visibility: RawReasoningVisibility,
-    codex_home: Option<&Path>,
+    config: Option<&Config>,
     visible_transcript: Vec<Arc<dyn HistoryCell>>,
 ) -> Result<Vec<Arc<dyn HistoryCell>>, String> {
     let mut thread = app_server
@@ -123,7 +123,7 @@ pub(super) async fn load_export_transcript(
                 &thread.cwd,
                 [item],
                 visibility,
-                codex_home,
+                config,
             ));
         }
     }
@@ -224,7 +224,7 @@ fn render_markdown_transcript(cells: &[Arc<dyn HistoryCell>]) -> Result<String, 
         let lines = if let Some(user) = cell.as_any().downcast_ref::<UserHistoryCell>() {
             let (message, _) =
                 crate::ide_context::extract_prompt_request_with_offset(&user.message);
-            let message = crate::history_cell::sanitize_user_text(message);
+            let message = crate::history_cell::sanitize_user_text(message.into());
             let mut lines = raw_lines_from_source(&message);
             let image_count = user.local_image_paths.len() + user.remote_image_urls.len();
             let image_labels = (0..image_count)
@@ -273,9 +273,7 @@ fn render_markdown_transcript(cells: &[Arc<dyn HistoryCell>]) -> Result<String, 
                 markdown.push_str("    ");
             }
             for span in line.spans {
-                markdown.push_str(&crate::history_cell::sanitize_user_text(
-                    span.content.as_ref(),
-                ));
+                markdown.push_str(&crate::history_cell::sanitize_user_text(span.content));
             }
             markdown.push('\n');
         }
