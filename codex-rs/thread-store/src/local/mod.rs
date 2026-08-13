@@ -8,6 +8,7 @@ mod model_context;
 mod move_thread_to_section;
 mod paginated_fork;
 mod read_thread;
+mod revert_thread;
 mod rollout_migration;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
@@ -15,6 +16,7 @@ mod rollout_lineage;
 mod search_threads;
 mod thread_history;
 mod thread_history_materialization;
+mod thread_rollout_resolver;
 mod thread_sections;
 mod unarchive_thread;
 mod update_thread_metadata;
@@ -61,6 +63,7 @@ use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
+use crate::RevertThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
@@ -112,6 +115,9 @@ pub struct LocalThreadStore {
 
 struct LiveRecorderEntry {
     recorder: RolloutRecorder,
+    // Rollout projection rows are keyed by immutable rollout ID, not the stable thread ID used
+    // to find this live writer.
+    rollout_id: ThreadId,
     // Local rollout files are materialized lazily, but metadata updates can arrive before the
     // canonical SessionMeta is durable. Retain the mode captured when live persistence was opened
     // so missing SQLite rows can still be seeded.
@@ -291,6 +297,7 @@ impl LocalThreadStore {
         &self,
         thread_id: ThreadId,
         recorder: RolloutRecorder,
+        rollout_id: ThreadId,
         history_mode: ThreadHistoryMode,
         writer_lock: WriterLockGuard,
     ) -> ThreadStoreResult<()> {
@@ -301,6 +308,7 @@ impl LocalThreadStore {
             Entry::Vacant(entry) => {
                 entry.insert(LiveRecorderEntry {
                     recorder,
+                    rollout_id,
                     history_mode,
                     writer_lock,
                 });
@@ -437,6 +445,10 @@ impl ThreadStore for LocalThreadStore {
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move { paginated_fork::prepare(self, params).await })
+    }
+
+    fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { revert_thread::revert(self, params).await })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {

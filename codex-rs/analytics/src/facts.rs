@@ -29,6 +29,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -541,6 +542,7 @@ pub(crate) enum CustomAnalyticsFact {
     PluginInstallRequested(PluginInstallRequestedInput),
     PluginStateChanged(PluginStateChangedInput),
     PluginInstallFailed(PluginInstallFailedInput),
+    PluginMeasurements(PluginMeasurementsInput),
     ExternalAgentConfigImportCompleted(ExternalAgentConfigImportCompletedInput),
     ExternalAgentConfigImportFailure(ExternalAgentConfigImportFailureInput),
 }
@@ -548,6 +550,24 @@ pub(crate) enum CustomAnalyticsFact {
 pub(crate) struct ArtifactOperationInput {
     pub tracking: TrackEventsContext,
     pub operation: ArtifactOperation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginMeasurementRow {
+    pub measurement_name: String,
+    pub number_value: f64,
+    pub dimensions: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginMeasurementsInput {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub plugin_id: String,
+    pub execution_id: String,
+    pub operation: String,
+    pub rows: Vec<PluginMeasurementRow>,
 }
 
 pub(crate) struct SkillInvokedInput {

@@ -276,6 +276,11 @@ stream_max_retries = 0
         )
     };
     let package = locator(&skill_dir);
+    let main_package = if scenario == ExecutorSkillScenario::VisibleWithBudgetWarning {
+        "e0/skills/deploy".to_string()
+    } else {
+        package.clone()
+    };
     let main_resource = locator(&skill_dir.join("SKILL.md")?);
     let reference_resource = locator(&reference_dir.join("details.md")?);
     let tool_response = |call_id: &str, tool: &str, arguments: serde_json::Value| {
@@ -296,7 +301,7 @@ stream_max_retries = 0
             "main",
             "read",
             json!({
-                "package": package.clone(),
+                "package": main_package,
                 "resource": main_resource.clone(),
             }),
         ),
@@ -437,6 +442,14 @@ stream_max_retries = 0
 
     let requests = response_mock.requests();
     let request = &requests[0];
+    if scenario == ExecutorSkillScenario::VisibleWithBudgetWarning {
+        assert!(
+            request
+                .message_input_texts("developer")
+                .iter()
+                .any(|text| text.contains("executor package: e0/skills/deploy"))
+        );
+    }
     assert!(
         request
             .message_input_texts("developer")
@@ -518,11 +531,19 @@ stream_max_retries = 0
             assert_eq!(list_output["skills"], json!([]));
         }
     }
-    assert!(
-        requests[2]
+    let main_output = serde_json::from_str::<serde_json::Value>(
+        &requests[2]
             .function_call_output_text("main")
-            .expect("main skill output")
-            .contains(SKILL_MARKER)
+            .expect("main skill output"),
+    )?;
+    assert!(
+        main_output["contents"]
+            .as_str()
+            .is_some_and(|contents| contents.contains(SKILL_MARKER))
+    );
+    assert_eq!(
+        main_output["skill_root"],
+        json!(skill_dir.inferred_native_path_string())
     );
     let reference_output_text = requests[3]
         .function_call_output_text("reference")
@@ -541,6 +562,10 @@ stream_max_retries = 0
         reference_output["contents"]
             .as_str()
             .is_some_and(|contents| contents.contains(REFERENCE_MARKER))
+    );
+    assert_eq!(
+        reference_output["skill_root"],
+        json!(skill_dir.inferred_native_path_string())
     );
     match scenario {
         ExecutorSkillScenario::VisibleWithBudgetWarning => {

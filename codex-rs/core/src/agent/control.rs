@@ -1,3 +1,6 @@
+use crate::TurnInputRequest;
+use crate::TurnInputSubmission;
+use crate::TurnStartOptions;
 use crate::agent::AgentStatus;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
@@ -51,6 +54,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::watch;
 use tracing::warn;
+use uuid::Uuid;
 
 pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
@@ -73,6 +77,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) parent_turn_id: Option<String>,
+    pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
 }
 
@@ -169,27 +174,35 @@ impl AgentControl {
         agent_id: ThreadId,
         input: Vec<UserInput>,
         parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
-        self.ensure_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
-            .await?;
-        self.send_input_after_capacity_check(agent_id, &state, input, parent_turn_id)
+        let thread = state.get_thread(agent_id).await?;
+        let result = match thread
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(input).on_start(TurnStartOptions {
+                    parent_turn_id,
+                    root_turn_id,
+                    ..Default::default()
+                }),
+            )
             .await
-    }
-
-    async fn send_input_after_capacity_check(
-        &self,
-        agent_id: ThreadId,
-        state: &Arc<ThreadManagerState>,
-        input: Vec<UserInput>,
-        parent_turn_id: Option<String>,
-    ) -> CodexResult<String> {
-        self.handle_thread_request_result(
-            agent_id,
-            state,
-            state.send_op(agent_id, input.into(), parent_turn_id).await,
-        )
-        .await
+        {
+            Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
+            Ok(TurnInputSubmission::Steered { .. }) => {
+                // MAv1 exposes an opaque `submission_id` to the model. The legacy
+                // `Op::UserInput` path returned a fresh ID for every steer, while the
+                // turn-input API returns the active turn ID. Keep the tool-visible ID
+                // unique without adding a submission receipt back to Core.
+                Ok(Uuid::now_v7().to_string())
+            }
+            Ok(TurnInputSubmission::NotSubmitted { reason }) => Err(CodexErr::InvalidRequest(
+                format!("turn input was not submitted: {reason:?}"),
+            )),
+            Err(err) => Err(err),
+        };
+        self.handle_thread_request_result(agent_id, &state, result)
+            .await
     }
 
     pub(crate) async fn send_inter_agent_communication(
@@ -198,16 +211,21 @@ impl AgentControl {
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
         parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
-        self.ensure_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
-            .await?;
+        if communication.trigger_turn {
+            let thread = state.get_thread(agent_id).await?;
+            self.ensure_execution_capacity_for_turn_start(&thread)
+                .await?;
+        }
         self.send_inter_agent_communication_after_capacity_check(
             agent_id,
             &state,
             communication,
             agent_communication_context,
             parent_turn_id,
+            root_turn_id,
         )
         .await
     }
@@ -219,6 +237,7 @@ impl AgentControl {
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         self.submit_inter_agent_communication(
             agent_id,
@@ -226,6 +245,7 @@ impl AgentControl {
             communication,
             context,
             parent_turn_id,
+            root_turn_id,
         )
         .await
     }
@@ -237,10 +257,12 @@ impl AgentControl {
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let communication_for_log =
             crate::agent_communication::logging_enabled().then(|| communication.clone());
         let parent_turn_id = parent_turn_id.filter(|_| communication.trigger_turn);
+        let root_turn_id = root_turn_id.filter(|_| communication.trigger_turn);
         let result = self
             .handle_thread_request_result(
                 agent_id,
@@ -250,6 +272,7 @@ impl AgentControl {
                         agent_id,
                         Op::InterAgentCommunication { communication },
                         parent_turn_id,
+                        root_turn_id,
                     )
                     .await,
             )
@@ -274,7 +297,12 @@ impl AgentControl {
             agent_id,
             &state,
             state
-                .send_op(agent_id, Op::Interrupt, /*parent_turn_id*/ None)
+                .send_op(
+                    agent_id,
+                    Op::Interrupt,
+                    /*parent_turn_id*/ None,
+                    /*root_turn_id*/ None,
+                )
                 .await,
         )
         .await
@@ -556,6 +584,7 @@ impl AgentControl {
                         communication,
                         context,
                         /*parent_turn_id*/ None,
+                        /*root_turn_id*/ None,
                     )
                     .await;
                 return;

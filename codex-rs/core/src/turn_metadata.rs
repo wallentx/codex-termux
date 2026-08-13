@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
+use crate::responses_metadata::ROOT_TURN_ID_KEY;
 use crate::responses_metadata::TurnMetadataWorkspace;
 use crate::responses_metadata::TurnToolNamespacesInfo;
 use crate::responses_metadata::filter_extra_metadata;
@@ -29,6 +30,7 @@ use codex_git_utils::get_head_commit_hash;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
@@ -101,6 +103,7 @@ pub(crate) struct TurnMetadataState {
     forked_from_thread_id: Option<ThreadId>,
     parent_thread_id: Option<ThreadId>,
     parent_turn_id: OnceLock<String>,
+    root_turn_id: OnceLock<String>,
     subagent_header: Option<String>,
     subagent_kind: Option<String>,
     thread_source: Option<ThreadSource>,
@@ -108,11 +111,14 @@ pub(crate) struct TurnMetadataState {
     sandbox: Option<String>,
     sandbox_mode: Option<String>,
     auto_review_enabled: bool,
+    node_repl_auto_review_required: bool,
+    node_repl_disabled: bool,
     enriched_workspaces: RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>,
     tool_namespaces_info: RwLock<Option<TurnToolNamespacesInfo>>,
     turn_started_at_unix_ms: RwLock<Option<i64>>,
     responses_api_metadata: RwLock<BTreeMap<String, String>>,
     responsesapi_client_metadata: RwLock<BTreeMap<String, String>>,
+    root_turn_ambiguous: AtomicBool,
     user_input_requested_during_turn: AtomicBool,
     enrichment_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -132,6 +138,7 @@ impl TurnMetadataState {
         windows_sandbox_level: WindowsSandboxLevel,
         enforce_managed_network: bool,
         auto_review_enabled: bool,
+        model_info: &ModelInfo,
     ) -> Self {
         let repo_root = get_git_repo_root(&cwd);
         let sandbox = Some(
@@ -152,6 +159,7 @@ impl TurnMetadataState {
             forked_from_thread_id,
             parent_thread_id,
             parent_turn_id: OnceLock::new(),
+            root_turn_id: OnceLock::new(),
             subagent_header: subagent_header_value(session_source),
             subagent_kind: subagent_metadata_kind(session_source),
             thread_source,
@@ -159,11 +167,14 @@ impl TurnMetadataState {
             sandbox,
             sandbox_mode,
             auto_review_enabled,
+            node_repl_auto_review_required: model_info.node_repl_auto_review_required,
+            node_repl_disabled: model_info.node_repl_disabled,
             enriched_workspaces: RwLock::new(None),
             tool_namespaces_info: RwLock::new(None),
             turn_started_at_unix_ms: RwLock::new(None),
             responses_api_metadata: RwLock::new(BTreeMap::new()),
             responsesapi_client_metadata: RwLock::new(BTreeMap::new()),
+            root_turn_ambiguous: AtomicBool::new(false),
             user_input_requested_during_turn: AtomicBool::new(false),
             enrichment_task: Mutex::new(None),
         }
@@ -180,6 +191,7 @@ impl TurnMetadataState {
             return None;
         };
         metadata.remove(PARENT_TURN_ID_KEY);
+        metadata.remove(ROOT_TURN_ID_KEY);
         metadata.insert(
             MODEL_KEY.to_string(),
             Value::String(context.model.to_string()),
@@ -243,6 +255,38 @@ impl TurnMetadataState {
         let _ = self.parent_turn_id.set(parent_turn_id);
     }
 
+    pub(crate) fn set_root_turn_id(&self, root_turn_id: String) {
+        if root_turn_id.trim().is_empty() {
+            return;
+        }
+        let _ = self.root_turn_id.set(root_turn_id);
+    }
+
+    pub(crate) fn root_turn_id(&self) -> Option<String> {
+        self.root_turn_id
+            .get()
+            .filter(|_| !self.root_turn_ambiguous.load(Ordering::Relaxed))
+            .cloned()
+    }
+
+    pub(crate) fn mark_root_turn_ambiguous(&self) {
+        self.root_turn_ambiguous.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn can_start_root_turn(&self, session_source: &SessionSource) -> bool {
+        if session_source.is_non_root_agent() {
+            return false;
+        }
+        match &self.thread_source {
+            // Desktop create/fork/send lacks trusted app-server provenance; fail closed.
+            Some(ThreadSource::Subagent | ThreadSource::MemoryConsolidation) => false,
+            Some(ThreadSource::Feature(feature)) => {
+                !matches!(feature.as_str(), "system" | "title") && !feature.starts_with("ambient")
+            }
+            Some(ThreadSource::User) | None => true,
+        }
+    }
+
     pub(crate) fn set_responsesapi_client_metadata(
         &self,
         responsesapi_client_metadata: HashMap<String, String>,
@@ -302,12 +346,15 @@ impl TurnMetadataState {
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
             parent_turn_id: self.parent_turn_id.get().cloned(),
+            root_turn_id: self.root_turn_id(),
             subagent_header: self.subagent_header.clone(),
             subagent_kind: self.subagent_kind.clone(),
             thread_source: self.thread_source.clone(),
             sandbox: self.sandbox.clone(),
             sandbox_mode: self.sandbox_mode.clone(),
             auto_review_enabled: Some(self.auto_review_enabled),
+            node_repl_auto_review_required: Some(self.node_repl_auto_review_required),
+            node_repl_disabled: Some(self.node_repl_disabled),
             workspaces: self.current_workspaces(),
             tool_namespaces_info: self
                 .tool_namespaces_info
