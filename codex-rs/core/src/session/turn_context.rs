@@ -4,6 +4,7 @@ use crate::exec_policy::AllowPrefixRules;
 use crate::shell_snapshot::ShellSnapshotFile;
 use crate::tools::sandboxing::executor_windows_sandbox_level;
 use codex_core_plugins::PluginCommandAttribution;
+use codex_core_plugins::ResolvedPluginMetricsOperation;
 use codex_core_plugins::TrustedPluginRoots;
 use codex_exec_server::ExecutorFileSystem;
 use codex_file_system::FileSystemSandboxContext;
@@ -239,6 +240,26 @@ impl TurnContext {
             AllowPrefixRules::IgnoreForCyberModel
         } else {
             AllowPrefixRules::Honor
+        }
+    }
+
+    pub(crate) async fn plugin_metrics_operation_for_command(
+        &self,
+        command: &[String],
+        cwd: &PathUri,
+        environment: &Environment,
+    ) -> Option<ResolvedPluginMetricsOperation> {
+        let trusted_roots = self.extension_data.get::<TrustedPluginRoots>()?;
+        if environment.is_remote() {
+            trusted_roots
+                .resolve_metrics_operation_in_filesystem(
+                    command,
+                    cwd,
+                    environment.get_filesystem().as_ref(),
+                )
+                .await
+        } else {
+            trusted_roots.resolve_metrics_operation(command, &cwd.to_abs_path().ok()?)
         }
     }
 
@@ -605,6 +626,7 @@ impl Session {
             session_configuration.windows_sandbox_level,
             network.is_some(),
             auto_review_enabled,
+            &model_info,
         ));
         turn_metadata_state
             .set_responses_api_metadata(per_turn_config.responses_api_metadata.clone());

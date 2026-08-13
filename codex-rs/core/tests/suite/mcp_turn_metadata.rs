@@ -4,6 +4,7 @@
 use anyhow::Result;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_config::types::AppToolApproval;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_history::RolloutItem;
@@ -14,11 +15,16 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::McpToolCallStatus;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ElicitationAction;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::request_permissions::PermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile;
+use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
@@ -29,6 +35,7 @@ use core_test_support::apps_test_server::SEARCH_CALENDAR_LIST_TOOL;
 use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
 use core_test_support::apps_test_server::recorded_apps_tool_call_by_call_id;
 use core_test_support::apps_test_server::search_capable_apps_builder;
+use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -106,23 +113,20 @@ async fn submit_user_turn(
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.cwd.path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
                 collaboration_mode: collaboration_mode.or({
-                    Some(codex_protocol::config_types::CollaborationMode {
-                        mode: codex_protocol::config_types::ModeKind::Default,
-                        settings: codex_protocol::config_types::Settings {
+                    Some(CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
                             model: session_model,
                             reasoning_effort: None,
                             developer_instructions: None,
@@ -130,8 +134,8 @@ async fn submit_user_turn(
                     })
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     Ok(())
 }
@@ -156,7 +160,11 @@ async fn wait_for_mcp_tool_call_item(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn approved_mcp_tool_call_metadata_records_prior_user_input_request() -> Result<()> {
+#[test_case(false; "without strict auto review")]
+#[test_case(true; "with strict auto review")]
+async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
+    strict_auto_review: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -166,36 +174,65 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request() -> R
         "title": "Lunch",
         "starts_at": "2026-03-10T12:00:00Z"
     }))?;
-    let mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_function_call_with_namespace(
-                    call_id,
-                    SEARCH_CALENDAR_NAMESPACE,
-                    SEARCH_CALENDAR_CREATE_TOOL,
-                    &calendar_args,
-                ),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
+    let mut response_sequence = Vec::new();
+    if strict_auto_review {
+        let requested_permissions = RequestPermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            ..Default::default()
+        };
+        let request_permissions_args = json!({
+            "reason": "Enable strict auto review before the MCP approval",
+            "permissions": requested_permissions,
+        });
+        response_sequence.push(sse(vec![
+            ev_response_created("resp-permissions"),
+            ev_function_call(
+                "calendar-strict-permissions",
+                "request_permissions",
+                &serde_json::to_string(&request_permissions_args)?,
+            ),
+            ev_completed("resp-permissions"),
+        ]));
+    }
+    response_sequence.extend([
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call_with_namespace(
+                call_id,
+                SEARCH_CALENDAR_NAMESPACE,
+                SEARCH_CALENDAR_CREATE_TOOL,
+                &calendar_args,
+            ),
+            ev_completed("resp-1"),
+        ]),
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    ]);
+    let mock = mount_sse_sequence(&server, response_sequence).await;
 
     let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url.clone())
-        .with_config(|config| {
-            // Use the opposite global reviewer so this route must come from apps._default.
-            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        .with_config(move |config| {
+            // The permission grant needs user review before strict review applies to the turn.
+            config.approvals_reviewer = if strict_auto_review {
+                ApprovalsReviewer::User
+            } else {
+                ApprovalsReviewer::AutoReview
+            };
             config
                 .features
                 .enable(Feature::ToolCallMcpElicitation)
                 .expect("test config should allow feature update");
+            if strict_auto_review {
+                config
+                    .features
+                    .enable(Feature::RequestPermissionsTool)
+                    .expect("test config should allow feature update");
+            }
             set_default_app_approval_mode_and_reviewer(
                 config,
                 AppToolApproval::Prompt,
@@ -212,6 +249,30 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request() -> R
         /*collaboration_mode*/ None,
     )
     .await?;
+
+    if strict_auto_review {
+        let event = wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::RequestPermissions(_) | EventMsg::TurnComplete(_)
+            )
+        })
+        .await;
+        let EventMsg::RequestPermissions(request) = event else {
+            panic!("expected permission request before MCP approval, received {event:?}");
+        };
+        assert_eq!(request.call_id, "calendar-strict-permissions");
+        test.codex
+            .submit(Op::RequestPermissionsResponse {
+                id: request.call_id,
+                response: RequestPermissionsResponse {
+                    permissions: request.permissions,
+                    scope: PermissionGrantScope::Turn,
+                    strict_auto_review: true,
+                },
+            })
+            .await?;
+    }
 
     let EventMsg::McpToolCallBegin(begin) = wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::McpToolCallBegin(_))
@@ -248,8 +309,24 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request() -> R
     })
     .await;
 
-    assert_eq!(mock.requests().len(), 2);
+    let response_requests = mock.requests();
+    assert_eq!(response_requests.len(), 2 + usize::from(strict_auto_review));
+    let response_body = response_requests[0].body_json();
+    let turn_id = response_body["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("Responses request turn id");
+    assert_root_turn(&response_body, Some(turn_id))?;
     let apps_tool_call = recorded_apps_tool_call_by_call_id(&server, call_id).await;
+    let mcp_turn_metadata = apps_tool_call
+        .pointer("/params/_meta/x-codex-turn-metadata")
+        .expect("MCP tools/call turn metadata");
+    assert_eq!(
+        (
+            mcp_turn_metadata.get("root_turn_id"),
+            mcp_turn_metadata.get("parent_turn_id"),
+        ),
+        (None, None)
+    );
 
     assert_eq!(
         apps_tool_call.pointer("/params/_meta/callId"),
