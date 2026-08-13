@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 
-# Notarize a standalone binary and retain its diagnostic report.
+# Submits a signed standalone macOS binary to Apple notarization through
+# rcodesign. Standalone binaries cannot carry a stapled ticket, so the binary
+# is submitted in a ZIP and the successful notarization log is retained.
 
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: notarize_macos_binary_with_akv.sh --binary PATH [--report-dir PATH] [--max-wait-seconds SECONDS]
+Usage: notarize_macos_binary_with_rcodesign.sh --binary PATH [--report-dir PATH] [--max-wait-seconds SECONDS]
 
 Options:
   --binary PATH                 Signed standalone macOS binary to notarize.
   --report-dir PATH             Directory for notarization logs.
-  --max-wait-seconds SECONDS    Maximum Apple notarization wait time.
+  --max-wait-seconds SECONDS    Maximum rcodesign notarization wait time.
 EOF
 }
 
@@ -61,7 +63,7 @@ if [[ ! "$max_wait_seconds" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-for command_name in python3 zip; do
+for command_name in rcodesign zip; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "$command_name was not found on PATH." >&2
     exit 1
@@ -71,11 +73,11 @@ done
 missing_environment=0
 for variable_name in \
   APPLE_NOTARIZATION_ISSUER_ID \
-  APPLE_NOTARIZATION_AKV_KEY_NAME \
-  AZURE_KEYVAULT_NAME
+  APPLE_NOTARIZATION_KEY_ID \
+  APPLE_NOTARIZATION_KEY_P8
 do
   if [[ -z "${!variable_name:-}" ]]; then
-    echo "$variable_name must be configured before notarizing a binary." >&2
+    echo "$variable_name must be set from CI secrets before notarizing a binary." >&2
     missing_environment=1
   fi
 done
@@ -89,6 +91,23 @@ mkdir -p "$report_dir"
 notarization_temp_dir="$(mktemp -d)"
 trap 'rm -rf "$notarization_temp_dir" >/dev/null' EXIT
 
+private_key_path="$notarization_temp_dir/AuthKey_${APPLE_NOTARIZATION_KEY_ID}.p8"
+if ! printf '%s' "$APPLE_NOTARIZATION_KEY_P8" | base64 --decode >"$private_key_path" 2>/dev/null; then
+  if ! printf '%s' "$APPLE_NOTARIZATION_KEY_P8" | base64 -D >"$private_key_path" 2>/dev/null; then
+    echo "APPLE_NOTARIZATION_KEY_P8 must be a base64-encoded .p8 private key." >&2
+    exit 2
+  fi
+fi
+chmod 600 "$private_key_path"
+
+api_key_path="$notarization_temp_dir/app-store-connect-api-key.json"
+rcodesign encode-app-store-connect-api-key \
+  --output-path "$api_key_path" \
+  "$APPLE_NOTARIZATION_ISSUER_ID" \
+  "$APPLE_NOTARIZATION_KEY_ID" \
+  "$private_key_path" \
+  >"$report_dir/encode-app-store-connect-api-key.log" 2>&1
+
 binary_name="$(basename "$binary_path")"
 archive_path="$notarization_temp_dir/${binary_name}.zip"
 (
@@ -97,15 +116,16 @@ archive_path="$notarization_temp_dir/${binary_name}.zip"
 )
 
 notarization_log="$report_dir/${binary_name}-notarization.log"
-python3 "$(dirname "$0")/notarize_with_akv.py" \
-  --file "$archive_path" \
-  --report-log "$report_dir/${binary_name}-notarization-developer-log.json" \
+rcodesign notarize \
+  --api-key-file "$api_key_path" \
   --max-wait-seconds "$max_wait_seconds" \
+  --wait \
+  "$archive_path" \
   2>&1 | tee "$notarization_log"
 
 {
   echo "binary_name=$binary_name"
   echo "max_wait_seconds=$max_wait_seconds"
   echo "binary_sha256=$(shasum -a 256 "$binary_path" | awk '{ print $1 }')"
-  echo "notarization=completed"
+  echo "rcodesign_notarize=completed"
 } >"$report_dir/${binary_name}-notarization-summary.txt"
