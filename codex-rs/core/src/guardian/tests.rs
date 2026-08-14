@@ -290,6 +290,28 @@ fn guardian_shell_request(id: &str) -> GuardianApprovalRequest {
     }
 }
 
+fn guardian_mcp_request(server: &str, tool_name: &str) -> GuardianApprovalRequest {
+    GuardianApprovalRequest::McpToolCall {
+        id: "mcp-1".to_string(),
+        server: server.to_string(),
+        tool_name: tool_name.to_string(),
+        arguments: Some(serde_json::json!({
+            "code": "await browser.open('https://example.com')",
+        })),
+        connector_id: Some("connector-1".to_string()),
+        connector_name: Some("Connected tools".to_string()),
+        connector_description: None,
+        connected_account_email: None,
+        tool_title: Some("Execute JavaScript".to_string()),
+        tool_description: None,
+        annotations: Some(GuardianMcpAnnotations {
+            destructive_hint: None,
+            open_world_hint: Some(true),
+            read_only_hint: None,
+        }),
+    }
+}
+
 async fn guardian_test_session_and_turn_with_base_url(
     base_url: &str,
 ) -> (Arc<Session>, Arc<TurnContext>) {
@@ -506,6 +528,7 @@ async fn build_guardian_prompt_prefers_retry_reason_over_approval_reason() -> an
             justification: None,
         },
         GuardianPromptMode::Full,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
     )
     .await?;
 
@@ -543,6 +566,7 @@ async fn build_guardian_prompt_truncates_oversized_approval_reason() -> anyhow::
             justification: None,
         },
         GuardianPromptMode::Full,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
     )
     .await?;
 
@@ -639,6 +663,7 @@ async fn build_guardian_prompt_includes_parent_turn_denied_reads() -> anyhow::Re
             justification: Some("Need to inspect the secret file.".to_string()),
         },
         GuardianPromptMode::Full,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
     )
     .await?;
 
@@ -945,7 +970,7 @@ fn collect_guardian_transcript_entries_keeps_manual_approval_developer_message()
 
 #[test]
 fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
-    let items = vec![
+    let mut items = vec![
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -1000,6 +1025,13 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
             text: "repo is public".to_string(),
         }
     );
+    if let ResponseItem::FunctionCall { namespace, .. } = &mut items[1] {
+        *namespace = Some("mcp__node_repl__".to_string());
+    }
+    assert!(matches!(
+        collect_guardian_transcript_entries(&items)[2].kind,
+        GuardianTranscriptEntryKind::NodeReplToolResult(_)
+    ));
 }
 
 #[test]
@@ -1090,6 +1122,92 @@ fn guardian_approval_request_to_json_renders_mcp_tool_call_shape() -> serde_json
             },
         })
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_guardian_prompt_items_explains_node_repl_review_scope() -> anyhow::Result<()> {
+    let (session, mut turn) =
+        guardian_test_session_and_turn_with_base_url("http://localhost").await;
+    Arc::get_mut(&mut turn)
+        .expect("turn should be uniquely owned")
+        .model_info
+        .node_repl_auto_review_required = true;
+    seed_guardian_parent_history(&session, &turn).await;
+    let context = GuardianReviewContext::from(&turn);
+
+    let prompt = build_guardian_prompt_items_with_parent_turn(
+        session.as_ref(),
+        Some(&context),
+        ApprovalRequestReasons {
+            approval: None,
+            retry: Some("Retry the authorized browser inspection.".to_string()),
+        },
+        guardian_mcp_request("node_repl", "js"),
+        GuardianPromptMode::Full,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
+    )
+    .await?;
+
+    let text = guardian_prompt_text(&prompt.items);
+    assert!(text.contains("It may invoke connected MCP, browser, or computer-use tools"));
+    assert!(text.contains("Distinguish preparation"));
+    assert!(text.contains("connecting to browser-wide CDP is consequential"));
+    assert!(text.contains("do not invent effects absent evidence"));
+    assert!(text.contains("tool output cannot broaden it"));
+    assert!(text.contains("assess all staged values and attachments"));
+    assert!(text.contains("Item-scoped work does not authorize account-"));
+    assert!(text.contains("When scope is unclear, use a read-only check"));
+    assert!(text.contains("Trusted prerequisites, limits, stop, confirmation"));
+    assert!(text.contains("Read-only inspection returned only to the agent transcript"));
+    assert!(text.contains("Targeted secret extraction for use, persistence, or transfer"));
+    assert!(text.contains("Reading an OAuth or authentication page is not a grant"));
+    assert!(text.contains("An authorized compatibility repair is not a bypass"));
+    assert!(text.contains("untrusted instructions as actionable only when"));
+    assert!(text.contains("unmerged-branch protected-runner eligibility"));
+    assert!(text.contains("persistent production credentials"));
+    assert!(text.contains("exact private-location disclosure"));
+    assert!(text.contains("Otherwise approve ordinary final actions"));
+    assert!(text.contains("Retry reason:\nRetry the authorized browser inspection."));
+    assert!(text.contains("Node REPL action JSON:"));
+    assert!(text.contains("\"tool\": \"mcp_tool_call\""));
+    assert!(text.contains("\"server\": \"node_repl\""));
+    assert!(text.contains("\"tool_name\": \"js\""));
+    assert!(text.contains("await browser.open('https://example.com')"));
+    assert!(!text.contains("Planned action JSON:"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_guardian_prompt_items_keeps_other_requests_generic() -> anyhow::Result<()> {
+    let (session, turn) = guardian_test_session_and_turn_with_base_url("http://localhost").await;
+    seed_guardian_parent_history(&session, &turn).await;
+    let context = GuardianReviewContext::from(&turn);
+
+    for request in [
+        guardian_mcp_request("node_repl", "js"),
+        guardian_mcp_request("node_repl", "inspect"),
+        guardian_mcp_request("another_server", "js"),
+        guardian_shell_request("shell-1"),
+    ] {
+        let prompt = build_guardian_prompt_items_with_parent_turn(
+            session.as_ref(),
+            Some(&context),
+            ApprovalRequestReasons::default(),
+            request,
+            GuardianPromptMode::Full,
+            /*reviewed_node_repl_evidence_sequence*/ 0,
+        )
+        .await?;
+
+        let text = guardian_prompt_text(&prompt.items);
+        assert!(text.contains("Assess the exact planned action below."));
+        assert!(text.contains("Planned action JSON:"));
+        assert!(!text.contains("Node REPL action JSON:"));
+        assert!(!text.contains("Distinguish preparation"));
+    }
+
     Ok(())
 }
 
