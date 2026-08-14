@@ -759,7 +759,8 @@ impl ThreadManager {
     ///
     /// Loaded threads route through `CodexThread`/`LiveThread`, so metadata changes stay ordered
     /// with live rollout writes. Cold threads go directly to the store, which owns unloaded JSONL
-    /// compatibility and SQLite metadata updates.
+    /// compatibility and SQLite metadata updates. This API always returns a materialized thread;
+    /// if the store reports a successful no-op without one, it performs a fallback read.
     pub async fn update_thread_metadata(
         &self,
         thread_id: ThreadId,
@@ -777,7 +778,8 @@ impl ThreadManager {
                 .await
                 .map_err(|err| thread_store_metadata_update_error(thread_id, err));
         }
-        self.state
+        let updated = self
+            .state
             .thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id,
@@ -790,7 +792,20 @@ impl ThreadManager {
                     CodexErr::ThreadNotFound(thread_id)
                 }
                 err => thread_store_metadata_update_error(thread_id, err),
-            })
+            })?;
+        match updated {
+            Some(thread) => Ok(thread),
+            None => self
+                .state
+                .thread_store
+                .read_thread(ReadThreadParams {
+                    thread_id,
+                    include_archived,
+                    include_history: false,
+                })
+                .await
+                .map_err(|err| thread_store_metadata_update_error(thread_id, err)),
+        }
     }
 
     /// Moves a persisted thread to, within, or out of a server-ordered section.
@@ -1023,6 +1038,26 @@ impl ThreadManager {
     /// Returns the thread if the thread was found and removed.
     pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
         self.state.threads.write().await.remove(thread_id)
+    }
+
+    /// Removes a thread only if `thread_id` still maps to `expected`.
+    ///
+    /// Delayed cleanup uses this to avoid removing a replacement runtime registered under the
+    /// same thread ID.
+    pub async fn remove_thread_if_matches(
+        &self,
+        thread_id: &ThreadId,
+        expected: &Arc<CodexThread>,
+    ) -> Option<Arc<CodexThread>> {
+        let mut threads = self.state.threads.write().await;
+        if threads
+            .get(thread_id)
+            .is_some_and(|thread| Arc::ptr_eq(thread, expected))
+        {
+            threads.remove(thread_id)
+        } else {
+            None
+        }
     }
 
     /// Tries to shut down all tracked threads concurrently within the provided timeout.

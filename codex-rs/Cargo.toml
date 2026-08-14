@@ -59,6 +59,7 @@ members = [
     "ext/goal",
     "ext/git-attribution",
     "ext/guardian",
+    "ext/guardian-v2",
     "ext/image-generation",
     "ext/items",
     "ext/memories",
@@ -98,6 +99,7 @@ members = [
     "websocket-client",
     "workload-identity",
     "utils/absolute-path",
+    "utils/audio",
     "utils/path-uri",
     "utils/cargo-bin",
     "git-utils",
@@ -253,6 +255,7 @@ codex-tui = { path = "tui" }
 codex-uds = { path = "uds" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-approval-presets = { path = "utils/approval-presets" }
+codex-utils-audio = { path = "utils/audio" }
 codex-utils-cache = { path = "utils/cache" }
 codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }
@@ -275,6 +278,7 @@ codex-utils-stream-parser = { path = "utils/stream-parser" }
 codex-utils-string = { path = "utils/string" }
 codex-utils-template = { path = "utils/template" }
 codex-v8-poc = { path = "v8-poc" }
+codex-workload-identity = { path = "workload-identity" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
 core_test_support = { path = "core/tests/common" }
 mcp_test_support = { path = "mcp-server/tests/common" }
@@ -358,7 +362,7 @@ libc = "0.2.182"
 # https://www.sqlite.org/wal.html#the_wal_reset_bug
 libsqlite3-sys = { version = "0.37", default-features = false }
 log = "0.4"
-lru = "0.16.3"
+lru = "0.18.2"
 maplit = "1.0.2"
 memchr = "2.7.6"
 mime_guess = "2.0.5"
@@ -396,6 +400,7 @@ regex-lite = "0.1.8"
 reqwest = { version = "0.12", features = ["cookies"] }
 rmcp = { version = "=3.0.0", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
+rustix = { version = "1.1.4", features = ["net"] }
 rustls = { version = "0.23", default-features = false, features = [
     "aws_lc_rs",
     "std",
@@ -483,7 +488,7 @@ uuid = "1"
 v8 = "=150.4.0"
 vt100 = "0.16.2"
 walkdir = "2.5.0"
-webbrowser = "1.0"
+webbrowser = "1.2.2"
 which = "8"
 whoami = "1.6.1"
 wildmatch = "2.6.1"
