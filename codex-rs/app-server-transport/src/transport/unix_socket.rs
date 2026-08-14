@@ -8,6 +8,10 @@ use crate::transport::websocket::run_websocket_connection;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_file_lock::FileLockOutcome;
+use codex_utils_file_lock::LockDirGuard;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
+use codex_utils_file_lock::lock_exclusive_optional;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -133,6 +137,7 @@ pub async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
 
 pub struct AppServerStartupLock {
     _file: std::fs::File,
+    _lock_dir_guard: Option<LockDirGuard>,
 }
 
 pub async fn acquire_app_server_startup_lock(
@@ -148,8 +153,16 @@ pub async fn acquire_app_server_startup_lock(
             .read(true)
             .write(true)
             .open(startup_lock_path.as_path())?;
-        file.lock()?;
-        Ok(AppServerStartupLock { _file: file })
+        let lock_dir_guard = match lock_exclusive_optional(&file)? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => {
+                Some(acquire_sibling_lock_dir(startup_lock_path.as_path())?)
+            }
+        };
+        Ok(AppServerStartupLock {
+            _file: file,
+            _lock_dir_guard: lock_dir_guard,
+        })
     })
     .await
     .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))?
