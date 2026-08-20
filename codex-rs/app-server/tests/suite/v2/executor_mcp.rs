@@ -21,6 +21,7 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
+use codex_http_client::HttpClientBuilder;
 use codex_utils_path_uri::PathUri;
 use core_test_support::responses;
 use core_test_support::stdio_server_bin;
@@ -48,6 +49,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use url::Url;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const EXECUTOR_HTTP_MCP_URL: &str = "http://executor-only.invalid/mcp";
@@ -150,11 +152,17 @@ async fn selected_executor_plugin_exposes_its_mcps_only_to_that_thread() -> Resu
     let http_server_handle = tokio::spawn(async move {
         let _ = axum::serve(http_listener, http_router).await;
     });
+    let plugin_callback_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let plugin_callback_port = plugin_callback_listener.local_addr()?.port();
+    let global_callback_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let global_callback_port = global_callback_listener.local_addr()?.port();
+    drop(plugin_callback_listener);
     let codex_home = TempDir::new()?;
+    let root_config = format!(
+        "compact_prompt = \"compact\"\nmodel_auto_compact_token_limit = 1024\nmcp_oauth_credentials_store = \"file\"\nmcp_oauth_callback_port = {global_callback_port}"
+    );
     MockResponsesConfig::new(&responses_server.uri())
-        .with_root_config(
-            "compact_prompt = \"compact\"\nmodel_auto_compact_token_limit = 1024\nmcp_oauth_credentials_store = \"file\"",
-        )
+        .with_root_config(&root_config)
         .with_provider_config("supports_websockets = false")
         .write(codex_home.path())?;
     let executor_config: codex_config::types::McpServerConfig = serde_json::from_value(json!({
@@ -221,12 +229,16 @@ HTTP_PROXY = {http_proxy}
                 (OAUTH_MCP_SERVER_NAME): {
                     "url": EXECUTOR_OAUTH_MCP_URL,
                     "environment_id": "local",
+                    "oauth": {"callbackPort": plugin_callback_port},
                     "startup_timeout_sec": 10,
                 },
                 (PRE_REGISTERED_OAUTH_MCP_SERVER_NAME): {
                     "url": EXECUTOR_OAUTH_MCP_URL,
                     "environment_id": "local",
-                    "oauth": {"clientId": "configured-client"},
+                    "oauth": {
+                        "clientId": "configured-client",
+                        "callbackPort": plugin_callback_port,
+                    },
                     "startup_timeout_sec": 10,
                 }
             }
@@ -285,7 +297,7 @@ startup_timeout_sec = 10
         .await?;
     let response: McpServerOauthLoginResponse =
         timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
-    let authorization_url = reqwest::Url::parse(&response.authorization_url)?;
+    let authorization_url = Url::parse(&response.authorization_url)?;
     let parameters = authorization_url
         .query_pairs()
         .into_owned()
@@ -298,14 +310,13 @@ startup_timeout_sec = 10
         registration_request_rx.try_recv().is_err(),
         "configured OAuth client must skip dynamic registration"
     );
-    let mut callback_url = reqwest::Url::parse(&parameters["redirect_uri"])?;
+    let mut callback_url = Url::parse(&parameters["redirect_uri"])?;
     callback_url
         .query_pairs_mut()
         .append_pair("code", "configured-test-code")
         .append_pair("state", &parameters["state"]);
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()?
+    HttpClientBuilder::new()
+        .build_direct()?
         .get(callback_url)
         .send()
         .await?
@@ -340,7 +351,7 @@ startup_timeout_sec = 10
             .authorization_url
             .starts_with("https://oauth-only.invalid/authorize?")
     );
-    let authorization_url = reqwest::Url::parse(&response.authorization_url)?;
+    let authorization_url = Url::parse(&response.authorization_url)?;
     let client_id = authorization_url
         .query_pairs()
         .find_map(|(key, value)| (key == "client_id").then(|| value.into_owned()));
@@ -361,14 +372,14 @@ startup_timeout_sec = 10
         registration_request["redirect_uris"],
         json!([redirect_uri.clone()])
     );
-    let mut callback_url = reqwest::Url::parse(&redirect_uri)?;
+    let mut callback_url = Url::parse(&redirect_uri)?;
+    assert_eq!(callback_url.port(), Some(plugin_callback_port));
     callback_url
         .query_pairs_mut()
         .append_pair("code", "executor-test-code")
         .append_pair("state", &state);
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()?
+    HttpClientBuilder::new()
+        .build_direct()?
         .get(callback_url)
         .send()
         .await?

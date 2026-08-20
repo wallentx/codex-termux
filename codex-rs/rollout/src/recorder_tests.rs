@@ -23,6 +23,7 @@ use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::security_risk::SecurityRiskScore;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -64,6 +65,7 @@ fn agent_message_item(message: &str) -> RolloutItem {
         message: message.to_string(),
         phase: None,
         memory_citation: None,
+        delivery: None,
     }))
 }
 
@@ -438,8 +440,11 @@ async fn load_rollout_items_preserves_security_risk_scores() -> std::io::Result<
     let rollout_path = home.path().join("rollout.jsonl");
     let thread_id = ThreadId::new();
     let security_risk = SecurityRiskScore {
-        category: "action_risk".to_string(),
-        score: 0.76,
+        scores: BTreeMap::from([
+            ("action_risk".to_string(), 0.76),
+            ("data_exfiltration".to_string(), 0.31),
+        ]),
+        sampled_at: None,
     };
     let security_risk_item = RolloutItem::SecurityRiskScore(security_risk.clone());
     for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
@@ -640,6 +645,7 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
                 message: "buffered-event".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
         ))])
         .await?;
@@ -887,6 +893,7 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
                 message: "buffered-before-persist".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
         ))])
         .await?;
@@ -938,6 +945,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
             message: "queued-after-writer-error".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
         },
     ))]);
 
@@ -1508,6 +1516,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(filesystem_thread_id),
         first_user_message: Some("filesystem message".to_string()),
         preview: Some("filesystem preview".to_string()),
+        project_id: None,
         section: None,
         cwd: None,
         git_branch: Some("filesystem-branch".to_string()),
@@ -1529,6 +1538,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(state_thread_id),
         first_user_message: Some("state message".to_string()),
         preview: Some("state preview".to_string()),
+        project_id: None,
         section: Some(codex_state::ThreadSection {
             id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
             name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
@@ -1698,6 +1708,7 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: None,
+            active_permission_profile: None,
             network: None,
             file_system_sandbox_policy: None,
             model: "test-model".to_string(),

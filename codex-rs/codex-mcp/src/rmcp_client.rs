@@ -70,6 +70,7 @@ use rmcp::model::ElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::ProtocolVersion;
+use rmcp::model::ServerPeerInfo;
 use rmcp::model::Tool as RmcpTool;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
@@ -492,22 +493,22 @@ impl AsyncManagedClient {
         self.client.clone().await
     }
 
+    /// Returns the current ready client, including its tool catalog and metadata,
+    /// without waiting for startup or initiating a reconnection.
+    pub(crate) fn ready_client(&self) -> Option<ManagedClient> {
+        self.startup_reconnect
+            .as_ref()
+            .and_then(|reconnect| reconnect.current_client())
+            .or_else(|| {
+                self.client
+                    .peek()
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned()
+            })
+    }
+
     pub(crate) fn ready_transport(&self) -> Option<Arc<RmcpClient>> {
-        let recovered = self.startup_reconnect.as_ref().and_then(|reconnect| {
-            reconnect
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .current_client
-                .as_ref()
-                .map(|client| Arc::clone(&client.client))
-        });
-        recovered.or_else(|| {
-            self.client
-                .peek()
-                .and_then(|result| result.as_ref().ok())
-                .map(|client| Arc::clone(&client.client))
-        })
+        self.ready_client().map(|client| client.client)
     }
 
     pub(crate) async fn reconnect_failed_startup(&self) {
@@ -879,10 +880,17 @@ async fn start_server_task(
         mcp_initialize_request_params(client_elicitation_capability, client_mcp_extensions);
     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
 
+    let started_at = Instant::now();
     let initialize_result = client
         .initialize(params, startup_timeout, send_elicitation)
-        .await
-        .map_err(StartupOutcomeError::from)?;
+        .await;
+    record_protocol_discovery_metrics(
+        client.protocol_mode(),
+        is_codex_apps_mcp_server,
+        started_at,
+        &initialize_result,
+    );
+    let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
 
     let server_disables_tool_catalog_cache = initialize_result
         .capabilities
@@ -954,6 +962,37 @@ async fn start_server_task(
     };
 
     Ok(managed)
+}
+
+fn record_protocol_discovery_metrics(
+    mode: McpProtocolMode,
+    is_codex_apps_mcp_server: bool,
+    started_at: Instant,
+    result: &Result<ServerPeerInfo>,
+) {
+    let Some(metrics) = codex_otel::global() else {
+        return;
+    };
+
+    let mode = match mode {
+        McpProtocolMode::Legacy => "legacy",
+        McpProtocolMode::V20260728 => "auto",
+    };
+    let outcome = match result {
+        Ok(result) if result.protocol_version == ProtocolVersion::V_2026_07_28 => "modern",
+        Ok(_) => "legacy",
+        Err(_) => "failure",
+    };
+    let mut tags = vec![("mode", mode), ("outcome", outcome)];
+    if is_codex_apps_mcp_server {
+        tags.push(("server_kind", "openai_codex_apps"));
+    }
+    let _ = metrics.counter("codex.mcp.protocol_discovery", /*inc*/ 1, &tags);
+    let _ = metrics.record_duration(
+        "codex.mcp.protocol_discovery.duration_ms",
+        started_at.elapsed(),
+        &tags,
+    );
 }
 
 fn mcp_initialize_request_params(

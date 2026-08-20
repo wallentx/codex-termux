@@ -110,7 +110,9 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
             collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            multi_agent: None,
             token_budget: None,
+            guardian_v2: None,
         }),
         ..specific
     };
@@ -123,7 +125,9 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
             collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            multi_agent: None,
             token_budget: None,
+            guardian_v2: None,
         }),
         ..generic
     };
@@ -521,7 +525,6 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-        supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
         max_context_window: None,
@@ -771,7 +774,9 @@ async fn remote_models_apply_legacy_instructions() -> Result<()> {
             collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            multi_agent: None,
             token_budget: None,
+            guardian_v2: None,
         }),
         include_skills_usage_instructions: false,
         include_plugin_usage_instructions: false,
@@ -784,7 +789,6 @@ async fn remote_models_apply_legacy_instructions() -> Result<()> {
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-        supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
         max_context_window: None,
@@ -1357,7 +1361,6 @@ fn test_remote_model_with_policy(
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
         truncation_policy,
-        supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
         max_context_window: None,

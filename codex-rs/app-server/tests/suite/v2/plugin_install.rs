@@ -788,76 +788,6 @@ async fn plugin_install_rejects_remote_plugin_not_available() -> Result<()> {
 }
 
 #[tokio::test]
-async fn plugin_install_rejects_when_workspace_codex_plugins_disabled() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let repo_root = TempDir::new()?;
-    let server = MockServer::start().await;
-    write_plugins_enabled_config_with_base_url(
-        codex_home.path(),
-        &format!("{}/backend-api/", server.uri()),
-    )?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token")
-            .account_id("account-123")
-            .chatgpt_user_id("user-123")
-            .chatgpt_account_id("account-123")
-            .plan_type("team"),
-        AuthCredentialsStoreMode::File,
-    )?;
-    write_plugin_marketplace(
-        repo_root.path(),
-        "debug",
-        "sample-plugin",
-        "./sample-plugin",
-        /*install_policy*/ None,
-        /*auth_policy*/ None,
-    )?;
-    write_plugin_source(repo_root.path(), "sample-plugin", &[])?;
-    let marketplace_path =
-        AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
-
-    Mock::given(method("GET"))
-        .and(path("/backend-api/accounts/account-123/settings"))
-        .and(header("authorization", "Bearer chatgpt-token"))
-        .and(header("chatgpt-account-id", "account-123"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"beta_settings":{"enable_plugins":false}}"#),
-        )
-        .mount(&server)
-        .await;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
-        .await?;
-
-    let request_id = mcp
-        .send_plugin_install_request(PluginInstallParams {
-            marketplace_path: Some(marketplace_path),
-            remote_marketplace_name: None,
-            install_attempt_id: None,
-            plugin_name: "sample-plugin".to_string(),
-        })
-        .await?;
-
-    let err = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(err.error.code, -32600);
-    assert!(
-        err.error
-            .message
-            .contains("Codex plugins are disabled for this workspace")
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn plugin_install_returns_invalid_request_for_missing_marketplace_file() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut mcp = TestAppServer::builder()
@@ -1818,10 +1748,16 @@ async fn plugin_install_starts_mcp_oauth_through_configured_http_proxy() -> Resu
         .mount(&proxy)
         .await;
 
+    let plugin_callback_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let plugin_callback_port = plugin_callback_listener.local_addr()?.port();
+    let global_callback_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let global_callback_port = global_callback_listener.local_addr()?.port();
+    drop(plugin_callback_listener);
+
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join("config.toml"),
-        "[features]\nplugins = true\n",
+        format!("mcp_oauth_callback_port = {global_callback_port}\n\n[features]\nplugins = true\n"),
     )?;
     let repo_root = TempDir::new()?;
     write_plugin_marketplace(
@@ -1833,7 +1769,18 @@ async fn plugin_install_starts_mcp_oauth_through_configured_http_proxy() -> Resu
         /*auth_policy*/ None,
     )?;
     write_plugin_source(repo_root.path(), "sample-plugin", &[])?;
-    write_plugin_mcp_config(repo_root.path(), "sample-plugin", resource_url)?;
+    std::fs::write(
+        repo_root.path().join("sample-plugin/.mcp.json"),
+        serde_json::to_vec_pretty(&json!({
+            "mcpServers": {
+                "sample-mcp": {
+                    "type": "http",
+                    "url": format!("{resource_url}/mcp"),
+                    "oauth": {"callbackPort": plugin_callback_port},
+                }
+            }
+        }))?,
+    )?;
     let marketplace_path =
         AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
 
@@ -1871,13 +1818,27 @@ async fn plugin_install_starts_mcp_oauth_through_configured_http_proxy() -> Resu
     )
     .await?;
 
-    let resource_metadata_requested = proxy
-        .received_requests()
-        .await
-        .unwrap_or_default()
+    let requests = proxy.received_requests().await.unwrap_or_default();
+    let resource_metadata_requested = requests
         .iter()
         .any(|request| request.url.path() == "/oauth-resource");
     assert!(resource_metadata_requested);
+
+    let registration_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/oauth/register")
+        .expect("OAuth client registration request");
+    let registration: serde_json::Value = serde_json::from_slice(&registration_request.body)?;
+    let redirect_uri: Uri = registration["redirect_uris"][0]
+        .as_str()
+        .expect("OAuth client registration redirect URI")
+        .parse()?;
+    assert_eq!(
+        redirect_uri
+            .authority()
+            .and_then(axum::http::uri::Authority::port_u16),
+        Some(plugin_callback_port)
+    );
     Ok(())
 }
 
@@ -2546,22 +2507,6 @@ mcp_oauth_credentials_store = "file"
 [features]
 connectors = true
 "#
-        ),
-    )
-}
-
-fn write_plugins_enabled_config_with_base_url(
-    codex_home: &std::path::Path,
-    base_url: &str,
-) -> std::io::Result<()> {
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"chatgpt_base_url = "{base_url}"
-
-[features]
-plugins = true
-"#,
         ),
     )
 }

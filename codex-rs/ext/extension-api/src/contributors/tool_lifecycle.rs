@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use codex_tools::ToolName;
+use codex_tools::ToolPayload;
 
 use crate::ConversationHistorySnapshot;
 use crate::ExtensionData;
@@ -59,7 +60,11 @@ pub struct ToolStartInput<'a> {
     pub call_id: &'a str,
     /// Tool name as routed by the host.
     pub tool_name: &'a ToolName,
-    /// Shared read-only snapshot of the conversation when the tool started.
+    /// Finalized tool arguments, including any pre-tool-use hook rewrites.
+    ///
+    /// Payloads can contain sensitive plaintext and must not be logged.
+    pub payload: &'a ToolPayload,
+    /// Shared read-only snapshot taken after pre-tool hooks have completed.
     pub conversation_history: Arc<dyn ConversationHistorySnapshot>,
     /// Source that issued the tool call.
     pub source: ToolCallSource,

@@ -9,6 +9,7 @@ use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentRoleInstructions;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
 use crate::thread_manager::StartThreadOptions;
@@ -1248,6 +1249,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
                     }
                     .into(),
                 ]),
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
@@ -1380,6 +1382,10 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                                 .to_string(),
                         },
                         ContentItem::InputText {
+                            text: "<multi_agent_mode>Proactive multi-agent delegation is active.</multi_agent_mode>"
+                                .to_string(),
+                        },
+                        ContentItem::InputText {
                             text: "Preserved developer context.".to_string(),
                         },
                     ],
@@ -1509,7 +1515,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     no_hint_child_config
         .multi_agent_v2
         .subagent_developer_instructions = Some(String::new());
-    no_hint_child_config.multi_agent_v2.subagent_usage_hint_text = None;
+    no_hint_child_config.multi_agent_v2.subagent_usage_hint_text = Some(String::new());
     let no_hint_child_thread_id = harness
         .control
         .spawn_agent_with_metadata(
@@ -1538,8 +1544,12 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .expect("no-hint child thread should be registered");
     let no_hint_history = no_hint_child_thread.session.clone_history().await;
     assert!(
-        !history_contains_text(no_hint_history.raw_items(), "Child subagent guidance."),
-        "full-history forked child should not add empty subagent guidance"
+        !history_contains_text(no_hint_history.raw_items(), "Child subagent guidance.")
+            && !history_contains_text(
+                no_hint_history.raw_items(),
+                "You are an agent in a team of agents"
+            ),
+        "full-history forked child should not add configured or bundled subagent guidance"
     );
     assert!(
         !history_contains_text(
@@ -1623,6 +1633,9 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
+        ContextualUserFragment::into(MultiAgentRoleInstructions::catalog(
+            "Catalog parent root guidance.",
+        )),
         parent_task.to_model_input_item(),
         ResponseItem::Message {
             id: None,
@@ -1642,6 +1655,10 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
                         .to_string(),
                 },
                 ContentItem::InputText {
+                    text: "<multi_agent_mode>Proactive multi-agent delegation is active.</multi_agent_mode>"
+                        .to_string(),
+                },
+                ContentItem::InputText {
                     text: "Preserved compacted developer context.".to_string(),
                 },
             ],
@@ -1657,6 +1674,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
                 replacement_history: Some(
                     replacement_history.into_iter().map(Into::into).collect(),
                 ),
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
@@ -1691,6 +1709,12 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                multi_agent_v2_usage_hints: Some(ResolvedMultiAgentV2UsageHints {
+                    root: None,
+                    subagent: Some(MultiAgentRoleInstructions::catalog(
+                        "Catalog child subagent guidance.",
+                    )),
+                }),
                 ..Default::default()
             },
         )
@@ -1709,6 +1733,14 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
         "forked child history should retain compacted non-hint content"
     );
     assert!(
+        !history_contains_text(history.raw_items(), "Catalog parent root guidance."),
+        "forked child history should strip the resolved parent hint from compacted replacement history"
+    );
+    assert!(
+        history_contains_text(history.raw_items(), "Catalog child subagent guidance."),
+        "full-history forked child should add the resolved child hint after compacted-history sanitization"
+    );
+    assert!(
         !history
             .raw_items()
             .any(|item| matches!(item, ResponseItem::AgentMessage { .. })),
@@ -1717,6 +1749,13 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     assert!(
         !history_contains_text(history.raw_items(), "Parent root guidance."),
         "forked child history should strip stale parent hints from compacted replacement history"
+    );
+    assert!(
+        !history_contains_text(
+            history.raw_items(),
+            "Proactive multi-agent delegation is active."
+        ),
+        "forked child history should strip stale policy fragments from compound compacted messages"
     );
     assert!(
         !history_contains_text(history.raw_items(), "Parent developer instructions."),
@@ -1735,10 +1774,6 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
             "Preserved compacted developer context."
         ),
         "forked child history should preserve unrelated compacted developer fragments"
-    );
-    assert!(
-        history_contains_text(history.raw_items(), "Child subagent guidance."),
-        "full-history forked child should add the child subagent hint after compacted-history sanitization"
     );
 
     let _ = harness
@@ -1821,6 +1856,7 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
                 replacement_history: Some(
                     replacement_history.into_iter().map(Into::into).collect(),
                 ),
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
@@ -1950,6 +1986,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             RolloutItem::Compacted(CompactedItem {
                 message: "legacy compacted summary".to_string(),
                 replacement_history: None,
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,

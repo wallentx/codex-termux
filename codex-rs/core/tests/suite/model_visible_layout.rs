@@ -23,6 +23,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -77,6 +78,7 @@ fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
@@ -217,6 +219,7 @@ async fn model_visible_environment_context_preserves_foreign_workspace_roots() -
                         environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                         cwd: PathUri::from_abs_path(&test.config.cwd),
                         workspace_roots: vec![foreign_root],
+                        config: EnvironmentConfigState::FromThread,
                     }],
                 )),
                 ..Default::default()

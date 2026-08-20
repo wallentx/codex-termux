@@ -19,6 +19,7 @@ use codex_app_server_client::ExecServerRuntimePaths;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::InProcessServerEvent;
+use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -33,6 +34,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
@@ -411,6 +413,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         sandbox_mode,
         permission_profile: None,
         default_permissions: None,
+        persisted_permission_profile_id: None,
         cwd: resolved_cwd,
         workspace_roots: None,
         model_provider: model_provider.clone(),
@@ -834,16 +837,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     .map_err(anyhow::Error::msg)?;
             (session_configured.thread_id, session_configured)
         } else {
-            let response: ThreadStartResponse = send_request_with_response(
-                &client,
-                ClientRequest::ThreadStart {
-                    request_id: request_ids.next(),
-                    params: thread_start_params_from_config(&config),
-                },
-                "thread/start",
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
+            let response = start_thread(&client, &mut request_ids, &config)
+                .await
+                .map_err(anyhow::Error::msg)?;
             let session_configured =
                 session_configured_from_thread_start_response(&response, &config)
                     .map_err(anyhow::Error::msg)?;
@@ -915,16 +911,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
         (session_configured.thread_id, session_configured)
     } else {
-        let response: ThreadStartResponse = send_request_with_response(
-            &client,
-            ClientRequest::ThreadStart {
-                request_id: request_ids.next(),
-                params: thread_start_params_from_config(&config),
-            },
-            "thread/start",
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
+        let response = start_thread(&client, &mut request_ids, &config)
+            .await
+            .map_err(anyhow::Error::msg)?;
         let session_configured = session_configured_from_thread_start_response(&response, &config)
             .map_err(anyhow::Error::msg)?;
         (session_configured.thread_id, session_configured)
@@ -1148,6 +1137,34 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn start_thread(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    config: &Config,
+) -> Result<ThreadStartResponse, String> {
+    let mut params = thread_start_params_from_config(config);
+    loop {
+        match client
+            .request_typed(ClientRequest::ThreadStart {
+                request_id: request_ids.next(),
+                params: params.clone(),
+            })
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(TypedRequestError::Server { source, .. })
+                if params.history_mode.is_some()
+                    && source.code == -32600
+                    && source.message
+                        == "paginated threads require thread/turns/list and thread/items/list support" =>
+            {
+                params.history_mode = None;
+            }
+            Err(err) => return Err(format!("thread/start: {err}")),
+        }
+    }
+}
+
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
     let permissions = permissions_selection_from_config(config);
     let sandbox = permissions.is_none().then(|| {
@@ -1167,6 +1184,7 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         permissions,
         config: thread_config_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
+        history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
         thread_source: Some(ThreadSource::User),
         ..ThreadStartParams::default()
     }
@@ -1574,6 +1592,7 @@ async fn resolve_resume_thread_id(
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
                         section_id: None,
+                        project_id: None,
                         parent_thread_id: None,
                         ancestor_thread_id: None,
                         cwd: None,
@@ -1658,6 +1677,7 @@ async fn resolve_resume_thread_id(
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
                     section_id: None,
+                    project_id: None,
                     parent_thread_id: None,
                     ancestor_thread_id: None,
                     cwd: None,
