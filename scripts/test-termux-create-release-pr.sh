@@ -321,9 +321,18 @@ perl -0pi -e 's/(    "tui",\n)/$1    "utils\/audio",\n/' codex-rs/Cargo.toml
 perl -0pi -e 's/(base = "1"\n)/$1codex-utils-audio = { path = "utils\/audio" }\n/' codex-rs/Cargo.toml
 mkdir -p codex-rs/utils/audio
 printf '[package]\nname = "codex-utils-audio"\nversion.workspace = true\n' > codex-rs/utils/audio/Cargo.toml
+mkdir -p .github/scripts/macos-signing codex-rs/windows-sandbox-rs
+for path in \
+  notarize_macos_binary_with_rcodesign.sh \
+  notarize_macos_dmg_with_rcodesign.sh \
+  notarize_with_akv.py \
+  test_notarize_with_akv.py; do
+  printf 'upstream %s\n' "${path}" > ".github/scripts/macos-signing/${path}"
+done
+printf 'upstream windows build\n' > codex-rs/windows-sandbox-rs/BUILD.bazel
 printf 'new-release\n' > src/shared.txt
 printf 'new-tag\n' > src/new-tag.txt
-git add codex-rs/Cargo.toml codex-rs/utils/audio/Cargo.toml src/shared.txt src/new-tag.txt
+git add .github/scripts/macos-signing codex-rs/Cargo.toml codex-rs/utils/audio/Cargo.toml codex-rs/windows-sandbox-rs/BUILD.bazel src/shared.txt src/new-tag.txt
 git commit -m "new upstream release" >/dev/null
 git tag rust-v1.0.0-alpha.2
 git push origin main rust-v1.0.0-alpha.2 >/dev/null
@@ -335,11 +344,20 @@ perl -0pi -e 's/(    "tui",\n)/$1    "utils\/file-lock",\n/' codex-rs/Cargo.toml
 perl -0pi -e 's/(base = "1"\n)/$1codex-utils-file-lock = { path = "utils\/file-lock" }\n/' codex-rs/Cargo.toml
 mkdir -p codex-rs/utils/file-lock
 printf '[package]\nname = "codex-utils-file-lock"\nversion.workspace = true\n' > codex-rs/utils/file-lock/Cargo.toml
+mkdir -p .github/scripts/macos-signing codex-rs/windows-sandbox-rs
+for path in \
+  notarize_macos_binary_with_rcodesign.sh \
+  notarize_macos_dmg_with_rcodesign.sh \
+  notarize_with_akv.py \
+  test_notarize_with_akv.py; do
+  printf 'stale target %s\n' "${path}" > ".github/scripts/macos-signing/${path}"
+done
+printf 'stale target windows build\n' > codex-rs/windows-sandbox-rs/BUILD.bazel
 printf 'termux workflow\n' > .github/workflows/rust-release.yml
 printf 'compat\n' > termux/compat.txt
 printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
 printf 'termux updater with target drift\n' > codex-rs/tui/src/termux_update.rs
-git add .github/workflows/rust-release.yml codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml termux/compat.txt
+git add .github/scripts/macos-signing .github/workflows/rust-release.yml codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml codex-rs/windows-sandbox-rs/BUILD.bazel termux/compat.txt
 git commit -m "termux compatibility changes" >/dev/null
 git push origin wallentx/termux-target >/dev/null
 
@@ -383,6 +401,20 @@ assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'codex-u
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml '"utils/file-lock",'
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'codex-utils-file-lock = { path = "utils/file-lock" }'
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'release = "new"'
+for path in \
+  notarize_macos_binary_with_rcodesign.sh \
+  notarize_macos_dmg_with_rcodesign.sh \
+  notarize_with_akv.py \
+  test_notarize_with_akv.py; do
+  assert_ref_file_equals \
+    origin/release-train/1.0.0 \
+    ".github/scripts/macos-signing/${path}" \
+    "upstream ${path}"
+done
+assert_ref_file_equals \
+  origin/release-train/1.0.0 \
+  codex-rs/windows-sandbox-rs/BUILD.bazel \
+  "upstream windows build"
 assert_ref_file_equals \
   origin/release-train/1.0.0 \
   .github/workflows/rust-release.yml \
