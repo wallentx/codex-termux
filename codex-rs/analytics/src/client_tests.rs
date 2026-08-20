@@ -130,7 +130,7 @@ fn sample_accepted_line_fingerprint_event(thread_id: &str) -> TrackEventRequest 
                 repo_hash: None,
                 accepted_added_lines: 1,
                 accepted_deleted_lines: 0,
-                line_fingerprints: Vec::new(),
+                line_fingerprints: [],
             },
         },
     ))
@@ -592,6 +592,7 @@ fn sample_thread(thread_id: &str) -> Thread {
         ephemeral: false,
         section: None,
         section_entered_at: None,
+        project_id: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
         created_at: 1,

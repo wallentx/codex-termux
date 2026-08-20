@@ -32,6 +32,7 @@ use crate::dynamic_tools::DynamicToolCallRequest;
 use crate::dynamic_tools::DynamicToolResponse;
 use crate::dynamic_tools::DynamicToolSpec;
 use crate::error::Result as CodexResult;
+use crate::items::AgentMessageDelivery;
 use crate::items::TurnItem;
 use crate::mcp::CallToolResult;
 use crate::mcp::RequestId;
@@ -58,8 +59,6 @@ use crate::request_user_input::RequestUserInputResponse;
 use crate::turn_input::TurnInputMode;
 use crate::turn_input::TurnInputRequest;
 use crate::turn_input::TurnInputSubmission;
-#[cfg(test)]
-use crate::user_input::UserInput;
 use codex_extension_items::image_generation::ImageGenerationFailure;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -93,6 +92,7 @@ pub use crate::approvals::NetworkApprovalProtocol;
 pub use crate::approvals::NetworkPolicyAmendment;
 pub use crate::approvals::NetworkPolicyRuleAction;
 pub use crate::environment::EnvironmentConfig;
+pub use crate::environment::EnvironmentConfigState;
 pub use crate::legacy_events::HasLegacyEvent;
 pub use crate::permissions::FileSystemAccessMode;
 pub use crate::permissions::FileSystemPath;
@@ -101,6 +101,7 @@ pub use crate::permissions::FileSystemSandboxKind;
 pub use crate::permissions::FileSystemSandboxPolicy;
 pub use crate::permissions::FileSystemSpecialPath;
 pub use crate::permissions::NetworkSandboxPolicy;
+pub use crate::permissions::RawFileSystemSandboxPolicy;
 use crate::permissions::default_read_only_subpaths_for_writable_root;
 pub use crate::request_permissions::RequestPermissionsArgs;
 pub use crate::request_user_input::RequestUserInputEvent;
@@ -148,6 +149,7 @@ pub struct TurnEnvironmentSelection {
     pub environment_id: String,
     pub cwd: PathUri,
     pub workspace_roots: Vec<PathUri>,
+    pub config: EnvironmentConfigState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -912,9 +914,8 @@ impl Op {
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
 pub enum AskForApproval {
-    /// Under this policy, only "known safe" commands—as determined by
-    /// `is_safe_command()`—that **only read files** are auto‑approved.
-    /// Everything else will ask the user to approve.
+    /// Internal policy for projects marked untrusted. Commands require
+    /// approval unless an explicit exec policy rule allows them.
     #[serde(rename = "untrusted")]
     #[strum(serialize = "untrusted")]
     UnlessTrusted,
@@ -1114,7 +1115,9 @@ impl FromStr for FileSystemSandboxPolicy {
     type Err = serde_json::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(s)
+        serde_json::from_str::<RawFileSystemSandboxPolicy>(s)?
+            .try_into()
+            .map_err(serde_json::Error::custom)
     }
 }
 
@@ -1514,6 +1517,7 @@ pub enum HookEventName {
 #[serde(rename_all = "snake_case")]
 pub enum HookHandlerType {
     Command,
+    McpTool,
     Prompt,
     Agent,
 }
@@ -1770,6 +1774,7 @@ pub enum CodexErrorInfo {
     UsageLimitExceeded,
     ServerOverloaded,
     CyberPolicy,
+    MisalignmentPolicyViolation,
     HttpConnectionFailed {
         http_status_code: Option<u16>,
     },
@@ -1808,6 +1813,7 @@ impl CodexErrorInfo {
             | Self::UsageLimitExceeded
             | Self::ServerOverloaded
             | Self::CyberPolicy
+            | Self::MisalignmentPolicyViolation
             | Self::HttpConnectionFailed { .. }
             | Self::ResponseStreamConnectionFailed { .. }
             | Self::InternalServerError
@@ -2330,6 +2336,9 @@ pub struct AgentMessageEvent {
     pub phase: Option<MessagePhase>,
     #[serde(default)]
     pub memory_citation: Option<MemoryCitation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub delivery: Option<AgentMessageDelivery>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3033,10 +3042,14 @@ pub struct TurnContextItem {
     pub sandbox_policy: SandboxPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<PermissionProfile>,
+    /// Built-in or named profile that produced `permission_profile`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub active_permission_profile: Option<ActivePermissionProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<TurnContextNetworkItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_system_sandbox_policy: Option<FileSystemSandboxPolicy>,
+    pub file_system_sandbox_policy: Option<RawFileSystemSandboxPolicy>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comp_hash: Option<String>,
@@ -3063,8 +3076,13 @@ pub struct TurnContextItem {
 impl TurnContextItem {
     pub fn permission_profile(&self) -> PermissionProfile {
         self.permission_profile.clone().unwrap_or_else(|| {
-            let file_system_sandbox_policy =
-                self.file_system_sandbox_policy.clone().unwrap_or_else(|| {
+            let file_system_sandbox_policy = self
+                .file_system_sandbox_policy
+                .clone()
+                .map(TryInto::try_into)
+                .transpose()
+                .unwrap_or_else(|_| Some(FileSystemSandboxPolicy::restricted(Vec::new())))
+                .unwrap_or_else(|| {
                     FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
                         &self.sandbox_policy,
                         self.cwd.as_path(),
@@ -3839,7 +3857,7 @@ pub struct ThreadGoalUpdatedEvent {
     pub goal: ThreadGoal,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "protocol/")]
 pub struct ThreadQueueChangedEvent {
@@ -4726,7 +4744,7 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: blocked },
+                path: blocked.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -4786,7 +4804,7 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: secret },
+                path: secret.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -4850,12 +4868,12 @@ mod tests {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: docs },
+                path: docs.into(),
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: docs_public },
+                path: docs_public.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
@@ -4891,7 +4909,7 @@ mod tests {
         };
         let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: external_write_path,
+                path: external_write_path.into(),
             },
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
@@ -5562,7 +5580,7 @@ mod tests {
 
     #[test]
     fn user_input_text_serializes_empty_text_elements() -> Result<()> {
-        let input = UserInput::Text {
+        let input = crate::user_input::UserInput::Text {
             text: "hello".to_string(),
             text_elements: Vec::new(),
         };
@@ -5772,19 +5790,22 @@ mod tests {
             approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             permission_profile: None,
+            active_permission_profile: None,
             network: Some(TurnContextNetworkItem {
                 allowed_domains: vec!["api.example.com".to_string()],
                 denied_domains: vec!["blocked.example.com".to_string()],
             }),
-            file_system_sandbox_policy: Some(FileSystemSandboxPolicy::restricted(vec![
-                FileSystemSandboxEntry {
+            file_system_sandbox_policy: Some(
+                FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
                     path: FileSystemPath::GlobPattern {
                         pattern: "/tmp/private/**/*.txt".to_string(),
                     },
                     access: FileSystemAccessMode::Deny,
                     missing_path_behavior: None,
-                },
-            ])),
+                }])
+                .try_into()
+                .expect("serializable split policy"),
+            ),
             model: "gpt-5".to_string(),
             comp_hash: None,
             personality: None,

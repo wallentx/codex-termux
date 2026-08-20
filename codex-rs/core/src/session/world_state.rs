@@ -148,19 +148,9 @@ impl Session {
             .current_for_prefix_rules(turn_context.allow_prefix_rules());
         if turn_context.config.include_permissions_instructions {
             let environment = step_context.environments.primary();
-            let permission_profile = environment
-                .map(|environment| {
-                    let workspace_roots = environment
-                        .workspace_roots()
-                        .iter()
-                        .filter_map(|workspace_root| workspace_root.to_abs_path().ok())
-                        .collect::<Vec<_>>();
-                    environment
-                        .permission_profile()
-                        .clone()
-                        .materialize_project_roots_with_workspace_roots(&workspace_roots)
-                })
-                .unwrap_or_else(|| turn_context.permission_profile());
+            let permission_profile = step_context
+                .environments
+                .permission_profile_or_else(|| turn_context.permission_profile());
             #[allow(deprecated)]
             let cwd = environment
                 .and_then(|environment| environment.cwd().to_abs_path().ok())
@@ -168,9 +158,9 @@ impl Session {
             let model_messages = turn_context.model_info.model_messages.as_ref();
             world_state.add_section(PermissionsState::new(
                 &permission_profile,
-                turn_context.approval_policy(),
+                step_context.approval_policy,
                 ApprovalPromptContext::new(
-                    turn_context.config.approvals_reviewer,
+                    step_context.approvals_reviewer,
                     model_messages.and_then(|messages| messages.approvals.as_ref()),
                     model_messages.and_then(|messages| messages.permissions.as_ref()),
                 ),

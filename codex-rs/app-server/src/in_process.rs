@@ -67,15 +67,18 @@ use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::OutboundConnectionState;
 use crate::transport::route_outgoing_envelope;
 use codex_analytics::AppServerRpcTransport;
+use codex_app_server_protocol::AgentMessageDelivery;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeParams;
+use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadItem;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
@@ -108,8 +111,16 @@ fn server_notification_requires_delivery(notification: &ServerNotification) -> b
     matches!(
         notification,
         ServerNotification::TurnCompleted(_)
+            | ServerNotification::ThreadQueueChanged(_)
             | ServerNotification::ThreadSettingsUpdated(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
+            | ServerNotification::ItemCompleted(ItemCompletedNotification {
+                item: ThreadItem::AgentMessage {
+                    delivery: Some(AgentMessageDelivery::Async),
+                    ..
+                },
+                ..
+            })
     )
 }
 
@@ -780,6 +791,7 @@ mod tests {
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadQueueChangedNotification;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_app_server_protocol::Turn;
@@ -997,12 +1009,31 @@ mod tests {
             })
         ));
         assert!(server_notification_requires_delivery(
+            &ServerNotification::ThreadQueueChanged(ThreadQueueChangedNotification {
+                thread_id: "thread-1".to_string(),
+            })
+        ));
+        assert!(server_notification_requires_delivery(
             &ServerNotification::ExternalAgentConfigImportCompleted(
                 ExternalAgentConfigImportCompletedNotification {
                     import_id: "import".to_string(),
                     item_type_results: Vec::new(),
                 },
             )
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ItemCompleted(ItemCompletedNotification {
+                item: ThreadItem::AgentMessage {
+                    id: "item-1".to_string(),
+                    text: "Still working".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                    delivery: Some(AgentMessageDelivery::Async),
+                },
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ms: 0,
+            })
         ));
     }
 }

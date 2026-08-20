@@ -334,8 +334,10 @@ use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod command_lifecycle;
+mod connector_mentions;
 mod connectors;
 mod constructor;
+pub(crate) use self::connectors::ConnectorScopeGeneration;
 use self::connectors::ConnectorsState;
 mod exec_state;
 use self::exec_state::RunningCommand;
@@ -362,6 +364,7 @@ use self::interrupts::InterruptManager;
 mod keymap_picker;
 mod mcp_startup;
 use self::mcp_startup::McpStartupStatus;
+mod misalignment_policy;
 mod pets;
 mod session_flow;
 mod session_header;
@@ -437,6 +440,7 @@ mod turn_runtime;
 use self::turn_lifecycle::TurnLifecycleState;
 mod usage;
 mod user_messages;
+mod working_directory;
 use self::user_messages::PendingSteer;
 use self::user_messages::PendingSteerCompareKey;
 use self::user_messages::QueueDrain;
@@ -671,6 +675,7 @@ pub(crate) struct ChatWidget {
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
     blocks_direct_input: bool,
+    misalignment_policy_violation: bool,
     normal_placeholder_text: String,
     side_placeholder_text: String,
     forked_from: Option<ThreadId>,
@@ -1027,7 +1032,19 @@ impl ChatWidget {
     pub(crate) fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) {
         // A remotely resolved request must not remain user-actionable. It may be
         // materialized in the bottom pane or still deferred behind active streaming.
-        let removed_deferred = self.interrupts.remove_resolved_prompt(request);
+        let request_thread_id = match request {
+            ResolvedAppServerRequest::ExecApproval { thread_id, .. }
+            | ResolvedAppServerRequest::FileChangeApproval { thread_id, .. }
+            | ResolvedAppServerRequest::PermissionsApproval { thread_id, .. } => {
+                Some(thread_id.as_str())
+            }
+            ResolvedAppServerRequest::UserInput { .. }
+            | ResolvedAppServerRequest::McpElicitation { .. } => None,
+        };
+        let removed_deferred = request_thread_id.is_none_or(|request_thread_id| {
+            self.thread_id
+                .is_some_and(|thread_id| thread_id.to_string() == request_thread_id)
+        }) && self.interrupts.remove_resolved_prompt(request);
         let removed_visible = self.bottom_pane.dismiss_app_server_request(request);
         if removed_deferred || removed_visible {
             self.request_redraw();
@@ -1205,6 +1222,9 @@ impl ChatWidget {
     pub(crate) fn pre_draw_tick(&mut self) {
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
+        if self.bottom_pane.has_active_view() {
+            self.flush_completed_command_activity();
+        }
         self.bottom_pane.pre_draw_tick();
         if let Some(pet) = self.ambient_pet.as_ref() {
             pet.schedule_next_frame();
@@ -1228,6 +1248,18 @@ impl ChatWidget {
             self.transcript.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
             self.request_pending_usage_output_insertion();
+        }
+    }
+
+    fn flush_completed_command_activity(&mut self) {
+        if self
+            .transcript
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .is_some_and(|cell| !cell.is_active())
+        {
+            self.flush_active_cell();
         }
     }
 
@@ -1260,6 +1292,15 @@ impl ChatWidget {
                 self.flush_active_cell();
             }
             self.transcript.needs_final_message_separator = true;
+        } else if !keep_placeholder_header_active
+            && self
+                .transcript
+                .active_cell
+                .as_ref()
+                .is_some_and(|active_cell| active_cell.as_any().is::<ExecCell>())
+            && !cell.transcript_lines(history_width).is_empty()
+        {
+            self.flush_completed_command_activity();
         }
         self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
     }
@@ -1686,7 +1727,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn composer_is_empty(&self) -> bool {
-        self.bottom_pane.composer_is_empty()
+        self.bottom_pane.composer_is_empty() && !self.bottom_pane.is_in_paste_burst()
     }
 
     #[cfg(test)]
@@ -1738,7 +1779,6 @@ impl ChatWidget {
         self.bottom_pane.pending_thread_approvals()
     }
 
-    #[cfg(test)]
     pub(crate) fn has_active_view(&self) -> bool {
         self.bottom_pane.has_active_view()
     }
@@ -1764,6 +1804,9 @@ impl ChatWidget {
         T: Into<AppCommand>,
     {
         let op: AppCommand = op.into();
+        if self.rejects_misalignment_policy_op(&op) {
+            return false;
+        }
         if self.blocks_direct_input
             && matches!(
                 &op,

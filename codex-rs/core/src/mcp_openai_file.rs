@@ -16,6 +16,7 @@ use crate::session::step_context::StepContext;
 use codex_api::HostedFileUploadContext;
 use codex_api::OPENAI_FILE_UPLOAD_LIMIT_BYTES;
 use codex_api::upload_openai_file;
+use codex_exec_server::GetMetadataOptions;
 use codex_login::CodexAuth;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
@@ -161,10 +162,10 @@ async fn build_uploaded_argument_value(
         .join(file_path)
         .map_err(|error| contextualize_error(error.to_string()))?;
     let additional_permissions = merge_permission_profiles(
-        sess.granted_session_permissions(&turn_environment.environment_id)
+        sess.granted_session_permissions(&turn_environment.selection.environment_id)
             .await
             .as_ref(),
-        sess.granted_turn_permissions(&turn_environment.environment_id)
+        sess.granted_turn_permissions(&turn_environment.selection.environment_id)
             .await
             .as_ref(),
     );
@@ -196,7 +197,7 @@ async fn build_uploaded_argument_value(
     }
     let fs = turn_environment.environment.get_filesystem();
     let metadata = fs
-        .get_metadata(&path_uri, sandbox.as_ref())
+        .get_metadata(&path_uri, GetMetadataOptions::default(), sandbox.as_ref())
         .await
         .map_err(|error| contextualize_error(error.to_string()))?;
     if !metadata.is_file {
@@ -271,7 +272,6 @@ mod tests {
     use crate::environment_selection::TurnEnvironmentState;
     use crate::session::tests::make_session_and_context;
     use crate::session::turn_context::TurnContext;
-    use crate::session::turn_context::TurnEnvironment;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
@@ -285,14 +285,8 @@ mod tests {
         else {
             panic!("expected ready primary environment");
         };
-        *primary = TurnEnvironment::new(
-            primary.environment_id.clone(),
-            Arc::clone(&primary.environment),
-            PathUri::from_abs_path(&cwd),
-            Vec::new(),
-            primary.shell.clone(),
-            primary.config.clone(),
-        );
+        primary.selection.cwd = PathUri::from_abs_path(&cwd);
+        primary.selection.workspace_roots.clear();
     }
 
     #[tokio::test]
@@ -374,7 +368,7 @@ mod tests {
             .primary()
             .expect("ready primary environment");
         let selection = environment.selection();
-        let environment_config = environment.config.clone();
+        let environment_config = environment.config().clone();
         let environments = crate::environment_selection::ThreadEnvironments::new(
             session.services.turn_environments.environment_manager(),
             crate::shell::default_user_shell(),
