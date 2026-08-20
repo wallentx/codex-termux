@@ -52,6 +52,7 @@ origin="${tmp_dir}/origin.git"
 work="${tmp_dir}/work"
 runner_temp="${tmp_dir}/runner"
 github_output="${tmp_dir}/github-output"
+merge_log="${tmp_dir}/merge-log"
 
 mkdir -p "${bin_dir}" "${runner_temp}"
 
@@ -66,6 +67,7 @@ case "${1:-} ${2:-}" in
     printf '{"headRefOid":"checkpoint-head-sha","state":"OPEN","url":"%s"}\n' "${3:-}"
     ;;
   "pr merge")
+    printf '%s\n' "$*" >> "${TERMUX_TEST_MERGE_LOG:?}"
     [[ "${4:-}" == "--repo" ]] || {
       echo "expected --repo as fourth pr merge arg: $*" >&2
       exit 1
@@ -147,6 +149,7 @@ SOURCE_BRANCH="release/1.0.0" \
 REVIEWER="wallentx" \
 RUNNER_TEMP="${runner_temp}" \
 GITHUB_OUTPUT="${github_output}" \
+TERMUX_TEST_MERGE_LOG="${merge_log}" \
 GH_TOKEN="test-token" \
 bash "${script}" > "${tmp_dir}/stdout" 2> "${tmp_dir}/stderr" || {
   cat "${tmp_dir}/stdout" >&2
@@ -176,4 +179,9 @@ if [[ "$(cat "${github_output}")" != "pr_url=https://github.com/wallentx/codex-t
   fail "checkpoint PR URL was not written to GITHUB_OUTPUT"
 fi
 
-echo "ok - checkpoint carries tested code and keeps conflicted paths on the destination baseline"
+if [[ "$(wc -l < "${merge_log}")" -ne 1 ]]; then
+  cat "${merge_log}" >&2
+  fail "checkpoint PR auto-merge was not enabled after fallback conflict resolution"
+fi
+
+echo "ok - checkpoint carries tested code, keeps conflicted paths on the destination baseline, and enables auto-merge"
