@@ -20,6 +20,7 @@ use crate::permissions::FileSystemSandboxKind;
 use crate::permissions::FileSystemSandboxPolicy;
 use crate::permissions::FileSystemSpecialPath;
 use crate::permissions::NetworkSandboxPolicy;
+use crate::permissions::RawFileSystemSandboxEntry;
 use crate::protocol::SandboxPolicy;
 use crate::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -28,11 +29,13 @@ use schemars::JsonSchema;
 
 use crate::ResponseItemId;
 use crate::mcp::CallToolResult;
+use codex_utils_path_uri::PathUri;
 
 mod executed_tool_calls;
 
 pub use crate::local_media::MAX_PROMPT_AUDIO_INPUT_BYTES;
 pub use crate::local_media::snapshot_local_user_input;
+pub use crate::permission_profile_snapshot::PermissionProfileSnapshot;
 pub use executed_tool_calls::ExecutedToolCall;
 pub use executed_tool_calls::ExecutedToolCallArguments;
 pub use executed_tool_calls::ExecutedToolCallTruncation;
@@ -77,6 +80,8 @@ impl SandboxPermissions {
 
 #[derive(Debug, Clone, Default, Eq, Hash, PartialEq, JsonSchema, TS)]
 pub struct FileSystemPermissions {
+    #[schemars(with = "Vec<RawFileSystemSandboxEntry>")]
+    #[ts(as = "Vec<RawFileSystemSandboxEntry>")]
     pub entries: Vec<FileSystemSandboxEntry>,
     pub glob_scan_max_depth: Option<NonZeroUsize>,
 }
@@ -99,22 +104,34 @@ impl FileSystemPermissions {
         read: Option<Vec<AbsolutePathBuf>>,
         write: Option<Vec<AbsolutePathBuf>>,
     ) -> Self {
+        Self::from_paths(read, write)
+    }
+
+    pub fn from_read_write_path_uris(
+        read: Option<Vec<PathUri>>,
+        write: Option<Vec<PathUri>>,
+    ) -> Self {
+        Self::from_paths(read, write)
+    }
+
+    fn from_paths<P>(read: Option<Vec<P>>, write: Option<Vec<P>>) -> Self
+    where
+        P: Into<FileSystemPath>,
+    {
         let mut entries = Vec::new();
         if let Some(read) = read {
-            entries.extend(read.into_iter().map(|path| {
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Path { path },
-                    FileSystemAccessMode::Read,
-                )
-            }));
+            entries.extend(
+                read.into_iter().map(|path| {
+                    FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Read)
+                }),
+            );
         }
         if let Some(write) = write {
-            entries.extend(write.into_iter().map(|path| {
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Path { path },
-                    FileSystemAccessMode::Write,
-                )
-            }));
+            entries.extend(
+                write.into_iter().map(|path| {
+                    FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Write)
+                }),
+            );
         }
         Self {
             entries,
@@ -138,9 +155,10 @@ impl FileSystemPermissions {
             let FileSystemPath::Path { path } = &entry.path else {
                 return None;
             };
+            let path = path.to_abs_path().ok()?;
             match entry.access {
-                FileSystemAccessMode::Read => read.push(path.clone()),
-                FileSystemAccessMode::Write => write.push(path.clone()),
+                FileSystemAccessMode::Read => read.push(path),
+                FileSystemAccessMode::Write => write.push(path),
                 FileSystemAccessMode::Deny => return None,
             }
         }
@@ -156,7 +174,7 @@ impl FileSystemPermissions {
 #[serde(deny_unknown_fields)]
 struct CanonicalFileSystemPermissions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    entries: Vec<FileSystemSandboxEntry>,
+    entries: Vec<RawFileSystemSandboxEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     glob_scan_max_depth: Option<NonZeroUsize>,
 }
@@ -177,7 +195,13 @@ impl Serialize for FileSystemPermissions {
             legacy.serialize(serializer)
         } else {
             CanonicalFileSystemPermissions {
-                entries: self.entries.clone(),
+                entries: self
+                    .entries
+                    .clone()
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::ser::Error::custom)?,
                 glob_scan_max_depth: self.glob_scan_max_depth,
             }
             .serialize(serializer)
@@ -195,7 +219,11 @@ impl<'de> Deserialize<'de> for FileSystemPermissions {
                 entries,
                 glob_scan_max_depth,
             }) => Ok(Self {
-                entries,
+                entries: entries
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::de::Error::custom)?,
                 glob_scan_max_depth,
             }),
             FileSystemPermissionsDe::Legacy(LegacyReadWriteRoots { read, write }) => {
@@ -255,7 +283,7 @@ impl SandboxEnforcement {
 }
 
 /// Filesystem permissions for profiles where Codex owns sandbox construction.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Eq, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]
 pub enum ManagedFileSystemPermissions {
@@ -263,6 +291,8 @@ pub enum ManagedFileSystemPermissions {
     #[serde(rename_all = "snake_case")]
     #[ts(rename_all = "snake_case")]
     Restricted {
+        #[schemars(with = "Vec<RawFileSystemSandboxEntry>")]
+        #[ts(as = "Vec<RawFileSystemSandboxEntry>")]
         entries: Vec<FileSystemSandboxEntry>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -270,6 +300,68 @@ pub enum ManagedFileSystemPermissions {
     },
     /// Apply a managed sandbox that allows all filesystem access.
     Unrestricted,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SerializedManagedFileSystemPermissions {
+    #[serde(rename_all = "snake_case")]
+    Restricted {
+        entries: Vec<RawFileSystemSandboxEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        glob_scan_max_depth: Option<NonZeroUsize>,
+    },
+    Unrestricted,
+}
+
+impl Serialize for ManagedFileSystemPermissions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Restricted {
+                entries,
+                glob_scan_max_depth,
+            } => SerializedManagedFileSystemPermissions::Restricted {
+                entries: entries
+                    .clone()
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::ser::Error::custom)?,
+                glob_scan_max_depth: *glob_scan_max_depth,
+            }
+            .serialize(serializer),
+            Self::Unrestricted => {
+                SerializedManagedFileSystemPermissions::Unrestricted.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedFileSystemPermissions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            match SerializedManagedFileSystemPermissions::deserialize(deserializer)? {
+                SerializedManagedFileSystemPermissions::Restricted {
+                    entries,
+                    glob_scan_max_depth,
+                } => Self::Restricted {
+                    entries: entries
+                        .into_iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<_, _>>()
+                        .map_err(serde::de::Error::custom)?,
+                    glob_scan_max_depth,
+                },
+                SerializedManagedFileSystemPermissions::Unrestricted => Self::Unrestricted,
+            },
+        )
+    }
 }
 
 impl ManagedFileSystemPermissions {
@@ -2655,6 +2747,33 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn permission_profile_round_trip_preserves_ambiguous_native_denies() -> Result<()> {
+        let denied_path = AbsolutePathBuf::try_from(PathBuf::from("/C:/secret"))?;
+        let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(denied_path.into(), FileSystemAccessMode::Deny),
+        ]);
+        let permission_profile = PermissionProfile::from_runtime_permissions(
+            &file_system_sandbox_policy,
+            NetworkSandboxPolicy::Restricted,
+        );
+
+        assert_eq!(
+            serde_json::from_value::<PermissionProfile>(serde_json::to_value(
+                &permission_profile
+            )?)?,
+            permission_profile
+        );
+        Ok(())
+    }
+
     #[test]
     fn permission_profile_deserializes_legacy_rollout_shape() -> Result<()> {
         let legacy = serde_json::json!({
@@ -2828,7 +2947,7 @@ mod tests {
         .expect("absolute path");
         let file_system_permissions = FileSystemPermissions {
             entries: vec![FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
+                path: path.into(),
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             }],

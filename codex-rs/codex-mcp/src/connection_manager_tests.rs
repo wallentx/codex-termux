@@ -1441,18 +1441,37 @@ fn test_normalize_tools_duplicated_names_skipped() {
 }
 
 #[test]
+fn test_normalize_tools_respects_responses_api_name_length_boundaries() {
+    let namespace = "mcp__codex_apps";
+    let namespace_len = namespace.len() + "__".len();
+
+    for total_len in [128, 129] {
+        let tool_name = "a".repeat(total_len - namespace_len);
+        let model_tools = normalize_tools_for_model_with_prefix(
+            vec![create_test_tool("codex_apps", &tool_name)],
+            /*prefix_mcp_tool_names*/ true,
+            &[],
+        );
+        let model_name = model_tools[0].canonical_tool_name();
+
+        assert_eq!(model_tool_name_len(&model_name), 128);
+        if total_len == 128 {
+            assert_eq!(model_name, ToolName::namespaced(namespace, tool_name));
+        } else {
+            assert_ne!(model_name.name, tool_name);
+        }
+    }
+}
+
+#[test]
 fn test_normalize_tools_long_names_same_server() {
     let server_name = "my_server";
+    let first_name = "a".repeat(128);
+    let second_name = "b".repeat(128);
 
     let tools = vec![
-        create_test_tool(
-            server_name,
-            "extremely_lengthy_function_name_that_absolutely_surpasses_all_reasonable_limits",
-        ),
-        create_test_tool(
-            server_name,
-            "yet_another_extremely_lengthy_function_name_that_absolutely_surpasses_all_reasonable_limits",
-        ),
+        create_test_tool(server_name, &first_name),
+        create_test_tool(server_name, &second_name),
     ];
 
     let model_tools =
@@ -1462,7 +1481,7 @@ fn test_normalize_tools_long_names_same_server() {
 
     let names = model_tool_names(&model_tools);
 
-    assert!(names.iter().all(|name| model_tool_name_len(name) == 64));
+    assert!(names.iter().all(|name| model_tool_name_len(name) == 128));
     assert!(
         names
             .iter()
@@ -2634,6 +2653,92 @@ async fn list_all_tools_applies_legacy_mcp_prefix_by_default() {
         ),
         expected
     );
+}
+
+#[tokio::test]
+async fn call_tool_requires_connection_without_waiting_for_startup() {
+    let client = create_test_managed_client(vec![create_test_tool("docs", "search")]).await;
+    let (client, startup_started, release_startup) = create_gated_async_managed_client(client);
+    let startup_client = client.clone();
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionSet::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    manager.insert_test_client("docs", client);
+
+    let pending_call = tokio::time::timeout(
+        Duration::from_millis(50),
+        manager.call_tool(
+            "docs",
+            "search",
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(5)),
+            /*wait_for_server*/ false,
+        ),
+    )
+    .await
+    .expect("ready-only invocation must not wait for pending server startup")
+    .expect_err("pending server must not accept ready-only calls");
+    assert!(pending_call.to_string().contains("not connected"));
+
+    let startup = tokio::spawn(async move { startup_client.client().await });
+    startup_started.await.expect("server startup should begin");
+    release_startup.send(()).expect("release server startup");
+    startup
+        .await
+        .expect("startup task should finish")
+        .expect("server startup should succeed");
+
+    let ready_error = manager
+        .call_tool(
+            "docs",
+            "search",
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(5)),
+            /*wait_for_server*/ false,
+        )
+        .await
+        .expect_err("ready server should reach the uninitialized test transport");
+    assert!(format!("{ready_error:#}").contains("MCP client not initialized"));
+}
+
+#[tokio::test]
+async fn connected_call_respects_server_tool_filters() {
+    let client = create_ready_async_managed_client(vec![create_test_tool("docs", "search")]).await;
+    client.client().await.expect("server should be ready");
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionSet::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    manager.insert_test_client("docs", client);
+    manager
+        .servers
+        .get_mut("docs")
+        .expect("test server should exist")
+        .tool_filter
+        .disabled
+        .insert("search".to_string());
+
+    let filtered_error = manager
+        .call_tool(
+            "docs",
+            "search",
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(5)),
+            /*wait_for_server*/ false,
+        )
+        .await
+        .expect_err("disabled tools should not be callable");
+    assert!(filtered_error.to_string().contains("disabled"));
 }
 
 #[tokio::test]
@@ -4166,6 +4271,101 @@ async fn reconciliation_reuses_an_unchanged_ready_server() {
         model_tool_names(&reconciled.list_all_tools().await),
         HashSet::from([ToolName::namespaced("mcp__docs", "search")])
     );
+}
+
+#[tokio::test]
+async fn reconciliation_reuses_an_unchanged_pending_server_without_waiting() -> anyhow::Result<()> {
+    let runtime_context = reusable_server_runtime_context();
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    let tools = vec![
+        create_test_tool("docs", "search"),
+        create_test_tool("docs", "write"),
+    ];
+    let mut previous =
+        manager_with_reusable_ready_server(&config, &runtime_context, tools.clone()).await;
+    let managed_client = create_test_managed_client(tools).await;
+    let (pending_client, startup_started, release_startup) =
+        create_gated_async_managed_client(managed_client);
+    let startup = tokio::spawn({
+        let pending_client = pending_client.clone();
+        async move { pending_client.client().await }
+    });
+    startup_started.await?;
+    let connection = Arc::get_mut(
+        &mut previous
+            .servers
+            .get_mut("docs")
+            .expect("test server should exist")
+            .connection,
+    )
+    .expect("test server should have one connection owner");
+    connection.client = pending_client;
+    config.enabled_tools = Some(vec!["search".to_string()]);
+
+    let reconciled = tokio::time::timeout(
+        Duration::from_millis(100),
+        reconcile_reusable_server(&previous, config, runtime_context),
+    )
+    .await
+    .expect("reconciliation must not wait for an unchanged pending MCP server");
+
+    assert!(previous.shares_test_connection_with(&reconciled, "docs"));
+    release_startup
+        .send(())
+        .map_err(|()| anyhow!("pending startup should still be running"))?;
+    startup.await??;
+    assert_eq!(
+        model_tool_names(&reconciled.list_all_tools().await),
+        HashSet::from([ToolName::namespaced("mcp__docs", "search")])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_cancels_a_reused_pending_server_when_disabled() -> anyhow::Result<()> {
+    let runtime_context = reusable_server_runtime_context();
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    let tools = vec![create_test_tool("docs", "search")];
+    let mut previous =
+        manager_with_reusable_ready_server(&config, &runtime_context, tools.clone()).await;
+    let managed_client = create_test_managed_client(tools).await;
+    let (pending_client, startup_started, release_startup) =
+        create_gated_async_managed_client(managed_client);
+    let cancellation = pending_client.cancel_token.clone();
+    let startup = tokio::spawn({
+        let pending_client = pending_client.clone();
+        async move { pending_client.client().await }
+    });
+    startup_started.await?;
+    let connection = Arc::get_mut(
+        &mut previous
+            .servers
+            .get_mut("docs")
+            .expect("test server should exist")
+            .connection,
+    )
+    .expect("test server should have one connection owner");
+    connection.client = pending_client;
+
+    let reused =
+        reconcile_reusable_server(&previous, config.clone(), runtime_context.clone()).await;
+    assert!(previous.shares_test_connection_with(&reused, "docs"));
+
+    config.enabled = false;
+    let removed = reconcile_reusable_server(&reused, config, runtime_context).await;
+    assert!(!removed.servers.contains_key("docs"));
+    drop(previous);
+    drop(reused);
+
+    assert!(
+        cancellation.is_cancelled(),
+        "disabling a reused pending MCP server should cancel its obsolete startup"
+    );
+    release_startup
+        .send(())
+        .map_err(|()| anyhow!("pending startup should remain available for test cleanup"))?;
+    startup.await??;
+    Ok(())
 }
 
 #[tokio::test]

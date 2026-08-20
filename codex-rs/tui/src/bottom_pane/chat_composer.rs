@@ -57,6 +57,16 @@
 //! recall is a two-phase handoff: stage the submitted slash text here, then record it after
 //! `ChatWidget` dispatches the command.
 //!
+//! # Startup Draft Handoff
+//!
+//! Startup uses a provisional plain-text composer: editing remains available, but submission,
+//! popups, attachments, and other actions are disabled. [`ComposerDraftSnapshot`] transfers its
+//! text, cursor, pending paste placeholders, local history, and recent activity to the fully
+//! initialized composer.
+//! `ChatWidget` merges the draft with any existing initial prompt and attachments, rebasing cursor
+//! and placeholder positions while preserving both composers' contents. The draft remains deferred
+//! until protected views close, input is enabled, and required sandbox setup completes.
+//!
 //! # Submission and Prompt Expansion
 //!
 //! `Enter` submits immediately. `Tab` requests queuing while a task is running; if no task is
@@ -67,6 +77,7 @@
 //!
 //! - Expands pending paste placeholders so element ranges align with the final text.
 //! - Trims whitespace and rebases text elements accordingly.
+//! - Treats a leading `!` revealed only by paste expansion as literal model input, not shell input.
 //! - Prunes local attached images so only placeholders that survive expansion are sent.
 //! - Preserves remote image URLs as separate attachments even when text is empty.
 //!
@@ -134,7 +145,8 @@
 //! `KeyCode::Char` and `KeyCode::Enter` key events instead of a single paste event.
 //!
 //! To avoid misinterpreting these bursts as real typing (and to prevent transient UI effects like
-//! shortcut overlays toggling on a pasted `?`), we feed "plain" character events into
+//! shortcut overlays toggling on a pasted `?`), we feed text-producing character events (plain,
+//! Shift, or Windows AltGr) into
 //! [`PasteBurst`](super::paste_burst::PasteBurst), which buffers bursts and later flushes them
 //! through [`ChatComposer::handle_paste`].
 //!
@@ -311,6 +323,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -372,7 +385,7 @@ fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
                 | SlashCommand::App
                 | SlashCommand::Side
                 | SlashCommand::Btw
-                | SlashCommand::Agent
+                | SlashCommand::Agents
                 | SlashCommand::MultiAgents
                 | SlashCommand::Vim
                 | SlashCommand::Keymap
@@ -412,6 +425,8 @@ fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedInputAction {
     Plain,
+    /// Preserve model-input provenance when paste expansion reveals a leading shell sigil.
+    Literal,
     ParseSlash,
     RunShell,
 }
@@ -504,7 +519,7 @@ pub(crate) struct ChatComposer {
     toggle_shortcuts_keys: Vec<KeyBinding>,
     history_search_previous_keys: Vec<KeyBinding>,
     history_search_next_keys: Vec<KeyBinding>,
-    editor_keymap: EditorKeymap,
+    editor_keymap: Arc<EditorKeymap>,
     vim_normal_keymap: VimNormalKeymap,
 }
 
@@ -529,11 +544,14 @@ struct ComposerDraft {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ComposerDraftSnapshot {
     pub(crate) text: String,
+    pub(crate) cursor: usize,
     pub(crate) text_elements: Vec<TextElement>,
     pub(crate) local_images: Vec<LocalImageAttachment>,
     pub(crate) remote_image_urls: Vec<String>,
     pub(crate) mention_bindings: Vec<MentionBinding>,
     pub(crate) pending_pastes: Vec<(String, String)>,
+    pub(crate) startup_local_history: Vec<HistoryEntry>,
+    pub(crate) last_composer_activity_at: Option<Instant>,
 }
 
 const FOOTER_SPACING_HEIGHT: u16 = 0;
@@ -693,6 +711,7 @@ impl ChatComposer {
             editor_keymap: default_editor_keymap,
             vim_normal_keymap: default_vim_normal_keymap,
         };
+        this.draft.textarea.set_keymap_bindings(&default_keymap);
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
         this
@@ -1298,6 +1317,22 @@ impl ChatComposer {
         self.footer.mode = reset_mode_after_activity(self.footer.mode);
     }
 
+    /// Enable Vim while keeping already-active text entry in insert mode.
+    pub(crate) fn enable_vim_in_insert_mode(&mut self) {
+        self.set_vim_enabled(/*enabled*/ true);
+        self.draft.textarea.enter_vim_insert_mode();
+    }
+
+    /// Restore draft history transferred from the startup composer.
+    pub(crate) fn restore_startup_local_history(
+        &mut self,
+        startup_local_history: Vec<HistoryEntry>,
+    ) {
+        for entry in startup_local_history {
+            self.history.record_local_submission(entry);
+        }
+    }
+
     /// Toggle Vim editing and return the new enabled state.
     ///
     /// This is the app-level command target for the configurable Vim toggle
@@ -1309,8 +1344,7 @@ impl ChatComposer {
         enabled
     }
 
-    /// Return whether Vim editing is enabled for tests that assert mode transitions.
-    #[cfg(test)]
+    /// Return whether Vim editing is enabled.
     pub(crate) fn is_vim_enabled(&self) -> bool {
         self.draft.textarea.is_vim_enabled()
     }
@@ -1327,14 +1361,7 @@ impl ChatComposer {
     }
 
     fn vim_mode_indicator_span(&self) -> Option<Span<'static>> {
-        self.draft
-            .textarea
-            .vim_mode_label()
-            .map(|label| match label {
-                "Normal" => "Vim: Normal".magenta(),
-                "Insert" => "Vim: Insert".green(),
-                _ => unreachable!(),
-            })
+        self.draft.textarea.vim_mode_indicator_span()
     }
 
     fn mode_indicator_line(&self, show_cycle_hint: bool) -> Option<Line<'static>> {
@@ -1532,7 +1559,7 @@ impl ChatComposer {
         }
     }
 
-    fn set_current_cursor(&mut self, cursor: usize) {
+    pub(crate) fn set_current_cursor(&mut self, cursor: usize) {
         let visible_cursor = if self.draft.is_bash_mode {
             cursor.saturating_sub(1)
         } else {
@@ -1716,11 +1743,14 @@ impl ChatComposer {
     pub(crate) fn draft_snapshot(&self) -> ComposerDraftSnapshot {
         ComposerDraftSnapshot {
             text: self.current_text(),
+            cursor: self.current_cursor(),
             text_elements: self.text_elements(),
             local_images: self.local_images(),
             remote_image_urls: self.remote_image_urls(),
             mention_bindings: self.mention_bindings(),
             pending_pastes: self.pending_pastes(),
+            startup_local_history: self.history.startup_local_history().to_vec(),
+            last_composer_activity_at: None,
         }
     }
 
@@ -2972,13 +3002,29 @@ impl ChatComposer {
         }
         self.draft.recent_submission_mention_bindings = original_mention_bindings.clone();
         if record_history && (!text.is_empty() || !self.attachments.is_empty()) {
+            let preserve_literal_paste = self.slash_commands_enabled()
+                && text.starts_with('!')
+                && !original_input.trim_start().starts_with('!');
+            let (history_text, history_text_elements) = if preserve_literal_paste {
+                let history_text = original_input.trim().to_string();
+                let history_text_elements = Self::trim_text_elements(
+                    &original_input,
+                    &history_text,
+                    original_text_elements,
+                );
+                (history_text, history_text_elements)
+            } else {
+                (text.clone(), text_elements.clone())
+            };
             self.history.record_local_submission(HistoryEntry {
-                text: text.clone(),
-                text_elements: text_elements.clone(),
+                text: history_text,
+                text_elements: history_text_elements,
                 local_image_paths: self.attachments.local_image_paths(),
                 remote_image_urls: self.attachments.remote_image_urls(),
                 mention_bindings: original_mention_bindings,
-                pending_pastes: if pending_paste_handling == PendingPasteHandling::Preserve {
+                pending_pastes: if pending_paste_handling == PendingPasteHandling::Preserve
+                    || preserve_literal_paste
+                {
                     original_pending_pastes.clone()
                 } else {
                     Vec::new()
@@ -3056,6 +3102,10 @@ impl ChatComposer {
             if let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() {
                 self.handle_paste(pasted);
             }
+            let visible_shell_command = self.is_bang_shell_command();
+            let original_input = self.current_text();
+            let original_text_elements = self.current_text_elements();
+            let original_pending_pastes = self.draft.pending_pastes.clone();
             let raw_text = self.draft.textarea.text();
             let defer_slash_validation = self.slash_input().should_parse_on_dequeue(raw_text);
             let preserve_pending_pastes = defer_slash_validation
@@ -3080,7 +3130,20 @@ impl ChatComposer {
                     PendingPasteHandling::Expand
                 },
             ) {
-                let action = slash_input::queued_input_action(&text, defer_slash_validation);
+                let action = if text.starts_with('!') && !visible_shell_command {
+                    QueuedInputAction::Literal
+                } else {
+                    slash_input::queued_input_action(&text, defer_slash_validation)
+                };
+                let (text, text_elements, pending_pastes) = if action == QueuedInputAction::Literal
+                {
+                    let text = original_input.trim().to_string();
+                    let text_elements =
+                        Self::trim_text_elements(&original_input, &text, original_text_elements);
+                    (text, text_elements, original_pending_pastes)
+                } else {
+                    (text, text_elements, pending_pastes)
+                };
                 return (
                     InputResult::Queued {
                         text,
@@ -3117,13 +3180,19 @@ impl ChatComposer {
         if let Some((text, text_elements)) =
             self.prepare_submission_text(/*record_history*/ true)
         {
-            if should_queue {
+            if self.slash_commands_enabled()
+                && text.starts_with('!')
+                && !original_input.trim_start().starts_with('!')
+            {
+                let text = original_input.trim().to_string();
+                let text_elements =
+                    Self::trim_text_elements(&original_input, &text, original_text_elements);
                 (
                     InputResult::Queued {
                         text,
                         text_elements,
-                        action: QueuedInputAction::Plain,
-                        pending_pastes: Vec::new(),
+                        action: QueuedInputAction::Literal,
+                        pending_pastes: original_pending_pastes,
                     },
                     true,
                 )
@@ -3482,8 +3551,8 @@ impl ChatComposer {
     ///
     /// - Always flush any *due* paste burst first so buffered text does not lag behind unrelated
     ///   edits.
-    /// - Then handle the incoming key, intercepting only "plain" (no Ctrl/Alt) char input.
-    /// - For non-plain keys, flush via `flush_before_modified_input()` before applying the key;
+    /// - Then handle the incoming key, intercepting only text-producing character input.
+    /// - For non-text keys, flush via `flush_before_modified_input()` before applying the key;
     ///   otherwise `clear_window_after_non_char()` can leave buffered text waiting without a
     ///   timestamp to time out against.
     fn handle_input_basic(&mut self, input: KeyEvent) -> (InputResult, bool) {
@@ -3518,19 +3587,21 @@ impl ChatComposer {
             return (InputResult::None, true);
         }
 
-        // Intercept plain Char inputs to optionally accumulate into a burst buffer.
+        let has_non_text_modifier = has_ctrl_or_alt(input.modifiers)
+            || input
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META);
+
+        // Intercept text-producing Char inputs to optionally accumulate into a burst buffer.
         //
-        // This is intentionally limited to "plain" (no Ctrl/Alt) chars so shortcuts keep their
-        // normal semantics, and so we can aggressively flush/clear any burst state when non-char
-        // keys are pressed.
+        // This preserves plain, Shift, and Windows AltGr input while keeping shortcut modifiers
+        // out of the burst detector and flushing any in-flight text before a non-text key.
         if let KeyEvent {
             code: KeyCode::Char(ch),
-            modifiers,
             ..
         } = input
         {
-            let has_ctrl_or_alt = has_ctrl_or_alt(modifiers);
-            if !has_ctrl_or_alt
+            if !has_non_text_modifier
                 && !self.draft.disable_paste_burst
                 && self.draft.textarea.allows_paste_burst()
             {
@@ -3618,14 +3689,10 @@ impl ChatComposer {
             self.reconcile_deleted_elements(elements_before);
         }
 
-        // Update paste-burst heuristic for plain Char (no Ctrl/Alt) events.
-        let crossterm::event::KeyEvent {
-            code, modifiers, ..
-        } = input;
-        match code {
+        // Update the paste-burst heuristic for text, shortcut, and non-char events.
+        match input.code {
             KeyCode::Char(_) => {
-                let has_ctrl_or_alt = has_ctrl_or_alt(modifiers);
-                if has_ctrl_or_alt {
+                if has_non_text_modifier {
                     self.draft.paste_burst.clear_window_after_non_char();
                 }
             }
@@ -4944,7 +5011,8 @@ mod tests {
     #[test]
     fn parent_owned_thread_allows_bare_navigation_commands() {
         for (command, expected) in [
-            ("/agent", SlashCommand::Agent),
+            ("/agents", SlashCommand::Agents),
+            ("/subagents", SlashCommand::MultiAgents),
             ("/side", SlashCommand::Side),
             ("/btw", SlashCommand::Btw),
             ("/diff ", SlashCommand::Diff),
@@ -4970,7 +5038,7 @@ mod tests {
             .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .0;
 
-        assert_eq!(result, InputResult::Command(SlashCommand::Agent));
+        assert_eq!(result, InputResult::Command(SlashCommand::Agents));
     }
 
     #[test]
@@ -11191,8 +11259,10 @@ mod tests {
         assert!(matches!(result, InputResult::Submitted { .. }));
 
         let mut keymap = RuntimeKeymap::defaults();
-        keymap.editor.move_up = vec![key_hint::plain(KeyCode::F(2))];
+        Arc::make_mut(&mut keymap.editor).move_up = vec![key_hint::plain(KeyCode::F(2))];
         composer.set_keymap_bindings(&keymap);
+        assert!(Arc::ptr_eq(&composer.editor_keymap, &keymap.editor));
+        assert_eq!(Arc::strong_count(&keymap.editor), 3);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert!(composer.draft.textarea.is_empty());
@@ -11874,6 +11944,148 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shortcut_modified_input_does_not_enter_paste_bursts() {
+        snapshot_composer_state(
+            "shortcut_modified_space_is_not_rendered",
+            /*enhanced_keys_supported*/ false,
+            |composer| {
+                let now = Instant::now();
+                for input in [
+                    KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                    KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SUPER),
+                    KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                ] {
+                    composer.handle_input_basic_with_time(input, now);
+                }
+
+                assert!(
+                    composer.handle_paste_burst_flush(
+                        now + PasteBurst::recommended_active_flush_delay()
+                    )
+                );
+            },
+        );
+
+        for modifiers in [
+            KeyModifiers::SUPER,
+            KeyModifiers::SHIFT | KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+        ] {
+            let (mut composer, _rx) = new_test_composer();
+            let now = Instant::now();
+
+            composer
+                .handle_input_basic_with_time(KeyEvent::new(KeyCode::Char(' '), modifiers), now);
+
+            assert!(
+                !composer.is_in_paste_burst(),
+                "shortcut modifiers {modifiers:?} must not start a paste burst"
+            );
+            assert!(
+                !composer.handle_paste_burst_flush(now + PasteBurst::recommended_flush_delay())
+            );
+            assert_eq!(composer.draft.textarea.text(), "");
+        }
+    }
+
+    #[test]
+    fn plain_and_shift_spaces_insert_normally() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let (mut composer, _rx) = new_test_composer();
+            let now = Instant::now();
+
+            composer
+                .handle_input_basic_with_time(KeyEvent::new(KeyCode::Char(' '), modifiers), now);
+
+            assert!(composer.is_in_paste_burst());
+            assert_eq!(composer.draft.textarea.text(), "");
+            assert!(composer.handle_paste_burst_flush(now + PasteBurst::recommended_flush_delay()));
+            assert_eq!(composer.draft.textarea.text(), " ");
+            assert!(!composer.is_in_paste_burst());
+
+            let snapshot_name = if modifiers == KeyModifiers::NONE {
+                "plain_space_is_rendered"
+            } else {
+                "shift_space_is_rendered"
+            };
+            snapshot_composer_state(
+                snapshot_name,
+                /*enhanced_keys_supported*/ false,
+                |composer| {
+                    let now = Instant::now();
+                    for input in [
+                        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                        KeyEvent::new(KeyCode::Char(' '), modifiers),
+                        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                    ] {
+                        composer.handle_input_basic_with_time(input, now);
+                    }
+
+                    assert!(composer.handle_paste_burst_flush(
+                        now + PasteBurst::recommended_active_flush_delay()
+                    ));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn non_text_input_flushes_pending_paste_without_inserting_text() {
+        let (mut composer, _rx) = new_test_composer();
+        let now = Instant::now();
+
+        composer.handle_input_basic_with_time(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            now,
+        );
+        composer.handle_input_basic_with_time(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            now,
+        );
+
+        assert!(composer.is_in_paste_burst());
+        assert_eq!(composer.draft.textarea.text(), "");
+
+        composer.handle_input_basic_with_time(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SUPER),
+            now,
+        );
+
+        assert_eq!(composer.draft.textarea.text(), "ab");
+        assert!(!composer.is_in_paste_burst());
+        assert!(!composer.handle_paste_burst_flush(now + PasteBurst::recommended_flush_delay()));
+    }
+
+    #[test]
+    fn platform_specific_altgr_input_remains_text() {
+        for modifiers in [
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            let (mut composer, _rx) = new_test_composer();
+            let now = Instant::now();
+
+            composer
+                .handle_input_basic_with_time(KeyEvent::new(KeyCode::Char('@'), modifiers), now);
+
+            if cfg!(windows) {
+                assert!(composer.is_in_paste_burst());
+                assert!(
+                    composer.handle_paste_burst_flush(now + PasteBurst::recommended_flush_delay())
+                );
+                assert_eq!(composer.draft.textarea.text(), "@");
+            } else {
+                assert!(!composer.is_in_paste_burst());
+                assert!(
+                    !composer.handle_paste_burst_flush(now + PasteBurst::recommended_flush_delay())
+                );
+                assert_eq!(composer.draft.textarea.text(), "");
+            }
+        }
+    }
+
     /// Behavior: the first fast ASCII character is held briefly to avoid flicker; if no burst
     /// follows, it should eventually flush as normal typed input (not as a paste).
     #[test]
@@ -12008,8 +12220,16 @@ mod tests {
         );
 
         let count = LARGE_PASTE_CHAR_THRESHOLD; // 1000 in current config
-        let chars: Vec<char> = vec!['z'; count];
-        type_chars_humanlike(&mut composer, &chars);
+        let mut now = Instant::now();
+        let step = ChatComposer::recommended_paste_flush_delay();
+        for _ in 0..count {
+            let _ = composer.handle_input_basic_with_time(
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+                now,
+            );
+            now += step;
+            let _ = composer.handle_paste_burst_flush(now);
+        }
 
         assert_eq!(composer.draft.textarea.text(), "z".repeat(count));
         assert!(composer.draft.pending_pastes.is_empty());

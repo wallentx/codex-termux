@@ -16,6 +16,7 @@ use super::ConfiguredHandler;
 use super::ConfiguredHandlerKind;
 use super::HandlerRunResult;
 use super::command_runner::run_command;
+use super::mcp_runner::run_mcp_tool;
 use crate::events::common::matches_matcher;
 
 #[derive(Debug)]
@@ -123,6 +124,21 @@ pub(crate) async fn execute_handlers<T: 'static>(
                     )
                     .await
                 }
+                ConfiguredHandlerKind::McpTool {
+                    server,
+                    tool,
+                    input,
+                } => {
+                    run_mcp_tool(
+                        engine.mcp_executor.as_ref(),
+                        &handler,
+                        server,
+                        tool,
+                        input,
+                        &input_json,
+                    )
+                    .await
+                }
             };
             (configured_order, parse(&handler, result, turn_id))
         });
@@ -195,16 +211,19 @@ pub(crate) fn hook_event_name_label(event_name: HookEventName) -> &'static str {
     }
 }
 
-pub(crate) fn hook_execution_mode_label(mode: HookExecutionMode) -> &'static str {
+/// Returns the canonical label for a hook execution mode.
+pub fn hook_execution_mode_label(mode: HookExecutionMode) -> &'static str {
     match mode {
         HookExecutionMode::Sync => "sync",
         HookExecutionMode::Async => "async",
     }
 }
 
-pub(crate) fn hook_handler_type_label(handler_type: HookHandlerType) -> &'static str {
+/// Returns the canonical label for a hook handler type.
+pub fn hook_handler_type_label(handler_type: HookHandlerType) -> &'static str {
     match handler_type {
         HookHandlerType::Command => "command",
+        HookHandlerType::McpTool => "mcp_tool",
         HookHandlerType::Prompt => "prompt",
         HookHandlerType::Agent => "agent",
     }

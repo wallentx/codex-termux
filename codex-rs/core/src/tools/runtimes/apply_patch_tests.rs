@@ -1,13 +1,16 @@
 use super::*;
 use crate::config::PermissionProfileSnapshot;
-use crate::session::turn_context::TurnEnvironmentConfig;
+use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::tools::sandboxing::SandboxAttempt;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::GranularApprovalConfig;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
@@ -18,16 +21,25 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::TurnEnvironment {
     crate::session::turn_context::TurnEnvironment::new(
-        environment_id.to_string(),
-        std::sync::Arc::new(codex_exec_server::Environment::default_for_tests()),
-        PathUri::from_abs_path(&std::env::temp_dir().abs()),
-        Vec::new(),
-        /*shell*/ None,
-        TurnEnvironmentConfig {
-            allow_login_shell: true,
-            permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::read_only()),
-            selected_capability_roots: None,
+        TurnEnvironmentSelection {
+            environment_id: environment_id.to_string(),
+            cwd: PathUri::from_abs_path(&std::env::temp_dir().abs()),
+            workspace_roots: Vec::new(),
+            config: EnvironmentConfigState::Ready(EnvironmentConfig {
+                allow_login_shell: true,
+                permission_profile: PermissionProfileSnapshot::legacy(
+                    PermissionProfile::read_only(),
+                ),
+                shell_environment_policy: Default::default(),
+                exec_policy: None,
+                mcp_policy: None,
+                network_policy: None,
+                selected_capability_roots: Vec::new(),
+            }),
         },
+        EnvironmentConfigOrigin::Thread,
+        std::sync::Arc::new(codex_exec_server::Environment::default_for_tests()),
+        /*shell*/ None,
     )
 }
 
