@@ -1,6 +1,6 @@
 use crate::accepted_lines::AcceptedLineFingerprintEventInput;
+use crate::accepted_lines::accepted_line_counts_from_unified_diff;
 use crate::accepted_lines::accepted_line_fingerprint_event_requests;
-use crate::accepted_lines::accepted_line_fingerprints_from_unified_diff;
 use crate::accepted_lines::accepted_line_repo_hash_for_cwd;
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexAppMentionedEventRequest;
@@ -11,6 +11,8 @@ use crate::events::CodexCollabAgentToolCallEventRequest;
 use crate::events::CodexCommandExecutionEventParams;
 use crate::events::CodexCommandExecutionEventRequest;
 use crate::events::CodexCompactionEventRequest;
+use crate::events::CodexControlToolCallEventParams;
+use crate::events::CodexControlToolCallEventRequest;
 use crate::events::CodexDynamicToolCallEventParams;
 use crate::events::CodexDynamicToolCallEventRequest;
 use crate::events::CodexFileChangeEventParams;
@@ -82,6 +84,8 @@ use crate::facts::CodeModeToolCallFact;
 use crate::facts::CodeModeToolCallStatus;
 use crate::facts::CodexCompactionEvent;
 use crate::facts::CodexGoalEvent;
+use crate::facts::ControlToolCallFact;
+use crate::facts::ControlToolCallStatus;
 use crate::facts::CustomAnalyticsFact;
 use crate::facts::ExternalAgentConfigImportCompletedInput;
 use crate::facts::ExternalAgentConfigImportFailureInput;
@@ -589,6 +593,9 @@ impl AnalyticsReducer {
                 CustomAnalyticsFact::CodeModeToolCall(input) => {
                     self.ingest_code_mode_tool_call(input, out);
                 }
+                CustomAnalyticsFact::ControlToolCall(input) => {
+                    self.ingest_control_tool_call(input, out);
+                }
                 CustomAnalyticsFact::SubAgentThreadStarted(input) => {
                     self.ingest_subagent_thread_started(input, out);
                 }
@@ -831,6 +838,83 @@ impl AnalyticsReducer {
                 );
             }
         }
+    }
+
+    fn ingest_control_tool_call(
+        &mut self,
+        input: ControlToolCallFact,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
+        let ControlToolCallFact {
+            thread_id,
+            turn_id,
+            call_id,
+            cell_id,
+            tool_name,
+            started_at_ms,
+            completed_at_ms,
+            status,
+        } = input;
+        let drop_site = AnalyticsDropSite {
+            event_name: "control tool",
+            thread_id: &thread_id,
+            turn_id: Some(&turn_id),
+            review_id: None,
+            item_id: Some(&call_id),
+        };
+        let Some((connection_state, thread_state, thread_metadata)) =
+            self.thread_context_or_warn(drop_site)
+        else {
+            return;
+        };
+        let mut base = tool_item_base(
+            &thread_id,
+            &turn_id,
+            call_id,
+            tool_name,
+            ToolItemOutcome {
+                terminal_status: match status {
+                    ControlToolCallStatus::Completed => ToolItemTerminalStatus::Completed,
+                    ControlToolCallStatus::Failed => ToolItemTerminalStatus::Failed,
+                    ControlToolCallStatus::Rejected => ToolItemTerminalStatus::Rejected,
+                    ControlToolCallStatus::Interrupted => ToolItemTerminalStatus::Interrupted,
+                },
+                failure_kind: match status {
+                    ControlToolCallStatus::Failed => Some(ToolItemFailureKind::ToolError),
+                    ControlToolCallStatus::Rejected => Some(ToolItemFailureKind::PolicyForbidden),
+                    ControlToolCallStatus::Completed | ControlToolCallStatus::Interrupted => None,
+                },
+                execution_duration_ms: observed_duration_ms(started_at_ms, completed_at_ms),
+            },
+            ToolItemContext {
+                started_at_ms,
+                completed_at_ms,
+                connection_state,
+                thread_state,
+                thread_metadata,
+                review_summary: None,
+            },
+        );
+        base.cell_id = cell_id;
+        let event = TrackEventRequest::ControlToolCall(CodexControlToolCallEventRequest {
+            event_type: "codex_control_tool_call_event",
+            event_params: CodexControlToolCallEventParams {
+                base,
+                success: status == ControlToolCallStatus::Completed,
+            },
+        });
+        self.turns
+            .entry(turn_id.clone())
+            .or_default()
+            .tool_counts
+            .total += 1;
+        self.record_tool_event(
+            &thread_id,
+            &turn_id,
+            event,
+            ToolEventEmission::AwaitResponse,
+            out,
+        );
     }
 
     fn ingest_sampling_response_completed(
@@ -2307,6 +2391,7 @@ fn tool_event_base_mut(event: &mut TrackEventRequest) -> Option<&mut CodexToolIt
         TrackEventRequest::FileChange(event) => Some(&mut event.event_params.base),
         TrackEventRequest::McpToolCall(event) => Some(&mut event.event_params.base),
         TrackEventRequest::DynamicToolCall(event) => Some(&mut event.event_params.base),
+        TrackEventRequest::ControlToolCall(event) => Some(&mut event.event_params.base),
         TrackEventRequest::CollabAgentToolCall(event) => Some(&mut event.event_params.base),
         TrackEventRequest::WebSearch(event) => Some(&mut event.event_params.base),
         TrackEventRequest::ImageGeneration(event) => Some(&mut event.event_params.base),
@@ -3166,7 +3251,7 @@ fn accepted_line_event_input(
     turn_state: &TurnState,
 ) -> Option<(AcceptedLineFingerprintEventInput, PathBuf)> {
     let latest_diff = turn_state.latest_diff.as_deref()?;
-    let summary = accepted_line_fingerprints_from_unified_diff(latest_diff);
+    let summary = accepted_line_counts_from_unified_diff(latest_diff);
     if summary.accepted_added_lines == 0 && summary.accepted_deleted_lines == 0 {
         return None;
     }
@@ -3185,7 +3270,6 @@ fn accepted_line_event_input(
             repo_hash: None,
             accepted_added_lines: summary.accepted_added_lines,
             accepted_deleted_lines: summary.accepted_deleted_lines,
-            line_fingerprints: summary.line_fingerprints,
         },
         resolved_config.permission_profile_cwd,
     ))

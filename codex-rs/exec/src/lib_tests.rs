@@ -337,6 +337,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
         ephemeral: false,
         section: None,
         section_entered_at: None,
+        project_id: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
         created_at: 0,
@@ -362,6 +363,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
                     text: "hello".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 }],
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
@@ -392,6 +394,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
             text: "hello".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
         }])
     );
     assert_eq!(turn_items_for_thread(&thread, "missing-turn"), None);
@@ -613,10 +616,10 @@ async fn build_exec_config_preserves_headless_error_when_retry_fails() {
 }
 
 #[tokio::test]
-async fn thread_start_params_include_user_thread_source() {
+async fn thread_start_params_match_history_to_persistence() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(cwd.path().to_path_buf()))
         .build()
@@ -629,6 +632,13 @@ async fn thread_start_params_include_user_thread_source() {
         params.thread_source,
         Some(codex_app_server_protocol::ThreadSource::User)
     );
+    assert_eq!(params.history_mode, Some(ThreadHistoryMode::Paginated));
+
+    config.ephemeral = true;
+    let params = thread_start_params_from_config(&config);
+
+    assert_eq!(params.ephemeral, Some(true));
+    assert_eq!(params.history_mode, None);
 }
 
 #[tokio::test]
@@ -809,6 +819,7 @@ fn sample_thread_start_response() -> ThreadStartResponse {
             ephemeral: false,
             section: None,
             section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
             created_at: 0,

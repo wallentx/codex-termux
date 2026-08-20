@@ -29,12 +29,6 @@ pub(super) fn session_limits(
 
 pub(super) fn execute_request(request: proto::ExecuteRequest) -> Result<ExecuteRequest, Status> {
     validation::identifier(&request.tool_call_id, "tool call ID")?;
-    if request.enabled_tools.len() > validation::MAX_TOOL_DEFINITIONS {
-        return Err(Status::invalid_argument(format!(
-            "code-mode execution exceeds {} enabled tools",
-            validation::MAX_TOOL_DEFINITIONS
-        )));
-    }
     Ok(ExecuteRequest {
         tool_call_id: request.tool_call_id,
         source: request.source,
@@ -54,11 +48,6 @@ pub(super) fn execute_request(request: proto::ExecuteRequest) -> Result<ExecuteR
 
 fn tool_definition(definition: proto::ToolDefinition) -> Result<ToolDefinition, Status> {
     validation::identifier(&definition.name, "tool definition name")?;
-    validation::bounded(
-        &definition.description,
-        validation::MAX_TOOL_DESCRIPTION_BYTES,
-        "tool description",
-    )?;
     let name = definition
         .tool_name
         .ok_or_else(|| Status::invalid_argument("tool definition is missing its tool name"))?;

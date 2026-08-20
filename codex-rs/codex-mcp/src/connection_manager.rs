@@ -27,7 +27,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::McpServerSource;
 use crate::binding::call_tool_result_from_rmcp;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
@@ -53,6 +52,7 @@ use crate::tools::filter_tools;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use codex_config::McpServerTransportConfig;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
@@ -275,16 +275,14 @@ impl McpConnectionSet {
             .into_iter()
             .filter(|(_, server)| server.enabled())
         {
-            let is_host_owned_codex_apps = server_name == CODEX_APPS_MCP_SERVER_NAME
-                && config.mcp_server_catalog.server(&server_name).is_some_and(
-                    |server| match server.source() {
-                        McpServerSource::Compatibility { .. } => true,
-                        McpServerSource::Extension { id } => id == "hosted_plugin_runtime",
-                        McpServerSource::Plugin(_)
-                        | McpServerSource::SelectedPlugin(_)
-                        | McpServerSource::Config => false,
-                    },
-                );
+            let is_host_owned_codex_apps = config
+                .mcp_server_catalog
+                .server(&server_name)
+                .is_some_and(|server| {
+                    server
+                        .source()
+                        .is_host_owned_apps(&server_name, server.config())
+                });
             let catalog_item_limit = if is_host_owned_codex_apps {
                 MAX_CODEX_APPS_TOOL_CATALOG_ITEMS
             } else {
@@ -376,6 +374,15 @@ impl McpConnectionSet {
                 reusable_previous.and_then(|previous| previous.servers.get(&server_name))
             {
                 let connection = Arc::clone(&previous_view.connection);
+                let reusable_pending_startup = connection.identity.as_ref()
+                    == Some(&connection_identity)
+                    && !connection.client.startup_complete.load(Ordering::Acquire)
+                    && !connection.startup_is_dormant()
+                    && !connection.client.cancel_token.is_cancelled()
+                    && previous_view.catalog_item_limit == catalog_item_limit
+                    && expected_protocol_mode.is_some()
+                    && reusable_previous
+                        .is_some_and(|previous| previous.protocol_mode == protocol_mode);
                 let unchanged_auth_failure = if connection.identity.as_ref()
                     == Some(&connection_identity)
                     && connection_identity.oauth_store_was_contended
@@ -391,7 +398,8 @@ impl McpConnectionSet {
                 } else {
                     None
                 };
-                if unchanged_auth_failure.is_some()
+                if reusable_pending_startup
+                    || unchanged_auth_failure.is_some()
                     || connection
                         .reusable_client(&connection_identity)
                         .await
@@ -402,6 +410,8 @@ impl McpConnectionSet {
                                 })
                         })
                 {
+                    let pending_client =
+                        reusable_pending_startup.then(|| connection.client.clone());
                     servers.insert(
                         server_name.clone(),
                         McpServerView {
@@ -448,6 +458,14 @@ impl McpConnectionSet {
                                 }
                             }
                             (server_name, Err(error))
+                        });
+                    } else if let Some(client) = pending_client {
+                        let publication_gate = publication_gate.clone();
+                        join_set.spawn(async move {
+                            if !publication_gate.wait().await {
+                                return (server_name, Err(StartupOutcomeError::Cancelled));
+                            }
+                            (server_name, client.client().await)
                         });
                     } else {
                         reused_ready.push(server_name);
@@ -842,6 +860,8 @@ impl McpConnectionSet {
         tool: &str,
         arguments: Option<serde_json::Value>,
         meta: Option<serde_json::Value>,
+        requested_timeout: Option<Duration>,
+        wait_for_server: bool,
     ) -> Result<CallToolResult> {
         let view = self
             .servers
@@ -852,14 +872,32 @@ impl McpConnectionSet {
                 "tool '{tool}' is disabled for MCP server '{server}'"
             ));
         }
-        let client = view
-            .connection
-            .client()
-            .await
-            .context("failed to get client")?;
+        let client = if wait_for_server {
+            view.connection
+                .client()
+                .await
+                .context("failed to get client")?
+        } else {
+            let client = view
+                .connection
+                .client
+                .ready_client()
+                .ok_or_else(|| anyhow!("MCP server '{server}' is not connected"))?;
+            if client.client.is_closed().await {
+                bail!("MCP server '{server}' is not connected");
+            }
+            client
+        };
+
+        let effective_timeout = match (view.tool_timeout, requested_timeout) {
+            (Some(server_timeout), Some(requested_timeout)) => {
+                Some(server_timeout.min(requested_timeout))
+            }
+            (server_timeout, requested_timeout) => server_timeout.or(requested_timeout),
+        };
         let result: rmcp::model::CallToolResult = client
             .client
-            .call_tool(tool.to_string(), arguments, meta, view.tool_timeout)
+            .call_tool(tool.to_string(), arguments, meta, effective_timeout)
             .await
             .with_context(|| format!("tool call failed for `{server}/{tool}`"))?;
 

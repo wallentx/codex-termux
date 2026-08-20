@@ -1,6 +1,5 @@
 #![cfg(not(debug_assertions))]
 
-use crate::history_cell::padded_emoji;
 use crate::key_hint;
 use crate::legacy_core::config::Config;
 use crate::render::Insets;
@@ -49,6 +48,7 @@ pub(crate) async fn run_update_prompt_if_needed(
         frame.render_widget_ref(&screen, frame.area());
     })?;
 
+    tui.discard_pending_input_before_interactive_screen()?;
     let events = tui.event_stream();
     tokio::pin!(events);
 
@@ -192,7 +192,7 @@ impl WidgetRef for &UpdatePromptScreen {
 
         column.push("");
         column.push(Line::from(vec![
-            padded_emoji("  ✨").bold().cyan(),
+            "  ✨\u{200A}".bold().cyan(),
             "Update available!".bold(),
             " ".into(),
             format!(

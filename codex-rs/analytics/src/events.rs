@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use crate::facts::AcceptedLineFingerprint;
 use crate::facts::AppInvocation;
 use crate::facts::ArtifactOperation;
 use crate::facts::ArtifactOperationLifecycle;
@@ -40,6 +39,8 @@ use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -81,6 +82,7 @@ pub(crate) enum TrackEventRequest {
     FileChange(CodexFileChangeEventRequest),
     McpToolCall(CodexMcpToolCallEventRequest),
     DynamicToolCall(CodexDynamicToolCallEventRequest),
+    ControlToolCall(CodexControlToolCallEventRequest),
     CollabAgentToolCall(CodexCollabAgentToolCallEventRequest),
     WebSearch(CodexWebSearchEventRequest),
     ImageGeneration(CodexImageGenerationEventRequest),
@@ -179,7 +181,9 @@ pub(crate) struct CodexAcceptedLineFingerprintsEventParams {
     pub(crate) repo_hash: Option<String>,
     pub(crate) accepted_added_lines: u64,
     pub(crate) accepted_deleted_lines: u64,
-    pub(crate) line_fingerprints: Vec<AcceptedLineFingerprint>,
+    // Analytics ingestion and warehouse schemas require this field on the wire.
+    // Keep it statically empty; line fingerprints are no longer generated.
+    pub(crate) line_fingerprints: [(); 0],
 }
 
 #[derive(Serialize)]
@@ -825,6 +829,19 @@ pub(crate) struct CodexDynamicToolCallEventRequest {
 }
 
 #[derive(Serialize)]
+pub(crate) struct CodexControlToolCallEventParams {
+    #[serde(flatten)]
+    pub(crate) base: CodexToolItemEventBase,
+    pub(crate) success: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexControlToolCallEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexControlToolCallEventParams,
+}
+
+#[derive(Serialize)]
 pub(crate) struct CodexCollabAgentToolCallEventParams {
     #[serde(flatten)]
     pub(crate) base: CodexToolItemEventBase,
@@ -904,6 +921,8 @@ pub(crate) struct CodexHookRunMetadata {
     pub(crate) model_slug: Option<String>,
     pub(crate) hook_name: Option<String>,
     pub(crate) hook_source: Option<&'static str>,
+    pub(crate) handler_type: Option<HookHandlerType>,
+    pub(crate) execution_mode: Option<HookExecutionMode>,
     pub(crate) status: Option<HookRunStatus>,
 }
 
@@ -1358,6 +1377,8 @@ pub(crate) fn codex_hook_run_metadata(
         model_slug: Some(tracking.model_slug.clone()),
         hook_name: Some(analytics_hook_event_name(hook.event_name).to_owned()),
         hook_source: Some(analytics_hook_source(hook.hook_source)),
+        handler_type: Some(hook.handler_type),
+        execution_mode: Some(hook.execution_mode),
         status: Some(analytics_hook_status(hook.status)),
     }
 }

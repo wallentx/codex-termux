@@ -88,6 +88,7 @@ pub struct UnifiedExecRequest {
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct UnifiedExecApprovalKey {
     pub environment_id: String,
+    pub executable: Option<String>,
     pub command: Vec<String>,
     pub cwd: PathUri,
     pub tty: bool,
@@ -168,7 +169,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     ) -> std::io::Result<ApprovalAction> {
         Ok(ApprovalAction::ExecCommand {
             id: call_id.to_string(),
-            environment_id: req.turn_environment.environment_id.clone(),
+            environment_id: req.turn_environment.selection.environment_id.clone(),
             command: req.command.clone(),
             hook_command: req.hook_command.clone(),
             cwd: req.cwd.clone(),
@@ -230,14 +231,14 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 call_id: ctx.call_id.clone(),
                 tool_name: flat_tool_name(&ctx.tool_name).into_owned(),
                 command: req.command.clone(),
-                cwd: req.cwd.to_abs_path().ok()?,
+                cwd: req.cwd.clone(),
                 sandbox_permissions: req.sandbox_permissions,
                 additional_permissions: req.additional_permissions.clone(),
                 justification: req.justification.clone(),
                 tty: Some(req.tty),
             },
             command: req.hook_command.clone(),
-            environment_id: req.turn_environment.environment_id.clone(),
+            environment_id: req.turn_environment.selection.environment_id.clone(),
             permission_profile: req.turn_environment.permission_profile().clone(),
         })
     }
@@ -325,12 +326,12 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 let prepared = network
                     .prepare_for_optional_environment(
                         env,
-                        Some(&req.turn_environment.environment_id),
+                        Some(&req.turn_environment.selection.environment_id),
                     )
                     .map_err(|err| {
                         ToolError::Codex(CodexErr::Io(io::Error::other(format!(
                             "failed to prepare network proxy for environment `{}`: {err}",
-                            req.turn_environment.environment_id
+                            req.turn_environment.selection.environment_id
                         ))))
                     })?;
                 (prepared.env, Some(prepared.sandbox_context), None)
@@ -419,7 +420,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                     command,
                     options,
                     managed_network,
-                    Some(&req.turn_environment.environment_id),
+                    Some(&req.turn_environment.selection.environment_id),
                 )
                 .map_err(ToolError::Codex)?;
             exec_env.exec_server_env_config = req.exec_server_env_config.clone();
@@ -495,7 +496,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 attempt,
                 managed_network,
                 network_proxy_launch,
-                /*environment_id*/ Some(&req.turn_environment.environment_id),
+                /*environment_id*/ Some(&req.turn_environment.selection.environment_id),
                 req.exec_server_env_config.clone(),
                 windows_sandbox_proxy_settings_mode,
                 req.tty,
@@ -514,12 +515,15 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
 mod tests {
     use super::*;
     use crate::config::PermissionProfileSnapshot;
+    use crate::environment_selection::EnvironmentConfigOrigin;
     use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
-    use crate::session::turn_context::TurnEnvironmentConfig;
     use crate::tools::sandboxing::ToolRuntime;
     use codex_exec_server::Environment;
     use codex_exec_server::LOCAL_ENVIRONMENT_ID;
     use codex_protocol::models::PermissionProfile;
+    use codex_protocol::protocol::EnvironmentConfig;
+    use codex_protocol::protocol::EnvironmentConfigState;
+    use codex_protocol::protocol::TurnEnvironmentSelection;
     use codex_tools::ZshForkConfig;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_path_uri::PathUri;
@@ -530,18 +534,25 @@ mod tests {
 
     fn test_turn_environment(cwd: PathUri) -> TurnEnvironment {
         TurnEnvironment::new(
-            LOCAL_ENVIRONMENT_ID.to_string(),
-            Arc::new(Environment::default_for_tests()),
-            cwd,
-            Vec::new(),
-            /*shell*/ None,
-            TurnEnvironmentConfig {
-                allow_login_shell: true,
-                permission_profile: PermissionProfileSnapshot::legacy(
-                    PermissionProfile::read_only(),
-                ),
-                selected_capability_roots: None,
+            TurnEnvironmentSelection {
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                cwd,
+                workspace_roots: Vec::new(),
+                config: EnvironmentConfigState::Ready(EnvironmentConfig {
+                    allow_login_shell: true,
+                    permission_profile: PermissionProfileSnapshot::legacy(
+                        PermissionProfile::read_only(),
+                    ),
+                    shell_environment_policy: Default::default(),
+                    exec_policy: None,
+                    mcp_policy: None,
+                    network_policy: None,
+                    selected_capability_roots: Vec::new(),
+                }),
             },
+            EnvironmentConfigOrigin::Thread,
+            Arc::new(Environment::default_for_tests()),
+            /*shell*/ None,
         )
     }
 
@@ -578,12 +589,12 @@ mod tests {
                 proposed_execpolicy_amendment: None,
             },
         );
-        request.turn_environment.environment_id = "remote".to_string();
+        request.turn_environment.selection.environment_id = "remote".to_string();
         let original_key = runtime
             .approval_action(&request, "call-1")
             .expect("build approval action")
             .cache_keys();
-        request.turn_environment.environment_id = "other".to_string();
+        request.turn_environment.selection.environment_id = "other".to_string();
         let other_key = runtime
             .approval_action(&request, "call-1")
             .expect("build approval action")
