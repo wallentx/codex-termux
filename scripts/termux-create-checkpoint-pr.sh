@@ -99,12 +99,6 @@ resolve_source_version_conflicts() {
 
 enable_checkpoint_automerge() {
   local pr_url="$1"
-  local manual_resolution_required="${2:-false}"
-
-  if [[ "${manual_resolution_required}" == "true" ]]; then
-    echo "Skipping checkpoint auto-merge for ${pr_url}; manual conflict resolution is required."
-    return 0
-  fi
 
   local pr_info
   pr_info="$(
@@ -145,7 +139,7 @@ existing_pr="$(
     --repo "${GITHUB_REPOSITORY}" \
     --head "${checkpoint_branch}" \
     --state all \
-    --json body,number,state,mergedAt,url \
+    --json number,state,mergedAt,url \
     --jq '[.[] | select(.state == "OPEN" or .mergedAt != null)] | .[0] // empty'
 )"
 if [[ -n "${existing_pr}" ]]; then
@@ -153,12 +147,7 @@ if [[ -n "${existing_pr}" ]]; then
   existing_state="$(jq -r '.state' <<< "${existing_pr}")"
   echo "Checkpoint PR already exists for ${checkpoint_branch}: ${existing_url} (${existing_state})."
   if [[ "${existing_state}" == "OPEN" ]]; then
-    existing_body="$(jq -r '.body // ""' <<< "${existing_pr}")"
-    if [[ "${existing_body}" == *"## Merge conflicts"* ]]; then
-      enable_checkpoint_automerge "${existing_url}" true
-    else
-      enable_checkpoint_automerge "${existing_url}" false
-    fi
+    enable_checkpoint_automerge "${existing_url}"
   fi
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "pr_url=${existing_url}" >> "${GITHUB_OUTPUT}"
@@ -294,7 +283,7 @@ body_path="${RUNNER_TEMP}/termux-checkpoint-pr.md"
     echo
     echo "GitHub Actions kept the destination branch versions of the conflicted paths so the PR remains a focused, mergeable checkpoint instead of exposing the entire source branch as a replacement tree."
     echo
-    echo "Review these paths and manually carry over any source-side changes that the destination still needs. Auto-merge is disabled until that review is complete."
+    echo "Destination versions of these paths are retained in the checkpoint. Any source-side changes that are still needed can be carried forward separately."
     echo
     echo "Conflicted paths from the failed merge attempt:"
     if [[ -n "${conflict_summary}" ]]; then
@@ -319,7 +308,7 @@ gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-reviewer "${REVIEWER}
 gh label create checkpoint --repo "${GITHUB_REPOSITORY}" --color c5def5 --description "Checkpoint merge" --force
 gh label create termux-release --repo "${GITHUB_REPOSITORY}" --color 0e8a16 --description "Termux release automation" --force
 gh pr edit "${pr_url}" --repo "${GITHUB_REPOSITORY}" --add-label "checkpoint" --add-label "termux-release"
-enable_checkpoint_automerge "${pr_url}" "${merge_conflicted}"
+enable_checkpoint_automerge "${pr_url}"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "pr_url=${pr_url}" >> "${GITHUB_OUTPUT}"
