@@ -56,6 +56,7 @@ use std::time::Instant;
 
 mod action_required_title;
 mod app_link_view;
+mod apply_patch_header;
 mod approval_overlay;
 mod mcp_server_elicitation;
 mod multi_select_picker;
@@ -156,6 +157,7 @@ mod scroll_state;
 mod selection_popup_common;
 mod selection_row_layout;
 mod selection_tabs;
+mod startup;
 mod textarea;
 mod unified_exec_footer;
 pub(crate) use feedback_view::FeedbackNoteView;
@@ -194,6 +196,7 @@ pub(crate) enum CancellationEvent {
 use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
+pub(crate) use chat_composer::ComposerDraftSnapshot;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::QueuedInputAction;
 pub(crate) use chat_composer_history::HistoryEntry;
@@ -267,6 +270,14 @@ pub(crate) struct BottomPaneParams {
 
 impl BottomPane {
     pub fn new(params: BottomPaneParams) -> Self {
+        Self::new_with_composer_config(params, ChatComposerConfig::default())
+    }
+
+    /// Construct a bottom pane with explicitly restricted composer behavior.
+    pub(crate) fn new_with_composer_config(
+        params: BottomPaneParams,
+        composer_config: ChatComposerConfig,
+    ) -> Self {
         let BottomPaneParams {
             app_event_tx,
             frame_requester,
@@ -277,12 +288,13 @@ impl BottomPane {
             animations_enabled,
             skills,
         } = params;
-        let mut composer = ChatComposer::new(
+        let mut composer = ChatComposer::new_with_config(
             has_input_focus,
             app_event_tx.clone(),
             enhanced_keys_supported,
             placeholder_text,
             disable_paste_burst,
+            composer_config,
         );
         composer.set_frame_requester(frame_requester.clone());
         let keymap = RuntimeKeymap::defaults();
@@ -577,7 +589,7 @@ impl BottomPane {
 
     fn record_composer_activity_at(&mut self, now: Instant) {
         self.last_composer_activity_at = Some(now);
-        if !self.delayed_approval_requests.is_empty()
+        if self.has_pending_approval()
             && let Some(delay) = self.approval_prompt_delay_remaining(now)
         {
             self.request_redraw_in(delay);
@@ -585,7 +597,7 @@ impl BottomPane {
     }
 
     fn maybe_show_delayed_approval_requests_at(&mut self, now: Instant) {
-        if self.delayed_approval_requests.is_empty() || !self.view_stack.is_empty() {
+        if !self.has_pending_approval() || !self.view_stack.is_empty() {
             return;
         }
         if let Some(delay) = self.approval_prompt_delay_remaining(now) {
@@ -882,10 +894,6 @@ impl BottomPane {
     #[cfg(test)]
     pub(crate) fn composer_cursor(&self) -> usize {
         self.composer.cursor()
-    }
-
-    pub(crate) fn composer_draft_snapshot(&self) -> chat_composer::ComposerDraftSnapshot {
-        self.composer.draft_snapshot()
     }
 
     #[cfg(test)]
@@ -1215,6 +1223,21 @@ impl BottomPane {
         popup_consts::standard_popup_hint_line_for_keymap(&self.keymap.list)
     }
 
+    pub(crate) fn replace_view_if_present(
+        &mut self,
+        view_id: &'static str,
+        view: Box<dyn BottomPaneView>,
+    ) {
+        if let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|existing| existing.view_id() == Some(view_id))
+        {
+            self.view_stack[index] = view;
+            self.request_redraw();
+        }
+    }
+
     pub(crate) fn list_keymap(&self) -> crate::keymap::ListKeymap {
         self.keymap.list.clone()
     }
@@ -1357,7 +1380,6 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
-    #[cfg(test)]
     pub(crate) fn composer_is_vim_enabled(&self) -> bool {
         self.composer.is_vim_enabled()
     }
@@ -1376,7 +1398,7 @@ impl BottomPane {
             .lines()
             .next()
             .and_then(parse_slash_name)
-            .is_some_and(|(name, _, _)| name == "agent");
+            .is_some_and(|(name, _, _)| matches!(name, "agents" | "subagents"));
 
         self.keymap.chat.interrupt_turn.is_pressed(key_event)
             && self.is_task_running
@@ -1430,6 +1452,15 @@ impl BottomPane {
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
+    }
+
+    /// Show a text prompt with the composer's current editing preferences.
+    pub(crate) fn show_text_prompt(&mut self, mut view: custom_prompt_view::CustomPromptView) {
+        view.set_keymap_bindings(&self.keymap);
+        if self.composer_is_vim_enabled() {
+            view.enable_vim_in_insert_mode();
+        }
+        self.push_view(Box::new(view));
     }
 
     /// Called when the agent requests user approval.
@@ -1995,7 +2026,7 @@ mod tests {
         }
 
         fn dismiss_app_server_request(&mut self, request: &ResolvedAppServerRequest) -> bool {
-            let ResolvedAppServerRequest::ExecApproval { id } = request else {
+            let ResolvedAppServerRequest::ExecApproval { id, .. } = request else {
                 return false;
             };
             if self.dismiss_exec_id != Some(id.as_str()) {
@@ -2239,10 +2270,13 @@ mod tests {
         let mut pane = test_pane(tx);
         let now = Instant::now();
         pane.last_composer_activity_at = Some(now);
-        pane.push_approval_request(exec_request(), &features);
+        let request = exec_request();
+        let thread_id = request.thread_id();
+        pane.push_approval_request(request, &features);
 
         assert!(
             pane.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: thread_id.to_string(),
                 id: "1".to_string(),
             })
         );
@@ -2271,6 +2305,7 @@ mod tests {
 
         assert!(
             pane.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: "thread-1".to_string(),
                 id: "request-1".to_string(),
             })
         );
@@ -2300,6 +2335,7 @@ mod tests {
 
         assert!(
             !pane.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: "thread-1".to_string(),
                 id: "request-1".to_string(),
             })
         );
@@ -2776,12 +2812,12 @@ mod tests {
 
         pane.set_task_running(/*running*/ true);
 
-        // Repro: `/agent ` hides the popup (cursor past command name). Esc should
+        // Repro: `/subagents ` hides the popup (cursor past command name). Esc should
         // keep editing command text instead of interrupting the running task.
-        pane.insert_str("/agent ");
+        pane.insert_str("/subagents ");
         assert!(
             !pane.composer.popup_active(),
-            "expected command popup to be hidden after entering `/agent `"
+            "expected command popup to be hidden after entering `/subagents `"
         );
 
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -2789,10 +2825,10 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             assert!(
                 !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
-                "expected Esc to not send Op::Interrupt while typing `/agent`"
+                "expected Esc to not send Op::Interrupt while typing `/subagents`"
             );
         }
-        assert_eq!(pane.composer_text(), "/agent ");
+        assert_eq!(pane.composer_text(), "/subagents ");
     }
 
     #[test]
@@ -2877,7 +2913,7 @@ mod tests {
         keymap.chat.interrupt_turn = vec![crate::key_hint::plain(KeyCode::F(12))];
         pane.set_keymap_bindings(&keymap);
         pane.set_task_running(/*running*/ true);
-        pane.insert_str("/agent ");
+        pane.insert_str("/subagents ");
 
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
@@ -2888,7 +2924,7 @@ mod tests {
         pane.handle_key_event(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
         assert!(
             matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Interrupt))),
-            "expected configured key to interrupt while `/agent` is being edited"
+            "expected configured key to interrupt while `/subagents` is being edited"
         );
     }
 

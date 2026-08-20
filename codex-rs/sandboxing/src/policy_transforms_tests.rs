@@ -1,5 +1,6 @@
 use super::effective_file_system_sandbox_policy;
 use super::intersect_permission_profiles;
+use super::materialize_additional_permissions;
 use super::merge_file_system_policy_with_additional_permissions;
 use super::normalize_additional_permissions;
 use super::should_require_platform_sandbox;
@@ -59,7 +60,7 @@ fn root_write_policy_with_carveouts_still_uses_platform_sandbox() {
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: blocked },
+            path: blocked.into(),
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
         },
@@ -228,6 +229,54 @@ fn normalize_additional_permissions_drops_empty_nested_profiles() {
     .expect("permissions");
 
     assert_eq!(permissions, PermissionProfile::default());
+}
+
+#[test]
+fn materialize_additional_permissions_preserves_authority_and_constraints() {
+    use FileSystemAccessMode::Deny;
+    use FileSystemAccessMode::Read;
+    use FileSystemAccessMode::Write;
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let cwd = AbsolutePathBuf::from_absolute_path(
+        canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
+    )
+    .expect("absolute temp dir");
+    let project_path = |subpath: &str| FileSystemPath::Special {
+        value: FileSystemSpecialPath::project_roots(Some(subpath.to_owned())),
+    };
+    let deny_glob = |pattern: String| {
+        FileSystemSandboxEntry::new(FileSystemPath::GlobPattern { pattern }, Deny)
+    };
+    let profile = |entries| PermissionProfile {
+        file_system: Some(FileSystemPermissions {
+            entries,
+            glob_scan_max_depth: std::num::NonZeroUsize::new(/*n*/ 3),
+        }),
+        ..Default::default()
+    };
+    let reopened = FileSystemSandboxEntry::new(cwd.join("private/reopened").into(), Write);
+    let requested = profile(vec![
+        FileSystemSandboxEntry::new(project_path("."), Write),
+        FileSystemSandboxEntry::new(project_path("private"), Deny),
+        FileSystemSandboxEntry::skip_missing_path(project_path("readonly"), Read),
+        FileSystemSandboxEntry::new(project_path("private/reopened"), Write),
+        reopened.clone(),
+        deny_glob("**/*.env".to_owned()),
+    ]);
+    let expected = profile(vec![
+        FileSystemSandboxEntry::new(cwd.clone().into(), Write),
+        FileSystemSandboxEntry::new(cwd.join("private").into(), Deny),
+        FileSystemSandboxEntry::skip_missing_path(cwd.join("readonly").into(), Read),
+        reopened,
+        deny_glob(cwd.join("**/*.env").to_string_lossy().into_owned()),
+    ]);
+
+    assert_eq!(
+        materialize_additional_permissions(requested, cwd.as_path())
+            .expect("materialized permissions"),
+        expected
+    );
 }
 
 #[test]
@@ -433,7 +482,7 @@ fn intersect_permission_profiles_deduplicates_materialized_grants() {
                     missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
-                    path: FileSystemPath::Path { path: cwd.clone() },
+                    path: cwd.clone().into(),
                     access: FileSystemAccessMode::Write,
                     missing_path_behavior: None,
                 },
@@ -496,7 +545,7 @@ fn intersect_permission_profiles_materializes_cwd_deny_entries() {
                         missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
-                        path: FileSystemPath::Path { path: request_cwd },
+                        path: request_cwd.into(),
                         access: FileSystemAccessMode::Deny,
                         missing_path_behavior: None,
                     },
@@ -530,7 +579,7 @@ fn intersect_permission_profiles_drops_deny_entries_without_filesystem_grants() 
                     missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
-                    path: FileSystemPath::Path { path: secret },
+                    path: secret.into(),
                     access: FileSystemAccessMode::Deny,
                     missing_path_behavior: None,
                 },
@@ -633,9 +682,7 @@ fn intersect_permission_profiles_materializes_relative_deny_globs_for_reuse() {
             file_system: Some(FileSystemPermissions {
                 entries: vec![
                     FileSystemSandboxEntry {
-                        path: FileSystemPath::Path {
-                            path: request_cwd.clone(),
-                        },
+                        path: request_cwd.clone().into(),
                         access: FileSystemAccessMode::Write,
                         missing_path_behavior: None,
                     },
@@ -838,9 +885,7 @@ fn merge_file_system_policy_with_additional_permissions_preserves_unreadable_roo
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: denied_path.clone(),
-                },
+                path: denied_path.clone().into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
@@ -853,7 +898,7 @@ fn merge_file_system_policy_with_additional_permissions_preserves_unreadable_roo
 
     assert_eq!(
         merged_policy.entries.contains(&FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: denied_path },
+            path: denied_path.into(),
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
         }),
@@ -861,7 +906,7 @@ fn merge_file_system_policy_with_additional_permissions_preserves_unreadable_roo
     );
     assert_eq!(
         merged_policy.entries.contains(&FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: allowed_path },
+            path: allowed_path.into(),
             access: FileSystemAccessMode::Read,
             missing_path_behavior: None,
         }),
@@ -925,7 +970,7 @@ fn effective_file_system_sandbox_policy_returns_base_policy_without_additional_p
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: denied_path },
+            path: denied_path.into(),
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
         },
@@ -955,9 +1000,7 @@ fn effective_file_system_sandbox_policy_merges_additional_write_roots() {
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: denied_path.clone(),
-            },
+            path: denied_path.clone().into(),
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
         },
@@ -975,7 +1018,7 @@ fn effective_file_system_sandbox_policy_merges_additional_write_roots() {
 
     assert_eq!(
         effective_policy.entries.contains(&FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: denied_path },
+            path: denied_path.into(),
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
         }),
@@ -983,7 +1026,7 @@ fn effective_file_system_sandbox_policy_merges_additional_write_roots() {
     );
     assert_eq!(
         effective_policy.entries.contains(&FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: allowed_path },
+            path: allowed_path.into(),
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         }),

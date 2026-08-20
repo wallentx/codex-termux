@@ -36,8 +36,10 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -69,6 +71,7 @@ use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use test_case::test_case;
 use tokio::time::Duration;
 use wiremock::ResponseTemplate;
 
@@ -216,6 +219,14 @@ fn compacted_summary_only_output(summary: &str) -> Vec<ResponseItem> {
 fn test_codex() -> TestCodexBuilder {
     base_test_codex().with_config(|config| {
         let _ = config.features.disable(Feature::RemoteCompactionV2);
+    })
+}
+
+fn unrestricted_user_turn(items: Vec<UserInput>) -> TurnInputRequest {
+    TurnInputRequest::user_input(items).with_thread_settings(ThreadSettingsOverrides {
+        approval_policy: Some(AskForApproval::Never),
+        permission_profile: Some(PermissionProfile::Disabled),
+        ..Default::default()
     })
 }
 
@@ -567,6 +578,102 @@ async fn remote_compact_v2_retains_metadata_from_resumed_history() -> Result<()>
     );
     assert_compact_request_omits_harness_metadata(compact_request);
     assert_compacted_user_metadata(&rollout_path, retained_text)?;
+
+    Ok(())
+}
+
+#[test_case(false; "feature_disabled")]
+#[test_case(true; "feature_enabled")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_v2_retains_only_client_developer_messages_when_enabled(
+    enabled: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_auto_env_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(move |config| {
+                config
+                    .features
+                    .enable(Feature::RemoteCompactionV2)
+                    .expect("remote compaction v2 should be configurable");
+                if enabled {
+                    config
+                        .features
+                        .enable(Feature::RetainClientDeveloperMessages)
+                        .expect("client developer retention should be configurable");
+                }
+            }),
+    )
+    .await?;
+    let developer = |text: &str| ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let codex = &harness.test().codex;
+    let rollout_path = codex.rollout_path().context("rollout path")?;
+    codex
+        .inject_response_items(vec![developer("INJECTED_CLIENT_DEVELOPER")])
+        .await?;
+    let response_mock = responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![responses::ev_completed("before-compact")]),
+            sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "CLIENT_RETENTION_SUMMARY",
+                    },
+                }),
+                responses::ev_completed("compact"),
+            ]),
+            sse(vec![responses::ev_completed("after-compact")]),
+        ],
+    )
+    .await;
+
+    harness.test().submit_turn("before compact").await?;
+    codex.submit(Op::Compact).await?;
+    wait_for_turn_complete(codex).await;
+    harness.test().submit_turn("after compact").await?;
+
+    let requests = response_mock.requests();
+    let follow_up = requests.last().context("follow-up request")?;
+    assert_eq!(
+        follow_up.body_contains_text("INJECTED_CLIENT_DEVELOPER"),
+        enabled
+    );
+    requests
+        .iter()
+        .for_each(assert_compact_request_omits_harness_metadata);
+
+    codex.shutdown_and_wait().await?;
+    let replacement_history = fs::read_to_string(&rollout_path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| match line.item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history,
+            _ => None,
+        })
+        .next_back()
+        .context("remote compaction should persist a checkpoint")?;
+    let retained_client_developers = replacement_history
+        .iter()
+        .filter(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.client_authored)
+        })
+        .count();
+    assert_eq!(retained_client_developers, usize::from(enabled));
 
     Ok(())
 }
@@ -999,7 +1106,7 @@ async fn assert_remote_manual_compact_request_parity(
     .await;
 
     codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+        .start_or_steer_turn(unrestricted_user_turn(vec![UserInput::Text {
             text: "TURN_ONE_USER".to_string(),
             text_elements: Vec::new(),
         }]))
@@ -1259,6 +1366,10 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
                 responses::ev_completed("resp-agent"),
             ]),
             responses::sse(vec![
+                responses::ev_assistant_message("m-descendant", "DESCENDANT_FOLLOWUP_REPLY"),
+                responses::ev_completed("resp-descendant"),
+            ]),
+            responses::sse(vec![
                 serde_json::json!({
                     "type": "response.output_item.done",
                     "item": {
@@ -1290,6 +1401,18 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
                 AgentPath::root().join("child").expect("valid child path"),
                 AgentPath::root(),
                 Vec::new(),
+                "Message Type: MESSAGE\nTask name: /root\nSender: /root/child\nPayload:\nchild progress"
+                    .to_string(),
+                /*trigger_turn*/ false,
+            ),
+        })
+        .await?;
+    codex
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root().join("child").expect("valid child path"),
+                AgentPath::root(),
+                Vec::new(),
                 "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/child\nPayload:\nchild completion".to_string(),
                 /*trigger_turn*/ false,
             ),
@@ -1309,6 +1432,21 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         .await?;
     wait_for_turn_complete(&codex).await;
 
+    let descendant_followup_ciphertext = "descendant follow-up task";
+    let worker_path = AgentPath::root().join("worker").expect("valid worker path");
+    codex
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new_encrypted(
+                worker_path.join("child").expect("valid grandchild path"),
+                worker_path,
+                Vec::new(),
+                descendant_followup_ciphertext.to_string(),
+                /*trigger_turn*/ true,
+            ),
+        })
+        .await?;
+    wait_for_turn_complete(&codex).await;
+
     codex.submit(Op::Compact).await?;
     wait_for_turn_complete(&codex).await;
 
@@ -1321,7 +1459,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
     wait_for_turn_complete(&codex).await;
 
     let response_requests = responses_mock.requests();
-    let compact_request = &response_requests[2];
+    let compact_request = &response_requests[3];
     let item_create_time = |request: &responses::ResponsesRequest, text: &str| {
         request
             .input()
@@ -1350,6 +1488,21 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
             .any(|item| item["content"][1]["encrypted_content"].as_str()
                 == Some(delegated_task_ciphertext.as_str())),
         "expected v2 compaction input to include the encrypted delegated task"
+    );
+    assert!(
+        compact_request
+            .inputs_of_type("agent_message")
+            .iter()
+            .any(|item| item["content"][1]["encrypted_content"].as_str()
+                == Some(descendant_followup_ciphertext)),
+        "expected v2 compaction input to include the descendant-authored follow-up task"
+    );
+    assert!(
+        compact_request
+            .inputs_of_type("agent_message")
+            .iter()
+            .any(|item| item.to_string().contains("child progress")),
+        "expected v2 compaction input to include the child progress update"
     );
     assert!(
         compact_request
@@ -1427,6 +1580,21 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
             .any(|item| item["content"][1]["encrypted_content"].as_str()
                 == Some(delegated_task_ciphertext.as_str())),
         "expected v2 follow-up request to retain the encrypted delegated task"
+    );
+    assert!(
+        follow_up_request
+            .inputs_of_type("agent_message")
+            .iter()
+            .any(|item| item["content"][1]["encrypted_content"].as_str()
+                == Some(descendant_followup_ciphertext)),
+        "expected v2 follow-up request to retain the descendant-authored follow-up task"
+    );
+    assert!(
+        follow_up_request
+            .inputs_of_type("agent_message")
+            .iter()
+            .all(|item| !item.to_string().contains("child progress")),
+        "expected v2 follow-up request to omit the child progress update"
     );
     assert!(
         follow_up_request
@@ -1887,7 +2055,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     .await;
 
     codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+        .start_or_steer_turn(unrestricted_user_turn(vec![UserInput::Text {
             text: "hello remote compact".into(),
             text_elements: Vec::new(),
         }]))
@@ -4406,7 +4574,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
     .await;
 
     codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+        .start_or_steer_turn(unrestricted_user_turn(vec![UserInput::Text {
             text: "USER_ONE".to_string(),
             text_elements: Vec::new(),
         }]))

@@ -1,13 +1,13 @@
 use super::*;
 use crate::config::ConfigBuilder;
 use crate::config::ManagedFeatures;
+use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::TurnEnvironmentState;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::tests::mcp_config_for_test;
 use crate::session::turn_context::TurnEnvironment;
-use crate::session::turn_context::TurnEnvironmentConfig;
 use crate::state::ActiveTurn;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::hook_names::HookToolName;
@@ -26,9 +26,12 @@ use codex_hooks::HooksConfig;
 use codex_model_provider::create_model_provider;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::McpInvocation;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_utils_path_uri::PathUri;
 use core_test_support::hooks::trusted_config_layer_stack;
 use core_test_support::responses::ev_assistant_message;
@@ -85,9 +88,7 @@ fn approval_metadata(
 }
 
 fn approval_config(turn_context: &TurnContext) -> codex_mcp::McpConfig {
-    let mut config = (*mcp_config_for_test(&turn_context.config)).clone();
-    config.permission_profile = turn_context.permission_profile();
-    config
+    (*mcp_config_for_test(&turn_context.config)).clone()
 }
 
 fn mcp_turn_metadata_context(turn_context: &TurnContext) -> McpTurnMetadataContext<'_> {
@@ -1106,20 +1107,27 @@ async fn mcp_sandbox_cwd_uses_matching_server_environment_uri() -> anyhow::Resul
         .environments
         .environments
         .push(TurnEnvironmentState::Ready(TurnEnvironment::new(
-            "remote".to_string(),
-            environment,
-            secondary_cwd.clone(),
-            Vec::new(),
-            /*shell*/ None,
-            TurnEnvironmentConfig {
-                allow_login_shell: true,
-                permission_profile: turn_context
-                    .config
-                    .permissions
-                    .permission_profile_state()
-                    .snapshot(),
-                selected_capability_roots: None,
+            TurnEnvironmentSelection {
+                environment_id: "remote".to_string(),
+                cwd: secondary_cwd.clone(),
+                workspace_roots: Vec::new(),
+                config: EnvironmentConfigState::Ready(EnvironmentConfig {
+                    allow_login_shell: true,
+                    permission_profile: turn_context
+                        .config
+                        .permissions
+                        .permission_profile_state()
+                        .snapshot(),
+                    shell_environment_policy: Default::default(),
+                    exec_policy: None,
+                    mcp_policy: None,
+                    network_policy: None,
+                    selected_capability_roots: Vec::new(),
+                }),
             },
+            EnvironmentConfigOrigin::Thread,
+            environment,
+            /*shell*/ None,
         )));
 
     let step_context = StepContext::for_test(Arc::new(turn_context));
@@ -2625,7 +2633,7 @@ async fn permission_request_hook_runs_after_remembered_mcp_approval() {
 }
 
 #[tokio::test]
-async fn guardian_mode_mcp_denial_uses_captured_policy_and_returns_rationale_message() {
+async fn strict_auto_review_forces_guardian_for_mcp_policy_skip() {
     let server = start_mock_server().await;
     let guardian_request_log = mount_sse_once(
         &server,
@@ -2654,7 +2662,7 @@ async fn guardian_mode_mcp_denial_uses_captured_policy_and_returns_rationale_mes
         .expect("test setup should allow updating approval policy");
     let mut config = (*turn_context.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    config.approvals_reviewer = ApprovalsReviewer::User;
     let config = Arc::new(config);
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -2668,6 +2676,13 @@ async fn guardian_mode_mcp_denial_uses_captured_policy_and_returns_rationale_mes
         turn_context.auth_manager.clone(),
     );
 
+    let active_turn = ActiveTurn::default();
+    active_turn
+        .turn_state
+        .lock()
+        .await
+        .enable_strict_auto_review();
+    *session.active_turn.lock().await = Some(active_turn);
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
     let invocation = McpInvocation {
@@ -2704,7 +2719,7 @@ async fn guardian_mode_mcp_denial_uses_captured_policy_and_returns_rationale_mes
         &HookToolName::new("mcp__test__tool"),
         &metadata,
         &captured_mcp_config,
-        McpToolApprovalPolicy::for_server(AppToolApproval::Auto),
+        McpToolApprovalPolicy::for_server(AppToolApproval::Approve),
     )
     .await;
 

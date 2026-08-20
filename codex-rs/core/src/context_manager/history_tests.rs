@@ -309,6 +309,7 @@ fn reference_context_item() -> TurnContextItem {
         approvals_reviewer: None,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: "gpt-test".to_string(),
@@ -1202,6 +1203,7 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
             "{ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG}\nROLLED_BACK_ENVIRONMENT_INSTRUCTIONS"
         )),
         developer_msg("<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>"),
+        developer_msg("<multi_agent_role>ROLLED_BACK_MULTI_AGENT_ROLE</multi_agent_role>"),
         developer_msg("<multi_agent_mode>ROLLED_BACK_MULTI_AGENT_MODE</multi_agent_mode>"),
         user_input_text_msg(
             "<environment_context><cwd>PRETURN_CONTEXT_DIFF_CWD</cwd></environment_context>",

@@ -1,15 +1,23 @@
+use codex_core::EnvironmentConfig;
+use codex_core::EnvironmentMcpPolicy;
 use codex_core::TurnInputRequest;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::McpServerConfig;
+use codex_config::McpServerOAuthConfig;
 use codex_config::McpServerTransportConfig;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
+use codex_protocol::mcp_policy::McpServerIdentity;
+use codex_protocol::mcp_policy::McpServerRequirement;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
@@ -25,7 +33,9 @@ use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use tokio::net::TcpListener;
 use tokio::process::Command;
+use url::Url;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -33,11 +43,15 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const PROXY_TEST_SUBPROCESS_ENV_VAR: &str = "CODEX_MCP_HTTP_PROXY_TEST_SUBPROCESS";
+const SKILL_CALLBACK_PORT_ENV_VAR: &str = "CODEX_MCP_SKILL_CALLBACK_PORT";
+const SKILL_GLOBAL_CALLBACK_PORT_ENV_VAR: &str = "CODEX_MCP_SKILL_GLOBAL_CALLBACK_PORT";
 const TEST_NAME: &str = "suite::mcp_startup_refresh_http_proxy::local_mcp_startup_and_refresh_use_configured_http_client";
 const SKILL_TEST_NAME: &str =
     "suite::mcp_startup_refresh_http_proxy::skill_mcp_dependency_oauth_uses_configured_http_client";
 const SERVER_NAME: &str = "proxied_mcp";
 const SERVER_URL: &str = "http://mcp-proxy.invalid/api/codex/ps/mcp";
+const DENIED_SERVER_NAME: &str = "denied_mcp";
+const DENIED_SERVER_URL: &str = "http://mcp-proxy.invalid/denied-mcp";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_mcp_startup_and_refresh_use_configured_http_client() -> Result<()> {
@@ -215,6 +229,12 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
             .mount(&proxy)
             .await;
 
+        let skill_callback_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let skill_callback_port = skill_callback_listener.local_addr()?.port();
+        let global_callback_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let global_callback_port = global_callback_listener.local_addr()?.port();
+        drop(skill_callback_listener);
+
         let mut command = Command::new(std::env::current_exe()?);
         command.arg("--exact").arg(SKILL_TEST_NAME);
         for &key in codex_network_proxy::PROXY_ENV_KEYS {
@@ -222,6 +242,11 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
         }
         command
             .env(PROXY_TEST_SUBPROCESS_ENV_VAR, "1")
+            .env(SKILL_CALLBACK_PORT_ENV_VAR, skill_callback_port.to_string())
+            .env(
+                SKILL_GLOBAL_CALLBACK_PORT_ENV_VAR,
+                global_callback_port.to_string(),
+            )
             .env("HTTP_PROXY", proxy.uri())
             .env("http_proxy", proxy.uri())
             .env("NO_PROXY", codex_network_proxy::DEFAULT_NO_PROXY_VALUE)
@@ -238,22 +263,42 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert!(
-            requests.iter().any(|request| {
+        let registration_request = requests
+            .iter()
+            .find(|request| {
                 request.method == "POST" && request.url.path() == "/oauth/register"
-            }),
-            "skill dependency OAuth registration should use the configured proxy: {requests:#?}"
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "skill dependency OAuth registration should use the configured proxy: {requests:#?}"
+                )
+            });
+        let registration: Value = serde_json::from_slice(&registration_request.body)?;
+        let redirect_uri = Url::parse(
+            registration["redirect_uris"][0]
+                .as_str()
+                .expect("OAuth client registration redirect URI"),
+        )?;
+        assert_eq!(redirect_uri.port(), Some(skill_callback_port));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/denied-mcp"),
+            "denied skill dependency must not perform OAuth discovery: {requests:#?}"
         );
         return Ok(());
     }
 
+    let skill_callback_port = std::env::var(SKILL_CALLBACK_PORT_ENV_VAR)?.parse::<u16>()?;
+    let global_callback_port = std::env::var(SKILL_GLOBAL_CALLBACK_PORT_ENV_VAR)?.parse::<u16>()?;
     let responses_server = responses::start_mock_server().await;
     let mut builder = test_codex()
-        .with_config(|config| {
+        .with_config(move |config| {
             config
                 .features
                 .enable(Feature::SkillMcpDependencyInstall)
                 .expect("test config should allow skill MCP dependency installation");
+            config.mcp_oauth_callback_port = Some(global_callback_port);
             if cfg!(target_os = "linux") {
                 config
                     .features
@@ -262,28 +307,28 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
                 config.respect_system_proxy = true;
             }
         })
-        .with_workspace_setup(|cwd, fs| async move {
+        .with_workspace_setup(move |cwd, fs| async move {
             let skill_dir = cwd.join(".agents/skills/proxy-skill");
             let agents_dir = skill_dir.join("agents");
             fs.create_directory(
                 &PathUri::from_host_native_path(&agents_dir)?,
-                CreateDirectoryOptions { recursive: true },
+                CreateDirectoryOptions { recursive: true, follow_symlinks: true },
                 /*sandbox*/ None,
             )
             .await?;
             fs.write_file(
                 &PathUri::from_host_native_path(skill_dir.join("SKILL.md"))?,
                 b"---\nname: proxy-skill\ndescription: Uses a proxied MCP server.\n---\n".to_vec(),
-                /*sandbox*/ None,
+                Default::default(), /*sandbox*/ None,
             )
             .await?;
             let metadata = format!(
-                "dependencies:\n  tools:\n    - type: mcp\n      value: {SERVER_NAME}\n      transport: streamable_http\n      url: {SERVER_URL}\n"
+                "dependencies:\n  tools:\n    - type: mcp\n      value: {SERVER_NAME}\n      transport: streamable_http\n      url: {SERVER_URL}\n      oauth:\n        callbackPort: {skill_callback_port}\n    - type: mcp\n      value: {DENIED_SERVER_NAME}\n      transport: streamable_http\n      url: {DENIED_SERVER_URL}\n"
             );
             fs.write_file(
                 &PathUri::from_host_native_path(agents_dir.join("openai.yaml"))?,
                 metadata.into_bytes(),
-                /*sandbox*/ None,
+                Default::default(), /*sandbox*/ None,
             )
             .await?;
             Ok(())
@@ -312,6 +357,26 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
         });
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, fixture.config.cwd.as_path());
+    let mut environments = local_selections(fixture.config.cwd.clone());
+    environments.environments[0].config = EnvironmentConfigState::Ready(EnvironmentConfig {
+        allow_login_shell: fixture.config.permissions.allow_login_shell,
+        permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
+        shell_environment_policy: Default::default(),
+        exec_policy: None,
+        mcp_policy: Some(EnvironmentMcpPolicy {
+            servers: Some(BTreeMap::from([(
+                SERVER_NAME.to_string(),
+                McpServerRequirement::Identity {
+                    identity: McpServerIdentity::Url {
+                        url: SERVER_URL.to_string(),
+                    },
+                },
+            )])),
+            plugins: None,
+        }),
+        network_policy: None,
+        selected_capability_roots: Vec::new(),
+    });
     fixture
         .codex
         .start_or_steer_turn(
@@ -326,7 +391,7 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
                 },
             ])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(fixture.config.cwd.clone())),
+                environments: Some(environments),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -340,6 +405,15 @@ async fn skill_mcp_dependency_oauth_uses_configured_http_client() -> Result<()> 
     .await;
 
     let servers = codex_config::load_global_mcp_servers(&fixture.config.codex_home).await?;
-    assert!(servers.contains_key(SERVER_NAME));
+    assert_eq!(
+        servers
+            .get(SERVER_NAME)
+            .and_then(|server| server.oauth.as_ref()),
+        Some(&McpServerOAuthConfig {
+            client_id: None,
+            callback_port: Some(skill_callback_port),
+        })
+    );
+    assert!(!servers.contains_key(DENIED_SERVER_NAME));
     Ok(())
 }

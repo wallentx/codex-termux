@@ -1,5 +1,6 @@
 use super::*;
 use crate::extensions::send_thread_warning;
+use codex_app_server_protocol::ThreadQueueChangedNotification;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::config_types::MultiAgentMode;
 
@@ -16,6 +17,7 @@ pub(super) struct ListenerTaskContext {
     pub(super) fallback_model_provider: String,
     pub(super) codex_home: PathBuf,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+    pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
 }
 
 struct UnloadingState {
@@ -273,6 +275,7 @@ pub(super) async fn ensure_listener_task_running(
         thread_list_state_permit,
         fallback_model_provider,
         codex_home,
+        turn_cost_worker,
         ..
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
@@ -309,6 +312,12 @@ pub(super) async fn ensure_listener_task_running(
                             break;
                         }
                     };
+
+                    if let Some(worker) = &turn_cost_worker {
+                        worker.observe_event(conversation_id, &event, || {
+                            conversation.session_telemetry()
+                        });
+                    }
 
                     // Track the event before emitting any typed translations
                     // so thread-local state such as raw event opt-in stays
@@ -497,6 +506,23 @@ pub(super) async fn handle_thread_listener_command(
                         thread_id: conversation_id.to_string(),
                         turn_id,
                         goal,
+                    },
+                ))
+                .await;
+        }
+        ThreadListenerCommand::EmitThreadQueueChanged => {
+            let subscribed_connection_ids = thread_state_manager
+                .subscribed_connection_ids(conversation_id)
+                .await;
+            let outgoing = ThreadScopedOutgoingMessageSender::new(
+                Arc::clone(outgoing),
+                subscribed_connection_ids,
+                conversation_id,
+            );
+            outgoing
+                .send_server_notification(ServerNotification::ThreadQueueChanged(
+                    ThreadQueueChangedNotification {
+                        thread_id: conversation_id.to_string(),
                     },
                 ))
                 .await;

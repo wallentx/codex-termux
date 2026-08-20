@@ -223,7 +223,27 @@ pub(crate) async fn run_turn(
     // Keep the exact model-visible state used by this turn and its inline compactions.
     let (world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
-        turn_diff_display_roots(first_step_context.as_ref()),
+        async {
+            if first_step_context
+                .turn
+                .config
+                .features
+                .enabled(Feature::CwdRelativeTurnDiffs)
+            {
+                first_step_context
+                    .environments
+                    .turn_environments()
+                    .map(|environment| {
+                        (
+                            environment.selection().environment_id,
+                            environment.cwd().clone(),
+                        )
+                    })
+                    .collect()
+            } else {
+                turn_diff_display_roots(first_step_context.as_ref()).await
+            }
+        },
     );
     let mut world_state = world_state?;
 
@@ -350,7 +370,7 @@ pub(crate) async fn run_turn(
             let sampling_request_input: Vec<ResponseItem> = async {
                 sess.clone_history()
                     .await
-                    .for_prompt(&turn_context.model_info.input_modalities)
+                    .for_prompt(&step_context.model_info.input_modalities)
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
@@ -588,7 +608,7 @@ async fn turn_diff_display_roots(step_context: &StepContext) -> Vec<(String, Pat
         .ok()
         .flatten()
         .unwrap_or_else(|| cwd.clone());
-        display_roots.push((turn_environment.environment_id.clone(), root));
+        display_roots.push((turn_environment.selection.environment_id.clone(), root));
     }
     display_roots
 }
@@ -897,7 +917,7 @@ async fn build_extension_turn_input_items(
         .turn_environments()
         .enumerate()
         .map(|(index, environment)| TurnInputEnvironment {
-            environment_id: environment.environment_id.clone(),
+            environment_id: environment.selection.environment_id.clone(),
             cwd: environment.cwd().clone(),
             is_primary: index == 0,
         })
@@ -1293,14 +1313,14 @@ pub(super) fn collect_explicit_app_ids_from_skill_items(
 #[instrument(level = "trace", skip_all)]
 pub(crate) fn build_prompt(
     input: Vec<ResponseItem>,
-    router: &ToolRouter,
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
+    let turn_context = &step_context.turn;
     Prompt {
         input,
-        tools: router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+        tools: step_context.tool_router.model_visible_specs(),
+        parallel_tool_calls: true,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
         output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
@@ -1315,7 +1335,7 @@ pub(crate) fn build_prompt(
     skip_all,
     fields(
         turn_id = %step_context.turn.sub_id,
-        model = %step_context.turn.model_info.slug,
+        model = %step_context.model_info.slug,
         cwd = %step_context.turn.cwd.display()
     )
 )]
@@ -1330,8 +1350,6 @@ async fn run_sampling_request(
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
-    let router = Arc::clone(&step_context.tool_router);
-
     let base_instructions = sess.get_base_instructions().await;
 
     let tool_runtime = ToolCallRuntime::new(
@@ -1355,7 +1373,7 @@ async fn run_sampling_request(
         } else {
             sess.clone_history()
                 .await
-                .for_prompt(&turn_context.model_info.input_modalities)
+                .for_prompt(&step_context.model_info.input_modalities)
         };
         let mut prompt_input = prompt_input;
         if let Some(executed_tool_calls) = sess.services.executed_tool_calls.as_ref()
@@ -1366,14 +1384,13 @@ async fn run_sampling_request(
         }
         let prompt = build_prompt(
             prompt_input,
-            router.as_ref(),
-            turn_context.as_ref(),
+            step_context.as_ref(),
             base_instructions.clone(),
         );
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
-            Arc::clone(&turn_context),
+            Arc::clone(&step_context),
             Arc::clone(&turn_store),
             client_session,
             responses_metadata,
@@ -1739,6 +1756,23 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
             TurnItem::AgentMessage(item) => Some((agent_message_text(item), item.phase.clone())),
             _ => None,
         },
+        EventMsg::ExecApprovalRequest(_)
+        | EventMsg::RequestPermissions(_)
+        | EventMsg::ApplyPatchApprovalRequest(_)
+        | EventMsg::RequestUserInput(_)
+        | EventMsg::ElicitationRequest(_) => {
+            let message = if matches!(
+                msg,
+                EventMsg::RequestUserInput(_) | EventMsg::ElicitationRequest(_)
+            ) {
+                "I need your input. Please respond in the app."
+            } else {
+                "I need your approval to continue. Please review the request in the app."
+            };
+            serde_json::to_string(msg)
+                .ok()
+                .map(|request| (format!("{message}\n\n{request}"), None))
+        }
         EventMsg::Error(_)
         | EventMsg::Warning(_)
         | EventMsg::GuardianWarning(_)
@@ -1781,14 +1815,9 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::ImageGenerationBegin(_)
         | EventMsg::ImageGenerationEnd(_)
         | EventMsg::ViewImageToolCall(_)
-        | EventMsg::ExecApprovalRequest(_)
-        | EventMsg::RequestPermissions(_)
-        | EventMsg::RequestUserInput(_)
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)
         | EventMsg::GuardianAssessment(_)
-        | EventMsg::ElicitationRequest(_)
-        | EventMsg::ApplyPatchApprovalRequest(_)
         | EventMsg::DeprecationNotice(_)
         | EventMsg::StreamError(_)
         | EventMsg::TurnDiff(_)
@@ -2011,6 +2040,7 @@ async fn emit_agent_message_in_plan_mode(
                     content: Vec::new(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 })
             });
         sess.emit_turn_item_started(turn_context, &start_item).await;
@@ -2144,14 +2174,14 @@ fn assign_missing_streamed_response_item_id(
 #[instrument(level = "trace",
     skip_all,
     fields(
-        turn_id = %turn_context.sub_id,
-        model = %turn_context.model_info.slug
+        turn_id = %step_context.turn.sub_id,
+        model = %step_context.model_info.slug
     )
 )]
 async fn try_run_sampling_request(
     tool_runtime: ToolCallRuntime,
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
     turn_store: Arc<codex_extension_api::ExtensionData>,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
@@ -2159,17 +2189,18 @@ async fn try_run_sampling_request(
     prompt: &Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
+    let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
-        model = turn_context.model_info.slug.clone(),
+        model = step_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy(),
         sandbox_policy = &turn_context.sandbox_policy(),
-        effort = turn_context.reasoning_effort,
+        effort = step_context.reasoning_effort,
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
     let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
         turn_context.sub_id.as_str(),
-        turn_context.model_info.slug.as_str(),
+        step_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
@@ -2181,11 +2212,11 @@ async fn try_run_sampling_request(
     let mut stream = client_session
         .stream(
             prompt,
-            &turn_context.model_info,
-            &turn_context.session_telemetry,
-            turn_context.reasoning_effort.clone(),
-            turn_context.reasoning_summary,
-            turn_context.config.service_tier.clone(),
+            &step_context.model_info,
+            &step_context.session_telemetry,
+            step_context.reasoning_effort.clone(),
+            step_context.reasoning_summary,
+            step_context.service_tier.clone(),
             responses_metadata,
             &inference_trace,
         )
@@ -2205,7 +2236,12 @@ async fn try_run_sampling_request(
     let mut should_emit_token_count = false;
     const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
     let mut analytics_tool_call_ids = Vec::new();
-    let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
+    let reasoning_effort = step_context
+        .reasoning_effort
+        .clone()
+        .or_else(|| step_context.model_info.default_reasoning_level.clone())
+        .map(|effort| effort.to_string())
+        .unwrap_or_else(|| "default".to_string());
     let plan_mode = turn_context.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));

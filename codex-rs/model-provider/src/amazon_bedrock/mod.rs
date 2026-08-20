@@ -1,7 +1,10 @@
 mod auth;
+mod auth_refresh;
 mod catalog;
 mod error;
 mod mantle;
+mod runtime;
+mod runtime_catalog;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,10 +12,14 @@ use std::sync::Arc;
 use codex_api::ApiError;
 use codex_api::Provider;
 use codex_api::SharedAuthProvider;
+use codex_api::TransportError;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth::BedrockApiKeyAuth;
-use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_LUNA_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_TERRA_MODEL_ID;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::SharedModelsManager;
@@ -29,19 +36,32 @@ use crate::provider::ModelProviderFuture;
 use crate::provider::ProviderAccountResult;
 use crate::provider::ProviderAccountState;
 use crate::provider::ProviderCapabilities;
+use crate::provider::ProviderUnauthorizedRecovery;
 use crate::provider::RemoteCompactionSupport;
+use crate::shared_state::process_shared_state;
 use auth::resolve_provider_auth as resolve_bedrock_provider_auth;
+pub(crate) use auth_refresh::AwsAuthRecovery;
 use catalog::normalize_bedrock_catalog;
 pub(crate) use catalog::static_model_catalog;
 use mantle::bedrock_mantle_runtime_base_url;
 pub use mantle::is_supported_amazon_bedrock_region;
+use runtime::bedrock_runtime_base_url;
+use runtime_catalog::static_runtime_model_catalog;
 
-/// Runtime provider for Amazon Bedrock's OpenAI-compatible Mantle endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BedrockEndpoint {
+    Mantle,
+    Runtime,
+}
+
+/// Runtime provider for Amazon Bedrock's OpenAI-compatible endpoints.
 #[derive(Clone, Debug)]
 pub(crate) struct AmazonBedrockModelProvider {
     pub(crate) info: ModelProviderInfo,
-    pub(crate) aws: ModelProviderAwsAuthInfo,
+    aws: ModelProviderAwsAuthInfo,
+    endpoint: BedrockEndpoint,
     auth_manager: Option<Arc<AuthManager>>,
+    auth_recovery: Option<Arc<AwsAuthRecovery>>,
 }
 
 impl AmazonBedrockModelProvider {
@@ -49,18 +69,34 @@ impl AmazonBedrockModelProvider {
         provider_info: ModelProviderInfo,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
-        let auth_manager = auth_manager_for_provider(auth_manager, &provider_info);
+        let endpoint = if provider_info.is_amazon_bedrock_runtime() {
+            BedrockEndpoint::Runtime
+        } else {
+            BedrockEndpoint::Mantle
+        };
         let aws = provider_info
             .aws
             .clone()
             .unwrap_or(ModelProviderAwsAuthInfo {
                 profile: None,
                 region: None,
+                auth_refresh: None,
             });
+        let uses_aws_sdk_auth =
+            auth::auth_source(&provider_info, auth_manager.as_deref(), std::env::var)
+                == auth::BedrockAuthSource::AwsSdk;
+        let auth_recovery = if uses_aws_sdk_auth && aws.auth_refresh.is_some() {
+            process_shared_state().aws_auth_recovery(&aws)
+        } else {
+            None
+        };
+        let auth_manager = auth_manager_for_provider(auth_manager, &provider_info);
         Self {
             info: provider_info,
             aws,
+            endpoint,
             auth_manager,
+            auth_recovery,
         }
     }
 
@@ -77,6 +113,12 @@ impl AmazonBedrockModelProvider {
                 | CodexAuth::AgentIdentity(_)
                 | CodexAuth::PersonalAccessToken(_) => None,
             })
+    }
+
+    fn uses_aws_auth_recovery(&self) -> bool {
+        self.auth_recovery.is_some()
+            && auth::auth_source(&self.info, self.auth_manager.as_deref(), std::env::var)
+                == auth::BedrockAuthSource::AwsSdk
     }
 
     async fn auth(&self) -> Option<CodexAuth> {
@@ -101,9 +143,15 @@ impl AmazonBedrockModelProvider {
             return Ok(Some(base_url));
         }
         let managed_auth = self.managed_auth();
-        Ok(Some(
-            bedrock_mantle_runtime_base_url(managed_auth.as_ref(), &self.aws).await?,
-        ))
+        let base_url = match self.endpoint {
+            BedrockEndpoint::Mantle => {
+                bedrock_mantle_runtime_base_url(managed_auth.as_ref(), &self.aws).await?
+            }
+            BedrockEndpoint::Runtime => {
+                bedrock_runtime_base_url(managed_auth.as_ref(), &self.aws).await?
+            }
+        };
+        Ok(Some(base_url))
     }
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
@@ -112,7 +160,14 @@ impl AmazonBedrockModelProvider {
             return resolve_configured_provider_auth(auth.as_ref(), &self.info);
         }
         let managed_auth = self.managed_auth();
-        resolve_bedrock_provider_auth(managed_auth.as_ref(), &self.aws).await
+        resolve_bedrock_provider_auth(managed_auth.as_ref(), &self.aws, self.endpoint).await
+    }
+
+    fn default_model_catalog(&self) -> ModelsResponse {
+        match self.endpoint {
+            BedrockEndpoint::Mantle => static_model_catalog(),
+            BedrockEndpoint::Runtime => static_runtime_model_catalog(),
+        }
     }
 }
 
@@ -125,22 +180,31 @@ impl ModelProvider for AmazonBedrockModelProvider {
         ProviderCapabilities {
             namespace_tools: true,
             image_generation: false,
-            web_search: true,
+            web_search: self.endpoint == BedrockEndpoint::Mantle,
             external_web_access: false,
             remote_compaction: RemoteCompactionSupport::V1,
         }
     }
 
     fn approval_review_preferred_model(&self) -> &'static str {
-        AMAZON_BEDROCK_GPT_5_4_MODEL_ID
+        match self.endpoint {
+            BedrockEndpoint::Mantle => AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID,
+            BedrockEndpoint::Runtime => AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_LUNA_MODEL_ID,
+        }
     }
 
     fn memory_extraction_preferred_model(&self) -> &'static str {
-        AMAZON_BEDROCK_GPT_5_4_MODEL_ID
+        match self.endpoint {
+            BedrockEndpoint::Mantle => AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID,
+            BedrockEndpoint::Runtime => AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_LUNA_MODEL_ID,
+        }
     }
 
     fn memory_consolidation_preferred_model(&self) -> &'static str {
-        AMAZON_BEDROCK_GPT_5_4_MODEL_ID
+        match self.endpoint {
+            BedrockEndpoint::Mantle => AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID,
+            BedrockEndpoint::Runtime => AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_TERRA_MODEL_ID,
+        }
     }
 
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {
@@ -149,6 +213,36 @@ impl ModelProvider for AmazonBedrockModelProvider {
         } else {
             None
         }
+    }
+
+    fn is_recoverable_auth_error(&self, error: &TransportError) -> bool {
+        matches!(
+            error,
+            TransportError::Http { status, .. } if *status == http::StatusCode::UNAUTHORIZED
+        ) || (self.uses_aws_auth_recovery() && error::is_refreshable_auth_error(error))
+    }
+
+    fn recover_from_unauthorized(
+        &self,
+    ) -> ModelProviderFuture<'_, Result<ProviderUnauthorizedRecovery>> {
+        Box::pin(async move {
+            let Some(recovery) = self
+                .auth_recovery
+                .as_ref()
+                .filter(|_| self.uses_aws_auth_recovery())
+            else {
+                return Ok(ProviderUnauthorizedRecovery::NotConfigured);
+            };
+
+            recovery.refresh().await.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    CodexErr::InvalidRequest(error.to_string())
+                } else {
+                    CodexErr::Io(error)
+                }
+            })?;
+            Ok(ProviderUnauthorizedRecovery::Recovered)
+        })
     }
 
     fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
@@ -187,7 +281,8 @@ impl ModelProvider for AmazonBedrockModelProvider {
     ) -> SharedModelsManager {
         Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
-            config_model_catalog.map_or_else(static_model_catalog, normalize_bedrock_catalog),
+            config_model_catalog
+                .map_or_else(|| self.default_model_catalog(), normalize_bedrock_catalog),
         ))
     }
 
@@ -197,7 +292,8 @@ impl ModelProvider for AmazonBedrockModelProvider {
     ) -> SharedModelsManager {
         Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
-            config_model_catalog.map_or_else(static_model_catalog, normalize_bedrock_catalog),
+            config_model_catalog
+                .map_or_else(|| self.default_model_catalog(), normalize_bedrock_catalog),
         ))
     }
 }
@@ -210,6 +306,7 @@ mod error_tests;
 mod tests {
     use std::num::NonZeroU64;
 
+    use codex_model_provider_info::AwsAuthRefreshConfig;
     use codex_protocol::config_types::ModelProviderAuthInfo;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
@@ -254,6 +351,11 @@ mod tests {
         provider_info.aws = Some(ModelProviderAwsAuthInfo {
             profile: Some("aws-profile-that-should-not-be-loaded".to_string()),
             region: Some("us-west-2".to_string()),
+            auth_refresh: Some(AwsAuthRefreshConfig {
+                command: "aws".to_string(),
+                args: vec!["login".to_string()],
+                timeout_ms: NonZeroU64::new(1_000).expect("timeout should be non-zero"),
+            }),
         });
         let provider = AmazonBedrockModelProvider::new(provider_info, /*auth_manager*/ None);
 
@@ -293,6 +395,11 @@ mod tests {
             ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
                 profile: Some("aws-profile-that-should-not-be-loaded".to_string()),
                 region: Some("us-west-2".to_string()),
+                auth_refresh: Some(AwsAuthRefreshConfig {
+                    command: "aws".to_string(),
+                    args: vec!["login".to_string()],
+                    timeout_ms: NonZeroU64::new(1_000).expect("timeout should be non-zero"),
+                }),
             })),
             Some(auth_manager.clone()),
         );
@@ -376,15 +483,80 @@ mod tests {
     }
 
     #[test]
-    fn approval_review_preferred_model_uses_bedrock_gpt_5_4() {
+    fn runtime_capabilities_disable_web_search_and_support_v1_remote_compaction() {
         let provider = AmazonBedrockModelProvider::new(
-            ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
+            ModelProviderInfo::create_amazon_bedrock_runtime_provider(/*aws*/ None),
             /*auth_manager*/ None,
         );
 
         assert_eq!(
-            provider.approval_review_preferred_model(),
-            AMAZON_BEDROCK_GPT_5_4_MODEL_ID
+            provider.capabilities(),
+            ProviderCapabilities {
+                namespace_tools: true,
+                image_generation: false,
+                web_search: false,
+                external_web_access: false,
+                remote_compaction: RemoteCompactionSupport::V1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_managed_auth_resolves_runtime_endpoint() {
+        let managed_auth = BedrockApiKeyAuth {
+            api_key: "managed-bedrock-api-key".to_string(),
+            region: "eu-west-1".to_string(),
+        };
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::BedrockApiKey(managed_auth));
+        let provider = AmazonBedrockModelProvider::new(
+            ModelProviderInfo::create_amazon_bedrock_runtime_provider(/*aws*/ None),
+            Some(auth_manager),
+        );
+
+        assert_eq!(
+            provider
+                .runtime_base_url()
+                .await
+                .expect("managed Bedrock Runtime region should resolve"),
+            Some("https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn preferred_background_models_match_bedrock_endpoint() {
+        let mantle_provider = AmazonBedrockModelProvider::new(
+            ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
+            /*auth_manager*/ None,
+        );
+        let runtime_provider = AmazonBedrockModelProvider::new(
+            ModelProviderInfo::create_amazon_bedrock_runtime_provider(/*aws*/ None),
+            /*auth_manager*/ None,
+        );
+
+        assert_eq!(
+            (
+                mantle_provider.approval_review_preferred_model(),
+                mantle_provider.memory_extraction_preferred_model(),
+                mantle_provider.memory_consolidation_preferred_model(),
+            ),
+            (
+                AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID,
+                AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID,
+                AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID,
+            )
+        );
+        assert_eq!(
+            (
+                runtime_provider.approval_review_preferred_model(),
+                runtime_provider.memory_extraction_preferred_model(),
+                runtime_provider.memory_consolidation_preferred_model(),
+            ),
+            (
+                AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_LUNA_MODEL_ID,
+                AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_LUNA_MODEL_ID,
+                AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_TERRA_MODEL_ID,
+            )
         );
     }
 }

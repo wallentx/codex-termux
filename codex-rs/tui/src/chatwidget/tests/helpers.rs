@@ -44,6 +44,7 @@ pub(super) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
             text = text.replace(&platform_path, unix_path);
         }
     }
+    text = text.replace("/tmp/project\\", "/tmp/project/");
 
     let platform_test_cwd = test_path_display("/tmp/project");
     if platform_test_cwd == "/tmp/project" {
@@ -282,7 +283,6 @@ fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> Model
         "default_verbosity": null,
         "apply_patch_tool_type": null,
         "truncation_policy": {"mode": "bytes", "limit": 10_000},
-        "supports_parallel_tool_calls": false,
         "supports_image_detail_original": false,
         "context_window": 272_000,
         "experimental_supported_tools": [],
@@ -767,6 +767,7 @@ pub(super) fn replay_agent_message(
             text: text.into(),
             phase: Some(MessagePhase::FinalAnswer),
             memory_citation: None,
+            delivery: None,
         },
         "turn-1".to_string(),
         replay_kind,
@@ -919,6 +920,7 @@ pub(super) fn complete_assistant_message(
                 text: text.to_string(),
                 phase,
                 memory_citation: None,
+                delivery: None,
             },
         }),
         /*replay_kind*/ None,
