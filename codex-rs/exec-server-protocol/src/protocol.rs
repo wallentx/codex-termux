@@ -118,6 +118,9 @@ pub struct EnvironmentCapabilities {
     /// Whether this executor supports the `environmentConfig/read` request.
     #[serde(default)]
     pub environment_config_read: bool,
+    /// Whether HTTP headers can resolve values from the executor environment.
+    #[serde(default)]
+    pub http_header_env_vars: bool,
     /// Whether filesystem streams can use the requested platform sandbox.
     #[serde(default)]
     pub sandboxed_file_streaming: bool,
@@ -185,8 +188,9 @@ impl EnvironmentInfo {
                 network_proxy_launch: true,
                 capability_discovery_sandbox: true,
                 environment_config_read: true,
+                http_header_env_vars: true,
                 sandboxed_file_streaming: true,
-                shell_snapshot_v2: cfg!(unix),
+                shell_snapshot_v2: false,
             },
         }
     }
@@ -269,9 +273,6 @@ pub struct ShellSnapshotRequest {
     pub scope_id: String,
     /// Executor-native shell used to capture and restore the snapshot.
     pub shell: ShellInfo,
-    /// Runtime-owned PATH entries to replay after restoring profile state.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub runtime_path_prepends: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,8 +681,11 @@ impl ExecutorCapabilityDiscoverySnapshot {
 pub struct HttpHeader {
     /// Header name as it appears on the HTTP wire.
     pub name: String,
-    /// Header value after UTF-8 conversion.
+    /// Literal header value, or prefix for an executor-local environment value.
     pub value: String,
+    /// Environment variable resolved by the process that sends the HTTP request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_env_var: Option<String>,
 }
 
 /// Redirect behavior for an executor-side HTTP request.
@@ -963,6 +967,7 @@ mod tests {
                 network_proxy_launch: true,
                 capability_discovery_sandbox: true,
                 environment_config_read: false,
+                http_header_env_vars: false,
                 sandboxed_file_streaming: false,
                 shell_snapshot_v2: false,
             }
@@ -979,6 +984,7 @@ mod tests {
                 "networkProxyLaunch": false,
                 "capabilityDiscoverySandbox": false,
                 "environmentConfigRead": false,
+                "httpHeaderEnvVars": false,
                 "sandboxedFileStreaming": false,
                 "shellSnapshotV2": false,
             },
