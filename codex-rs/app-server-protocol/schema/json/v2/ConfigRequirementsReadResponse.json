@@ -115,6 +115,12 @@
     },
     "ConfigRequirements": {
       "properties": {
+        "additionalDeveloperInstructions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "allowAppshots": {
           "type": [
             "boolean",
@@ -265,6 +271,16 @@
           "anyOf": [
             {
               "$ref": "#/definitions/FeedbackRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inAppBrowser": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InAppBrowserRequirements"
             },
             {
               "type": "null"
@@ -463,6 +479,17 @@
     "FeedbackRequirements": {
       "properties": {
         "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "InAppBrowserRequirements": {
+      "properties": {
+        "allowExternalBrowserSettingsImport": {
           "type": [
             "boolean",
             "null"

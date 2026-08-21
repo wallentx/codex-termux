@@ -2042,6 +2042,7 @@ fn config_requirements_granular_allowed_approval_policy_is_marked_experimental()
         crate::experimental_api::ExperimentalApi::experimental_reason(&ConfigRequirements {
             cli_auth_credentials_store: None,
             chatgpt_base_url: None,
+            additional_developer_instructions: None,
             allowed_approval_policies: Some(vec![AskForApproval::Granular {
                 sandbox_approval: true,
                 rules: true,
@@ -2060,6 +2061,7 @@ fn config_requirements_granular_allowed_approval_policy_is_marked_experimental()
             allow_remote_control: None,
             computer_use: None,
             browser_use: None,
+            in_app_browser: None,
             feature_requirements: None,
             hooks: None,
             enforce_residency: None,

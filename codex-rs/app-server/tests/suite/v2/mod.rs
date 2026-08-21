@@ -12,6 +12,7 @@ mod collaboration_mode_list;
 #[cfg(unix)]
 mod command_exec;
 mod compaction;
+mod config_requirements_in_app_browser;
 mod config_rpc;
 mod connection_handling_websocket;
 #[cfg(unix)]
@@ -42,6 +43,7 @@ mod initialize;
 mod marketplace_add;
 mod marketplace_remove;
 mod marketplace_upgrade;
+mod mcp_event_stream;
 mod mcp_resource;
 mod mcp_resource_origin;
 mod mcp_server_elicitation;

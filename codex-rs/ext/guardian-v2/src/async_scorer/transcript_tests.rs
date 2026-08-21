@@ -40,7 +40,9 @@ fn transcript_keeps_conversation_and_configured_sources() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("Workspace inspected.".to_string()),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -459,7 +461,9 @@ fn transcript_truncates_tool_results_using_standard_budget() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_owned(),
+            call_id: Some("call-1".to_owned()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text(output),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -478,6 +482,36 @@ fn transcript_truncates_tool_results_using_standard_budget() {
     assert!(
         result.len()
             <= TruncationPolicy::Tokens(MAX_TOOL_ENTRY_TOKENS).byte_budget() + prefix.len() + 1
+    );
+}
+
+#[test]
+fn transcript_preserves_named_unpaired_tool_source() {
+    let mut items = vec![ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: None,
+        name: Some("notifications".to_owned()),
+        namespace: Some("slack".to_owned()),
+        output: FunctionCallOutputPayload::from_text("new message".to_owned()),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+
+    assert_eq!(
+        TranscriptConfig::default().build(&items),
+        vec!["[1] tool slack.notifications result: new message\n"]
+    );
+
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut items[0] {
+        *output = FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,image".to_owned(),
+                detail: None,
+            },
+        ]);
+    }
+    assert_eq!(
+        TranscriptConfig::default().build(&items),
+        vec!["[1] tool slack.notifications result: [non-text output]\n"]
     );
 }
 
@@ -596,7 +630,9 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "Screenshot captured.".to_string(),

@@ -1,5 +1,6 @@
 use super::mcp_refresh::McpRefreshInvalidationGuard;
 use super::*;
+use crate::environment_selection::combine_selected_capability_roots;
 use crate::tools::sandboxing::executor_windows_sandbox_level;
 use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
@@ -29,6 +30,7 @@ use codex_protocol::mcp_approval_meta::TOOL_DESCRIPTION_KEY as MCP_ELICITATION_T
 use codex_protocol::mcp_approval_meta::TOOL_NAME_KEY as MCP_ELICITATION_TOOL_NAME_KEY;
 use codex_protocol::mcp_approval_meta::TOOL_PARAMS_KEY as MCP_ELICITATION_TOOL_PARAMS_KEY;
 use codex_protocol::mcp_approval_meta::TOOL_TITLE_KEY as MCP_ELICITATION_TOOL_TITLE_KEY;
+use codex_protocol::openai_models::ModelInfo;
 use codex_rmcp_client::Elicitation;
 use rmcp::model::ElicitationAction;
 use rmcp::model::RequestMetaObject;
@@ -154,6 +156,7 @@ impl Session {
     }
 
     /// Publishes changed MCP state, waiting for any refresh already in progress.
+    #[tracing::instrument(name = "mcp.runtime.refresh_if_dirty", skip_all)]
     pub(crate) async fn refresh_mcp_if_dirty(self: &Arc<Self>) {
         let Ok(_refresh) = self.mcp_refresh.acquire().await else {
             error!("MCP runtime refresh semaphore closed");
@@ -436,18 +439,18 @@ impl Session {
         let mut root_locations_by_id = HashMap::new();
         let mut selected_capability_roots = Vec::new();
         let mut ready_environment_root_count = 0;
-        for (index, root) in self
-            .services
-            .selected_capability_roots
-            .iter()
-            .cloned()
-            .chain(
-                environments
-                    .turn_environments()
-                    .flat_map(|environment| environment.config().selected_capability_roots.clone()),
-            )
-            .enumerate()
-        {
+        let combined_roots = combine_selected_capability_roots(
+            &self.services.selected_capability_roots,
+            environments.turn_environments().map(|environment| {
+                (
+                    environment.config_origin,
+                    environment
+                        .config_origin
+                        .selected_capability_roots(&environment.environment, environment.config()),
+                )
+            }),
+        );
+        for (index, root) in combined_roots.into_iter().enumerate() {
             if let Some(kept_location) = root_locations_by_id.get(&root.id) {
                 if kept_location != &root.location {
                     tracing::warn!(
@@ -783,8 +786,9 @@ async fn review_guardian_mcp_elicitation(
         )
         .await;
 
-        return Ok(matches!(decision, ReviewDecision::Approved)
-            .then(|| mcp_elicitation_response_from_guardian_decision(decision)));
+        return Ok(matches!(decision, ReviewDecision::Approved).then(|| {
+            mcp_elicitation_response_from_guardian_decision(decision, &turn_context.model_info)
+        }));
     }
 
     let approval_policy = mcp_config.approval_policy.value();
@@ -854,6 +858,7 @@ async fn review_guardian_mcp_elicitation(
     .await;
     Ok(Some(mcp_elicitation_response_from_guardian_decision(
         decision,
+        &turn_context.model_info,
     )))
 }
 
@@ -1004,6 +1009,7 @@ fn mcp_elicitation_request_id(id: &RequestId) -> String {
 
 fn mcp_elicitation_response_from_guardian_decision(
     decision: ReviewDecision,
+    model_info: &ModelInfo,
 ) -> ElicitationResponse {
     match decision {
         ReviewDecision::Approved
@@ -1016,9 +1022,9 @@ fn mcp_elicitation_response_from_guardian_decision(
             meta: Some(mcp_elicitation_auto_meta()),
         },
         ReviewDecision::Denied { rejection } => mcp_elicitation_decline_with_message(rejection),
-        ReviewDecision::TimedOut => {
-            mcp_elicitation_decline_with_message(crate::guardian::guardian_timeout_message())
-        }
+        ReviewDecision::TimedOut => mcp_elicitation_decline_with_message(
+            crate::guardian::guardian_timeout_message(model_info),
+        ),
         ReviewDecision::Abort => ElicitationResponse {
             action: ElicitationAction::Cancel,
             content: None,

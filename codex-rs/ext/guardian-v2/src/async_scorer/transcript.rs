@@ -228,7 +228,9 @@ impl TranscriptConfig {
                     (format!("tool {name} call"), arguments.clone())
                 }
                 ResponseItem::FunctionCallOutput {
-                    call_id, output, ..
+                    call_id: Some(call_id),
+                    output,
+                    ..
                 }
                 | ResponseItem::CustomToolCallOutput {
                     call_id, output, ..
@@ -243,6 +245,29 @@ impl TranscriptConfig {
                         || "tool result".to_owned(),
                         |name| format!("tool {name} result"),
                     );
+                    (role, output)
+                }
+                ResponseItem::FunctionCallOutput {
+                    call_id: None,
+                    name,
+                    namespace,
+                    output,
+                    ..
+                } => {
+                    if !self.sources.contains(&TranscriptSource::ToolOutputs) {
+                        continue;
+                    }
+                    let output = output
+                        .body
+                        .to_text()
+                        .unwrap_or_else(|| "[non-text output]".into());
+                    let role = match (name.as_deref(), namespace.as_deref()) {
+                        (Some(name), Some(namespace)) => {
+                            format!("tool {namespace}.{name} result")
+                        }
+                        (Some(name), None) => format!("tool {name} result"),
+                        (None, _) => "tool result".to_owned(),
+                    };
                     (role, output)
                 }
                 ResponseItem::Reasoning {
