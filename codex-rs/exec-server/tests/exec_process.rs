@@ -103,15 +103,25 @@ async fn create_process_context(use_remote: bool) -> Result<ProcessContext> {
 }
 
 #[cfg(unix)]
-#[test_case(false, false, false, "bash"; "local_pipe")]
-#[test_case(false, true, false, "bash"; "local_tty")]
-#[test_case(true, false, false, "bash"; "remote_pipe")]
-#[test_case(true, true, false, "bash"; "remote_tty")]
-#[test_case(true, false, true, "bash"; "remote_sandbox")]
-#[test_case(false, false, false, "sh"; "local_sh_pipe")]
+#[test_case(false, false, false, false, "bash"; "local_pipe")]
+#[test_case(false, true, false, false, "bash"; "local_tty")]
+#[test_case(true, false, false, false, "bash"; "remote_pipe")]
+#[test_case(true, true, false, false, "bash"; "remote_tty")]
+#[test_case(true, false, true, false, "bash"; "remote_sandbox")]
+#[test_case(false, false, false, false, "sh"; "local_sh_pipe")]
+#[test_case(false, false, false, true, "bash"; "local_bash_env")]
+#[test_case(true, false, false, true, "bash"; "remote_bash_env")]
 #[cfg_attr(
     target_os = "macos",
-    test_case(false, false, false, "zsh"; "local_zsh_pipe")
+    test_case(false, false, false, false, "zsh"; "local_zsh_pipe")
+)]
+#[cfg_attr(
+    target_os = "macos",
+    test_case(false, false, false, true, "zsh"; "local_zshenv")
+)]
+#[cfg_attr(
+    target_os = "macos",
+    test_case(true, false, false, true, "zsh"; "remote_zshenv")
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
@@ -120,6 +130,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     use_remote: bool,
     tty: bool,
     use_sandbox: bool,
+    automatic_startup: bool,
     shell_name: &str,
 ) -> Result<()> {
     if use_sandbox
@@ -133,16 +144,16 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     let home = TempDir::new()?;
     let cwd = PathUri::from_host_native_path(home.path())?;
     let (shell_path, profile_name) = match shell_name {
+        "bash" if automatic_startup => ("/bin/bash", ".bash-env"),
         "bash" => ("/bin/bash", ".bashrc"),
         "sh" => ("/bin/sh", ".snapshot-env"),
+        "zsh" if automatic_startup => ("/bin/zsh", ".zshenv"),
         "zsh" => ("/bin/zsh", ".zshrc"),
         name => anyhow::bail!("unsupported test shell {name}"),
     };
     let profile_path = home.path().join(profile_name);
     let profile_path_entry = home.path().join("profile-bin");
     let runtime_path_entry = home.path().join("runtime-bin");
-    let inherited_path = std::env::var("PATH")?;
-    let runtime_path = format!("{}:{inherited_path}", runtime_path_entry.display());
     let padding = if !use_remote && !tty && shell_name == "bash" {
         format!(
             "snapshot_padding() {{ printf '%s' '{}'; }}\n",
@@ -162,6 +173,12 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
             "printf x >> \"$HOME/captures\"\nexport PATH=\"$HOME/profile-bin:/usr/bin:/bin\"\nexport PROFILE_ALLOWED=profile\nexport PROFILE_SECRET=secret\nexport PROFILE_DENIED=denied\nprofile_helper() {{ printf helper; }}\n{shadowed_builtins}{padding}"
         ),
     )?;
+    if shell_name == "zsh" && automatic_startup {
+        std::fs::write(
+            home.path().join(".zshrc"),
+            "export PATH=\"$HOME/profile-bin:/usr/bin:/bin\"\n",
+        )?;
+    }
     let mut configured_environment = HashMap::from([(
         "HOME".to_string(),
         home.path().to_string_lossy().into_owned(),
@@ -172,12 +189,19 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
             profile_path.to_string_lossy().into_owned(),
         );
     }
+    if shell_name == "bash" && automatic_startup {
+        configured_environment.insert(
+            "BASH_ENV".to_string(),
+            profile_path.to_string_lossy().into_owned(),
+        );
+    }
     let policy = ExecEnvPolicy {
         inherit: ShellEnvironmentPolicyInherit::All,
         ignore_default_excludes: false,
         exclude: vec!["PROFILE_DENIED".to_string()],
         r#set: configured_environment,
         include_only: vec![
+            "BASH_ENV".to_string(),
             "ENV".to_string(),
             "HOME".to_string(),
             "PATH".to_string(),
@@ -190,7 +214,8 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
         ("profile_helper; ", "helper")
     };
     let command = format!(
-        "{command_prefix}printf '|%s|%s|%s|%s|%s|%s' \"$PROFILE_ALLOWED\" \"${{PROFILE_SECRET-missing}}\" \"${{PROFILE_DENIED-missing}}\" \"$PATH\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_0-missing}}\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_1-missing}}\""
+        "export PATH='{}':\"$PATH\"; {command_prefix}printf '|%s|%s|%s|%s|%s|%s' \"$PROFILE_ALLOWED\" \"${{PROFILE_SECRET-missing}}\" \"${{PROFILE_DENIED-missing}}\" \"$PATH\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_0-missing}}\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_1-missing}}\"",
+        runtime_path_entry.display(),
     );
     let expected_stdout = format!(
         "{expected_prefix}|profile|missing|missing|{}:{}:/usr/bin:/bin|missing|missing",
@@ -212,9 +237,8 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
                         name: shell_name.to_string(),
                         path: shell_path.to_string(),
                     },
-                    runtime_path_prepends: vec![runtime_path_entry.to_string_lossy().into_owned()],
                 }),
-                env: HashMap::from([("PATH".to_string(), runtime_path.clone())]),
+                env: HashMap::new(),
                 tty,
                 pipe_stdin: false,
                 arg0: None,
@@ -293,7 +317,6 @@ async fn shell_snapshot_v2_remote_managed_proxy_uses_prepared_execution_context(
                         name: "bash".to_string(),
                         path: "/bin/bash".to_string(),
                     },
-                    runtime_path_prepends: Vec::new(),
                 }),
                 env: HashMap::new(),
                 tty: false,
@@ -362,7 +385,6 @@ async fn shell_snapshot_v2_capture_failure_falls_back_to_original_command() -> R
                 name: "bash".to_string(),
                 path: "/bin/bash".to_string(),
             },
-            runtime_path_prepends: Vec::new(),
         }),
         env: HashMap::new(),
         tty: false,
