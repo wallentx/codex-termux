@@ -21,6 +21,7 @@ use wildmatch::WildMatchPattern;
 use super::requirements_exec_policy::RequirementsExecPolicyToml;
 use crate::Constrained;
 use crate::ConstraintError;
+use crate::InAppBrowserRequirementsToml;
 use crate::ManagedAuthPolicy;
 use crate::ManagedHooksRequirementsToml;
 use crate::McpServerRequirement;
@@ -186,6 +187,8 @@ pub struct ConfigRequirements {
     pub network: Option<Sourced<NetworkConstraints>>,
     /// Managed filesystem constraints derived from requirements.
     pub filesystem: Option<Sourced<FilesystemConstraints>>,
+    /// Managed instructions included independently of ordinary developer instructions.
+    pub additional_developer_instructions: Option<Sourced<String>>,
     /// Source for the managed guardian policy config, when one is configured.
     pub guardian_policy_config_source: Option<RequirementSource>,
 }
@@ -241,6 +244,7 @@ impl Default for ConfigRequirements {
             ),
             network: None,
             filesystem: None,
+            additional_developer_instructions: None,
             guardian_policy_config_source: None,
         }
     }
@@ -942,6 +946,7 @@ pub struct ConfigRequirementsToml {
     pub allow_remote_control: Option<bool>,
     pub computer_use: Option<ComputerUseRequirementsToml>,
     pub browser_use: Option<BrowserUseRequirementsToml>,
+    pub in_app_browser: Option<InAppBrowserRequirementsToml>,
     pub windows: Option<WindowsRequirementsToml>,
     #[serde(rename = "features", alias = "feature_requirements")]
     pub feature_requirements: Option<FeatureRequirementsToml>,
@@ -957,6 +962,7 @@ pub struct ConfigRequirementsToml {
     pub permissions: Option<PermissionsRequirementsToml>,
     pub auto_review: Option<AutoReviewRequirementsToml>,
     pub models: Option<ModelsRequirementsToml>,
+    pub additional_developer_instructions: Option<String>,
     pub guardian_policy_config: Option<String>,
 }
 
@@ -1043,6 +1049,7 @@ pub struct ConfigRequirementsWithSources {
     pub allow_remote_control: Option<Sourced<bool>>,
     pub computer_use: Option<Sourced<ComputerUseRequirementsToml>>,
     pub browser_use: Option<Sourced<BrowserUseRequirementsToml>>,
+    pub in_app_browser: Option<Sourced<InAppBrowserRequirementsToml>>,
     pub windows: Option<Sourced<WindowsRequirementsToml>>,
     pub feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
     pub hooks: Option<Sourced<ManagedHooksRequirementsToml>>,
@@ -1056,6 +1063,7 @@ pub struct ConfigRequirementsWithSources {
     pub permissions: Option<Sourced<PermissionsRequirementsToml>>,
     pub auto_review: Option<Sourced<AutoReviewRequirementsToml>>,
     pub models: Option<Sourced<ModelsRequirementsToml>>,
+    pub additional_developer_instructions: Option<Sourced<String>>,
     pub guardian_policy_config: Option<Sourced<String>>,
 }
 
@@ -1100,6 +1108,7 @@ impl ConfigRequirementsWithSources {
             allow_remote_control: _,
             computer_use: _,
             browser_use: _,
+            in_app_browser: _,
             windows: _,
             feature_requirements: _,
             hooks: _,
@@ -1113,6 +1122,7 @@ impl ConfigRequirementsWithSources {
             permissions: _,
             auto_review: _,
             models: _,
+            additional_developer_instructions: _,
             guardian_policy_config: _,
         } = &other;
 
@@ -1150,6 +1160,7 @@ impl ConfigRequirementsWithSources {
                 allow_remote_control,
                 computer_use,
                 browser_use,
+                in_app_browser,
                 windows,
                 feature_requirements,
                 hooks,
@@ -1161,6 +1172,7 @@ impl ConfigRequirementsWithSources {
                 network,
                 permissions,
                 models,
+                additional_developer_instructions,
                 guardian_policy_config,
             }
         );
@@ -1229,6 +1241,7 @@ impl ConfigRequirementsWithSources {
             allow_remote_control,
             computer_use,
             browser_use,
+            in_app_browser,
             windows,
             feature_requirements,
             hooks,
@@ -1242,6 +1255,7 @@ impl ConfigRequirementsWithSources {
             permissions,
             auto_review,
             models,
+            additional_developer_instructions,
             guardian_policy_config,
         } = self;
         ConfigRequirementsToml {
@@ -1267,6 +1281,7 @@ impl ConfigRequirementsWithSources {
             allow_remote_control: allow_remote_control.map(|sourced| sourced.value),
             computer_use: computer_use.map(|sourced| sourced.value),
             browser_use: browser_use.map(|sourced| sourced.value),
+            in_app_browser: in_app_browser.map(|sourced| sourced.value),
             windows: windows.map(|sourced| sourced.value),
             feature_requirements: feature_requirements.map(|sourced| sourced.value),
             hooks: hooks.map(|sourced| sourced.value),
@@ -1280,6 +1295,8 @@ impl ConfigRequirementsWithSources {
             permissions: permissions.map(|sourced| sourced.value),
             auto_review: auto_review.map(|sourced| sourced.value),
             models: models.map(|sourced| sourced.value),
+            additional_developer_instructions: additional_developer_instructions
+                .map(|sourced| sourced.value),
             guardian_policy_config: guardian_policy_config.map(|sourced| sourced.value),
         }
     }
@@ -1381,6 +1398,10 @@ impl ConfigRequirementsToml {
                 .as_ref()
                 .is_none_or(BrowserUseRequirementsToml::is_empty)
             && self
+                .in_app_browser
+                .as_ref()
+                .is_none_or(|requirements| requirements == &InAppBrowserRequirementsToml::default())
+            && self
                 .windows
                 .as_ref()
                 .is_none_or(WindowsRequirementsToml::is_empty)
@@ -1420,6 +1441,7 @@ impl ConfigRequirementsToml {
                 .models
                 .as_ref()
                 .is_none_or(ModelsRequirementsToml::is_empty)
+            && self.additional_developer_instructions.is_none()
             && self
                 .guardian_policy_config
                 .as_deref()
@@ -1581,6 +1603,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             allow_remote_control,
             computer_use,
             browser_use: _,
+            in_app_browser: _,
             windows,
             feature_requirements,
             hooks,
@@ -1594,6 +1617,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             permissions,
             auto_review,
             models: _,
+            additional_developer_instructions,
             guardian_policy_config,
         } = toml;
 
@@ -1950,6 +1974,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             enforce_residency,
             network,
             filesystem,
+            additional_developer_instructions,
             guardian_policy_config_source,
         })
     }
@@ -2108,6 +2133,7 @@ mod tests {
             allow_remote_control,
             computer_use,
             browser_use,
+            in_app_browser,
             windows,
             feature_requirements,
             hooks,
@@ -2121,6 +2147,7 @@ mod tests {
             permissions,
             auto_review,
             models,
+            additional_developer_instructions,
             guardian_policy_config,
         } = toml;
         ConfigRequirementsWithSources {
@@ -2161,6 +2188,8 @@ mod tests {
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             computer_use: computer_use.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             browser_use: browser_use.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            in_app_browser: in_app_browser
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             windows: windows.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             feature_requirements: feature_requirements
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -2176,6 +2205,8 @@ mod tests {
             permissions: permissions.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             auto_review: auto_review.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             models: models.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            additional_developer_instructions: additional_developer_instructions
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             guardian_policy_config: guardian_policy_config
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
         }
@@ -2430,6 +2461,7 @@ mod tests {
         };
         let enforce_residency = ResidencyRequirement::Us;
         let enforce_source = source.clone();
+        let additional_developer_instructions = "Follow the company policy.".to_string();
         let guardian_policy_config = "Use the company-managed guardian policy.".to_string();
 
         // Intentionally constructed without `..Default::default()` so adding a new field to
@@ -2457,6 +2489,7 @@ mod tests {
             allow_remote_control: Some(false),
             computer_use: Some(computer_use.clone()),
             browser_use: None,
+            in_app_browser: None,
             windows: Some(windows.clone()),
             feature_requirements: Some(feature_requirements.clone()),
             hooks: None,
@@ -2470,6 +2503,7 @@ mod tests {
             permissions: None,
             auto_review: Some(auto_review.clone()),
             models: Some(models.clone()),
+            additional_developer_instructions: Some(additional_developer_instructions.clone()),
             guardian_policy_config: Some(guardian_policy_config.clone()),
         };
 
@@ -2532,6 +2566,7 @@ mod tests {
                 )),
                 computer_use: Some(Sourced::new(computer_use, enforce_source.clone())),
                 browser_use: None,
+                in_app_browser: None,
                 windows: Some(Sourced::new(windows, enforce_source.clone())),
                 feature_requirements: Some(Sourced::new(
                     feature_requirements,
@@ -2548,6 +2583,10 @@ mod tests {
                 permissions: None,
                 auto_review: Some(Sourced::new(auto_review, source.clone())),
                 models: Some(Sourced::new(models, source.clone())),
+                additional_developer_instructions: Some(Sourced::new(
+                    additional_developer_instructions,
+                    source.clone(),
+                )),
                 guardian_policy_config: Some(Sourced::new(guardian_policy_config, source)),
             }
         );
@@ -2585,6 +2624,7 @@ mod tests {
                 allow_remote_control: None,
                 computer_use: None,
                 browser_use: None,
+                in_app_browser: None,
                 windows: None,
                 feature_requirements: None,
                 hooks: None,
@@ -2643,6 +2683,7 @@ mod tests {
                 allow_remote_control: None,
                 computer_use: None,
                 browser_use: None,
+                in_app_browser: None,
                 windows: None,
                 feature_requirements: None,
                 hooks: None,

@@ -3,14 +3,14 @@ use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_apply_patch_sse_response;
-use app_test_support::create_escalated_shell_command_sse_response;
+use app_test_support::create_command_execution_sse_response;
+use app_test_support::create_escalated_command_execution_sse_response;
 use app_test_support::create_exec_command_sse_response;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::create_request_user_input_sse_response;
-use app_test_support::create_shell_command_sse_response;
 use app_test_support::format_with_current_shell_display;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use app_test_support::write_models_cache;
@@ -48,6 +48,7 @@ use codex_app_server_protocol::ThreadDeletedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
@@ -2242,7 +2243,7 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
     let first_shell_command = vec![
         "python3".to_string(),
         "-c".to_string(),
-        "import sys; print(sys.argv[1].endswith('7890'))".to_string(),
+        "import sys, time; time.sleep(0.5); print(sys.argv[1].endswith('7890'))".to_string(),
         format!("Authorization: Bearer {bearer_token}"),
     ];
     let expected_approval_command = format_with_current_shell_display(&shlex::try_join(
@@ -2254,14 +2255,14 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
     // Mock server: first turn requests a shell call (elicitation), then completes.
     // Second turn same, but we'll set approval_policy=never to avoid elicitation.
     let responses = vec![
-        create_escalated_shell_command_sse_response(
+        create_escalated_command_execution_sse_response(
             first_shell_command,
             /*workdir*/ None,
             Some(5000),
             "call1",
         )?,
         create_final_assistant_message_sse_response("done 1")?,
-        create_shell_command_sse_response(
+        create_command_execution_sse_response(
             vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -2387,6 +2388,31 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
         }
     }
 
+    let requests = server
+        .received_requests()
+        .await
+        .context("failed to fetch received requests")?;
+    assert!(
+        requests.iter().any(|request| {
+            request.url.path().ends_with("/responses")
+                && serde_json::from_slice::<Value>(&request.body)
+                    .ok()
+                    .and_then(|body| {
+                        body["input"].as_array().map(|items| {
+                            items.iter().any(|item| {
+                                item["type"] == "function_call_output"
+                                    && item["call_id"] == "call1"
+                                    && item["output"]
+                                        .as_str()
+                                        .is_some_and(|output| output.contains("True"))
+                            })
+                        })
+                    })
+                    .unwrap_or(false)
+        }),
+        "model request should include the command output confirming the original bearer token"
+    );
+
     // Second turn with approval_policy=never should not elicit approval
     let _: TurnStartResponse = mcp
         .request(|request_id| ClientRequest::TurnStart {
@@ -2468,7 +2494,7 @@ async fn run_turn_start_exec_approval_rejection_v2(
         expected_approval_command.replace(bearer_token, "[REDACTED_SECRET]");
 
     let responses = vec![
-        create_escalated_shell_command_sse_response(
+        create_escalated_command_execution_sse_response(
             shell_command,
             /*workdir*/ None,
             Some(5000),
@@ -2614,6 +2640,12 @@ async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns(
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
     std::fs::create_dir(&codex_home)?;
+    let rules_dir = codex_home.join("rules");
+    std::fs::create_dir(&rules_dir)?;
+    std::fs::write(
+        rules_dir.join("default.rules"),
+        r#"prefix_rule(pattern=["echo"], decision="allow")"#,
+    )?;
     let workspace_root = tmp.path().join("workspace");
     std::fs::create_dir(&workspace_root)?;
     let first_cwd = workspace_root.join("turn1");
@@ -2622,14 +2654,14 @@ async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns(
     std::fs::create_dir(&second_cwd)?;
 
     let responses = vec![
-        create_shell_command_sse_response(
+        create_command_execution_sse_response(
             vec!["echo".to_string(), "first".to_string(), "turn".to_string()],
             /*workdir*/ None,
             Some(5000),
             "call-first",
         )?,
         create_final_assistant_message_sse_response("done first")?,
-        create_shell_command_sse_response(
+        create_command_execution_sse_response(
             vec!["echo".to_string(), "second".to_string(), "turn".to_string()],
             /*workdir*/ None,
             Some(5000),
@@ -3693,6 +3725,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
     const CHILD_PROMPT: &str = "child: do work";
     const PARENT_PROMPT: &str = "spawn a child and continue";
     const SPAWN_CALL_ID: &str = "spawn-call-direct-input-rejection";
+    const FAILED_SPAWN_CALL_ID: &str = "spawn-call-invalid-fork-turns";
     const ERROR_MESSAGE: &str =
         "direct app-server input is not allowed for multi-agent v2 sub-agents";
 
@@ -3701,11 +3734,22 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
         "message": CHILD_PROMPT,
         "task_name": "worker",
     }))?;
+    let failed_spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "task_name": "invalid-worker",
+        "fork_turns": "0",
+    }))?;
     let _parent_turn = responses::mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains(req, PARENT_PROMPT),
         responses::sse(vec![
             responses::ev_response_created("resp-parent-1"),
+            responses::ev_function_call_with_namespace(
+                FAILED_SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &failed_spawn_args,
+            ),
             responses::ev_function_call_with_namespace(
                 SPAWN_CALL_ID,
                 MULTI_AGENT_V2_NAMESPACE,
@@ -3719,8 +3763,10 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .enable_feature(Feature::MultiAgentV2)
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
         .write(codex_home.path())?;
     write_models_cache(codex_home.path())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -3738,7 +3784,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
         .request(|request_id| ClientRequest::TurnStart {
             request_id,
             params: TurnStartParams {
-                thread_id: thread.id,
+                thread_id: thread.id.clone(),
                 input: vec![V2UserInput::Text {
                     text: PARENT_PROMPT.to_string(),
                     text_elements: Vec::new(),
@@ -3752,6 +3798,10 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
         loop {
             let completed: ItemCompletedNotification =
                 mcp.read_notification("item/completed").await?;
+            assert!(!matches!(
+                &completed.item,
+                ThreadItem::CollabAgentToolCall { .. }
+            ));
             if let ThreadItem::SubAgentActivity {
                 id,
                 kind: SubAgentActivityKind::Started,
@@ -3825,7 +3875,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
 
     let direct_steer_req = mcp
         .send_turn_steer_request(TurnSteerParams {
-            thread_id: child_thread_id,
+            thread_id: child_thread_id.clone(),
             client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "direct app-server steer".to_string(),
@@ -3843,6 +3893,78 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
     .await??;
     assert_eq!(direct_steer_error.error.code, INVALID_REQUEST_ERROR_CODE);
     assert_eq!(direct_steer_error.error.message, ERROR_MESSAGE);
+
+    let direct_settings_req = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: child_thread_id.clone(),
+            permissions: Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let direct_settings_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(direct_settings_req)),
+    )
+    .await??;
+    assert_eq!(direct_settings_error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(direct_settings_error.error.message, ERROR_MESSAGE);
+
+    let event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+        event["event_type"] == "codex_collab_agent_tool_call_event"
+            && event["event_params"]["item_id"] == SPAWN_CALL_ID
+    })
+    .await?;
+    assert_eq!(
+        json!({
+            "tool_name": event["event_params"]["tool_name"],
+            "sender_thread_id": event["event_params"]["sender_thread_id"],
+            "receiver_thread_ids": event["event_params"]["receiver_thread_ids"],
+            "agent_state_count": event["event_params"]["agent_state_count"],
+            "terminal_status": event["event_params"]["terminal_status"],
+        }),
+        json!({
+            "tool_name": "spawn_agent",
+            "sender_thread_id": thread.id,
+            "receiver_thread_ids": [child_thread_id],
+            "agent_state_count": 1,
+            "terminal_status": "completed",
+        })
+    );
+    let duration_ms = event["event_params"]["duration_ms"]
+        .as_u64()
+        .context("successful spawn should report its execution duration")?;
+    assert_eq!(event["event_params"]["execution_duration_ms"], duration_ms);
+    assert!(!event.to_string().contains(CHILD_PROMPT));
+
+    let failed_event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+        event["event_type"] == "codex_collab_agent_tool_call_event"
+            && event["event_params"]["item_id"] == FAILED_SPAWN_CALL_ID
+    })
+    .await?;
+    assert_eq!(
+        json!({
+            "tool_name": failed_event["event_params"]["tool_name"],
+            "receiver_thread_count": failed_event["event_params"]["receiver_thread_count"],
+            "receiver_thread_ids": failed_event["event_params"]["receiver_thread_ids"],
+            "terminal_status": failed_event["event_params"]["terminal_status"],
+            "failure_kind": failed_event["event_params"]["failure_kind"],
+        }),
+        json!({
+            "tool_name": "spawn_agent",
+            "receiver_thread_count": 0,
+            "receiver_thread_ids": [],
+            "terminal_status": "failed",
+            "failure_kind": "tool_error",
+        })
+    );
+    assert!(!failed_event.to_string().contains(CHILD_PROMPT));
+
+    let turn_event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+        event["event_type"] == "codex_turn_event" && event["event_params"]["thread_id"] == thread.id
+    })
+    .await?;
+    assert_eq!(turn_event["event_params"]["subagent_tool_call_count"], 2);
+    assert_eq!(turn_event["event_params"]["total_tool_call_count"], 2);
 
     Ok(())
 }
@@ -4564,7 +4686,7 @@ async fn command_execution_notifications_include_trusted_plugin_id() -> Result<(
 }"#,
     )?;
     let responses = vec![
-        create_shell_command_sse_response(
+        create_command_execution_sse_response(
             vec![
                 "/bin/sh".to_string(),
                 script_path.to_string_lossy().into_owned(),

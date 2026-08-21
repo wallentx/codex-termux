@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use codex_core::config::Config;
+use codex_core::context::NodeReplReviewEvidence;
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionMetrics;
@@ -270,25 +271,23 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
         arguments: r#"{"cmd":"pwd","sandbox_permissions":"require_escalated"}"#.to_owned(),
     };
 
-    for tool_name in ["exec_command", "shell_command"] {
-        let tool_name = ToolName::plain(tool_name);
-        assert!(!should_classify_tool(
-            &tool_name, &sandboxed, /*sandboxed_exec_commands*/ false
-        ));
-        assert!(!should_classify_tool(
-            &tool_name,
-            &additional_permissions,
-            /*sandboxed_exec_commands*/ false
-        ));
-        assert!(should_classify_tool(
-            &tool_name,
-            &unsandboxed,
-            /*sandboxed_exec_commands*/ false
-        ));
-        assert!(should_classify_tool(
-            &tool_name, &sandboxed, /*sandboxed_exec_commands*/ true
-        ));
-    }
+    let tool_name = ToolName::plain("exec_command");
+    assert!(!should_classify_tool(
+        &tool_name, &sandboxed, /*sandboxed_exec_commands*/ false
+    ));
+    assert!(!should_classify_tool(
+        &tool_name,
+        &additional_permissions,
+        /*sandboxed_exec_commands*/ false
+    ));
+    assert!(should_classify_tool(
+        &tool_name,
+        &unsandboxed,
+        /*sandboxed_exec_commands*/ false
+    ));
+    assert!(should_classify_tool(
+        &tool_name, &sandboxed, /*sandboxed_exec_commands*/ true
+    ));
     assert!(should_classify_tool(
         &ToolName::plain("read_file"),
         &sandboxed,
@@ -919,7 +918,9 @@ max_recent_non_user_entries = 8
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "previous-call".to_owned(),
+            call_id: Some("previous-call".to_owned()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("README.md".to_owned()),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -1175,7 +1176,9 @@ async fn contributor_includes_configured_transcript_images() -> Result<()> {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "previous-call".to_owned(),
+            call_id: Some("previous-call".to_owned()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "Screenshot captured.".to_owned(),
@@ -1231,15 +1234,18 @@ async fn contributor_uses_model_defaults_and_preserves_local_overrides() -> Resu
     let model_defaults = GuardianV2ModelConfig {
         classifier_instructions: Some("Use the experimental model-owned prompt.".to_owned()),
         review_threshold_basis_points: Some(6_000),
+        max_tool_call_lag: Some(2),
         reasoning_effort: Some(ReasoningEffort::Minimal),
         transcript: Some(GuardianV2TranscriptModelConfig {
             sources: Some(vec!["reasoning".to_owned()]),
+            include_images: Some(true),
             max_message_entry_tokens: Some(128),
             max_message_transcript_tokens: Some(256),
             ..Default::default()
         }),
         max_action_tokens: Some(128),
         max_classifier_instruction_tokens: Some(256),
+        reuse_parent_compaction: Some(false),
         max_parent_compaction_tokens: Some(384),
     };
     let conversation_history = vec![
@@ -1312,13 +1318,19 @@ async fn contributor_uses_model_defaults_and_preserves_local_overrides() -> Resu
 
     let session_store = ExtensionData::new("session-1");
     let thread_store = test.codex.thread_extension_data();
+    let guardian_config = thread_store
+        .get::<crate::async_scorer::config::GuardianV2Config>()
+        .expect("Guardian v2 configuration should be installed");
     assert_eq!(
-        thread_store
-            .get::<crate::async_scorer::config::GuardianV2Config>()
-            .expect("Guardian v2 configuration should be installed")
-            .max_parent_compaction_tokens,
-        384
+        (
+            guardian_config.max_tool_call_lag,
+            guardian_config.reuse_parent_compaction,
+            guardian_config.max_parent_compaction_tokens,
+            guardian_config.transcript.include_images,
+        ),
+        (2, false, 384, true)
     );
+    assert!(thread_store.get::<NodeReplReviewEvidence>().is_some());
     tokio::time::timeout(Duration::from_secs(5), async {
         while thread_store.get::<SecurityRiskScore>().is_none() {
             tokio::task::yield_now().await;
@@ -1378,7 +1390,9 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "previous-call".to_owned(),
+            call_id: Some("previous-call".to_owned()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("README.md".to_owned()),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -1654,7 +1668,9 @@ async fn contributor_sends_compacted_conversation_history_to_luna() -> Result<()
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id,
+                call_id: Some(call_id),
+                name: None,
+                namespace: None,
                 output: FunctionCallOutputPayload::from_text(format!(
                     "result evidence {index}: {}",
                     "signal ".repeat(1_000)
@@ -1907,6 +1923,63 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
                     && tags == &[("outcome".to_owned(), "failure".to_owned())]
         )
     }));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contributor_can_disable_parent_compaction_reuse() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let oversized_compaction = ResponseItem::Compaction {
+        id: Some(ResponseItemId::from_server("cmp_oversized".to_owned())),
+        encrypted_content: "a".repeat(TruncationPolicy::Tokens(/*limit*/ 256).byte_budget()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let conversation_history = vec![
+        oversized_compaction,
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_owned(),
+            content: vec![ContentItem::InputText {
+                text: "Inspect the repository guidelines.".to_owned(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let configuration = "[features.guardianv2]\nenabled = true\nreuse_parent_compaction = false\nmax_parent_compaction_tokens = 256\n";
+    let (request, test, _registry) = sample_configured_conversation_history(
+        conversation_history,
+        r#"{"path":"README.md"}"#,
+        Some(TEST_GUARDIAN_POLICY),
+        configuration,
+        /*model_defaults*/ None,
+    )
+    .await?;
+
+    let input = request["input"]
+        .as_array()
+        .expect("Luna request input should be an array");
+    assert_eq!(input.len(), 3);
+    assert_eq!(input[2]["role"], "user");
+    assert!(
+        input
+            .iter()
+            .all(|item| item["type"] != "compaction" && item["type"] != "context_compaction")
+    );
+
+    let thread_store = test.codex.thread_extension_data();
+    let score = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(score) = thread_store.get::<SecurityRiskScore>() {
+                return score;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(score.scores.get("action_risk"), Some(&0.8));
 
     Ok(())
 }

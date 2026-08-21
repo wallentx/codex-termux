@@ -9,6 +9,7 @@ use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
+use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
@@ -34,6 +35,7 @@ use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
@@ -1306,6 +1308,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
 
 #[tokio::test]
 async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
+    let managed_fragment = "<managed_developer_instructions>\nParent developer instructions.\n</managed_developer_instructions>";
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
@@ -1350,6 +1353,14 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         "parent trigger message".to_string(),
         /*trigger_turn*/ true,
     );
+    let standalone_output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: None,
+        name: Some("notifications".to_string()),
+        namespace: Some("slack".to_string()),
+        output: FunctionCallOutputPayload::from_text("parent notification".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
     parent_thread
         .session
         .record_conversation_items(
@@ -1388,12 +1399,16 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                         ContentItem::InputText {
                             text: "Preserved developer context.".to_string(),
                         },
+                        ContentItem::InputText {
+                            text: managed_fragment.to_string(),
+                        },
                     ],
                     phase: None,
                     internal_chat_message_metadata_passthrough: None,
                 },
                 assistant_message("parent commentary", Some(MessagePhase::Commentary)),
                 assistant_message("parent final answer", Some(MessagePhase::FinalAnswer)),
+                standalone_output,
                 assistant_message("parent unknown phase", /*phase*/ None),
                 ResponseItem::Reasoning {
                     id: Some(ResponseItemId::with_suffix("rs", "parent-reasoning")),
@@ -1407,6 +1422,14 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             ],
         )
         .await;
+    let expected_standalone_output = parent_thread
+        .session
+        .clone_history()
+        .await
+        .raw_items()
+        .find(|item| matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }))
+        .cloned()
+        .expect("standalone output should be recorded");
     let parent_reference_context_item = turn_context.to_turn_context_item();
     parent_thread
         .session
@@ -1471,6 +1494,9 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             ContentItem::InputText {
                 text: "Preserved developer context.".to_string(),
             },
+            ContentItem::InputText {
+                text: managed_fragment.to_string(),
+            },
         ],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
@@ -1486,6 +1512,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         expected_parent_seed,
         expected_developer_message,
         expected_final_answer,
+        expected_standalone_output,
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
@@ -1554,9 +1581,13 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     assert!(
         !history_contains_text(
             no_hint_history.raw_items(),
-            "Parent developer instructions."
+            "Developer context before.\nParent developer instructions."
         ),
         "empty child developer instructions should remove parent developer instructions"
+    );
+    assert!(
+        history_contains_text(no_hint_history.raw_items(), managed_fragment),
+        "clearing child instructions must preserve an overlapping managed policy"
     );
     assert!(
         history_contains_text(
@@ -1934,6 +1965,12 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
 /// rebuild configured developer instructions exactly once.
 #[tokio::test]
 async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_once() {
+    let managed_policy = "Managed policy for every agent.";
+    let current_managed_fragment = format!(
+        "<managed_developer_instructions>\n{managed_policy}\n</managed_developer_instructions>"
+    );
+    let stale_managed_fragment =
+        "<managed_developer_instructions>\nOld managed policy.\n</managed_developer_instructions>";
     for (case, parent_developer_instructions) in [
         ("without parent instructions", None),
         (
@@ -1945,6 +1982,23 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
         let mut parent_config = harness.config.clone();
         let _ = parent_config.features.enable(Feature::MultiAgentV2);
         parent_config.developer_instructions = parent_developer_instructions.map(str::to_string);
+        let mut requirements = parent_config.config_layer_stack.requirements().clone();
+        requirements.additional_developer_instructions = Some(codex_config::Sourced::new(
+            managed_policy.to_string(),
+            codex_config::RequirementSource::Unknown,
+        ));
+        let mut requirements_toml = parent_config.config_layer_stack.requirements_toml().clone();
+        requirements_toml.additional_developer_instructions = Some(managed_policy.to_string());
+        parent_config.config_layer_stack = codex_config::ConfigLayerStack::new(
+            parent_config
+                .config_layer_stack
+                .all_layers_low_to_high()
+                .cloned()
+                .collect(),
+            requirements,
+            requirements_toml,
+        )
+        .expect("managed requirements stack");
         let mut child_config = parent_config.clone();
         child_config.developer_instructions = Some("Child developer instructions.".to_string());
         child_config.multi_agent_v2.subagent_developer_instructions =
@@ -2004,6 +2058,15 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                 internal_chat_message_metadata_passthrough: None,
             }));
         }
+        rollout_items.push(rollout_response_item(ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: stale_managed_fragment.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }));
         rollout_items.push(RolloutItem::TurnContext(
             turn_context.to_turn_context_item(),
         ));
@@ -2060,6 +2123,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
         }
         let history = child_thread.session.clone_history().await;
         let mut instruction_count = 0;
+        let mut managed_instructions = Vec::new();
         for item in history.raw_items() {
             let ResponseItem::Message { role, content, .. } = item else {
                 continue;
@@ -2068,16 +2132,18 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                 continue;
             }
             for content_item in content {
-                if let ContentItem::InputText { text } = content_item
-                    && text == "Child developer instructions."
-                {
-                    instruction_count += 1;
+                if let ContentItem::InputText { text } = content_item {
+                    instruction_count += usize::from(text == "Child developer instructions.");
+                    if ManagedDeveloperInstructions::matches_text(text) {
+                        managed_instructions.push(text.as_str());
+                    }
                 }
             }
         }
         assert_eq!(
-            instruction_count, 1,
-            "{case}: canonical context reconstruction must not duplicate child developer instructions"
+            (instruction_count, managed_instructions),
+            (1, vec![current_managed_fragment.as_str()]),
+            "{case}: canonical context reconstruction must keep only the current child and managed developer instructions"
         );
 
         let _ = harness

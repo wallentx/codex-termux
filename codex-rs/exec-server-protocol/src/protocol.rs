@@ -97,7 +97,7 @@ pub struct EnvironmentInfo {
     /// On Windows, a command's `TEMP` or `TMP` overrides take precedence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporary_directories: Option<Vec<PathUri>>,
-    /// Executor-native temporary directory for private, child-visible sidecars.
+    /// Executor-native temporary directory for child-visible sidecars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_dir: Option<PathUri>,
     /// Optional executor features that clients must gate before sending newer request fields.
@@ -121,6 +121,9 @@ pub struct EnvironmentCapabilities {
     /// Whether filesystem streams can use the requested platform sandbox.
     #[serde(default)]
     pub sandboxed_file_streaming: bool,
+    /// Whether shell state can be cached and restored entirely inside the executor.
+    #[serde(default)]
+    pub shell_snapshot_v2: bool,
 }
 
 /// Status returned by an initialized exec-server connection.
@@ -183,6 +186,7 @@ impl EnvironmentInfo {
                 capability_discovery_sandbox: true,
                 environment_config_read: true,
                 sandboxed_file_streaming: true,
+                shell_snapshot_v2: cfg!(unix),
             },
         }
     }
@@ -219,6 +223,9 @@ pub struct ExecParams {
     pub cwd: PathUri,
     #[serde(default)]
     pub env_policy: Option<ExecEnvPolicy>,
+    /// Optional request to restore executor-owned, attachment-scoped shell state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_snapshot: Option<ShellSnapshotRequest>,
     pub env: HashMap<String, String>,
     pub tty: bool,
     /// Keep non-tty stdin writable through `process/write`.
@@ -252,6 +259,19 @@ pub struct ExecEnvPolicy {
     pub exclude: Vec<String>,
     pub r#set: HashMap<String, String>,
     pub include_only: Vec<String>,
+}
+
+/// Identifies shell state owned by one attachment within an executor session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellSnapshotRequest {
+    /// Attachment identity; executor sessions independently scope every cache.
+    pub scope_id: String,
+    /// Executor-native shell used to capture and restore the snapshot.
+    pub shell: ShellInfo,
+    /// Runtime-owned PATH entries to replay after restoring profile state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_path_prepends: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,9 +453,6 @@ pub struct FsCreateDirectoryParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
-    /// Atomically restrict a newly created, non-recursive directory to its owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub private: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,6 +869,7 @@ mod tests {
             argv: vec!["true".to_string()],
             cwd,
             env_policy: None,
+            shell_snapshot: None,
             env: HashMap::new(),
             tty: false,
             pipe_stdin: false,
@@ -946,6 +964,7 @@ mod tests {
                 capability_discovery_sandbox: true,
                 environment_config_read: false,
                 sandboxed_file_streaming: false,
+                shell_snapshot_v2: false,
             }
         );
     }
@@ -961,6 +980,7 @@ mod tests {
                 "capabilityDiscoverySandbox": false,
                 "environmentConfigRead": false,
                 "sandboxedFileStreaming": false,
+                "shellSnapshotV2": false,
             },
         });
         let info: EnvironmentInfo = serde_json::from_value(expected.clone())

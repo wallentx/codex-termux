@@ -118,6 +118,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -158,13 +159,22 @@ impl ThreadLifecycleContributor<Config> for WaitForEnvironmentTestExtension {
     }
 }
 
-struct ReadyCapabilityRootsTestExtension;
+#[derive(Default)]
+struct ReadyCapabilityRootsTestExtension {
+    observed_roots: Option<Arc<Mutex<Vec<Vec<SelectedCapabilityRoot>>>>>,
+}
 
 impl ContextContributor for ReadyCapabilityRootsTestExtension {
     fn contribute_world_state<'a>(
         &'a self,
         input: WorldStateContributionInput<'a>,
     ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
+        if let Some(observed_roots) = &self.observed_roots {
+            observed_roots
+                .lock()
+                .expect("observed capability roots should not be poisoned")
+                .push(input.ready_selected_capability_roots.to_vec());
+        }
         let root_ids = input
             .ready_selected_capability_roots
             .iter()
@@ -194,14 +204,7 @@ fn test_codex_with_wait_for_environment() -> TestCodexBuilder {
 }
 
 async fn unified_exec_test(server: &wiremock::MockServer) -> Result<TestCodex> {
-    let mut builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
-        let result = config.features.enable(Feature::UnifiedExec);
-        assert!(
-            result.is_ok(),
-            "unified exec should enable for test: {result:?}",
-        );
-    });
+    let mut builder = test_codex();
     builder.build_with_remote_and_local_env(server).await
 }
 
@@ -337,7 +340,7 @@ async fn remote_test_env_exposes_target_shell_to_model() -> Result<()> {
     let mut builder = test_codex().with_config(|config| {
         config
             .features
-            .disable(Feature::UnifiedExec)
+            .disable(Feature::ShellTool)
             .expect("test config should allow feature update");
     });
     let test = builder.build_with_auto_env(&server).await?;
@@ -346,7 +349,7 @@ async fn remote_test_env_exposes_target_shell_to_model() -> Result<()> {
 
     let request = response_mock.single_request();
     let tools = tool_names(&request.body_json());
-    assert!(!tools.contains(&"shell_command".to_string()));
+    assert!(!tools.contains(&"exec_command".to_string()));
     let environment_context = request
         .message_input_texts("user")
         .into_iter()
@@ -395,13 +398,7 @@ async fn explicit_remote_shell_runs_in_remote_cwd() -> Result<()> {
         "login": false,
         "yield_time_ms": 10_000,
     }))?;
-    let mut builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex();
     let test = builder.build_with_auto_env(&server).await?;
     let response_mock = mount_sse_sequence(
         &server,
@@ -458,11 +455,6 @@ async fn environment_permissions_follow_configuration_ownership() -> Result<()> 
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
         config
             .permissions
             .set_permission_profile(PermissionProfile::workspace_write())
@@ -1218,13 +1210,8 @@ async fn wait_for_response_request_count(response_mock: &ResponseMock, expected_
 async fn shared_executor_keeps_ready_capability_roots_scoped_to_each_attachment() -> Result<()> {
     let server = start_mock_server().await;
     let mut extensions = ExtensionRegistryBuilder::new();
-    extensions.prompt_contributor(Arc::new(ReadyCapabilityRootsTestExtension));
-    let mut builder = test_codex()
-        .with_extensions(Arc::new(extensions.build()))
-        .with_config(|config| {
-            config.use_experimental_unified_exec_tool = true;
-            assert!(config.features.enable(Feature::UnifiedExec).is_ok());
-        });
+    extensions.prompt_contributor(Arc::new(ReadyCapabilityRootsTestExtension::default()));
+    let mut builder = test_codex().with_extensions(Arc::new(extensions.build()));
     let test = builder.build_with_auto_env(&server).await?;
     let selection = test
         .codex
@@ -1484,13 +1471,11 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
     let server = start_mock_server().await;
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.thread_lifecycle_contributor(Arc::new(WaitForEnvironmentTestExtension));
-    extensions.prompt_contributor(Arc::new(ReadyCapabilityRootsTestExtension));
+    extensions.prompt_contributor(Arc::new(ReadyCapabilityRootsTestExtension::default()));
     let mut builder = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
-            config.use_experimental_unified_exec_tool = true;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
-            assert!(config.features.enable(Feature::UnifiedExec).is_ok());
             config
                 .permissions
                 .set_permission_profile(PermissionProfile::read_only())
@@ -1718,9 +1703,12 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
     Ok(())
 }
 
+#[test_case(true; "uses refreshed executor root")]
+#[test_case(false; "preserves persisted root when executor reports none")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ready_before_selection_exposes_remote_tools_and_capability_context_after_wait()
--> Result<()> {
+async fn ready_before_selection_resolves_resumed_thread_capability_root_after_wait(
+    executor_reports_refreshed_root: bool,
+) -> Result<()> {
     const WAIT_CALL_ID: &str = "wait-ready-before-selection";
 
     let rendezvous = TcpListener::bind("127.0.0.1:0").await?;
@@ -1804,24 +1792,37 @@ async fn ready_before_selection_exposes_remote_tools_and_capability_context_afte
         ],
     )
     .await;
+    let observed_roots = Arc::new(Mutex::new(Vec::new()));
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.thread_lifecycle_contributor(Arc::new(WaitForEnvironmentTestExtension));
-    extensions.prompt_contributor(Arc::new(ReadyCapabilityRootsTestExtension));
+    extensions.prompt_contributor(Arc::new(ReadyCapabilityRootsTestExtension {
+        observed_roots: Some(Arc::clone(&observed_roots)),
+    }));
     let mut builder = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
             config.project_doc_max_bytes = 0;
-            config.use_experimental_unified_exec_tool = true;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
-            assert!(config.features.enable(Feature::UnifiedExec).is_ok());
         });
     let test = builder.build(&server).await?;
-    let ready_root = SelectedCapabilityRoot {
+    let refreshed_root = SelectedCapabilityRoot {
         id: "ready-first-root".to_string(),
         location: CapabilityRootLocation::Environment {
             environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
             path: PathUri::parse("file:///ready-first-root")?,
         },
+    };
+    let stale_root = SelectedCapabilityRoot {
+        id: refreshed_root.id.clone(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+            path: PathUri::parse("file:///stale-ready-first-root")?,
+        },
+    };
+    let expected_root = if executor_reports_refreshed_root {
+        refreshed_root.clone()
+    } else {
+        stale_root.clone()
     };
     let environment = test
         .thread_manager
@@ -1829,7 +1830,11 @@ async fn ready_before_selection_exposes_remote_tools_and_capability_context_afte
         .report_environment_provisioning_status(
             REMOTE_ENVIRONMENT_ID.to_string(),
             Ok(EnvironmentReadyInfo {
-                selected_capability_roots: Vec::new(),
+                selected_capability_roots: if executor_reports_refreshed_root {
+                    vec![refreshed_root.clone()]
+                } else {
+                    Vec::new()
+                },
             }),
             Arc::new(ReadyNoiseConnectProvider {
                 websocket_url: format!("{rendezvous_url}/relay?role=harness"),
@@ -1867,26 +1872,45 @@ async fn ready_before_selection_exposes_remote_tools_and_capability_context_afte
         anyhow::Ok(())
     });
 
-    test.submit_turn_with_environments(
-        "use the ready environment",
-        Some(vec![TurnEnvironmentSelection {
-            environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-            cwd: PathUri::from_abs_path(&test.config.cwd),
-            workspace_roots: vec![PathUri::from_abs_path(&test.config.cwd)],
-            config: EnvironmentConfigState::Ready(EnvironmentConfig {
-                allow_login_shell: true,
-                permission_profile: PermissionProfileSnapshot::legacy(
-                    test.config.permissions.permission_profile().clone(),
-                ),
-                shell_environment_policy: Default::default(),
-                exec_policy: None,
-                mcp_policy: None,
-                network_policy: None,
-                selected_capability_roots: vec![ready_root],
-            }),
-        }]),
-    )
-    .await?;
+    let selection = TurnEnvironmentSelection {
+        environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+        cwd: PathUri::from_abs_path(&test.config.cwd),
+        workspace_roots: vec![PathUri::from_abs_path(&test.config.cwd)],
+        config: EnvironmentConfigState::FromThread,
+    };
+    let mut thread_extension_init = ExtensionDataInit::new();
+    thread_extension_init.insert(vec![stale_root]);
+    let resumed = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            environments: Some(vec![selection.clone()]),
+            thread_extension_init,
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+    resumed
+        .thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "use the ready environment".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&resumed.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(
+        resumed.thread.environment_selections().await,
+        vec![selection]
+    );
+    assert_eq!(
+        resumed
+            .thread
+            .inspect_selected_capability_roots()
+            .ready_roots,
+        vec![expected_root.clone()]
+    );
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
@@ -1930,6 +1954,14 @@ async fn ready_before_selection_exposes_remote_tools_and_capability_context_afte
             .iter()
             .any(|text| text.contains("<ready_capability_roots>ready-first-root"))
     );
+    let observed_selected_roots = observed_roots
+        .lock()
+        .expect("observed capability roots should not be poisoned")
+        .iter()
+        .rfind(|roots| roots.iter().any(|root| root.id == expected_root.id))
+        .cloned()
+        .context("selected capability root should reach world state")?;
+    assert_eq!(observed_selected_roots, vec![expected_root]);
 
     relay.abort();
     remote_environment.abort();
@@ -1959,9 +1991,7 @@ async fn deferred_executor_stays_pending_after_materialization() -> Result<()> {
     )
     .await;
     let mut builder = test_codex_with_wait_for_environment().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
         assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
-        assert!(config.features.enable(Feature::UnifiedExec).is_ok());
     });
     let test = timeout(Duration::from_secs(5), builder.build(&server))
         .await
@@ -2251,11 +2281,9 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment() -> Resul
         .with_exec_server_url(format!("ws://{}", listener.local_addr()?))
         .with_config(|config| {
             config.project_doc_max_bytes = 0;
-            config.use_experimental_unified_exec_tool = true;
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
-            assert!(config.features.enable(Feature::UnifiedExec).is_ok());
         });
     let (attach_tx, attach_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -2734,7 +2762,6 @@ async fn exec_command_routing_output(
     let tools = tool_names(&request.body_json());
     assert!(tools.contains(&"exec_command".to_string()));
     assert!(tools.contains(&"write_stdin".to_string()));
-    assert!(!tools.contains(&"shell_command".to_string()));
 
     Ok(output)
 }
@@ -2991,13 +3018,8 @@ async fn remote_request_permissions_grant_unblocks_later_remote_exec() -> Result
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config.approvals_reviewer = ApprovalsReviewer::User;
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)

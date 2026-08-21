@@ -32,6 +32,7 @@ pub(crate) struct GuardianV2Config {
     pub(crate) reasoning_effort: ReasoningEffort,
     pub(crate) max_action_tokens: usize,
     pub(crate) max_classifier_instruction_tokens: usize,
+    pub(crate) reuse_parent_compaction: bool,
     pub(crate) max_parent_compaction_tokens: usize,
     pub(crate) sandboxed_exec_commands: bool,
     pub(crate) transcript: TranscriptConfig,
@@ -74,6 +75,9 @@ impl GuardianV2Config {
                     .review_threshold_basis_points
                     .map(|basis_points| f64::from(basis_points) / 10_000.0)
             });
+            configured.max_tool_call_lag = configured
+                .max_tool_call_lag
+                .or(model_defaults.max_tool_call_lag);
             configured.reasoning_effort = configured
                 .reasoning_effort
                 .or_else(|| model_defaults.reasoning_effort.clone());
@@ -83,6 +87,9 @@ impl GuardianV2Config {
             configured.max_classifier_instruction_tokens = configured
                 .max_classifier_instruction_tokens
                 .or(model_defaults.max_classifier_instruction_tokens);
+            configured.reuse_parent_compaction = configured
+                .reuse_parent_compaction
+                .or(model_defaults.reuse_parent_compaction);
             configured.max_parent_compaction_tokens = configured
                 .max_parent_compaction_tokens
                 .or(model_defaults.max_parent_compaction_tokens);
@@ -108,6 +115,9 @@ impl GuardianV2Config {
                             .collect::<Result<Vec<_>, _>>()?,
                     );
                 }
+                transcript.include_images = transcript
+                    .include_images
+                    .or(model_transcript.include_images);
                 transcript.max_message_entry_tokens = transcript
                     .max_message_entry_tokens
                     .or(model_transcript.max_message_entry_tokens);
@@ -233,6 +243,7 @@ impl GuardianV2Config {
             reasoning_effort: configured.reasoning_effort.unwrap_or(ReasoningEffort::Low),
             max_action_tokens,
             max_classifier_instruction_tokens,
+            reuse_parent_compaction: configured.reuse_parent_compaction.unwrap_or(true),
             max_parent_compaction_tokens,
             sandboxed_exec_commands: configured
                 .review_scope

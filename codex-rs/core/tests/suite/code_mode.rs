@@ -97,7 +97,6 @@ use image::metadata::Orientation;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -384,7 +383,7 @@ async fn missing_process_host_keeps_code_mode_only_and_fails_closed() -> Result<
     assert!(
         tools
             .iter()
-            .all(|name| { !matches!(name.as_str(), "shell" | "shell_command" | "exec_command") }),
+            .all(|name| !matches!(name.as_str(), "shell" | "exec_command")),
         "code-mode-only must never expose direct shell tools: {tools:?}"
     );
     let (output, _) = custom_tool_output_body_and_success(&request, "call-1");
@@ -3686,48 +3685,6 @@ text("after");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_output_images_via_global_helper() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to return images",
-        r#"
-image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==");
-"#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(false),
-        "code_mode image output failed unexpectedly"
-    );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(
-        items[1],
-        serde_json::json!({
-            "type": "input_image",
-            "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
-            "detail": "high"
-        }),
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_replaces_malformed_image() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -5117,118 +5074,6 @@ text(`echo=${result.structuredContent.echo}`);
         "exec normalized rmcp tool call failed unexpectedly: {output}"
     );
     assert_eq!(output, "echo=ECHOING: ping");
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_lists_global_scope_items() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let code = r#"
-text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
-"#;
-
-    let (_test, second_mock) =
-        run_code_mode_turn_with_rmcp(&server, "use exec to inspect global scope", code).await?;
-
-    let req = second_mock.single_request();
-    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(false),
-        "exec global scope inspection failed unexpectedly: {output}"
-    );
-    let globals = serde_json::from_str::<Vec<String>>(&output)?;
-    let globals = globals.into_iter().collect::<HashSet<_>>();
-    let expected = [
-        "AggregateError",
-        "ALL_TOOLS",
-        "Array",
-        "ArrayBuffer",
-        "AsyncDisposableStack",
-        "BigInt",
-        "BigInt64Array",
-        "BigUint64Array",
-        "Boolean",
-        "clearTimeout",
-        "DataView",
-        "Date",
-        "DisposableStack",
-        "Error",
-        "EvalError",
-        "FinalizationRegistry",
-        "Float16Array",
-        "Float32Array",
-        "Float64Array",
-        "Function",
-        "Infinity",
-        "Int16Array",
-        "Int32Array",
-        "Int8Array",
-        "Intl",
-        "Iterator",
-        "JSON",
-        "Map",
-        "Math",
-        "NaN",
-        "Number",
-        "Object",
-        "Promise",
-        "Proxy",
-        "RangeError",
-        "ReferenceError",
-        "Reflect",
-        "RegExp",
-        "Set",
-        "String",
-        "SuppressedError",
-        "Symbol",
-        "SyntaxError",
-        "Temporal",
-        "TypeError",
-        "URIError",
-        "Uint16Array",
-        "Uint32Array",
-        "Uint8Array",
-        "Uint8ClampedArray",
-        "WeakMap",
-        "WeakRef",
-        "WeakSet",
-        "__codexContentItems",
-        "add_content",
-        "audio",
-        "decodeURI",
-        "decodeURIComponent",
-        "encodeURI",
-        "encodeURIComponent",
-        "escape",
-        "exit",
-        "eval",
-        "generatedImage",
-        "globalThis",
-        "image",
-        "isFinite",
-        "isNaN",
-        "load",
-        "notify",
-        "parseFloat",
-        "parseInt",
-        "setTimeout",
-        "store",
-        "text",
-        "tools",
-        "undefined",
-        "unescape",
-        "yield_control",
-    ];
-    for g in &globals {
-        assert!(
-            expected.contains(&g.as_str()),
-            "unexpected global {g} in {globals:?}"
-        );
-    }
 
     Ok(())
 }
