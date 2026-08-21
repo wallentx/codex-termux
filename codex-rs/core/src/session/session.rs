@@ -6,6 +6,8 @@ use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
+use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::state::ActiveTurn;
 use codex_extension_api::ExtensionDataInit;
@@ -361,14 +363,6 @@ impl SessionConfiguration {
         let current_file_system_sandbox_policy =
             self.file_system_sandbox_policy(current_environments);
         let current_network_sandbox_policy = self.network_sandbox_policy();
-        let legacy_file_system_projection =
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
-                &current_sandbox_policy,
-                self.cwd(),
-                &current_file_system_sandbox_policy,
-            );
-        let file_system_policy_matches_legacy = current_file_system_sandbox_policy
-            .is_semantically_equivalent_to(&legacy_file_system_projection, self.cwd());
         let file_system_policy_has_rebindable_project_root_write =
             current_file_system_sandbox_policy
                 .entries
@@ -503,8 +497,15 @@ impl SessionConfiguration {
                     ),
                 )?;
         } else if cwd_changed
-            && file_system_policy_matches_legacy
             && file_system_policy_has_rebindable_project_root_write
+            && current_file_system_sandbox_policy.is_semantically_equivalent_to(
+                &FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
+                    &current_sandbox_policy,
+                    self.cwd(),
+                    &current_file_system_sandbox_policy,
+                ),
+                self.cwd(),
+            )
         {
             // Preserve richer split policies across cwd-only updates; only
             // rederive when the session is already using a structurally
@@ -637,6 +638,22 @@ impl Session {
     pub(crate) async fn originator(&self) -> String {
         let state = self.state.lock().await;
         state.session_configuration.originator.clone()
+    }
+
+    pub(crate) async fn responses_metadata(
+        &self,
+        turn_context: &TurnContext,
+        request_kind: CodexResponsesRequestKind,
+    ) -> CodexResponsesMetadata {
+        let (window_id, context_window_id) = self.current_window().await;
+        CodexResponsesMetadata {
+            context_window_id: Some(context_window_id),
+            ..turn_context.turn_metadata_state.to_responses_metadata(
+                self.installation_id.clone(),
+                window_id,
+                request_kind,
+            )
+        }
     }
 
     #[instrument(name = "session_init", level = "info", skip_all)]
