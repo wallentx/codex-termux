@@ -58,7 +58,7 @@ members = [
     "ext/extension-api",
     "ext/goal",
     "ext/git-attribution",
-    "ext/guardian",
+    "ext/guardian-v2",
     "ext/image-generation",
     "ext/items",
     "ext/memories",
@@ -98,6 +98,7 @@ members = [
     "websocket-client",
     "workload-identity",
     "utils/absolute-path",
+    "utils/audio",
     "utils/path-uri",
     "utils/cargo-bin",
     "git-utils",
@@ -166,7 +167,6 @@ codex-arg0 = { path = "arg0" }
 codex-async-utils = { path = "async-utils" }
 codex-backend-client = { path = "backend-client" }
 codex-chatgpt = { path = "chatgpt" }
-codex-cli = { path = "cli" }
 codex-client = { path = "codex-client" }
 codex-collaboration-mode-templates = { path = "collaboration-mode-templates" }
 codex-cloud-config = { path = "cloud-config" }
@@ -197,7 +197,7 @@ codex-extension-api = { path = "ext/extension-api" }
 codex-extension-items = { path = "ext/items" }
 codex-goal-extension = { path = "ext/goal" }
 codex-git-attribution = { path = "ext/git-attribution" }
-codex-guardian = { path = "ext/guardian" }
+codex-guardian-v2 = { path = "ext/guardian-v2" }
 codex-image-generation-extension = { path = "ext/image-generation" }
 codex-external-agent-migration = { path = "external-agent-migration" }
 codex-experimental-api-macros = { path = "codex-experimental-api-macros" }
@@ -253,6 +253,7 @@ codex-tui = { path = "tui" }
 codex-uds = { path = "uds" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-approval-presets = { path = "utils/approval-presets" }
+codex-utils-audio = { path = "utils/audio" }
 codex-utils-cache = { path = "utils/cache" }
 codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }
@@ -275,6 +276,7 @@ codex-utils-stream-parser = { path = "utils/stream-parser" }
 codex-utils-string = { path = "utils/string" }
 codex-utils-template = { path = "utils/template" }
 codex-v8-poc = { path = "v8-poc" }
+codex-workload-identity = { path = "workload-identity" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
 core_test_support = { path = "core/tests/common" }
 mcp_test_support = { path = "mcp-server/tests/common" }
@@ -358,7 +360,7 @@ libc = "0.2.182"
 # https://www.sqlite.org/wal.html#the_wal_reset_bug
 libsqlite3-sys = { version = "0.37", default-features = false }
 log = "0.4"
-lru = "0.16.3"
+lru = "0.18.2"
 maplit = "1.0.2"
 memchr = "2.7.6"
 mime_guess = "2.0.5"
@@ -394,8 +396,9 @@ rcgen = { version = "0.14.7", default-features = false, features = [
 regex = "1.12.3"
 regex-lite = "0.1.8"
 reqwest = { version = "0.12", features = ["cookies"] }
-rmcp = { version = "=3.0.0", default-features = false }
+rmcp = { version = "=3.1.3", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
+rustix = { version = "1.1.4", features = ["net"] }
 rustls = { version = "0.23", default-features = false, features = [
     "aws_lc_rs",
     "std",
@@ -472,6 +475,7 @@ tonic = { version = "0.14.3", default-features = false, features = ["channel", "
 tonic-prost = "0.14.3"
 tree-sitter = "0.25.10"
 tree-sitter-bash = "0.25"
+tree-sitter-powershell = "=0.26.4"
 ts-rs = "11"
 tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }
 uds_windows = "1.1.0"
@@ -483,7 +487,7 @@ uuid = "1"
 v8 = "=150.4.0"
 vt100 = "0.16.2"
 walkdir = "2.5.0"
-webbrowser = "1.0"
+webbrowser = "1.2.2"
 which = "8"
 whoami = "1.6.1"
 wildmatch = "2.6.1"
@@ -581,7 +585,7 @@ opt-level = 0
 [patch.crates-io]
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
-crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "f69a4a0499f2fdc7d5d222df32373ffffe9ba3f5" }
+crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "45fecb9508105988f42fe6ff0441783ed3717f92" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 

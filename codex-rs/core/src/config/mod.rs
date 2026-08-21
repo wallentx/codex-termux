@@ -1,5 +1,6 @@
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
+use crate::context::world_state::validate_managed_developer_instructions;
 use crate::guardian::BUNDLED_GUARDIAN_POLICY;
 use crate::path_utils::normalize_for_native_workdir;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
@@ -159,6 +160,7 @@ mod managed_features;
 mod network_proxy_spec;
 mod otel;
 mod permission_profile_catalog;
+mod permission_profile_selection;
 mod permissions;
 mod requirements;
 mod resolved_permission_profile;
@@ -182,6 +184,8 @@ pub use permission_profile_catalog::permission_profile_catalog;
 use permission_profile_catalog::permission_profile_catalog_from_permissions;
 use permission_profile_catalog::permission_profile_is_allowed;
 use permission_profile_catalog::validate_permission_profile_for_deny_read;
+pub use permission_profile_selection::ResolvedPermissionProfileSelection;
+pub use permission_profile_selection::resolve_permission_profile_selection;
 pub(crate) use permissions::is_builtin_permission_profile_name;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
 
@@ -986,9 +990,6 @@ pub struct Config {
 
     /// Configuration for the experimental code-mode tool surface.
     pub code_mode: CodeModeConfig,
-
-    /// If set to `true`, used only the experimental unified exec tool.
-    pub use_experimental_unified_exec_tool: bool,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
     /// Default: `300000` (5 minutes).
@@ -3105,6 +3106,12 @@ impl Config {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             })?;
         }
+        validate_managed_developer_instructions(
+            config_layer_stack
+                .requirements()
+                .additional_developer_instructions
+                .as_ref(),
+        )?;
         let orchestrator = cfg.orchestrator.as_ref();
         let orchestrator_skills_enabled =
             resolve_orchestrator_feature_enabled(orchestrator.and_then(|value| value.skills.as_ref()));
@@ -3153,6 +3160,7 @@ impl Config {
             enforce_residency,
             network: network_requirements,
             filesystem: filesystem_requirements,
+            additional_developer_instructions: _,
             guardian_policy_config_source: _,
         } = config_layer_stack.requirements().clone();
 
@@ -3763,8 +3771,6 @@ impl Config {
             config
         };
 
-        let use_experimental_unified_exec_tool = features.enabled(Feature::UnifiedExec);
-
         let forced_chatgpt_workspace_id = cfg
             .forced_chatgpt_workspace_id
             .clone()
@@ -4164,7 +4170,6 @@ impl Config {
             update_plan_enabled,
             tool_registry,
             code_mode,
-            use_experimental_unified_exec_tool,
             background_terminal_max_timeout,
             ghost_snapshot,
             multi_agent_v2,
