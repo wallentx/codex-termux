@@ -829,7 +829,6 @@ impl MessageProcessor {
 
     /// Handle an error object received from the peer.
     pub(crate) async fn process_error(&self, err: JSONRPCError) {
-        tracing::error!("<- error: {:?}", err);
         self.outgoing.notify_client_error(err.id, err.error).await;
     }
 
@@ -1542,9 +1541,12 @@ impl MessageProcessor {
                     .login_account(request_id.clone(), params)
                     .await
             }
-            ClientRequest::BedrockDiscover { .. } | ClientRequest::BedrockSetup { .. } => Err(
-                crate::error_code::method_not_found("Amazon Bedrock setup is not implemented"),
-            ),
+            ClientRequest::BedrockDiscover { params, .. } => {
+                self.account_processor.bedrock_discover(params).await
+            }
+            ClientRequest::BedrockSetup { params, .. } => {
+                self.account_processor.bedrock_setup(params).await
+            }
             ClientRequest::LogoutAccount { .. } => {
                 self.account_processor
                     .logout_account(request_id.clone())
