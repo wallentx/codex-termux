@@ -7,9 +7,12 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use codex_core::GuardianAuthorizationVersion;
 use codex_core::GuardianRootMessage;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_core::context::ContextualUserFragment;
+use codex_core::context::GuardianReviewEvidence;
 use codex_core::context::NodeReplReviewEvidence;
 use codex_extension_api::ApprovalReviewContributor;
 use codex_extension_api::ExtensionData;
@@ -328,6 +331,7 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                         metrics: input.extension_metrics.clone(),
                         ..Default::default()
                     });
+                    input.thread_store.insert(GuardianReviewEvidence::default());
                     input.thread_store.insert(GuardianV2Enabled);
                 }
                 Err(error) => self.event_sink.emit_warning(ExtensionWarning {
@@ -440,7 +444,57 @@ impl GuardianV2Extension {
         }
         let metrics = score_progress.metrics.clone();
         let sampled_at = SystemTime::now();
+        let tool_call_index = score_progress
+            .latest_tool_call
+            .fetch_add(/*val*/ 1, Ordering::Relaxed)
+            .saturating_add(1);
+        let event_sink = Arc::clone(&self.event_sink);
+        let thread_id = input.thread_store.level_id().to_owned();
+        let turn_id = input.turn_id.to_owned();
+        let thread_context: Result<_, String> = async {
+            let parsed_thread_id =
+                ThreadId::from_string(&thread_id).map_err(|error| error.to_string())?;
+            let manager = self
+                .thread_manager
+                .upgrade()
+                .ok_or_else(|| "thread manager is unavailable".to_string())?;
+            let thread = manager
+                .get_thread(parsed_thread_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let config = thread.config().await;
+            Ok((manager, thread, config))
+        }
+        .await;
+        let (manager, thread, config) = match thread_context {
+            Ok(context) => context,
+            Err(error) => {
+                score_progress
+                    .latest_failed_tool_call
+                    .fetch_max(tool_call_index, Ordering::Release);
+                record_classification(
+                    metrics.as_deref(),
+                    classification_started_at.elapsed(),
+                    "failure",
+                );
+                event_sink.emit_warning(ExtensionWarning {
+                    thread_id,
+                    turn_id: Some(turn_id),
+                    message: format!("Guardian V2 risk scoring failed: {error}"),
+                });
+                return;
+            }
+        };
         let parent_model = input.thread_store.get::<ModelInfo>();
+        if parent_model.as_ref().is_some_and(|model| {
+            config
+                .config_layer_stack
+                .requirements()
+                .auto_review_required_for_model(&model.slug)
+        }) {
+            input.thread_store.remove::<SecurityRiskScore>();
+            return;
+        }
         let model_defaults = parent_model
             .as_ref()
             .and_then(|model| model.model_messages.as_ref())
@@ -469,10 +523,6 @@ impl GuardianV2Extension {
                 .enable_image_capture();
         }
         input.thread_store.insert(guardian_config.clone());
-        let tool_call_index = score_progress
-            .latest_tool_call
-            .fetch_add(/*val*/ 1, Ordering::Relaxed)
-            .saturating_add(1);
         let latest_parent_compaction = if guardian_config.reuse_parent_compaction {
             input
                 .conversation_history
@@ -516,10 +566,6 @@ impl GuardianV2Extension {
             );
             return;
         }
-        let event_sink = Arc::clone(&self.event_sink);
-        let thread_manager = self.thread_manager.clone();
-        let thread_id = input.thread_store.level_id().to_owned();
-        let turn_id = input.turn_id.to_owned();
         let action = GuardianAction {
             tool_name: input.tool_name.clone(),
             payload: input.payload.clone(),
@@ -531,6 +577,11 @@ impl GuardianV2Extension {
             .as_ref()
             .and_then(|model| model.auto_review_model_override.clone());
         let conversation_history = Arc::clone(&input.conversation_history);
+        // Snapshot before spawning so a delayed sample cannot see later reviews.
+        let sync_reviews = input
+            .thread_store
+            .get_or_init(GuardianReviewEvidence::default)
+            .snapshot();
         let node_repl_images = if guardian_config.transcript.include_images {
             input
                 .thread_store
@@ -542,39 +593,13 @@ impl GuardianV2Extension {
         };
 
         tokio::spawn(async move {
-            let thread_context: Result<_, String> = async {
-                let parsed_thread_id =
-                    ThreadId::from_string(&thread_id).map_err(|error| error.to_string())?;
-                let manager = thread_manager
-                    .upgrade()
-                    .ok_or_else(|| "thread manager is unavailable".to_string())?;
-                let thread = manager
-                    .get_thread(parsed_thread_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok((manager, thread))
-            }
-            .await;
-            let (manager, thread) = match thread_context {
-                Ok(context) => context,
-                Err(error) => {
-                    score_progress
-                        .latest_failed_tool_call
-                        .fetch_max(tool_call_index, Ordering::Release);
-                    record_classification(
-                        metrics.as_deref(),
-                        classification_started_at.elapsed(),
-                        "failure",
-                    );
-                    event_sink.emit_warning(ExtensionWarning {
-                        thread_id,
-                        turn_id: Some(turn_id),
-                        message: format!("Guardian V2 risk scoring failed: {error}"),
-                    });
-                    return;
-                }
-            };
-            let root_conversation = thread.guardian_root_conversation().await;
+            let root_snapshot = thread.guardian_root_snapshot().await;
+            let root_authorization_version = root_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.authorization_version);
+            let root_conversation = root_snapshot.map(|snapshot| snapshot.messages);
+            let authorization_version =
+                GuardianAuthorizationVersion::from_history(conversation_history.as_ref());
             let transcript = guardian_config
                 .transcript
                 .build(conversation_history.items());
@@ -617,8 +642,16 @@ impl GuardianV2Extension {
             }
             classification_input.push(">>> TRANSCRIPT START\n".to_owned());
             classification_input.extend(transcript);
+            classification_input.push(">>> TRANSCRIPT END\n\n".to_owned());
+            let trusted_review_evidence = sync_reviews
+                .iter()
+                .filter(|review| {
+                    review.authorization_version == authorization_version
+                        && review.root_authorization_version == root_authorization_version
+                })
+                .map(ContextualUserFragment::render)
+                .collect();
             classification_input.extend([
-                ">>> TRANSCRIPT END\n\n".to_owned(),
                 "The Codex agent has requested the following action:\n".to_owned(),
                 ">>> APPROVAL REQUEST START\n".to_owned(),
                 "Planned action JSON:\n".to_owned(),
@@ -627,7 +660,6 @@ impl GuardianV2Extension {
             ]);
             let mut classification_finished_at = None;
             let result: Result<&str, String> = async {
-                let config = thread.config().await;
                 let review_model_messages = if config.guardian_policy_config.is_none() {
                     let review_model_id = review_model_override.as_deref().unwrap_or_else(|| {
                         create_model_provider(
@@ -656,6 +688,7 @@ impl GuardianV2Extension {
                 let output = match sampler
                     .sample(LunaSamplingRequest {
                         instructions,
+                        trusted_review_evidence,
                         input: classification_input,
                         images,
                         parent_compaction,

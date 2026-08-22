@@ -9,11 +9,14 @@ use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use serde_json::Map;
+use serde_json::Value;
 
 use super::common;
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerRunResult;
+use crate::engine::HandlerSourcePath;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
 use crate::schema::NullableString;
@@ -28,6 +31,7 @@ pub struct StopRequest {
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
+    pub request_metadata: Option<Map<String, Value>>,
     pub stop_hook_active: bool,
     pub last_assistant_message: Option<String>,
     pub target: StopHookTarget,
@@ -88,6 +92,7 @@ pub(crate) fn preview(
         request.target.matcher_input(),
     )
     .into_iter()
+    .filter(|handler| matches!(handler.source_path, HandlerSourcePath::Local(_)))
     .map(|handler| dispatcher::running_summary(&handler))
     .collect()
 }
@@ -173,12 +178,13 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
         }
     };
 
-    let results = dispatcher::execute_handlers(
+    let results = dispatcher::execute_handlers_with_metadata(
         engine,
         matched,
         input_json,
         request.cwd.as_path(),
         Some(request.turn_id),
+        request.request_metadata.as_ref(),
         parse_completed,
     )
     .await;
@@ -645,7 +651,7 @@ mod tests {
             timeout_sec: 600,
             status_message: None,
             additional_context_limit: Default::default(),
-            source_path: test_path_buf("/tmp/hooks.json").abs(),
+            source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: codex_protocol::protocol::HookSource::User,
             display_order: 0,
             kind: crate::engine::ConfiguredHandlerKind::Command {
