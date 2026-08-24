@@ -4,7 +4,6 @@ use super::REMOTE_WORKSPACE_MARKETPLACE_NAME;
 use super::REMOTE_WORKSPACE_SHARED_WITH_ME_MARKETPLACE_NAME;
 use super::REMOTE_WORKSPACE_SHARED_WITH_ME_PRIVATE_MARKETPLACE_NAME;
 use super::REMOTE_WORKSPACE_SHARED_WITH_ME_UNLISTED_MARKETPLACE_NAME;
-use super::RemoteInstalledPlugin;
 use super::RemoteInstalledPluginScope;
 use super::RemotePluginCatalogError;
 use super::RemotePluginScope;
@@ -12,6 +11,7 @@ use super::RemotePluginServiceConfig;
 use super::RemotePluginShareDiscoverability;
 use super::ensure_chatgpt_auth;
 use super::fetch_installed_plugins;
+use super::remote_plugin_canonical_marketplace_name;
 use crate::store::PLUGINS_CACHE_DIR;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
@@ -51,13 +51,6 @@ pub struct RemoteInstalledPluginBundleSyncOutcome {
     pub materialized_remote_plugins: Vec<RemotePluginMaterialization>,
     pub removed_cache_plugin_ids: Vec<String>,
     pub failed_remote_plugin_ids: Vec<String>,
-    /// Failures that leave an otherwise valid installed plugin unavailable locally.
-    pub failed_materialization_remote_plugin_ids: Vec<String>,
-}
-
-pub(crate) struct RemoteInstalledPluginBundleSyncResult {
-    pub(crate) outcome: RemoteInstalledPluginBundleSyncOutcome,
-    pub(crate) installed_plugins: Vec<RemoteInstalledPlugin>,
 }
 
 impl RemoteInstalledPluginBundleSyncOutcome {
@@ -73,12 +66,6 @@ pub enum RemoteInstalledPluginBundleSyncError {
 
     #[error("{0}")]
     Store(#[from] PluginStoreError),
-
-    #[error("timed out waiting for another remote plugin cache mutation; retry")]
-    LockTimeout,
-
-    #[error("remote plugin state changed during reconciliation; retry reconciliation")]
-    Superseded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -113,44 +100,15 @@ pub async fn sync_remote_installed_plugin_bundles_once(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
 ) -> Result<RemoteInstalledPluginBundleSyncOutcome, RemoteInstalledPluginBundleSyncError> {
-    let result =
-        sync_remote_installed_plugin_bundles_once_with_snapshot(codex_home, config, auth).await?;
-    Ok(result.outcome)
-}
-
-pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
-    codex_home: PathBuf,
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-) -> Result<RemoteInstalledPluginBundleSyncResult, RemoteInstalledPluginBundleSyncError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let authenticated_account_id = auth.get_account_id();
-    let fetched_installed_plugins = fetch_installed_plugins(
+    let installed_plugins = fetch_installed_plugins(
         config,
         auth,
         RemoteInstalledPluginScope::All,
         /*include_download_urls*/ true,
     )
     .await?;
-    // `/installed` is an authoritative full snapshot. If any row cannot be
-    // canonicalized to a local cache key, omitting it makes an installed plugin
-    // indistinguishable from an uninstall, so reject the pass before downloads,
-    // publication, or stale cleanup.
-    let mut validated_installed_plugins = Vec::with_capacity(fetched_installed_plugins.len());
-    for installed_plugin in fetched_installed_plugins {
-        let cached_plugin = super::remote_installed_plugin_to_cache_entry(&installed_plugin)?;
-        let plugin_id = PluginId::new(
-            installed_plugin.plugin.name.clone(),
-            cached_plugin.marketplace_name.clone(),
-        )
-        .map_err(|err| {
-            RemotePluginCatalogError::UnexpectedResponse(format!(
-                "remote installed plugin `{}` has an invalid local cache id: {err}",
-                installed_plugin.plugin.id
-            ))
-        })?;
-        validated_installed_plugins.push((installed_plugin, cached_plugin, plugin_id));
-    }
     let store = PluginStore::try_new(codex_home.clone())?;
     let mut installed_plugin_names_by_marketplace =
         BTreeMap::<String, BTreeSet<String>>::from_iter([
@@ -178,27 +136,37 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
         ]);
     let mut materialized_remote_plugins = BTreeMap::new();
     let mut failed_remote_plugin_ids = BTreeSet::new();
-    let mut failed_materialization_remote_plugin_ids = BTreeSet::new();
-    let mut installed_plugins = Vec::new();
 
-    for (installed_plugin, cached_plugin, plugin_id) in validated_installed_plugins {
-        let marketplace_name = cached_plugin.marketplace_name.clone();
+    for installed_plugin in installed_plugins {
         let plugin = installed_plugin.plugin;
         let scope = plugin.scope;
         let discoverability = plugin.discoverability;
+        let marketplace_name = remote_plugin_canonical_marketplace_name(&plugin)?.to_string();
         installed_plugin_names_by_marketplace
             .entry(marketplace_name.clone())
             .or_default()
             .insert(plugin.name.clone());
+        let plugin_id = match PluginId::new(plugin.name.clone(), marketplace_name.clone()) {
+            Ok(plugin_id) => plugin_id,
+            Err(err) => {
+                warn!(
+                    remote_plugin_id = %plugin.id,
+                    plugin = %plugin.name,
+                    marketplace = %marketplace_name,
+                    error = %err,
+                    "skipping remote installed plugin with invalid local cache id"
+                );
+                failed_remote_plugin_ids.insert(plugin.id);
+                continue;
+            }
+        };
         let release_version = plugin
             .release
             .version
             .as_deref()
             .map(str::trim)
             .filter(|version| !version.is_empty());
-        if let Some(release_version) = release_version
-            && store.active_plugin_version(&plugin_id).as_deref() == Some(release_version)
-        {
+        if store.active_plugin_version(&plugin_id).as_deref() == release_version {
             if let Err(err) = store.write_remote_plugin_id(&plugin_id, &plugin.id) {
                 warn!(
                     remote_plugin_id = %plugin.id,
@@ -209,7 +177,6 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
                 );
                 failed_remote_plugin_ids.insert(plugin.id);
             }
-            installed_plugins.push(cached_plugin);
             continue;
         }
 
@@ -230,9 +197,7 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
                     error = %err,
                     "skipping remote installed plugin bundle download"
                 );
-                failed_remote_plugin_ids.insert(plugin.id.clone());
-                failed_materialization_remote_plugin_ids.insert(plugin.id);
-                installed_plugins.push(cached_plugin);
+                failed_remote_plugin_ids.insert(plugin.id);
                 continue;
             }
         };
@@ -264,51 +229,34 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
                     error = %err,
                     "failed to download remote installed plugin bundle"
                 );
-                failed_remote_plugin_ids.insert(plugin.id.clone());
-                failed_materialization_remote_plugin_ids.insert(plugin.id);
+                failed_remote_plugin_ids.insert(plugin.id);
             }
         }
-        installed_plugins.push(cached_plugin);
     }
 
-    installed_plugins.sort_by(|left, right| {
-        left.marketplace_name
-            .cmp(&right.marketplace_name)
-            .then_with(|| left.id.cmp(&right.id))
-    });
     let stale_cache_cleanup = tokio::task::spawn_blocking(move || {
-        let mut removed_cache_plugin_ids = Vec::new();
-        let cleanup_error = remove_stale_remote_plugin_caches(
+        remove_stale_remote_plugin_caches(
             codex_home.as_path(),
             &installed_plugin_names_by_marketplace,
-            &mut removed_cache_plugin_ids,
         )
-        .err();
-        removed_cache_plugin_ids.sort();
-        (removed_cache_plugin_ids, cleanup_error)
     })
     .await;
-    let (removed_cache_plugin_ids, cleanup_error) = match stale_cache_cleanup {
-        Ok(result) => result,
+    let removed_cache_plugin_ids = match stale_cache_cleanup {
+        Ok(Ok(removed_cache_plugin_ids)) => removed_cache_plugin_ids,
+        Ok(Err(err)) => {
+            warn!(error = %err, "failed to remove stale remote plugin cache entries");
+            Vec::new()
+        }
         Err(err) => {
             warn!(error = %err, "failed to join stale remote plugin cache cleanup task");
-            (Vec::new(), Some(err.to_string()))
+            Vec::new()
         }
     };
-    if let Some(err) = cleanup_error {
-        warn!(error = %err, "failed to remove stale remote plugin cache entries");
-    }
 
-    Ok(RemoteInstalledPluginBundleSyncResult {
-        outcome: RemoteInstalledPluginBundleSyncOutcome {
-            materialized_remote_plugins: materialized_remote_plugins.into_values().collect(),
-            removed_cache_plugin_ids,
-            failed_remote_plugin_ids: failed_remote_plugin_ids.into_iter().collect(),
-            failed_materialization_remote_plugin_ids: failed_materialization_remote_plugin_ids
-                .into_iter()
-                .collect(),
-        },
-        installed_plugins,
+    Ok(RemoteInstalledPluginBundleSyncOutcome {
+        materialized_remote_plugins: materialized_remote_plugins.into_values().collect(),
+        removed_cache_plugin_ids,
+        failed_remote_plugin_ids: failed_remote_plugin_ids.into_iter().collect(),
     })
 }
 
@@ -353,8 +301,8 @@ impl Drop for RemotePluginCacheMutationGuard {
 fn remove_stale_remote_plugin_caches(
     codex_home: &Path,
     installed_plugin_names_by_marketplace: &BTreeMap<String, BTreeSet<String>>,
-    removed_cache_plugin_ids: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    let mut removed_cache_plugin_ids = Vec::new();
     for marketplace_name in [
         REMOTE_GLOBAL_MARKETPLACE_NAME,
         REMOTE_CREATED_BY_ME_MARKETPLACE_NAME,
@@ -421,7 +369,8 @@ fn remove_stale_remote_plugin_caches(
         }
     }
 
-    Ok(())
+    removed_cache_plugin_ids.sort();
+    Ok(removed_cache_plugin_ids)
 }
 
 fn remote_plugin_cache_root(codex_home: &Path) -> PathBuf {
@@ -461,7 +410,7 @@ mod tests {
     use wiremock::matchers::query_param_is_missing;
 
     #[tokio::test]
-    async fn sync_same_version_backfills_metadata_and_missing_version_requires_materialization() {
+    async fn sync_same_version_backfills_metadata_without_materialization() {
         let server = MockServer::start().await;
         let codex_home = tempfile::tempdir().expect("create codex home");
         let cached_manifest = codex_home
@@ -483,37 +432,21 @@ mod tests {
             .and(query_param("limit", "200"))
             .and(query_param("includeDownloadUrls", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "plugins": [
-                    {
-                        "id": remote_plugin_id,
-                        "name": "linear",
-                        "scope": "GLOBAL",
-                        "installation_policy": "AVAILABLE",
-                        "authentication_policy": "ON_USE",
-                        "status": "ENABLED",
-                        "release": {
-                            "version": "1.2.3",
-                            "display_name": "Linear",
-                            "description": "Track work",
-                            "interface": {},
-                        },
-                        "enabled": true,
+                "plugins": [{
+                    "id": remote_plugin_id,
+                    "name": "linear",
+                    "scope": "GLOBAL",
+                    "installation_policy": "AVAILABLE",
+                    "authentication_policy": "ON_USE",
+                    "status": "ENABLED",
+                    "release": {
+                        "version": "1.2.3",
+                        "display_name": "Linear",
+                        "description": "Track work",
+                        "interface": {},
                     },
-                    {
-                        "id": "plugins~Plugin_missing_version",
-                        "name": "missing-version",
-                        "scope": "GLOBAL",
-                        "installation_policy": "AVAILABLE",
-                        "authentication_policy": "ON_USE",
-                        "status": "ENABLED",
-                        "release": {
-                            "display_name": "Missing version",
-                            "description": "Needs materialization",
-                            "interface": {},
-                        },
-                        "enabled": true,
-                    },
-                ],
+                    "enabled": true,
+                }],
                 "pagination": {"next_page_token": null},
             })))
             .expect(1)
@@ -533,16 +466,7 @@ mod tests {
         .await
         .expect("sync current remote plugin bundle");
 
-        assert_eq!(
-            outcome,
-            RemoteInstalledPluginBundleSyncOutcome {
-                failed_remote_plugin_ids: vec!["plugins~Plugin_missing_version".to_string()],
-                failed_materialization_remote_plugin_ids: vec![
-                    "plugins~Plugin_missing_version".to_string()
-                ],
-                ..RemoteInstalledPluginBundleSyncOutcome::default()
-            }
-        );
+        assert_eq!(outcome, RemoteInstalledPluginBundleSyncOutcome::default());
         let plugin_id = PluginId::new(
             "linear".to_string(),
             REMOTE_GLOBAL_MARKETPLACE_NAME.to_string(),
@@ -561,14 +485,6 @@ mod tests {
                 "schema_version": 1,
                 "remote_plugin_id": remote_plugin_id,
             })
-        );
-        assert!(
-            !codex_home
-                .path()
-                .join(PLUGINS_CACHE_DIR)
-                .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
-                .join("missing-version")
-                .exists()
         );
     }
 
@@ -695,7 +611,6 @@ mod tests {
                 materialized_remote_plugins: Vec::new(),
                 removed_cache_plugin_ids,
                 failed_remote_plugin_ids: Vec::new(),
-                failed_materialization_remote_plugin_ids: Vec::new(),
             }
         );
         assert_eq!(
@@ -786,33 +701,27 @@ mod tests {
             REMOTE_GLOBAL_MARKETPLACE_NAME,
             "linear",
         );
-        let mut removed = Vec::new();
-        remove_stale_remote_plugin_caches(
+        let removed = remove_stale_remote_plugin_caches(
             codex_home.path(),
             &installed_plugin_names_by_marketplace,
-            &mut removed,
         )
         .expect("cleanup while install is guarded");
         assert_eq!(removed, Vec::<String>::new());
         assert!(cached_manifest.is_file());
 
         drop(guard);
-        let mut removed = Vec::new();
-        remove_stale_remote_plugin_caches(
+        let removed = remove_stale_remote_plugin_caches(
             codex_home.path(),
             &installed_plugin_names_by_marketplace,
-            &mut removed,
         )
         .expect("cleanup while second install guard is still active");
         assert_eq!(removed, Vec::<String>::new());
         assert!(cached_manifest.is_file());
 
         drop(second_guard);
-        let mut removed = Vec::new();
-        remove_stale_remote_plugin_caches(
+        let removed = remove_stale_remote_plugin_caches(
             codex_home.path(),
             &installed_plugin_names_by_marketplace,
-            &mut removed,
         )
         .expect("cleanup after install guard is dropped");
         assert_eq!(removed, vec!["linear@openai-curated-remote".to_string()]);
@@ -890,11 +799,9 @@ mod tests {
                 ),
             ]);
 
-        let mut removed = Vec::new();
-        remove_stale_remote_plugin_caches(
+        let removed = remove_stale_remote_plugin_caches(
             codex_home.path(),
             &installed_plugin_names_by_marketplace,
-            &mut removed,
         )
         .expect("cleanup private shared-with-me cache");
 

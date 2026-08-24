@@ -25,10 +25,6 @@ use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::ReadFileOptions;
 use codex_exec_server::RemoveOptions;
-use codex_exec_server::WalkEntry;
-use codex_exec_server::WalkEntryKind;
-use codex_exec_server::WalkOptions;
-use codex_exec_server::WalkOutcome;
 use codex_exec_server::WriteFileOptions;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -193,34 +189,6 @@ impl ExecutorFileSystem for SyntheticFileSystem {
         _sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
         Box::pin(SyntheticFileSystem::read_directory(self, path))
-    }
-
-    fn walk<'a>(
-        &'a self,
-        path: &'a PathUri,
-        options: WalkOptions,
-        _sandbox: Option<&'a FileSystemSandboxContext>,
-    ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
-        Box::pin(async move {
-            self.metadata(path)?;
-            assert_eq!(path, &self.canonical_root);
-            assert!(options.max_depth >= 1);
-            assert!(options.max_directories >= 2);
-            assert!(options.max_entries >= 2);
-            Ok(WalkOutcome {
-                entries: vec![
-                    WalkEntry {
-                        path: self.path("skill")?,
-                        kind: WalkEntryKind::Directory,
-                    },
-                    WalkEntry {
-                        path: self.path("skill/SKILL.md")?,
-                        kind: WalkEntryKind::File,
-                    },
-                ],
-                ..WalkOutcome::default()
-            })
-        })
     }
 
     fn remove<'a>(

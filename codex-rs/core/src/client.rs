@@ -483,17 +483,9 @@ impl ModelClient {
     }
 
     fn prompt_cache_key(&self, responses_metadata: &CodexResponsesMetadata) -> String {
-        if let Some(prompt_cache_key) = &self.prompt_cache_key_override {
-            return prompt_cache_key.clone();
-        }
-
-        if let SessionSource::Internal(source) = &self.state.session_source
-            && let Some(parent_thread_id) = responses_metadata.parent_thread_id
-        {
-            return format!("{source}:{parent_thread_id}");
-        }
-
-        responses_metadata.session_id.clone()
+        self.prompt_cache_key_override
+            .clone()
+            .unwrap_or_else(|| responses_metadata.session_id.clone())
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -692,20 +684,6 @@ impl ModelClient {
             call_id: response.call_id,
             sideband_headers,
         })
-    }
-
-    pub(crate) async fn realtime_sideband_headers(
-        &self,
-        mut extra_headers: ApiHeaderMap,
-    ) -> Result<ApiHeaderMap> {
-        let client_setup = self.current_client_setup().await?;
-        if let Some(header_value) = self.generate_attestation_header_for().await {
-            extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
-        }
-        extra_headers.extend(sideband_websocket_auth_headers(
-            client_setup.api_auth.as_ref(),
-        ));
-        Ok(extra_headers)
     }
 
     /// Builds memory summaries for each provided normalized raw memory.

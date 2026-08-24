@@ -342,18 +342,17 @@ fn shell_event_with_prefix_rule(
     prefix_rule: Option<Vec<String>>,
 ) -> Result<Value> {
     let mut args = json!({
-        "cmd": command,
-        "yield_time_ms": timeout_ms,
+        "command": command,
+        "timeout_ms": timeout_ms,
     });
     if sandbox_permissions.requests_sandbox_override() {
         args["sandbox_permissions"] = json!(sandbox_permissions);
-        args["justification"] = json!(DEFAULT_UNIFIED_EXEC_JUSTIFICATION);
     }
     if let Some(prefix_rule) = prefix_rule {
         args["prefix_rule"] = json!(prefix_rule);
     }
     let args_str = serde_json::to_string(&args)?;
-    Ok(ev_function_call(call_id, "exec_command", &args_str))
+    Ok(ev_function_call(call_id, "shell_command", &args_str))
 }
 
 fn exec_command_event(
@@ -1075,34 +1074,6 @@ fn scenarios() -> Vec<ScenarioSpec> {
             },
         },
         ScenarioSpec {
-            name: "simple_command_escalation_granular_sandbox_enabled_requires_approval",
-            approval_policy: Granular(GranularApprovalConfig {
-                sandbox_approval: true,
-                rules: true,
-                skill_approval: true,
-                request_permissions: true,
-                mcp_elicitations: true,
-            }),
-            sandbox_policy: workspace_write(false),
-            action: ActionKind::RunCommand {
-                command: "echo known-safe-escalation",
-            },
-            sandbox_permissions: SandboxPermissions::RequireEscalated,
-            features: vec![],
-            model_override: Some("gpt-5.2"),
-            outcome: Outcome::ExecApprovalWithAmendment {
-                decision: ReviewDecision::denied("rejected by user"),
-                expected_reason: None,
-                expected_execpolicy_amendment: Some(ExpectedExecPolicyAmendment::Prefix(&[
-                    "echo",
-                    "known-safe-escalation",
-                ])),
-            },
-            expectation: Expectation::CommandFailure {
-                output_contains: "rejected by user",
-            },
-        },
-        ScenarioSpec {
             name: "simple_command_escalation_granular_sandbox_disabled_rejects",
             approval_policy: Granular(GranularApprovalConfig {
                 sandbox_approval: false,
@@ -1120,7 +1091,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             model_override: Some("gpt-5.2"),
             outcome: Outcome::Auto,
             expectation: Expectation::CommandFailure {
-                output_contains: "you cannot ask for escalated permissions",
+                output_contains: "you should not ask for escalated permissions",
             },
         },
         ScenarioSpec {
@@ -1382,7 +1353,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             },
             expectation: Expectation::FileNotCreated {
                 target: TargetPath::Workspace("ro_on_request_denied.txt"),
-                message_contains: &["rejected by user"],
+                message_contains: &["exec command rejected by user"],
             },
         },
         ScenarioSpec {
@@ -1424,7 +1395,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             },
         },
         ScenarioSpec {
-            name: "apply_patch_exec_command_requires_patch_approval",
+            name: "apply_patch_shell_command_requires_patch_approval",
             approval_policy: UnlessTrusted,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             action: ActionKind::ApplyPatchShell {
@@ -1518,7 +1489,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             },
         },
         ScenarioSpec {
-            name: "apply_patch_exec_command_outside_requires_patch_approval",
+            name: "apply_patch_shell_command_outside_requires_patch_approval",
             approval_policy: OnRequest,
             sandbox_policy: workspace_write(false),
             action: ActionKind::ApplyPatchShell {
@@ -1574,6 +1545,46 @@ fn scenarios() -> Vec<ScenarioSpec> {
                 message_contains: &[
                     "patch rejected: writing outside of the project; rejected by user approval settings",
                 ],
+            },
+        },
+        ScenarioSpec {
+            name: "read_only_unless_trusted_requires_approval",
+            approval_policy: UnlessTrusted,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            action: ActionKind::WriteFile {
+                target: TargetPath::Workspace("ro_unless_trusted.txt"),
+                content: "read-only-unless-trusted",
+            },
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            features: vec![],
+            model_override: Some("gpt-5.2"),
+            outcome: Outcome::ExecApproval {
+                decision: ReviewDecision::Approved,
+                expected_reason: None,
+            },
+            expectation: Expectation::FileCreated {
+                target: TargetPath::Workspace("ro_unless_trusted.txt"),
+                content: "read-only-unless-trusted",
+            },
+        },
+        ScenarioSpec {
+            name: "read_only_unless_trusted_requires_approval_gpt_5_1_no_exit",
+            approval_policy: UnlessTrusted,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            action: ActionKind::WriteFile {
+                target: TargetPath::Workspace("ro_unless_trusted_5_1.txt"),
+                content: "read-only-unless-trusted",
+            },
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            features: vec![],
+            model_override: Some("gpt-5.4"),
+            outcome: Outcome::ExecApproval {
+                decision: ReviewDecision::Approved,
+                expected_reason: None,
+            },
+            expectation: Expectation::FileCreatedNoExitCode {
+                target: TargetPath::Workspace("ro_unless_trusted_5_1.txt"),
+                content: "read-only-unless-trusted",
             },
         },
         ScenarioSpec {
@@ -1680,6 +1691,26 @@ fn scenarios() -> Vec<ScenarioSpec> {
             outcome: Outcome::Auto,
             expectation: Expectation::NetworkSuccess {
                 body_contains: "workspace-network-ok",
+            },
+        },
+        ScenarioSpec {
+            name: "workspace_write_unless_trusted_requires_approval_outside_workspace",
+            approval_policy: UnlessTrusted,
+            sandbox_policy: workspace_write(false),
+            action: ActionKind::WriteFile {
+                target: TargetPath::OutsideWorkspace("ww_unless_trusted.txt"),
+                content: "workspace-unless-trusted",
+            },
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            features: vec![],
+            model_override: Some("gpt-5.2"),
+            outcome: Outcome::ExecApproval {
+                decision: ReviewDecision::Approved,
+                expected_reason: None,
+            },
+            expectation: Expectation::FileCreated {
+                target: TargetPath::OutsideWorkspace("ww_unless_trusted.txt"),
+                content: "workspace-unless-trusted",
             },
         },
         ScenarioSpec {
@@ -2441,7 +2472,7 @@ async fn assert_execpolicy_amendment_context(
 async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts() -> Result<()> {
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::UnlessTrusted;
-    let sandbox_policy = SandboxPolicy::new_workspace_write_policy();
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
     let sandbox_policy_for_config = sandbox_policy.clone();
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
@@ -2614,7 +2645,7 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::UnlessTrusted;
-    let sandbox_policy = SandboxPolicy::new_workspace_write_policy();
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
     let sandbox_policy_for_config = sandbox_policy.clone();
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
@@ -2657,8 +2688,8 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
     .await;
 
     let child_cmd_args = serde_json::to_string(&json!({
-        "cmd": "touch subagent-allow-prefix.txt",
-        "yield_time_ms": 10_000,
+        "command": "touch subagent-allow-prefix.txt",
+        "timeout_ms": 1_000,
         "prefix_rule": ["touch", "subagent-allow-prefix.txt"],
     }))?;
     mount_sse_once_match(
@@ -2666,7 +2697,7 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
         |req: &Request| body_contains(req, CHILD_PROMPT) && !body_contains(req, SPAWN_CALL_ID),
         sse(vec![
             ev_response_created("resp-child-1"),
-            ev_function_call(CHILD_CALL_ID_1, "exec_command", &child_cmd_args),
+            ev_function_call(CHILD_CALL_ID_1, "shell_command", &child_cmd_args),
             ev_completed("resp-child-1"),
         ]),
     )
@@ -2698,7 +2729,7 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
         &server,
         sse(vec![
             ev_response_created("resp-parent-3"),
-            ev_function_call(PARENT_CALL_ID_2, "exec_command", &child_cmd_args),
+            ev_function_call(PARENT_CALL_ID_2, "shell_command", &child_cmd_args),
             ev_completed("resp-parent-3"),
         ]),
     )
@@ -3064,7 +3095,7 @@ async fn matched_prefix_rule_runs_unsandboxed_under_zsh_fork() -> Result<()> {
 /// `:workspace` sandbox, while its inherited profile name remains `:workspace`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
-async fn allowed_escalated_exec_command_inherits_active_permission_profile() -> Result<()> {
+async fn allowed_escalated_shell_command_inherits_active_permission_profile() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -3446,7 +3477,7 @@ async fn approving_fallback_rule_for_compound_command_works() -> Result<()> {
     let event = shell_event_with_prefix_rule(
         call_id,
         command,
-        /*timeout_ms*/ 10_000,
+        /*timeout_ms*/ 1_000,
         SandboxPermissions::RequireEscalated,
         Some(vec!["touch".to_string()]),
     )?;
@@ -3493,7 +3524,7 @@ async fn approving_fallback_rule_for_compound_command_works() -> Result<()> {
     let event = shell_event_with_prefix_rule(
         call_id,
         command,
-        /*timeout_ms*/ 10_000,
+        /*timeout_ms*/ 1_000,
         SandboxPermissions::RequireEscalated,
         Some(vec!["touch".to_string()]),
     )?;

@@ -8,7 +8,6 @@ use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
 use crate::chatwidget::ThreadInputStateRestoreMode;
 use crate::session_resume::read_session_model;
-use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::WarningNotification;
@@ -989,32 +988,9 @@ impl App {
             self.apply_thread_settings_to_cached_session(thread_id, &notification.thread_settings)
                 .await;
         }
-        let inferred_session = if let ServerNotification::ThreadStarted(started) = &notification
-            && self.primary_session_configured.is_some()
-        {
-            self.upsert_agent_picker_thread(
-                thread_id,
-                started.thread.agent_nickname.clone(),
-                started.thread.agent_role.clone(),
-                /*is_closed*/ false,
-            );
-
-            // Lifecycle responses already contain authoritative session state. Their rollout may
-            // not exist until the first turn, so inferring it again can wait through reader retries.
-            let already_has_session = match self.thread_event_channels.get(&thread_id) {
-                Some(channel) => channel.store.lock().await.session.is_some(),
-                None => false,
-            };
-
-            if already_has_session {
-                None
-            } else {
-                self.infer_session_for_started_thread(thread_id, started)
-                    .await
-            }
-        } else {
-            None
-        };
+        let inferred_session = self
+            .infer_session_for_thread_notification(thread_id, &notification)
+            .await;
         let is_turn_started = matches!(notification, ServerNotification::TurnStarted(_));
         let notification_status_change = SideParentStatusChange::for_notification(&notification);
         let (sender, store) = {
@@ -1128,11 +1104,14 @@ impl App {
         }
     }
 
-    async fn infer_session_for_started_thread(
-        &self,
+    pub(super) async fn infer_session_for_thread_notification(
+        &mut self,
         thread_id: ThreadId,
-        notification: &ThreadStartedNotification,
+        notification: &ServerNotification,
     ) -> Option<ThreadSessionState> {
+        let ServerNotification::ThreadStarted(notification) = notification else {
+            return None;
+        };
         let mut session = self.primary_session_configured.clone()?;
         session.thread_id = thread_id;
         session.thread_name = notification.thread.name.clone();
@@ -1149,6 +1128,12 @@ impl App {
         }
         session.message_history = None;
         session.rollout_path = rollout_path;
+        self.upsert_agent_picker_thread(
+            thread_id,
+            notification.thread.agent_nickname.clone(),
+            notification.thread.agent_role.clone(),
+            /*is_closed*/ false,
+        );
         Some(session)
     }
 
@@ -1448,16 +1433,6 @@ impl App {
     /// historical id now" and converted into closed picker entries instead of deleting them, so
     /// the stable traversal order remains intact for review and keyboard navigation.
     pub(super) async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
-        let frame_deadline = Instant::now() + tui::TARGET_FRAME_INTERVAL;
-        self.drain_active_thread_events_until(tui, frame_deadline)
-            .await
-    }
-
-    pub(super) async fn drain_active_thread_events_until(
-        &mut self,
-        tui: &mut tui::Tui,
-        frame_deadline: Instant,
-    ) -> Result<()> {
         let Some(mut rx) = self.active_thread_rx.take() else {
             return Ok(());
         };
@@ -1474,9 +1449,6 @@ impl App {
                     disconnected = true;
                     break;
                 }
-            }
-            if Instant::now() >= frame_deadline {
-                break;
             }
         }
 

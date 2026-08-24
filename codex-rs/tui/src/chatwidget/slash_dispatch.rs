@@ -402,7 +402,7 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::Logout);
             }
             SlashCommand::Copy => {
-                self.show_copy_picker();
+                self.copy_last_agent_markdown();
             }
             SlashCommand::Export => {
                 self.show_transcript_export_popup();

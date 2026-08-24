@@ -5,10 +5,6 @@ use super::*;
 #[path = "mcp_result.rs"]
 mod result;
 
-use crate::style::StatusTone;
-use crate::style::accent_style;
-use crate::style::status_style;
-use codex_app_server_protocol::McpServerConnectionStatus;
 use result::McpResultKind;
 use result::McpToolResult;
 
@@ -522,8 +518,9 @@ pub(crate) fn new_mcp_tools_output(
 /// alphabetically. The TUI deliberately does not enrich these rows from
 /// client-local config because the app-server owns the remote MCP state.
 ///
-/// Normal output is a compact connection summary. Full detail preserves the
-/// tool, auth, resource, and resource-template inventory.
+/// This mirrors the layout of [`new_mcp_tools_output`] but sources data from
+/// the paginated RPC response rather than the in-process `McpManager`. The
+/// `detail` flag controls whether resources and resource templates are rendered.
 pub(crate) fn new_mcp_tools_output_from_statuses(
     statuses: &[McpServerStatus],
     detail: McpServerStatusDetail,
@@ -539,54 +536,15 @@ pub(crate) fn new_mcp_tools_output_from_statuses(
     statuses.sort_by(|a, b| a.name.cmp(&b.name));
 
     let has_any_tools = statuses.iter().any(|status| !status.tools.is_empty());
-    if !has_any_tools && matches!(detail, McpServerStatusDetail::Full) {
+    if !has_any_tools {
         lines.push("  • No MCP tools available.".italic().into());
         lines.push("".into());
     }
 
     for status in statuses {
-        let (label, style) = match status.runtime_status {
-            Some(McpServerConnectionStatus::Connected) => {
-                ("connected", status_style(StatusTone::Success))
-            }
-            Some(McpServerConnectionStatus::Starting) => ("starting", accent_style()),
-            Some(McpServerConnectionStatus::AuthenticationRequired) => (
-                "authentication required",
-                status_style(StatusTone::Attention),
-            ),
-            Some(McpServerConnectionStatus::Failed) => {
-                ("failed", status_style(StatusTone::Failure))
-            }
-            Some(McpServerConnectionStatus::NotStarted) => ("not started", Style::default().dim()),
-            Some(McpServerConnectionStatus::Disabled) => ("disabled", Style::default().dim()),
-            Some(McpServerConnectionStatus::Cancelled) => ("cancelled", Style::default().dim()),
-            None if matches!(
-                status.auth_status,
-                codex_app_server_protocol::McpAuthStatus::NotLoggedIn
-            ) =>
-            {
-                (
-                    "authentication required",
-                    status_style(StatusTone::Attention),
-                )
-            }
-            None => ("unknown", Style::default().dim()),
-        };
-        let count = status.tools.len();
-        let unit = if count == 1 { "tool" } else { "tools" };
-        lines.push(
-            vec![
-                "  • ".set_style(style),
-                status.name.clone().bold(),
-                ": ".into(),
-                label.set_style(style),
-                format!(" ({count} {unit})").dim(),
-            ]
-            .into(),
-        );
-        if matches!(detail, McpServerStatusDetail::ToolsAndAuthOnly) {
-            continue;
-        }
+        let header: Vec<Span<'static>> = vec!["  • ".into(), status.name.clone().into()];
+
+        lines.push(header.into());
         let auth_status = match status.auth_status {
             codex_app_server_protocol::McpAuthStatus::Unknown => McpAuthStatus::Unknown,
             codex_app_server_protocol::McpAuthStatus::Unsupported => McpAuthStatus::Unsupported,
@@ -653,11 +611,6 @@ pub(crate) fn new_mcp_tools_output_from_statuses(
         }
 
         lines.push(Line::from(""));
-    }
-
-    if matches!(detail, McpServerStatusDetail::ToolsAndAuthOnly) {
-        lines.push("".into());
-        lines.push("  Use /mcp verbose for tools and resources.".dim().into());
     }
 
     PlainHistoryCell { lines }

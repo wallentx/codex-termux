@@ -115,7 +115,8 @@ fn open_capture_action(
 
 fn action_menu_item(
     name: &str,
-    description: String,
+    description: &str,
+    selected_description: String,
     context: &str,
     action: &str,
     intent: KeymapEditIntent,
@@ -123,7 +124,8 @@ fn action_menu_item(
 ) -> SelectionItem {
     SelectionItem {
         name: name.to_string(),
-        description: Some(description),
+        description: Some(description.to_string()),
+        selected_description: Some(selected_description),
         actions: vec![open_capture_action(
             context.to_string(),
             action.to_string(),
@@ -201,7 +203,8 @@ pub(crate) fn build_keymap_action_menu_params(
         0 => {
             items.push(action_menu_item(
                 "Set key",
-                "Capture a key for this unbound action.".to_string(),
+                "Capture a key for this unbound action.",
+                "Capture one key and bind this action.".to_string(),
                 &context,
                 &action,
                 KeymapEditIntent::ReplaceAll,
@@ -211,7 +214,8 @@ pub(crate) fn build_keymap_action_menu_params(
         1 => {
             items.push(action_menu_item(
                 "Replace binding",
-                format!("Capture a replacement key for `{current_binding}`."),
+                "Capture a replacement key.",
+                format!("Capture one key and replace `{current_binding}`."),
                 &context,
                 &action,
                 KeymapEditIntent::ReplaceAll,
@@ -219,7 +223,8 @@ pub(crate) fn build_keymap_action_menu_params(
             ));
             items.push(action_menu_item(
                 "Add alternate binding",
-                format!("Keep `{current_binding}` and add another key."),
+                "Keep the current binding and add another key.",
+                format!("Capture one key and keep `{current_binding}` as an alternate."),
                 &context,
                 &action,
                 KeymapEditIntent::AddAlternate,
@@ -232,6 +237,9 @@ pub(crate) fn build_keymap_action_menu_params(
             items.push(SelectionItem {
                 name: "Replace one binding...".to_string(),
                 description: Some("Choose which existing binding to replace.".to_string()),
+                selected_description: Some(
+                    "Pick one current binding, then capture its replacement.".to_string(),
+                ),
                 actions: vec![Box::new(move |tx| {
                     tx.send(AppEvent::OpenKeymapReplaceBindingMenu {
                         context: replace_one_context.clone(),
@@ -242,7 +250,8 @@ pub(crate) fn build_keymap_action_menu_params(
             });
             items.push(action_menu_item(
                 "Replace all bindings",
-                format!("Replace `{current_binding}` with one key."),
+                "Replace every current binding with one key.",
+                format!("Capture one key and replace `{current_binding}`."),
                 &context,
                 &action,
                 KeymapEditIntent::ReplaceAll,
@@ -250,7 +259,8 @@ pub(crate) fn build_keymap_action_menu_params(
             ));
             items.push(action_menu_item(
                 "Add alternate binding",
-                format!("Keep `{current_binding}` and add another key."),
+                "Keep current bindings and add another key.",
+                format!("Capture one key and keep `{current_binding}`."),
                 &context,
                 &action,
                 KeymapEditIntent::AddAlternate,
@@ -261,7 +271,8 @@ pub(crate) fn build_keymap_action_menu_params(
     if active_binding_count == 0 {
         items.push(action_menu_item(
             "Set key chord",
-            "Capture two consecutive keys for this action.".to_string(),
+            "Capture two consecutive keys for this action.",
+            "Capture a two-stroke key chord.".to_string(),
             &context,
             &action,
             KeymapEditIntent::ReplaceAll,
@@ -270,7 +281,8 @@ pub(crate) fn build_keymap_action_menu_params(
     } else {
         items.push(action_menu_item(
             "Replace with key chord",
-            format!("Replace `{current_binding}` with a two-stroke key chord."),
+            "Replace current bindings with a two-stroke key chord.",
+            format!("Capture two keys and replace `{current_binding}`."),
             &context,
             &action,
             KeymapEditIntent::ReplaceAll,
@@ -278,7 +290,8 @@ pub(crate) fn build_keymap_action_menu_params(
         ));
         items.push(action_menu_item(
             "Add alternate key chord",
-            format!("Keep `{current_binding}` and add a two-stroke key chord."),
+            "Keep current bindings and add a two-stroke key chord.",
+            format!("Capture two keys and keep `{current_binding}`."),
             &context,
             &action,
             KeymapEditIntent::AddAlternate,
@@ -288,6 +301,8 @@ pub(crate) fn build_keymap_action_menu_params(
     items.push(SelectionItem {
         name: "Remove custom binding".to_string(),
         description: custom_binding.then(|| "Restore the default keymap binding.".to_string()),
+        selected_description: custom_binding
+            .then(|| "Delete the root override and use the default keymap again.".to_string()),
         disabled_reason: remove_disabled_reason,
         disabled_gutter_marker: Some("–"),
         actions: vec![Box::new(move |tx| {
@@ -345,7 +360,10 @@ pub(crate) fn build_keymap_replace_binding_menu_params(
             [
                 SelectionItem {
                     name: binding.clone(),
-                    description: Some(format!("Replace `{binding}` with another key.")),
+                    description: Some("Replace this binding.".to_string()),
+                    selected_description: Some(format!(
+                        "Capture a new key to replace `{binding}`."
+                    )),
                     actions: vec![open_capture_action(
                         context.clone(),
                         action.clone(),
@@ -359,7 +377,8 @@ pub(crate) fn build_keymap_replace_binding_menu_params(
                 },
                 SelectionItem {
                     name: format!("{binding} (key chord)"),
-                    description: Some(format!("Replace `{binding}` with a two-stroke key chord.")),
+                    description: Some("Replace this binding with a key chord.".to_string()),
+                    selected_description: Some(format!("Capture two keys to replace `{binding}`.")),
                     actions: vec![open_capture_action(
                         context.clone(),
                         action.clone(),
@@ -994,7 +1013,7 @@ mod tests {
                 let selectable = tab.items.iter().filter(|item| !item.is_disabled).count();
                 format!("tab: {} ({selectable} selectable)", tab.label)
             })
-            .chain(all_tab.items.iter().take(13).map(|item| {
+            .chain(all_tab.items.iter().take(12).map(|item| {
                 format!(
                     "{} | {} | {}",
                     item.name,
@@ -1040,23 +1059,13 @@ mod tests {
         let params = build_keymap_picker_params(&runtime, &TuiKeymap::default());
         let unbound_tab = selection_tab(&params, KEYMAP_UNBOUND_TAB_ID);
 
-        assert_eq!(
-            unbound_tab
-                .items
-                .iter()
-                .map(|item| (
-                    item.name.as_str(),
-                    item.description.as_deref(),
-                    item.is_disabled
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                ("Toggle Vim Mode", Some("unbound"), false),
-                ("Previous Permission Mode", Some("unbound"), false),
-                ("Next Permission Mode", Some("unbound"), false),
-                ("Kill Whole Line", Some("unbound"), false),
-            ]
-        );
+        assert_eq!(unbound_tab.items.len(), 2);
+        assert_eq!(unbound_tab.items[0].name, "Toggle Vim Mode");
+        assert_eq!(unbound_tab.items[0].description.as_deref(), Some("unbound"));
+        assert!(!unbound_tab.items[0].is_disabled);
+        assert_eq!(unbound_tab.items[1].name, "Kill Whole Line");
+        assert_eq!(unbound_tab.items[1].description.as_deref(), Some("unbound"));
+        assert!(!unbound_tab.items[1].is_disabled);
     }
 
     #[test]
@@ -1259,20 +1268,6 @@ mod tests {
         .join("\n");
 
         assert_snapshot!("keymap_action_menu", snapshot);
-
-        for params in [unbound_params, single_params, multi_params, replace_params] {
-            let item_count = params.items.len();
-            let mut view =
-                ListSelectionView::new(params, app_event_sender(), RuntimeKeymap::defaults().list);
-            let initial = render_picker_from_view(&view, /*width*/ 160).replace('›', " ");
-            for _ in 1..item_count {
-                view.handle_key_event(KeyEvent::from(KeyCode::Down));
-                assert_eq!(
-                    render_picker_from_view(&view, /*width*/ 160).replace('›', " "),
-                    initial,
-                );
-            }
-        }
     }
 
     #[test]

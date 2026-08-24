@@ -1,5 +1,4 @@
 mod config;
-mod discovery;
 mod signing;
 
 use std::time::SystemTime;
@@ -10,10 +9,6 @@ use bytes::Bytes;
 use http::HeaderMap;
 use http::Method;
 use thiserror::Error;
-
-pub use discovery::AwsProfile;
-pub use discovery::discover_aws_profiles;
-pub use discovery::validate_aws_profile;
 
 /// AWS auth configuration used to resolve credentials and sign requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,14 +39,10 @@ pub struct AwsSignedRequest {
 pub enum AwsAuthError {
     #[error("AWS service name must not be empty")]
     EmptyService,
-    #[error("AWS profile must be configured")]
-    MissingProfile,
     #[error("AWS SDK config did not resolve a credentials provider")]
     MissingCredentialsProvider,
     #[error("AWS SDK config did not resolve a region")]
     MissingRegion,
-    #[error("failed to load AWS profiles: {0}")]
-    ProfileLoad(#[from] aws_config::profile::ProfileFileLoadError),
     #[error("failed to load AWS credentials: {0}")]
     Credentials(#[from] aws_credential_types::provider::error::CredentialsError),
     #[error("request URL is not a valid URI: {0}")]
@@ -98,19 +89,6 @@ impl AwsAuthContext {
         })
     }
 
-    pub async fn load_profile(config: AwsAuthConfig) -> Result<Self, AwsAuthError> {
-        let profile = config
-            .profile
-            .as_deref()
-            .ok_or(AwsAuthError::MissingProfile)?;
-        let credentials_provider = SharedCredentialsProvider::new(
-            discovery::profile_credentials_provider(profile, config.region.as_deref()).await,
-        );
-        let mut context = Self::load(config).await?;
-        context.credentials_provider = credentials_provider;
-        Ok(context)
-    }
-
     pub fn region(&self) -> &str {
         &self.region
     }
@@ -143,10 +121,8 @@ impl AwsAuthError {
                     | aws_credential_types::provider::error::CredentialsError::ProviderError(_)
             ),
             AwsAuthError::EmptyService
-            | AwsAuthError::MissingProfile
             | AwsAuthError::MissingCredentialsProvider
             | AwsAuthError::MissingRegion
-            | AwsAuthError::ProfileLoad(_)
             | AwsAuthError::InvalidUri(_)
             | AwsAuthError::BuildHttpRequest(_)
             | AwsAuthError::InvalidHeaderValue(_)
@@ -241,7 +217,6 @@ mod tests {
     #[test]
     fn deterministic_aws_auth_errors_are_not_retryable() {
         assert!(!AwsAuthError::EmptyService.is_retryable());
-        assert!(!AwsAuthError::MissingProfile.is_retryable());
         assert!(
             !AwsAuthError::Credentials(CredentialsError::not_loaded_no_source()).is_retryable()
         );
@@ -272,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_rejects_invalid_configuration() {
+    async fn load_rejects_empty_service_name() {
         let err = AwsAuthContext::load(AwsAuthConfig {
             profile: None,
             region: None,
@@ -282,15 +257,5 @@ mod tests {
         .expect_err("empty service should be rejected");
 
         assert_eq!(err.to_string(), "AWS service name must not be empty");
-
-        let err = AwsAuthContext::load_profile(AwsAuthConfig {
-            profile: None,
-            region: Some("us-east-1".to_string()),
-            service: "bedrock".to_string(),
-        })
-        .await
-        .expect_err("profile auth should require a configured profile");
-
-        assert_eq!(err.to_string(), "AWS profile must be configured");
     }
 }

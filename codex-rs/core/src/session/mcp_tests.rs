@@ -217,9 +217,8 @@ fn guardian_elicitation_review_request_declines_unsupported_opt_in_shapes() {
 
 #[test]
 fn guardian_decisions_map_to_elicitation_responses_without_session_state() {
-    let model = codex_models_manager::model_info::model_info_from_slug("acting-model");
     assert_eq!(
-        mcp_elicitation_response_from_guardian_decision(ReviewDecision::Approved, &model),
+        mcp_elicitation_response_from_guardian_decision(ReviewDecision::Approved),
         ElicitationResponse {
             action: ElicitationAction::Accept,
             content: Some(json!({})),
@@ -229,10 +228,9 @@ fn guardian_decisions_map_to_elicitation_responses_without_session_state() {
         }
     );
     assert_eq!(
-        mcp_elicitation_response_from_guardian_decision(
-            ReviewDecision::denied("Denied by Guardian"),
-            &model,
-        ),
+        mcp_elicitation_response_from_guardian_decision(ReviewDecision::denied(
+            "Denied by Guardian",
+        )),
         ElicitationResponse {
             action: ElicitationAction::Decline,
             content: None,
@@ -243,18 +241,18 @@ fn guardian_decisions_map_to_elicitation_responses_without_session_state() {
         }
     );
     assert_eq!(
-        mcp_elicitation_response_from_guardian_decision(ReviewDecision::TimedOut, &model),
+        mcp_elicitation_response_from_guardian_decision(ReviewDecision::TimedOut),
         ElicitationResponse {
             action: ElicitationAction::Decline,
             content: None,
             meta: Some(json!({
                 "approvals_reviewer": ApprovalsReviewer::AutoReview,
-                "message": crate::guardian::guardian_timeout_message(&model),
+                "message": crate::guardian::guardian_timeout_message(),
             })),
         }
     );
     assert_eq!(
-        mcp_elicitation_response_from_guardian_decision(ReviewDecision::Abort, &model),
+        mcp_elicitation_response_from_guardian_decision(ReviewDecision::Abort),
         ElicitationResponse {
             action: ElicitationAction::Cancel,
             content: None,
@@ -263,30 +261,4 @@ fn guardian_decisions_map_to_elicitation_responses_without_session_state() {
             })),
         }
     );
-}
-
-#[test]
-fn guardian_elicitation_timeout_uses_acting_model_instructions() {
-    let mut model = codex_models_manager::model_info::model_info_from_slug("acting-model");
-    for timeout_instructions in ["Catalog timeout instructions.", ""] {
-        model.model_messages = Some(
-            serde_json::from_value(json!({
-                "auto_review": {
-                    "timeout_instructions": timeout_instructions,
-                },
-            }))
-            .expect("model messages should deserialize"),
-        );
-        assert_eq!(
-            mcp_elicitation_response_from_guardian_decision(ReviewDecision::TimedOut, &model),
-            ElicitationResponse {
-                action: ElicitationAction::Decline,
-                content: None,
-                meta: Some(json!({
-                    "approvals_reviewer": ApprovalsReviewer::AutoReview,
-                    "message": timeout_instructions,
-                })),
-            }
-        );
-    }
 }

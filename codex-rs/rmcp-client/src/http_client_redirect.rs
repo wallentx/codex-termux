@@ -166,7 +166,6 @@ impl SameOriginRedirectHttpClient {
                 params.headers.push(HttpHeader {
                     name: "referer".to_string(),
                     value: referer.to_string(),
-                    value_env_var: None,
                 });
             }
 

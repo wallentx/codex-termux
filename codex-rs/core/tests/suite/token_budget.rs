@@ -33,9 +33,9 @@ use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
-use core_test_support::responses::ev_exec_command_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
@@ -294,7 +294,7 @@ async fn token_budget_uses_model_message_defaults() -> Result<()> {
         .with_pre_build_hook(|home| {
             std::fs::write(
                 home.join("config.toml"),
-                "[features.token_budget]\nenabled = true\nuse_history_notes_extension = true\n",
+                "[features.token_budget]\nenabled = true\n",
             )
             .expect("write token-budget configuration");
         })
@@ -1022,15 +1022,6 @@ async fn token_budget_context_uses_new_window_after_compaction(
     assert_eq!(initial_token_budget.len(), 1);
     let (initial_first_window_id, initial_previous_window_id, initial_window_id) =
         token_budget_window_ids(&initial_token_budget[0], "/root");
-    let initial_turn_metadata: Value = serde_json::from_str(
-        &requests[0]
-            .header("x-codex-turn-metadata")
-            .expect("initial context window metadata"),
-    )?;
-    assert_eq!(
-        initial_turn_metadata["context_window_id"].as_str(),
-        Some(initial_window_id.as_str())
-    );
     let post_compaction_token_budget = token_budget_contexts(&requests[1]);
     assert_eq!(post_compaction_token_budget.len(), 1);
     let (
@@ -1038,15 +1029,6 @@ async fn token_budget_context_uses_new_window_after_compaction(
         post_compaction_previous_window_id,
         post_compaction_window_id,
     ) = token_budget_window_ids(&post_compaction_token_budget[0], "/root");
-    let post_compaction_turn_metadata: Value = serde_json::from_str(
-        &requests[1]
-            .header("x-codex-turn-metadata")
-            .expect("post-compaction context window metadata"),
-    )?;
-    assert_eq!(
-        post_compaction_turn_metadata["context_window_id"].as_str(),
-        Some(post_compaction_window_id.as_str())
-    );
     assert_eq!(initial_previous_window_id, None);
     assert_eq!(initial_first_window_id, initial_window_id);
     assert_eq!(post_compaction_first_window_id, initial_first_window_id);
@@ -1272,7 +1254,7 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
             ]),
             sse(vec![
                 ev_response_created("fallback-tool-resp"),
-                ev_exec_command_call(fallback_call_id, "echo fallback-note > fallback-note.txt"),
+                ev_shell_command_call(fallback_call_id, "echo fallback-note > fallback-note.txt"),
                 ev_completed_with_tokens("fallback-tool-resp", /*total_tokens*/ 10_000),
             ]),
             sse(vec![

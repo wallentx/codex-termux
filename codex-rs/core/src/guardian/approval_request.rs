@@ -16,6 +16,14 @@ use super::prompt::guardian_truncate_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GuardianApprovalRequest {
+    Shell {
+        id: String,
+        command: Vec<String>,
+        cwd: AbsolutePathBuf,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions,
+        additional_permissions: Option<AdditionalPermissionProfile>,
+        justification: Option<String>,
+    },
     ExecCommand {
         id: String,
         command: Vec<String>,
@@ -256,6 +264,22 @@ pub(crate) fn guardian_approval_request_to_json(
     action: &GuardianApprovalRequest,
 ) -> serde_json::Result<Value> {
     match action {
+        GuardianApprovalRequest::Shell {
+            id: _,
+            command,
+            cwd,
+            sandbox_permissions,
+            additional_permissions,
+            justification,
+        } => serialize_command_guardian_action(
+            "shell",
+            command,
+            cwd,
+            *sandbox_permissions,
+            additional_permissions.as_ref(),
+            justification.as_ref(),
+            /*tty*/ None,
+        ),
         GuardianApprovalRequest::ExecCommand {
             id: _,
             command,
@@ -364,6 +388,9 @@ pub(crate) fn guardian_assessment_action(
     action: &GuardianApprovalRequest,
 ) -> GuardianAssessmentAction {
     match action {
+        GuardianApprovalRequest::Shell { command, cwd, .. } => {
+            command_assessment_action(GuardianCommandSource::Shell, command, cwd)
+        }
         GuardianApprovalRequest::ExecCommand { command, cwd, .. } => {
             command_assessment_action(GuardianCommandSource::UnifiedExec, command, cwd)
         }
@@ -429,6 +456,14 @@ pub(crate) fn guardian_reviewed_action(
     request: &GuardianApprovalRequest,
 ) -> GuardianReviewedAction {
     match request {
+        GuardianApprovalRequest::Shell {
+            sandbox_permissions,
+            additional_permissions,
+            ..
+        } => GuardianReviewedAction::Shell {
+            sandbox_permissions: *sandbox_permissions,
+            additional_permissions: additional_permissions.clone(),
+        },
         GuardianApprovalRequest::ExecCommand {
             sandbox_permissions,
             additional_permissions,
@@ -479,7 +514,8 @@ pub(crate) fn guardian_reviewed_action(
 
 pub(crate) fn guardian_request_target_item_id(request: &GuardianApprovalRequest) -> Option<&str> {
     match request {
-        GuardianApprovalRequest::ExecCommand { id, .. }
+        GuardianApprovalRequest::Shell { id, .. }
+        | GuardianApprovalRequest::ExecCommand { id, .. }
         | GuardianApprovalRequest::ApplyPatch { id, .. }
         | GuardianApprovalRequest::McpToolCall { id, .. }
         | GuardianApprovalRequest::RequestPermissions { id, .. } => Some(id),
@@ -496,7 +532,8 @@ pub(crate) fn guardian_request_turn_id<'a>(
     match request {
         GuardianApprovalRequest::NetworkAccess { turn_id, .. }
         | GuardianApprovalRequest::RequestPermissions { turn_id, .. } => turn_id,
-        GuardianApprovalRequest::ExecCommand { .. }
+        GuardianApprovalRequest::Shell { .. }
+        | GuardianApprovalRequest::ExecCommand { .. }
         | GuardianApprovalRequest::ApplyPatch { .. }
         | GuardianApprovalRequest::McpToolCall { .. } => default_turn_id,
         #[cfg(unix)]

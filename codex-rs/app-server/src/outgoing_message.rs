@@ -408,12 +408,11 @@ impl OutgoingMessageSender {
 
         match entry {
             Some((id, entry)) => {
-                // Don't log error messages or data because they may contain credentials.
-                warn!(code = error.code, "client responded with error for {id:?}");
+                warn!("client responded with error for {id:?}: {error:?}");
                 self.analytics_events_client
                     .track_server_request_aborted(now_unix_timestamp_ms(), id.clone());
-                if entry.callback.send(Err(error)).is_err() {
-                    warn!("could not notify callback for {id:?}: receiver dropped");
+                if let Err(err) = entry.callback.send(Err(error)) {
+                    warn!("could not notify callback for {id:?} due to: {err:?}");
                 }
             }
             None => {
@@ -446,10 +445,10 @@ impl OutgoingMessageSender {
             self.analytics_events_client
                 .track_server_request_aborted(now_unix_timestamp_ms(), entry.request.id().clone());
             if let Some(error) = error.as_ref()
-                && entry.callback.send(Err(error.clone())).is_err()
+                && let Err(err) = entry.callback.send(Err(error.clone()))
             {
                 let request_id = entry.request.id();
-                warn!("could not notify callback for {request_id:?}: receiver dropped");
+                warn!("could not notify callback for {request_id:?} due to: {err:?}");
             }
         }
     }
@@ -504,10 +503,10 @@ impl OutgoingMessageSender {
             self.analytics_events_client
                 .track_server_request_aborted(now_unix_timestamp_ms(), entry.request.id().clone());
             if let Some(error) = error.as_ref()
-                && entry.callback.send(Err(error.clone())).is_err()
+                && let Err(err) = entry.callback.send(Err(error.clone()))
             {
                 let request_id = entry.request.id();
-                warn!("could not notify callback for {request_id:?}: receiver dropped");
+                warn!("could not notify callback for {request_id:?} due to: {err:?}",);
             }
         }
     }
@@ -635,7 +634,7 @@ impl OutgoingMessageSender {
         &self,
         connection_id: ConnectionId,
         notification: ServerNotification,
-    ) -> bool {
+    ) {
         tracing::trace!("app-server event: {notification}");
         let outgoing_message = timestamped_server_notification(notification);
         let (write_complete_tx, write_complete_rx) = oneshot::channel();
@@ -650,7 +649,7 @@ impl OutgoingMessageSender {
         {
             warn!("failed to send server notification to client: {err:?}");
         }
-        write_complete_rx.await.is_ok()
+        let _ = write_complete_rx.await;
     }
 
     pub(crate) async fn send_error(

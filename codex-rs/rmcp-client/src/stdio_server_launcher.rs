@@ -605,7 +605,6 @@ impl ExecutorStdioServerLauncher {
                 process_id,
                 argv,
                 cwd,
-                shell_snapshot: None,
                 env_policy: Some(Self::remote_env_policy(&remote_env_vars)),
                 env,
                 tty: false,

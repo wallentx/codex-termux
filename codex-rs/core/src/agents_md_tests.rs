@@ -22,8 +22,6 @@ use codex_exec_server::LOCAL_FS;
 use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::ReadFileOptions;
 use codex_exec_server::RemoveOptions;
-use codex_exec_server::WalkOptions;
-use codex_exec_server::WalkOutcome;
 use codex_exec_server::WriteFileOptions;
 use codex_extension_api::UserInstructions;
 use codex_features::Feature;
@@ -272,15 +270,6 @@ impl ExecutorFileSystem for FailingFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
         Box::pin(FailingFileSystem::read_directory(self, path, sandbox))
-    }
-
-    fn walk<'a>(
-        &'a self,
-        _path: &'a PathUri,
-        _options: WalkOptions,
-        _sandbox: Option<&'a FileSystemSandboxContext>,
-    ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
-        Box::pin(async { unreachable!("walk should not be called") })
     }
 
     fn remove<'a>(

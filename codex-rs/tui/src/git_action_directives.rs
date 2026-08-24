@@ -131,7 +131,7 @@ fn rewrite_code_comment_line(line: &str, cwd: &Path) -> Option<String> {
     ))
 }
 
-pub(crate) fn strip_line_directives(line: &str) -> (String, Vec<GitActionDirective>) {
+fn strip_line_directives(line: &str) -> (String, Vec<GitActionDirective>) {
     let mut visible = String::new();
     let mut actions = Vec::new();
     let mut remaining = line;

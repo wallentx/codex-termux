@@ -130,15 +130,6 @@ enum ClientState {
     Closed,
 }
 
-/// Bearer authentication applied directly or by the selected HTTP transport.
-#[derive(Clone)]
-pub enum StreamableHttpBearerToken {
-    /// A token already resolved in the current process.
-    Resolved(String),
-    /// The HTTP client attaches credentials when it sends each request.
-    ProvidedByHttpClient,
-}
-
 #[derive(Clone)]
 enum TransportRecipe {
     InProcess {
@@ -151,7 +142,7 @@ enum TransportRecipe {
     StreamableHttp {
         server_name: String,
         url: String,
-        bearer_token: Option<StreamableHttpBearerToken>,
+        bearer_token: Option<String>,
         http_headers: Option<HashMap<String, String>>,
         env_http_headers: Option<HashMap<String, String>>,
         store_mode: OAuthCredentialsStoreMode,
@@ -523,7 +514,7 @@ impl RmcpClient {
         Self::new_streamable_http_client_with_protocol_mode_and_redirect_mode(
             server_name,
             url,
-            bearer_token.map(StreamableHttpBearerToken::Resolved),
+            bearer_token,
             http_headers,
             env_http_headers,
             store_mode,
@@ -540,7 +531,7 @@ impl RmcpClient {
     pub async fn new_streamable_http_client_with_protocol_mode_and_redirect_mode(
         server_name: &str,
         url: &str,
-        bearer_token: Option<StreamableHttpBearerToken>,
+        bearer_token: Option<String>,
         http_headers: Option<HashMap<String, String>>,
         env_http_headers: Option<HashMap<String, String>>,
         store_mode: OAuthCredentialsStoreMode,
@@ -1021,10 +1012,7 @@ impl RmcpClient {
                 redirect_mode,
                 initialize_deadline,
             } => {
-                let has_configured_headers = matches!(
-                    bearer_token,
-                    Some(StreamableHttpBearerToken::ProvidedByHttpClient)
-                ) || http_headers
+                let has_configured_headers = http_headers
                     .as_ref()
                     .is_some_and(|headers| !headers.is_empty())
                     || env_http_headers
@@ -1145,8 +1133,8 @@ impl RmcpClient {
                 } else {
                     let mut http_config =
                         StreamableHttpClientTransportConfig::with_uri(url.clone());
-                    if let Some(StreamableHttpBearerToken::Resolved(bearer_token)) = bearer_token {
-                        http_config = http_config.auth_header(bearer_token.clone());
+                    if let Some(bearer_token) = bearer_token.clone() {
+                        http_config = http_config.auth_header(bearer_token);
                     }
 
                     let transport = StreamableHttpClientTransport::with_client(

@@ -4,7 +4,7 @@ import {
   assistantMessage,
   responseCompleted,
   responseStarted,
-  exec_command_call as execCommandCall,
+  shell_call as shellCall,
   sse,
   SseResponseBody,
   startResponsesTestProxy,
@@ -13,7 +13,7 @@ import { createMockClient } from "./testCodex";
 
 function* infiniteShellCall(): Generator<SseResponseBody> {
   while (true) {
-    yield sse(responseStarted(), execCommandCall(), responseCompleted());
+    yield sse(responseStarted(), shellCall(), responseCompleted());
   }
 }
 

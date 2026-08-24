@@ -173,7 +173,6 @@ impl McpHandler {
         let ToolInvocation {
             session,
             step_context,
-            cancellation_token,
             call_id,
             tool_name,
             payload,
@@ -194,7 +193,6 @@ impl McpHandler {
         let result = handle_mcp_tool_call(
             Arc::clone(&session),
             &step_context,
-            &cancellation_token,
             call_id.clone(),
             &self.tool_info,
             self.hook_tool_name(),

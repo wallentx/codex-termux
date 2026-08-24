@@ -767,13 +767,6 @@ pub struct RealtimeWebsocketClient {
     webrtc_sideband_base_url: String,
 }
 
-#[derive(Clone, Copy)]
-enum RealtimeSessionInitialization {
-    NewSession,
-    LegacyWebrtcSideband,
-    ExistingCall,
-}
-
 impl RealtimeWebsocketClient {
     pub fn new(provider: Provider) -> Self {
         Self {
@@ -806,7 +799,7 @@ impl RealtimeWebsocketClient {
             config,
             extra_headers,
             default_headers,
-            RealtimeSessionInitialization::NewSession,
+            /*initialize_session*/ true,
             RealtimeTranscriptState::default(),
         )
         .await
@@ -820,46 +813,6 @@ impl RealtimeWebsocketClient {
         default_headers: HeaderMap,
         transcript_state: RealtimeTranscriptState,
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
-        self.connect_sideband(
-            config,
-            call_id,
-            extra_headers,
-            default_headers,
-            RealtimeSessionInitialization::LegacyWebrtcSideband,
-            transcript_state,
-        )
-        .await
-    }
-
-    /// Attaches to a client-created call without overwriting its session configuration.
-    pub async fn connect_existing_call_sideband(
-        &self,
-        config: RealtimeSessionConfig,
-        call_id: &str,
-        extra_headers: HeaderMap,
-        default_headers: HeaderMap,
-        transcript_state: RealtimeTranscriptState,
-    ) -> Result<RealtimeWebsocketConnection, ApiError> {
-        self.connect_sideband(
-            config,
-            call_id,
-            extra_headers,
-            default_headers,
-            RealtimeSessionInitialization::ExistingCall,
-            transcript_state,
-        )
-        .await
-    }
-
-    async fn connect_sideband(
-        &self,
-        config: RealtimeSessionConfig,
-        call_id: &str,
-        extra_headers: HeaderMap,
-        default_headers: HeaderMap,
-        session_initialization: RealtimeSessionInitialization,
-        transcript_state: RealtimeTranscriptState,
-    ) -> Result<RealtimeWebsocketConnection, ApiError> {
         // The WebRTC call already exists; this loop only retries joining its sideband control
         // socket. Once joined, the returned connection is the same reader/writer state that the
         // ordinary websocket start path uses.
@@ -870,7 +823,6 @@ impl RealtimeWebsocketClient {
                     call_id,
                     extra_headers.clone(),
                     default_headers.clone(),
-                    session_initialization,
                     transcript_state.clone(),
                 )
                 .await;
@@ -902,7 +854,6 @@ impl RealtimeWebsocketClient {
         call_id: &str,
         extra_headers: HeaderMap,
         default_headers: HeaderMap,
-        session_initialization: RealtimeSessionInitialization,
         transcript_state: RealtimeTranscriptState,
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
         // Keep the parser/session query shaping from standalone realtime while replacing the model
@@ -913,7 +864,7 @@ impl RealtimeWebsocketClient {
             config,
             extra_headers,
             default_headers,
-            session_initialization,
+            /*initialize_session*/ false,
             transcript_state,
         )
         .await
@@ -940,7 +891,7 @@ impl RealtimeWebsocketClient {
         config: RealtimeSessionConfig,
         extra_headers: HeaderMap,
         default_headers: HeaderMap,
-        session_initialization: RealtimeSessionInitialization,
+        initialize_session: bool,
         transcript_state: RealtimeTranscriptState,
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
         ensure_rustls_crypto_provider();
@@ -983,14 +934,7 @@ impl RealtimeWebsocketClient {
             config.event_parser,
             transcript_state,
         );
-        let initialize_session = match session_initialization {
-            RealtimeSessionInitialization::NewSession => true,
-            RealtimeSessionInitialization::LegacyWebrtcSideband => {
-                config.event_parser != RealtimeEventParser::FramelessBidi
-            }
-            RealtimeSessionInitialization::ExistingCall => false,
-        };
-        if initialize_session {
+        if initialize_session || config.event_parser != RealtimeEventParser::FramelessBidi {
             debug!(
                 session_id = config.session_id.as_deref().unwrap_or("<none>"),
                 "realtime websocket sending session.update"
@@ -1007,11 +951,7 @@ impl RealtimeWebsocketClient {
                 )
                 .await?;
         }
-        if matches!(
-            session_initialization,
-            RealtimeSessionInitialization::NewSession
-        ) && config.event_parser == RealtimeEventParser::FramelessBidi
-        {
+        if initialize_session && config.event_parser == RealtimeEventParser::FramelessBidi {
             connection.events.wait_for_session_started().await?;
         }
         Ok(connection)
@@ -1139,19 +1079,8 @@ fn websocket_url_from_api_url_for_call(
     )?;
     match event_parser {
         RealtimeEventParser::FramelessBidi => {
-            if matches!(call_id, "." | "..") {
-                return Err(ApiError::InvalidRequest {
-                    message: format!("invalid realtime call id: {call_id}"),
-                });
-            }
-            url.path_segments_mut()
-                .map_err(|()| {
-                    ApiError::Stream(
-                        "realtime sideband URL cannot contain path segments".to_string(),
-                    )
-                })?
-                .pop_if_empty()
-                .push(call_id);
+            let path = format!("{}/{}", url.path().trim_end_matches('/'), call_id);
+            url.set_path(&path);
         }
         RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => {
             url.query_pairs_mut().append_pair("call_id", call_id);
@@ -2120,43 +2049,6 @@ mod tests {
             url.as_str(),
             "wss://api.openai.com/v1/realtime?call_id=rtc_test"
         );
-    }
-
-    #[test]
-    fn frameless_websocket_url_encodes_call_id_as_one_path_segment() {
-        let url = websocket_url_from_api_url_for_call(
-            "https://example.com/proxy/v1/live?trace=1",
-            /*query_params*/ None,
-            RealtimeEventParser::FramelessBidi,
-            RealtimeSessionMode::Conversational,
-            "../../admin",
-        )
-        .expect("build existing-call websocket url");
-
-        assert_eq!(
-            url.as_str(),
-            "wss://example.com/proxy/v1/live/..%2F..%2Fadmin?trace=1"
-        );
-    }
-
-    #[test]
-    fn frameless_websocket_url_rejects_dot_only_call_ids() {
-        for call_id in [".", ".."] {
-            let error = websocket_url_from_api_url_for_call(
-                "https://example.com/v1/live",
-                /*query_params*/ None,
-                RealtimeEventParser::FramelessBidi,
-                RealtimeSessionMode::Conversational,
-                call_id,
-            )
-            .expect_err("dot-only call IDs must not target the parent sideband URL");
-
-            assert!(matches!(
-                error,
-                ApiError::InvalidRequest { message }
-                    if message == format!("invalid realtime call id: {call_id}")
-            ));
-        }
     }
 
     #[test]

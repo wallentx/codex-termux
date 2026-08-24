@@ -141,9 +141,6 @@ impl App {
                     self.chat_widget.maybe_send_next_queued_input();
                 }
             }
-            AppEvent::CopySelection { text, label } => {
-                self.chat_widget.copy_selection(text, label);
-            }
             AppEvent::ClearUi { name } => {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
                 self.reset_app_ui_state_after_clear();
@@ -1521,9 +1518,6 @@ impl App {
                     return_to_permissions,
                     profile_selection,
                 );
-            }
-            AppEvent::ApplyPermissionShortcut { thread_id, selection } => {
-                self.apply_permission_shortcut(app_server, tui, thread_id, selection).await;
             }
             AppEvent::OpenWorldWritableWarningConfirmation {
                 preset,

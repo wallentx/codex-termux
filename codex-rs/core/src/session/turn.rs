@@ -375,9 +375,11 @@ pub(crate) async fn run_turn(
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
 
-            let responses_metadata = sess
-                .responses_metadata(turn_context.as_ref(), CodexResponsesRequestKind::Turn)
-                .await;
+            let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+                sess.installation_id.clone(),
+                window_id,
+                CodexResponsesRequestKind::Turn,
+            );
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
@@ -501,7 +503,7 @@ pub(crate) async fn run_turn(
                     last_agent_message = sampling_request_last_agent_message;
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
-                        &step_context,
+                        &turn_context,
                         stop_hook_active,
                         last_agent_message.clone(),
                     )
@@ -1221,7 +1223,7 @@ async fn run_auto_compact(
             )
             .await?;
         }
-        RemoteCompactionSupport::V2 => {
+        RemoteCompactionSupport::V1 | RemoteCompactionSupport::V2 => {
             emit_compact_metric(
                 &sess.services.session_telemetry,
                 "remote",

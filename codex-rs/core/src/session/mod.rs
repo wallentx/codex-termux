@@ -21,7 +21,6 @@ use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::context::ContextualUserFragment;
-use crate::context::ManagedDeveloperInstructions;
 use crate::context::ModelSwitchInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::NetworkRuleSaved;
@@ -42,7 +41,6 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::skills_load_input_from_config;
-use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::turn_metadata::TurnMetadataState;
 use crate::turn_timing::now_unix_timestamp_ms;
 use async_channel::Receiver;
@@ -229,7 +227,6 @@ mod token_budget;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 mod turn_input;
-mod turn_suspension;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
 #[cfg(test)]
@@ -1348,13 +1345,12 @@ impl Session {
             let mut state = self.state.lock().await;
             state.set_next_turn_is_first(!has_prior_user_turns);
         }
-        let turn_context = match conversation_history {
+        match conversation_history {
             InitialHistory::New | InitialHistory::Cleared => {
                 // Defer initial context insertion until the first real turn starts so
                 // turn/start overrides can be merged before we write model-visible context.
                 self.set_previous_turn_settings(/*previous_turn_settings*/ None)
                     .await;
-                None
             }
             InitialHistory::Resumed(resumed_history) => {
                 let turn_context = self.new_default_turn().await;
@@ -1404,7 +1400,6 @@ impl Session {
                 if !is_subagent {
                     let _ = self.flush_rollout().await;
                 }
-                None
             }
             InitialHistory::Forked(mut rollout_items) => {
                 let turn_context = self.new_default_turn().await;
@@ -1453,19 +1448,6 @@ impl Session {
                 if !is_subagent {
                     let _ = self.flush_rollout().await;
                 }
-                Some(turn_context)
-            }
-        };
-        if let Some(turn_context) = turn_context
-            && turn_context.config.memories.disable_on_external_context
-        {
-            let history = self.clone_history().await;
-            if let Some(item) = history
-                .raw_items()
-                .find(|item| matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }))
-            {
-                mark_thread_memory_mode_polluted_if_external_context(self, &turn_context, item)
-                    .await;
             }
         }
     }
@@ -1753,7 +1735,6 @@ impl Session {
             let previous_config = notify_config_contributors
                 .then(|| self.build_effective_session_config(&state.session_configuration));
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-            config.active_project = next_config.active_project.clone();
             config.config_layer_stack = config
                 .config_layer_stack
                 .with_user_layer_from(&next_config.config_layer_stack);
@@ -2576,7 +2557,6 @@ impl Session {
             };
             let approval_context = ApprovalContext {
                 review_context: review_context.clone(),
-                cancellation_token: Some(cancellation_token.clone()),
                 call_id,
                 tool_name: ToolName::plain("request_permissions"),
                 strict_auto_review: false,
@@ -2590,6 +2570,7 @@ impl Session {
                 decision = self.request_guardian_approval(
                     action,
                     &approval_context,
+                    Some(cancellation_token.clone()),
                 ) => decision,
             };
             let response = match decision {
@@ -3105,13 +3086,6 @@ impl Session {
         let rollout_items: Vec<RolloutItem> =
             items.into_iter().map(RolloutItem::ResponseItem).collect();
         self.persist_rollout_items(&rollout_items).await;
-        if turn_context.config.memories.disable_on_external_context
-            && let Some(item) = response_items
-                .iter()
-                .find(|item| matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }))
-        {
-            mark_thread_memory_mode_polluted_if_external_context(self, turn_context, item).await;
-        }
         self.send_raw_response_items(turn_context, &response_items)
             .await;
     }
@@ -3636,7 +3610,6 @@ impl Session {
                 .latest_call_tool(
                     "notes",
                     "thread_hint",
-                    /*environment_id*/ None,
                     /*arguments*/ None,
                     Some(serde_json::json!({
                         "threadId": self.thread_id().to_string(),
@@ -3673,7 +3646,6 @@ impl Session {
         }
         // Render the active mode after the usage hint so it can override that hint.
         let mut initial_multi_agent_mode = None;
-        let mut managed_developer_instructions = None;
         for fragment in world_state.render_full() {
             match fragment.role() {
                 "developer"
@@ -3684,11 +3656,6 @@ impl Session {
                 }
                 "developer" if fragment.markers().0 == MULTI_AGENT_MODE_OPEN_TAG => {
                     initial_multi_agent_mode = Some(fragment);
-                }
-                "developer"
-                    if fragment.markers().0 == ManagedDeveloperInstructions::type_markers().0 =>
-                {
-                    managed_developer_instructions = Some(fragment);
                 }
                 "developer"
                     if fragment.markers().0 == MultiAgentRoleInstructions::type_markers().0 =>
@@ -3739,9 +3706,6 @@ impl Session {
         {
             items.push(guardian_developer_message);
         }
-        if let Some(managed_developer_instructions) = managed_developer_instructions {
-            items.push(managed_developer_instructions.into_boxed_response_item());
-        }
         // New context windows and compaction install these items directly into replacement history.
         for item in &mut items {
             item.set_turn_id_if_missing(&turn_context.sub_id);
@@ -3771,15 +3735,10 @@ impl Session {
     }
 
     pub(crate) async fn current_window_id(&self) -> String {
-        self.current_window().await.0
-    }
-
-    pub(crate) async fn current_window(&self) -> (String, Uuid) {
         let state = self.state.lock().await;
         let thread_id = self.thread_id;
         let window_number = state.auto_compact_window_number();
-        let context_window_id = state.auto_compact_window_ids().window_id;
-        (format!("{thread_id}:{window_number}"), context_window_id)
+        format!("{thread_id}:{window_number}")
     }
 
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {

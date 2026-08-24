@@ -308,7 +308,7 @@ async fn request_permissions_guardian_review_stops_when_cancelled() {
 }
 
 #[tokio::test]
-async fn guardian_allows_exec_command_additional_permissions_requests_past_policy_validation() {
+async fn guardian_allows_shell_command_additional_permissions_requests_past_policy_validation() {
     let server = start_mock_server().await;
     let _request_log = mount_sse_once(
         &server,
@@ -371,9 +371,11 @@ async fn guardian_allows_exec_command_additional_permissions_requests_past_polic
     );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
-    let yield_time_ms: u64 = 10_000;
+    let expiration_ms: u64 = if cfg!(windows) { 2_500 } else { 1_000 };
 
-    let handler = crate::tools::handlers::ExecCommandHandler::default();
+    let handler = crate::tools::handlers::ShellCommandHandler::from(
+        codex_tools::ShellCommandBackendConfig::Classic,
+    );
     #[allow(deprecated)]
     let workdir = Some(turn_context.cwd.to_string_lossy().to_string());
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
@@ -385,14 +387,14 @@ async fn guardian_allows_exec_command_additional_permissions_requests_past_polic
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "test-call".to_string(),
-            tool_name: codex_tools::ToolName::plain("exec_command"),
+            tool_name: codex_tools::ToolName::plain("shell_command"),
             source: crate::tools::context::ToolCallSource::Direct,
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
-                    "cmd": "echo hi",
+                    "command": "echo hi",
                     "login": false,
                     "workdir": workdir,
-                    "yield_time_ms": yield_time_ms,
+                    "timeout_ms": expiration_ms,
                     "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
                     "additional_permissions": PermissionProfile {
                         network: Some(NetworkPermissions {
@@ -412,7 +414,7 @@ async fn guardian_allows_exec_command_additional_permissions_requests_past_polic
 }
 
 #[tokio::test]
-async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_skip() {
+async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_skip() {
     let server = start_mock_server().await;
     let guardian_request_log = mount_sse_once(
         &server,
@@ -499,7 +501,9 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
         )
         .await;
 
-    let handler = crate::tools::handlers::ExecCommandHandler::default();
+    let handler = crate::tools::handlers::ShellCommandHandler::from(
+        codex_tools::ShellCommandBackendConfig::Classic,
+    );
     #[allow(deprecated)]
     let workdir = Some(turn_context.cwd.to_string_lossy().to_string());
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
@@ -511,14 +515,14 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "strict-shell-command-call".to_string(),
-            tool_name: codex_tools::ToolName::plain("exec_command"),
+            tool_name: codex_tools::ToolName::plain("shell_command"),
             source: ToolCallSource::Direct,
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
-                    "cmd": "echo hi",
+                    "command": "echo hi",
                     "login": false,
                     "workdir": workdir,
-                    "yield_time_ms": 10_000_u64,
+                    "timeout_ms": 1_000_u64,
                 })
                 .to_string(),
             },
@@ -661,7 +665,7 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
     clippy::await_holding_invalid_type,
     reason = "test mutates active turn state directly to seed granted permissions"
 )]
-async fn exec_command_allows_sticky_turn_permissions_without_inline_request_permissions_feature() {
+async fn shell_command_allows_sticky_turn_permissions_without_inline_request_permissions_feature() {
     let (mut session, turn_context_raw) = make_session_and_context().await;
     session
         .features
@@ -686,7 +690,9 @@ async fn exec_command_allows_sticky_turn_permissions_without_inline_request_perm
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
 
-    let handler = crate::tools::handlers::ExecCommandHandler::default();
+    let handler = crate::tools::handlers::ShellCommandHandler::from(
+        codex_tools::ShellCommandBackendConfig::Classic,
+    );
     #[allow(deprecated)]
     let workdir = Some(turn_context.cwd.to_string_lossy().to_string());
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
@@ -698,13 +704,13 @@ async fn exec_command_allows_sticky_turn_permissions_without_inline_request_perm
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "sticky-turn-grant".to_string(),
-            tool_name: codex_tools::ToolName::plain("exec_command"),
+            tool_name: codex_tools::ToolName::plain("shell_command"),
             source: crate::tools::context::ToolCallSource::Direct,
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
-                    "cmd": "echo hi",
+                    "command": "echo hi",
                     "login": false,
-                    "yield_time_ms": 10_000_u64,
+                    "timeout_ms": 1_000_u64,
                     "workdir": workdir,
                 })
                 .to_string(),

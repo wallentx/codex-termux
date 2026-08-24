@@ -121,9 +121,6 @@ impl RmcpClient {
 
     fn is_retryable_client_initialize_error(error: &rmcp::service::ClientInitializeError) -> bool {
         match error {
-            rmcp::service::ClientInitializeError::LegacyFallbackFailed { fallback, .. } => {
-                Self::is_retryable_client_initialize_error(fallback)
-            }
             rmcp::service::ClientInitializeError::TransportError { error, context }
                 if matches!(
                     context.as_ref(),

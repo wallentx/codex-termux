@@ -48,7 +48,10 @@ pub(crate) fn permission_profile_policy_tag(
             let file_system_policy = profile.file_system_sandbox_policy();
             if file_system_policy.has_full_disk_write_access() {
                 "danger-full-access"
-            } else if !file_system_policy.has_writable_roots_with_cwd(cwd) {
+            } else if file_system_policy
+                .get_writable_roots_with_cwd(cwd)
+                .is_empty()
+            {
                 "read-only"
             } else {
                 "workspace-write"

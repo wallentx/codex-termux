@@ -145,7 +145,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         description: None,
         default_reasoning_level: None,
         supported_reasoning_levels: Vec::new(),
-        shell_type: ConfigShellToolType::UnifiedExec,
+        shell_type: ConfigShellToolType::Default,
         visibility: ModelVisibility::None,
         supported_in_api: true,
         priority: 99,

@@ -120,12 +120,8 @@ pub(crate) fn maybe_init(config: &Config) {
 }
 
 pub(crate) fn log_inbound_app_event(event: &AppEvent) {
-    log_inbound_app_event_with(&LOGGER, event);
-}
-
-fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
     // Log only if enabled
-    if !logger.is_enabled() {
+    if !LOGGER.is_enabled() {
         return;
     }
 
@@ -136,7 +132,7 @@ fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
                 "dir": "to_tui",
                 "kind": "new_session",
             });
-            logger.write_json_line(value);
+            LOGGER.write_json_line(value);
         }
         AppEvent::ClearUi { .. } => {
             let value = json!({
@@ -144,7 +140,7 @@ fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
                 "dir": "to_tui",
                 "kind": "clear_ui",
             });
-            logger.write_json_line(value);
+            LOGGER.write_json_line(value);
         }
         AppEvent::InsertHistoryCell(cell) => {
             let value = json!({
@@ -153,7 +149,7 @@ fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
                 "kind": "insert_history_cell",
                 "lines": cell.transcript_lines(u16::MAX).len(),
             });
-            logger.write_json_line(value);
+            LOGGER.write_json_line(value);
         }
         AppEvent::StartFileSearch(query) => {
             let value = json!({
@@ -162,7 +158,7 @@ fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
                 "kind": "file_search_start",
                 "query": query,
             });
-            logger.write_json_line(value);
+            LOGGER.write_json_line(value);
         }
         AppEvent::FileSearchResult { query, matches } => {
             let value = json!({
@@ -172,7 +168,7 @@ fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
                 "query": query,
                 "matches": matches.len(),
             });
-            logger.write_json_line(value);
+            LOGGER.write_json_line(value);
         }
         AppEvent::PetPreviewLoaded { request_id, result } => {
             let value = json!({
@@ -183,7 +179,7 @@ fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
                 "request_id": request_id,
                 "ok": result.is_ok(),
             });
-            logger.write_json_line(value);
+            LOGGER.write_json_line(value);
         }
         AppEvent::PetSelectionLoaded {
             request_id,
@@ -199,18 +195,17 @@ fn log_inbound_app_event_with(logger: &SessionLogger, event: &AppEvent) {
                 "pet_id": pet_id,
                 "ok": result.is_ok(),
             });
-            logger.write_json_line(value);
+            LOGGER.write_json_line(value);
         }
         // Noise or control flow – record variant only
         other => {
-            let variant: &'static str = other.into();
             let value = json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "app_event",
-                "variant": variant,
+                "variant": format!("{other:?}").split('(').next().unwrap_or("app_event"),
             });
-            logger.write_json_line(value);
+            LOGGER.write_json_line(value);
         }
     }
 }
@@ -246,7 +241,3 @@ where
     });
     LOGGER.write_json_line(value);
 }
-
-#[cfg(test)]
-#[path = "session_log_tests.rs"]
-mod tests;

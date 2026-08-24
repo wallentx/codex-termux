@@ -37,6 +37,7 @@ use crate::protocol::FsWalkParams;
 use crate::protocol::FsWriteFileParams;
 
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const NOT_FOUND_ERROR_CODE: i64 = -32004;
 
 #[path = "remote_file_stream.rs"]
@@ -145,6 +146,7 @@ impl RemoteFileSystem {
                 recursive: Some(options.recursive),
                 follow_symlinks: (!options.follow_symlinks).then_some(false),
                 sandbox: remote_sandbox_context(sandbox),
+                private: None,
             })
             .await;
         self.metadata_requests.lock().await.clear();
@@ -251,14 +253,27 @@ impl RemoteFileSystem {
     ) -> FileSystemResult<WalkOutcome> {
         trace!("remote fs walk");
         let client = self.client.get().await.map_err(map_remote_error)?;
-        client
+        let response = match client
             .fs_walk(FsWalkParams {
                 path: path.clone(),
                 options,
                 sandbox: remote_sandbox_context(sandbox),
             })
             .await
-            .map_err(map_remote_error)
+        {
+            Ok(response) => response,
+            Err(ExecServerError::Server {
+                code: METHOD_NOT_FOUND_ERROR_CODE,
+                ..
+            }) => {
+                return <Self as ExecutorFileSystem>::walk_via_directory_reads(
+                    self, path, options, sandbox,
+                )
+                .await;
+            }
+            Err(error) => return Err(map_remote_error(error)),
+        };
+        Ok(response)
     }
 
     async fn remove(

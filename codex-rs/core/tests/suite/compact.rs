@@ -99,22 +99,12 @@ const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 
-fn ev_exec_command_call(call_id: &str, command: &str) -> serde_json::Value {
+fn ev_shell_command_call(call_id: &str, command: &str) -> serde_json::Value {
     ev_function_call(
         call_id,
-        "exec_command",
-        &json!({ "cmd": command }).to_string(),
+        "shell_command",
+        &json!({ "command": command }).to_string(),
     )
-}
-
-pub(super) fn allow_echo_commands(home: &Path) {
-    let rules_dir = home.join("rules");
-    fs::create_dir_all(&rules_dir).expect("create exec policy rules directory");
-    fs::write(
-        rules_dir.join("default.rules"),
-        r#"prefix_rule(pattern=["echo"], decision="allow")"#,
-    )
-    .expect("write echo exec policy rule");
 }
 
 fn disabled_permission_user_turn(
@@ -1052,7 +1042,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 
     let non_openai_provider_name = non_openai_model_provider(&server).name;
     let test = test_codex()
-        .with_pre_build_hook(allow_echo_commands)
         .with_config(move |config| {
             config.model_provider.name = non_openai_provider_name;
         })
@@ -1088,7 +1077,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // first chunk of work
     let model_reasoning_response_1_sse = sse(vec![
         reasoning_response_1.clone(),
-        ev_exec_command_call("r1-shell", "echo make-react"),
+        ev_shell_command_call("r1-shell", "echo make-react"),
         ev_completed_with_tokens("r1", token_count_used),
     ]);
 
@@ -1106,7 +1095,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // second chunk of work
     let model_reasoning_response_2_sse = sse(vec![
         reasoning_response_2.clone(),
-        ev_exec_command_call("r3-shell", "echo make-node"),
+        ev_shell_command_call("r3-shell", "echo make-node"),
         ev_completed_with_tokens("r3", token_count_used),
     ]);
 
@@ -1124,7 +1113,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // third chunk of work
     let model_reasoning_response_3_sse = sse(vec![
         ev_reasoning_item("m6", &["I will create a python app"], &[]),
-        ev_exec_command_call("r6-shell", "echo make-python"),
+        ev_shell_command_call("r6-shell", "echo make-python"),
         ev_completed_with_tokens("r6", token_count_used),
     ]);
 
@@ -1319,9 +1308,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "reasoning"
       },
       {
-        "arguments": "{\"cmd\":\"echo make-react\"}",
+        "arguments": "{\"command\":\"echo make-react\"}",
         "call_id": "r1-shell",
-        "name": "exec_command",
+        "name": "shell_command",
         "type": "function_call"
       },
       {
@@ -1419,9 +1408,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "reasoning"
       },
       {
-        "arguments": "{\"cmd\":\"echo make-node\"}",
+        "arguments": "{\"command\":\"echo make-node\"}",
         "call_id": "r3-shell",
-        "name": "exec_command",
+        "name": "shell_command",
         "type": "function_call"
       },
       {
@@ -1519,9 +1508,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         "type": "reasoning"
       },
       {
-        "arguments": "{\"cmd\":\"echo make-python\"}",
+        "arguments": "{\"command\":\"echo make-python\"}",
         "call_id": "r6-shell",
-        "name": "exec_command",
+        "name": "shell_command",
         "type": "function_call"
       },
       {

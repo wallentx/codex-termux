@@ -4,7 +4,6 @@ use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_protocol::error::Result;
 
 use super::BedrockEndpoint;
-use super::auth::BedrockAuthSource;
 use super::auth::resolve_region;
 use super::mantle::region_from_config;
 
@@ -23,11 +22,10 @@ pub(super) fn base_url(region: &str) -> String {
 }
 
 pub(super) async fn bedrock_runtime_base_url(
-    source: BedrockAuthSource,
     managed_auth: Option<&BedrockApiKeyAuth>,
     aws: &ModelProviderAwsAuthInfo,
 ) -> Result<String> {
-    let region = resolve_region(source, managed_auth, aws, BedrockEndpoint::Runtime).await?;
+    let region = resolve_region(managed_auth, aws, BedrockEndpoint::Runtime).await?;
     Ok(base_url(&region))
 }
 

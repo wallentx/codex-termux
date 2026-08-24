@@ -2806,21 +2806,6 @@ async fn status_line_invalid_items_warn_once() {
 }
 
 #[tokio::test]
-async fn status_line_hostname_renders_current_machine_hostname() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.config.tui_status_line = Some(vec!["hostname".to_string()]);
-
-    chat.refresh_status_line();
-
-    assert_eq!(status_line_text(&chat), codex_config::os_host_name());
-    assert!(
-        drain_insert_history(&mut rx).is_empty(),
-        "hostname should be accepted as a status line item"
-    );
-}
-
-#[tokio::test]
 async fn status_line_context_used_renders_labeled_percent() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -3806,8 +3791,7 @@ async fn completed_turn_clears_visible_running_hook() {
 
 #[tokio::test]
 async fn status_line_fast_mode_renders_on_and_off() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
-    set_fast_mode_test_catalog(&mut chat);
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.tui_status_line = Some(vec!["fast-mode".to_string()]);
 
     chat.refresh_status_line();
@@ -3815,27 +3799,6 @@ async fn status_line_fast_mode_renders_on_and_off() {
 
     chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
     chat.refresh_status_line();
-    assert_eq!(status_line_text(&chat), Some("Fast on".to_string()));
-}
-
-#[tokio::test]
-async fn status_line_fast_mode_updates_visibility_on_model_change() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
-    set_fast_mode_test_catalog(&mut chat);
-    chat.config.tui_status_line = Some(vec!["fast-mode".to_string()]);
-
-    chat.refresh_status_line();
-    assert_eq!(status_line_text(&chat), Some("Fast off".to_string()));
-
-    chat.set_model("gpt-5.2");
-    assert_eq!(status_line_text(&chat), None);
-
-    chat.set_model("gpt-5.4");
-    assert_eq!(status_line_text(&chat), Some("Fast off".to_string()));
-
-    chat.set_model("uncatalogued-model");
-    assert_eq!(status_line_text(&chat), Some("Fast off".to_string()));
-    chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
     assert_eq!(status_line_text(&chat), Some("Fast on".to_string()));
 }
 
@@ -3844,14 +3807,10 @@ async fn status_line_fast_mode_footer_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
-    set_fast_mode_test_catalog(&mut chat);
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
-    chat.config.tui_status_line = Some(vec![
-        "model-with-reasoning".to_string(),
-        "fast-mode".to_string(),
-    ]);
-    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+    chat.config.tui_status_line = Some(vec!["fast-mode".to_string()]);
+    chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
     chat.refresh_status_line();
 
     let width = 80;

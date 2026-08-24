@@ -55,10 +55,15 @@ pub(crate) fn event_notification_channel() -> (EventNotificationSender, EventNot
 }
 
 impl EventNotificationSender {
-    fn send(&self, notification: CustomNotification, notification_bytes: usize) -> Result<(), ()> {
+    async fn send(
+        &self,
+        notification: CustomNotification,
+        notification_bytes: usize,
+    ) -> Result<(), ()> {
         let bytes = u32::try_from(notification_bytes).map_err(|_| ())?;
         let permit = Arc::clone(&self.available_bytes)
-            .try_acquire_many_owned(bytes)
+            .acquire_many_owned(bytes)
+            .await
             .map_err(|_| ())?;
         self.notifications
             .send(QueuedEventNotification {
@@ -226,6 +231,7 @@ where
             }
             if route
                 .send(notification.clone(), notification_bytes)
+                .await
                 .is_err()
                 && let Some(route) = self
                     .routes
@@ -233,13 +239,6 @@ where
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&subscription_id)
             {
-                let _ = route.send(
-                    CustomNotification::new(
-                        "notifications/events/terminated",
-                        /*params*/ None,
-                    ),
-                    /*notification_bytes*/ 0,
-                );
                 route.close();
             }
         }

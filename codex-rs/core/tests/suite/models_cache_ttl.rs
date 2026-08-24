@@ -495,7 +495,7 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
                 description: "medium".to_string(),
             },
         ],
-        shell_type: ConfigShellToolType::UnifiedExec,
+        shell_type: ConfigShellToolType::ShellCommand,
         visibility: ModelVisibility::List,
         supported_in_api: true,
         priority,

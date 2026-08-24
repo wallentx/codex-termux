@@ -135,7 +135,6 @@ fn response_item_may_include_external_context(item: &ResponseItem) -> bool {
         ResponseItem::ToolSearchCall { .. }
             | ResponseItem::ToolSearchOutput { .. }
             | ResponseItem::WebSearchCall { .. }
-            | ResponseItem::FunctionCallOutput { call_id: None, .. }
     )
 }
 
@@ -505,9 +504,7 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
         ResponseInputItem::FunctionCallOutput { call_id, output } => {
             Some(ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: Some(call_id.clone()),
-                name: None,
-                namespace: None,
+                call_id: call_id.clone(),
                 output: output.clone(),
                 internal_chat_message_metadata_passthrough: None,
             })
@@ -527,9 +524,7 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
             let output = output.as_function_call_output_payload();
             Some(ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: Some(call_id.clone()),
-                name: None,
-                namespace: None,
+                call_id: call_id.clone(),
                 output,
                 internal_chat_message_metadata_passthrough: None,
             })

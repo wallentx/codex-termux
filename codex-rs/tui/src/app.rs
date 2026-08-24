@@ -223,7 +223,6 @@ mod history_ui;
 mod input;
 mod loaded_threads;
 mod pending_interactive_replay;
-mod permission_shortcuts;
 mod pets;
 mod platform_actions;
 mod plugin_mentions;

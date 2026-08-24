@@ -1,5 +1,4 @@
 use std::io::IsTerminal;
-use std::ops::Deref;
 use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -45,7 +44,7 @@ impl AwsAuthRecovery {
 
         let mut command = Command::new(&self.config.command);
         command
-            .args(self.config.args.iter().map(Deref::deref))
+            .args(&self.config.args)
             .stdin(if std::io::stdin().is_terminal() {
                 Stdio::inherit()
             } else {

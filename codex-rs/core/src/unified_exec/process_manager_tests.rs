@@ -184,7 +184,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
                 ),
             ]),
         }),
-        exec_server_shell_snapshot: None,
         network: None,
         network_environment_id: None,
         expiration: crate::exec::ExecExpiration::DefaultTimeout,
@@ -231,18 +230,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
             ("CODEX_NETWORK_PROXY_ACTIVE".to_string(), "1".to_string(),),
         ])
     );
-    request.exec_server_shell_snapshot = Some(codex_exec_server::ShellSnapshotRequest {
-        scope_id: "attachment-1".to_string(),
-        shell: codex_exec_server::ShellInfo {
-            name: "bash".to_string(),
-            path: "/bin/bash".to_string(),
-        },
-    });
-    let mut snapshot_env = params.env;
-    snapshot_env.remove("PATH");
-    assert_eq!(params_for_request(&request).env, snapshot_env);
-    request.exec_server_shell_snapshot = None;
-
     request.exec_server_sandbox = Some(
         codex_exec_server::FileSystemSandboxContext::from_permission_profile(permission_profile),
     );
@@ -296,8 +283,7 @@ fn initial_exec_yield_time_has_no_platform_floor() {
 
 #[tokio::test]
 async fn output_collection_stays_bounded_across_repeated_drains() {
-    let chunks: [&[u8]; 4] = [b"01234567", b"89ABCDEF", b"ghijklmnopq", b"rs"];
-    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::<10>::default()));
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
     let output_notify = Arc::new(Notify::new());
     let output_closed = Arc::new(AtomicBool::new(false));
     let output_closed_notify = Arc::new(Notify::new());
@@ -316,8 +302,10 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
         Instant::now() + Duration::from_secs(5),
     );
     let produce = async {
-        for chunk in chunks {
-            output_buffer.lock().await.push_chunk(chunk);
+        for byte in [b'a', b'b', b'c'] {
+            output_buffer.lock().await.push_chunk(
+                vec![byte; crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES],
+            );
             output_notify.notify_one();
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
@@ -338,21 +326,30 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
     };
 
     let (collected, ()) = tokio::join!(collect, produce);
-    let mut expected = HeadTailBuffer::<10>::default();
-    for chunk in chunks {
-        expected.push_chunk(chunk);
+    let mut expected = HeadTailBuffer::default();
+    for byte in [b'a', b'b', b'c'] {
+        expected.push_chunk(vec![
+            byte;
+            crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES
+        ]);
     }
     assert_eq!(collected, expected);
 }
 
 #[tokio::test]
 async fn output_collection_preserves_omissions_from_drained_buffer() {
-    let mut buffered_output = HeadTailBuffer::<10>::default();
-    buffered_output.push_chunk(&[b'a'; 10]);
-    buffered_output.push_chunk(b"overflow");
-    let mut expected = HeadTailBuffer::<10>::default();
-    expected.push_chunk(&[b'a'; 10]);
-    expected.push_chunk(b"overflow");
+    let mut buffered_output = HeadTailBuffer::default();
+    buffered_output.push_chunk(vec![
+        b'a';
+        crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES
+    ]);
+    buffered_output.push_chunk(b"overflow".to_vec());
+    let mut expected = HeadTailBuffer::default();
+    expected.push_chunk(vec![
+        b'a';
+        crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES
+    ]);
+    expected.push_chunk(b"overflow".to_vec());
     let output_buffer = Arc::new(tokio::sync::Mutex::new(buffered_output));
     let output_notify = Arc::new(Notify::new());
     let output_closed = Arc::new(AtomicBool::new(true));
@@ -405,7 +402,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     let context = UnifiedExecContext::new(
         Arc::clone(&session),
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
-        tokio_util::sync::CancellationToken::new(),
         "call-unified-denied".to_string(),
     );
     let request = ExecCommandRequest {
@@ -439,7 +435,10 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    transcript.lock().await.push_chunk(b"PARTIAL_TRANSCRIPT");
+    transcript
+        .lock()
+        .await
+        .push_chunk(b"PARTIAL_TRANSCRIPT".to_vec());
 
     emit_failed_initial_exec_end_if_unstored(
         /*process_started_alive*/ false,

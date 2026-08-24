@@ -10,7 +10,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use serde_json::Value;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::responses_metadata::AGENT_NAME_KEY;
@@ -126,7 +125,6 @@ pub(crate) struct TurnMetadataState {
     root_turn_ambiguous: AtomicBool,
     user_input_requested_during_turn: AtomicBool,
     enrichment_task: Mutex<Option<JoinHandle<()>>>,
-    git_enrichment_complete: watch::Sender<bool>,
 }
 
 impl TurnMetadataState {
@@ -188,7 +186,6 @@ impl TurnMetadataState {
             root_turn_ambiguous: AtomicBool::new(false),
             user_input_requested_during_turn: AtomicBool::new(false),
             enrichment_task: Mutex::new(None),
-            git_enrichment_complete: watch::channel(/*init*/ true).0,
         }
     }
 
@@ -409,9 +406,9 @@ impl TurnMetadataState {
     }
 
     pub(crate) fn spawn_git_enrichment_task(self: &Arc<Self>) {
-        let Some(repo_root) = self.repo_root.clone() else {
+        if self.repo_root.is_none() {
             return;
-        };
+        }
 
         let mut task_guard = self
             .enrichment_task
@@ -421,30 +418,27 @@ impl TurnMetadataState {
             return;
         }
 
-        self.git_enrichment_complete.send_replace(/*value*/ false);
         let state = Arc::clone(self);
         *task_guard = Some(tokio::spawn(async move {
+            let Some(repo_root) = state.repo_root.clone() else {
+                return;
+            };
             let workspace_git_metadata = state.fetch_workspace_git_metadata(&repo_root).await;
 
-            if !workspace_git_metadata.is_empty() {
-                let mut workspaces = BTreeMap::new();
-                workspaces.insert(
-                    repo_root.to_string_lossy().into_owned(),
-                    workspace_git_metadata.into(),
-                );
-                *state
-                    .enriched_workspaces
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(workspaces);
+            if workspace_git_metadata.is_empty() {
+                return;
             }
 
-            state.git_enrichment_complete.send_replace(/*value*/ true);
+            let mut workspaces = BTreeMap::new();
+            workspaces.insert(
+                repo_root.to_string_lossy().into_owned(),
+                workspace_git_metadata.into(),
+            );
+            *state
+                .enriched_workspaces
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(workspaces);
         }));
-    }
-
-    pub(crate) async fn wait_for_git_enrichment(&self) {
-        let mut completion = self.git_enrichment_complete.subscribe();
-        let _ = completion.wait_for(|complete| *complete).await;
     }
 
     pub(crate) fn cancel_git_enrichment_task(&self) {
@@ -454,7 +448,6 @@ impl TurnMetadataState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(task) = task_guard.take() {
             task.abort();
-            self.git_enrichment_complete.send_replace(/*value*/ true);
         }
     }
 

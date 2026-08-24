@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use anyhow::Context;
 use anyhow::Result;
 use codex_exec_server::CreateDirectoryOptions;
+use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_protocol::config_types::ModeKind;
@@ -25,7 +26,6 @@ use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::shell_environment::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
 use codex_protocol::user_input::UserInput;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use codex_utils_path_uri::PathUri;
@@ -184,7 +184,7 @@ async fn wait_for_raw_unified_exec_output(
     let content = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::RawResponseItem(raw) => match &raw.item {
             ResponseItem::FunctionCallOutput {
-                call_id: Some(output_call_id),
+                call_id: output_call_id,
                 output,
                 ..
             } if output_call_id == call_id => output.text_content().map(str::to_string),
@@ -258,6 +258,11 @@ async fn exec_command_hides_and_rejects_login_when_disabled() -> Result<()> {
 
     let builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config.permissions.allow_login_shell = false;
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
     });
     let harness = TestCodexHarness::with_builder(builder).await?;
     let call_id = "exec-command-login-disabled";
@@ -300,60 +305,6 @@ async fn exec_command_hides_and_rejects_login_when_disabled() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_command_does_not_expose_configured_noise_auth_token() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-    skip_if_wine_exec!(
-        Ok(()),
-        "basic PowerShell execution through Wine is unavailable"
-    );
-
-    let builder = test_codex().with_model("gpt-5.4").with_config(|config| {
-        config.permissions.shell_environment_policy.r#set.insert(
-            CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR.to_string(),
-            "configured-noise-token".to_string(),
-        );
-        config.permissions.shell_environment_policy.r#set.insert(
-            CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR.to_ascii_lowercase(),
-            "case-variant-noise-token".to_string(),
-        );
-    });
-    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
-    let command = match core_test_support::test_target_os() {
-        core_test_support::TestTargetOs::Linux | core_test_support::TestTargetOs::MacOs => {
-            "if [ -n \"${CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN:-}\" ] || [ -n \"${codex_exec_server_noise_auth_token:-}\" ]; then echo leaked; else echo unset; fi"
-        }
-        core_test_support::TestTargetOs::Windows => {
-            "if ($env:CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN) { Write-Output leaked } else { Write-Output unset }"
-        }
-    };
-    let call_id = "exec-command-noise-auth-token";
-    let arguments = json!({ "cmd": command, "yield_time_ms": 5_000 });
-    mount_sse_sequence(
-        harness.server(),
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_function_call(call_id, "exec_command", &serde_json::to_string(&arguments)?),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-    harness
-        .submit("check the remote execution auth token")
-        .await?;
-
-    let output = parse_unified_exec_output(&harness.function_call_stdout(call_id).await)?;
-    assert_eq!(output.output.trim(), "unset");
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_command_uses_installed_environment_shell_policy_with_explicit_overrides() -> Result<()>
 {
     skip_if_wine_exec!(
@@ -363,6 +314,11 @@ async fn exec_command_uses_installed_environment_shell_policy_with_explicit_over
     skip_if_no_network!(Ok(()));
 
     let builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
         config.permissions.shell_environment_policy = ShellEnvironmentPolicy {
             inherit: ShellEnvironmentPolicyInherit::None,
             include_only: vec![EnvironmentVariablePattern::new_case_insensitive("DROP")],
@@ -457,7 +413,13 @@ async fn unified_exec_intercepts_apply_patch_exec_command() -> Result<()> {
     skip_if_sandbox!(Ok(()));
     skip_if_host_windows!(Ok(()));
 
-    let builder = test_codex();
+    let builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let harness = TestCodexHarness::with_builder(builder).await?;
 
     let patch =
@@ -590,7 +552,13 @@ async fn unified_exec_rejects_justification_without_sandbox_permissions() -> Res
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2");
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-missing-sandbox-permissions";
@@ -663,7 +631,13 @@ async fn unified_exec_emits_exec_command_begin_event() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_model("gpt-5.2");
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
     let cwd = test.config.cwd.to_path_buf();
 
@@ -720,7 +694,13 @@ async fn unified_exec_resolves_relative_workdir() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_model("gpt-5.2");
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let workdir_rel = std::path::PathBuf::from("uexec_relative_workdir");
@@ -784,7 +764,13 @@ async fn unified_exec_respects_workdir_override() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_model("gpt-5.2");
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let workdir = create_workspace_directory(&test, "uexec_workdir_test").await?;
@@ -844,7 +830,13 @@ async fn unified_exec_emits_exec_command_end_event() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-end-event";
@@ -912,26 +904,19 @@ async fn unified_exec_emits_output_delta_for_exec_command() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-delta-1";
     let args = json!({
-        "cmd": "stty -echo; read start; printf 'HELLO-UEXEC\\303'; read finish; printf '\\251\\303'",
-        "yield_time_ms": 250,
-        "tty": true,
-    });
-    let start_call_id = "uexec-delta-start";
-    let start_args = json!({
-        "chars": "start\n",
-        "session_id": 1000,
-        "yield_time_ms": 250,
-    });
-    let finish_call_id = "uexec-delta-finish";
-    let finish_args = json!({
-        "chars": "finish\n",
-        "session_id": 1000,
-        "yield_time_ms": 250,
+        "cmd": "printf 'HELLO-UEXEC'",
+        "yield_time_ms": 1000,
     });
 
     let responses = vec![
@@ -942,76 +927,30 @@ async fn unified_exec_emits_output_delta_for_exec_command() -> Result<()> {
         ]),
         sse(vec![
             ev_response_created("resp-2"),
-            ev_function_call(
-                start_call_id,
-                "write_stdin",
-                &serde_json::to_string(&start_args)?,
-            ),
-            ev_completed("resp-2"),
-        ]),
-        sse(vec![
-            ev_response_created("resp-3"),
-            ev_function_call(
-                finish_call_id,
-                "write_stdin",
-                &serde_json::to_string(&finish_args)?,
-            ),
-            ev_completed("resp-3"),
-        ]),
-        sse(vec![
-            ev_response_created("resp-4"),
             ev_assistant_message("msg-1", "finished"),
-            ev_completed("resp-4"),
+            ev_completed("resp-2"),
         ]),
     ];
     mount_sse_sequence(&server, responses).await;
 
     submit_unified_exec_turn(&test, "emit delta", PermissionProfile::Disabled).await?;
 
-    let mut deltas = Vec::new();
-    let mut end_event = None;
-    let mut turn_completed = false;
-    while !turn_completed || end_event.is_none() {
-        match wait_for_event(&test.codex, |_| true).await {
-            EventMsg::ExecCommandOutputDelta(event) => {
-                if event.call_id != call_id {
-                    continue;
-                }
-                deltas.push(event.chunk);
-            }
-            EventMsg::ExecCommandEnd(event) => {
-                if event.call_id != call_id {
-                    continue;
-                }
-                end_event = Some(event);
-            }
-            EventMsg::TurnComplete(_) => turn_completed = true,
-            _ => {}
-        }
-    }
+    let event = wait_for_event_match(&test.codex, |msg| match msg {
+        EventMsg::ExecCommandEnd(ev) if ev.call_id == call_id => Some(ev.clone()),
+        _ => None,
+    })
+    .await;
 
-    assert_eq!(
-        (
-            deltas.concat(),
-            deltas
-                .iter()
-                .map(|bytes| String::from_utf8_lossy(bytes))
-                .collect::<String>(),
-        ),
-        (
-            b"HELLO-UEXEC\xc3\xa9\xc3".to_vec(),
-            "HELLO-UEXECé�".to_string(),
-        )
+    let text = event.stdout;
+    assert!(
+        text.contains("HELLO-UEXEC"),
+        "delta chunk missing expected text: {text:?}",
     );
-    let end_event = end_event.expect("expected command completion");
-    assert_eq!(
-        (
-            end_event.exit_code,
-            end_event.stdout,
-            end_event.aggregated_output
-        ),
-        (0, "HELLO-UEXECé�".to_string(), "HELLO-UEXECé�".to_string())
-    );
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     Ok(())
 }
 
@@ -1024,7 +963,13 @@ async fn unified_exec_full_lifecycle_with_background_end_event() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-full-lifecycle";
@@ -1262,6 +1207,11 @@ allow_local_binding = true
         .with_home(home)
         .with_cloud_config_bundle(managed_network_requirements_loader())
         .with_config(move |config| {
+            config.use_experimental_unified_exec_tool = true;
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("test config should allow feature update");
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
             config
                 .permissions
@@ -1346,7 +1296,13 @@ async fn unified_exec_emits_terminal_interaction_for_write_stdin() -> Result<()>
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let open_call_id = "uexec-open";
@@ -1424,7 +1380,13 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let open_call_id = "uexec-delayed-open";
@@ -1599,7 +1561,13 @@ async fn unified_exec_emits_one_begin_and_one_end_event() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let open_call_id = "uexec-open-session";
@@ -1717,7 +1685,12 @@ async fn exec_command_reports_chunk_and_exit_metadata() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-metadata";
@@ -1807,7 +1780,12 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
     let server = start_mock_server().await;
 
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
         config.tool_output_token_limit = Some(50);
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
     });
     let test = builder.build_with_auto_env(&server).await?;
 
@@ -1843,10 +1821,9 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
     assert_eq!(output.original_token_count, Some(8_991));
     let output_text = output.output.replace("\r\n", "\n");
     assert_regex_match(
-        r"(?s)^Warning: truncated output \(original token count: 8991\)\nTotal output lines: 999\n\nEXEC-LINE-.*…\d+ tokens truncated…x+\n$",
+        r"^Warning: truncated output \(original token count: 8991\)\nTotal output lines: 999\n\nEXEC-LINE-0001 x{20}\nEXEC-LINE-0002 x{20}\nEXEC-LINE-0003 x{13}…8941 tokens truncated…E-0997 x{20}\nEXEC-LINE-0998 x{20}\nEXEC-LINE-0999 x{20}\n$",
         &output_text,
     );
-    assert_eq!(output_text.matches("tokens truncated").count(), 1);
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -1866,7 +1843,12 @@ async fn write_stdin_clamps_model_requested_max_output_tokens_to_policy() -> Res
     let server = start_mock_server().await;
 
     let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
         config.tool_output_token_limit = Some(50);
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
     });
     let test = builder.build_with_auto_env(&server).await?;
 
@@ -1929,10 +1911,9 @@ async fn write_stdin_clamps_model_requested_max_output_tokens_to_policy() -> Res
     assert_eq!(stdin_output.original_token_count, Some(9_492));
     let stdin_output_text = stdin_output.output.replace("\r\n", "\n");
     assert_regex_match(
-        r"(?s)^Warning: truncated output \(original token count: 9492\)\nTotal output lines: 1000\n\ngo\nSTDIN.*…\d+ tokens truncated…y+\n$",
+        r"^Warning: truncated output \(original token count: 9492\)\nTotal output lines: 1000\n\ngo\nSTDIN-LINE-0001 y{20}\nSTDIN-LINE-0002 y{20}\nSTDIN-LINE-0003 yyyy…9442 tokens truncated…7 y{20}\nSTDIN-LINE-0998 y{20}\nSTDIN-LINE-0999 y{20}\n$",
         &stdin_output_text,
     );
-    assert_eq!(stdin_output_text.matches("tokens truncated").count(), 1);
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -1951,7 +1932,12 @@ async fn unified_exec_defaults_to_pipe() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-default-pipe";
@@ -2016,7 +2002,12 @@ async fn unified_exec_can_enable_tty() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-tty-enabled";
@@ -2078,7 +2069,12 @@ async fn unified_exec_respects_early_exit_notifications() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec-early-exit";
@@ -2157,7 +2153,12 @@ async fn write_stdin_returns_exit_metadata_and_clears_session() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let start_call_id = "uexec-cat-start";
@@ -2360,7 +2361,12 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let start_call_id = format!("uexec-non-tty-interrupt-{test_name}-start");
@@ -2478,7 +2484,12 @@ async fn write_stdin_ctrl_c_terminates_non_tty_session_on_windows() -> Result<()
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let start_call_id = "uexec-windows-interrupt-start";
@@ -2567,7 +2578,13 @@ async fn unified_exec_emits_end_event_when_session_dies_via_stdin() -> Result<()
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let start_call_id = "uexec-end-on-exit-start";
@@ -2653,7 +2670,13 @@ async fn unified_exec_keeps_long_running_session_after_turn_end() -> Result<()> 
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let TestCodex {
         codex,
         cwd,
@@ -2754,7 +2777,13 @@ async fn unified_exec_interrupt_preserves_long_running_session() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let TestCodex {
         codex,
         cwd,
@@ -2844,7 +2873,12 @@ async fn unified_exec_reuses_session_via_stdin() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let first_call_id = "uexec-start";
@@ -2938,7 +2972,13 @@ async fn unified_exec_streams_after_lagged_output() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let script = r#"python3 - <<'PY'
@@ -3049,7 +3089,12 @@ async fn unified_exec_timeout_and_followup_poll() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let first_call_id = "uexec-timeout";
@@ -3137,7 +3182,12 @@ async fn unified_exec_formats_large_output_summary() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let output_line = "token token \n";
@@ -3228,7 +3278,12 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let TestCodex {
         codex,
         cwd,
@@ -3316,6 +3371,10 @@ async fn unified_exec_enforces_glob_deny_read_policy() -> Result<()> {
 
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
         let mut file_system_sandbox_policy = FileSystemSandboxPolicy::default();
         file_system_sandbox_policy
             .entries
@@ -3451,7 +3510,13 @@ async fn unified_exec_python_prompt_under_seatbelt() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let TestCodex {
         codex,
         cwd,
@@ -3581,7 +3646,12 @@ async fn unified_exec_runs_on_all_platforms() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let call_id = "uexec";
@@ -3639,7 +3709,13 @@ async fn write_stdin_calls_run_in_parallel_across_sessions() -> Result<()> {
     skip_if_target_windows!(Ok(()), "uses bash and POSIX file rendezvous commands");
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build_with_auto_env(&server).await?;
 
     let start_args = serde_json::to_string(&json!({

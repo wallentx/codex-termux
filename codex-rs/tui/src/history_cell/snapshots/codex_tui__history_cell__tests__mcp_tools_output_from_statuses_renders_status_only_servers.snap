@@ -6,6 +6,6 @@ expression: rendered
 
 🔌  MCP Tools
 
-  • plugin_docs: unknown (1 tool)
-
-  Use /mcp verbose for tools and resources.
+  • plugin_docs
+    • Auth: Unknown
+    • Tools: lookup

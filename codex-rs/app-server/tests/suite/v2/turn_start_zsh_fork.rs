@@ -9,11 +9,11 @@
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
-use app_test_support::create_command_execution_sse_response;
-use app_test_support::create_escalated_command_execution_sse_response;
+use app_test_support::create_escalated_shell_command_sse_response;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use app_test_support::create_shell_command_sse_response;
 use codex_app_server_protocol::CommandAction;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
@@ -74,7 +74,7 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
     let release_marker_escaped = release_marker.to_string_lossy().replace('\'', r#"'\''"#);
     let wait_for_interrupt =
         format!("while [ ! -f '{release_marker_escaped}' ]; do sleep 0.01; done");
-    let response = create_command_execution_sse_response(
+    let response = create_shell_command_sse_response(
         vec!["/bin/sh".to_string(), "-c".to_string(), wait_for_interrupt],
         /*workdir*/ None,
         Some(5000),
@@ -96,6 +96,7 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
         "never",
         &BTreeMap::from([
             (Feature::ShellZshFork, true),
+            (Feature::UnifiedExec, false),
             (Feature::ShellSnapshot, false),
         ]),
     )?;
@@ -191,7 +192,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_decline_v2() -> Result<()> {
     eprintln!("using zsh path for zsh-fork test: {}", zsh_path.display());
 
     let responses = vec![
-        create_escalated_command_execution_sse_response(
+        create_escalated_shell_command_sse_response(
             vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -210,6 +211,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_decline_v2() -> Result<()> {
         "on-request",
         &BTreeMap::from([
             (Feature::ShellZshFork, true),
+            (Feature::UnifiedExec, false),
             (Feature::ShellSnapshot, false),
         ]),
     )?;
@@ -321,7 +323,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_cancel_v2() -> Result<()> {
     };
     eprintln!("using zsh path for zsh-fork test: {}", zsh_path.display());
 
-    let responses = vec![create_escalated_command_execution_sse_response(
+    let responses = vec![create_escalated_shell_command_sse_response(
         vec![
             "python3".to_string(),
             "-c".to_string(),
@@ -338,6 +340,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_cancel_v2() -> Result<()> {
         "on-request",
         &BTreeMap::from([
             (Feature::ShellZshFork, true),
+            (Feature::UnifiedExec, false),
             (Feature::ShellSnapshot, false),
         ]),
     )?;
@@ -463,15 +466,15 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
         second_file.display()
     );
     let tool_call_arguments = serde_json::to_string(&serde_json::json!({
-        "cmd": shell_command,
+        "command": shell_command,
         "workdir": serde_json::Value::Null,
-        "yield_time_ms": 20000
+        "timeout_ms": 20000
     }))?;
     let response = responses::sse(vec![
         responses::ev_response_created("resp-1"),
         responses::ev_function_call(
             "call-zsh-fork-subcommand-decline",
-            "exec_command",
+            "shell_command",
             &tool_call_arguments,
         ),
         responses::ev_completed("resp-1"),
@@ -492,6 +495,7 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
         "on-request",
         &BTreeMap::from([
             (Feature::ShellZshFork, true),
+            (Feature::UnifiedExec, false),
             (Feature::ShellSnapshot, false),
         ]),
     )?;

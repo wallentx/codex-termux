@@ -25,7 +25,6 @@ fn protocol_headers_preserve_utf8_values() {
         vec![HttpHeader {
             name: "x-plugin-name".to_string(),
             value: "café".to_string(),
-            value_env_var: None,
         }]
     );
 }

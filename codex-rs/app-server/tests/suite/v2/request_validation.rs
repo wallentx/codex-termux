@@ -168,9 +168,7 @@ async fn request_handlers_reject_remote_image_urls() -> Result<()> {
 
     let remote_tool_output = serde_json::to_value(ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: Some("call-1".to_string()),
-        name: None,
-        namespace: None,
+        call_id: "call-1".to_string(),
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
                 image_url: "https://example.com/tool.png".to_string(),

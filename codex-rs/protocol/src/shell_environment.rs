@@ -172,7 +172,6 @@ pub const WINDOWS_CORE_ENV_VARS: &[&str] = &[
     "SHELL",
     "COMSPEC",
     "SYSTEMROOT",
-    "WINDIR",
     "SYSTEMDRIVE",
     // User context and profiles
     "USERNAME",
@@ -219,7 +218,6 @@ mod windows_tests {
         let vars = make_vars(&[
             ("Shell", "C:\\Program Files\\Git\\bin\\bash.exe"),
             ("SystemRoot", "C:\\Windows"),
-            ("WinDir", "C:\\Windows"),
             ("AppData", "C:\\Users\\codex\\AppData\\Roaming"),
             ("TmpDir", "C:\\Temp\\custom"),
             ("OPENAI_API_KEY", "secret"),
@@ -239,7 +237,6 @@ mod windows_tests {
                 "C:\\Program Files\\Git\\bin\\bash.exe".to_string(),
             ),
             ("SystemRoot".to_string(), "C:\\Windows".to_string()),
-            ("WinDir".to_string(), "C:\\Windows".to_string()),
             (
                 "AppData".to_string(),
                 "C:\\Users\\codex\\AppData\\Roaming".to_string(),

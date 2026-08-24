@@ -2,7 +2,6 @@ use std::collections::HashMap;
 #[cfg(not(windows))]
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Stdio;
@@ -112,13 +111,19 @@ impl CommandHookRuntime {
         turn_id: Option<String>,
         parse: fn(&ConfiguredHandler, HandlerRunResult, Option<String>) -> ParsedHandler<T>,
     ) {
-        if self.result_sender.is_closed() {
+        let mut state = self.lock_state();
+        if self.result_sender.is_closed() || state.concurrency_limit.is_closed() {
             return;
         }
 
+        while state.tasks.try_join_next().is_some() {}
         let result_sender = self.result_sender.clone();
+        let concurrency_limit = Arc::clone(&state.concurrency_limit);
         let runtime = self.clone();
-        self.schedule_async_task(async move {
+        state.tasks.spawn(async move {
+            let Ok(_permit) = concurrency_limit.acquire_owned().await else {
+                return;
+            };
             let result = match &handler.kind {
                 ConfiguredHandlerKind::Command { command, env, .. } => {
                     run_command(&runtime, &handler, command, env, &input_json, &cwd).await
@@ -157,22 +162,6 @@ impl CommandHookRuntime {
             entries.extend(warnings);
             hook_result.run.entries = entries;
             let _ = result_sender.try_send(hook_result);
-        });
-    }
-
-    pub(crate) fn schedule_async_task(&self, task: impl Future<Output = ()> + Send + 'static) {
-        let mut state = self.lock_state();
-        if state.concurrency_limit.is_closed() {
-            return;
-        }
-
-        while state.tasks.try_join_next().is_some() {}
-        let concurrency_limit = Arc::clone(&state.concurrency_limit);
-        state.tasks.spawn(async move {
-            let Ok(_permit) = concurrency_limit.acquire_owned().await else {
-                return;
-            };
-            task.await;
         });
     }
 

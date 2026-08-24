@@ -183,12 +183,21 @@ fn bind_environment_env_vars(config: &mut McpServerConfig) -> Result<(), String>
     let is_local_environment = config.is_local_environment();
     let env_vars = match &mut config.transport {
         McpServerTransportConfig::Stdio { env_vars, .. } => env_vars,
-        // Bearer credentials resolve on the executor; other header variables do not yet.
+        // Never resolve executor-owned environment references in the host process.
+        // Remove this rejection once the owning executor resolves these fields.
         McpServerTransportConfig::StreamableHttp {
-            env_http_headers, ..
+            bearer_token_env_var,
+            env_http_headers,
+            ..
         } => {
             if is_local_environment {
                 return Ok(());
+            }
+            if bearer_token_env_var.is_some() {
+                return Err(
+                    "`bearer_token_env_var` requires executor-side environment resolution for an executor-owned HTTP MCP"
+                        .to_string(),
+                );
             }
             if env_http_headers
                 .as_ref()

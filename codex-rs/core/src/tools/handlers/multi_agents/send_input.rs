@@ -145,7 +145,7 @@ pub(crate) struct SendInputResult {
 }
 
 impl ToolOutput for SendInputResult {
-    fn log_output(&self) -> String {
+    fn log_preview(&self) -> String {
         tool_output_json_text(self, "send_input")
     }
 

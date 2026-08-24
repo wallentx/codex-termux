@@ -46,7 +46,9 @@ pub(crate) fn enforce_managed_residency(provider: &mut Provider) {
 pub enum RemoteCompactionSupport {
     /// The provider does not support remote compaction.
     Unsupported,
-    /// The provider supports `compaction_trigger` items over the Responses endpoint.
+    /// The provider supports only the dedicated `/v1/responses/compact` endpoint.
+    V1,
+    /// The provider supports both the dedicated endpoint and `compaction_trigger` items.
     V2,
 }
 
@@ -71,7 +73,7 @@ impl Default for ProviderCapabilities {
             image_generation: true,
             web_search: true,
             external_web_access: true,
-            remote_compaction: RemoteCompactionSupport::Unsupported,
+            remote_compaction: RemoteCompactionSupport::V2,
         }
     }
 }
@@ -519,7 +521,6 @@ mod tests {
     use codex_protocol::openai_models::ModelInfo;
     use codex_protocol::openai_models::ModelsResponse;
     use codex_protocol::protocol::SessionSource;
-    use codex_utils_redacted_string::RedactedString;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use wiremock::Mock;
@@ -628,19 +629,13 @@ mod tests {
     }
 
     #[test]
-    fn openai_provider_enables_remote_compaction() {
+    fn configured_provider_uses_default_capabilities() {
         let provider = create_model_provider(
             ModelProviderInfo::create_openai_provider(/*base_url*/ None),
             /*auth_manager*/ None,
         );
 
-        assert_eq!(
-            provider.capabilities(),
-            ProviderCapabilities {
-                remote_compaction: RemoteCompactionSupport::V2,
-                ..ProviderCapabilities::default()
-            }
-        );
+        assert_eq!(provider.capabilities(), ProviderCapabilities::default());
     }
 
     #[test]
@@ -822,7 +817,7 @@ mod tests {
                         "--skip",
                         counter.to_str().expect("counter path should be UTF-8"),
                     ]
-                    .map(RedactedString::from),
+                    .map(str::to_string),
                 ),
                 timeout_ms: NonZeroU64::new(10_000).expect("timeout should be non-zero"),
             }),
@@ -1170,7 +1165,7 @@ mod tests {
             .await;
 
         let mut provider_info = provider_for(server.uri());
-        provider_info.experimental_bearer_token = Some("provider-token".into());
+        provider_info.experimental_bearer_token = Some("provider-token".to_string());
         let provider = create_model_provider(
             provider_info,
             Some(AuthManager::from_auth_for_testing(

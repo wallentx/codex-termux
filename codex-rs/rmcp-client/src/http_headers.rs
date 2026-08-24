@@ -185,7 +185,6 @@ impl HttpHeadersClient {
                 value: std::str::from_utf8(value.as_bytes())
                     .map_err(|error| ExecServerError::HttpRequest(error.to_string()))?
                     .to_string(),
-                value_env_var: None,
             });
         }
         if let Some(deadline) = deadline {

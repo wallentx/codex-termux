@@ -66,7 +66,6 @@ mod transport;
 
 const IPC_CHANNEL_CAPACITY: usize = 128;
 const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCAL_HOST_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 // TODO(anp) make this timeout configurable if 60 seconds is insufficient.
 const DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WEBSOCKET_FRAME_BYTES: usize = MAX_FRAME_BYTES + std::mem::size_of::<u32>();
@@ -346,11 +345,7 @@ impl Connection {
                 None => Err("code-mode host exited during handshake".to_string()),
             }
         };
-        let handshake_timeout = match &owner {
-            ConnectionOwner::Process(_) => LOCAL_HOST_STARTUP_TIMEOUT,
-            ConnectionOwner::WebSocket => HOST_HANDSHAKE_TIMEOUT,
-        };
-        let handshake_result = match tokio::time::timeout(handshake_timeout, handshake).await {
+        let handshake_result = match tokio::time::timeout(HOST_HANDSHAKE_TIMEOUT, handshake).await {
             Ok(result) => result,
             Err(_) => {
                 let _ = writer.close().await;

@@ -210,6 +210,7 @@ struct GuardianReviewSessionReuseKey {
     main_execve_wrapper_exe: Option<PathBuf>,
     zsh_path: Option<PathBuf>,
     features: ManagedFeatures,
+    use_experimental_unified_exec_tool: bool,
     environment_ids: Vec<String>,
 }
 
@@ -248,6 +249,7 @@ impl GuardianReviewSessionReuseKey {
             main_execve_wrapper_exe: spawn_config.main_execve_wrapper_exe.clone(),
             zsh_path: spawn_config.zsh_path.clone(),
             features: spawn_config.features.clone(),
+            use_experimental_unified_exec_tool: spawn_config.use_experimental_unified_exec_tool,
             environment_ids: Vec::new(),
         }
     }
@@ -1624,14 +1626,13 @@ mod tests {
             parent_session: Arc::new(session),
             parent_context: GuardianReviewContext::from(Arc::new(turn)),
             spawn_config,
-            request: GuardianApprovalRequest::ExecCommand {
+            request: GuardianApprovalRequest::Shell {
                 id: "shell-1".to_string(),
                 command: vec!["git".to_string(), "status".to_string()],
                 cwd,
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None,
                 justification: Some("Inspect repo state.".to_string()),
-                tty: false,
             },
             reasons: ApprovalRequestReasons::default(),
             schema: super::super::prompt::guardian_output_schema(),
@@ -1911,8 +1912,6 @@ mod tests {
             auto_review: Some(AutoReviewMessages {
                 policy: Some("Use the catalog Guardian policy.".to_string()),
                 policy_template: Some(catalog_template.to_string()),
-                rejection_instructions: None,
-                timeout_instructions: None,
             }),
             permissions: None,
             multi_agent: None,
@@ -1949,8 +1948,6 @@ mod tests {
             auto_review: Some(AutoReviewMessages {
                 policy: Some(String::new()),
                 policy_template: None,
-                rejection_instructions: None,
-                timeout_instructions: None,
             }),
             permissions: None,
             multi_agent: None,
@@ -1995,8 +1992,6 @@ mod tests {
             auto_review: Some(AutoReviewMessages {
                 policy: Some(catalog_policy.to_string()),
                 policy_template: Some(String::new()),
-                rejection_instructions: None,
-                timeout_instructions: None,
             }),
             permissions: None,
             multi_agent: None,

@@ -102,9 +102,11 @@ fn patch_rejection_reason(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     cwd: &PathUri,
 ) -> &'static str {
-    let has_no_writable_roots = cwd
-        .to_abs_path()
-        .is_ok_and(|cwd| !file_system_sandbox_policy.has_writable_roots_with_cwd(cwd.as_path()));
+    let has_no_writable_roots = cwd.to_abs_path().is_ok_and(|cwd| {
+        file_system_sandbox_policy
+            .get_writable_roots_with_cwd(cwd.as_path())
+            .is_empty()
+    });
     match permission_profile {
         PermissionProfile::Managed { .. }
             if !file_system_sandbox_policy.has_full_disk_write_access()

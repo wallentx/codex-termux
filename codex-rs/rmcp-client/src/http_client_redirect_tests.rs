@@ -38,7 +38,6 @@ fn headers<const N: usize>(headers: [(&str, &str); N]) -> Vec<HttpHeader> {
         .map(|(name, value)| HttpHeader {
             name: name.to_string(),
             value: value.to_string(),
-            value_env_var: None,
         })
         .collect()
 }

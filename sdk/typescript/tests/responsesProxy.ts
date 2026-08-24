@@ -180,16 +180,16 @@ export function assistantMessage(text: string, itemId: string = DEFAULT_MESSAGE_
   };
 }
 
-export function exec_command_call(): SseEvent {
+export function shell_call(): SseEvent {
   return {
     type: "response.output_item.done",
     item: {
       type: "function_call",
       call_id: `call_id${Math.random().toString(36).slice(2)}`,
-      name: "exec_command",
+      name: "shell_command",
       arguments: JSON.stringify({
-        cmd: "echo 'Hello, world!'",
-        yield_time_ms: 100,
+        command: "echo 'Hello, world!'",
+        timeout_ms: 100,
       }),
     },
   };

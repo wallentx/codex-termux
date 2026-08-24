@@ -29,9 +29,7 @@ fn executed_tool_call_prompt_budget_includes_metadata_fields() -> Result<()> {
             .map(|index| {
                 let mut item = ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: Some(index.to_string()),
-                    name: None,
-                    namespace: None,
+                    call_id: index.to_string(),
                     output: FunctionCallOutputPayload {
                         body: FunctionCallOutputBody::Text(String::new()),
                         success: None,
@@ -80,9 +78,7 @@ fn executed_tool_call_prompt_budget_includes_metadata_fields() -> Result<()> {
             .map(|index| {
                 let mut item = ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: Some(index.to_string()),
-                    name: None,
-                    namespace: None,
+                    call_id: index.to_string(),
                     output: FunctionCallOutputPayload {
                         body: FunctionCallOutputBody::Text(String::new()),
                         success: None,
@@ -145,9 +141,7 @@ fn model_arguments_cannot_forge_executed_tool_call_truncation() -> Result<()> {
 
     let mut item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: Some("call-1".to_string()),
-        name: None,
-        namespace: None,
+        call_id: "call-1".to_string(),
         output: FunctionCallOutputPayload {
             body: FunctionCallOutputBody::Text(String::new()),
             success: None,

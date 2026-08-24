@@ -70,13 +70,6 @@
       },
       "type": "object"
     },
-    "AllowDenyRequirementToml": {
-      "enum": [
-        "allow",
-        "deny"
-      ],
-      "type": "string"
-    },
     "AltScreenMode": {
       "description": "Controls whether the TUI uses the terminal's alternate screen buffer.\n\n- `auto` (default): Use alternate screen mode. - `always`: Always use alternate screen mode. - `never`: Never use alternate screen mode. Runs in inline mode, preserving scrollback.\n\nThe CLI flag `--no-alt-screen` can override this setting at runtime.",
       "oneOf": [
@@ -381,42 +374,6 @@
       ],
       "type": "object"
     },
-    "BrowserUseConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "allow_history_access": {
-          "type": "boolean"
-        },
-        "default_origin_policy": {
-          "$ref": "#/definitions/BrowserUseOriginPolicyConfigToml"
-        },
-        "origins": {
-          "additionalProperties": {
-            "$ref": "#/definitions/BrowserUseOriginPolicyConfigToml"
-          },
-          "type": "object"
-        }
-      },
-      "type": "object"
-    },
-    "BrowserUseOriginPolicyConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "access": {
-          "$ref": "#/definitions/AllowDenyRequirementToml"
-        },
-        "downloads": {
-          "$ref": "#/definitions/AllowDenyRequirementToml"
-        },
-        "full_cdp_access": {
-          "$ref": "#/definitions/AllowDenyRequirementToml"
-        },
-        "uploads": {
-          "$ref": "#/definitions/AllowDenyRequirementToml"
-        }
-      },
-      "type": "object"
-    },
     "BundledSkillsConfig": {
       "additionalProperties": false,
       "properties": {
@@ -467,74 +424,6 @@
           "type": "boolean"
         }
       },
-      "type": "object"
-    },
-    "ComputerUseConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "default_app_access": {
-          "$ref": "#/definitions/AllowDenyRequirementToml"
-        },
-        "macos": {
-          "$ref": "#/definitions/ComputerUseMacosConfigToml"
-        },
-        "windows": {
-          "$ref": "#/definitions/ComputerUseWindowsConfigToml"
-        }
-      },
-      "type": "object"
-    },
-    "ComputerUseMacosConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "bundle_ids": {
-          "additionalProperties": {
-            "$ref": "#/definitions/AllowDenyRequirementToml"
-          },
-          "type": "object"
-        }
-      },
-      "type": "object"
-    },
-    "ComputerUseWindowsConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "aumids": {
-          "additionalProperties": {
-            "$ref": "#/definitions/AllowDenyRequirementToml"
-          },
-          "type": "object"
-        },
-        "exes": {
-          "items": {
-            "$ref": "#/definitions/ComputerUseWindowsExeConfigToml"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "ComputerUseWindowsExeConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "access": {
-          "$ref": "#/definitions/AllowDenyRequirementToml"
-        },
-        "binary_name": {
-          "type": "string"
-        },
-        "product_name": {
-          "type": "string"
-        },
-        "publisher_name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "access",
-        "product_name",
-        "publisher_name"
-      ],
       "type": "object"
     },
     "ConfigProfile": {
@@ -715,9 +604,6 @@
             "guardian_enhanced_node_repl_transcripts": {
               "type": "boolean"
             },
-            "guardian_ext": {
-              "type": "boolean"
-            },
             "guardian_node_repl_transcript_images": {
               "type": "boolean"
             },
@@ -869,9 +755,6 @@
               "type": "boolean"
             },
             "shell_snapshot": {
-              "type": "boolean"
-            },
-            "shell_snapshot_v2": {
               "type": "boolean"
             },
             "shell_tool": {
@@ -1418,9 +1301,6 @@
         },
         "reasoning_effort": {
           "$ref": "#/definitions/ReasoningEffort"
-        },
-        "reuse_parent_compaction": {
-          "type": "boolean"
         },
         "review_scope": {
           "$ref": "#/definitions/GuardianV2ReviewScopeConfigToml"
@@ -2681,17 +2561,6 @@
           "description": "Attributes to add to every exported trace span.",
           "type": "object"
         },
-        "tool_result": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ToolResultLogConfig"
-            }
-          ],
-          "default": {
-            "max_bytes": 2048
-          },
-          "description": "Byte limit for tool-result log output; independent of model-visible output."
-        },
         "trace_exporter": {
           "allOf": [
             {
@@ -3497,10 +3366,6 @@
           "format": "int64",
           "minimum": 1.0,
           "type": "integer"
-        },
-        "use_history_notes_extension": {
-          "description": "Whether to expose the built-in history and notes extension.",
-          "type": "boolean"
         }
       },
       "type": "object"
@@ -3541,19 +3406,6 @@
         "turn_metadata_includes_tool_info": {
           "description": "Include authoritative tool information in per-turn request metadata.",
           "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
-    "ToolResultLogConfig": {
-      "description": "Limit for the text included in `codex.tool_result` log records. This does not affect model-visible output. Raising it can expose more tool data to logs.",
-      "properties": {
-        "max_bytes": {
-          "default": 2048,
-          "description": "Maximum UTF-8 bytes before the truncation notice. Defaults to 2048.",
-          "format": "uint",
-          "minimum": 0.0,
-          "type": "integer"
         }
       },
       "type": "object"
@@ -3691,10 +3543,7 @@
               "decrease_reasoning_effort": null,
               "edit_queued_message": null,
               "increase_reasoning_effort": null,
-              "interrupt_turn": null,
-              "next_permission_mode": null,
-              "previous_permission_mode": null,
-              "toggle_voice_mute": null
+              "interrupt_turn": null
             },
             "composer": {
               "history_search_next": null,
@@ -4090,30 +3939,6 @@
             }
           ],
           "description": "Interrupt the active turn."
-        },
-        "next_permission_mode": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/KeybindingsSpec"
-            }
-          ],
-          "description": "Switch to the next available permission mode."
-        },
-        "previous_permission_mode": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/KeybindingsSpec"
-            }
-          ],
-          "description": "Switch to the previous available permission mode."
-        },
-        "toggle_voice_mute": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/KeybindingsSpec"
-            }
-          ],
-          "description": "Toggle the microphone in an active voice conversation."
         }
       },
       "type": "object"
@@ -4456,10 +4281,7 @@
             "decrease_reasoning_effort": null,
             "edit_queued_message": null,
             "increase_reasoning_effort": null,
-            "interrupt_turn": null,
-            "next_permission_mode": null,
-            "previous_permission_mode": null,
-            "toggle_voice_mute": null
+            "interrupt_turn": null
           }
         },
         "composer": {
@@ -5448,9 +5270,6 @@
       "minimum": 0.0,
       "type": "integer"
     },
-    "browser_use": {
-      "$ref": "#/definitions/BrowserUseConfigToml"
-    },
     "chatgpt_base_url": {
       "description": "Base URL for requests to ChatGPT (as opposed to the OpenAI API).",
       "type": "string"
@@ -5471,9 +5290,6 @@
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",
       "type": "string"
-    },
-    "computer_use": {
-      "$ref": "#/definitions/ComputerUseConfigToml"
     },
     "default_permissions": {
       "description": "Default permissions profile to apply. Names starting with `:` refer to built-in profiles; other names are resolved from the `[permissions]` table.",
@@ -5688,9 +5504,6 @@
         "guardian_enhanced_node_repl_transcripts": {
           "type": "boolean"
         },
-        "guardian_ext": {
-          "type": "boolean"
-        },
         "guardian_node_repl_transcript_images": {
           "type": "boolean"
         },
@@ -5842,9 +5655,6 @@
           "type": "boolean"
         },
         "shell_snapshot": {
-          "type": "boolean"
-        },
-        "shell_snapshot_v2": {
           "type": "boolean"
         },
         "shell_tool": {

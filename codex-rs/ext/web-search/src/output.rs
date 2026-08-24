@@ -15,7 +15,7 @@ impl SearchOutput {
 }
 
 impl ToolOutput for SearchOutput {
-    fn log_output(&self) -> String {
+    fn log_preview(&self) -> String {
         "[standalone web search output]".to_string()
     }
 

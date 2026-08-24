@@ -1,12 +1,10 @@
 use codex_backend_client::ApiKeyTurnCost;
 use codex_backend_client::ApiKeyTurnCostStatus;
 use codex_backend_client::Client as BackendClient;
-use codex_backend_client::RequestError;
 use codex_config::types::OtelExporterKind;
 use codex_core::config::Config;
 use codex_login::AuthManager;
-use codex_model_provider::SharedModelProvider;
-use codex_model_provider::create_model_provider;
+use codex_login::CodexAuth;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
@@ -37,8 +35,7 @@ pub(crate) struct TurnCostWorker {
 #[derive(Clone)]
 pub(crate) struct TurnCostWorkerHandle {
     sender: mpsc::Sender<TurnCostObservation>,
-    backend: TurnCostBackend,
-    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
 }
 
 enum TurnCostObservationKind {
@@ -75,14 +72,8 @@ struct TurnCostEntry {
 
 struct WorkerRuntime {
     config: Arc<Config>,
-    backend: TurnCostBackend,
+    auth_manager: Arc<AuthManager>,
     turns: HashMap<String, TurnCostEntry>,
-}
-
-#[derive(Clone)]
-enum TurnCostBackend {
-    OpenAiApiKey(Arc<AuthManager>),
-    ModelProvider(SharedModelProvider),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,24 +89,15 @@ impl TurnCostWorker {
         if !matches!(
             config.otel.exporter,
             OtelExporterKind::OtlpHttp { .. } | OtelExporterKind::OtlpGrpc { .. }
-        ) || config.model_provider.is_amazon_bedrock()
+        ) || !config.model_provider.is_openai()
         {
             return None;
         }
-        let is_openai = config.model_provider.is_openai();
-        let backend = if is_openai {
-            TurnCostBackend::OpenAiApiKey(Arc::clone(&auth_manager))
-        } else {
-            TurnCostBackend::ModelProvider(create_model_provider(
-                config.model_provider.clone(),
-                Some(Arc::clone(&auth_manager)),
-            ))
-        };
         let (sender, receiver) = mpsc::channel(OBSERVATION_CHANNEL_CAPACITY);
         let shutdown = CancellationToken::new();
         let runtime = WorkerRuntime {
             config: Arc::clone(&config),
-            backend: backend.clone(),
+            auth_manager: Arc::clone(&auth_manager),
             turns: HashMap::new(),
         };
         let worker_shutdown = shutdown.clone();
@@ -125,8 +107,7 @@ impl TurnCostWorker {
         Some(Self {
             handle: TurnCostWorkerHandle {
                 sender,
-                backend,
-                config,
+                auth_manager,
             },
             shutdown,
             _task: task,
@@ -152,20 +133,14 @@ impl TurnCostWorkerHandle {
     pub(crate) fn observe_event(
         &self,
         thread_id: ThreadId,
-        thread_config: &Config,
         event: &Event,
         session_telemetry: impl FnOnce() -> SessionTelemetry,
     ) {
-        if thread_config.model_provider != self.config.model_provider {
+        let Some(auth) = self.auth_manager.auth_cached() else {
             return;
-        }
-        if let TurnCostBackend::OpenAiApiKey(auth_manager) = &self.backend {
-            let Some(auth) = auth_manager.auth_cached() else {
-                return;
-            };
-            if !auth.is_api_key_auth() {
-                return;
-            }
+        };
+        if !auth.is_api_key_auth() {
+            return;
         }
         let kind = match &event.msg {
             EventMsg::TurnStarted(_) => TurnCostObservationKind::Started {
@@ -186,12 +161,7 @@ impl TurnCostWorkerHandle {
 
 impl WorkerRuntime {
     async fn run(self, receiver: mpsc::Receiver<TurnCostObservation>, shutdown: CancellationToken) {
-        let auth_changes = match &self.backend {
-            TurnCostBackend::OpenAiApiKey(auth_manager) => {
-                Some(auth_manager.auth_change_receiver())
-            }
-            TurnCostBackend::ModelProvider(_) => None,
-        };
+        let auth_changes = self.auth_manager.auth_change_receiver();
         let backend_availability = self.probe_backend().await;
         self.run_with_backend_availability(receiver, shutdown, auth_changes, backend_availability)
             .await;
@@ -201,7 +171,7 @@ impl WorkerRuntime {
         mut self,
         mut receiver: mpsc::Receiver<TurnCostObservation>,
         shutdown: CancellationToken,
-        mut auth_changes: Option<tokio::sync::watch::Receiver<u64>>,
+        mut auth_changes: tokio::sync::watch::Receiver<u64>,
         mut backend_availability: BackendAvailability,
     ) {
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
@@ -210,12 +180,7 @@ impl WorkerRuntime {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
-                changed = async {
-                    match auth_changes.as_mut() {
-                        Some(auth_changes) => auth_changes.changed().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
+                changed = auth_changes.changed() => {
                     if changed.is_err() {
                         break;
                     }
@@ -250,21 +215,44 @@ impl WorkerRuntime {
     }
 
     async fn probe_backend(&self) -> BackendAvailability {
+        let Some(auth) = self.auth_manager.auth().await else {
+            return BackendAvailability::AwaitingAuthChange;
+        };
+        if !auth.is_api_key_auth() {
+            return BackendAvailability::AwaitingAuthChange;
+        }
+        let provider = match self
+            .config
+            .model_provider
+            .to_api_provider(Some(AuthMode::ApiKey))
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                warn!("failed to resolve OpenAI API-key provider headers: {error}");
+                return BackendAvailability::RetryProbe;
+            }
+        };
+        let client = BackendClient::from_auth(
+            self.config.chatgpt_base_url.clone(),
+            &auth,
+            self.config.http_client_factory(),
+        );
         let probe_turn_ids = [uuid::Uuid::new_v4().to_string()];
-        match tokio::time::timeout(REQUEST_TIMEOUT, self.query_turn_costs(&probe_turn_ids)).await {
-            Ok(Ok(Some(_))) => BackendAvailability::Ready,
-            Ok(Ok(None)) => match self.backend {
-                TurnCostBackend::OpenAiApiKey(_) => BackendAvailability::AwaitingAuthChange,
-                TurnCostBackend::ModelProvider(_) => BackendAvailability::Disabled,
-            },
+        match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            client.query_api_key_turn_costs(&probe_turn_ids, &provider.headers),
+        )
+        .await
+        {
+            Ok(Ok(_)) => BackendAvailability::Ready,
             Ok(Err(error)) => match error.status().map(|status| status.as_u16()) {
-                Some(401 | 403) if matches!(self.backend, TurnCostBackend::OpenAiApiKey(_)) => {
+                Some(401 | 403) => {
                     tracing::debug!(
                         "turn cost worker waiting for auth change after backend availability check: {error}"
                     );
                     BackendAvailability::AwaitingAuthChange
                 }
-                Some(401 | 403 | 429) => BackendAvailability::RetryProbe,
+                Some(429) => BackendAvailability::RetryProbe,
                 Some(400..=499) => {
                     tracing::debug!(
                         "turn cost worker disabled by backend availability check: {error}"
@@ -328,6 +316,12 @@ impl WorkerRuntime {
     }
 
     async fn poll_due(&mut self) {
+        let Some(auth) = self.auth_manager.auth().await else {
+            return;
+        };
+        if !auth.is_api_key_auth() {
+            return;
+        }
         let now = Instant::now();
         let due_turn_ids: Vec<String> = self
             .turns
@@ -339,26 +333,46 @@ impl WorkerRuntime {
             .map(|(turn_id, _)| turn_id.clone())
             .collect();
         if !due_turn_ids.is_empty() {
-            self.poll_api_key_entries(&due_turn_ids).await;
+            self.poll_api_key_entries(&due_turn_ids, &auth).await;
         }
     }
 
-    async fn poll_api_key_entries(&mut self, turn_ids: &[String]) {
-        let costs =
-            match tokio::time::timeout(REQUEST_TIMEOUT, self.query_turn_costs(turn_ids)).await {
-                Ok(Ok(Some(costs))) => costs,
-                Ok(Ok(None)) => return,
-                Ok(Err(error)) => {
-                    warn!("failed to query API-key turn costs: {error}");
-                    self.retry_entries(turn_ids);
-                    return;
-                }
-                Err(_) => {
-                    warn!("timed out querying API-key turn costs");
-                    self.retry_entries(turn_ids);
-                    return;
-                }
-            };
+    async fn poll_api_key_entries(&mut self, turn_ids: &[String], auth: &CodexAuth) {
+        let provider = match self
+            .config
+            .model_provider
+            .to_api_provider(Some(AuthMode::ApiKey))
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                warn!("failed to resolve OpenAI API-key provider headers: {error}");
+                self.retry_entries(turn_ids);
+                return;
+            }
+        };
+        let client = BackendClient::from_auth(
+            self.config.chatgpt_base_url.clone(),
+            auth,
+            self.config.http_client_factory(),
+        );
+        let costs = match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            client.query_api_key_turn_costs(turn_ids, &provider.headers),
+        )
+        .await
+        {
+            Ok(Ok(costs)) => costs,
+            Ok(Err(error)) => {
+                warn!("failed to query OpenAI API-key turn costs: {error}");
+                self.retry_entries(turn_ids);
+                return;
+            }
+            Err(_) => {
+                warn!("timed out querying OpenAI API-key turn costs");
+                self.retry_entries(turn_ids);
+                return;
+            }
+        };
         let costs_by_turn: HashMap<String, ApiKeyTurnCost> = costs
             .into_iter()
             .map(|cost| (cost.turn_id.clone(), cost))
@@ -369,64 +383,6 @@ impl WorkerRuntime {
                 continue;
             };
             self.process_api_key_cost(turn_id, cost);
-        }
-    }
-
-    async fn query_turn_costs(
-        &self,
-        turn_ids: &[String],
-    ) -> Result<Option<Vec<ApiKeyTurnCost>>, RequestError> {
-        match &self.backend {
-            TurnCostBackend::OpenAiApiKey(auth_manager) => {
-                let Some(auth) = auth_manager.auth().await else {
-                    return Ok(None);
-                };
-                if !auth.is_api_key_auth() {
-                    return Ok(None);
-                }
-                let provider = self
-                    .config
-                    .model_provider
-                    .to_api_provider(Some(AuthMode::ApiKey))
-                    .map_err(|error| RequestError::Other(error.into()))?;
-                let client = BackendClient::from_auth(
-                    self.config.chatgpt_base_url.clone(),
-                    &auth,
-                    self.config.http_client_factory(),
-                );
-                client
-                    .query_api_key_turn_costs(turn_ids, &provider.headers)
-                    .await
-                    .map(Some)
-            }
-            TurnCostBackend::ModelProvider(model_provider) => {
-                if model_provider.info().requires_openai_auth {
-                    let Some(auth) = model_provider.auth().await else {
-                        return Ok(None);
-                    };
-                    if !auth.is_api_key_auth() {
-                        return Ok(None);
-                    }
-                }
-                let provider = model_provider
-                    .api_provider()
-                    .await
-                    .map_err(|error| RequestError::Other(error.into()))?;
-                let auth = model_provider
-                    .api_auth()
-                    .await
-                    .map_err(|error| RequestError::Other(error.into()))?;
-                let endpoint = provider.url_for_path("analytics/codex/turn-costs");
-                let client = BackendClient::new(
-                    provider.base_url.clone(),
-                    self.config.http_client_factory(),
-                )
-                .with_auth_provider(auth);
-                client
-                    .query_api_key_turn_costs_at(&endpoint, turn_ids, &provider.headers)
-                    .await
-                    .map(Some)
-            }
         }
     }
 

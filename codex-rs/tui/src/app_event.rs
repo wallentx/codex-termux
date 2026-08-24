@@ -40,7 +40,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
-use strum_macros::IntoStaticStr;
 use uuid::Uuid;
 
 use crate::app_command::AppCommand;
@@ -194,7 +193,7 @@ pub(crate) enum TranscriptExportDestination {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, IntoStaticStr)]
+#[derive(Debug)]
 pub(crate) enum AppEvent {
     /// Open the daemon-wide overview of loaded root sessions.
     OpenAgentsOverview,
@@ -285,12 +284,6 @@ pub(crate) enum AppEvent {
     /// Export all current-thread history to the selected destination.
     ExportTranscript {
         destination: TranscriptExportDestination,
-    },
-
-    /// Copy a picker selection while retaining its clipboard lease in the chat widget.
-    CopySelection {
-        text: Arc<str>,
-        label: String,
     },
 
     /// Persist a submitted prompt in the cross-session message history.
@@ -952,12 +945,6 @@ pub(crate) enum AppEvent {
         preset: ApprovalPreset,
         return_to_permissions: bool,
         profile_selection: Option<PermissionProfileSelection>,
-    },
-
-    /// Apply a permission shortcut only while its originating thread is displayed.
-    ApplyPermissionShortcut {
-        thread_id: ThreadId,
-        selection: PermissionProfileSelection,
     },
 
     /// Open the Windows world-writable directories warning.

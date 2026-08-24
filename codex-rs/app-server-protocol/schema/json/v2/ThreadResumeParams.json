@@ -806,10 +806,7 @@
         {
           "properties": {
             "call_id": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "id": {
               "type": [
@@ -827,18 +824,6 @@
                 }
               ]
             },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "namespace": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "output": {
               "$ref": "#/definitions/FunctionCallOutputBody"
             },
@@ -851,6 +836,7 @@
             }
           },
           "required": [
+            "call_id",
             "output",
             "type"
           ],

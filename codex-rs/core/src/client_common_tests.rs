@@ -30,9 +30,7 @@ fn prompt_with_image_outputs() -> Prompt {
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: Some("function-call".to_string()),
-                name: None,
-                namespace: None,
+                call_id: "function-call".to_string(),
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
                         image_url: "data:image/png;base64,function".to_string(),
@@ -80,9 +78,7 @@ fn responses_lite_request_copies_strip_image_details() {
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: Some("function-call".to_string()),
-                name: None,
-                namespace: None,
+                call_id: "function-call".to_string(),
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
                         image_url: "data:image/png;base64,function".to_string(),

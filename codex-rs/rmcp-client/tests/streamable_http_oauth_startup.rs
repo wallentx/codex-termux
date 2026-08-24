@@ -100,7 +100,7 @@ async fn assert_expired_token_refresh(scenario: OAuthStartupScenario) -> anyhow:
             "/.well-known/oauth-authorization-server/mcp",
         ),
         OAuthStartupScenario::ProtectedResourceMetadata => (
-            format!("{resource_url}/?oauth=initialize"),
+            format!("{resource_url}/"),
             "/mcp/",
             "/.well-known/oauth-authorization-server",
         ),

@@ -3051,10 +3051,7 @@
         {
           "properties": {
             "call_id": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "id": {
               "type": [
@@ -3072,18 +3069,6 @@
                 }
               ]
             },
-            "name": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "namespace": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "output": {
               "$ref": "#/definitions/FunctionCallOutputBody"
             },
@@ -3096,6 +3081,7 @@
             }
           },
           "required": [
+            "call_id",
             "output",
             "type"
           ],
@@ -4525,27 +4511,6 @@
             "type"
           ],
           "title": "WebrtcThreadRealtimeStartTransport",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "callId": {
-              "description": "Identifier of a realtime call already created and negotiated by the client.",
-              "type": "string"
-            },
-            "type": {
-              "enum": [
-                "existingCall"
-              ],
-              "title": "ExistingCallThreadRealtimeStartTransportType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "callId",
-            "type"
-          ],
-          "title": "ExistingCallThreadRealtimeStartTransport",
           "type": "object"
         }
       ]
