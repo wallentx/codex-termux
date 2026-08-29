@@ -61,6 +61,9 @@ use tempfile::TempDir;
 use tracing::instrument;
 use tracing::warn;
 
+#[path = "agent_plugin_mcp_overlay.rs"]
+mod agent_plugin_mcp_overlay;
+
 const DEFAULT_SKILLS_DIR_NAME: &str = "skills";
 const DEFAULT_HOOKS_CONFIG_FILE: &str = "hooks/hooks.json";
 const DEFAULT_MCP_CONFIG_FILE: &str = ".mcp.json";
@@ -720,7 +723,7 @@ fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-fn configured_plugins_from_user_config_value(
+fn configured_plugins_from_config_value(
     user_config: &toml::Value,
 ) -> HashMap<String, PluginConfig> {
     let Some(plugins_value) = user_config.get("plugins") else {
@@ -766,7 +769,7 @@ fn configured_plugins_from_codex_home(
         }
     };
 
-    configured_plugins_from_user_config_value(&user_config)
+    configured_plugins_from_config_value(&user_config)
 }
 
 fn configured_plugin_ids(
@@ -971,6 +974,7 @@ fn apply_plugin_mcp_server_policy(config: &mut McpServerConfig, policy: &PluginM
         if let Some(approval_mode) = tool_policy.approval_mode {
             tool_config.approval_mode = Some(approval_mode);
         }
+        tool_config.restrict_output_token_limit(tool_policy.output_token_limit);
     }
 }
 
@@ -1064,7 +1068,7 @@ pub(crate) async fn load_plugin_skill_inventory(
     }
 }
 
-fn plugin_skill_roots(
+pub(crate) fn plugin_skill_roots(
     plugin_root: &AbsolutePathBuf,
     manifest_paths: &PluginManifestPaths,
     manifest_format: PluginManifestFormat,
@@ -1388,7 +1392,7 @@ pub async fn load_plugin_mcp_servers(
     load_plugin_mcp_servers_with_policy(plugin_root, auth_mode, /*plugin_policy*/ None).await
 }
 
-/// Loads plugin MCP servers with the effective user policy for an installed plugin.
+/// Loads plugin MCP servers with the effective configuration policy for an installed plugin.
 pub async fn load_configured_plugin_mcp_servers(
     plugin_root: &Path,
     auth_mode: Option<AuthMode>,
@@ -1409,10 +1413,7 @@ pub async fn load_configured_plugin_mcp_servers(
 pub fn configured_plugin_mcp_server_policies(
     config_layer_stack: &ConfigLayerStack,
 ) -> HashMap<String, HashMap<String, PluginMcpServerConfig>> {
-    config_layer_stack
-        .effective_user_config()
-        .map(|config| configured_plugins_from_user_config_value(&config))
-        .unwrap_or_default()
+    configured_plugins_from_config_value(&config_layer_stack.effective_config())
         .into_iter()
         .map(|(plugin_id, plugin)| (plugin_id, plugin.mcp_servers))
         .collect()
@@ -1449,7 +1450,7 @@ pub fn apply_configured_plugin_mcp_server_policies(
                 }
             }
             for (tool_name, tool_policy) in &policy.tools {
-                if tool_policy.approval_mode.is_some() {
+                if tool_policy.approval_mode.is_some() || tool_policy.output_token_limit.is_some() {
                     server.tools.entry(tool_name.clone()).or_default();
                 }
             }
@@ -1467,6 +1468,12 @@ pub fn apply_configured_plugin_mcp_server_policies(
                             .restrict_to(approval_mode),
                     );
                 }
+                tool_config.restrict_output_token_limit(
+                    policy
+                        .tools
+                        .get(tool_name)
+                        .and_then(|tool_policy| tool_policy.output_token_limit),
+                );
             }
         }
     }
@@ -1558,6 +1565,10 @@ pub(crate) async fn load_plugin_mcp_servers_from_manifest_with_format(
                 }
             }
         }
+    }
+
+    if manifest_format == PluginManifestFormat::AgentPlugin {
+        agent_plugin_mcp_overlay::apply_codex_env_overlay(plugin_root, &mut mcp_servers).await;
     }
 
     mcp_servers

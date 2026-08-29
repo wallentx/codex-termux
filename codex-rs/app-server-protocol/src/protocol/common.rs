@@ -54,6 +54,11 @@ pub enum AuthMode {
     #[ts(rename = "bedrockApiKey")]
     #[strum(serialize = "bedrockApiKey")]
     BedrockApiKey,
+    /// Amazon Bedrock AWS access keys managed by Codex.
+    #[serde(rename = "bedrockAccessKeys")]
+    #[ts(rename = "bedrockAccessKeys")]
+    #[strum(serialize = "bedrockAccessKeys")]
+    BedrockAccessKeys,
 }
 
 impl AuthMode {
@@ -61,7 +66,11 @@ impl AuthMode {
     pub fn has_chatgpt_account(self) -> bool {
         match self {
             Self::Chatgpt | Self::ChatgptAuthTokens | Self::PersonalAccessToken => true,
-            Self::ApiKey | Self::Headers | Self::AgentIdentity | Self::BedrockApiKey => false,
+            Self::ApiKey
+            | Self::Headers
+            | Self::AgentIdentity
+            | Self::BedrockApiKey
+            | Self::BedrockAccessKeys => false,
         }
     }
 
@@ -73,7 +82,7 @@ impl AuthMode {
             | Self::Headers
             | Self::AgentIdentity
             | Self::PersonalAccessToken => true,
-            Self::ApiKey | Self::BedrockApiKey => false,
+            Self::ApiKey | Self::BedrockApiKey | Self::BedrockAccessKeys => false,
         }
     }
 }
@@ -683,7 +692,6 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadRollbackResponse,
     },
-    #[experimental("thread/revert")]
     ThreadRevert => "thread/revert" {
         params: v2::ThreadRevertParams,
         serialization: thread_id(params.thread_id),
@@ -780,14 +788,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadReadResponse,
     },
-    #[experimental("thread/turns/list")]
     ThreadTurnsList => "thread/turns/list" {
         params: v2::ThreadTurnsListParams,
         // Explicitly concurrent: this primarily reads append-only rollout storage.
         serialization: None,
         response: v2::ThreadTurnsListResponse,
     },
-    #[experimental("thread/items/list")]
     ThreadItemsList => "thread/items/list" {
         params: v2::ThreadItemsListParams,
         // Explicitly concurrent: this primarily reads append-only rollout storage.
@@ -964,6 +970,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::TurnStartResponse,
     },
+    #[experimental("turn/settings/update")]
+    TurnSettingsUpdate => "turn/settings/update" {
+        params: v2::TurnSettingsUpdateParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::TurnSettingsUpdateResponse,
+    },
     TurnSteer => "turn/steer" {
         params: v2::TurnSteerParams,
         inspect_params: true,
@@ -1004,6 +1016,12 @@ client_request_definitions! {
         params: v2::ThreadRealtimeStopParams,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadRealtimeStopResponse,
+    },
+    #[experimental("thread/timeline/list")]
+    ThreadTimelineList => "thread/timeline/list" {
+        params: v2::ThreadTimelineListParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadTimelineListResponse,
     },
     #[experimental("thread/realtime/listVoices")]
     ThreadRealtimeListVoices => "thread/realtime/listVoices" {
@@ -1824,7 +1842,6 @@ server_notification_definitions! {
     ThreadDeleted => "thread/deleted" (v2::ThreadDeletedNotification),
     ThreadUnarchived => "thread/unarchived" (v2::ThreadUnarchivedNotification),
     ThreadClosed => "thread/closed" (v2::ThreadClosedNotification),
-    #[experimental("thread/reverted")]
     ThreadReverted => "thread/reverted" (v2::ThreadRevertedNotification),
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
@@ -1895,6 +1912,8 @@ server_notification_definitions! {
     ContextCompacted => "thread/compacted" (v2::ContextCompactedNotification),
     ModelRerouted => "model/rerouted" (v2::ModelReroutedNotification),
     ModelVerification => "model/verification" (v2::ModelVerificationNotification),
+    AuthRecoveryStarted => "modelProvider/authRecoveryStarted" (v2::AuthRecoveryNotification),
+    AuthRecoveryCompleted => "modelProvider/authRecoveryCompleted" (v2::AuthRecoveryNotification),
     #[experimental("turn/moderationMetadata")]
     TurnModerationMetadata => "turn/moderationMetadata" (v2::TurnModerationMetadataNotification),
     ModelSafetyBufferingUpdated => "model/safetyBuffering/updated" (v2::ModelSafetyBufferingUpdatedNotification),
@@ -1908,6 +1927,12 @@ server_notification_definitions! {
     ThreadRealtimeStarted => "thread/realtime/started" (v2::ThreadRealtimeStartedNotification),
     #[experimental("thread/realtime/itemAdded")]
     ThreadRealtimeItemAdded => "thread/realtime/itemAdded" (v2::ThreadRealtimeItemAddedNotification),
+    #[experimental("thread/realtime/item/started")]
+    ThreadRealtimeItemStarted => "thread/realtime/item/started" (v2::ThreadRealtimeItemStartedNotification),
+    #[experimental("thread/realtime/item/transcript/delta")]
+    ThreadRealtimeItemTranscriptDelta => "thread/realtime/item/transcript/delta" (v2::ThreadRealtimeItemTranscriptDeltaNotification),
+    #[experimental("thread/realtime/item/completed")]
+    ThreadRealtimeItemCompleted => "thread/realtime/item/completed" (v2::ThreadRealtimeItemCompletedNotification),
     #[experimental("thread/realtime/transcript/delta")]
     ThreadRealtimeTranscriptDelta => "thread/realtime/transcript/delta" (v2::ThreadRealtimeTranscriptDeltaNotification),
     #[experimental("thread/realtime/transcript/done")]
@@ -3234,25 +3259,47 @@ mod tests {
 
     #[test]
     fn serialize_account_login_amazon_bedrock() -> Result<()> {
-        let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(2),
-            params: v2::LoginAccountParams::AmazonBedrock {
-                api_key: "secret".to_string(),
-                region: "us-west-2".to_string(),
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/login/start",
-                "id": 2,
-                "params": {
+        for (params, expected_params) in [
+            (
+                v2::LoginAccountParams::AmazonBedrock {
+                    api_key: "secret".to_string(),
+                    region: "us-west-2".to_string(),
+                },
+                json!({
                     "type": "amazonBedrock",
                     "apiKey": "secret",
                     "region": "us-west-2"
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
+                }),
+            ),
+            (
+                v2::LoginAccountParams::AmazonBedrockAccessKeys {
+                    access_key_id: "access-key-id".to_string(),
+                    secret_access_key: "secret-access-key".to_string(),
+                    session_token: Some("session-token".to_string()),
+                    region: "us-west-2".to_string(),
+                },
+                json!({
+                    "type": "amazonBedrockAccessKeys",
+                    "accessKeyId": "access-key-id",
+                    "secretAccessKey": "secret-access-key",
+                    "sessionToken": "session-token",
+                    "region": "us-west-2"
+                }),
+            ),
+        ] {
+            let request = ClientRequest::LoginAccount {
+                request_id: RequestId::Integer(2),
+                params,
+            };
+            assert_eq!(
+                json!({
+                    "method": "account/login/start",
+                    "id": 2,
+                    "params": expected_params,
+                }),
+                serde_json::to_value(&request)?,
+            );
+        }
         assert_eq!(
             json!({"type": "amazonBedrock"}),
             serde_json::to_value(v2::LoginAccountResponse::AmazonBedrock {})?,
@@ -4425,6 +4472,7 @@ mod tests {
     #[test]
     fn command_execution_request_approval_additional_permissions_is_marked_experimental() {
         let params = v2::CommandExecutionRequestApprovalParams {
+            kind: Default::default(),
             thread_id: "thr_123".to_string(),
             turn_id: "turn_123".to_string(),
             item_id: "call_123".to_string(),

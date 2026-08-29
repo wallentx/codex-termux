@@ -1,17 +1,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-use codex_core::GuardianAuthorizationVersion;
 use codex_core::GuardianRootMessage;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
-use codex_core::context::ContextualUserFragment;
 use codex_core::context::GuardianReviewEvidence;
 use codex_core::context::NodeReplReviewEvidence;
 use codex_extension_api::ApprovalReviewContributor;
@@ -22,6 +20,8 @@ use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
 use codex_extension_api::ResponseItem;
+use codex_extension_api::SkillInvocationContributor;
+use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadOriginator;
 use codex_extension_api::ThreadStartInput;
@@ -31,33 +31,50 @@ use codex_extension_api::ToolName;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolStartInput;
 use codex_features::Feature;
+use codex_history::RolloutItem;
 use codex_login::AgentIdentityAuthPolicy;
 use codex_login::AuthManager;
 use codex_model_provider::create_model_provider;
 use codex_protocol::ThreadId;
+use codex_protocol::mcp::is_node_repl_backed_server;
+use codex_protocol::mcp::is_node_repl_backed_tool;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::security_risk::SecurityRiskScore;
-use serde_json::json;
 
+use super::action::GuardianAction;
+use super::action::RenderedAction;
+use super::authorization::ScoreAuthorization;
 use super::config::GuardianV2Config;
+use super::config::GuardianV2ReviewScope;
+use super::metrics::REVIEW_FALLBACK_METRIC;
+use super::metrics::TOOL_CALL_LAG_METRIC;
+use super::metrics::record_classification;
+use super::metrics::record_classification_risk;
+use super::metrics::record_fast_decision;
+use super::review_evidence::render_review_evidence;
 use super::sampler::LunaSampler;
 use super::sampler::LunaSamplerConfig;
 use super::sampler::LunaSamplerError;
 use super::sampler::LunaSamplingRequest;
 use super::sampler::MODEL;
-
-struct GuardianAction {
-    tool_name: ToolName,
-    payload: ToolPayload,
-}
+use super::truncation::ClassificationTruncations;
+use super::trusted_skills::TrustedSkillInvocations;
+use super::trusted_skills::TrustedSkillRoots;
+use super::trusted_tools::trusted_tool_context;
 
 fn should_classify_tool(
     tool_name: &ToolName,
     payload: &ToolPayload,
-    sandboxed_exec_commands: bool,
+    review_scope: GuardianV2ReviewScope,
 ) -> bool {
+    let GuardianV2ReviewScope::Standard {
+        sandboxed_exec_commands,
+    } = review_scope
+    else {
+        return is_node_repl_backed_tool(&tool_name.name, tool_name.namespace.as_deref());
+    };
     if sandboxed_exec_commands
         || !tool_name.is_default_namespace()
         || tool_name.name != "exec_command"
@@ -79,140 +96,6 @@ fn should_classify_tool(
     )
 }
 
-impl GuardianAction {
-    fn render(self, max_action_tokens: usize) -> serde_json::Result<String> {
-        let arguments = match self.payload {
-            ToolPayload::Function { arguments } => {
-                serde_json::from_str(&arguments).unwrap_or(serde_json::Value::String(arguments))
-            }
-            ToolPayload::Custom { input } => serde_json::Value::String(input),
-            ToolPayload::ToolSearch { arguments } => json!(arguments),
-        };
-        let mut action = match arguments {
-            serde_json::Value::Object(arguments) => arguments,
-            arguments => serde_json::Map::from_iter([("arguments".to_owned(), arguments)]),
-        };
-        action.insert(
-            "tool".to_owned(),
-            serde_json::Value::String(self.tool_name.to_string()),
-        );
-
-        action.sort_keys();
-        action
-            .values_mut()
-            .for_each(serde_json::Value::sort_all_objects);
-        let max_action_bytes = TruncationPolicy::Tokens(max_action_tokens).byte_budget();
-        let rendered = serde_json::to_string_pretty(&action)?;
-        if rendered.len().saturating_add(1) <= max_action_bytes {
-            return Ok(rendered);
-        }
-
-        if let Some(rendered) = fit_action_to_budget(&action, max_action_bytes, max_action_tokens)?
-        {
-            return Ok(rendered);
-        }
-
-        let mut omission_key = "_guardian_omitted_fields".to_owned();
-        while action.contains_key(&omission_key) {
-            omission_key.push('_');
-        }
-        let mut retained = serde_json::Map::new();
-        for key in ["tool", "call_id"] {
-            if let Some(value) = action.get(key) {
-                retained.insert(key.to_owned(), value.clone());
-            }
-        }
-        let mut omitted = action.len().saturating_sub(retained.len());
-        retained.insert(omission_key.clone(), json!(omitted));
-
-        let mut optional_fields = action
-            .iter()
-            .filter(|(key, _)| !matches!(key.as_str(), "tool" | "call_id"))
-            .collect::<Vec<_>>();
-        optional_fields.sort_by_key(|(key, _)| {
-            !matches!(
-                key.as_str(),
-                "arguments" | "cmd" | "command" | "input" | "patch" | "path" | "url"
-            )
-        });
-        for (key, value) in optional_fields {
-            let mut candidate = retained.clone();
-            candidate.insert(key.clone(), value.clone());
-            candidate.insert(omission_key.clone(), json!(omitted.saturating_sub(1)));
-            candidate.sort_keys();
-            let minimized = render_action_with_limit(&candidate, /*max_tokens*/ 0)?;
-            if minimized.len().saturating_add(1) <= max_action_bytes {
-                retained = candidate;
-                omitted = omitted.saturating_sub(1);
-            }
-        }
-
-        retained.sort_keys();
-        fit_action_to_budget(&retained, max_action_bytes, max_action_tokens)?.ok_or_else(|| {
-            serde_json::Error::io(std::io::Error::other(format!(
-                "Guardian action identity exceeds the {max_action_tokens}-token limit"
-            )))
-        })
-    }
-}
-
-fn fit_action_to_budget(
-    action: &serde_json::Map<String, serde_json::Value>,
-    max_action_bytes: usize,
-    max_action_tokens: usize,
-) -> serde_json::Result<Option<String>> {
-    let mut low = 0usize;
-    let mut high = max_action_tokens.saturating_add(1);
-    let mut best = None;
-
-    while low < high {
-        let max_tokens = low + (high - low) / 2;
-        let rendered = render_action_with_limit(action, max_tokens)?;
-        if rendered.len().saturating_add(1) <= max_action_bytes {
-            best = Some(rendered);
-            low = max_tokens.saturating_add(1);
-        } else {
-            high = max_tokens;
-        }
-    }
-
-    Ok(best)
-}
-
-fn render_action_with_limit(
-    action: &serde_json::Map<String, serde_json::Value>,
-    max_tokens: usize,
-) -> serde_json::Result<String> {
-    let mut truncated = action.clone();
-    for (key, value) in &mut truncated {
-        if !matches!(key.as_str(), "tool" | "call_id") {
-            truncate_action_value(value, max_tokens);
-        }
-    }
-    serde_json::to_string_pretty(&truncated)
-}
-
-fn truncate_action_value(value: &mut serde_json::Value, max_tokens: usize) {
-    match value {
-        serde_json::Value::String(text) => {
-            let truncated = super::transcript::truncate_entry(text, max_tokens);
-            if truncated.len() < text.len() {
-                *text = truncated;
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                truncate_action_value(value, max_tokens);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                truncate_action_value(value, max_tokens);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-}
 /// Explains why Guardian v2 requires synchronous approval review.
 #[derive(Debug, Eq, PartialEq)]
 pub enum StrictReviewReason {
@@ -222,35 +105,19 @@ pub enum StrictReviewReason {
 
 struct GuardianV2Enabled;
 
-// Sampled when the approval contributor evaluates the cached Luna score.
-const TOOL_CALL_LAG_METRIC: &str = "codex.guardian_v2.tool_call_lag";
-const REVIEW_FALLBACK_METRIC: &str = "codex.guardian_v2.review_fallback";
-const CLASSIFICATION_METRIC: &str = "codex.guardian_v2.classification";
-const CLASSIFICATION_DURATION_METRIC: &str = "codex.guardian_v2.classification.duration_ms";
+enum ClassificationOutcome {
+    Scored,
+    Superseded,
+}
 
 #[derive(Default)]
 struct GuardianV2ScoreProgress {
     latest_tool_call: AtomicUsize,
     latest_scored_tool_call: AtomicUsize,
     latest_failed_tool_call: AtomicUsize,
+    // Serialize successful score publication with its authorization metadata.
+    authorization: Mutex<Option<ScoreAuthorization>>,
     metrics: Option<Arc<dyn ExtensionMetrics>>,
-}
-
-fn record_classification(
-    metrics: Option<&dyn ExtensionMetrics>,
-    duration: Duration,
-    outcome: &str,
-) {
-    let Some(metrics) = metrics else {
-        return;
-    };
-    let tags = [("outcome", outcome)];
-    metrics.counter(CLASSIFICATION_METRIC, /*inc*/ 1, &tags);
-    metrics.histogram(
-        CLASSIFICATION_DURATION_METRIC,
-        i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        &tags,
-    );
 }
 
 #[derive(Clone)]
@@ -293,7 +160,7 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
             } else {
                 None
             };
-            let sampler = LunaSampler::connect(LunaSamplerConfig {
+            let sampler_config = LunaSamplerConfig {
                 provider: create_model_provider(
                     input.config.model_provider.clone(),
                     Some(Arc::clone(&self.auth_manager)),
@@ -311,51 +178,123 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     .thread_store
                     .get::<ThreadOriginator>()
                     .map(|originator| originator.0.clone()),
+                free_guardian: input.config.free_guardian_enabled(),
                 service_tier: input.config.service_tier.clone(),
                 luna_compaction_hash,
                 metrics: input.extension_metrics.clone(),
-            })
-            .await;
+            };
 
-            match sampler {
-                Ok(sampler) => {
-                    if guardian_config.transcript.include_images {
-                        input
-                            .thread_store
-                            .get_or_init(NodeReplReviewEvidence::default)
-                            .enable_image_capture();
-                    }
-                    input.thread_store.insert(sampler);
-                    input.thread_store.insert(guardian_config);
-                    input.thread_store.insert(GuardianV2ScoreProgress {
-                        metrics: input.extension_metrics.clone(),
-                        ..Default::default()
-                    });
-                    input.thread_store.insert(GuardianReviewEvidence::default());
-                    input.thread_store.insert(GuardianV2Enabled);
-                }
-                Err(error) => self.event_sink.emit_warning(ExtensionWarning {
-                    thread_id,
-                    turn_id: None,
-                    message: format!("Guardian V2 Luna initialization failed: {error}"),
-                }),
+            if guardian_config.transcript.include_images {
+                input
+                    .thread_store
+                    .get_or_init(NodeReplReviewEvidence::default)
+                    .enable_image_capture();
             }
+            input.thread_store.remove::<LunaSampler>();
+            let sampler = input
+                .thread_store
+                .get_or_init(|| LunaSampler::new(sampler_config));
+            input.thread_store.insert(guardian_config);
+            input.thread_store.insert(GuardianV2ScoreProgress {
+                metrics: input.extension_metrics.clone(),
+                ..Default::default()
+            });
+            input.thread_store.insert(GuardianReviewEvidence::default());
+            input
+                .thread_store
+                .insert(TrustedSkillRoots::from_config(input.config));
+            input.thread_store.insert(GuardianV2Enabled);
+
+            tokio::spawn(async move {
+                sampler.prewarm().await;
+            });
+        })
+    }
+}
+
+impl SkillInvocationContributor for GuardianV2Extension {
+    fn requires_host_skill_discovery(&self) -> bool {
+        false
+    }
+
+    fn on_skill_invocation<'a>(
+        &'a self,
+        input: SkillInvocationInput<'a>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(roots) = input.thread_store.get::<TrustedSkillRoots>() else {
+                return;
+            };
+            let Some(skill_path) = roots.trusted_skill_path(input.skill_resource) else {
+                return;
+            };
+            let Some(evidence) = input.thread_store.get::<GuardianReviewEvidence>() else {
+                return;
+            };
+            evidence.record_trusted_skill(input.turn_id, skill_path);
         })
     }
 }
 
 impl ApprovalReviewContributor for GuardianV2Extension {
-    fn contribute<'a>(
+    fn fast_decision<'a>(
         &'a self,
         _session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
-        _prompt: &'a str,
+        prompt: &'a str,
         extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
     ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
         Box::pin(async move {
             thread_store.get::<GuardianV2Enabled>()?;
             let guardian_config = thread_store.get::<GuardianV2Config>()?;
-            let score_progress = thread_store.get::<GuardianV2ScoreProgress>()?;
+            if guardian_config.review_scope == GuardianV2ReviewScope::ComputerUseOnly {
+                let Ok(action) = serde_json::from_str::<serde_json::Value>(prompt) else {
+                    record_fast_decision(extension_metrics.as_deref(), "deferred", "out_of_scope");
+                    return None;
+                };
+                if action.get("tool").and_then(serde_json::Value::as_str) != Some("mcp_tool_call")
+                    || !action
+                        .get("server")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_node_repl_backed_server)
+                {
+                    record_fast_decision(extension_metrics.as_deref(), "deferred", "out_of_scope");
+                    return None;
+                }
+            } else if thread_store.get::<ModelInfo>().is_some() {
+                let manager = self.thread_manager.upgrade()?;
+                let thread_id = ThreadId::from_string(thread_store.level_id()).ok()?;
+                let thread = manager.get_thread(thread_id).await.ok()?;
+                let config = thread.config().await;
+                let model = thread_store.get::<ModelInfo>()?;
+                if config
+                    .config_layer_stack
+                    .requirements()
+                    .auto_review_required_for_model(&model.slug)
+                {
+                    record_fast_decision(
+                        extension_metrics.as_deref(),
+                        "deferred",
+                        "required_model",
+                    );
+                    return None;
+                }
+            }
+            let Some(score_progress) = thread_store.get::<GuardianV2ScoreProgress>() else {
+                record_fast_decision(extension_metrics.as_deref(), "deferred", "missing_score");
+                return None;
+            };
+            let manager = self.thread_manager.upgrade()?;
+            let thread_id = ThreadId::from_string(thread_store.level_id()).ok()?;
+            let Ok(thread) = manager.get_thread(thread_id).await else {
+                record_fast_decision(extension_metrics.as_deref(), "deferred", "scoring_failure");
+                return None;
+            };
+            let current_authorization = ScoreAuthorization::current(&thread).await;
+            let scored_authorization = score_progress
+                .authorization
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let latest_scored_tool_call = score_progress
                 .latest_scored_tool_call
                 .load(Ordering::Acquire);
@@ -379,6 +318,7 @@ impl ApprovalReviewContributor for GuardianV2Extension {
                         &[("fallback_reason", "score_lag")],
                     );
                 }
+                record_fast_decision(extension_metrics.as_deref(), "deferred", "stale_score");
                 return None;
             }
             if score_progress
@@ -387,17 +327,35 @@ impl ApprovalReviewContributor for GuardianV2Extension {
                 > latest_scored_tool_call
             {
                 thread_store.insert(StrictReviewReason::ElevatedRisk);
+                record_fast_decision(extension_metrics.as_deref(), "deferred", "scoring_failure");
                 return None;
             }
 
-            let score = thread_store
+            let Some(score) = thread_store
                 .get::<SecurityRiskScore>()
-                .and_then(|score| score.scores.get("action_risk").copied())?;
+                .and_then(|score| score.scores.get("action_risk").copied())
+            else {
+                record_fast_decision(extension_metrics.as_deref(), "deferred", "missing_score");
+                return None;
+            };
             if score < guardian_config.review_threshold {
+                if scored_authorization.as_ref() != Some(&current_authorization) {
+                    thread_store.insert(StrictReviewReason::StaleScore);
+                    record_fast_decision(
+                        extension_metrics.as_deref(),
+                        "deferred",
+                        "authorization_changed",
+                    );
+                    return None;
+                }
+                record_fast_decision(extension_metrics.as_deref(), "approved", "low_risk");
                 return Some(ReviewDecision::Approved);
             }
             if score >= guardian_config.review_threshold {
                 thread_store.insert(StrictReviewReason::ElevatedRisk);
+                record_fast_decision(extension_metrics.as_deref(), "deferred", "elevated_risk");
+            } else {
+                record_fast_decision(extension_metrics.as_deref(), "deferred", "invalid_score");
             }
             None
         })
@@ -414,6 +372,8 @@ impl GuardianV2Extension {
     fn record_fail_closed_score(thread_store: &ExtensionData, sampled_at: SystemTime) {
         let score = SecurityRiskScore {
             scores: BTreeMap::from([("action_risk".to_owned(), 1.0)]),
+            call_id: None,
+            action: None,
             sampled_at: Some(sampled_at.into()),
         };
         thread_store.insert_if(score.clone(), |previous| {
@@ -432,14 +392,12 @@ impl GuardianV2Extension {
         let Some(score_progress) = input.thread_store.get::<GuardianV2ScoreProgress>() else {
             return;
         };
-        if !should_classify_tool(
-            input.tool_name,
-            input.payload,
-            guardian_config.sandboxed_exec_commands,
-        ) {
-            score_progress
-                .latest_tool_call
-                .fetch_add(/*val*/ 1, Ordering::Relaxed);
+        if !should_classify_tool(input.tool_name, input.payload, guardian_config.review_scope) {
+            if guardian_config.review_scope != GuardianV2ReviewScope::ComputerUseOnly {
+                score_progress
+                    .latest_tool_call
+                    .fetch_add(/*val*/ 1, Ordering::Relaxed);
+            }
             return;
         }
         let metrics = score_progress.metrics.clone();
@@ -451,6 +409,7 @@ impl GuardianV2Extension {
         let event_sink = Arc::clone(&self.event_sink);
         let thread_id = input.thread_store.level_id().to_owned();
         let turn_id = input.turn_id.to_owned();
+        let root_turn_id = input.root_turn_id.map(str::to_owned);
         let thread_context: Result<_, String> = async {
             let parsed_thread_id =
                 ThreadId::from_string(&thread_id).map_err(|error| error.to_string())?;
@@ -486,12 +445,15 @@ impl GuardianV2Extension {
             }
         };
         let parent_model = input.thread_store.get::<ModelInfo>();
-        if parent_model.as_ref().is_some_and(|model| {
-            config
-                .config_layer_stack
-                .requirements()
-                .auto_review_required_for_model(&model.slug)
-        }) {
+        // Computer-use-only scores cannot approve other tools for required models.
+        if guardian_config.review_scope != GuardianV2ReviewScope::ComputerUseOnly
+            && parent_model.as_ref().is_some_and(|model| {
+                config
+                    .config_layer_stack
+                    .requirements()
+                    .auto_review_required_for_model(&model.slug)
+            })
+        {
             input.thread_store.remove::<SecurityRiskScore>();
             return;
         }
@@ -523,50 +485,27 @@ impl GuardianV2Extension {
                 .enable_image_capture();
         }
         input.thread_store.insert(guardian_config.clone());
-        let latest_parent_compaction = if guardian_config.reuse_parent_compaction {
-            input
-                .conversation_history
-                .items()
-                .filter(|item| {
-                    matches!(
-                        item,
-                        ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
-                    )
-                })
-                .last()
+        let parent_compaction = if guardian_config.reuse_parent_compaction {
+            match encrypted_parent_compaction(
+                input.conversation_history.items(),
+                guardian_config.max_parent_compaction_tokens,
+            ) {
+                Ok(compaction) => compaction,
+                Err(_) => {
+                    Self::record_fail_closed_score(input.thread_store, sampled_at);
+                    record_classification(
+                        metrics.as_deref(),
+                        classification_started_at.elapsed(),
+                        "failure",
+                    );
+                    return;
+                }
+            }
         } else {
             None
         };
-        let parent_compaction = latest_parent_compaction.and_then(|item| {
-            encrypted_parent_compaction(
-                std::iter::once(item),
-                guardian_config.max_parent_compaction_tokens,
-            )
-        });
-        if parent_compaction.is_none()
-            && latest_parent_compaction.is_some_and(|item| match item {
-                ResponseItem::Compaction {
-                    id: Some(_),
-                    encrypted_content,
-                    ..
-                }
-                | ResponseItem::ContextCompaction {
-                    id: Some(_),
-                    encrypted_content: Some(encrypted_content),
-                    ..
-                } => !encrypted_content.is_empty(),
-                _ => false,
-            })
-        {
-            Self::record_fail_closed_score(input.thread_store, sampled_at);
-            record_classification(
-                metrics.as_deref(),
-                classification_started_at.elapsed(),
-                "failure",
-            );
-            return;
-        }
         let call_id = input.call_id.to_owned();
+        let mcp_tool = input.mcp_tool.cloned();
         let action = GuardianAction {
             tool_name: input.tool_name.clone(),
             payload: input.payload.clone(),
@@ -579,10 +518,11 @@ impl GuardianV2Extension {
             .and_then(|model| model.auto_review_model_override.clone());
         let conversation_history = Arc::clone(&input.conversation_history);
         // Snapshot before spawning so a delayed sample cannot see later reviews.
-        let sync_reviews = input
+        let guardian_evidence = input
             .thread_store
-            .get_or_init(GuardianReviewEvidence::default)
-            .snapshot();
+            .get_or_init(GuardianReviewEvidence::default);
+        let sync_reviews = guardian_evidence.snapshot();
+        let local_trusted_skill_paths = guardian_evidence.trusted_skill_paths(input.turn_id);
         let node_repl_images = if guardian_config.transcript.include_images {
             input
                 .thread_store
@@ -594,22 +534,58 @@ impl GuardianV2Extension {
         };
 
         tokio::spawn(async move {
+            let mut truncations = ClassificationTruncations::default();
+            let trusted_tool_context = match mcp_tool.as_ref() {
+                Some(tool) => {
+                    trusted_tool_context(tool.tool_info(), tool.source(), &manager, &config).await
+                }
+                None => None,
+            };
             let root_snapshot = thread.guardian_root_snapshot().await;
+            let mut trusted_skills = TrustedSkillInvocations::default();
+            for path in local_trusted_skill_paths.iter().chain(
+                root_snapshot
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|snapshot| snapshot.trusted_skill_paths.iter()),
+            ) {
+                trusted_skills.record(path.clone());
+            }
+            let trusted_skill_paths = trusted_skills.into_paths();
             let root_authorization_version = root_snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.authorization_version);
             let root_conversation = root_snapshot.map(|snapshot| snapshot.messages);
             let authorization_version =
-                GuardianAuthorizationVersion::from_history(conversation_history.as_ref());
+                guardian_evidence.authorization_version(conversation_history.as_ref());
+            let score_authorization = ScoreAuthorization {
+                local: authorization_version,
+                root: root_authorization_version,
+            };
+            let trusted_user_inputs =
+                guardian_evidence.user_input_fragments(conversation_history.as_ref());
             let transcript = guardian_config
                 .transcript
                 .build(conversation_history.items());
-            let images = guardian_config
+            truncations.extend(transcript.truncations);
+            let rendered_images = guardian_config
                 .transcript
                 .images(conversation_history.items(), node_repl_images);
+            truncations.record(
+                "transcript_image",
+                rendered_images.omitted_bytes,
+                /*retained_bytes*/ 0,
+            );
+            let images = rendered_images.images;
             drop(conversation_history);
             let planned_action = match action.render(guardian_config.max_action_tokens) {
-                Ok(planned_action) => planned_action,
+                Ok(RenderedAction {
+                    text,
+                    original_bytes,
+                }) => {
+                    truncations.record("action", original_bytes, text.len());
+                    text
+                }
                 Err(error) => {
                     Self::record_fail_closed_score(thread.thread_extension_data(), sampled_at);
                     record_classification(
@@ -641,8 +617,13 @@ impl GuardianV2Extension {
                 );
                 classification_input.push(">>> ROOT CONVERSATION END\n".to_owned());
             }
+            if !trusted_user_inputs.is_empty() {
+                classification_input.push(">>> TRUSTED USER ANSWERS START\n".to_owned());
+                classification_input.extend(trusted_user_inputs);
+                classification_input.push(">>> TRUSTED USER ANSWERS END\n".to_owned());
+            }
             classification_input.push(">>> TRANSCRIPT START\n".to_owned());
-            classification_input.extend(transcript);
+            classification_input.extend(transcript.entries);
             classification_input.push(">>> TRANSCRIPT END\n\n".to_owned());
             let trusted_review_evidence = sync_reviews
                 .iter()
@@ -650,7 +631,11 @@ impl GuardianV2Extension {
                     review.authorization_version == authorization_version
                         && review.root_authorization_version == root_authorization_version
                 })
-                .map(ContextualUserFragment::render)
+                .map(|review| {
+                    let review = render_review_evidence(review);
+                    truncations.extend(review.truncations);
+                    review.text
+                })
                 .collect();
             classification_input.extend([
                 "The Codex agent has requested the following action:\n".to_owned(),
@@ -660,7 +645,7 @@ impl GuardianV2Extension {
                 ">>> APPROVAL REQUEST END\n".to_owned(),
             ]);
             let mut classification_finished_at = None;
-            let result: Result<&str, String> = async {
+            let result: Result<ClassificationOutcome, String> = async {
                 let review_model_messages = if config.guardian_policy_config.is_none() {
                     let review_model_id = review_model_override.as_deref().unwrap_or_else(|| {
                         create_model_provider(
@@ -690,64 +675,57 @@ impl GuardianV2Extension {
                     .sample(LunaSamplingRequest {
                         instructions,
                         trusted_review_evidence,
+                        trusted_tool_context,
+                        trusted_skill_paths,
                         input: classification_input,
                         images,
                         parent_compaction,
                         parent_compaction_hash,
-                        output_schema: json!({
-                            "type": "object",
-                            "properties": {
-                                "scores": {
-                                    "type": "object",
-                                    "properties": {
-                                        "action_risk": {
-                                            "type": "number",
-                                            "minimum": 0.0,
-                                            "maximum": 1.0
-                                        }
-                                    },
-                                    "required": ["action_risk"],
-                                    "additionalProperties": false
-                                }
-                            },
-                            "required": ["scores"],
-                            "additionalProperties": false
-                        }),
                         reasoning_effort: guardian_config.reasoning_effort.clone(),
-                        turn_id: turn_id.clone(),
+                        parent_turn_id: turn_id.clone(),
+                        root_turn_id,
                     })
                     .await
                 {
                     Ok(output) => output,
-                    Err(LunaSamplerError::Superseded) => return Ok("superseded"),
+                    Err(LunaSamplerError::Superseded) => {
+                        return Ok(ClassificationOutcome::Superseded);
+                    }
                     Err(error) => return Err(error.to_string()),
                 };
-                let output: serde_json::Value =
-                    serde_json::from_str(&output).map_err(|error| error.to_string())?;
-                let scores = output
-                    .get("scores")
-                    .and_then(serde_json::Value::as_object)
-                    .ok_or_else(|| "Luna returned no security risk scores".to_string())?;
-                let scores = scores
-                    .iter()
-                    .map(|(category, value)| {
-                        value
-                            .as_f64()
-                            .filter(|score| (0.0..=1.0).contains(score))
-                            .map(|score| (category.clone(), score))
-                            .ok_or_else(|| format!("invalid security risk score for {category}"))
-                    })
-                    .collect::<Result<_, _>>()?;
+                let action_risk = match output.as_str() {
+                    "high" => 1.0,
+                    "low" => 0.0,
+                    _ => return Err("invalid Guardian V2 classification".to_owned()),
+                };
                 let score = SecurityRiskScore {
-                    scores,
+                    scores: BTreeMap::from([("action_risk".to_owned(), action_risk)]),
+                    call_id: Some(call_id.clone()),
+                    action: Some(
+                        serde_json::from_str(&planned_action).map_err(|error| error.to_string())?,
+                    ),
                     sampled_at: Some(sampled_at.into()),
                 };
-                let accepted =
-                    thread
-                        .thread_extension_data()
-                        .insert_if(score.clone(), |previous| {
-                            previous.is_none_or(|previous| previous.sampled_at < score.sampled_at)
-                        });
+                if score_authorization != ScoreAuthorization::current(&thread).await {
+                    return Ok(ClassificationOutcome::Superseded);
+                }
+                let accepted = {
+                    let mut scored_authorization = score_progress
+                        .authorization
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let accepted =
+                        thread
+                            .thread_extension_data()
+                            .insert_if(score.clone(), |previous| {
+                                previous
+                                    .is_none_or(|previous| previous.sampled_at < score.sampled_at)
+                            });
+                    if accepted {
+                        *scored_authorization = Some(score_authorization);
+                    }
+                    accepted
+                };
                 tracing::info!(
                     %thread_id,
                     %turn_id,
@@ -760,13 +738,28 @@ impl GuardianV2Extension {
                     "Guardian V2 classification result"
                 );
                 if !accepted {
-                    return Ok("superseded");
+                    return Ok(ClassificationOutcome::Superseded);
                 }
                 score_progress
                     .latest_scored_tool_call
                     .fetch_max(tool_call_index, Ordering::Release);
                 classification_finished_at = Some(Instant::now());
-                Ok("success")
+                record_classification_risk(metrics.as_deref(), output.as_str());
+                if guardian_config.persist_scores
+                    && !config.ephemeral
+                    && let Err(error) = thread
+                        .append_rollout_items(&[RolloutItem::SecurityRiskScore(score)])
+                        .await
+                {
+                    tracing::warn!(
+                        %thread_id,
+                        %turn_id,
+                        %call_id,
+                        %error,
+                        "failed to persist Guardian V2 classification result"
+                    );
+                }
+                Ok(ClassificationOutcome::Scored)
             }
             .await;
             if result.is_err() {
@@ -779,8 +772,15 @@ impl GuardianV2Extension {
                         finished_at.duration_since(classification_started_at)
                     })
                     .unwrap_or_else(|| classification_started_at.elapsed()),
-                result.as_deref().unwrap_or("failure"),
+                match &result {
+                    Ok(ClassificationOutcome::Scored) => "success",
+                    Ok(ClassificationOutcome::Superseded) => "superseded",
+                    Err(_) => "failure",
+                },
             );
+            if matches!(result, Ok(ClassificationOutcome::Scored)) {
+                truncations.emit(metrics.as_deref());
+            }
             if let Err(error) = result {
                 event_sink.emit_warning(ExtensionWarning {
                     thread_id,
@@ -792,21 +792,32 @@ impl GuardianV2Extension {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum ParentCompactionError {
+    Serialization,
+    Oversized,
+}
+
+// An unusable latest compaction must never fall back to an older one. Missing
+// encrypted content can be omitted; content that cannot be bounded rejects the sample.
 fn encrypted_parent_compaction<'a>(
     items: impl Iterator<Item = &'a ResponseItem>,
     max_parent_compaction_tokens: usize,
-) -> Option<ResponseItem> {
+) -> Result<Option<ResponseItem>, ParentCompactionError> {
     let max_compaction_bytes = TruncationPolicy::Tokens(max_parent_compaction_tokens).byte_budget();
-    let item = items
+    let Some(item) = items
         .filter(|item| {
             matches!(
                 item,
                 ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
             )
         })
-        .last()?;
+        .last()
+    else {
+        return Ok(None);
+    };
 
-    match item {
+    let encrypted_content = match item {
         ResponseItem::Compaction {
             id: Some(_),
             encrypted_content,
@@ -816,14 +827,18 @@ fn encrypted_parent_compaction<'a>(
             id: Some(_),
             encrypted_content: Some(encrypted_content),
             ..
-        } if !encrypted_content.is_empty()
-            && serde_json::to_vec(item)
-                .is_ok_and(|serialized| serialized.len() <= max_compaction_bytes) =>
-        {
-            Some(item.clone())
-        }
-        _ => None,
+        } => encrypted_content,
+        _ => return Ok(None),
+    };
+    if encrypted_content.is_empty() {
+        return Ok(None);
     }
+    let serialized = serde_json::to_vec(item).map_err(|_| ParentCompactionError::Serialization)?;
+    if serialized.len() > max_compaction_bytes {
+        return Err(ParentCompactionError::Oversized);
+    }
+
+    Ok(Some(item.clone()))
 }
 
 /// Installs feature-gated Guardian V2 tool classification for each thread.
@@ -839,6 +854,7 @@ pub fn install(
     });
     registry.thread_lifecycle_contributor(extension.clone());
     registry.approval_review_contributor(extension.clone());
+    registry.skill_invocation_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension);
 }
 

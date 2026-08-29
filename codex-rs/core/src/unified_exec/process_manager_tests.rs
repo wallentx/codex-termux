@@ -545,6 +545,7 @@ fn pruning_protects_recent_processes_even_if_exited() {
 #[cfg(unix)]
 #[tokio::test]
 async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing() {
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
     let exited_process = Arc::new(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
@@ -589,6 +590,15 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 initial_exec_command_active: Arc::new(AtomicBool::new(false)),
                 hook_command: format!("command-{process_id}"),
                 tty: false,
+                environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+                permissions: super::super::TerminalPermissions::for_launch(
+                    turn.environments.primary().expect("turn environment"),
+                    &turn,
+                    super::super::TerminalSandboxSource::Native,
+                    crate::sandboxing::SandboxPermissions::UseDefault,
+                    /*additional_permissions*/ None,
+                    /*internal_permissions*/ None,
+                ),
                 network_approval: None,
                 session: std::sync::Weak::new(),
                 last_used: if is_exited {

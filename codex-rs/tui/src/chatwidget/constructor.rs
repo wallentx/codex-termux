@@ -198,8 +198,8 @@ impl ChatWidget {
             #[cfg(test)]
             pet_image_support_override: None,
             thread_id: None,
-            dismissed_plan_mode_nudge_scopes: HashSet::new(),
             thread_name: None,
+            pending_automatic_thread_names: HashSet::new(),
             thread_rename_block_message: None,
             active_side_conversation: false,
             blocks_direct_input: false,
@@ -234,6 +234,7 @@ impl ChatWidget {
             last_terminal_title_requires_action: false,
             terminal_title_setup_original_items: None,
             terminal_title_animation_origin: Instant::now(),
+            terminal_title_next_refresh: None,
             status_line_project_root_name_cache: None,
             status_line_branch: None,
             status_line_branch_cwd: None,

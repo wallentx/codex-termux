@@ -72,6 +72,7 @@ impl Session {
             && matches!(&item, ResponseItem::Message { role, .. } if role == "developer"))
         .then_some(CodexHarnessMetadata {
             client_authored: true,
+            ..Default::default()
         });
 
         ResponseItemEnvelope { item, metadata }
@@ -82,9 +83,7 @@ impl Session {
         turn_context: &TurnContext,
         items: Vec<ResponseItemEnvelope>,
     ) {
-        if !self.enabled(Feature::RetainClientDeveloperMessages)
-            || items.iter().all(|item| item.metadata.is_none())
-        {
+        if items.iter().all(|item| item.metadata.is_none()) {
             let items = items
                 .into_iter()
                 .map(ResponseItemEnvelope::into_item)

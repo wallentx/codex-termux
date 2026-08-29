@@ -37,7 +37,10 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_spawn_agent_tool_v2(self.options.clone())
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let analytics = invocation.session.services.analytics_events_client.clone();
             let sender_thread_id = invocation.session.thread_id;
@@ -121,9 +124,6 @@ async fn handle_spawn_agent(
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
-    if let Some(service_tier) = args.service_tier.as_ref() {
-        config.service_tier = Some(service_tier.clone());
-    }
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
     apply_requested_spawn_agent_model_overrides(
         &session,
@@ -141,20 +141,23 @@ async fn handle_spawn_agent(
                 .clone_from(&turn.developer_instructions);
         }
     }
-    apply_spawn_agent_service_tier(
-        &session,
-        &mut config,
-        turn.config.service_tier.as_deref(),
-        args.service_tier.as_deref(),
-    )
-    .await?;
+    apply_spawn_agent_service_tier(&session, &mut config).await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 
+    // Remember an applied configured default so cold reload reapplies its restrictions.
+    let persisted_role_name = role_name.or_else(|| {
+        (!is_full_history_fork
+            && config
+                .agent_roles
+                .get(DEFAULT_ROLE_NAME)
+                .is_some_and(|role| role.config_file.is_some()))
+        .then_some(DEFAULT_ROLE_NAME)
+    });
     let spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        role_name,
+        persisted_role_name,
         Some(args.task_name.clone()),
     )?;
     let new_agent_path = spawn_source.get_agent_path().ok_or_else(|| {
@@ -177,7 +180,7 @@ async fn handle_spawn_agent(
     let multi_agent_v2_usage_hints =
         if is_full_history_fork && turn.multi_agent_version == MultiAgentVersion::V2 {
             let child_model_info = match config.model.as_deref() {
-                Some(model) if model != turn.model_info.slug => Some(
+                Some(model) if model != turn.model_info().slug => Some(
                     session
                         .services
                         .models_manager
@@ -188,7 +191,7 @@ async fn handle_spawn_agent(
             };
             let child_catalog = child_model_info
                 .as_ref()
-                .unwrap_or(&turn.model_info)
+                .unwrap_or(turn.model_info())
                 .model_messages
                 .as_ref()
                 .and_then(|messages| messages.multi_agent.as_ref())
@@ -214,6 +217,7 @@ async fn handle_spawn_agent(
                     root_turn_id: turn.turn_metadata_state.root_turn_id(),
                     environments: Some(step_context.environments.to_selections()),
                     multi_agent_v2_usage_hints,
+                    cyber_access_program: turn.cyber_access_program,
                 },
             ),
     )
@@ -275,7 +279,6 @@ struct SpawnAgentArgs {
     agent_type: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
-    service_tier: Option<String>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
 }

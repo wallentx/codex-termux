@@ -18,7 +18,6 @@
 use crate::config::Config;
 use crate::context::UserInstructions as ContextUserInstructions;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use crate::tools::sandboxing::executor_windows_sandbox_level;
 use codex_config::ConfigLayerSource;
 use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
@@ -26,11 +25,10 @@ use codex_config::project_root_markers_from_config;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::ReadFileOptions;
-use codex_extension_api::UserInstructions;
+use codex_extension_api::Instructions;
 use codex_file_system::FileSystemSandboxContext;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
-use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
@@ -56,9 +54,8 @@ const MAX_CONCURRENT_ANCESTOR_PROBES: usize = 256;
 /// instructions.
 pub(crate) async fn load_project_instructions(
     config: &Config,
-    user_instructions: Option<UserInstructions>,
+    user_instructions: Option<Instructions>,
     environments: &TurnEnvironmentSnapshot,
-    windows_sandbox_level: WindowsSandboxLevel,
 ) -> io::Result<Option<LoadedAgentsMd>> {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
     if config.active_project.is_untrusted() {
@@ -76,20 +73,7 @@ pub(crate) async fn load_project_instructions(
             .permission_profile()
             .file_system_sandbox_policy()
             .has_full_disk_read_access())
-        .then(|| {
-            // TODO(anp): Move sandbox context construction to a method on TurnEnvironment.
-            let mut sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
-                turn_environment.permission_profile().clone(),
-                turn_environment.cwd().clone(),
-            );
-            sandbox.workspace_roots = turn_environment.workspace_roots().to_vec();
-            sandbox.windows_sandbox_level =
-                executor_windows_sandbox_level(windows_sandbox_level, turn_environment.cwd());
-            sandbox.windows_sandbox_private_desktop =
-                config.permissions.windows_sandbox_private_desktop;
-            sandbox.use_legacy_landlock = config.features.use_legacy_landlock();
-            sandbox
-        });
+        .then(|| turn_environment.sandbox_context(/*additional_permissions*/ None));
         match read_agents_md(
             config,
             filesystem.as_ref(),
@@ -301,7 +285,7 @@ fn candidate_filenames(config: &Config) -> Vec<&str> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedAgentsMd {
     /// Host-provided user instructions.
-    user_instructions: Option<UserInstructions>,
+    user_instructions: Option<Instructions>,
 
     /// Ordered instructions and their provenance.
     entries: Vec<InstructionEntry>,
@@ -314,7 +298,7 @@ impl LoadedAgentsMd {
             return Self::default();
         }
         Self {
-            user_instructions: Some(UserInstructions {
+            user_instructions: Some(Instructions {
                 text: contents,
                 source: path,
             }),
@@ -322,7 +306,7 @@ impl LoadedAgentsMd {
         }
     }
 
-    fn from_user_instructions(user_instructions: Option<UserInstructions>) -> Self {
+    fn from_user_instructions(user_instructions: Option<Instructions>) -> Self {
         Self {
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),

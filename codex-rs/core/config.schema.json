@@ -601,6 +601,9 @@
             "background_paginated_rollout_migration": {
               "type": "boolean"
             },
+            "bedrock_setup_wizard": {
+              "type": "boolean"
+            },
             "browser_use": {
               "type": "boolean"
             },
@@ -628,6 +631,9 @@
             "code_mode_only": {
               "type": "boolean"
             },
+            "code_mode_prewarm": {
+              "type": "boolean"
+            },
             "codex_git_commit": {
               "type": "boolean"
             },
@@ -650,6 +656,9 @@
               "type": "boolean"
             },
             "connectors": {
+              "type": "boolean"
+            },
+            "content_item_kinds": {
               "type": "boolean"
             },
             "current_time_reminder": {
@@ -751,6 +760,9 @@
             "in_app_dictation": {
               "type": "boolean"
             },
+            "in_app_local_automation": {
+              "type": "boolean"
+            },
             "in_app_updates": {
               "type": "boolean"
             },
@@ -764,6 +776,9 @@
               "type": "boolean"
             },
             "local_thread_store_compression": {
+              "type": "boolean"
+            },
+            "local_thread_store_shared_compression": {
               "type": "boolean"
             },
             "mcp_2026_07_28": {
@@ -793,6 +808,9 @@
             "non_prefixed_mcp_tool_names": {
               "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
             },
+            "omit_app_server_notification_media": {
+              "type": "boolean"
+            },
             "personality": {
               "type": "boolean"
             },
@@ -803,6 +821,9 @@
               "type": "boolean"
             },
             "plugins": {
+              "type": "boolean"
+            },
+            "powershell_shell_version": {
               "type": "boolean"
             },
             "prevent_idle_sleep": {
@@ -889,6 +910,12 @@
             "skill_search": {
               "type": "boolean"
             },
+            "skip_host_skill_discovery": {
+              "type": "boolean"
+            },
+            "sleep_tool": {
+              "$ref": "#/definitions/FeatureToml_for_SleepToolConfigToml"
+            },
             "sqlite": {
               "type": "boolean"
             },
@@ -896,6 +923,9 @@
               "type": "boolean"
             },
             "steer": {
+              "type": "boolean"
+            },
+            "step_model_switching": {
               "type": "boolean"
             },
             "telepathy": {
@@ -923,6 +953,9 @@
               "type": "boolean"
             },
             "tool_suggest": {
+              "type": "boolean"
+            },
+            "transcript_v2": {
               "type": "boolean"
             },
             "tui_app_server": {
@@ -971,6 +1004,9 @@
               "type": "boolean"
             },
             "workspace_owner_usage_nudge": {
+              "type": "boolean"
+            },
+            "write_stdin_approval": {
               "type": "boolean"
             }
           },
@@ -1235,6 +1271,16 @@
         }
       ]
     },
+    "FeatureToml_for_SleepToolConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/SleepToolConfigToml"
+        }
+      ]
+    },
     "FeatureToml_for_TokenBudgetConfigToml": {
       "anyOf": [
         {
@@ -1393,6 +1439,10 @@
         "enabled": {
           "type": "boolean"
         },
+        "free_guardian": {
+          "description": "Route Guardian review and classification through the unmetered Codex endpoints.",
+          "type": "boolean"
+        },
         "max_action_tokens": {
           "format": "uint",
           "maximum": 100000.0,
@@ -1415,6 +1465,10 @@
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "persist_scores": {
+          "description": "Persist reviewed actions and risk scores to rollout files for debugging.",
+          "type": "boolean"
         },
         "reasoning_effort": {
           "$ref": "#/definitions/ReasoningEffort"
@@ -1441,6 +1495,10 @@
       "additionalProperties": false,
       "description": "Optional tool-call categories available to the Guardian v2 classifier.",
       "properties": {
+        "computer_use_only": {
+          "description": "Restrict asynchronous classification and fast approvals to browser and computer-use tools.",
+          "type": "boolean"
+        },
         "sandboxed_exec_commands": {
           "description": "Include sandboxed shell command calls in Guardian v2 classification.",
           "type": "boolean"
@@ -1668,6 +1726,13 @@
     },
     "HooksToml": {
       "properties": {
+        "Interrupt": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
         "PermissionRequest": {
           "default": [],
           "items": {
@@ -1888,6 +1953,10 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "callback_url": {
+          "description": "Registered callback URL associated with this OAuth client.",
+          "type": "string"
+        },
         "client_id": {
           "description": "Explicit OAuth client identifier to present during authorization and token exchange.",
           "type": "string"
@@ -1897,7 +1966,7 @@
     },
     "McpServerToolConfig": {
       "additionalProperties": false,
-      "description": "Per-tool approval settings for a single MCP server tool.",
+      "description": "Per-tool settings for a single MCP server tool.",
       "properties": {
         "approval_mode": {
           "allOf": [
@@ -1906,6 +1975,12 @@
             }
           ],
           "description": "Approval mode for this tool."
+        },
+        "output_token_limit": {
+          "description": "Token budget for this tool's output, before the standard 20% serialization allowance.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -2373,6 +2448,9 @@
           "type": "boolean"
         },
         "allow_upstream_proxy": {
+          "type": "boolean"
+        },
+        "credential_broker": {
           "type": "boolean"
         },
         "dangerously_allow_all_unix_sockets": {
@@ -2918,7 +2996,7 @@
           "additionalProperties": {
             "$ref": "#/definitions/McpServerToolConfig"
           },
-          "description": "Per-tool approval settings keyed by tool name.",
+          "description": "Per-tool policy settings keyed by tool name.",
           "type": "object"
         }
       },
@@ -3446,6 +3524,37 @@
       },
       "type": "object"
     },
+    "SleepToolConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/definitions/SleepToolMode"
+        }
+      },
+      "type": "object"
+    },
+    "SleepToolMode": {
+      "description": "How the sleep tool is selected when its feature gate is enabled.",
+      "oneOf": [
+        {
+          "description": "Preserve the existing model and legacy clock configuration defaults.",
+          "enum": [
+            "model_driven"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Register sleep regardless of the model or legacy clock configuration.",
+          "enum": [
+            "always_on"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ThreadStoreToml": {
       "oneOf": [
         {
@@ -3768,7 +3877,11 @@
               "delete_char": null,
               "delete_to_line_end": null,
               "enter_insert": null,
+              "find_backward": null,
+              "find_forward": null,
               "insert_line_start": null,
+              "jump_bottom": null,
+              "jump_top": null,
               "move_down": null,
               "move_left": null,
               "move_line_end": null,
@@ -3781,21 +3894,30 @@
               "open_line_above": null,
               "open_line_below": null,
               "paste_after": null,
+              "repeat_last_change": null,
               "replace_char": null,
               "start_change_operator": null,
               "start_delete_operator": null,
               "start_yank_operator": null,
               "substitute_char": null,
+              "till_backward": null,
+              "till_forward": null,
               "yank_line": null
             },
             "vim_operator": {
               "cancel": null,
               "delete_line": null,
               "motion_down": null,
+              "motion_find_backward": null,
+              "motion_find_forward": null,
+              "motion_jump_bottom": null,
+              "motion_jump_top": null,
               "motion_left": null,
               "motion_line_end": null,
               "motion_line_start": null,
               "motion_right": null,
+              "motion_till_backward": null,
+              "motion_till_forward": null,
               "motion_up": null,
               "motion_word_backward": null,
               "motion_word_end": null,
@@ -4575,7 +4697,11 @@
             "delete_char": null,
             "delete_to_line_end": null,
             "enter_insert": null,
+            "find_backward": null,
+            "find_forward": null,
             "insert_line_start": null,
+            "jump_bottom": null,
+            "jump_top": null,
             "move_down": null,
             "move_left": null,
             "move_line_end": null,
@@ -4588,11 +4714,14 @@
             "open_line_above": null,
             "open_line_below": null,
             "paste_after": null,
+            "repeat_last_change": null,
             "replace_char": null,
             "start_change_operator": null,
             "start_delete_operator": null,
             "start_yank_operator": null,
             "substitute_char": null,
+            "till_backward": null,
+            "till_forward": null,
             "yank_line": null
           }
         },
@@ -4606,10 +4735,16 @@
             "cancel": null,
             "delete_line": null,
             "motion_down": null,
+            "motion_find_backward": null,
+            "motion_find_forward": null,
+            "motion_jump_bottom": null,
+            "motion_jump_top": null,
             "motion_left": null,
             "motion_line_end": null,
             "motion_line_start": null,
             "motion_right": null,
+            "motion_till_backward": null,
+            "motion_till_forward": null,
             "motion_up": null,
             "motion_word_backward": null,
             "motion_word_end": null,
@@ -4892,6 +5027,22 @@
           ],
           "description": "Enter insert mode at cursor (`i`)."
         },
+        "find_backward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Find the previous character on the current line (`F`)."
+        },
+        "find_forward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Find the next character on the current line (`f`)."
+        },
         "insert_line_start": {
           "allOf": [
             {
@@ -4899,6 +5050,22 @@
             }
           ],
           "description": "Enter insert mode at first non-blank of line (`I`)."
+        },
+        "jump_bottom": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Jump to the last buffer line (`G`)."
+        },
+        "jump_top": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Begin a jump to the first buffer line (`gg`)."
         },
         "move_down": {
           "allOf": [
@@ -4996,6 +5163,14 @@
           ],
           "description": "Paste after cursor (`p`)."
         },
+        "repeat_last_change": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Repeat the last complete edit (`.`)."
+        },
         "replace_char": {
           "allOf": [
             {
@@ -5036,6 +5211,22 @@
           ],
           "description": "Delete character under cursor and enter insert mode (`s`)."
         },
+        "till_backward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Stop after the previous character on the current line (`T`)."
+        },
+        "till_forward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Stop before the next character on the current line (`t`)."
+        },
         "yank_line": {
           "allOf": [
             {
@@ -5075,6 +5266,38 @@
           ],
           "description": "Motion: down one line (`j`)."
         },
+        "motion_find_backward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Motion: find the previous character on the current line (`F`)."
+        },
+        "motion_find_forward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Motion: find the next character on the current line (`f`)."
+        },
+        "motion_jump_bottom": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Motion: jump to the last buffer line (`G`)."
+        },
+        "motion_jump_top": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Motion: begin a jump to the first buffer line (`gg`)."
+        },
         "motion_left": {
           "allOf": [
             {
@@ -5106,6 +5329,22 @@
             }
           ],
           "description": "Motion: right (`l`)."
+        },
+        "motion_till_backward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Motion: stop after the previous character on the current line (`T`)."
+        },
+        "motion_till_forward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Motion: stop before the next character on the current line (`t`)."
         },
         "motion_up": {
           "allOf": [
@@ -5574,6 +5813,9 @@
         "background_paginated_rollout_migration": {
           "type": "boolean"
         },
+        "bedrock_setup_wizard": {
+          "type": "boolean"
+        },
         "browser_use": {
           "type": "boolean"
         },
@@ -5601,6 +5843,9 @@
         "code_mode_only": {
           "type": "boolean"
         },
+        "code_mode_prewarm": {
+          "type": "boolean"
+        },
         "codex_git_commit": {
           "type": "boolean"
         },
@@ -5623,6 +5868,9 @@
           "type": "boolean"
         },
         "connectors": {
+          "type": "boolean"
+        },
+        "content_item_kinds": {
           "type": "boolean"
         },
         "current_time_reminder": {
@@ -5724,6 +5972,9 @@
         "in_app_dictation": {
           "type": "boolean"
         },
+        "in_app_local_automation": {
+          "type": "boolean"
+        },
         "in_app_updates": {
           "type": "boolean"
         },
@@ -5737,6 +5988,9 @@
           "type": "boolean"
         },
         "local_thread_store_compression": {
+          "type": "boolean"
+        },
+        "local_thread_store_shared_compression": {
           "type": "boolean"
         },
         "mcp_2026_07_28": {
@@ -5766,6 +6020,9 @@
         "non_prefixed_mcp_tool_names": {
           "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
         },
+        "omit_app_server_notification_media": {
+          "type": "boolean"
+        },
         "personality": {
           "type": "boolean"
         },
@@ -5776,6 +6033,9 @@
           "type": "boolean"
         },
         "plugins": {
+          "type": "boolean"
+        },
+        "powershell_shell_version": {
           "type": "boolean"
         },
         "prevent_idle_sleep": {
@@ -5862,6 +6122,12 @@
         "skill_search": {
           "type": "boolean"
         },
+        "skip_host_skill_discovery": {
+          "type": "boolean"
+        },
+        "sleep_tool": {
+          "$ref": "#/definitions/FeatureToml_for_SleepToolConfigToml"
+        },
         "sqlite": {
           "type": "boolean"
         },
@@ -5869,6 +6135,9 @@
           "type": "boolean"
         },
         "steer": {
+          "type": "boolean"
+        },
+        "step_model_switching": {
           "type": "boolean"
         },
         "telepathy": {
@@ -5896,6 +6165,9 @@
           "type": "boolean"
         },
         "tool_suggest": {
+          "type": "boolean"
+        },
+        "transcript_v2": {
           "type": "boolean"
         },
         "tui_app_server": {
@@ -5944,6 +6216,9 @@
           "type": "boolean"
         },
         "workspace_owner_usage_nudge": {
+          "type": "boolean"
+        },
+        "write_stdin_approval": {
           "type": "boolean"
         }
       },
@@ -6079,6 +6354,12 @@
       ],
       "default": null,
       "description": "Preferred backend for storing MCP OAuth credentials. keyring: Use an OS-specific keyring service. https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/oauth.rs#L2 file: Use a file in the Codex home directory. auto (default): Use the OS-specific keyring service if available, otherwise use a file."
+    },
+    "mcp_optional_startup_grace_ms": {
+      "description": "Milliseconds to wait for optional MCP servers while building the initial tool catalog.\n\nDefaults to 1000. Set to 0 to disable the shared grace and wait for each server's configured `startup_timeout_sec` instead.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
     },
     "mcp_servers": {
       "additionalProperties": {

@@ -1329,7 +1329,7 @@ impl MessageProcessor {
                 self.thread_processor.thread_loaded_list(params).await
             }
             ClientRequest::ThreadRead { params, .. } => {
-                self.thread_processor.thread_read(params).await
+                self.thread_processor.thread_read(&request_id, params).await
             }
             ClientRequest::ThreadTurnsList { params, .. } => {
                 self.thread_processor.thread_turns_list(params).await
@@ -1448,10 +1448,17 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::ThreadInjectItems { params, .. } => {
-                self.turn_processor.thread_inject_items(params).await
+                self.turn_processor
+                    .thread_inject_items(&request_id, params)
+                    .await
             }
             ClientRequest::TurnSteer { params, .. } => {
                 self.turn_processor.turn_steer(&request_id, params).await
+            }
+            ClientRequest::TurnSettingsUpdate { params, .. } => {
+                self.turn_processor
+                    .turn_settings_update(&request_id, params)
+                    .await
             }
             ClientRequest::TurnInterrupt { params, .. } => {
                 self.turn_processor
@@ -1482,6 +1489,9 @@ impl MessageProcessor {
                 self.turn_processor
                     .thread_realtime_stop(&request_id, params)
                     .await
+            }
+            ClientRequest::ThreadTimelineList { params, .. } => {
+                self.thread_processor.thread_timeline_list(params).await
             }
             ClientRequest::ThreadRealtimeListVoices { params: _, .. } => {
                 self.turn_processor.thread_realtime_list_voices().await

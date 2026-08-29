@@ -11,12 +11,15 @@ use codex_app_server_protocol::CurrentTimeReadParams;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadActiveFlag;
+use codex_app_server_protocol::ThreadSource;
+use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::ThreadUnsubscribeStatus;
 use codex_config::types::KeybindingSpec;
 use codex_config::types::KeybindingsSpec;
 use codex_config::types::TuiKeymap;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::SubAgentSource;
 
 static OVERVIEW_TIMESTAMP: std::sync::LazyLock<i64> =
@@ -65,6 +68,92 @@ fn overview_thread(
         name: Some(name.to_string()),
         turns: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn hidden_system_thread_does_not_refresh_shared_overview() {
+    let mut app = make_test_app().await;
+    let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+        .await
+        .expect("embedded app server");
+    let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+    app.chat_widget.show_bottom_pane_view(Box::new(view));
+
+    let request_id = uuid::Uuid::new_v4();
+    app.agents_overview.request_id = Some(request_id);
+
+    let parent_thread_id = ThreadId::new();
+    app.primary_thread_id = Some(parent_thread_id);
+    app.active_thread_id = Some(parent_thread_id);
+    app.ensure_thread_channel(parent_thread_id);
+    app.agents_overview
+        .dispatched_requests
+        .insert(parent_thread_id, Vec::new());
+
+    let hidden_thread_id = ThreadId::new();
+    let mut thread = overview_thread(
+        hidden_thread_id,
+        Some(parent_thread_id),
+        "Generate thread title",
+        ThreadStatus::Idle,
+    );
+    thread.ephemeral = true;
+    thread.thread_source = Some(ThreadSource::Feature("system".to_string()));
+
+    app.handle_app_server_event(
+        &app_server,
+        AppServerEvent::ServerNotification(Box::new(ServerNotification::ThreadStarted(
+            ThreadStartedNotification { thread },
+        ))),
+    )
+    .await;
+
+    assert_eq!(
+        (
+            app.agents_overview.request_id,
+            app.agents_overview.refresh_pending,
+        ),
+        (Some(request_id), false)
+    );
+    assert!(!app.thread_event_channels.contains_key(&hidden_thread_id));
+    assert!(
+        !app.agents_overview
+            .dispatched_requests
+            .contains_key(&hidden_thread_id)
+    );
+
+    let visible_thread_id = ThreadId::new();
+    let mut thread = overview_thread(
+        visible_thread_id,
+        Some(parent_thread_id),
+        "Persisted system thread",
+        ThreadStatus::Idle,
+    );
+    thread.thread_source = Some(ThreadSource::Feature("system".to_string()));
+
+    app.handle_app_server_event(
+        &app_server,
+        AppServerEvent::ServerNotification(Box::new(ServerNotification::ThreadStarted(
+            ThreadStartedNotification { thread },
+        ))),
+    )
+    .await;
+
+    assert_eq!(
+        (
+            app.agents_overview.request_id,
+            app.agents_overview.refresh_pending,
+        ),
+        (Some(request_id), true)
+    );
+    assert!(app.thread_event_channels.contains_key(&visible_thread_id));
+    assert!(
+        app.agents_overview
+            .dispatched_requests
+            .contains_key(&visible_thread_id)
+    );
+
+    app_server.shutdown().await.expect("shutdown app server");
 }
 
 #[tokio::test]
@@ -420,6 +509,79 @@ async fn root_switch_preserves_idle_root_with_running_subagent() -> Result<()> {
         })
         .await?;
     assert_eq!(response.status, ThreadUnsubscribeStatus::Unsubscribed);
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restored_server_permission_profile_survives_cd_without_turn_override() -> Result<()> {
+    let mut app = make_test_app().await;
+    let destination = app.config.codex_home.join("destination");
+    std::fs::create_dir(&destination)?;
+    crate::legacy_core::config::set_project_trust_level(
+        app.config.codex_home.as_path(),
+        &destination,
+        codex_protocol::config_types::TrustLevel::Trusted,
+    )
+    .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let previous = app_server.start_thread(&app.config).await?;
+    app.enqueue_primary_thread_session(previous.session, previous.turns)
+        .await?;
+    let target = app_server.start_thread(&app.config).await?;
+    let target_thread_id = target.session.thread_id;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    app.select_agents_overview_thread(&mut tui, &mut app_server, target_thread_id)
+        .await?;
+    app.config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())?;
+    app.chat_widget.set_permission_profile_with_active_profile(
+        PermissionProfile::read_only(),
+        /*active_permission_profile*/ None,
+    )?;
+    app.runtime_permission_profile_override = Some(
+        RuntimePermissionProfileOverride::from_restored_config(app.chat_widget.config_ref()),
+    );
+
+    assert_eq!(
+        app.chat_widget
+            .config_ref()
+            .permissions
+            .effective_permission_profile(),
+        PermissionProfile::read_only()
+    );
+    assert_eq!(
+        app.runtime_permission_profile_override
+            .as_ref()
+            .map(|profile| profile.turn_override),
+        Some(RuntimePermissionProfileTurnOverride::Preserve)
+    );
+    assert_eq!(
+        App::turn_permissions_override_from_config(
+            app.chat_widget.config_ref(),
+            /*active_permission_profile*/ None,
+            app.runtime_permission_profile_override
+                .as_ref()
+                .and_then(RuntimePermissionProfileOverride::turn_permission_profile),
+        ),
+        TurnPermissionsOverride::Preserve
+    );
+
+    app.change_working_directory(&mut tui, &mut app_server, destination.clone())
+        .await;
+
+    assert_eq!(app.chat_widget.config_ref().cwd, destination);
+    assert_eq!(
+        app.chat_widget
+            .config_ref()
+            .permissions
+            .effective_permission_profile(),
+        PermissionProfile::read_only()
+    );
+
     app_server.shutdown().await?;
     Ok(())
 }

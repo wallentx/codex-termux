@@ -280,7 +280,9 @@ async fn assert_user_turn_local_image_resizes_to(
     )
     .await;
 
-    let body = mock.single_request().body_json();
+    let request = mock.single_request();
+    assert!(request.has_content_kinds(&["user.text", "user.image", "user.text"]));
+    let body = request.body_json();
     let input = body
         .get("input")
         .and_then(Value::as_array)
@@ -303,6 +305,7 @@ async fn assert_user_turn_local_image_resizes_to(
             assert_eq!(resize_notice_indices, Vec::<usize>::new());
         }
         ResizeNoticeExpectation::Enabled => {
+            assert!(request.has_content_kinds(&["images.resize_notice"]));
             assert_eq!(resize_notice_indices, vec![image_message_index + 1]);
             assert_developer_text_message(
                 &input[image_message_index + 1],
@@ -1626,6 +1629,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),

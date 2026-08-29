@@ -5,8 +5,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
+use codex_config::LoaderOverrides;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
+use codex_core::config::set_project_trust_level;
 use codex_core_plugins::store::PluginStore;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -20,6 +23,7 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::TrustLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -685,11 +689,13 @@ async fn legacy_plugin_skill_prompt_remains_complete() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() -> Result<()> {
+async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths_and_codex_env_overlay()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let search_call_id = "search-agent-echo";
     let tool_call_id = "call-agent-echo";
+    let overlay_call_id = "call-agent-overlay-env";
     let mock = mount_sse_sequence(
         &server,
         vec![
@@ -710,8 +716,18 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
             ]),
             sse(vec![
                 ev_response_created("resp-3"),
-                ev_assistant_message("msg-1", "done"),
+                ev_function_call_with_namespace(
+                    overlay_call_id,
+                    "mcp__agent",
+                    "echo",
+                    r#"{"message":"ping","env_var":"INSTA_WORKSPACE_ROOT"}"#,
+                ),
                 ev_completed("resp-3"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-4"),
             ]),
         ],
     )
@@ -744,6 +760,11 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
         plugin_root.join("mcp.json"),
         serde_json::to_vec_pretty(&mcp_config)?,
     )?;
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"acme.tools","mcpServers":{"agent":{"command":"ignored","env_vars":["INSTA_WORKSPACE_ROOT"]}}}"#,
+    )?;
     let mut builder = test_codex().with_home(Arc::clone(&codex_home));
     let test_codex = builder.build_with_remote_and_local_env(&server).await?;
     wait_for_mcp_server(&test_codex.codex, "agent").await?;
@@ -770,6 +791,10 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
         matches!(event, EventMsg::McpToolCallEnd(_))
     })
     .await;
+    let overlay_end = wait_for_event(&test_codex.codex, |event| {
+        matches!(event, EventMsg::McpToolCallEnd(_))
+    })
+    .await;
     wait_for_event(&test_codex.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
@@ -787,10 +812,30 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
             .and_then(serde_json::Value::as_str),
         Some(expected_env.as_str())
     );
+    let EventMsg::McpToolCallEnd(overlay_end) = overlay_end else {
+        unreachable!("wait_for_event matched an MCP tool end")
+    };
+    let overlay_result = overlay_end
+        .result
+        .as_ref()
+        .expect("Agent Plugin overlay MCP tool result");
+    assert_eq!(
+        overlay_result
+            .structured_content
+            .as_ref()
+            .and_then(|content| content.get("env"))
+            .and_then(serde_json::Value::as_str),
+        Some(std::env::var("INSTA_WORKSPACE_ROOT")?.as_str())
+    );
     let requests = mock.requests();
     let search_output = requests[1].tool_search_output(search_call_id);
     assert!(namespace_child_tool(&search_output, "mcp__agent", "echo").is_some());
     assert!(requests[2].function_call_output(tool_call_id).is_object());
+    assert!(
+        requests[3]
+            .function_call_output(overlay_call_id)
+            .is_object()
+    );
     Ok(())
 }
 
@@ -1200,6 +1245,121 @@ async fn explicit_plugin_mentions_keep_non_conflicting_mcp_for_chatgpt_auth() ->
     let echo_tool = echo_tool.expect("plugin MCP tool should remain searchable");
     assert_plugin_provenance(&echo_tool);
 
+    Ok(())
+}
+
+#[test_case(TrustLevel::Trusted, true, true, false, &[]; "trusted project disables the plugin")]
+#[test_case(TrustLevel::Untrusted, true, true, false, &["echo_tool"]; "untrusted project cannot disable the plugin")]
+#[test_case(TrustLevel::Trusted, false, true, true, &["echo"]; "trusted project enables system-disabled server and overrides user tool policy")]
+#[test_case(TrustLevel::Untrusted, false, true, true, &[]; "untrusted project cannot enable system-disabled server")]
+#[test_case(TrustLevel::Trusted, true, false, true, &[]; "trusted project disables system-enabled server")]
+#[test_case(TrustLevel::Untrusted, true, false, true, &["echo_tool"]; "untrusted project preserves system startup and user tool policy")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_marketplace_plugin_honors_layered_activation_and_mcp_policy(
+    trust_level: TrustLevel,
+    system_enabled: bool,
+    project_enabled: bool,
+    plugin_enabled: bool,
+    expected_tools: &[&str],
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let mock = mount_plugin_tool_search_turn(&server).await;
+    let codex_home = Arc::new(TempDir::new()?);
+    let project = TempDir::new()?;
+    write_plugin_mcp_plugin(codex_home.as_ref(), &stdio_server_bin()?);
+    let user_config_path = codex_home.path().join("config.toml");
+    let user_config = std::fs::read_to_string(&user_config_path)?;
+    std::fs::write(
+        &user_config_path,
+        format!(
+            "{user_config}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\ndisabled_tools = [\"echo\"]\n"
+        ),
+    )?;
+    let system_config_path = codex_home.path().join("system.toml");
+    let marketplace = TempDir::new()?;
+    std::fs::create_dir_all(marketplace.path().join(".agents/plugins"))?;
+    std::fs::write(
+        marketplace.path().join(".agents/plugins/marketplace.json"),
+        r#"{"name":"test","plugins":[{"name":"sample","source":{"source":"local","path":"./sample"}}]}"#,
+    )?;
+    let marketplace_source = toml::Value::String(marketplace.path().to_string_lossy().into_owned());
+    std::fs::write(
+        &system_config_path,
+        format!(
+            "[marketplaces.test]\nsource_type = \"local\"\nsource = {marketplace_source}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\nenabled = {system_enabled}\nenabled_tools = [\"echo\", \"echo-tool\"]\n"
+        ),
+    )?;
+    // The cached plugin may activate only through this system-defined marketplace.
+    // Without the definition, source restrictions exclude it from the real turn.
+    let requirements_path = codex_home.path().join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        format!(
+            "[marketplaces]\nrestrict_to_allowed_sources = true\n[marketplaces.allowed_sources.test]\nsource = \"local\"\npath = {marketplace_source}\n"
+        ),
+    )?;
+    std::fs::create_dir_all(project.path().join(".git"))?;
+    std::fs::create_dir_all(project.path().join(".codex"))?;
+    std::fs::write(
+        project.path().join(".codex/config.toml"),
+        format!(
+            "[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\"]\nenabled = {plugin_enabled}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\nenabled = {project_enabled}\ndisabled_tools = [\"echo-tool\"]\n"
+        ),
+    )?;
+    set_project_trust_level(codex_home.path(), project.path(), trust_level)?;
+    // Exercise the real layer loader and trust checks while keeping the test harness's
+    // mock model provider and automatically selected executor environment.
+    let layered_config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(project.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides {
+            system_config_path: Some(system_config_path),
+            system_requirements_path: Some(requirements_path),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await?;
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_config(move |config| config.config_layer_stack = layered_config.config_layer_stack);
+    let test = builder.build_with_remote_and_local_env(&server).await?;
+    let startup = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::McpStartupComplete(summary) => Some(summary.clone()),
+        _ => None,
+    })
+    .await;
+    let expected_ready = if expected_tools.is_empty() {
+        vec![]
+    } else {
+        vec!["sample"]
+    };
+    assert_eq!(
+        serde_json::to_value(startup)?,
+        serde_json::json!({"ready": expected_ready, "failed": [], "cancelled": []}),
+    );
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Mention {
+            name: "sample".into(),
+            path: format!("plugin://{SAMPLE_PLUGIN_CONFIG_NAME}"),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let requests = mock.requests();
+    let output = requests[1].tool_search_output(PLUGIN_MCP_SEARCH_CALL_ID);
+    let mut visible_tools = output["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|namespace| namespace["name"] == SAMPLE_PLUGIN_MCP_NAMESPACE)
+        .flat_map(|namespace| namespace["tools"].as_array().into_iter().flatten())
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect::<Vec<_>>();
+    visible_tools.sort_unstable();
+    assert_eq!(visible_tools, expected_tools);
     Ok(())
 }
 

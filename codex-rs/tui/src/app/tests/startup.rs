@@ -6,6 +6,7 @@ use crate::tui::FrameRequester;
 use app_test_support::create_fake_parented_rollout_with_source;
 use codex_app_server_protocol::ToolRequestUserInputOption;
 use codex_app_server_protocol::ToolRequestUserInputQuestion;
+use codex_utils_approval_presets::builtin_approval_presets;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -28,6 +29,105 @@ fn startup_bottom_pane() -> (BottomPane, UnboundedReceiver<AppEvent>) {
         }),
         app_event_rx,
     )
+}
+
+#[tokio::test]
+async fn terminal_color_probe_waits_for_startup_sandbox_choice() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.startup_protected_input_boundary = true;
+    while app_event_rx.try_recv().is_ok() {}
+
+    assert!(app.ready_for_terminal_color_probe(/*has_pending_app_events*/ false));
+    assert!(!app.ready_for_terminal_color_probe(/*has_pending_app_events*/ true));
+
+    let preset = builtin_approval_presets()
+        .into_iter()
+        .find(|preset| preset.id == "auto")
+        .expect("auto preset");
+    app.chat_widget
+        .open_windows_sandbox_enable_prompt(preset, /*profile_selection*/ None);
+
+    assert!(!app.ready_for_terminal_color_probe(/*has_pending_app_events*/ false));
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert!(!app.ready_for_terminal_color_probe(/*has_pending_app_events*/ false));
+    assert!(app_event_rx.try_recv().is_err());
+
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        app_event_rx.try_recv(),
+        Ok(AppEvent::BeginWindowsSandboxLegacySetup { .. })
+    ));
+    assert!(app.ready_for_terminal_color_probe(/*has_pending_app_events*/ false));
+}
+
+#[tokio::test]
+async fn terminal_color_probe_waits_for_delayed_world_writable_scan_failure() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.startup_protected_input_boundary = true;
+    app.windows_sandbox.startup_world_writable_scan_pending = true;
+    while app_event_rx.try_recv().is_ok() {}
+
+    assert!(!app.ready_for_terminal_color_probe(/*has_pending_app_events*/ false));
+
+    app.app_event_tx
+        .send(AppEvent::OpenWorldWritableWarningConfirmation {
+            preset: None,
+            profile_selection: None,
+            sample_paths: Vec::new(),
+            extra_count: 0,
+            failed_scan: true,
+        });
+    app.app_event_tx
+        .send(AppEvent::StartupWorldWritableScanCompleted);
+    assert!(!app.ready_for_terminal_color_probe(/*has_pending_app_events*/ true));
+
+    let warning = app_event_rx
+        .try_recv()
+        .expect("the delayed scan should queue its warning before completion");
+    let AppEvent::OpenWorldWritableWarningConfirmation {
+        preset,
+        profile_selection,
+        sample_paths,
+        extra_count,
+        failed_scan,
+    } = warning
+    else {
+        panic!("the delayed scan should open a protected warning before completion");
+    };
+    app.chat_widget.open_world_writable_warning_confirmation(
+        preset,
+        profile_selection,
+        sample_paths,
+        extra_count,
+        failed_scan,
+    );
+    assert!(matches!(
+        app_event_rx.try_recv(),
+        Ok(AppEvent::StartupWorldWritableScanCompleted)
+    ));
+    app.windows_sandbox.startup_world_writable_scan_pending = false;
+
+    assert!(!app.windows_sandbox.startup_world_writable_scan_pending);
+    assert!(!app.ready_for_terminal_color_probe(/*has_pending_app_events*/ false));
+    for character in "20;rgb:2222/ffff/ffff".chars() {
+        app.chat_widget
+            .handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        assert!(app_event_rx.try_recv().is_err());
+    }
+
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        app_event_rx.try_recv(),
+        Ok(AppEvent::UpdateWorldWritableWarningAcknowledged(true))
+    ));
+    assert!(matches!(
+        app_event_rx.try_recv(),
+        Ok(AppEvent::PersistWorldWritableWarningAcknowledged)
+    ));
+    assert!(app.ready_for_terminal_color_probe(/*has_pending_app_events*/ false));
 }
 
 #[test]
@@ -696,6 +796,7 @@ async fn fresh_startup_thread_drains_buffered_approval_before_draft_handoff() ->
                 session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
                 turns: Vec::new(),
                 blocks_direct_input: false,
+                task_tools_available: false,
             }),
         },
     ))
@@ -910,6 +1011,7 @@ async fn startup_thread_started_submits_queued_startup_input() {
             session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
             turns: Vec::new(),
             blocks_direct_input: false,
+            task_tools_available: false,
         }),
     )
     .await
@@ -947,6 +1049,7 @@ async fn startup_thread_started_discards_another_threads_buffered_events() {
     let request = ServerRequest::CommandExecutionRequestApproval {
         request_id: AppServerRequestId::Integer(1),
         params: CommandExecutionRequestApprovalParams {
+            kind: Default::default(),
             thread_id: other_thread_id.to_string(),
             turn_id: "turn-1".to_string(),
             item_id: "item-1".to_string(),
@@ -998,6 +1101,7 @@ async fn startup_thread_started_discards_another_threads_buffered_events() {
             session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
             turns: Vec::new(),
             blocks_direct_input: false,
+            task_tools_available: false,
         }),
     )
     .await
@@ -1046,6 +1150,7 @@ async fn startup_thread_started_does_not_replay_resolved_approval() -> Result<()
             session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
             turns: Vec::new(),
             blocks_direct_input: false,
+            task_tools_available: false,
         }),
     )
     .await?;
@@ -1177,6 +1282,7 @@ fn stale_startup_thread_started_removes_local_routing_state() -> Result<()> {
                     session: test_thread_session(stale_thread_id, test_path_buf("/tmp/project")),
                     turns: Vec::new(),
                     blocks_direct_input: false,
+                    task_tools_available: false,
                 }),
             )
             .await?;
