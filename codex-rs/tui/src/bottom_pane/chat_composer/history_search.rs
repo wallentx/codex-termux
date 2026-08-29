@@ -419,24 +419,21 @@ impl ChatComposer {
 
         let mut ranges = Vec::new();
         let mut search_from = 0;
+        // Use two-pointer method to find matches in linear time.
+        let mut start_span = 0;
+        let mut end_span = 0;
         while search_from <= folded.len()
             && let Some(relative_start) = folded[search_from..].find(&query_lower)
         {
             let folded_start = search_from + relative_start;
             let folded_end = folded_start + query_lower.len();
-            if let Some((_, first_original)) = folded_spans.iter().find(|(folded_range, _)| {
-                folded_range.end > folded_start && folded_range.start < folded_end
-            }) {
-                let original_end = folded_spans
-                    .iter()
-                    .rev()
-                    .find(|(folded_range, _)| {
-                        folded_range.end > folded_start && folded_range.start < folded_end
-                    })
-                    .map(|(_, original_range)| original_range.end)
-                    .unwrap_or(first_original.end);
-                ranges.push(first_original.start..original_end);
+            while folded_spans[start_span].0.end <= folded_start {
+                start_span += 1;
             }
+            while folded_spans[end_span].0.end < folded_end {
+                end_span += 1;
+            }
+            ranges.push(folded_spans[start_span].1.start..folded_spans[end_span].1.end);
             search_from = folded_end;
         }
         ranges
@@ -567,6 +564,25 @@ mod tests {
             vec![1..3, 4..5]
         );
         assert!(ChatComposer::case_insensitive_match_ranges("git", "").is_empty());
+    }
+
+    #[test]
+    fn history_search_match_ranges_preserve_unicode_boundaries() {
+        for (text, query, expected) in [
+            ("İİ", "i", vec![0..2, 2..4]),
+            ("İİ", "\u{307}", vec![0..2, 2..4]),
+            ("İİİ", "\u{307}i", vec![0..4, 2..6]),
+            ("éÉ é", "É", vec![0..2, 2..4, 5..7]),
+            ("aaaaa", "aa", vec![0..2, 2..4]),
+            ("", "x", vec![]),
+            ("abc", "z", vec![]),
+        ] {
+            assert_eq!(
+                ChatComposer::case_insensitive_match_ranges(text, query),
+                expected,
+                "text: {text:?}, query: {query:?}"
+            );
+        }
     }
 
     #[test]

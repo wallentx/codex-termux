@@ -2,8 +2,10 @@ use std::io::Cursor;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_utils_image::data_url_from_bytes;
 use image::DynamicImage;
 use image::GenericImageView;
@@ -50,6 +52,16 @@ fn preparation_preserves_small_image_bytes_and_replaces_remote_urls() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }];
+    items.push(ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: "https://example.com/developer-image.png".to_string(),
+            detail: Some(ImageDetail::High),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
 
     prepare_response_items(
         &mut items,
@@ -69,6 +81,25 @@ fn preparation_preserves_small_image_bytes_and_replaces_remote_urls() {
     };
     assert_eq!(decoded_image(image_url).0, original_bytes);
     assert_eq!(text, REMOTE_IMAGE_URL_PLACEHOLDER);
+    assert_eq!(
+        &items[1],
+        &ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: REMOTE_IMAGE_URL_PLACEHOLDER.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![ContentItemKind(
+                        "images.preparation_error".to_string()
+                    )]),
+                    ..Default::default()
+                }
+            ),
+        }
+    );
 }
 
 #[test]
@@ -197,7 +228,16 @@ fn resize_notices_preserve_original_image_positions_and_skip_failed_images() {
                 },
             ],
             phase: None,
-            internal_chat_message_metadata_passthrough: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![
+                        ContentItemKind("user.image".to_string()),
+                        ContentItemKind("user.image".to_string()),
+                        ContentItemKind("user.image".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            ),
         },
         ResponseItem::FunctionCallOutput {
             id: None,
@@ -229,9 +269,25 @@ fn resize_notices_preserve_original_image_positions_and_skip_failed_images() {
         "</image_resize_notice>"
     );
 
-    let ResponseItem::Message { content, .. } = &items[0] else {
+    let ResponseItem::Message {
+        content,
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &items[0]
+    else {
         panic!("expected message");
     };
+    assert_eq!(
+        internal_chat_message_metadata_passthrough,
+        &Some(InternalChatMessageMetadataPassthrough {
+            content_item_kinds: Some(vec![
+                ContentItemKind("user.image".to_string()),
+                ContentItemKind("images.preparation_error".to_string()),
+                ContentItemKind("user.image".to_string()),
+            ]),
+            ..Default::default()
+        }),
+    );
     let [
         ContentItem::InputImage {
             image_url: small_message_image_url,
@@ -267,7 +323,14 @@ fn resize_notices_preserve_original_image_positions_and_skip_failed_images() {
                 text: expected_user_notice.to_string(),
             }],
             phase: None,
-            internal_chat_message_metadata_passthrough: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![ContentItemKind(
+                        "images.resize_notice".to_string()
+                    )]),
+                    ..Default::default()
+                },
+            ),
         }
     );
 
@@ -305,7 +368,14 @@ fn resize_notices_preserve_original_image_positions_and_skip_failed_images() {
                 .to_string(),
             }],
             phase: None,
-            internal_chat_message_metadata_passthrough: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![ContentItemKind(
+                        "images.resize_notice".to_string()
+                    )]),
+                    ..Default::default()
+                },
+            ),
         }
     );
 }

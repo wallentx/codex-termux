@@ -189,9 +189,13 @@ pub(crate) fn apply_network_proxy_feature_config(
         mitm: None,
     }
     .apply_to_network_proxy_config(config);
+    if let Some(credential_broker) = feature_config.credential_broker {
+        config.set_credential_broker_enabled(credential_broker);
+    }
 }
 
-pub(crate) fn resolve_permission_profile(
+/// Resolves a named permission profile and its inherited configuration.
+pub fn resolve_permission_profile(
     permissions: &PermissionsToml,
     profile_name: &str,
 ) -> io::Result<PermissionProfileToml> {
@@ -344,7 +348,8 @@ pub(crate) fn network_proxy_config_for_profile_selection(
     ))
 }
 
-pub(crate) fn compile_permission_profile(
+/// Compiles a named permission profile into filesystem and network policies.
+pub fn compile_permission_profile(
     permissions: &PermissionsToml,
     profile_name: &str,
     startup_warnings: &mut Vec<String>,

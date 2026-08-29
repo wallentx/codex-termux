@@ -1916,6 +1916,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-agent-roles"
+version = "0.0.0"
+dependencies = [
+ "codex-config",
+ "codex-file-system",
+ "codex-utils-absolute-path",
+ "codex-utils-path-uri",
+ "serde",
+ "toml 0.9.11+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "codex-analytics"
 version = "0.0.0"
 dependencies = [
@@ -2269,6 +2282,7 @@ dependencies = [
  "codex-utils-home-dir",
  "codex-windows-sandbox",
  "dotenvy",
+ "pathdiff",
  "pretty_assertions",
  "tempfile",
  "tokio",
@@ -2560,8 +2574,8 @@ dependencies = [
  "codex-code-mode-protocol",
  "codex-http-client",
  "codex-install-context",
+ "codex-otel",
  "codex-protocol",
- "codex-websocket-client",
  "futures",
  "http-body-util",
  "pretty_assertions",
@@ -2569,7 +2583,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde_json",
  "tokio",
- "tokio-tungstenite",
  "tokio-util",
  "tonic",
  "tower",
@@ -2587,6 +2600,7 @@ dependencies = [
  "codex-code-mode",
  "codex-code-mode-protocol",
  "codex-code-mode-runtime",
+ "codex-otel",
  "codex-protocol",
  "codex-utils-cargo-bin",
  "futures",
@@ -2596,7 +2610,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
- "tokio-tungstenite",
  "tokio-util",
  "tonic",
  "tracing",
@@ -2749,6 +2762,7 @@ dependencies = [
  "chrono",
  "clap",
  "codex-agent-graph-store",
+ "codex-agent-roles",
  "codex-analytics",
  "codex-api",
  "codex-app-server-protocol",
@@ -3080,8 +3094,15 @@ dependencies = [
 name = "codex-exec-server-test-support"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "codex-exec-server",
  "codex-http-client",
+ "futures",
+ "prost",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "wiremock",
 ]
 
 [[package]]
@@ -3305,6 +3326,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-guardian-context"
+version = "0.0.0"
+dependencies = [
+ "codex-protocol",
+ "pretty_assertions",
+ "serde_json",
+]
+
+[[package]]
 name = "codex-guardian-v2"
 version = "0.0.0"
 dependencies = [
@@ -3313,18 +3343,23 @@ dependencies = [
  "codex-core",
  "codex-extension-api",
  "codex-features",
+ "codex-history",
  "codex-http-client",
  "codex-login",
  "codex-model-provider",
  "codex-model-provider-info",
+ "codex-models-manager",
+ "codex-network-proxy",
  "codex-protocol",
  "core_test_support",
+ "dirs",
  "http 1.4.0",
  "pretty_assertions",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3354,6 +3389,7 @@ dependencies = [
  "codex-protocol",
  "codex-tools",
  "codex-utils-output-truncation",
+ "core_test_support",
  "http 1.4.0",
  "pretty_assertions",
  "serde_json",
@@ -3495,11 +3531,13 @@ dependencies = [
  "landlock",
  "libc",
  "pretty_assertions",
+ "rustix 1.1.4",
  "seccompiler",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "test-case",
  "tokio",
  "url",
 ]
@@ -3567,6 +3605,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "assert_matches",
  "async-channel",
  "codex-api",
  "codex-async-utils",
@@ -3951,6 +3990,7 @@ dependencies = [
  "codex-utils-redacted-string",
  "codex-utils-string",
  "encoding_rs",
+ "gix-url",
  "globset",
  "http 1.4.0",
  "icu_decimal",
@@ -4224,6 +4264,7 @@ dependencies = [
 name = "codex-skills-extension"
 version = "0.0.0"
 dependencies = [
+ "assert_matches",
  "codex-analytics",
  "codex-config",
  "codex-exec-server",
@@ -4382,6 +4423,7 @@ dependencies = [
  "app_test_support",
  "arboard",
  "assert_matches",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -4834,6 +4876,20 @@ dependencies = [
  "tokio",
  "url",
  "wiremock",
+]
+
+[[package]]
+name = "codex-worktree"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-git-utils",
+ "codex-protocol",
+ "dunce",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

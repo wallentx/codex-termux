@@ -9,6 +9,8 @@ use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactOutcome;
 use crate::events::compact::PreCompactRequest;
 use crate::events::compact::StatelessHookOutcome;
+use crate::events::interrupt::InterruptOutcome;
+use crate::events::interrupt::InterruptRequest;
 use crate::events::permission_request::PermissionRequestOutcome;
 use crate::events::permission_request::PermissionRequestRequest;
 use crate::events::post_tool_use::PostToolUseOutcome;
@@ -39,6 +41,7 @@ use codex_protocol::protocol::HookTrustStatus;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -169,6 +172,7 @@ impl ConfiguredHandler {
             codex_protocol::protocol::HookEventName::SubagentStart => "subagent-start",
             codex_protocol::protocol::HookEventName::SubagentStop => "subagent-stop",
             codex_protocol::protocol::HookEventName::Stop => "stop",
+            codex_protocol::protocol::HookEventName::Interrupt => "interrupt",
         }
     }
 
@@ -262,62 +266,73 @@ impl ClaudeHooksEngine {
             )
         });
 
-        // FIXME: Remove this restriction once executor hooks support multiple environments.
-        if executor_hooks.len() > 1 {
-            tracing::warn!(
-                executor_hook_count = executor_hooks.len(),
-                "multiple executor hooks found; only executing the first"
-            );
-        }
-        let Some(source) = executor_hooks.into_iter().next() else {
+        // All events share the first environment, even if it has no handler for an event.
+        let Some(selected_environment_id) = executor_hooks
+            .first()
+            .map(|source| source.environment_id.clone())
+        else {
             return;
         };
-        let Some(handler) = source
-            .hooks
-            .stop
-            .into_iter()
-            .flat_map(|group| group.hooks)
-            .next()
-        else {
-            unreachable!("allowlisted executor hook source must contain a Stop handler");
-        };
-        let HookHandlerConfig::McpTool {
-            server,
-            tool,
-            input,
-            timeout_sec,
-            status_message,
-        } = handler
-        else {
-            unreachable!("allowlisted executor Stop handler must be an MCP tool");
-        };
-
-        let display_order = self
-            .handlers
+        let environment_count = executor_hooks
             .iter()
-            .map(|handler| handler.display_order)
-            .max()
-            .map_or(0, |display_order| display_order.saturating_add(1));
-        self.handlers.push(ConfiguredHandler {
-            event_name: HookEventName::Stop,
-            matcher: None,
-            timeout_sec: timeout_sec.unwrap_or(5).max(1),
-            status_message,
-            additional_context_limit: Default::default(),
-            source_path: HandlerSourcePath::ExecutorScoped {
-                plugin_id: source.plugin_id,
-                environment_id: source.environment_id,
-                manifest_path: source.manifest_path,
-                source_relative_path: source.source_relative_path,
-            },
-            source: HookSource::Plugin,
-            display_order,
-            kind: ConfiguredHandlerKind::McpTool {
-                server,
-                tool,
-                input,
-            },
-        });
+            .map(|source| &source.environment_id)
+            .collect::<HashSet<_>>()
+            .len();
+        // FIXME: Remove this restriction once executor hooks support multiple environments.
+        if environment_count > 1 {
+            tracing::warn!(
+                executor_environment_count = environment_count,
+                selected_environment_id = %selected_environment_id,
+                "multiple executor environments found; only executing hooks in the first"
+            );
+        }
+        for source in executor_hooks {
+            if source.environment_id != selected_environment_id {
+                continue;
+            }
+            for (event_name, groups) in source.hooks.into_matcher_groups() {
+                let Some(handler) = groups.into_iter().flat_map(|group| group.hooks).next() else {
+                    continue;
+                };
+                let HookHandlerConfig::McpTool {
+                    server,
+                    tool,
+                    input,
+                    timeout_sec,
+                    status_message,
+                } = handler
+                else {
+                    unreachable!("allowlisted executor handler must be an MCP tool");
+                };
+
+                let display_order = self
+                    .handlers
+                    .iter()
+                    .map(|handler| handler.display_order)
+                    .max()
+                    .map_or(0, |display_order| display_order.saturating_add(1));
+                self.handlers.push(ConfiguredHandler {
+                    event_name,
+                    matcher: None,
+                    timeout_sec: timeout_sec.unwrap_or(5).max(1),
+                    status_message,
+                    additional_context_limit: Default::default(),
+                    source_path: HandlerSourcePath::ExecutorScoped {
+                        plugin_id: source.plugin_id.clone(),
+                        environment_id: source.environment_id.clone(),
+                        manifest_path: source.manifest_path.clone(),
+                        source_relative_path: source.source_relative_path.clone(),
+                    },
+                    source: HookSource::Plugin,
+                    display_order,
+                    kind: ConfiguredHandlerKind::McpTool {
+                        server,
+                        tool,
+                        input,
+                    },
+                });
+            }
+        }
     }
 
     pub(crate) fn required_load_errors(&self) -> &[String] {
@@ -451,6 +466,14 @@ impl ClaudeHooksEngine {
             .maybe_spill_prompt_fragments(outcome.continuation_fragments)
             .await;
         outcome
+    }
+
+    pub(crate) fn preview_interrupt(&self) -> Vec<HookRunSummary> {
+        crate::events::interrupt::preview(&self.handlers)
+    }
+
+    pub(crate) async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {
+        crate::events::interrupt::run(self, request).await
     }
 }
 

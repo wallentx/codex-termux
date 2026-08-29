@@ -30,6 +30,8 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::util::error_or_panic;
 use codex_analytics::ControlToolCallStatus;
 use codex_extension_api::ToolCallOutcome;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::parse_command::ParsedCommand;
@@ -191,14 +193,22 @@ pub(crate) struct AnyToolResult {
 }
 
 impl AnyToolResult {
-    pub(crate) fn into_response(self) -> ResponseInputItem {
+    pub(crate) fn into_response(self) -> ResponseItemEnvelope {
         let Self {
             call_id,
             payload,
             result,
             ..
         } = self;
-        result.to_response_item(&call_id, &payload)
+        ResponseItemEnvelope {
+            item: result.to_response_item(&call_id, &payload).into(),
+            metadata: result
+                .fallback_token_limit_override()
+                .map(|limit| CodexHarnessMetadata {
+                    fallback_token_limit_override: Some(limit),
+                    ..Default::default()
+                }),
+        }
     }
 
     pub(crate) fn code_mode_result(self) -> serde_json::Value {
@@ -221,6 +231,10 @@ impl ToolOutput for PostToolUseFeedbackOutput {
 
     fn success_for_logging(&self) -> bool {
         self.original.success_for_logging()
+    }
+
+    fn fallback_token_limit_override(&self) -> Option<usize> {
+        self.original.fallback_token_limit_override()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -485,6 +499,8 @@ impl ToolRegistry {
         let call_id_owned = invocation.call_id.clone();
         let otel = invocation.turn.session_telemetry.clone();
         let permission_profile = invocation.turn.permission_profile();
+        // TODO(anp): Reconcile these tags with TurnEnvironment::sandbox_context
+        // instead of reporting the thread-wide backend for environment-scoped tools.
         let base_tool_result_tags = [
             (
                 "sandbox",
@@ -617,7 +633,9 @@ impl ToolRegistry {
             }
         }
 
-        notify_tool_start(&invocation).await;
+        if tool.mcp_server_name().is_none() {
+            notify_tool_start(&invocation, /*mcp_tool*/ None).await;
+        }
         let mut control_tool_analytics = tool
             .is_builtin_control_tool()
             .then(|| ControlToolCallGuard::new(&invocation));

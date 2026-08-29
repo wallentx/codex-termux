@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use codex_config::HookEventsToml;
+use codex_config::MatcherGroup;
 use codex_exec_server::CapabilityRootDiscovery;
 use codex_exec_server::CapabilityTextFile;
 use codex_exec_server::DiscoveredPluginFiles;
@@ -105,24 +107,20 @@ fn expected_source(index: usize) -> ExecutorPluginHookSource {
 
 #[test]
 fn discovers_allowlisted_executor_plugin_hook_sources() {
-    let mut manifest = cleanup_hook_manifest();
-    manifest["hooks"]["hooks"]["Stop"][0]["hooks"]
-        .as_array_mut()
-        .expect("stop hooks")
-        .push(json!({
-            "type": "command",
-            "command": "echo ignored"
-        }));
-    manifest["hooks"]["hooks"]["UserPromptSubmit"] = json!([{
-        "hooks": [{
-            "type": "mcp_tool",
-            "server": "other",
-            "tool": "ignored"
-        }]
-    }]);
-    let second_hook_file = cleanup_hook_manifest()["hooks"].clone();
-    let first_hook_file = manifest["hooks"].take();
-    manifest["hooks"] = json!([first_hook_file, second_hook_file]);
+    let cleanup_hooks = cleanup_hook_manifest()["hooks"]["hooks"]["Stop"].clone();
+    let manifest = json!({
+        "name": "computer-use",
+        "hooks": [
+            { "hooks": { "Stop": cleanup_hooks } },
+            { "hooks": { "Interrupt": cleanup_hooks } },
+            { "hooks": {
+                "Stop": cleanup_hooks,
+                "Interrupt": cleanup_hooks,
+                "UserPromptSubmit": cleanup_hooks
+            } },
+            { "hooks": { "UserPromptSubmit": cleanup_hooks } }
+        ]
+    });
     let snapshot = snapshot_for_manifest(
         "computer-use@openai-bundled",
         "executor-a",
@@ -131,11 +129,53 @@ fn discovers_allowlisted_executor_plugin_hook_sources() {
     );
 
     let sources = executor_plugin_hook_sources(&snapshot);
+    let mut interrupt_source = expected_source(/*index*/ 1);
+    interrupt_source.hooks.interrupt = std::mem::take(&mut interrupt_source.hooks.stop);
+    let mut stop_and_interrupt_source = expected_source(/*index*/ 2);
+    stop_and_interrupt_source.hooks.interrupt = stop_and_interrupt_source.hooks.stop.clone();
 
     assert_eq!(
         sources,
-        vec![expected_source(/*index*/ 0), expected_source(/*index*/ 1)]
+        vec![
+            expected_source(/*index*/ 0),
+            interrupt_source,
+            stop_and_interrupt_source,
+        ]
     );
+}
+
+#[test]
+fn filters_mixed_handlers_without_rewriting_allowed_groups() {
+    let mut expected = expected_source(/*index*/ 0);
+    let mut second_handler = expected.hooks.stop[0].hooks[0].clone();
+    let HookHandlerConfig::McpTool { input, .. } = &mut second_handler else {
+        panic!("expected an MCP tool hook");
+    };
+    input.insert("order".to_string(), json!(2));
+    expected.hooks.stop[0].hooks.push(second_handler.clone());
+    expected.hooks.stop.push(MatcherGroup {
+        matcher: None,
+        hooks: vec![second_handler],
+    });
+
+    let mut manifest = cleanup_hook_manifest();
+    manifest["hooks"]["hooks"]["Stop"] =
+        serde_json::to_value(&expected.hooks.stop).expect("serialize stop hooks");
+    manifest["hooks"]["hooks"]["Stop"][0]["hooks"]
+        .as_array_mut()
+        .expect("stop handlers")
+        .insert(
+            /*index*/ 0,
+            json!({ "type": "mcp_tool", "server": "node_repl", "tool": "other" }),
+        );
+    let snapshot = snapshot_for_manifest(
+        "computer-use@openai-bundled",
+        "executor-a",
+        "file:///plugins/computer-use/.codex-plugin/plugin.json",
+        manifest,
+    );
+
+    assert_eq!(executor_plugin_hook_sources(&snapshot), vec![expected]);
 }
 
 #[test]
@@ -145,6 +185,7 @@ fn preserves_allowlisted_executor_plugin_hook_options() {
     handler["input"] = json!({ "untrusted": "manifest-provided input" });
     handler["timeout"] = json!(30);
     handler["statusMessage"] = json!("Cleaning up Computer Use");
+    manifest["hooks"]["hooks"]["Interrupt"] = manifest["hooks"]["hooks"]["Stop"].clone();
     let snapshot = snapshot_for_manifest(
         "computer-use@openai-bundled",
         "executor-a",
@@ -161,6 +202,7 @@ fn preserves_allowlisted_executor_plugin_hook_options() {
         timeout_sec: Some(30),
         status_message: Some("Cleaning up Computer Use".to_string()),
     };
+    expected.hooks.interrupt = expected.hooks.stop.clone();
 
     assert_eq!(executor_plugin_hook_sources(&snapshot), vec![expected]);
 }
@@ -186,8 +228,23 @@ fn ignores_unallowlisted_executor_plugin_hooks() {
     wrong_matcher["hooks"]["hooks"]["Stop"][0]["matcher"] = json!("unexpected");
     for (name, plugin_id, manifest) in [
         (
-            "wrong plugin id",
+            "unallowlisted bundled plugin",
+            "another-plugin@openai-bundled",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "wrong marketplace",
             "computer-use@other",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "bundled alpha marketplace",
+            "computer-use@openai-bundled-alpha",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "bundled marketplace suffix",
+            "computer-use@fake-openai-bundled",
             cleanup_hook_manifest(),
         ),
         ("wrong event", "computer-use@openai-bundled", wrong_event),

@@ -1,6 +1,4 @@
-use codex_config::HookEventsToml;
 use codex_config::HookHandlerConfig;
-use codex_config::MatcherGroup;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_plugin::ExecutorPluginHookSource;
 use codex_plugin::PluginId;
@@ -18,21 +16,107 @@ struct AllowlistedExecutorPluginHook {
 }
 
 // Executor plugin manifests are unsigned, so temporarily hardcode the expected
-// bundled cleanup hook identity and MCP target until plugin signing lands.
-const ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS: &[AllowlistedExecutorPluginHook] =
-    &[AllowlistedExecutorPluginHook {
+// bundled plugin identities, events, and MCP targets until plugin signing lands.
+const ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS: &[AllowlistedExecutorPluginHook] = &[
+    AllowlistedExecutorPluginHook {
+        plugin_id: "browser@openai-bundled",
+        event: HookEventName::Stop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "browser@openai-bundled",
+        event: HookEventName::Interrupt,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "browser@openai-bundled",
+        event: HookEventName::SubagentStop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome@openai-bundled",
+        event: HookEventName::Stop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome@openai-bundled",
+        event: HookEventName::Interrupt,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome@openai-bundled",
+        event: HookEventName::SubagentStop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome-dev@openai-bundled",
+        event: HookEventName::Stop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome-dev@openai-bundled",
+        event: HookEventName::Interrupt,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome-dev@openai-bundled",
+        event: HookEventName::SubagentStop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome-internal@openai-bundled",
+        event: HookEventName::Stop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome-internal@openai-bundled",
+        event: HookEventName::Interrupt,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome-internal@openai-bundled",
+        event: HookEventName::SubagentStop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
         plugin_id: "computer-use@openai-bundled",
         event: HookEventName::Stop,
         server: "node_repl",
         tool: "turn_ended",
-    }];
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "computer-use@openai-bundled",
+        event: HookEventName::Interrupt,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "computer-use@openai-bundled",
+        event: HookEventName::SubagentStop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+];
 
 /// Returns accepted inline hook sources from executor-discovered plugin manifests.
 ///
 /// Executor scoped hooks are best-effort because executor capabilities can become available
 /// after earlier lifecycle events have passed.
 ///
-/// Note: Executor manifests are not signed yet, so temporarily we only admit the known Computer Use cleanup hook.
+/// Note: Executor manifests are not signed yet, so temporarily we only admit the known cleanup
+/// hook from the bundled Browser, Chrome, Chrome Dev, Chrome Internal, and Computer Use plugins.
 pub fn executor_plugin_hook_sources(
     snapshot: &ExecutorCapabilityDiscoverySnapshot,
 ) -> Vec<ExecutorPluginHookSource> {
@@ -87,31 +171,27 @@ pub fn executor_plugin_hook_sources(
 }
 
 fn allowlisted_source(mut source: ExecutorPluginHookSource) -> Option<ExecutorPluginHookSource> {
-    let allowlisted_hook = ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS.iter().find(|hook| {
-        hook.plugin_id == source.plugin_id.as_key() && hook.event == HookEventName::Stop
-    })?;
-    let handler = source
-        .hooks
-        .stop
-        .into_iter()
-        .filter(|group| group.matcher.is_none())
-        .flat_map(|group| group.hooks)
-        .find(|handler| {
-            matches!(
-                handler,
-                HookHandlerConfig::McpTool { server, tool, .. }
-                    if server == allowlisted_hook.server && tool == allowlisted_hook.tool
-            )
-        })?;
-
-    source.hooks = HookEventsToml {
-        stop: vec![MatcherGroup {
-            matcher: None,
-            hooks: vec![handler],
-        }],
-        ..Default::default()
-    };
-    Some(source)
+    let plugin_id = source.plugin_id.as_key();
+    for (event, groups) in source.hooks.matcher_groups_mut() {
+        groups.retain_mut(|group| {
+            if group.matcher.is_some() {
+                return false;
+            }
+            group.hooks.retain(|handler| {
+                let HookHandlerConfig::McpTool { server, tool, .. } = handler else {
+                    return false;
+                };
+                ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS.iter().any(|hook| {
+                    hook.plugin_id == plugin_id
+                        && hook.event == event
+                        && hook.server == server
+                        && hook.tool == tool
+                })
+            });
+            !group.hooks.is_empty()
+        });
+    }
+    (!source.hooks.is_empty()).then_some(source)
 }
 
 #[cfg(test)]

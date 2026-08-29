@@ -152,6 +152,14 @@ impl ChatWidget {
             ServerNotification::ModelSafetyBufferingUpdated(notification) => {
                 self.on_model_safety_buffering_updated(notification, replay_kind)
             }
+            ServerNotification::AuthRecoveryStarted(notification) => {
+                self.add_info_message(notification.message, /*hint*/ None)
+            }
+            ServerNotification::AuthRecoveryCompleted(notification) => {
+                self.add_plain_history_lines(vec![
+                    vec!["✓ ".green(), notification.message.into()].into(),
+                ]);
+            }
             ServerNotification::Warning(notification) => self.on_warning(notification.message),
             ServerNotification::GuardianWarning(notification) => {
                 if !notification
@@ -238,6 +246,9 @@ impl ChatWidget {
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
             | ServerNotification::ThreadRealtimeStarted(_)
             | ServerNotification::ThreadRealtimeItemAdded(_)
+            | ServerNotification::ThreadRealtimeItemStarted(_)
+            | ServerNotification::ThreadRealtimeItemTranscriptDelta(_)
+            | ServerNotification::ThreadRealtimeItemCompleted(_)
             | ServerNotification::ThreadRealtimeOutputAudioDelta(_)
             | ServerNotification::ThreadRealtimeError(_)
             | ServerNotification::ThreadRealtimeClosed(_)

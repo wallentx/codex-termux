@@ -1,7 +1,9 @@
+use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use codex_core::McpManager;
 use codex_mcp::McpServerSource;
 use codex_mcp::ReadResourceRequestParams;
+use codex_mcp::resolve_oauth_callback;
 
 use crate::thread_state::ThreadStateManager;
 
@@ -203,6 +205,11 @@ impl McpRequestProcessor {
         let resolved_scopes =
             resolve_oauth_scopes(scopes, server.scopes.clone(), discovered_scopes);
         let oauth_credential_name = server.oauth_credential_name(&name);
+        let callback_url =
+            resolve_oauth_callback(server, &url, mcp_config.mcp_oauth_callback_url.as_deref())
+                .map_err(|err| {
+                    internal_error(format!("failed to resolve MCP OAuth callback: {err}"))
+                })?;
 
         let handle = perform_oauth_login_return_url(
             oauth_credential_name.as_ref(),
@@ -217,6 +224,7 @@ impl McpRequestProcessor {
             server.oauth_resource.as_deref(),
             timeout_secs,
             server.oauth_callback_port(mcp_config.mcp_oauth_callback_port),
+            callback_url.as_deref(),
             mcp_config.mcp_oauth_callback_url.as_deref(),
             http_client,
             redirect_mode,
@@ -501,7 +509,7 @@ impl McpRequestProcessor {
         origin_call_id: Option<String>,
     ) {
         let result = result
-            .map_err(|error| internal_error(format!("{error:#}")))
+            .map_err(mcp_operation_error)
             .and_then(|result| {
                 serde_json::from_value::<McpResourceReadResponse>(result).map_err(|error| {
                     internal_error(format!(
@@ -524,6 +532,7 @@ impl McpRequestProcessor {
         let outgoing = Arc::clone(&self.outgoing);
         let thread_id = params.thread_id.clone();
         let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_direct_input_allowed(thread.as_ref()).await?;
         let meta = with_mcp_tool_call_thread_id_meta(params.meta, &thread_id);
         let request_id = request_id.clone();
 
@@ -532,10 +541,21 @@ impl McpRequestProcessor {
                 .call_mcp_tool(&params.server, &params.tool, params.arguments, meta)
                 .await
                 .map(McpServerToolCallResponse::from)
-                .map_err(|error| internal_error(format!("{error:#}")));
+                .map_err(mcp_operation_error);
             outgoing.send_result(request_id, result).await;
         });
         Ok(())
+    }
+}
+
+fn mcp_operation_error(error: anyhow::Error) -> JSONRPCErrorError {
+    match codex_rmcp_client::mcp_error(&error) {
+        Some(error) => JSONRPCErrorError {
+            code: i64::from(error.code.0),
+            message: error.message.to_string(),
+            data: error.data.clone(),
+        },
+        None => internal_error(format!("{error:#}")),
     }
 }
 

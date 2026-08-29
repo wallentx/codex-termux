@@ -26,7 +26,6 @@ use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -65,14 +64,14 @@ impl codex_extension_api::ToolContributor for ExtensionEchoContributor {
         &self,
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ExtensionToolCall<'call>>>> {
         vec![Arc::new(ExtensionEchoExecutor)]
     }
 }
 
 struct ExtensionEchoExecutor;
 
-impl ToolExecutor<ExtensionToolCall> for ExtensionEchoExecutor {
+impl<'call> ToolExecutor<ExtensionToolCall<'call>> for ExtensionEchoExecutor {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced("extension/", "echo")
     }
@@ -100,7 +99,10 @@ impl ToolExecutor<ExtensionToolCall> for ExtensionEchoExecutor {
         })
     }
 
-    fn handle(&self, call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ExtensionToolCall<'call>) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(self.handle_call(call))
     }
 }
@@ -108,7 +110,7 @@ impl ToolExecutor<ExtensionToolCall> for ExtensionEchoExecutor {
 impl ExtensionEchoExecutor {
     async fn handle_call(
         &self,
-        call: ExtensionToolCall,
+        call: ExtensionToolCall<'_>,
     ) -> Result<Box<dyn codex_tools::ToolOutput>, codex_tools::FunctionCallError> {
         let arguments: serde_json::Value =
             serde_json::from_str(call.function_arguments()?).expect("test arguments should parse");
@@ -130,11 +132,14 @@ fn extension_tool_test_registry() -> Arc<ExtensionRegistry<Config>> {
 fn test_tool_router(
     step_context: &StepContext,
     mcp_tools: Vec<RegisteredTool>,
-    extension_tool_executors: impl IntoIterator<Item = Arc<dyn ToolExecutor<ExtensionToolCall>>>,
+    extension_tool_executors: impl IntoIterator<
+        Item = Arc<dyn for<'call> ToolExecutor<ExtensionToolCall<'call>>>,
+    >,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRouter {
     let mut registry = build_core_tool_registry(
         step_context.turn.as_ref(),
+        step_context.turn.model_info(),
         &step_context.environments,
         step_context.mcp.as_ref(),
         /*tool_suggest_candidates*/ None,
@@ -142,6 +147,7 @@ fn test_tool_router(
     );
     let hosted_specs = append_source_tools(
         step_context.turn.as_ref(),
+        step_context.turn.model_info(),
         &mut registry,
         mcp_tools,
         extension_tool_executors,
@@ -149,6 +155,7 @@ fn test_tool_router(
     );
     ToolRouter::from_registry(
         step_context.turn.as_ref(),
+        step_context.turn.model_info(),
         registry,
         hosted_specs,
         &Default::default(),
@@ -596,10 +603,12 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         )
         .await?;
 
-    let response = result.into_response();
+    let response = result.into_response().item;
     match response {
-        ResponseInputItem::FunctionCallOutput { call_id, output } => {
-            assert_eq!(call_id, "call-extension");
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } => {
+            assert_eq!(call_id.as_deref(), Some("call-extension"));
             let FunctionCallOutputBody::Text(text) = output.body else {
                 panic!("expected text function call output")
             };
