@@ -92,6 +92,13 @@ pub enum ProviderUnauthorizedRecovery {
     Recovered,
 }
 
+/// User-facing lifecycle messages for provider-owned authentication recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderAuthRecoveryMessages {
+    pub started: &'static str,
+    pub succeeded: &'static str,
+}
+
 /// Error returned when a provider cannot construct its app-visible account state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderAccountError {
@@ -190,6 +197,11 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
             error,
             TransportError::Http { status, .. } if *status == http::StatusCode::UNAUTHORIZED
         )
+    }
+
+    /// Returns lifecycle messages when provider-owned authentication recovery is active.
+    fn auth_recovery_messages(&self) -> Option<ProviderAuthRecoveryMessages> {
+        None
     }
 
     /// Attempts provider-owned authentication recovery before using the auth manager.
@@ -402,7 +414,7 @@ impl ModelProvider for ConfiguredModelProvider {
                 })
                 .map(|auth| match &auth {
                     CodexAuth::ApiKey(_) => Ok(ProviderAccount::ApiKey),
-                    CodexAuth::BedrockApiKey(_) => {
+                    CodexAuth::BedrockApiKey(_) | CodexAuth::BedrockAccessKeys(_) => {
                         Err(ProviderAccountError::UnsupportedBedrockApiKeyAuth)
                     }
                     CodexAuth::Chatgpt(_)

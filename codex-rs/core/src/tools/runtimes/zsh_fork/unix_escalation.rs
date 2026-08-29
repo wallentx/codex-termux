@@ -140,7 +140,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         sandbox_policy_cwd,
         windows_sandbox_workspace_roots: exec_request.windows_sandbox_workspace_roots.clone(),
         codex_linux_sandbox_exe: ctx.step_context.turn.config.codex_linux_sandbox_exe.clone(),
-        use_legacy_landlock: ctx.step_context.turn.config.features.use_legacy_landlock(),
+        use_legacy_landlock: req.turn_environment.config().use_legacy_landlock,
     };
     let escalation_policy = CoreShellActionProvider {
         policy: Arc::clone(&exec_policy),
@@ -150,7 +150,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         environment_id: req.turn_environment.selection.environment_id.clone(),
         source: GuardianCommandSource::UnifiedExec,
         tool_name: ctx.tool_name.clone(),
-        approval_policy: ctx.step_context.turn.approval_policy(),
+        approval_policy: ctx.step_context.settings.approval_policy(),
         permission_profile: exec_request.permission_profile.clone(),
         sandbox_permissions: req.sandbox_permissions,
         approval_sandbox_permissions: approval_sandbox_permissions(
@@ -280,7 +280,7 @@ impl CoreShellActionProvider {
         };
         match stopwatch
             .pause_for(async {
-                let (turn_context, strict_auto_review) = self
+                let (turn_context, step_settings, strict_auto_review) = self
                     .session
                     .active_turn_context_and_strict_auto_review()
                     .await
@@ -291,7 +291,10 @@ impl CoreShellActionProvider {
                         )
                     })?;
                 let approval_ctx = ApprovalContext {
-                    review_context: GuardianReviewContext::from(turn_context),
+                    review_context: GuardianReviewContext::from_resolved_settings(
+                        turn_context,
+                        &step_settings,
+                    ),
                     // The running process can outlive its launching tool or code-mode cell.
                     cancellation_token: None,
                     call_id: self.call_id.clone(),
@@ -365,7 +368,7 @@ impl CoreShellActionProvider {
                         }
                         ReviewDecision::TimedOut => EscalationDecision::deny(Some(
                             crate::guardian::guardian_timeout_message(
-                                &self.review_context.turn().model_info,
+                                self.review_context.turn().model_info(),
                             ),
                         )),
                         ReviewDecision::ApprovedMcpPolicyAmendment => {
@@ -532,6 +535,8 @@ fn evaluate_intercepted_exec_policy(
 struct InterceptedExecPolicyContext {
     approval_policy: AskForApproval,
     permission_profile: PermissionProfile,
+    // TODO(anp): Reconcile this policy input with TurnEnvironment::sandbox_context
+    // so intercepted commands use the selected environment's Windows backend.
     windows_sandbox_level: WindowsSandboxLevel,
     sandbox_permissions: SandboxPermissions,
     enable_shell_wrapper_parsing: bool,
@@ -557,6 +562,8 @@ fn commands_for_intercepted_exec_policy(
     vec![join_program_and_argv(program, argv)]
 }
 
+// TODO(anp): Capture these Windows and Landlock settings from
+// TurnEnvironment::sandbox_context when preparing this executor, preserving its snapshot.
 struct CoreShellCommandExecutor {
     command: Vec<String>,
     cwd: AbsolutePathBuf,
@@ -672,7 +679,7 @@ impl CoreShellCommandExecutor {
         program: &AbsolutePathBuf,
         argv: &[String],
         workdir: &AbsolutePathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         execution: EscalationExecution,
     ) -> anyhow::Result<PreparedExec> {
         let command = join_program_and_argv(program, argv);
@@ -683,12 +690,20 @@ impl CoreShellCommandExecutor {
         };
 
         let prepared = match execution {
-            EscalationExecution::Unsandboxed => PreparedExec {
-                command,
-                cwd: workdir.to_path_buf(),
-                env: exec_env_for_sandbox_permissions(&env, SandboxPermissions::RequireEscalated),
-                arg0: Some(first_arg.clone()),
-            },
+            EscalationExecution::Unsandboxed => {
+                if let Some(network) = self.network.as_ref() {
+                    network.restore_brokered_credentials(&mut env, &mut []);
+                }
+                PreparedExec {
+                    command,
+                    cwd: workdir.to_path_buf(),
+                    env: exec_env_for_sandbox_permissions(
+                        &env,
+                        SandboxPermissions::RequireEscalated,
+                    ),
+                    arg0: Some(first_arg.clone()),
+                }
+            }
             EscalationExecution::TurnDefault => {
                 self.prepare_sandboxed_exec(PrepareSandboxedExecParams {
                     command,

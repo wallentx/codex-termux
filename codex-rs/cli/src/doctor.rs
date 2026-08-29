@@ -162,13 +162,17 @@ const NARROW_TERMINAL_ROWS: u16 = 24;
 
 /// Options for building a local Codex diagnostic report.
 ///
-/// The command always runs the full bounded diagnostic set. Human output includes
+/// The command always runs the full diagnostic set. Human output includes
 /// detailed diagnostics by default; --summary keeps the terminal output compact.
 #[derive(Debug, Parser)]
 pub struct DoctorCommand {
     /// Emit a redacted machine-readable report.
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Limit database integrity scans when collecting a feedback attachment.
+    #[arg(long, hide = true, default_value_t = false)]
+    feedback: bool,
 
     /// Only show grouped check rows and the final count summary.
     #[arg(long, default_value_t = false)]
@@ -452,7 +456,7 @@ async fn build_report(
                         terminal_title_check(config)
                     })
                 },
-                run_async_check("state", progress.clone(), state_check(config)),
+                run_async_check("state", progress.clone(), state_check(config, command)),
                 run_async_check(
                     "thread inventory",
                     progress.clone(),
@@ -1416,6 +1420,7 @@ fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
         AuthMode::AgentIdentity => "agent_identity",
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
+        AuthMode::BedrockAccessKeys => "bedrock_access_keys",
     }
 }
 
@@ -1427,6 +1432,8 @@ fn stored_auth_mode_value(auth: &AuthDotJson) -> AuthMode {
         AuthMode::PersonalAccessToken
     } else if auth.bedrock_api_key.is_some() {
         AuthMode::BedrockApiKey
+    } else if auth.bedrock_access_keys.is_some() {
+        AuthMode::BedrockAccessKeys
     } else if auth.openai_api_key.is_some() {
         AuthMode::ApiKey
     } else {
@@ -1509,6 +1516,17 @@ fn stored_auth_issues(
                 issues.push("Bedrock API key auth is missing a Bedrock API key");
             }
         }
+        AuthMode::BedrockAccessKeys => match auth.bedrock_access_keys.as_ref() {
+            Some(access_keys) => {
+                if access_keys.access_key_id.trim().is_empty() {
+                    issues.push("Bedrock access key auth is missing an access key ID");
+                }
+                if access_keys.secret_access_key.trim().is_empty() {
+                    issues.push("Bedrock access key auth is missing a secret access key");
+                }
+            }
+            None => issues.push("Bedrock access key auth is missing AWS access keys"),
+        },
     }
     issues
 }
@@ -2165,35 +2183,36 @@ fn non_empty_trimmed(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-async fn state_check(config: &Config) -> DoctorCheck {
+async fn state_check(config: &Config, command: &DoctorCommand) -> DoctorCheck {
     let mut details = Vec::new();
     path_readiness(&mut details, "CODEX_HOME", &config.codex_home);
     path_readiness(&mut details, "log dir", &config.log_dir);
     path_readiness(&mut details, "sqlite home", config.sqlite_config().home());
-    let mut integrity_failures = Vec::new();
+    let mut status = CheckStatus::Ok;
     for db in config.sqlite_config().runtime_db_paths() {
         path_readiness(&mut details, db.label, &db.path);
-        sqlite_integrity_detail(
-            config.sqlite_config(),
-            &mut details,
-            &mut integrity_failures,
-            db.label,
-            &db.path,
-        )
-        .await;
+        // Feedback collection gives each database its own budget; direct runs scan fully.
+        let deadline = command
+            .feedback
+            .then(|| Instant::now() + Duration::from_secs(1));
+        status = status.max(
+            sqlite_integrity_detail(
+                config.sqlite_config(),
+                &mut details,
+                db.label,
+                &db.path,
+                deadline,
+            )
+            .await,
+        );
     }
     rollout_stats_details(&mut details, &config.codex_home);
     standalone_release_cache_details(&mut details);
 
-    let status = if integrity_failures.is_empty() {
-        CheckStatus::Ok
-    } else {
-        CheckStatus::Fail
-    };
-    let summary = if status == CheckStatus::Ok {
-        "state paths and databases are inspectable"
-    } else {
-        "state database integrity check failed"
+    let summary = match status {
+        CheckStatus::Ok => "state paths and databases are inspectable",
+        CheckStatus::Warning => "some database integrity checks exceeded their time limit",
+        CheckStatus::Fail => "state database integrity check failed",
     };
     let mut check = DoctorCheck::new("state.paths", "state", status, summary).details(details);
     if status == CheckStatus::Fail {
@@ -2207,29 +2226,37 @@ async fn state_check(config: &Config) -> DoctorCheck {
 async fn sqlite_integrity_detail(
     sqlite: &codex_state::SqliteConfig,
     details: &mut Vec<String>,
-    integrity_failures: &mut Vec<String>,
     label: &str,
     path: &Path,
-) {
+    deadline: Option<Instant>,
+) -> CheckStatus {
     if !path.is_file() {
         details.push(format!("{label} integrity: skipped (missing)"));
-        return;
+        return CheckStatus::Ok;
     }
 
-    match codex_state::sqlite_integrity_check(sqlite, path).await {
-        Ok(rows) if rows.iter().all(|row| row == "ok") => {
-            details.push(format!("{label} integrity: ok"));
-        }
-        Ok(rows) => {
-            let message = format!("{label} integrity: {}", rows.join("; "));
-            integrity_failures.push(message.clone());
-            details.push(message);
-        }
+    let (rows, timed_out) = match codex_state::sqlite_integrity_check(sqlite, path, deadline).await
+    {
+        Ok(codex_state::SqliteIntegrityCheck::Complete(rows)) => (rows, false),
+        Ok(codex_state::SqliteIntegrityCheck::TimedOut(rows)) => (rows, true),
         Err(err) => {
-            let message = format!("{label} integrity: {err}");
-            integrity_failures.push(message.clone());
-            details.push(message);
+            details.push(format!("{label} integrity: {err}"));
+            return CheckStatus::Fail;
         }
+    };
+    if timed_out {
+        details.push(format!(
+            "{label} integrity: incomplete (1 second time limit)"
+        ));
+    }
+    if rows.iter().any(|row| row != "ok") {
+        details.push(format!("{label} integrity: {}", rows.join("; ")));
+        CheckStatus::Fail
+    } else if timed_out {
+        CheckStatus::Warning
+    } else {
+        details.push(format!("{label} integrity: ok"));
+        CheckStatus::Ok
     }
 }
 
@@ -2478,6 +2505,7 @@ fn websocket_error_detail(err: &ApiError) -> String {
         | ApiError::QuotaExceeded
         | ApiError::UsageNotIncluded
         | ApiError::Retryable { .. }
+        | ApiError::RateLimitExceeded { .. }
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
         | ApiError::CyberPolicy { .. }
@@ -2495,6 +2523,7 @@ fn auth_mode_name(auth: &CodexAuth) -> &'static str {
         AuthMode::AgentIdentity => "agent_identity",
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
+        AuthMode::BedrockAccessKeys => "bedrock_access_keys",
     }
 }
 
@@ -2644,7 +2673,9 @@ fn provider_auth_reachability_mode_from_auth(
         return ProviderAuthReachabilityMode::Chatgpt;
     }
     match stored_auth.map(stored_auth_mode_value) {
-        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey) => ProviderAuthReachabilityMode::ApiKey,
+        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey | AuthMode::BedrockAccessKeys) => {
+            ProviderAuthReachabilityMode::ApiKey
+        }
         Some(
             AuthMode::Chatgpt
             | AuthMode::ChatgptAuthTokens
@@ -3566,6 +3597,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(
@@ -3585,6 +3617,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(
@@ -3606,6 +3639,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: Some("at-test".to_string()),
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(stored_auth_mode(&auth), "personal_access_token");
@@ -3629,6 +3663,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(

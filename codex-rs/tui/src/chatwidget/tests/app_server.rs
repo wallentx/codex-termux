@@ -1,4 +1,7 @@
 use super::*;
+use codex_app_server_protocol::AuthRecoveryNotification;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use pretty_assertions::assert_eq;
 
 const SAFETY_BUFFERING_HEADER_TEXT: &str =
@@ -728,6 +731,32 @@ async fn live_app_server_warning_notification_renders_message() {
         ),
         "expected warning guidance, got {rendered}"
     );
+
+    let notification = AuthRecoveryNotification {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        provider: "example".to_string(),
+        message: "Session expired. Sign in again.".to_string(),
+    };
+    let mut recovery_messages = String::new();
+    for notification in [
+        ServerNotification::AuthRecoveryStarted(notification.clone()),
+        ServerNotification::AuthRecoveryCompleted(AuthRecoveryNotification {
+            message: "Signed in successfully.".to_string(),
+            ..notification
+        }),
+    ] {
+        chat.handle_server_notification(notification, /*replay_kind*/ None);
+
+        let [cell] = drain_insert_history(&mut rx)
+            .try_into()
+            .expect("expected one authentication recovery history cell");
+        recovery_messages.push_str(&lines_to_single_string(&cell));
+    }
+    insta::assert_snapshot!(recovery_messages, @r"
+• Session expired. Sign in again.
+✓ Signed in successfully.
+");
 }
 
 #[tokio::test]
@@ -963,7 +992,7 @@ async fn live_app_server_sub_agent_activity_renders_once() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let activity = AppServerThreadItem::SubAgentActivity {
         id: "activity-1".to_string(),
-        kind: codex_app_server_protocol::SubAgentActivityKind::Interacted,
+        kind: codex_app_server_protocol::SubAgentActivityKind::Completed,
         agent_thread_id: ThreadId::new().to_string(),
         agent_path: "/root/researcher".to_string(),
     };
@@ -1171,6 +1200,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: "permission denied".to_string(),
                 codex_error_info: None,
                 additional_details: None,
@@ -1194,6 +1224,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::Failed,
                 error: Some(AppServerTurnError {
+                    misalignment: None,
                     message: "permission denied".to_string(),
                     codex_error_info: None,
                     additional_details: None,
@@ -1328,6 +1359,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: "Reconnecting... 1/5".to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
                 additional_details: None,
@@ -1362,6 +1394,26 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
 }
 
 #[tokio::test]
+async fn live_app_server_rate_limit_error_renders_upstream_message() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let error = CodexErr::from(CodexErrorDetails::RateLimitExceeded(
+        "Please try again in 10s.".to_string(),
+    ));
+
+    handle_error(
+        &mut chat,
+        error.to_string(),
+        Some(error.to_codex_protocol_error().into()),
+    );
+
+    let lines = drain_insert_history(&mut rx)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_chatwidget_snapshot!("rate_limit_exceeded_error", lines_to_single_string(&lines));
+}
+
+#[tokio::test]
 async fn live_app_server_server_overloaded_error_renders_warning() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -1386,6 +1438,7 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: "server overloaded".to_string(),
                 codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
                 additional_details: None,
@@ -1428,6 +1481,7 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: "server fallback message".to_string(),
                 codex_error_info: Some(CodexErrorInfo::CyberPolicy),
                 additional_details: None,
@@ -1556,6 +1610,100 @@ async fn live_app_server_thread_name_update_shows_resume_hint() {
     assert_eq!(cells.len(), 1);
     let rendered = lines_to_single_string(&cells[0]);
     assert_chatwidget_snapshot!("thread_name_update_resume_hint", rendered);
+}
+
+#[tokio::test]
+async fn live_app_server_automatic_thread_name_update_is_silent() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    for title in ["Provisional title", "Generated title"] {
+        chat.expect_automatic_thread_name(title.to_string());
+        assert_eq!(chat.thread_name(), Some(title.to_string()));
+
+        chat.handle_server_notification(
+            ServerNotification::ThreadNameUpdated(
+                codex_app_server_protocol::ThreadNameUpdatedNotification {
+                    thread_id: thread_id.to_string(),
+                    thread_name: Some(title.to_string()),
+                },
+            ),
+            /*replay_kind*/ None,
+        );
+
+        assert_eq!(chat.thread_name, Some(title.to_string()));
+        assert!(drain_insert_history(&mut rx).is_empty());
+    }
+
+    chat.handle_server_notification(
+        ServerNotification::ThreadNameUpdated(
+            codex_app_server_protocol::ThreadNameUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                thread_name: Some("Manual title".to_string()),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(chat.thread_name, Some("Manual title".to_string()));
+    assert_eq!(drain_insert_history(&mut rx).len(), 1);
+}
+
+#[tokio::test]
+async fn live_app_server_manual_thread_name_is_visible_before_notification() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.expect_automatic_thread_name("Provisional title".to_string());
+
+    chat.expect_manual_thread_name(thread_id, "Manual title".to_string());
+
+    assert_eq!(chat.thread_name(), Some("Manual title".to_string()));
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.handle_server_notification(
+        ServerNotification::ThreadNameUpdated(
+            codex_app_server_protocol::ThreadNameUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                thread_name: Some("Manual title".to_string()),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(chat.thread_name(), Some("Manual title".to_string()));
+    assert_eq!(drain_insert_history(&mut rx).len(), 1);
+}
+
+#[tokio::test]
+async fn thread_name_suggestion_requires_matching_thread_and_request() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    let request_id = uuid::Uuid::new_v4();
+    chat.thread_id = Some(thread_id);
+
+    let view = CustomPromptView::new(
+        "Rename thread".to_string(),
+        "Type a name and press Enter".to_string(),
+        /*initial_text*/ String::new(),
+        /*context_label*/ None,
+        Box::new(|_| {}),
+    )
+    .with_text_suggestion(request_id, "Loading".into(), "Ready".into());
+    chat.bottom_pane.show_text_prompt(view);
+
+    chat.apply_thread_name_suggestion(ThreadId::new(), request_id, Some("Wrong thread"));
+    chat.apply_thread_name_suggestion(thread_id, uuid::Uuid::new_v4(), Some("Wrong request"));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Loading"));
+    assert!(!popup.contains("Wrong"));
+
+    chat.apply_thread_name_suggestion(thread_id, request_id, Some("Suggested title"));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Ready"));
+    assert!(popup.contains("Suggested title"));
 }
 
 #[tokio::test]

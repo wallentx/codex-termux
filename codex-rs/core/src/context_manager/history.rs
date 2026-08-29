@@ -1,5 +1,6 @@
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
+use crate::context::world_state::PersistentModeState;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::normalize;
@@ -7,8 +8,11 @@ use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::turn_context::TurnContext;
+use crate::utils::json::serialized_json_bytes;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_context_fragments::set_annotated_content;
+use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -17,7 +21,6 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
@@ -33,8 +36,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
-use codex_utils_output_truncation::truncate_function_output_items_with_policy;
-use codex_utils_output_truncation::truncate_text;
+use codex_utils_output_truncation::truncate_function_output_payload;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -167,7 +169,7 @@ impl ContextManager {
         self.record_items_with_metadata(items.into_iter().map(|item| (item, None)), policy);
     }
 
-    /// Records history envelopes while preserving their history-only metadata.
+    /// Records output while preserving its history-only metadata.
     pub(crate) fn record_annotated_items(
         &mut self,
         items: &[ResponseItemEnvelope],
@@ -192,10 +194,20 @@ impl ContextManager {
                 continue;
             }
 
-            let processed = ResponseItemEnvelope {
-                item: Self::process_item(item, policy),
+            let mut processed = ResponseItemEnvelope {
+                item: item.clone(),
                 metadata: metadata.cloned(),
             };
+            if let ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } = &mut processed.item
+            {
+                // The override already includes the tool's serialization allowance.
+                let policy = metadata
+                    .and_then(|metadata| metadata.fallback_token_limit_override)
+                    .map(TruncationPolicy::Tokens)
+                    .unwrap_or(policy * 1.2);
+                truncate_function_output_payload(output, policy, estimate_audio_token_count);
+            }
             Arc::make_mut(&mut self.items).push(processed);
         }
     }
@@ -251,8 +263,10 @@ impl ContextManager {
     // Estimate token usage using byte-based heuristics from the truncation helpers.
     // This is a coarse lower bound, not a tokenizer-accurate count.
     pub(crate) fn estimate_token_count(&self, turn_context: &TurnContext) -> Option<i64> {
-        let model_info = &turn_context.model_info;
-        let personality = turn_context.personality.or(turn_context.config.personality);
+        let model_info = &turn_context.model_info();
+        let personality = turn_context
+            .personality()
+            .or(turn_context.config.personality);
         let base_instructions = BaseInstructions {
             text: model_info.get_model_instructions(personality),
             provenance: None,
@@ -345,17 +359,21 @@ impl ContextManager {
         {
             retained_items.retain_mut(|item| {
                 if item.turn_id() == Some(first_turn_id)
-                    && let ResponseItem::Message { role, content, .. } = &mut item.item
-                    && role == "developer"
+                    && matches!(&item.item, ResponseItem::Message { role, .. } if role == "developer")
                 {
+                    let Some(mut content) = to_annotated_content(&mut item.item) else {
+                        return false;
+                    };
                     content.retain(|content| {
+                        // Rebuild these from the next step's model and effort after rollback.
                         !matches!(
-                            content,
+                            content.content(),
                             ContentItem::InputText { text }
                                 if ModelSwitchInstructions::matches_text(text)
+                                    || PersistentModeState::matches_text(text)
                         )
                     });
-                    !content.is_empty()
+                    !content.is_empty() && set_annotated_content(&mut item.item, content).is_some()
                 } else {
                     true
                 }
@@ -463,55 +481,6 @@ impl ContextManager {
         normalize::strip_audio_when_unsupported(input_modalities, items);
     }
 
-    fn process_item(item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
-        let policy_with_serialization_budget = policy * 1.2;
-        match item {
-            ResponseItem::FunctionCallOutput {
-                id,
-                call_id,
-                name,
-                namespace,
-                output,
-                internal_chat_message_metadata_passthrough: metadata,
-            } => ResponseItem::FunctionCallOutput {
-                id: id.clone(),
-                call_id: call_id.clone(),
-                name: name.clone(),
-                namespace: namespace.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
-                internal_chat_message_metadata_passthrough: metadata.clone(),
-            },
-            ResponseItem::CustomToolCallOutput {
-                id,
-                call_id,
-                name,
-                output,
-                internal_chat_message_metadata_passthrough: metadata,
-            } => ResponseItem::CustomToolCallOutput {
-                id: id.clone(),
-                call_id: call_id.clone(),
-                name: name.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
-                internal_chat_message_metadata_passthrough: metadata.clone(),
-            },
-            ResponseItem::AdditionalTools { .. }
-            | ResponseItem::Message { .. }
-            | ResponseItem::AgentMessage { .. }
-            | ResponseItem::Reasoning { .. }
-            | ResponseItem::LocalShellCall { .. }
-            | ResponseItem::FunctionCall { .. }
-            | ResponseItem::ToolSearchCall { .. }
-            | ResponseItem::ToolSearchOutput { .. }
-            | ResponseItem::WebSearchCall { .. }
-            | ResponseItem::ImageGenerationCall { .. }
-            | ResponseItem::CustomToolCall { .. }
-            | ResponseItem::Compaction { .. }
-            | ResponseItem::CompactionTrigger { .. }
-            | ResponseItem::ContextCompaction { .. }
-            | ResponseItem::Other => item.clone(),
-        }
-    }
-
     /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.
     ///
     /// Returns the adjusted cut index after removing contextual developer/user items immediately
@@ -557,25 +526,6 @@ impl ContextManager {
             }
         }
         cut_idx
-    }
-}
-
-pub(crate) fn truncate_function_output_payload(
-    output: &FunctionCallOutputPayload,
-    policy: TruncationPolicy,
-) -> FunctionCallOutputPayload {
-    let body = match &output.body {
-        FunctionCallOutputBody::Text(content) => {
-            FunctionCallOutputBody::Text(truncate_text(content, policy))
-        }
-        FunctionCallOutputBody::ContentItems(items) => FunctionCallOutputBody::ContentItems(
-            truncate_function_output_items_with_policy(items, policy, estimate_audio_token_count),
-        ),
-    };
-
-    FunctionCallOutputPayload {
-        body,
-        success: output.success,
     }
 }
 
@@ -662,8 +612,8 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
             ..
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
         item => {
-            let raw = serde_json::to_string(item)
-                .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
+            let raw = serialized_json_bytes(item)
+                .map(|len| i64::try_from(len).unwrap_or(i64::MAX))
                 .unwrap_or_default();
             let (image_payload_bytes, image_replacement_bytes) =
                 image_data_url_estimate_adjustment(item);

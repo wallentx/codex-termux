@@ -78,6 +78,16 @@ fn finalize_active_segment<'a>(
         return;
     }
 
+    // Full world-state snapshots are persisted after installing initial context. They still
+    // establish a baseline when a child fork removes the parent turn's agent message. Do not
+    // count these context-only segments as user turns for rollback, or use a snapshot from
+    // before the segment's latest compaction.
+    let has_context_baseline = active_segment.counts_as_user_turn
+        || active_segment
+            .world_state_replay
+            .iter()
+            .take_while(|item| !matches!(item, RolloutItem::Compacted(_)))
+            .any(|item| matches!(item, RolloutItem::WorldState(state) if state.full));
     world_state_replay.extend(active_segment.world_state_replay);
 
     // A surviving replacement-history checkpoint is a complete history base. Once we
@@ -92,15 +102,15 @@ fn finalize_active_segment<'a>(
         *window = active_segment.window;
     }
 
-    // `previous_turn_settings` come from the newest surviving user turn that established them.
-    if previous_turn_settings.is_none() && active_segment.counts_as_user_turn {
+    // Restore settings from the newest surviving context baseline.
+    if previous_turn_settings.is_none() && has_context_baseline {
         *previous_turn_settings = active_segment.previous_turn_settings;
     }
 
-    // `reference_context_item` comes from the newest surviving user turn baseline, or
+    // `reference_context_item` comes from the newest surviving context baseline, or
     // from a surviving compaction that explicitly cleared that baseline.
     if matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
-        && (active_segment.counts_as_user_turn
+        && (has_context_baseline
             || matches!(
                 active_segment.reference_context_item,
                 TurnReferenceContextItem::Cleared
@@ -282,6 +292,7 @@ impl Session {
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::SessionMeta(_)
+                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             }
@@ -330,14 +341,14 @@ impl Session {
                 RolloutItem::ResponseItem(response_item) => {
                     history.record_annotated_items(
                         std::slice::from_ref(response_item),
-                        turn_context.model_info.truncation_policy.into(),
+                        turn_context.model_info().truncation_policy.into(),
                     );
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
                     let response_item = communication.to_model_input_item();
                     history.record_items(
                         std::iter::once(&response_item),
-                        turn_context.model_info.truncation_policy.into(),
+                        turn_context.model_info().truncation_policy.into(),
                     );
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. } => {}
@@ -371,6 +382,7 @@ impl Session {
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::SessionMeta(_) => {}
@@ -411,6 +423,7 @@ impl Session {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")

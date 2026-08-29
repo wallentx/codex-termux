@@ -34,6 +34,8 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
+use core_test_support::startup::STARTUP_TIMEOUT;
+use core_test_support::startup::expect_startup;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use futures::SinkExt;
@@ -74,15 +76,25 @@ enum PushedExecScenario {
     ReplayGap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedNetworkScenario {
+    None,
+    Enabled { policy_callbacks: bool },
+    Disabled,
+}
+
 #[derive(Debug)]
 struct PushedExecServerResult {
     process_read_requests: usize,
     process_start: Value,
 }
 
-async fn read_exec_server_json(websocket: &mut WebSocketStream<TcpStream>) -> Value {
+async fn read_exec_server_json(
+    websocket: &mut WebSocketStream<TcpStream>,
+    wait: Duration,
+) -> Value {
     loop {
-        match timeout(Duration::from_secs(5), websocket.next())
+        match timeout(wait, websocket.next())
             .await
             .expect("websocket read should not time out")
             .expect("websocket should stay open")
@@ -111,7 +123,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
     let (stream, _) = listener.accept().await.expect("connection");
     let mut websocket = accept_async(stream).await.expect("websocket handshake");
 
-    let initialize = read_exec_server_json(&mut websocket).await;
+    let initialize = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
     assert_eq!(initialize["method"], "initialize");
     send_exec_server_json(
         &mut websocket,
@@ -121,7 +133,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
         }),
     )
     .await;
-    let initialized = read_exec_server_json(&mut websocket).await;
+    let initialized = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
     assert_eq!(initialized["method"], "initialized");
 
     websocket
@@ -131,7 +143,7 @@ async fn send_environment_info(
     websocket: &mut WebSocketStream<TcpStream>,
     scenario: PushedExecScenario,
 ) {
-    let info = read_exec_server_json(websocket).await;
+    let info = read_exec_server_json(websocket, STARTUP_TIMEOUT).await;
     assert_eq!(info["method"], "environment/info");
     respond_environment_info(websocket, &info["id"], scenario).await;
 }
@@ -172,7 +184,8 @@ async fn serve_exec_with_pushed_events(
     send_environment_info(&mut websocket, scenario).await;
 
     let process_start = loop {
-        let request = read_exec_server_json(&mut websocket).await;
+        // The runtime may still be finishing local setup before its first tool call.
+        let request = read_exec_server_json(&mut websocket, STARTUP_TIMEOUT).await;
         match request["method"].as_str() {
             Some("process/start") => break request,
             Some("environment/info") => {
@@ -421,7 +434,7 @@ async fn serve_exec_with_pushed_events(
 
     let mut process_read_requests = 0;
     loop {
-        let request = read_exec_server_json(&mut websocket).await;
+        let request = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
         match request["method"].as_str() {
             Some("process/read") => {
                 process_read_requests += 1;
@@ -532,28 +545,36 @@ async fn serve_exec_with_pushed_events(
     }
 }
 
-#[test_case(PushedExecScenario::Complete, false, false, false ; "complete_event_stream")]
-#[test_case(PushedExecScenario::DirectDenied, false, false, false ; "direct_sandbox_denial")]
-#[test_case(PushedExecScenario::LegacyExit, false, false, false ; "legacy_exit_metadata")]
-#[test_case(PushedExecScenario::ReplayGap, false, false, false ; "truncated_event_replay")]
-#[test_case(PushedExecScenario::Complete, true, true, false ; "managed_network_uses_executor_proxy_launch")]
-#[test_case(PushedExecScenario::Complete, true, false, false ; "strict_managed_allowlist_omits_policy_callbacks")]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, true, true, true ; "foreign_windows_managed_network_preserves_approval_registration"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, false, false, true ; "foreign_windows_workspace_sandbox"))]
-#[test_case(PushedExecScenario::ElevatedPowerShell, false, false, true ; "windows_elevated_powershell_disables_profile")]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedInterceptedPatch, false, false, true ; "foreign_windows_intercepted_patch_is_sandboxed"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatch, false, false, true ; "foreign_windows_direct_patch_is_sandboxed"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchDenied, false, false, true ; "foreign_windows_direct_patch_denial_requests_approval"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchRetry, false, false, true ; "foreign_windows_direct_patch_denial_approval_retries_unsandboxed"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::UnsandboxedInterceptedPatch, false, false, true ; "foreign_windows_unsandboxed_intercepted_patch_succeeds"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::FullDiskInterceptedPatch, false, false, true ; "foreign_windows_full_disk_intercepted_patch_succeeds"))]
+#[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::None, false ; "complete_event_stream")]
+#[test_case(PushedExecScenario::DirectDenied, ManagedNetworkScenario::None, false ; "direct_sandbox_denial")]
+#[test_case(PushedExecScenario::LegacyExit, ManagedNetworkScenario::None, false ; "legacy_exit_metadata")]
+#[test_case(PushedExecScenario::ReplayGap, ManagedNetworkScenario::None, false ; "truncated_event_replay")]
+#[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: true }, false ; "managed_network_uses_executor_proxy_launch")]
+#[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: false }, false ; "strict_managed_allowlist_omits_policy_callbacks")]
+#[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Disabled, false ; "disabled_managed_network_omits_executor_proxy_launch")]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: true }, true ; "foreign_windows_managed_network_preserves_approval_registration"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::None, true ; "foreign_windows_workspace_sandbox"))]
+#[test_case(PushedExecScenario::ElevatedPowerShell, ManagedNetworkScenario::None, true ; "windows_elevated_powershell_disables_profile")]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedInterceptedPatch, ManagedNetworkScenario::None, true ; "foreign_windows_intercepted_patch_is_sandboxed"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatch, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_is_sandboxed"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchDenied, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_denial_requests_approval"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchRetry, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_denial_approval_retries_unsandboxed"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::UnsandboxedInterceptedPatch, ManagedNetworkScenario::None, true ; "foreign_windows_unsandboxed_intercepted_patch_succeeds"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::FullDiskInterceptedPatch, ManagedNetworkScenario::None, true ; "foreign_windows_full_disk_intercepted_patch_succeeds"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_command_consumes_pushed_remote_process_events(
     scenario: PushedExecScenario,
-    managed_network: bool,
-    policy_callbacks: bool,
+    managed_network: ManagedNetworkScenario,
     foreign_cwd: bool,
 ) -> Result<()> {
+    let managed_network_configured = !matches!(managed_network, ManagedNetworkScenario::None);
+    let managed_network_enabled = matches!(managed_network, ManagedNetworkScenario::Enabled { .. });
+    let policy_callbacks = matches!(
+        managed_network,
+        ManagedNetworkScenario::Enabled {
+            policy_callbacks: true
+        }
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server = start_mock_server().await;
     let tool_call = match scenario {
@@ -601,11 +622,14 @@ async fn exec_command_consumes_pushed_remote_process_events(
     let exec_server_url = format!("ws://{}", listener.local_addr()?);
     let exec_server = tokio::spawn(serve_exec_with_pushed_events(listener, scenario));
     let mut builder = test_codex().with_exec_server_url(exec_server_url);
-    if managed_network {
-        let cloud_config_bundle = if policy_callbacks {
-            managed_network_requirements_loader()
-        } else {
-            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+    if managed_network_configured {
+        let cloud_config_bundle = match managed_network {
+            ManagedNetworkScenario::Enabled {
+                policy_callbacks: true,
+            } => managed_network_requirements_loader(),
+            ManagedNetworkScenario::Enabled {
+                policy_callbacks: false,
+            } => CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 r#"
 [experimental_network]
 enabled = true
@@ -615,7 +639,16 @@ managed_allowed_domains_only = true
 [experimental_network.domains]
 "allowed.example.com" = "allow"
 "#,
-            )
+            ),
+            ManagedNetworkScenario::Disabled => {
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                    r#"
+[experimental_network]
+enabled = false
+"#,
+                )
+            }
+            ManagedNetworkScenario::None => unreachable!("managed network is not configured"),
         };
         builder = builder
             .with_cloud_config_bundle(cloud_config_bundle)
@@ -653,18 +686,16 @@ timeout = 900
         if matches!(scenario, PushedExecScenario::ElevatedPowerShell) {
             config.set_windows_elevated_sandbox_enabled(/*value*/ true);
         }
-        if managed_network {
+        if managed_network_configured {
             #[cfg(windows)]
             config.set_windows_sandbox_enabled(/*value*/ true);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
             config.bypass_hook_trust = true;
         }
     });
-    let test = timeout(Duration::from_secs(5), builder.build(&server))
-        .await
-        .context("thread startup should connect to the fake exec-server")??;
+    let test = expect_startup(builder.build(&server)).await;
 
-    let turn_permission_profile = if managed_network {
+    let turn_permission_profile = if managed_network_configured {
         test.session_configured.permission_profile.clone()
     } else if matches!(scenario, PushedExecScenario::FullDiskInterceptedPatch) {
         PermissionProfile::from_runtime_permissions(
@@ -707,7 +738,7 @@ timeout = 900
                     )
                 }),
                 approval_policy: Some(
-                    if managed_network
+                    if managed_network_configured
                         || matches!(
                             scenario,
                             PushedExecScenario::SandboxedDirectPatchDenied
@@ -735,7 +766,7 @@ timeout = 900
         .await?;
     let mut saw_exec_command_begin = false;
     let mut saw_patch_denial_approval = false;
-    if !managed_network {
+    if !managed_network_enabled {
         loop {
             let event = timeout(Duration::from_secs(5), test.codex.next_event())
                 .await
@@ -891,7 +922,7 @@ timeout = 900
         );
         return Ok(());
     }
-    let cleanup_timeout = if managed_network {
+    let cleanup_timeout = if managed_network_enabled {
         Duration::from_secs(15)
     } else {
         Duration::from_secs(5)
@@ -919,7 +950,7 @@ timeout = 900
             assert_eq!(params["sandbox"]["windowsSandboxLevel"], "restricted-token");
         }
     }
-    if managed_network {
+    if managed_network_enabled {
         let params = &exec_server_result.process_start["params"];
         assert_eq!(params["enforceManagedNetwork"], true);
         assert_eq!(params["managedNetwork"], Value::Null);
@@ -940,6 +971,13 @@ timeout = 900
         .await
         .context("model should receive the remote exec output")?;
         return Ok(());
+    }
+    if matches!(managed_network, ManagedNetworkScenario::Disabled) {
+        let params = &exec_server_result.process_start["params"];
+        assert_eq!(params["enforceManagedNetwork"], false);
+        assert_eq!(params["managedNetwork"], Value::Null);
+        assert_eq!(params["networkProxy"], Value::Null);
+        assert_eq!(params["env"]["HTTP_PROXY"], Value::Null);
     }
     let request = response_mock
         .last_request()

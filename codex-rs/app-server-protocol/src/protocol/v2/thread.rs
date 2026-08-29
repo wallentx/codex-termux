@@ -6,12 +6,15 @@ use super::SandboxPolicy;
 use super::Thread;
 use super::ThreadHistoryMode;
 use super::ThreadItem;
+use super::ThreadRealtimeItem;
 use super::ThreadSection;
 use super::ThreadSectionAppearance;
 use super::ThreadSource;
 use super::Turn;
 use super::TurnEnvironmentParams;
+use super::TurnError;
 use super::TurnItemsView;
+use super::TurnStatus;
 use super::UserInput;
 use super::shared::v2_enum_from_core;
 use crate::JsonSchema;
@@ -394,8 +397,9 @@ pub struct ThreadResumeParams {
     pub personality: Option<Personality>,
     /// When true, return only thread metadata and live-resume state without
     /// populating `thread.turns`. This is useful when the client plans to call
-    /// `thread/turns/list` immediately after resuming.
-    #[experimental("thread/resume.excludeTurns")]
+    /// `thread/turns/list` immediately after resuming. Full-history hydration
+    /// is deprecated for paginated threads; use this with `thread/turns/list`
+    /// and `thread/items/list` instead.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclude_turns: bool,
     /// When present, include a `thread/turns/list` page in the resume response
@@ -447,14 +451,12 @@ pub struct ThreadResumeResponse {
     ///
     /// Pass this as `cursor` to `thread/turns/list` with
     /// `sortDirection: "desc"`. The first page includes the turn identified by the cursor.
-    #[experimental("thread/resume.turnsBackwardsCursor")]
     #[serde(default)]
     pub turns_backwards_cursor: Option<String>,
     /// Opaque cursor for hydrating paginated items backwards.
     ///
     /// Pass this as `cursor` to `thread/items/list` with
     /// `sortDirection: "desc"`. The first page includes the item identified by the cursor.
-    #[experimental("thread/resume.itemsBackwardsCursor")]
     #[serde(default)]
     pub items_backwards_cursor: Option<String>,
 }
@@ -585,8 +587,9 @@ pub struct ThreadForkParams {
     pub thread_source: Option<ThreadSource>,
     /// When true, return only thread metadata and live fork state without
     /// populating `thread.turns`. This is useful when the client plans to call
-    /// `thread/turns/list` immediately after forking.
-    #[experimental("thread/fork.excludeTurns")]
+    /// `thread/turns/list` immediately after forking. Full-history hydration
+    /// is deprecated for paginated threads; use this with `thread/turns/list`
+    /// and `thread/items/list` instead.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclude_turns: bool,
     /// When true, carry the source thread's current goal into the fork without
@@ -1126,6 +1129,12 @@ pub struct ThreadShellCommandParams {
     /// such as pipes, redirects, and quoting. This runs unsandboxed with full
     /// access rather than inheriting the thread sandbox policy.
     pub command: String,
+    /// Maximum execution time in milliseconds. Defaults to one hour when omitted
+    /// or null. Must be non-negative; zero requests an immediate timeout, not
+    /// unlimited execution. Does not affect the immediate RPC acknowledgement.
+    #[ts(type = "number | null")]
+    #[ts(optional = nullable)]
+    pub timeout_ms: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1497,7 +1506,7 @@ pub enum ThreadSearchSortKey {
     RecencyAt,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
 pub enum SortDirection {
@@ -1647,6 +1656,9 @@ pub enum ThreadActiveFlag {
 pub struct ThreadReadParams {
     pub thread_id: String,
     /// When true, include turns and their items from rollout history.
+    /// Full-history hydration is deprecated for paginated threads; prefer a
+    /// metadata-only read and page with `thread/turns/list` and
+    /// `thread/items/list`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_turns: bool,
 }
@@ -1747,6 +1759,75 @@ pub struct ThreadItemsListResponse {
     pub backwards_cursor: Option<String>,
 }
 
+/// EXPERIMENTAL - list ordinary and realtime thread history in rollout order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadTimelineListParams {
+    pub thread_id: String,
+    #[ts(optional = nullable)]
+    pub cursor: Option<String>,
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+}
+
+/// EXPERIMENTAL - one item or turn boundary in canonical rollout order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(tag = "type", rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadTimelineEntry {
+    Item {
+        #[ts(type = "number")]
+        position: u64,
+        #[schemars(rename = "turnId")]
+        #[serde(rename = "turnId")]
+        #[ts(rename = "turnId")]
+        turn_id: String,
+        item: Box<ThreadItem>,
+    },
+    Realtime {
+        #[ts(type = "number")]
+        position: u64,
+        item: ThreadRealtimeItem,
+    },
+    TurnStarted {
+        #[ts(type = "number")]
+        position: u64,
+        #[ts(rename = "turnId")]
+        turn_id: String,
+        #[ts(rename = "startedAt", type = "number | null")]
+        started_at: Option<i64>,
+    },
+    TurnCompleted {
+        #[ts(type = "number")]
+        position: u64,
+        #[ts(rename = "turnId")]
+        turn_id: String,
+        status: TurnStatus,
+        error: Option<TurnError>,
+        #[ts(rename = "startedAt", type = "number | null")]
+        started_at: Option<i64>,
+        #[ts(rename = "completedAt", type = "number | null")]
+        completed_at: Option<i64>,
+        #[ts(rename = "durationMs", type = "number | null")]
+        duration_ms: Option<i64>,
+    },
+}
+
+/// EXPERIMENTAL - a bounded timeline page with its resolved opening voice state.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadTimelineListResponse {
+    pub data: Vec<ThreadTimelineEntry>,
+    pub next_cursor: Option<String>,
+    pub active_realtime_session_at_page_start: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1766,6 +1847,23 @@ pub struct RawResponseCompletedNotification {
     pub turn_id: String,
     pub response_id: String,
     pub usage: Option<TokenUsageBreakdown>,
+    pub usage_metadata: Option<ResponseUsageMetadata>,
+}
+
+/// Usage metadata reported for one upstream response.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ResponseUsageMetadata {
+    pub amount: Option<String>,
+}
+
+impl From<codex_protocol::ResponseUsageMetadata> for ResponseUsageMetadata {
+    fn from(value: codex_protocol::ResponseUsageMetadata) -> Self {
+        Self {
+            amount: value.amount,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

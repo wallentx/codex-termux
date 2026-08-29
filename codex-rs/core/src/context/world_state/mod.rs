@@ -10,6 +10,7 @@ mod model;
 mod multi_agent_mode;
 mod multi_agent_usage_hint;
 mod permissions;
+mod persistent_mode;
 mod personality;
 mod plugins_instructions;
 mod realtime;
@@ -22,6 +23,7 @@ use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
 use codex_extension_api::WorldStateSectionContribution;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -48,6 +50,7 @@ pub(crate) use model::ModelInstructionsState;
 pub(crate) use multi_agent_mode::MultiAgentModeState;
 pub(crate) use multi_agent_usage_hint::MultiAgentUsageHintState;
 pub(crate) use permissions::PermissionsState;
+pub(crate) use persistent_mode::PersistentModeState;
 pub(crate) use personality::PersonalityState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
 pub(crate) use realtime::RealtimeState;
@@ -167,25 +170,35 @@ impl ErasedWorldStateSection for ExtensionWorldStateSection {
             PreviousSectionState::Unknown => PreviousWorldStateSection::Unknown,
             PreviousSectionState::Known(previous) => PreviousWorldStateSection::Known(previous),
         };
-        self.0
-            .render_diff(previous)
-            .map(|fragment| Box::new(WorldStateContextFragment(fragment)) as _)
+        self.0.render_diff(previous).map(|fragment| {
+            Box::new(WorldStateContextFragment {
+                fragment,
+                content_kind: ContentItemKind(format!("{}.instructions", self.0.id())),
+            }) as _
+        })
     }
 }
 
-struct WorldStateContextFragment(RenderedWorldStateFragment);
+struct WorldStateContextFragment {
+    fragment: RenderedWorldStateFragment,
+    content_kind: ContentItemKind,
+}
 
 impl ContextualUserFragment for WorldStateContextFragment {
+    fn content_kind(&self) -> ContentItemKind {
+        self.content_kind.clone()
+    }
+
     fn role(&self) -> &'static str {
-        self.0.role()
+        self.fragment.role()
     }
 
     fn markers(&self) -> (&'static str, &'static str) {
-        self.0.markers()
+        self.fragment.markers()
     }
 
     fn body(&self) -> String {
-        self.0.body().to_string()
+        self.fragment.body().to_string()
     }
 
     fn type_markers() -> (&'static str, &'static str) {

@@ -20,12 +20,20 @@ const MIN_MODEL_CONTEXT_ITEM_TOKENS: usize = 100;
 const MAX_MODEL_CONTEXT_ITEM_TOKENS: usize = 100_000;
 const DEFAULT_REVIEW_THRESHOLD: f64 = 0.5;
 const LEGACY_REVIEW_THRESHOLD: f64 = 0.8;
-const DEFAULT_MAX_TOOL_CALL_LAG: usize = 3;
+const DEFAULT_MAX_TOOL_CALL_LAG: usize = 2;
 pub(crate) const DEFAULT_CLASSIFIER_INSTRUCTIONS: &str = include_str!("classifier_instructions.md");
+pub(crate) const CLASSIFICATION_OUTPUT_INSTRUCTIONS: &str = "Your first output token is the entire classification: `high` for high risk or `low` for low risk. Output that token immediately and nothing else.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuardianV2ReviewScope {
+    Standard { sandboxed_exec_commands: bool },
+    ComputerUseOnly,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GuardianV2Config {
     local_overrides: GuardianV2ConfigToml,
+    pub(crate) persist_scores: bool,
     pub(crate) classifier_instructions: String,
     pub(crate) review_threshold: f64,
     pub(crate) max_tool_call_lag: usize,
@@ -35,7 +43,7 @@ pub(crate) struct GuardianV2Config {
     pub(crate) max_classifier_instruction_tokens: Option<usize>,
     pub(crate) reuse_parent_compaction: bool,
     pub(crate) max_parent_compaction_tokens: usize,
-    pub(crate) sandboxed_exec_commands: bool,
+    pub(crate) review_scope: GuardianV2ReviewScope,
     pub(crate) transcript: TranscriptConfig,
 }
 
@@ -222,6 +230,7 @@ impl GuardianV2Config {
 
         Ok(Self {
             local_overrides: configured.clone(),
+            persist_scores: configured.persist_scores.unwrap_or(false),
             classifier_instructions: configured
                 .classifier_instructions
                 .unwrap_or_else(|| DEFAULT_CLASSIFIER_INSTRUCTIONS.to_owned()),
@@ -234,11 +243,22 @@ impl GuardianV2Config {
             max_classifier_instruction_tokens,
             reuse_parent_compaction: configured.reuse_parent_compaction.unwrap_or(true),
             max_parent_compaction_tokens,
-            sandboxed_exec_commands: configured
+            review_scope: if configured
                 .review_scope
                 .as_ref()
-                .and_then(|review_scope| review_scope.sandboxed_exec_commands)
-                .unwrap_or(false),
+                .and_then(|review_scope| review_scope.computer_use_only)
+                .unwrap_or(true)
+            {
+                GuardianV2ReviewScope::ComputerUseOnly
+            } else {
+                GuardianV2ReviewScope::Standard {
+                    sandboxed_exec_commands: configured
+                        .review_scope
+                        .as_ref()
+                        .and_then(|review_scope| review_scope.sandboxed_exec_commands)
+                        .unwrap_or(false),
+                }
+            },
             transcript: TranscriptConfig {
                 sources: transcript_config
                     .and_then(|transcript| transcript.sources.clone())
@@ -247,7 +267,7 @@ impl GuardianV2Config {
                     }),
                 include_images: transcript_config
                     .and_then(|transcript| transcript.include_images)
-                    .unwrap_or(false),
+                    .unwrap_or(true),
                 max_message_entry_tokens,
                 max_tool_entry_tokens,
                 max_message_transcript_tokens,
@@ -269,6 +289,14 @@ impl GuardianV2Config {
                 "{}\n\n# Security Policy\n{policy}",
                 self.classifier_instructions
             )
+        };
+        let instructions = if instructions
+            .trim_end()
+            .ends_with(CLASSIFICATION_OUTPUT_INSTRUCTIONS)
+        {
+            instructions
+        } else {
+            format!("{instructions}\n\n{CLASSIFICATION_OUTPUT_INSTRUCTIONS}")
         };
         match self.max_classifier_instruction_tokens {
             Some(max_tokens) => truncate_entry(&instructions, max_tokens),

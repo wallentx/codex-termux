@@ -11,15 +11,21 @@ mod key_chords;
 #[path = "tests/mcp_startup.rs"]
 mod mcp_startup;
 mod model_catalog;
+#[path = "tests/patch_approval_tests.rs"]
+mod patch_approval_tests;
 #[path = "tests/permission_shortcuts_tests.rs"]
 mod permission_shortcuts_tests;
 mod plugin_catalog;
 mod rate_limits;
+#[path = "tests/recap_generation_tests.rs"]
+mod recap_generation;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
 mod session_summary;
 mod startup;
+#[path = "tests/stream_animation_tests.rs"]
+mod stream_animation_tests;
 #[path = "tests/thread_usage.rs"]
 mod thread_usage;
 #[path = "tests/turn_submission.rs"]
@@ -2187,15 +2193,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
 
     runtime.block_on(async {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
-        let root = app_server
-            .start_thread(app.chat_widget.config_ref())
-            .await?;
-        let root_thread_id = root.session.thread_id;
-        app.enqueue_primary_thread_session(root.session, root.turns)
-            .await?;
-
+        let root_thread_id = ThreadId::new();
         let rollout_dir = app
             .config
             .codex_home
@@ -2204,6 +2202,29 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             .join("01")
             .join("01");
         std::fs::create_dir_all(&rollout_dir)?;
+        let root_session_meta = SessionMeta {
+            session_id: root_thread_id.into(),
+            id: root_thread_id,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            cwd: app.config.cwd.to_path_buf(),
+            originator: "codex-tui-test".to_string(),
+            cli_version: "0.0.0".to_string(),
+            source: RolloutSessionSource::Cli,
+            model_provider: Some(app.config.model_provider_id.clone()),
+            multi_agent_version: Some(MultiAgentVersion::V2),
+            ..SessionMeta::default()
+        };
+        let root_session_meta_line = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": serde_json::to_value(root_session_meta)?,
+        });
+        std::fs::write(
+            rollout_dir.join(format!(
+                "rollout-2026-01-01T00-00-00-{root_thread_id}.jsonl"
+            )),
+            format!("{root_session_meta_line}\n"),
+        )?;
         let mut child_thread_ids = Vec::new();
         for (index, multi_agent_version) in [MultiAgentVersion::V1, MultiAgentVersion::V2]
             .into_iter()
@@ -2212,7 +2233,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             let child_thread_id = ThreadId::new();
             let timestamp = format!("2026-01-01T00:00:0{index}Z");
             let session_meta = SessionMeta {
-                session_id: child_thread_id.into(),
+                session_id: root_thread_id.into(),
                 id: child_thread_id,
                 parent_thread_id: Some(root_thread_id),
                 timestamp: timestamp.clone(),
@@ -2239,7 +2260,26 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 "payload": serde_json::to_value(session_meta)?,
             });
             std::fs::write(rollout_path, format!("{session_meta_line}\n"))?;
+            child_thread_ids.push(child_thread_id);
+        }
 
+        // Cold-resume the persisted V2 root so its children are registered before selection.
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+        let root = app_server
+            .resume_thread(
+                app.config.clone(),
+                root_thread_id,
+                crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+            )
+            .await?;
+        app.enqueue_primary_thread_session(root.session, root.turns)
+            .await?;
+        for (child_thread_id, multi_agent_version) in child_thread_ids
+            .iter()
+            .copied()
+            .zip([MultiAgentVersion::V1, MultiAgentVersion::V2])
+        {
             assert!(
                 app.attach_live_thread_for_selection(&mut app_server, child_thread_id)
                     .await?
@@ -2248,7 +2288,6 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 app.agent_navigation.is_parent_owned(child_thread_id),
                 multi_agent_version == MultiAgentVersion::V2
             );
-            child_thread_ids.push(child_thread_id);
         }
 
         app.agent_navigation
@@ -4762,6 +4801,7 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
             session: test_thread_session(child_thread_id, test_path_buf("/tmp/child")),
             turns: Vec::new(),
             blocks_direct_input: false,
+            task_tools_available: false,
         },
         &mut child_snapshot,
     )
@@ -5016,7 +5056,7 @@ async fn discard_side_thread_keeps_local_state_when_server_close_fails() -> Resu
 
 #[tokio::test]
 async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -> Result<()> {
-    let mut app = make_test_app().await;
+    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
     let mut app_server =
         crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
     let parent_thread_id = ThreadId::new();
@@ -5032,9 +5072,21 @@ async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -
         Some("side".to_string()),
         /*is_closed*/ false,
     );
+    app.dynamic_tool_tasks.insert(
+        AppServerRequestId::Integer(123),
+        (
+            side_thread_id.to_string(),
+            tokio::spawn(std::future::pending::<()>()),
+        ),
+    );
     app.discard_side_thread_in_background(&mut app_server, side_thread_id)
         .await;
 
+    assert_matches!(
+        events.try_recv(),
+        Ok(AppEvent::DynamicToolCallCompleted { response, .. }) if !response.success
+    );
+    assert!(app.dynamic_tool_tasks.is_empty());
     assert_eq!(app.active_thread_id, Some(parent_thread_id));
     assert!(!app.side_threads.contains_key(&side_thread_id));
     assert!(!app.thread_event_channels.contains_key(&side_thread_id));
@@ -5385,7 +5437,7 @@ async fn make_test_app() -> App {
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
         key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
-        commit_anim_running: Arc::new(AtomicBool::new(false)),
+        commit_animation: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         skill_load_warnings: SkillLoadWarningState::default(),
@@ -5399,6 +5451,7 @@ async fn make_test_app() -> App {
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
+        temporary_structured_requests: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         agents_overview: Default::default(),
@@ -5411,12 +5464,15 @@ async fn make_test_app() -> App {
         primary_session_configured: None,
         pending_primary_events: VecDeque::new(),
         pending_app_server_requests: PendingAppServerRequests::default(),
+        dynamic_tool_status_updates: tokio::sync::broadcast::channel(/*capacity*/ 64).0,
+        dynamic_tool_tasks: HashMap::new(),
         pending_startup_thread_start: false,
         startup_protected_input_boundary: false,
         startup_pending_protected_request: false,
         rate_limit_hard_stop_generation: 0,
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
+        recap: recap::RecapState::default(),
     }
 }
 
@@ -5462,7 +5518,7 @@ async fn make_test_app_with_channels() -> (
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
             key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
+            commit_animation: None,
             status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             skill_load_warnings: SkillLoadWarningState::default(),
@@ -5476,6 +5532,7 @@ async fn make_test_app_with_channels() -> (
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
+            temporary_structured_requests: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             agents_overview: Default::default(),
@@ -5488,12 +5545,15 @@ async fn make_test_app_with_channels() -> (
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
+            dynamic_tool_status_updates: tokio::sync::broadcast::channel(/*capacity*/ 64).0,
+            dynamic_tool_tasks: HashMap::new(),
             pending_startup_thread_start: false,
             startup_protected_input_boundary: false,
             startup_pending_protected_request: false,
             rate_limit_hard_stop_generation: 0,
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
+            recap: recap::RecapState::default(),
         },
         rx,
         op_rx,
@@ -6270,6 +6330,7 @@ fn exec_approval_request(
     ServerRequest::CommandExecutionRequestApproval {
         request_id: AppServerRequestId::Integer(1),
         params: CommandExecutionRequestApprovalParams {
+            kind: Default::default(),
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
             item_id: item_id.to_string(),
@@ -6436,6 +6497,7 @@ fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
 #[test]
 fn active_turn_not_steerable_turn_error_extracts_structured_server_error() {
     let turn_error = AppServerTurnError {
+        misalignment: None,
         message: "cannot steer a review turn".to_string(),
         codex_error_info: Some(AppServerCodexErrorInfo::ActiveTurnNotSteerable {
             turn_kind: AppServerNonSteerableTurnKind::Review,
@@ -7634,6 +7696,7 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
             session: resumed_session.clone(),
             turns: resumed_turns.clone(),
             blocks_direct_input: true,
+            task_tools_available: false,
         },
         &mut snapshot,
     )
@@ -7653,6 +7716,13 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
     let store_snapshot = store.snapshot();
     assert_eq!(store_snapshot.session, Some(resumed_session));
     assert_eq!(store_snapshot.turns, snapshot.turns);
+    assert_eq!(
+        store.recap_progress(),
+        recap::RecapProgress {
+            completed_turns: 1,
+            last_recapped_turn_count: None,
+        }
+    );
 }
 
 #[tokio::test]

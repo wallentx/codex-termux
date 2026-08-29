@@ -45,6 +45,7 @@ use super::ConfiguredHandler;
 use super::ConfiguredHandlerKind;
 use super::HandlerSourcePath;
 use super::HookListEntryHandler;
+use crate::events::interrupt::InterruptRequest;
 use crate::events::pre_tool_use::PreToolUseRequest;
 use crate::events::stop::StopHookTarget;
 use crate::events::stop::StopRequest;
@@ -2219,6 +2220,110 @@ fn executor_stop_hooks_register_only_the_first_environment_and_handler() {
 }
 
 #[tokio::test]
+async fn executor_interrupt_hooks_register_and_run() {
+    let (mut engine, calls, stop_request, expected_stop_call, mut source) =
+        executor_stop_hook_fixture();
+    source.hooks.interrupt = source.hooks.stop.clone();
+    engine.set_executor_hooks(vec![source]);
+
+    assert_eq!(
+        engine
+            .handlers
+            .iter()
+            .map(|handler| handler.event_name)
+            .collect::<Vec<_>>(),
+        vec![HookEventName::Stop, HookEventName::Interrupt]
+    );
+    assert_eq!(engine.preview_interrupt(), Vec::new());
+
+    let outcome = engine
+        .run_interrupt(InterruptRequest {
+            session_id: stop_request.session_id,
+            turn_id: stop_request.turn_id,
+            cwd: stop_request.cwd,
+            transcript_path: stop_request.transcript_path,
+            model: stop_request.model,
+            permission_mode: stop_request.permission_mode,
+            request_metadata: stop_request.request_metadata,
+        })
+        .await;
+    wait_for_mcp_calls(&calls, /*count*/ 1).await;
+
+    assert!(outcome.hook_events.is_empty());
+    assert_eq!(
+        *calls.lock().expect("lock MCP calls"),
+        vec![expected_stop_call]
+    );
+}
+
+#[test]
+fn executor_hooks_use_one_environment_for_all_events() {
+    let (mut engine, _, _, _, mut first_source) = executor_stop_hook_fixture();
+    first_source.hooks.interrupt = std::mem::take(&mut first_source.hooks.stop);
+    engine.set_executor_hooks(vec![first_source.clone()]);
+    let expected_handlers = engine.handlers.clone();
+    let mut second_source = first_source.clone();
+    second_source.environment_id = "executor-b".to_string();
+    second_source.hooks.stop = std::mem::take(&mut second_source.hooks.interrupt);
+
+    engine.set_executor_hooks(vec![first_source, second_source]);
+
+    assert_eq!(engine.handlers, expected_handlers);
+}
+
+#[tokio::test]
+async fn memory_consolidation_stop_preserves_policy_and_executor_cleanup() {
+    for (source, runs_policy) in [
+        (HookSource::User, false),
+        (HookSource::Project, false),
+        (HookSource::SessionFlags, false),
+        (HookSource::Plugin, false),
+        (HookSource::System, true),
+        (HookSource::Mdm, true),
+        (HookSource::CloudRequirements, true),
+        (HookSource::CloudManagedConfig, true),
+        (HookSource::LegacyManagedConfigFile, true),
+        (HookSource::LegacyManagedConfigMdm, true),
+        (HookSource::Unknown, true),
+    ] {
+        let (mut engine, calls, mut request, expected_executor_call, _source) =
+            executor_stop_hook_fixture();
+        request.target = StopHookTarget::MemoryConsolidation;
+        let policy_call = HookMcpCall {
+            server: "security".to_string(),
+            tool: "check".to_string(),
+            environment_id: None,
+            metadata: None,
+            input: Default::default(),
+            timeout: Duration::from_secs(5),
+        };
+        let mut handler = engine.handlers[0].clone();
+        handler.source_path = cwd().join("hooks.json").into();
+        handler.source = source;
+        handler.kind = ConfiguredHandlerKind::McpTool {
+            server: policy_call.server.clone(),
+            tool: policy_call.tool.clone(),
+            input: policy_call.input.clone(),
+        };
+        engine.handlers.push(handler);
+        assert_eq!(
+            engine.preview_stop(&request).len(),
+            usize::from(runs_policy)
+        );
+
+        let outcome = engine.run_stop(request).await;
+        let expected_calls = if runs_policy {
+            vec![policy_call, expected_executor_call]
+        } else {
+            vec![expected_executor_call]
+        };
+        wait_for_mcp_calls(&calls, expected_calls.len()).await;
+        assert_eq!(*calls.lock().expect("lock MCP calls"), expected_calls);
+        assert_eq!(outcome.should_block, runs_policy);
+    }
+}
+
+#[tokio::test]
 async fn executor_stop_hooks_do_not_delay_stop_completion() {
     struct BlockingMcpExecutor {
         started: Arc<Notify>,
@@ -2356,6 +2461,110 @@ async fn mcp_tool_hooks_expand_event_input_and_apply_pre_tool_decisions() {
             }))
             .expect("object input"),
             timeout: Duration::from_secs(20),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn mcp_interrupt_hooks_expand_event_input_and_bound_timeout() {
+    let temp = tempdir().expect("create temp dir");
+    let config_path =
+        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path");
+    fs::write(
+        temp.path().join("hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "Interrupt": [{
+                    "hooks": [{
+                        "type": "mcp_tool",
+                        "server": "security",
+                        "tool": "notify",
+                        "input": {
+                            "event": "${hook_event_name}",
+                            "turn_id": "${turn_id}",
+                            "permission_mode": "${permission_mode}",
+                        },
+                        "timeout": 20,
+                    }],
+                }],
+            },
+        })
+        .to_string(),
+    )
+    .expect("write MCP Interrupt hooks.json");
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: config_path,
+                profile: None,
+            },
+            TomlValue::Table(Default::default()),
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("config layer stack");
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let executor = StaticMcpExecutor {
+        calls: Arc::clone(&calls),
+        output: serde_json::json!({
+            "systemMessage": "interrupt observed",
+        })
+        .to_string(),
+        outputs_by_tool: HashMap::new(),
+    };
+    let engine = ClaudeHooksEngine::new(
+        /*enabled*/ true,
+        /*bypass_hook_trust*/ true,
+        Some(&config_layer_stack),
+        Vec::new(),
+        Vec::new(),
+        command_runtime(CommandShell {
+            program: String::new(),
+            args: Vec::new(),
+        }),
+        Arc::new(executor),
+    );
+    let outcome = engine
+        .run_interrupt(InterruptRequest {
+            session_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            cwd: cwd(),
+            transcript_path: None,
+            model: "gpt-test".to_string(),
+            permission_mode: "default".to_string(),
+            request_metadata: None,
+        })
+        .await;
+
+    assert_eq!(outcome.hook_events.len(), 1);
+    assert_eq!(
+        outcome.hook_events[0].run.handler_type,
+        HookHandlerType::McpTool
+    );
+    assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Completed);
+    assert_eq!(
+        outcome.hook_events[0].run.entries,
+        vec![HookOutputEntry {
+            kind: HookOutputEntryKind::Warning,
+            text: "interrupt observed".to_string(),
+        }]
+    );
+    assert_eq!(
+        *calls.lock().expect("lock MCP calls"),
+        vec![HookMcpCall {
+            server: "security".to_string(),
+            tool: "notify".to_string(),
+            environment_id: None,
+            metadata: None,
+            input: serde_json::from_value(serde_json::json!({
+                "event": "Interrupt",
+                "turn_id": "turn-1",
+                "permission_mode": "default",
+            }))
+            .expect("object input"),
+            timeout: Duration::from_secs(3),
         }]
     );
 }

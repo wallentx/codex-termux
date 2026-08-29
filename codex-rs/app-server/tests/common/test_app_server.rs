@@ -113,6 +113,7 @@ use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadShellCommandParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadTimelineListParams;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -1191,6 +1192,14 @@ impl TestAppServer {
         self.send_request("thread/realtime/stop", params).await
     }
 
+    pub async fn send_thread_timeline_list_request(
+        &mut self,
+        params: ThreadTimelineListParams,
+    ) -> anyhow::Result<i64> {
+        self.send_request("thread/timeline/list", Some(serde_json::to_value(params)?))
+            .await
+    }
+
     pub async fn send_thread_realtime_list_voices_request(
         &mut self,
         params: ThreadRealtimeListVoicesParams,
@@ -1549,7 +1558,7 @@ impl TestAppServer {
         tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, self.read_response(request_id)).await?
     }
 
-    async fn send_request(
+    pub async fn send_request(
         &mut self,
         method: &str,
         params: Option<serde_json::Value>,

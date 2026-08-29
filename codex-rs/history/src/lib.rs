@@ -23,6 +23,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::WorldStateItem;
+use codex_protocol::realtime::RealtimeItem;
 use codex_protocol::security_risk::SecurityRiskScore;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -47,6 +48,11 @@ pub struct CodexHarnessMetadata {
     /// Whether a developer message was supplied by an app-server client.
     #[serde(default)]
     pub client_authored: bool,
+
+    /// Overrides history's fallback truncation budget, including on resume.
+    /// Measured in tokens, with any tool-specific allowance already included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_token_limit_override: Option<usize>,
 }
 
 impl ResponseItemEnvelope {
@@ -96,12 +102,16 @@ pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
     ResponseItem(ResponseItemEnvelope),
     InterAgentCommunication(InterAgentCommunication),
-    InterAgentCommunicationMetadata { trigger_turn: bool },
+    InterAgentCommunicationMetadata {
+        trigger_turn: bool,
+    },
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
     SecurityRiskScore(SecurityRiskScore),
     EventMsg(EventMsg),
+    /// Sparse, model-invisible facts used to reconstruct realtime presentation.
+    RealtimeItem(RealtimeItem),
 }
 
 impl Serialize for RolloutItem {
@@ -415,6 +425,7 @@ fn multi_agent_version_from_items(
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::RealtimeItem(_)
             | RolloutItem::EventMsg(_) => None,
         })
     })

@@ -439,6 +439,7 @@ impl App {
     /// This helper copies every known nickname/role from `AgentNavigationState` into the
     /// replacement widget so that replayed collab items render agent names immediately.
     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
+        self.commit_animation = None;
         // Transfer the last-written terminal title to the replacement widget
         // so it knows what OSC title is currently displayed. Without this, the
         // new widget would redundantly clear and rewrite the same title, causing
@@ -529,6 +530,14 @@ impl App {
             &mut snapshot,
         )
         .await;
+        // Refreshing can merge restored turns into the store, so recap progress must be read only
+        // after the refresh while the activated thread channel is still retained.
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            self.chat_widget
+                .add_error_message(format!("Agent thread {thread_id} is no longer available."));
+            return Ok(());
+        };
+        let recap_progress = channel.store.lock().await.recap_progress();
         if snapshot.input_state.is_none() {
             snapshot.input_state = self.agents_overview.input_states.remove(&thread_id);
         }
@@ -537,12 +546,25 @@ impl App {
         self.active_thread_id = Some(thread_id);
         self.active_thread_rx = Some(receiver);
 
+        self.recap.note_focus_gained();
+        self.recap = recap::RecapState::default();
+
+        if !tui.is_terminal_focused() {
+            self.recap.note_focus_lost(Instant::now());
+        }
+        let now = Instant::now();
+        self.recap.seed_from_progress(recap_progress, now);
+        self.recap
+            .schedule_check(thread_id, self.app_event_tx.clone(), now);
+
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
             tui,
             self.config.clone(),
             /*initial_user_message*/ None,
         );
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
+        self.chat_widget
+            .set_task_mentions_enabled(app_server.task_tools_available(thread_id));
         self.chat_widget
             .note_rendered_width(tui.terminal.last_known_screen_size.width);
         if blocks_direct_input {
@@ -638,6 +660,10 @@ impl App {
         match result {
             Ok(started) => {
                 let thread_id = started.session.thread_id;
+                if started.task_tools_available {
+                    app_server.remember_task_tool_thread(thread_id);
+                    self.chat_widget.set_task_mentions_enabled(/*enabled*/ true);
+                }
                 self.pending_primary_events.retain(|event| match event {
                     ThreadBufferedEvent::Notification(notification) => matches!(
                         server_notification_thread_target(notification),
@@ -809,6 +835,8 @@ impl App {
             initial_user_message,
         );
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
+        self.chat_widget
+            .set_task_mentions_enabled(started.task_tools_available);
         self.chat_widget
             .note_rendered_width(tui.terminal.last_known_screen_size.width);
         if started.blocks_direct_input {

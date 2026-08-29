@@ -14,6 +14,7 @@ use crate::guardian::prompt::guardian_policy_prompt_with_config_and_template;
 use crate::guardian::review::guardian_review_session_config;
 use crate::guardian::review::routes_approval_to_guardian_with_reviewer;
 use crate::session::session::Session;
+use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
 use crate::test_support;
 use codex_analytics::GuardianApprovalRequestSource;
@@ -37,12 +38,14 @@ use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::ThreadId;
+use codex_protocol::approvals::GuardianAssessmentAction;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::SandboxPermissions;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -64,6 +67,8 @@ use core_test_support::PathBufExt;
 use core_test_support::TempDirExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
+use core_test_support::responses::assert_parent_turn;
+use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -128,6 +133,9 @@ impl codex_extension_api::ContextContributor for GuardianMemoryContextProbe {
             {
                 vec![codex_extension_api::PromptFragment::developer_policy(
                     GUARDIAN_MEMORY_CONTEXT_PROBE,
+                    codex_extension_api::ContentItemKind(
+                        "guardian.memory_context_probe".to_string(),
+                    ),
                 )]
             } else {
                 Vec::new()
@@ -644,7 +652,7 @@ async fn build_guardian_prompt_includes_parent_turn_denied_reads() -> anyhow::Re
     };
     environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(environment_permission_profile);
-    environment.selection.workspace_roots = vec![
+    environment.config_mut().workspace_roots = vec![
         PathUri::from_abs_path(&workspace_root),
         PathUri::from_abs_path(&second_workspace_root),
     ];
@@ -1181,12 +1189,10 @@ async fn build_guardian_prompt_items_keeps_required_node_repl_reviews_generic() 
 {
     let (session, mut turn) =
         guardian_test_session_and_turn_with_base_url("http://localhost").await;
-    Arc::make_mut(
-        &mut Arc::get_mut(&mut turn)
-            .expect("turn should be uniquely owned")
-            .model_info,
-    )
-    .node_repl_auto_review_required = true;
+    update_turn_settings_for_test(
+        Arc::get_mut(&mut turn).expect("turn should be uniquely owned"),
+        |settings| Arc::make_mut(&mut settings.model_info).node_repl_auto_review_required = true,
+    );
     seed_guardian_parent_history(&session, &turn).await;
     let context = GuardianReviewContext::from(&turn);
 
@@ -1361,6 +1367,66 @@ async fn build_guardian_prompt_items_explains_network_access_review_scope() -> a
     Ok(())
 }
 
+#[test_case::test_case(SandboxPermissions::UseDefault)]
+#[test_case::test_case(SandboxPermissions::RequireEscalated)]
+#[test_case::test_case(SandboxPermissions::WithAdditionalPermissions)]
+fn guardian_write_stdin_preserves_input_and_foreign_cwd(
+    sandbox_permissions: SandboxPermissions,
+) -> serde_json::Result<()> {
+    let cwd = PathUri::parse("file:///C:/workspace").expect("valid executor cwd");
+    let input = "confirm\n";
+    let additional_permissions =
+        if sandbox_permissions == SandboxPermissions::WithAdditionalPermissions {
+            Some(serde_json::from_value(
+                serde_json::json!({"network":{"enabled":true}}),
+            )?)
+        } else {
+            None
+        };
+    let action = GuardianApprovalRequest::WriteStdin {
+        id: "terminal-open".to_string(),
+        approval_id: "terminal-write".to_string(),
+        environment_id: "windows-executor".to_string(),
+        process_id: 1000,
+        input: input.to_string(),
+        cwd: cwd.clone(),
+        tty: true,
+        sandbox_permissions,
+        additional_permissions: additional_permissions.clone(),
+    };
+
+    let mut expected = serde_json::json!({
+        "tool": "write_stdin",
+        "environment_id": "windows-executor",
+        "session_id": 1000,
+        "chars": input,
+        "cwd": r"C:\workspace",
+        "sandbox_permissions": sandbox_permissions,
+        "tty": true,
+    });
+    if let Some(permissions) = additional_permissions {
+        expected["additional_permissions"] = serde_json::to_value(permissions)?;
+    }
+    assert_eq!(guardian_approval_request_to_json(&action)?, expected);
+    assert_eq!(
+        guardian_assessment_action(&action),
+        GuardianAssessmentAction::WriteStdin {
+            approval_id: "terminal-write".to_string(),
+            process_id: "1000".to_string(),
+            stdin: input.to_string(),
+            cwd,
+        },
+    );
+    assert_eq!(
+        (
+            guardian_request_target_item_id(&action),
+            guardian_request_turn_id(&action, "current-turn"),
+        ),
+        (Some("terminal-open"), "current-turn"),
+    );
+    Ok(())
+}
+
 #[test]
 fn guardian_assessment_action_redacts_apply_patch_patch_text() {
     let cwd = test_path_buf("/tmp").abs();
@@ -1458,6 +1524,7 @@ async fn cancelled_guardian_review_emits_terminal_abort_without_warning() {
             plugin_attribution_override: None,
             approval_request_source: GuardianApprovalRequestSource::MainTurn,
             external_cancel: Some(cancel_token),
+            require_synchronous_review: false,
         },
     )
     .await;
@@ -1763,7 +1830,7 @@ async fn guardian_request_model_for_auto_review(
     match catalog {
         GuardianTestCatalog::Bundled => {}
         GuardianTestCatalog::ParentOnly => {
-            let parent_model = turn.model_info.as_ref().clone();
+            let parent_model = turn.model_info().as_ref().clone();
             let auth_manager = Arc::clone(&session.services.auth_manager);
             let models_manager = StaticModelsManager::new(
                 Some(auth_manager),
@@ -1777,13 +1844,14 @@ async fn guardian_request_model_for_auto_review(
                 .models_manager = Arc::new(models_manager);
         }
     }
-    Arc::make_mut(
-        &mut Arc::get_mut(&mut turn)
-            .expect("turn should be unique")
-            .model_info,
-    )
-    .auto_review_model_override = auto_review_model_override;
-    let parent_model = turn.model_info.slug.clone();
+    update_turn_settings_for_test(
+        Arc::get_mut(&mut turn).expect("turn should be unique"),
+        |settings| {
+            Arc::make_mut(&mut settings.model_info).auto_review_model_override =
+                auto_review_model_override
+        },
+    );
+    let parent_model = turn.model_info().slug.clone();
     let preferred_model = turn.provider.approval_review_preferred_model().to_string();
     let parent_turn_id = turn.sub_id.clone();
     seed_guardian_parent_history(&session, &turn).await;
@@ -2008,8 +2076,10 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     session.services.skills_service.clear_cache();
     turn.config = Arc::clone(&config);
     turn.provider = create_model_provider(config.model_provider.clone(), turn.auth_manager.clone());
-    Arc::make_mut(&mut turn.model_info).auto_review_model_override =
-        Some("codex-auto-review".to_string());
+    update_turn_settings_for_test(&mut turn, |settings| {
+        Arc::make_mut(&mut settings.model_info).auto_review_model_override =
+            Some("codex-auto-review".to_string());
+    });
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     seed_guardian_parent_history(&session, &turn).await;
@@ -2283,8 +2353,10 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
         .enable(Feature::GuardianReuseParentCompaction)
         .expect("Guardian parent-compaction reuse should be configurable");
     let turn_mut = Arc::get_mut(&mut turn).expect("turn should be unique");
-    Arc::make_mut(&mut turn_mut.model_info).auto_review_model_override =
-        Some("codex-auto-review".to_string());
+    update_turn_settings_for_test(turn_mut, |settings| {
+        Arc::make_mut(&mut settings.model_info).auto_review_model_override =
+            Some("codex-auto-review".to_string());
+    });
     turn_mut.config = Arc::new(config);
     seed_guardian_parent_history(&session, &turn).await;
 
@@ -3092,7 +3164,7 @@ async fn escalated_retry_bypasses_extension_approval_and_runs_guardian() -> anyh
     struct AutoApprovingReviewContributor;
 
     impl codex_extension_api::ApprovalReviewContributor for AutoApprovingReviewContributor {
-        fn contribute<'a>(
+        fn fast_decision<'a>(
             &'a self,
             _session_store: &'a codex_extension_api::ExtensionData,
             _thread_store: &'a codex_extension_api::ExtensionData,
@@ -3230,6 +3302,10 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         .await;
 
         let (session, turn) = guardian_test_session_and_turn_with_base_url(server.uri()).await;
+        turn.turn_metadata_state
+            .set_parent_turn_id("upstream-parent-turn".to_string());
+        turn.turn_metadata_state
+            .set_root_turn_id("causal-root-turn".to_string());
         seed_guardian_parent_history(&session, &turn).await;
 
         let initial_request = GuardianApprovalRequest::ExecCommand {
@@ -3348,6 +3424,8 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
             )
             .await;
 
+        // A conflicting input removes the known root while the trunk review is in flight.
+        turn.turn_metadata_state.mark_root_turn_ambiguous();
         let third_decision = review_approval_request(
             &session,
             &turn,
@@ -3362,11 +3440,27 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         assert_eq!(third_decision, ReviewDecision::Approved);
         let requests = server.requests().await;
         assert_eq!(requests.len(), 4);
+        let first_request_body = serde_json::from_slice::<serde_json::Value>(&requests[0])?;
         let second_request_body = serde_json::from_slice::<serde_json::Value>(&requests[1])?;
         let failed_ephemeral_request_body =
             serde_json::from_slice::<serde_json::Value>(&requests[2])?;
         let retried_ephemeral_request_body =
             serde_json::from_slice::<serde_json::Value>(&requests[3])?;
+        let mut reviewer_turn_ids = std::collections::BTreeSet::new();
+        for (body, expected_root) in [
+            (&first_request_body, Some("causal-root-turn")),
+            (&second_request_body, Some("causal-root-turn")),
+            (&failed_ephemeral_request_body, None),
+            (&retried_ephemeral_request_body, None),
+        ] {
+            assert_parent_turn(body, Some(turn.sub_id.as_str()))?;
+            assert_root_turn(body, expected_root)?;
+            assert_ne!(body["client_metadata"]["turn_id"], turn.sub_id);
+            reviewer_turn_ids.insert(
+                body["client_metadata"]["turn_id"].as_str().expect("reviewer turn id")
+            );
+        }
+        assert_eq!(reviewer_turn_ids.len(), 4);
         assert_eq!(
             second_request_body["prompt_cache_key"],
             failed_ephemeral_request_body["prompt_cache_key"],
@@ -3495,7 +3589,7 @@ async fn guardian_review_session_config_clears_context_overrides_for_distinct_ef
 async fn guardian_review_session_config_preserves_context_overrides_for_same_effective_model() {
     let server = start_mock_server().await;
     let (mut session, mut turn) = guardian_test_session_and_turn(&server).await;
-    let parent_model = turn.model_info.as_ref().clone();
+    let parent_model = turn.model_info().as_ref().clone();
     let auth_manager = Arc::clone(&session.services.auth_manager);
     Arc::get_mut(&mut session)
         .expect("session should be unique")
