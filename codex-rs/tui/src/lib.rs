@@ -195,6 +195,7 @@ mod terminal_palette;
 mod terminal_probe;
 mod terminal_title;
 mod terminal_visualization_instructions;
+pub mod termux_update;
 mod text_formatting;
 mod theme_picker;
 mod thread_transcript;
