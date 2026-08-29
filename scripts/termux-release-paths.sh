@@ -62,6 +62,10 @@ readonly -a TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS=(
   .github/workflows/python-runtime-build.yml
   .github/workflows/python-runtime-release.yml
   .github/workflows/r2-release.yml
+  codex-rs/core/src/compact_remote_v2_image_budget_tests.rs
+  codex-rs/core/src/compact_remote_v2_images.rs
+  codex-rs/core/tests/suite/compact_remote.rs
+  codex-rs/features/src/lib.rs
   codex-rs/windows-sandbox-rs/BUILD.bazel
 )
 
