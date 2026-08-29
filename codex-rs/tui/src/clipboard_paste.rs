@@ -1,12 +1,16 @@
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(not(target_os = "android"))]
 use tempfile::Builder;
 
 #[derive(Debug, Clone)]
 pub enum PasteImageError {
     ClipboardUnavailable(String),
+    #[cfg(not(target_os = "android"))]
     NoImage(String),
+    #[cfg(not(target_os = "android"))]
     EncodeFailed(String),
+    #[cfg(not(target_os = "android"))]
     IoError(String),
 }
 
@@ -14,8 +18,11 @@ impl std::fmt::Display for PasteImageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PasteImageError::ClipboardUnavailable(msg) => write!(f, "clipboard unavailable: {msg}"),
+            #[cfg(not(target_os = "android"))]
             PasteImageError::NoImage(msg) => write!(f, "no image on clipboard: {msg}"),
+            #[cfg(not(target_os = "android"))]
             PasteImageError::EncodeFailed(msg) => write!(f, "could not encode image: {msg}"),
+            #[cfg(not(target_os = "android"))]
             PasteImageError::IoError(msg) => write!(f, "io error: {msg}"),
         }
     }
@@ -105,14 +112,6 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
             height: dyn_img.height(),
             encoded_format: EncodedImageFormat::Png,
         },
-    ))
-}
-
-/// Android/Termux does not support arboard; return a clear error.
-#[cfg(target_os = "android")]
-pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
-    Err(PasteImageError::ClipboardUnavailable(
-        "clipboard image paste is unsupported on Android".into(),
     ))
 }
 
@@ -230,7 +229,6 @@ fn try_dump_windows_clipboard_image() -> Option<String> {
 
 #[cfg(target_os = "android")]
 pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImageError> {
-    // Keep error consistent with paste_image_as_png.
     Err(PasteImageError::ClipboardUnavailable(
         "clipboard image paste is unsupported on Android".into(),
     ))
