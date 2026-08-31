@@ -546,12 +546,18 @@ impl GuardianV2Extension {
         let review_model_override = parent_model
             .as_ref()
             .and_then(|model| model.auto_review_model_override.clone());
-        let conversation_history = Arc::clone(&input.conversation_history);
         // Snapshot before spawning so a delayed sample cannot see later reviews.
         let guardian_evidence = input
             .thread_store
             .get_or_init(GuardianReviewEvidence::default);
         let sync_reviews = guardian_evidence.snapshot();
+        let authorization_version =
+            guardian_evidence.authorization_version(input.conversation_history.as_ref());
+        let trusted_user_inputs =
+            guardian_evidence.user_input_fragments(input.conversation_history.as_ref());
+        let transcript = guardian_config
+            .transcript
+            .build(input.conversation_history.review_items());
         let local_trusted_skill_paths = guardian_evidence.trusted_skill_paths(input.turn_id);
         let node_repl_images = if guardian_config.transcript.include_images {
             input
@@ -562,6 +568,9 @@ impl GuardianV2Extension {
         } else {
             Vec::new()
         };
+        let rendered_images = guardian_config
+            .transcript
+            .images(input.conversation_history.review_items(), node_repl_images);
 
         tokio::spawn(async move {
             let mut truncations = ClassificationTruncations::default();
@@ -586,28 +595,17 @@ impl GuardianV2Extension {
                 .as_ref()
                 .map(|snapshot| snapshot.authorization_version);
             let root_conversation = root_snapshot.map(|snapshot| snapshot.messages);
-            let authorization_version =
-                guardian_evidence.authorization_version(conversation_history.as_ref());
             let score_authorization = ScoreAuthorization {
                 local: authorization_version,
                 root: root_authorization_version,
             };
-            let trusted_user_inputs =
-                guardian_evidence.user_input_fragments(conversation_history.as_ref());
-            let transcript = guardian_config
-                .transcript
-                .build(conversation_history.items());
             truncations.extend(transcript.truncations);
-            let rendered_images = guardian_config
-                .transcript
-                .images(conversation_history.items(), node_repl_images);
             truncations.record(
                 "transcript_image",
                 rendered_images.omitted_bytes,
                 /*retained_bytes*/ 0,
             );
             let images = rendered_images.images;
-            drop(conversation_history);
             let planned_action = match action.render(guardian_config.max_action_tokens) {
                 Ok(RenderedAction {
                     text,

@@ -478,28 +478,34 @@ const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyb
 
 impl Session {
     /// Spawn and initialize a new session.
-    pub(crate) async fn spawn(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
-        let parent_trace = match args.parent_trace {
-            Some(trace) => {
-                if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
-                    Some(trace)
-                } else {
-                    warn!("ignoring invalid thread spawn trace carrier");
-                    None
+    /// Hide the concrete startup future from callers while keeping initialization lazy.
+    #[inline(never)]
+    pub(crate) fn spawn(
+        args: SessionSpawnArgs,
+    ) -> BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
+        Box::pin(async move {
+            let parent_trace = match args.parent_trace {
+                Some(trace) => {
+                    if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
+                        Some(trace)
+                    } else {
+                        warn!("ignoring invalid thread spawn trace carrier");
+                        None
+                    }
                 }
+                None => None,
+            };
+            let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
+            if let Some(trace) = parent_trace.as_ref() {
+                let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
             }
-            None => None,
-        };
-        let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
-        if let Some(trace) = parent_trace.as_ref() {
-            let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
-        }
-        Self::spawn_internal(SessionSpawnArgs {
-            parent_trace,
-            ..args
+            Self::spawn_internal(SessionSpawnArgs {
+                parent_trace,
+                ..args
+            })
+            .instrument(thread_spawn_span)
+            .await
         })
-        .instrument(thread_spawn_span)
-        .await
     }
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
@@ -668,6 +674,10 @@ impl Session {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        // Intentionally resolve `enabled` and `use_history_notes_extension` only at
+        // thread startup. Both activation flags stay fixed for this thread runtime,
+        // even if the selected model changes later.
+        token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
         let configured_config = Arc::clone(&config);
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)

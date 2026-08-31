@@ -277,6 +277,8 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
             .as_mut()
             .expect("model messages")
             .token_budget = Some(ModelTokenBudgetConfig {
+            enabled: false,
+            use_history_notes_extension: false,
             reminder_threshold_tokens: 2_000,
             reminder_message_template: "{n_remaining} tokens remain.".to_string(),
             guidance_message: format!("Guidance for {}.", model.slug),

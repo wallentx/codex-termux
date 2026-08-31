@@ -1987,7 +1987,7 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
-        let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
+        let (session, io) = Session::spawn(SessionSpawnArgs {
             config,
             allow_provider_model_fallback,
             user_instructions,
@@ -2027,7 +2027,7 @@ impl ThreadManagerState {
             inherited_multi_agent_version: multi_agent_version,
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
             windows_sandbox_proxy_settings_mode,
-        }))
+        })
         .await?;
         // Enable Full Access form input only after session startup so a required MCP server cannot
         // block startup while waiting for form input.
