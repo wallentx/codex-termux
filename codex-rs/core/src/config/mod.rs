@@ -2641,7 +2641,7 @@ fn resolve_update_plan_enabled(config_toml: &ConfigToml) -> bool {
         .tools
         .as_ref()
         .and_then(|tools| tools.update_plan.as_ref())
-        .is_none_or(|config| config.enabled)
+        .is_some_and(|config| config.enabled)
 }
 
 fn resolve_orchestrator_feature_enabled(

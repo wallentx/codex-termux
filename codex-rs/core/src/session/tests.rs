@@ -1613,8 +1613,12 @@ async fn user_shell_commands_remain_login_shells_when_model_login_shells_are_dis
 
 #[tokio::test]
 async fn get_base_instructions_no_user_content() {
+    let prompt_path = codex_utils_cargo_bin::find_resource!(
+        "tests/fixtures/prompt_with_apply_patch_instructions.md"
+    )
+    .expect("resolve prompt fixture path");
     let prompt_with_apply_patch_instructions =
-        include_str!("../../prompt_with_apply_patch_instructions.md");
+        std::fs::read_to_string(prompt_path).expect("read prompt fixture");
     let models_response = bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
     let model_info_for_slug = |slug: &str, config: &Config| {
@@ -3590,6 +3594,7 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
     .await;
 
     let mut builder = test_codex().with_config(|config| {
+        config.update_plan_enabled = true;
         config.permissions.approval_policy =
             codex_config::Constrained::allow_any(AskForApproval::OnRequest);
     });
@@ -5329,6 +5334,55 @@ async fn resolved_environments_for_configuration(
 }
 
 #[tokio::test]
+async fn session_configuration_apply_client_metadata_preserves_permissions() {
+    let mut configuration = make_session_configuration_for_tests().await;
+    let workspace = tempfile::tempdir().expect("create workspace");
+    let cwd = workspace.path().abs();
+    configuration.legacy_fallback_cwd = cwd.clone();
+    let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+        SandboxEnforcement::Managed,
+        &FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: cwd.join("writable").into(),
+                },
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: cwd.join("writable/private").into(),
+                },
+                FileSystemAccessMode::Deny,
+            ),
+        ]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    configuration
+        .set_permission_profile_for_tests(permission_profile)
+        .expect("set custom permission profile");
+    let expected = configuration.thread_settings_snapshot(&[]);
+    let updated = configuration
+        .apply(
+            &SessionSettingsUpdate {
+                app_server_client_name: Some("codex-tui".to_string()),
+                app_server_client_version: Some("1.0.0".to_string()),
+                ..Default::default()
+            },
+            &[],
+        )
+        .expect("update client metadata");
+
+    assert_eq!(updated.thread_settings_snapshot(&[]), expected);
+    assert_eq!(
+        (
+            updated.app_server_client_name,
+            updated.app_server_client_version
+        ),
+        (Some("codex-tui".to_string()), Some("1.0.0".to_string())),
+    );
+}
+
+#[tokio::test]
 async fn session_configuration_apply_preserves_profile_file_system_policy_on_cwd_only_update() {
     let mut session_configuration = make_session_configuration_for_tests().await;
     let workspace = tempfile::tempdir().expect("create temp dir");
@@ -5761,6 +5815,101 @@ async fn session_configuration_apply_preserves_absolute_cwd_write_root_on_cwd_up
             .file_system_sandbox_policy(&[])
             .can_write_path_with_cwd(next_cwd.as_path(), updated.cwd().as_path()),
         "cwd-only update must not reinterpret an absolute old-cwd grant as :workspace_roots"
+    );
+}
+
+#[tokio::test]
+async fn compaction_checkpoint_waits_for_accepted_settings_persistence() {
+    let (mut session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::workspace_write())
+                .expect("set initial permission profile");
+        },
+    )
+    .await;
+    let rollout_path =
+        attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    let refresh_guard = session
+        .managed_network_proxy_refresh_lock
+        .acquire()
+        .await
+        .expect("network refresh lock");
+    let mut update = Box::pin(tokio::task::unconstrained(thread_settings::apply_update(
+        &session,
+        "settings".to_string(),
+        SessionSettingsUpdate {
+            step_settings: StepSettingsUpdate {
+                service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
+                ..Default::default()
+            },
+            permission_profile: Some(PermissionProfile::read_only()),
+            ..Default::default()
+        },
+    )));
+    // Pause after committing settings but before their accepted snapshot is persisted.
+    assert!(futures::poll!(update.as_mut()).is_pending());
+    let committed = session.thread_settings_snapshot().await;
+    let history_before = session.clone_history().await;
+    let (window_number, window_ids) = session.advance_auto_compact_window().await;
+    let mut checkpoint = Box::pin(tokio::task::unconstrained(
+        session.replace_compacted_history(
+            vec![ResponseItemEnvelope::new(user_message("compacted history"))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "summary".to_string(),
+                window_number,
+                window_ids,
+            },
+        ),
+    ));
+    assert!(futures::poll!(checkpoint.as_mut()).is_pending());
+    assert_eq!(
+        session.clone_history().await.annotated_items(),
+        history_before.annotated_items()
+    );
+
+    // Direct runtime restoration may overlap postcommit work. The checkpoint must wait
+    // for the accepted event, then capture current settings rather than its older commit.
+    let restored = session
+        .update_settings(SessionSettingsUpdate {
+            step_settings: StepSettingsUpdate {
+                service_tier: Some(None),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("restore current settings")
+        .snapshot;
+    assert_ne!(committed, restored);
+    drop(refresh_guard);
+    update.await.expect("accepted settings update");
+    checkpoint.await;
+
+    session.flush_rollout().await.expect("flush checkpoint");
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path)
+        .await
+        .expect("read persisted settings");
+    let snapshots = items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                Some((event.thread_id, event.thread_settings))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshots,
+        vec![
+            (Some(session.thread_id), committed),
+            (Some(session.thread_id), restored),
+        ]
     );
 }
 
@@ -6377,6 +6526,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         windows_sandbox_proxy_settings_mode:
@@ -8656,6 +8806,7 @@ where
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         windows_sandbox_proxy_settings_mode:

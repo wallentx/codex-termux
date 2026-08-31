@@ -3926,6 +3926,12 @@
               "select_inner_text_object": null,
               "yank_line": null
             },
+            "vim_search": {
+              "backward": null,
+              "forward": null,
+              "next": null,
+              "previous": null
+            },
             "vim_text_object": {
               "backtick": null,
               "big_word": null,
@@ -4754,6 +4760,19 @@
             "yank_line": null
           }
         },
+        "vim_search": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TuiVimSearchKeymap"
+            }
+          ],
+          "default": {
+            "backward": null,
+            "forward": null,
+            "next": null,
+            "previous": null
+          }
+        },
         "vim_text_object": {
           "allOf": [
             {
@@ -5405,6 +5424,45 @@
       },
       "type": "object"
     },
+    "TuiVimSearchKeymap": {
+      "additionalProperties": false,
+      "description": "Search motions shared by Vim normal and operator-pending input.",
+      "properties": {
+        "backward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Search backward in the active buffer (`?`)."
+        },
+        "forward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Search forward in the active buffer (`/`)."
+        },
+        "next": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Repeat the accepted search (`n`)."
+        },
+        "previous": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Repeat in the opposite direction (`N`)."
+        }
+      },
+      "type": "object"
+    },
     "TuiVimTextObjectKeymap": {
       "additionalProperties": false,
       "description": "Vim text-object keybindings for modal editing inside text areas.",
@@ -5488,7 +5546,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "default": true,
+          "default": false,
           "type": "boolean"
         }
       },

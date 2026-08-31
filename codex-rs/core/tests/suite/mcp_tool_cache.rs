@@ -42,6 +42,7 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::test_env;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
@@ -128,10 +129,12 @@ async fn mcp_calls_stay_bound_to_each_thread() -> anyhow::Result<()> {
     let responses_server = responses::start_mock_server().await;
     let command = remote_aware_stdio_server_bin()?;
     let environment_id = remote_aware_environment_id();
+    let test_env = test_env().await?;
     let make_server = |marker| {
         serde_json::from_value::<McpServerConfig>(json!({
             "command": command,
             "environment_id": environment_id,
+            "cwd": test_env.cwd(),
             "env": {
                 "MCP_TEST_DYNAMIC_SERVER_METADATA": "1",
                 "MCP_TEST_VALUE": marker,
@@ -157,7 +160,7 @@ async fn mcp_calls_stay_bound_to_each_thread() -> anyhow::Result<()> {
                 .set(servers)
                 .expect("first thread should accept its MCP servers");
         })
-        .build_with_auto_env(&responses_server)
+        .build_with_environment(&responses_server, test_env)
         .await?;
 
     let mut second_config = fixture.config.clone();
@@ -569,6 +572,7 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
     let fixture = test_codex()
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
             config
                 .permissions
@@ -583,6 +587,7 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
                 serde_json::from_value(json!({
                     "command": command,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "env": {
                         "MCP_TEST_APP_ONLY_CWD_MARKER_FILE": app_only_cwd_marker_file,
                         "MCP_TEST_INITIALIZE_BARRIER_FILE": barrier_file,

@@ -405,8 +405,8 @@ Rules:
 
     /// Resolves a built-in role `config_file` path to embedded content.
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
-        const EXPLORER: &str = include_str!("builtins/explorer.toml");
-        const AWAITER: &str = include_str!("builtins/awaiter.toml");
+        const EXPLORER: &str = include_str!("../../assets/agent/builtins/explorer.toml");
+        const AWAITER: &str = include_str!("../../assets/agent/builtins/awaiter.toml");
         match path.to_str()? {
             "explorer.toml" => Some(EXPLORER),
             "awaiter.toml" => Some(AWAITER),

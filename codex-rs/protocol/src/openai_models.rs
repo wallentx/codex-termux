@@ -546,6 +546,8 @@ pub struct ModelMessages {
     /// instructions; an empty string disables them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolMessages>,
     pub instructions_template: Option<String>,
     pub instructions_variables: Option<ModelInstructionsVariables>,
     pub approvals: Option<ApprovalMessages>,
@@ -571,6 +573,22 @@ pub struct ConfirmationPolicies {
     /// Replacement Markdown for the native Computer Use confirmation policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<String>,
+}
+
+/// Model-owned messages for built-in tools.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct ToolMessages {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_user_message_async: Option<ToolMessage>,
+}
+
+/// Model-owned messages for a built-in tool.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct ToolMessage {
+    /// Missing or null uses the built-in description; an empty string leaves the description
+    /// empty without disabling the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Model-owned defaults for the context-window token-budget feature.
@@ -627,6 +645,9 @@ pub struct MultiAgentRoleMessages {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct MultiAgentModeMessages {
     pub explicit: Option<String>,
+    /// Ultra-only mode instructions. Missing or null uses the built-in proactive hint;
+    /// an empty string suppresses the mode message. `hint_text` takes precedence.
+    pub proactive: Option<String>,
     pub hint_text: Option<String>,
 }
 
@@ -790,6 +811,7 @@ where
             {
                 let messages = model.model_messages.get_or_insert(ModelMessages {
                     persistent_instructions: None,
+                    tools: None,
                     instructions_template: None,
                     instructions_variables: None,
                     approvals: None,
@@ -999,6 +1021,7 @@ mod tests {
             messages,
             ModelMessages {
                 persistent_instructions: None,
+                tools: None,
                 instructions_template: None,
                 instructions_variables: None,
                 approvals: None,
@@ -1011,6 +1034,61 @@ mod tests {
                 guardian_v2: None,
             }
         );
+    }
+
+    #[test]
+    fn send_user_message_async_description_preserves_missing_null_and_empty_values() {
+        for (value, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"tools": null}), None),
+            (serde_json::json!({"tools": {}}), Some(None)),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": null}}),
+                Some(None),
+            ),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": {}}}),
+                Some(Some(ToolMessage::default())),
+            ),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": {"description": null}}}),
+                Some(Some(ToolMessage::default())),
+            ),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": {"description": ""}}}),
+                Some(Some(ToolMessage {
+                    description: Some(String::new()),
+                })),
+            ),
+            (
+                serde_json::json!({"tools": {"send_user_message_async": {"description": "Catalog description"}}}),
+                Some(Some(ToolMessage {
+                    description: Some("Catalog description".to_string()),
+                })),
+            ),
+        ] {
+            let messages: ModelMessages =
+                serde_json::from_value(value).expect("model messages should deserialize");
+            let serialized =
+                serde_json::to_value(&messages).expect("model messages should serialize");
+            assert_eq!(
+                (
+                    messages.tools,
+                    serialized
+                        .get("tools")
+                        .map(|tools| tools.get("send_user_message_async").cloned()),
+                ),
+                (
+                    expected.as_ref().map(|tool| ToolMessages {
+                        send_user_message_async: tool.clone(),
+                    }),
+                    expected.map(|tool| tool.map(|tool| match tool.description {
+                        Some(description) => serde_json::json!({"description": description}),
+                        None => serde_json::json!({}),
+                    })),
+                )
+            );
+        }
     }
 
     #[test]
@@ -1110,7 +1188,7 @@ mod tests {
     #[test]
     fn multi_agent_messages_preserve_missing_and_empty_values() {
         let messages: ModelMessages = from_str(
-            r#"{"instructions_template":null,"instructions_variables":null,"multi_agent":{"role":{"root":"","subagent":"subagent base"},"mode":{"explicit":"explicit mode","hint_text":""}}}"#,
+            r#"{"instructions_template":null,"instructions_variables":null,"multi_agent":{"role":{"root":"","subagent":"subagent base"},"mode":{"explicit":"explicit mode","proactive":"","hint_text":""}}}"#,
         )
         .expect("multi-agent messages should deserialize");
 
@@ -1123,6 +1201,7 @@ mod tests {
                 }),
                 mode: Some(MultiAgentModeMessages {
                     explicit: Some("explicit mode".to_string()),
+                    proactive: Some(String::new()),
                     hint_text: Some(String::new()),
                 }),
             })
@@ -1146,6 +1225,7 @@ mod tests {
             messages,
             ModelMessages {
                 persistent_instructions: None,
+                tools: None,
                 instructions_template: None,
                 instructions_variables: None,
                 approvals: None,
@@ -1239,6 +1319,7 @@ mod tests {
     fn get_model_instructions_uses_template_when_placeholder_present() {
         let model = test_model(Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some("Hello {{ personality }}".to_string()),
             instructions_variables: Some(personality_variables()),
             approvals: None,
@@ -1260,6 +1341,7 @@ mod tests {
     fn get_model_instructions_strips_placeholder_with_incomplete_variables() {
         let model = test_model(Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some("Hello\n{{ personality }}".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -1286,6 +1368,7 @@ mod tests {
 
         let model_no_personality = test_model(Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some("Hello\n{{ personality }}".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -1323,6 +1406,7 @@ mod tests {
     fn get_model_instructions_is_empty_when_template_is_missing() {
         let model = test_model(Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: None,
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -1370,6 +1454,7 @@ mod tests {
             model.model_messages,
             Some(ModelMessages {
                 persistent_instructions: None,
+                tools: None,
                 instructions_template: Some("legacy instructions".to_string()),
                 instructions_variables: None,
                 approvals: None,
@@ -1420,6 +1505,7 @@ mod tests {
         let response = ModelsResponse {
             models: vec![test_model(Some(ModelMessages {
                 persistent_instructions: None,
+                tools: None,
                 instructions_template: Some("before {{ personality }} after".to_string()),
                 instructions_variables: Some(ModelInstructionsVariables {
                     personality_default: Some("default".to_string()),
@@ -1449,6 +1535,11 @@ mod tests {
     fn models_response_prefers_template_and_preserves_message_siblings() {
         let messages = ModelMessages {
             persistent_instructions: Some("Persistent catalog instructions".to_string()),
+            tools: Some(ToolMessages {
+                send_user_message_async: Some(ToolMessage {
+                    description: Some("Catalog description".to_string()),
+                }),
+            }),
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(ApprovalMessages {
@@ -1515,6 +1606,11 @@ mod tests {
 
         let canonical_messages = ModelMessages {
             persistent_instructions: Some(String::new()),
+            tools: Some(ToolMessages {
+                send_user_message_async: Some(ToolMessage {
+                    description: Some(String::new()),
+                }),
+            }),
             instructions_template: Some("canonical instructions".to_string()),
             instructions_variables: None,
             approvals: None,

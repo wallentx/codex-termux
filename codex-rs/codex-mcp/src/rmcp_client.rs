@@ -860,7 +860,7 @@ fn resolve_bearer_token(
 }
 
 fn validate_mcp_server_name(server_name: &str) -> Result<()> {
-    let re = regex_lite::Regex::new(r"^[a-zA-Z0-9_-]+$")?;
+    let re = regex_lite::Regex::new(r"^[a-zA-Z0-9_:@/.-]+$")?;
     if !re.is_match(server_name) {
         return Err(anyhow!(
             "Invalid MCP server name '{server_name}': must match pattern {pattern}",

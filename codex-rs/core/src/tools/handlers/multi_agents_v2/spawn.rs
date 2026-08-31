@@ -196,7 +196,11 @@ async fn handle_spawn_agent(
                 .as_ref()
                 .and_then(|messages| messages.multi_agent.as_ref())
                 .and_then(|messages| messages.role.as_ref());
-            Some(resolve_usage_hints(&config.multi_agent_v2, child_catalog))
+            Some(resolve_usage_hints(
+                &config.multi_agent_v2,
+                child_catalog,
+                !config.update_plan_enabled && config.model_catalog.is_none(),
+            ))
         } else {
             None
         };
