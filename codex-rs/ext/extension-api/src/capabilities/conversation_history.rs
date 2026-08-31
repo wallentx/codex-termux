@@ -14,4 +14,15 @@ pub trait ConversationHistorySnapshot: Send + Sync {
 
     /// Returns the snapshot's response items in conversation order.
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_>;
+
+    /// Original review evidence retained across parent compaction, in conversation order.
+    /// Hosts without separate retention provide their current history.
+    fn review_items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        self.items()
+    }
+
+    /// Changes whenever offsets into the retained review evidence become invalid.
+    fn review_history_version(&self) -> u64 {
+        self.history_version()
+    }
 }

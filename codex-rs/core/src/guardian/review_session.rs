@@ -482,10 +482,10 @@ impl GuardianReviewSessionManager {
 
     pub(crate) async fn shutdown(&self) {
         self.cancellation_token.cancel();
-        self.invalidate_for_node_repl_evidence().await;
+        self.invalidate().await;
     }
 
-    pub(crate) async fn invalidate_for_node_repl_evidence(&self) {
+    pub(crate) async fn invalidate(&self) {
         let (review_session, ephemeral_reviews) = {
             let mut state = self.state.lock().await;
             (

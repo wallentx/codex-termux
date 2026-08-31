@@ -1,3 +1,6 @@
+//! Model history and bounded original evidence for approval review.
+//! Compaction replaces only model history; explicit resets also replace retained evidence.
+
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
 use crate::context::world_state::PersistentModeState;
@@ -14,6 +17,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ConversationHistorySnapshot;
+use codex_guardian_context::SectionHistory;
+use codex_guardian_context::TranscriptHistory;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::AgentMessageInputContent;
@@ -48,6 +53,8 @@ pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector. Snapshots share the vector until a
     /// caller needs to mutate it, avoiding deep copies for read-only history consumers.
     items: Arc<Vec<ResponseItemEnvelope>>,
+    /// Starts at the first compaction; ordinary history snapshots need no second payload copy.
+    review_history: Option<TranscriptHistory>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
     /// Monotonic user-input/reset revision, independent of compaction's history generation.
@@ -70,6 +77,7 @@ pub(crate) struct ContextManager {
 
 struct SharedConversationHistory {
     items: Arc<Vec<ResponseItemEnvelope>>,
+    review_history: Option<TranscriptHistory>,
     history_version: u64,
     user_message_revision: u64,
 }
@@ -80,6 +88,19 @@ pub(crate) enum HistoryReplacement {
 }
 
 impl ConversationHistorySnapshot for SharedConversationHistory {
+    fn review_items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        match &self.review_history {
+            Some(history) => history.items(),
+            None => self.items(),
+        }
+    }
+
+    fn review_history_version(&self) -> u64 {
+        self.review_history
+            .as_ref()
+            .map_or(self.history_version, TranscriptHistory::generation)
+    }
+
     fn history_version(&self) -> u64 {
         self.history_version
     }
@@ -108,6 +129,7 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Arc::new(Vec::new()),
+            review_history: None,
             history_version: 0,
             user_message_revision: 0,
             token_info: TokenUsageInfo::new_or_append(
@@ -121,6 +143,7 @@ impl ContextManager {
     pub(crate) fn conversation_history_snapshot(&self) -> Arc<dyn ConversationHistorySnapshot> {
         Arc::new(SharedConversationHistory {
             items: Arc::clone(&self.items),
+            review_history: self.review_history.clone(),
             history_version: self.history_version,
             user_message_revision: self.user_message_revision,
         })
@@ -221,6 +244,12 @@ impl ContextManager {
                     .map(TruncationPolicy::Tokens)
                     .unwrap_or(policy * 1.2);
                 truncate_function_output_payload(output, policy, estimate_audio_token_count);
+            }
+            if let Some(review_history) = &mut self.review_history
+                && !matches!(item, ResponseItem::Message { role, content, .. }
+                if role == "user" && is_contextual_user_message_content(content))
+            {
+                review_history.record(&processed.item);
             }
             Arc::make_mut(&mut self.items).push(processed);
             if crate::context::is_user_authorization_message(item) {
@@ -328,11 +357,29 @@ impl ContextManager {
 
     pub(crate) fn replace_annotated(&mut self, items: Vec<ResponseItemEnvelope>) {
         self.user_message_revision = self.user_message_revision.saturating_add(1);
-        self.replace_compacted(items);
+        if let Some(review_history) = &mut self.review_history {
+            review_history.reset(items.iter().map(|item| &item.item).filter(|item| {
+                !matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user" && is_contextual_user_message_content(content))
+            }));
+        }
+        self.items = Arc::new(items);
+        self.history_version = self.history_version.saturating_add(1);
+        self.world_state_baseline = None;
     }
 
     /// Compaction changes the model's history without changing the user's authorization.
     pub(crate) fn replace_compacted(&mut self, items: Vec<ResponseItemEnvelope>) {
+        if self.review_history.is_none() {
+            let mut retained = TranscriptHistory::new(self.history_version.saturating_add(1));
+            for item in self.raw_items().filter(|item| {
+                !matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user" && is_contextual_user_message_content(content))
+            }) {
+                retained.record(item);
+            }
+            self.review_history = Some(retained);
+        }
         self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);
         self.world_state_baseline = None;

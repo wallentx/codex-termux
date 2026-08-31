@@ -1,6 +1,7 @@
 //! Shared context sections for synchronous Guardian review and asynchronous scoring.
 //!
-//! Transcript collection is also available directly, without section composition.
+//! Transcript collection and bounded host-owned history are also available directly,
+//! without section composition.
 //! Contributor failures abort collection without returning partial context.
 //! Sections carry structured transcript evidence without depending on either
 //! consumer's rendering, retention, compaction, or request lifecycle.
@@ -17,6 +18,7 @@ use transcript::ConversationTranscriptSection;
 
 pub use entry::ConversationTranscriptEntry;
 pub use entry::ConversationTranscriptEntryKind;
+pub use history::TranscriptHistory;
 pub use transcript::ConversationTranscriptConfig;
 pub use transcript::ConversationTranscriptOptions;
 pub use transcript::MANUAL_APPROVAL_DEVELOPER_PREFIX;
@@ -26,6 +28,7 @@ pub use transcript::collect_transcript;
 pub use truncation::truncate_text;
 
 mod entry;
+mod history;
 mod transcript;
 mod truncation;
 

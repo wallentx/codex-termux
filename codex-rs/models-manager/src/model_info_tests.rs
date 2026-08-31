@@ -62,6 +62,8 @@ fn base_instruction_override_is_literal_and_preserves_catalog_messages() {
         }),
     };
     let token_budget = ModelTokenBudgetConfig {
+        enabled: false,
+        use_history_notes_extension: false,
         reminder_threshold_tokens: 128,
         reminder_message_template: "budget reminder".to_string(),
         guidance_message: "budget guidance".to_string(),
