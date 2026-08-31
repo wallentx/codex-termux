@@ -94,7 +94,13 @@ JSON
     fi
     ;;
   "pr list --repo")
-    printf '[]\n'
+    if [[ -n "${TERMUX_TEST_OPEN_PR_TAG:-}" ]]; then
+      cat <<JSON
+[{"number":7,"title":"Termux ${TERMUX_TEST_OPEN_PR_TAG}","body":"- Upstream tag: \`${TERMUX_TEST_OPEN_PR_TAG}\`\n- Release train branch: \`release/1.0.0\`","headRefName":"release-train/1.0.0","baseRefName":"release/1.0.0","url":"https://github.com/wallentx/codex-termux/pull/7"}]
+JSON
+    else
+      printf '[]\n'
+    fi
     ;;
   *)
     echo "unexpected gh invocation: $*" >&2
@@ -141,6 +147,26 @@ if ! grep -qx 'selected=true' "${github_output}"; then
 fi
 
 echo "ok - missing Termux release is selected for recreation"
+
+open_pr_output="${tmp_dir}/github-output-open-pr"
+PATH="${bin_dir}:${PATH}" \
+GITHUB_REPOSITORY="wallentx/codex-termux" \
+UPSTREAM_REPO="openai/codex" \
+REQUESTED_TAG="rust-v1.0.0-alpha.1" \
+BYPASS_PRIOR_RELEASE_TRAIN="true" \
+GITHUB_OUTPUT="${open_pr_output}" \
+GH_TOKEN="test-token" \
+TERMUX_TEST_OPEN_PR_TAG="rust-v1.0.0-alpha.1" \
+bash "${script}" > "${tmp_dir}/stdout-open-pr" 2> "${tmp_dir}/stderr-open-pr"
+
+if ! grep -qx 'selected=true' "${open_pr_output}"; then
+  cat "${tmp_dir}/stdout-open-pr" >&2
+  cat "${tmp_dir}/stderr-open-pr" >&2
+  cat "${open_pr_output}" >&2
+  fail "manual dispatch did not select the failed open release PR for rebuilding"
+fi
+
+echo "ok - manual dispatch rebuilds a failed open release PR"
 
 scheduled_output="${tmp_dir}/github-output-scheduled"
 PATH="${bin_dir}:${PATH}" \

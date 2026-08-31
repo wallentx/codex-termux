@@ -429,7 +429,9 @@ maybe_select_codex_release() {
   local termux_release_exists=false
   local current_tag
   local open_train_pr_json
+  local open_train_pr_tag
   local pending_other_release_train_prs
+  local rebuild_requested_open_train=false
 
   upstream_tag="$(jq -r '.tagName // empty' <<< "${release_json}")"
   if [[ "${upstream_tag}" != rust-v* ]]; then
@@ -448,6 +450,12 @@ maybe_select_codex_release() {
   open_train_pr_json="$(open_release_train_pr_for_branch "${release_branch}")"
   if [[ -n "${open_train_pr_json}" ]]; then
     work_branch="$(jq -r '.headRefName' <<< "${open_train_pr_json}")"
+    open_train_pr_tag="$(jq -r '.upstreamTag // empty' <<< "${open_train_pr_json}")"
+    if [[ -n "${REQUESTED_TAG}" \
+      && "${open_train_pr_tag}" == "${upstream_tag}" \
+      && "${termux_release_exists}" != "true" ]]; then
+      rebuild_requested_open_train=true
+    fi
   fi
 
   if [[ -z "${REQUESTED_TAG}" && "${version}" == *-* ]]; then
@@ -458,7 +466,9 @@ maybe_select_codex_release() {
     fi
   fi
 
-  if ! release_tag_is_newer_than_known_train "${upstream_tag}" "${release_branch}" "${open_train_pr_json}"; then
+  if [[ "${rebuild_requested_open_train}" == "true" ]]; then
+    echo "Manual dispatch requested a rebuild of ${upstream_tag} in open PR $(jq -r '.url' <<< "${open_train_pr_json}")."
+  elif ! release_tag_is_newer_than_known_train "${upstream_tag}" "${release_branch}" "${open_train_pr_json}"; then
     current_tag="$(release_branch_current_tag "${release_branch}")"
     if [[ "${termux_release_exists}" == "true" || "${current_tag}" != "${upstream_tag}" || -n "${open_train_pr_json}" ]]; then
       return 1
