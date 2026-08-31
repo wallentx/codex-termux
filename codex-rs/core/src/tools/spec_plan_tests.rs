@@ -529,6 +529,7 @@ async fn internal_guardian_sessions_exclude_optional_core_tools() {
         &session,
         step_context.turn.as_ref(),
         step_context.turn.model_info(),
+        step_context.settings.model_info.model_messages.as_ref(),
         &step_context.environments,
         &step_context.mcp,
         /*apps_enabled*/ false,
@@ -581,6 +582,7 @@ async fn internal_guardian_sessions_respect_managed_shell_restrictions() {
             &session,
             step_context.turn.as_ref(),
             step_context.turn.model_info(),
+            step_context.settings.model_info.model_messages.as_ref(),
             &step_context.environments,
             &step_context.mcp,
             /*apps_enabled*/ false,
@@ -617,6 +619,7 @@ async fn internal_guardian_sessions_preserve_code_mode() {
         &session,
         step_context.turn.as_ref(),
         step_context.turn.model_info(),
+        step_context.settings.model_info.model_messages.as_ref(),
         &step_context.environments,
         &step_context.mcp,
         /*apps_enabled*/ false,
@@ -687,6 +690,7 @@ async fn internal_guardian_sessions_require_managed_secondary_environments() {
             &session,
             step_context.turn.as_ref(),
             step_context.turn.model_info(),
+            step_context.settings.model_info.model_messages.as_ref(),
             &step_context.environments,
             &step_context.mcp,
             /*apps_enabled*/ false,
@@ -851,18 +855,18 @@ async fn request_user_input_tool_respects_experimental_config_gate() {
 
 #[tokio::test]
 async fn update_plan_tool_respects_config_gate() {
-    let enabled = probe(|_| {}).await;
-    enabled.assert_visible_contains(&["update_plan"]);
-    enabled.assert_registered_contains(&["update_plan"]);
+    let disabled = probe(|_| {}).await;
+    disabled.assert_visible_lacks(&["update_plan"]);
+    disabled.assert_registered_lacks(&["update_plan"]);
 
-    let disabled = probe(|turn| {
+    let enabled = probe(|turn| {
         update_config(turn, |config| {
-            config.update_plan_enabled = false;
+            config.update_plan_enabled = true;
         });
     })
     .await;
-    disabled.assert_visible_lacks(&["update_plan"]);
-    disabled.assert_registered_lacks(&["update_plan"]);
+    enabled.assert_visible_contains(&["update_plan"]);
+    enabled.assert_registered_contains(&["update_plan"]);
 }
 
 #[tokio::test]
@@ -1913,6 +1917,7 @@ async fn strict_tool_collisions_reject_external_and_synthetic_duplicates() {
         let (_session, mut turn) = make_session_and_context().await;
         update_config(&mut turn, |config| {
             config.tool_registry.error_on_tool_collisions = true;
+            config.update_plan_enabled = true;
         });
         if code_mode_enabled {
             set_feature(&mut turn, Feature::CodeMode, /*enabled*/ true);
@@ -2583,6 +2588,7 @@ async fn code_mode_only_exposes_default_namespace_tools_directly() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
         update_config(turn, |config| {
+            config.update_plan_enabled = true;
             config.code_mode.direct_only_tool_namespaces = vec!["functions".to_string()];
         });
     })
@@ -2640,6 +2646,7 @@ async fn code_mode_excludes_default_namespace_tools() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::CodeMode, /*enabled*/ true);
         update_config(turn, |config| {
+            config.update_plan_enabled = true;
             config.code_mode.excluded_tool_namespaces = vec!["functions".to_string()];
         });
     })

@@ -377,6 +377,7 @@ async fn guardian_review_session_config_prefers_managed_policy_and_uses_catalog_
     parent_config.guardian_policy_config = Some(managed_policy.to_string());
     let model_messages = ModelMessages {
         persistent_instructions: None,
+        tools: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: None,
@@ -417,6 +418,7 @@ async fn guardian_review_session_config_preserves_explicit_empty_catalog_policy(
     let parent_config = crate::config::test_config().await;
     let model_messages = ModelMessages {
         persistent_instructions: None,
+        tools: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: None,
@@ -465,6 +467,7 @@ async fn guardian_review_session_config_preserves_explicit_empty_catalog_templat
     let catalog_policy = "Use the catalog Guardian policy.";
     let model_messages = ModelMessages {
         persistent_instructions: None,
+        tools: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: None,

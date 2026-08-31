@@ -34,6 +34,8 @@ use std::sync::Arc;
 
 mod bindings;
 mod chords;
+mod vim_search;
+pub(crate) use vim_search::VimSearchKeymap;
 
 #[cfg(test)]
 #[path = "keymap/conflict_tests.rs"]
@@ -70,6 +72,7 @@ pub(crate) struct RuntimeKeymap {
     pub(crate) editor: Arc<EditorKeymap>,
     pub(crate) vim_normal: VimNormalKeymap,
     pub(crate) vim_operator: VimOperatorKeymap,
+    pub(crate) vim_search: VimSearchKeymap,
     pub(crate) vim_text_object: VimTextObjectKeymap,
     pub(crate) pager: PagerKeymap,
     pub(crate) list: ListKeymap,
@@ -1360,6 +1363,7 @@ impl RuntimeKeymap {
             editor,
             vim_normal,
             vim_operator,
+            vim_search: VimSearchKeymap::default(),
             vim_text_object,
             pager,
             list,
@@ -1367,6 +1371,7 @@ impl RuntimeKeymap {
             approval,
         };
 
+        resolved.configure_vim_search(keymap)?;
         resolved.validate_conflicts()?;
         chords::validate_chord_conflicts(&resolved)?;
         chords::install_dispatch_bindings(&mut resolved)?;
@@ -1544,6 +1549,7 @@ impl RuntimeKeymap {
                 start_change_operator: default_bindings![plain(KeyCode::Char('c'))],
                 cancel_operator: default_bindings![plain(KeyCode::Esc)],
             },
+            vim_search: VimSearchKeymap::default(),
             vim_operator: VimOperatorKeymap {
                 delete_line: default_bindings![plain(KeyCode::Char('d'))],
                 yank_line: default_bindings![plain(KeyCode::Char('y'))],
@@ -2924,6 +2930,27 @@ mod tests {
                 "till_forward"
             };
             expect_conflict(&keymap, "move_left", action);
+        }
+    }
+
+    #[test]
+    fn vim_search_preserves_custom_motion_bindings() {
+        for operator in [false, true] {
+            let mut config = TuiKeymap::default();
+            if operator {
+                config.vim_operator.motion_left = Some(one("n"));
+            } else {
+                config.vim_normal.move_left = Some(one("n"));
+            }
+            assert!(
+                RuntimeKeymap::from_config(&config)
+                    .unwrap()
+                    .vim_search
+                    .next
+                    .is_empty()
+            );
+            config.vim_search.next = Some(one("n"));
+            assert!(RuntimeKeymap::from_config(&config).is_err());
         }
     }
 

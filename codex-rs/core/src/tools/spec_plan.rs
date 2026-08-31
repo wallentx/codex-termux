@@ -75,6 +75,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::ResponsesApiNamespace;
@@ -109,6 +110,7 @@ const IMAGEGEN_TOOL_NAME: &str = "imagegen";
 struct CoreToolPlanContext<'a> {
     turn_context: &'a TurnContext,
     model_info: &'a ModelInfo,
+    model_messages: Option<&'a ModelMessages>,
     environments: &'a TurnEnvironmentSnapshot,
     mcp: &'a codex_mcp::McpBinding,
     tool_suggest_candidates: Option<&'a crate::tools::router::ToolSuggestCandidates>,
@@ -123,6 +125,7 @@ pub(crate) fn build_tool_router(
     session: &Session,
     turn_context: &TurnContext,
     model_info: &ModelInfo,
+    model_messages: Option<&ModelMessages>,
     environments: &TurnEnvironmentSnapshot,
     mcp: &Arc<codex_mcp::McpBinding>,
     apps_enabled: bool,
@@ -138,6 +141,7 @@ pub(crate) fn build_tool_router(
     let context = CoreToolPlanContext {
         turn_context,
         model_info,
+        model_messages,
         environments,
         mcp,
         tool_suggest_candidates,
@@ -290,6 +294,7 @@ pub(crate) fn build_core_tool_registry(
     let context = CoreToolPlanContext {
         turn_context,
         model_info,
+        model_messages: model_info.model_messages.as_ref(),
         environments,
         mcp,
         tool_suggest_candidates,
@@ -1172,7 +1177,16 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
             .iter()
             .any(|tool| tool == "send_user_message_async")
     {
-        registry.add_with_exposure(SendUserMessageAsyncHandler, ToolExposure::DirectModelOnly);
+        registry.add_with_exposure(
+            SendUserMessageAsyncHandler {
+                description: context
+                    .model_messages
+                    .and_then(|messages| messages.tools.as_ref())
+                    .and_then(|tools| tools.send_user_message_async.as_ref())
+                    .and_then(|tool| tool.description.clone()),
+            },
+            ToolExposure::DirectModelOnly,
+        );
     }
 
     if environment_mode.has_environment() && features.enabled(Feature::RequestPermissionsTool) {

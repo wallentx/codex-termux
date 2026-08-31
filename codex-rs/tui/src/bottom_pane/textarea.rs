@@ -23,6 +23,7 @@ use crate::keymap::KeymapContext;
 use crate::keymap::RuntimeKeymap;
 use crate::keymap::VimNormalKeymap;
 use crate::keymap::VimOperatorKeymap;
+use crate::keymap::VimSearchKeymap;
 use crate::keymap::VimTextObjectKeymap;
 use crate::width::display_width;
 use codex_protocol::user_input::ByteRange;
@@ -50,6 +51,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod hyperlinks;
 mod vim;
 mod vim_commands;
+mod vim_search;
 mod wrapping;
 use self::vim::VimMode;
 use self::vim::VimMotion;
@@ -141,9 +143,12 @@ pub(crate) struct TextArea {
     vim_mode: VimMode,
     vim_pending: VimPending,
     vim_commands: VimCommandState,
+    vim_search: vim_search::VimSearch,
+    vim_search_enabled: bool,
     editor_keymap: Arc<EditorKeymap>,
     vim_normal_keymap: VimNormalKeymap,
     vim_operator_keymap: VimOperatorKeymap,
+    vim_search_keymap: VimSearchKeymap,
     vim_text_object_keymap: VimTextObjectKeymap,
 }
 
@@ -184,9 +189,12 @@ impl TextArea {
             vim_mode: VimMode::Insert,
             vim_pending: VimPending::None,
             vim_commands: VimCommandState::default(),
+            vim_search: vim_search::VimSearch::default(),
+            vim_search_enabled: false,
             editor_keymap: defaults.editor,
             vim_normal_keymap: defaults.vim_normal,
             vim_operator_keymap: defaults.vim_operator,
+            vim_search_keymap: defaults.vim_search,
             vim_text_object_keymap: defaults.vim_text_object,
         }
     }
@@ -201,6 +209,7 @@ impl TextArea {
         self.editor_keymap = Arc::clone(&keymap.editor);
         self.vim_normal_keymap = keymap.vim_normal.clone();
         self.vim_operator_keymap = keymap.vim_operator.clone();
+        self.vim_search_keymap = keymap.vim_search.clone();
         self.vim_text_object_keymap = keymap.vim_text_object.clone();
     }
 
@@ -253,6 +262,7 @@ impl TextArea {
         self.wrap_cache.replace(None);
         self.preferred_col = None;
         self.vim_pending = VimPending::None;
+        self.vim_search = vim_search::VimSearch::default();
         self.vim_commands = VimCommandState::default();
     }
 
@@ -265,6 +275,7 @@ impl TextArea {
     pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
         self.vim_enabled = enabled;
         self.vim_pending = VimPending::None;
+        self.vim_search = vim_search::VimSearch::default();
         self.vim_commands = VimCommandState::default();
         self.vim_mode = if enabled {
             VimMode::Normal
@@ -301,12 +312,12 @@ impl TextArea {
     /// This is observable so the composer can avoid stealing the second key of
     /// `d{motion}` or `y{motion}` for higher-level shortcuts.
     pub(crate) fn is_vim_operator_pending(&self) -> bool {
-        !matches!(self.vim_pending, VimPending::None)
+        self.vim_query().is_some() || !matches!(self.vim_pending, VimPending::None)
     }
 
     /// Return the keymap context that owns the next editing key.
     pub(crate) fn keymap_context(&self) -> KeymapContext {
-        if !self.vim_enabled || self.vim_mode == VimMode::Insert {
+        if !self.vim_enabled || self.vim_mode == VimMode::Insert || self.vim_query().is_some() {
             return KeymapContext::Editor;
         }
         match self.vim_pending {
@@ -326,6 +337,7 @@ impl TextArea {
         if self.vim_enabled {
             self.vim_mode = VimMode::Insert;
             self.vim_pending = VimPending::None;
+            self.cancel_vim_search();
         }
     }
 
@@ -339,6 +351,7 @@ impl TextArea {
         if self.vim_enabled {
             self.vim_mode = VimMode::Normal;
             self.vim_pending = VimPending::None;
+            self.cancel_vim_search();
             self.preferred_col = None;
         }
     }
@@ -363,7 +376,7 @@ impl TextArea {
     /// transition rather than a popup cancel/backtrack or turn-interrupt shortcut.
     pub(crate) fn should_handle_vim_insert_escape(&self, event: KeyEvent) -> bool {
         self.vim_enabled
-            && (self.vim_mode == VimMode::Insert || !matches!(self.vim_pending, VimPending::None))
+            && (self.vim_mode == VimMode::Insert || self.is_vim_operator_pending())
             && event.code == KeyCode::Esc
             && event.modifiers == KeyModifiers::NONE
             && matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -679,6 +692,9 @@ impl TextArea {
     }
 
     fn handle_vim_input(&mut self, event: KeyEvent) {
+        if self.handle_vim_search_key(event) {
+            return;
+        }
         let prior_mode = self.vim_mode;
         match self.vim_mode {
             VimMode::Insert => self.handle_vim_insert(event),
@@ -830,6 +846,7 @@ impl TextArea {
         }
         if self.vim_normal_keymap.cancel_operator.is_pressed(event) {
             self.vim_pending = VimPending::None;
+            self.cancel_vim_search();
             return;
         }
         self.handle_vim_extra_command(event);

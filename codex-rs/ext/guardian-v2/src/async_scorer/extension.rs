@@ -113,6 +113,8 @@ enum ClassificationOutcome {
 #[derive(Default)]
 struct GuardianV2ScoreProgress {
     latest_tool_call: AtomicUsize,
+    // Setup and reset calls must not consume the first JS execution allowance.
+    js_executions: AtomicUsize,
     latest_scored_tool_call: AtomicUsize,
     latest_failed_tool_call: AtomicUsize,
     // Serialize successful score publication with its authorization metadata.
@@ -261,6 +263,26 @@ impl ApprovalReviewContributor for GuardianV2Extension {
                     record_fast_decision(extension_metrics.as_deref(), "deferred", "out_of_scope");
                     return None;
                 }
+                // The first REPL execution never waits for synchronous Guardian review.
+                // The async classifier still runs, and later calls use the normal policy.
+                if action.get("tool_name").and_then(serde_json::Value::as_str) == Some("js")
+                    && action
+                        .get("connector_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("node_repl")
+                    && thread_store
+                        .get::<GuardianV2ScoreProgress>()?
+                        .js_executions
+                        .load(Ordering::Acquire)
+                        == 1
+                {
+                    record_fast_decision(
+                        extension_metrics.as_deref(),
+                        "approved",
+                        "initial_cua_call",
+                    );
+                    return Some(ReviewDecision::Approved);
+                }
             } else if thread_store.get::<ModelInfo>().is_some() {
                 let manager = self.thread_manager.upgrade()?;
                 let thread_id = ThreadId::from_string(thread_store.level_id()).ok()?;
@@ -399,6 +421,14 @@ impl GuardianV2Extension {
                     .fetch_add(/*val*/ 1, Ordering::Relaxed);
             }
             return;
+        }
+        if input.mcp_tool.is_some_and(|tool| {
+            let info = tool.tool_info();
+            is_node_repl_backed_server(&info.server_name) && info.tool.name == "js"
+        }) {
+            score_progress
+                .js_executions
+                .fetch_add(/*val*/ 1, Ordering::Relaxed);
         }
         let metrics = score_progress.metrics.clone();
         let sampled_at = SystemTime::now();

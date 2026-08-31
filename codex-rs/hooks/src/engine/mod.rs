@@ -40,6 +40,8 @@ use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookTrustStatus;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use serde_json::Map;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -70,8 +72,7 @@ pub(crate) struct ConfiguredHandler {
 pub(crate) enum HandlerSourcePath {
     Local(AbsolutePathBuf),
     /// Executor-scoped handlers are currently excluded from user-visible hook reporting
-    /// (events, summary, telemetry) because the only supported 1p hook is
-    /// coupled to executor-scoped execution. Their handlers are always executed async.
+    /// (events, summary, telemetry). Their handlers are always executed async.
     ///
     /// TODO: With CCA, all hooks will be executor-scoped, so user visibility
     /// (participation in lifecycle events and summaries) and execution behavior
@@ -79,6 +80,8 @@ pub(crate) enum HandlerSourcePath {
     ExecutorScoped {
         plugin_id: PluginId,
         environment_id: String,
+        mcp_environment_id: Option<String>,
+        mcp_metadata: Option<Box<Map<String, Value>>>,
         manifest_path: PathUri,
         source_relative_path: String,
     },
@@ -266,30 +269,14 @@ impl ClaudeHooksEngine {
             )
         });
 
-        // All events share the first environment, even if it has no handler for an event.
-        let Some(selected_environment_id) = executor_hooks
-            .first()
-            .map(|source| source.environment_id.clone())
-        else {
-            return;
-        };
-        let environment_count = executor_hooks
+        let mut display_order = self
+            .handlers
             .iter()
-            .map(|source| &source.environment_id)
-            .collect::<HashSet<_>>()
-            .len();
-        // FIXME: Remove this restriction once executor hooks support multiple environments.
-        if environment_count > 1 {
-            tracing::warn!(
-                executor_environment_count = environment_count,
-                selected_environment_id = %selected_environment_id,
-                "multiple executor environments found; only executing hooks in the first"
-            );
-        }
+            .map(|handler| handler.display_order)
+            .max()
+            .map_or(0, |display_order| display_order.saturating_add(1));
+        let mut seen_targets = HashSet::new();
         for source in executor_hooks {
-            if source.environment_id != selected_environment_id {
-                continue;
-            }
             for (event_name, groups) in source.hooks.into_matcher_groups() {
                 let Some(handler) = groups.into_iter().flat_map(|group| group.hooks).next() else {
                     continue;
@@ -305,12 +292,21 @@ impl ClaudeHooksEngine {
                     unreachable!("allowlisted executor handler must be an MCP tool");
                 };
 
-                let display_order = self
-                    .handlers
-                    .iter()
-                    .map(|handler| handler.display_order)
-                    .max()
-                    .map_or(0, |display_order| display_order.saturating_add(1));
+                // Bundled plugins can share a cleanup target; run it once per event
+                // and MCP environment.
+                let target = (
+                    std::mem::discriminant(&event_name),
+                    source
+                        .mcp_environment_id
+                        .as_ref()
+                        .unwrap_or(&source.environment_id)
+                        .clone(),
+                    server.clone(),
+                    tool.clone(),
+                );
+                if !seen_targets.insert(target) {
+                    continue;
+                }
                 self.handlers.push(ConfiguredHandler {
                     event_name,
                     matcher: None,
@@ -320,6 +316,8 @@ impl ClaudeHooksEngine {
                     source_path: HandlerSourcePath::ExecutorScoped {
                         plugin_id: source.plugin_id.clone(),
                         environment_id: source.environment_id.clone(),
+                        mcp_environment_id: source.mcp_environment_id.clone(),
+                        mcp_metadata: source.mcp_metadata.clone().map(Box::new),
                         manifest_path: source.manifest_path.clone(),
                         source_relative_path: source.source_relative_path.clone(),
                     },
@@ -331,6 +329,7 @@ impl ClaudeHooksEngine {
                         input,
                     },
                 });
+                display_order = display_order.saturating_add(1);
             }
         }
     }

@@ -1806,25 +1806,35 @@ fn test_normalize_tools_disambiguates_sanitized_namespace_collisions() {
     let tools = vec![
         create_test_tool("basic-server", "lookup"),
         create_test_tool("basic_server", "query"),
+        create_test_tool("npm:@scope/package.name", "lookup"),
+        create_test_tool("npm__scope_package_name", "lookup"),
     ];
 
     let model_tools =
         normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true, &[]);
 
-    assert_eq!(model_tools.len(), 2);
+    assert_eq!(model_tools.len(), 4);
     let mut namespaces = model_tools
         .iter()
         .map(|tool| tool.callable_namespace.as_str())
         .collect::<Vec<_>>();
     namespaces.sort();
     namespaces.dedup();
-    assert_eq!(namespaces.len(), 2);
+    assert_eq!(namespaces.len(), 4);
 
     let raw_servers = model_tools
         .iter()
         .map(|tool| tool.server_name.as_str())
         .collect::<HashSet<_>>();
-    assert_eq!(raw_servers, HashSet::from(["basic-server", "basic_server"]));
+    assert_eq!(
+        raw_servers,
+        HashSet::from([
+            "basic-server",
+            "basic_server",
+            "npm:@scope/package.name",
+            "npm__scope_package_name",
+        ])
+    );
     let model_names = model_tool_names(&model_tools);
     assert!(
         model_names.iter().all(is_code_mode_compatible_tool_name),
@@ -4571,6 +4581,27 @@ fn mcp_init_error_display_reports_generic_errors() {
     let expected = format!("MCP client for `{server_name}` failed to start: {err:#}");
 
     assert_eq!(expected, display);
+}
+
+#[test]
+fn mcp_init_error_display_quotes_server_names() {
+    let github_config: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "https://api.githubcopilot.com/mcp/",
+    }))
+    .expect("GitHub MCP configuration should deserialize");
+    let error: StartupOutcomeError = anyhow::anyhow!("request timed out").into();
+    let mut displays = Vec::new();
+    for server_name in ["npm:@scope/package.name", "server.name"] {
+        for config in [None, Some(&github_config)] {
+            displays.push(mcp_init_error_display(
+                server_name,
+                config,
+                &error,
+                /*reason*/ None,
+            ));
+        }
+    }
+    insta::assert_snapshot!(displays.join("\n\n"));
 }
 
 #[test]

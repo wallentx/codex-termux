@@ -50,6 +50,8 @@ pub(crate) struct ContextManager {
     items: Arc<Vec<ResponseItemEnvelope>>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
+    /// Monotonic user-input/reset revision, independent of compaction's history generation.
+    user_message_revision: u64,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -69,11 +71,21 @@ pub(crate) struct ContextManager {
 struct SharedConversationHistory {
     items: Arc<Vec<ResponseItemEnvelope>>,
     history_version: u64,
+    user_message_revision: u64,
+}
+
+pub(crate) enum HistoryReplacement {
+    Compaction,
+    Reset,
 }
 
 impl ConversationHistorySnapshot for SharedConversationHistory {
     fn history_version(&self) -> u64 {
         self.history_version
+    }
+
+    fn user_message_revision(&self) -> u64 {
+        self.user_message_revision
     }
 
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
@@ -97,6 +109,7 @@ impl ContextManager {
         Self {
             items: Arc::new(Vec::new()),
             history_version: 0,
+            user_message_revision: 0,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
@@ -109,6 +122,7 @@ impl ContextManager {
         Arc::new(SharedConversationHistory {
             items: Arc::clone(&self.items),
             history_version: self.history_version,
+            user_message_revision: self.user_message_revision,
         })
     }
 
@@ -209,6 +223,9 @@ impl ContextManager {
                 truncate_function_output_payload(output, policy, estimate_audio_token_count);
             }
             Arc::make_mut(&mut self.items).push(processed);
+            if crate::context::is_user_authorization_message(item) {
+                self.user_message_revision = self.user_message_revision.saturating_add(1);
+            }
         }
     }
 
@@ -310,6 +327,12 @@ impl ContextManager {
     }
 
     pub(crate) fn replace_annotated(&mut self, items: Vec<ResponseItemEnvelope>) {
+        self.user_message_revision = self.user_message_revision.saturating_add(1);
+        self.replace_compacted(items);
+    }
+
+    /// Compaction changes the model's history without changing the user's authorization.
+    pub(crate) fn replace_compacted(&mut self, items: Vec<ResponseItemEnvelope>) {
         self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);
         self.world_state_baseline = None;

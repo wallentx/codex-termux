@@ -3739,7 +3739,21 @@ impl ThreadRequestProcessor {
             };
         }
 
-        let history_cwd = thread_history.session_cwd();
+        // Copied or referenced history can contain another thread's settings. Only snapshots
+        // explicitly owned by this thread can override its startup cwd.
+        let history_cwd = if let InitialHistory::Resumed(resumed) = &thread_history {
+            resumed.history.iter().rev().find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                    if event.thread_id == Some(resumed.conversation_id) =>
+                {
+                    Some(event.thread_settings.cwd.to_path_buf())
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let history_cwd = history_cwd.or_else(|| thread_history.session_cwd());
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,

@@ -71,6 +71,7 @@ mod extension_sandbox;
 mod external_auth;
 mod fork_thread;
 mod git_enrichment;
+mod guardian_authorization;
 mod guardian_mcp_elicitation;
 #[cfg(not(target_os = "windows"))]
 mod guardian_review;
