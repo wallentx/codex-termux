@@ -2272,6 +2272,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
+ "codex-async-utils",
  "codex-exec-server",
  "codex-install-context",
  "codex-linux-sandbox",
@@ -2784,6 +2785,7 @@ dependencies = [
  "codex-feedback",
  "codex-file-system",
  "codex-git-utils",
+ "codex-guardian-context",
  "codex-history",
  "codex-home",
  "codex-hooks",

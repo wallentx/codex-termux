@@ -63,6 +63,8 @@ const AUTO_COMPACT_FALLBACK_PROMPT: &str = "Save the important state before roll
 
 fn model_token_budget_config() -> ModelTokenBudgetConfig {
     ModelTokenBudgetConfig {
+        enabled: false,
+        use_history_notes_extension: false,
         reminder_threshold_tokens: 6_144,
         reminder_message_template: "Model reminder: {n_remaining} tokens remain.".to_string(),
         guidance_message: "Use the model-owned context-window guidance.".to_string(),
@@ -295,16 +297,11 @@ async fn token_budget_uses_model_message_defaults() -> Result<()> {
 
     let server = start_mock_server().await;
     let response = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let model_defaults = model_token_budget_config();
+    let mut model_defaults = model_token_budget_config();
+    model_defaults.enabled = true;
+    model_defaults.use_history_notes_extension = true;
     let expected_guidance = model_defaults.guidance_message.clone();
     let test = test_codex()
-        .with_pre_build_hook(|home| {
-            std::fs::write(
-                home.join("config.toml"),
-                "[features.token_budget]\nenabled = true\nuse_history_notes_extension = true\n",
-            )
-            .expect("write token-budget configuration");
-        })
         .with_model_info_override("gpt-5.2", move |model_info| {
             model_info
                 .model_messages
@@ -314,10 +311,6 @@ async fn token_budget_uses_model_message_defaults() -> Result<()> {
         })
         .with_config(|config| {
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
-            config
-                .features
-                .enable(Feature::TokenBudget)
-                .expect("test config should allow token budget");
         })
         .build_with_auto_env(&server)
         .await?;

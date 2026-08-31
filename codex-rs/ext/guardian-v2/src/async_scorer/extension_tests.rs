@@ -344,6 +344,29 @@ impl ExtensionMetrics for RecordingMetrics {
 
 struct TestConversationHistory(Vec<ResponseItem>);
 
+struct TestRetainedHistory {
+    current: TestConversationHistory,
+    retained: Vec<ResponseItem>,
+}
+
+impl ConversationHistorySnapshot for TestRetainedHistory {
+    fn history_version(&self) -> u64 {
+        self.current.history_version()
+    }
+
+    fn user_message_revision(&self) -> u64 {
+        self.current.user_message_revision()
+    }
+
+    fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        self.current.items()
+    }
+
+    fn review_items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        Box::new(self.retained.iter())
+    }
+}
+
 impl ConversationHistorySnapshot for TestConversationHistory {
     fn history_version(&self) -> u64 {
         0
@@ -2781,6 +2804,15 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
             .inject_response_items(conversation_history.0.clone()),
     )
     .await?;
+    let mut retained: Vec<ResponseItem> = serde_json::from_value(json!([
+        {"type":"function_call", "name":"check_repository", "arguments":"{}", "call_id":"before"},
+        {"type":"function_call_output", "call_id":"before", "output":"repository is private"}
+    ]))?;
+    retained.extend(conversation_history.0.clone());
+    let conversation_history = TestRetainedHistory {
+        retained,
+        current: conversation_history,
+    };
     thread_store.insert(parent_model);
 
     registry.tool_lifecycle_contributors()[0]
@@ -2826,6 +2858,9 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
         serde_json::to_value(&latest_compaction)?
     );
     assert_eq!(request["input"][3]["role"], "user");
+    let transcript = serde_json::to_string(&request["input"][3])?;
+    assert!(transcript.contains("tool check_repository call"));
+    assert!(transcript.contains("tool check_repository result: repository is private"));
 
     let previous_score = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {

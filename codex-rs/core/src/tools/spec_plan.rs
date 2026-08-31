@@ -153,18 +153,6 @@ pub(crate) fn build_tool_router(
     add_core_tool_sources(&context, &mut registry);
 
     let hosted_specs = if crate::guardian::is_basic_session_source(&turn_context.session_source) {
-        if let Some(history_tools) = session
-            .services
-            .thread_extension_data
-            .get::<crate::codex_delegate::GuardianReadOnlyHistoryTools>()
-        {
-            append_extension_tool_executors(
-                turn_context,
-                model_info,
-                history_tools.0.iter().cloned(),
-                &mut registry,
-            );
-        }
         Vec::new()
     } else {
         let registered_mcp_tools = session.services.mcp_handler_cache.append_mcp_tools(
