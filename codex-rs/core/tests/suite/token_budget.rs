@@ -249,6 +249,7 @@ async fn token_budget_guidance_precedes_standalone_context_window() -> Result<()
     let guidance_message = "Preserve important state before compaction.";
     let test = test_codex()
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
             config.token_budget = Some(TokenBudgetConfig {
                 guidance_message: Some(guidance_message.to_string()),
@@ -1468,6 +1469,7 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     let test = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config.model_context_window = Some(10_000);
             config.token_budget = Some(TokenBudgetConfig {
                 auto_compact_fallback_prompt: Some(AUTO_COMPACT_FALLBACK_PROMPT.to_string()),

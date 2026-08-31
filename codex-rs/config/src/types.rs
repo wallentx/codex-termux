@@ -42,6 +42,7 @@ pub use crate::tui_keymap::TuiListKeymap;
 pub use crate::tui_keymap::TuiPagerKeymap;
 pub use crate::tui_keymap::TuiVimNormalKeymap;
 pub use crate::tui_keymap::TuiVimOperatorKeymap;
+pub use crate::tui_keymap::TuiVimSearchKeymap;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 2;

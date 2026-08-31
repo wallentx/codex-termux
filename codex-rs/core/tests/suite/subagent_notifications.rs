@@ -1287,6 +1287,7 @@ async fn grandchild_full_fork_preserves_context_baseline(
             config.agent_default_subagent_model = Some(V2_DEFAULT_MODEL.to_string());
             config.developer_instructions = Some(INSTRUCTIONS.to_string());
             if compact_parent {
+                config.update_plan_enabled = true;
                 // Use local compaction so the test controls the replacement history.
                 config.model_provider.name = "test-provider".to_string();
                 config

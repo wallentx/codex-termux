@@ -258,7 +258,7 @@ impl ChatWidget {
                     .send(AppEvent::OpenDesktopThread { thread_id });
             }
             SlashCommand::Init => {
-                const INIT_PROMPT: &str = include_str!("../../prompt_for_init_command.md");
+                const INIT_PROMPT: &str = include_str!("../../assets/prompt_for_init_command.md");
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
             SlashCommand::Compact => {

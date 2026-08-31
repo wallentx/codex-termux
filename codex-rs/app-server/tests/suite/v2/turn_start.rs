@@ -1350,7 +1350,10 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .enable_feature(Feature::Goals)
-        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_root_config(&format!(
+            "chatgpt_base_url = \"{}\"\ntools.update_plan.enabled = true",
+            server.uri()
+        ))
         .write(codex_home.path())?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 
@@ -4044,7 +4047,10 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .enable_feature(Feature::Collab)
-        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_root_config(&format!(
+            "chatgpt_base_url = \"{}\"\ntools.update_plan.enabled = true",
+            server.uri()
+        ))
         .write(codex_home.path())?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 

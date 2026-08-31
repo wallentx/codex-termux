@@ -915,6 +915,7 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
                         serde_json::from_value(serde_json::json!({
                             "command": rmcp_test_server_bin,
                             "environment_id": environment_id,
+                            "cwd": config.cwd,
                             "omit_tools_from": omit_tools_from,
                         }))
                         .expect("test MCP server config should be valid"),
@@ -1149,6 +1150,7 @@ async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure() -> 
                         serde_json::from_value(serde_json::json!({
                             "command": rmcp_test_server_bin,
                             "environment_id": environment_id,
+                            "cwd": config.cwd,
                             "omit_tools_from": omit_tools_from,
                         }))
                         .expect("test MCP server config should be valid"),
@@ -1595,11 +1597,36 @@ text(output.output);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_update_plan_nested_tool_result_is_empty_object() -> Result<()> {
+async fn code_mode_does_not_expose_update_plan_by_default() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
+        &server,
+        "inspect the available tools",
+        r#"
+text(JSON.stringify({
+  callable: typeof tools.update_plan === "function",
+  listed: ALL_TOOLS.some(({ name }) => name === "update_plan"),
+}));
+"#,
+    )
+    .await?;
+
+    let (output, _) = custom_tool_output_body_and_success(&second_mock.single_request(), "call-1");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output)?,
+        serde_json::json!({ "callable": false, "listed": false })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_update_plan_nested_tool_result_is_empty_object() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn_with_config(
         &server,
         "use exec to run update_plan",
         r#"
@@ -1608,6 +1635,7 @@ const result = await tools.update_plan({
 });
 text(JSON.stringify(result));
 "#,
+        |config| config.update_plan_enabled = true,
     )
     .await?;
 
@@ -4347,6 +4375,7 @@ async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transc
         let mcp = serde_json::from_value(serde_json::json!({
             "command": mcp_server_bin,
             "environment_id": remote_aware_environment_id(),
+            "cwd": config.cwd,
             "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
             "omit_tools_from": ["deferred"],
         }))
@@ -4440,6 +4469,7 @@ async fn code_mode_node_repl_image_flag_without_enhanced_stays_disabled(
             let mcp = serde_json::from_value(serde_json::json!({
                 "command": mcp_server_bin,
                 "environment_id": remote_aware_environment_id(),
+                "cwd": config.cwd,
                 "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
                 "omit_tools_from": ["deferred"],
             }))
@@ -4602,6 +4632,7 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
             let mcp: McpServerConfig = serde_json::from_value(serde_json::json!({
                 "command": mcp_server_bin,
                 "environment_id": remote_aware_environment_id(),
+                "cwd": config.cwd,
                 "env": {
                     "MCP_TEST_ENABLE_NODE_REPL_JS": "1",
                     "MCP_TEST_IMAGE_DATA_URL": format!("data:image/png;base64,{}", BASE64_STANDARD.encode(large_image.into_inner())),
@@ -5805,6 +5836,7 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
+        config.update_plan_enabled = true;
         let _ = config.features.enable(Feature::CodeMode);
         config.code_mode.excluded_tool_namespaces = vec!["excluded".to_string()];
     });
@@ -5907,6 +5939,7 @@ async fn code_mode_omits_configured_mcp_server_tools() -> Result<()> {
             model.supports_search_tool = false;
         })
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             let _ = config.features.enable(Feature::CodeMode);
             let mut servers = config.mcp_servers.get().clone();
             servers.insert(
@@ -5914,6 +5947,7 @@ async fn code_mode_omits_configured_mcp_server_tools() -> Result<()> {
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["code_mode"],
                 }))
                 .expect("test MCP server config should be valid"),
@@ -6005,6 +6039,7 @@ async fn code_mode_only_keeps_mcp_tools_direct_when_nested_exposure_is_omitted()
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["code_mode"],
                 }))
                 .expect("test MCP server config should be valid"),
@@ -6098,6 +6133,7 @@ async fn code_mode_only_can_call_mcp_tools_hidden_from_direct_and_deferred_expos
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["direct", "deferred"],
                     "supports_parallel_tool_calls": true,
                 }))

@@ -2158,6 +2158,11 @@ pub struct TurnStartedEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ThreadSettingsAppliedEvent {
+    /// Logical task that owns this snapshot, independent of the physical rollout file.
+    /// Absent in older histories; copied snapshots retain their original owner's ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub thread_id: Option<ThreadId>,
     pub thread_settings: ThreadSettingsSnapshot,
 }
 

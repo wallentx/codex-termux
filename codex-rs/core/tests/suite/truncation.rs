@@ -787,13 +787,16 @@ async fn call_mcp_echo(
     )
     .await;
 
-    let mcp_server = serde_json::from_value(json!({
-        "command": remote_aware_stdio_server_bin()?,
-        "environment_id": remote_aware_environment_id(),
-        "startup_timeout_sec": 10,
-        "tools": { "echo": { "output_token_limit": output_token_limit } },
-    }))?;
+    let command = remote_aware_stdio_server_bin()?;
     let mut builder = builder.with_config(move |config| {
+        let mcp_server = serde_json::from_value(json!({
+            "command": command,
+            "environment_id": remote_aware_environment_id(),
+            "cwd": config.cwd,
+            "startup_timeout_sec": 10,
+            "tools": { "echo": { "output_token_limit": output_token_limit } },
+        }))
+        .expect("test MCP server configuration");
         config
             .mcp_servers
             .set(HashMap::from([(server_name.to_string(), mcp_server)]))

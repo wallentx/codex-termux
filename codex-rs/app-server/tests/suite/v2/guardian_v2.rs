@@ -59,6 +59,7 @@ use tokio::time::timeout;
 use super::mcp_tool::TEST_SERVER_NAME;
 use super::mcp_tool::TEST_TOOL_NAME;
 use super::mcp_tool::start_mcp_server;
+use super::mcp_tool::start_mcp_server_with_tools;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL: &str = "mock-model";
@@ -147,6 +148,7 @@ struct MockResponsesState {
     review_outcome: ReviewOutcome,
     transcript_content: TranscriptContent,
     mcp_server_name: Option<&'static str>,
+    mcp_tool_sequence: Option<&'static [&'static str]>,
     root_worker: bool,
     root_user_restriction: bool,
     root_user_input_restriction: bool,
@@ -429,7 +431,7 @@ async fn parent_response(
             ]
         } else if state.user_input_restriction && request_number == 1 {
             user_input_request_events()
-        } else if request_number < 2
+        } else if request_number < state.mcp_tool_sequence.map_or(/*default*/ 2, <[_]>::len)
             || state.user_input_restriction && request_number == 2
             || (state.root_worker || state.root_user_restriction) && request_number == 3
         {
@@ -450,7 +452,11 @@ async fn parent_response(
                 responses::ev_function_call_with_namespace(
                     &call_id,
                     &format!("mcp__{}", state.mcp_server_name.unwrap_or(TEST_SERVER_NAME)),
-                    TEST_TOOL_NAME,
+                    state
+                        .mcp_tool_sequence
+                        .and_then(|tools| tools.get(request_number))
+                        .copied()
+                        .unwrap_or(TEST_TOOL_NAME),
                     &arguments,
                 ),
                 responses::ev_completed(&call_id),
@@ -1604,6 +1610,103 @@ async fn guardian_v2_computer_use_only_scopes_classification_and_fast_reviews(
         /*sensitive_action*/ None,
     )
     .await
+}
+
+#[test_case("node_repl", &["js", "js"]; "browser startup")]
+#[test_case("cua_repl", &["js", "js"]; "computer use startup")]
+#[test_case("node_repl", &["js_reset", "js", "js"]; "browser reset before execution")]
+#[test_case("cua_repl", &["js_reset", "js", "js"]; "computer use reset before execution")]
+#[test_case("node_repl", &["js_add_node_module_dir", "js", "js"]; "browser setup before execution")]
+#[test_case("cua_repl", &["js_add_node_module_dir", "js", "js"]; "computer use setup before execution")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_cua_review_does_not_wait_for_initial_score(
+    server_name: &'static str,
+    tool_sequence: &'static [&'static str],
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let state = Arc::new(MockResponsesState {
+        mcp_server_name: Some(server_name),
+        mcp_tool_sequence: Some(tool_sequence),
+        ..Default::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let responses_url = format!("http://{}", listener.local_addr()?);
+    let router = Router::new()
+        .route("/v1/responses", get(luna_websocket).post(parent_response))
+        .with_state(Arc::clone(&state));
+    let responses_server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let (mcp_url, mcp_server) = start_mcp_server_with_tools(
+        &["js", "js_reset", "js_add_node_module_dir"],
+        /*sensitive_action*/ None,
+    )
+    .await?;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&responses_url)
+        .with_model(MODEL)
+        .with_provider_config("supports_websockets = false")
+        .with_approval_policy("on-request")
+        .with_root_config("approvals_reviewer = \"auto_review\"")
+        .with_extra_config(&format!(
+            "[mcp_servers.{server_name}]\nurl = \"{mcp_url}/mcp\"\ndefault_tools_approval_mode = \"auto\"\n\n[features.guardianv2]\nenabled = true"
+        ))
+        .enable_feature(Feature::GuardianApproval)
+        .write(codex_home.path())?;
+    let config = load_default_config_for_test(&codex_home).await;
+    let mut model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
+    model_info.node_repl_auto_review_required = true;
+    write_models_cache_with_models(codex_home.path(), vec![model_info])?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(TIMEOUT)
+        .await?;
+    let thread = app_server
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread;
+    let request_id = app_server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: USER_CONTEXT.to_owned(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = timeout(TIMEOUT, app_server.read_response(request_id)).await??;
+
+    // Leave the classifier pending: the first execution proceeds, the second waits for review.
+    let _: ItemGuardianApprovalReviewStartedNotification = timeout(
+        TIMEOUT,
+        app_server.read_notification("item/autoApprovalReview/started"),
+    )
+    .await??;
+    wait_for_luna_request(&state, /*index*/ 0).await?;
+    wait_for_guardian_reviews(&state, /*expected*/ 1).await?;
+    let reviewed_call = format!("guardian-{}", tool_sequence.len() - 1);
+    assert!(
+        state
+            .guardian_requests
+            .lock()
+            .expect("Guardian request lock")[0]
+            .to_string()
+            .contains(&reviewed_call)
+    );
+    assert_eq!(
+        state.parent_requests.load(Ordering::SeqCst),
+        tool_sequence.len()
+    );
+    state.allow_guardian_review.notify_one();
+    let completed: TurnCompletedNotification =
+        timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(state.guardian_reviews.load(Ordering::SeqCst), 1);
+    app_server.shutdown_gracefully().await?;
+    mcp_server.abort();
+    responses_server.abort();
+    Ok(())
 }
 
 #[test_case("node_repl", GuardianRisk::Low, None; "browser low risk")]
