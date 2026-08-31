@@ -362,7 +362,17 @@ printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
 printf 'termux updater with target drift\n' > codex-rs/tui/src/termux_update.rs
 git add .github/scripts/macos-signing .github/workflows/rust-release.yml codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/features/src/lib.rs codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml codex-rs/windows-sandbox-rs/BUILD.bazel termux/compat.txt
 git commit -m "termux compatibility changes" >/dev/null
-git push origin wallentx/termux-target >/dev/null
+git tag rust-v1.0.0-alpha.1-termux
+printf 'newer release line\n' > src/newer-release-line.txt
+git add src/newer-release-line.txt
+git commit -m "advance target to newer release line" >/dev/null
+git tag rust-v1.1.0-alpha.1-termux
+git push \
+  origin \
+  wallentx/termux-target \
+  rust-v1.0.0-alpha.1-termux \
+  rust-v1.1.0-alpha.1-termux \
+  >/dev/null
 
 git checkout -B release-train/1.0.0 rust-v1.0.0-alpha.1 >/dev/null
 printf 'stale\n' > stale-work-branch.txt
@@ -427,6 +437,7 @@ assert_ref_file_equals \
   .github/workflows/rust-release.yml \
   "$(cat "${repo_root}/.github/workflows/rust-release.yml")"
 assert_ref_has_file origin/release-train/1.0.0 termux/compat.txt
+assert_ref_lacks_file origin/release-train/1.0.0 src/newer-release-line.txt
 assert_ref_lacks_file origin/release-train/1.0.0 stale-work-branch.txt
 
 if [[ "$(cat "${github_output_update}")" != "pr_url=https://github.com/wallentx/codex-termux/pull/7" ]]; then

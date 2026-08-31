@@ -197,10 +197,10 @@ merge_release_branch_into_work_branch() {
     echo "Release merge reported conflicts; resolving authoritative paths."
   fi
 
-  seed_release_branch_workflows
-  git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
   restore_merge_authoritative_paths
   restore_release_workspace_manifest
+  seed_release_branch_workflows
+  git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
 
   unresolved_paths="$(git diff --name-only --diff-filter=U)"
   if [[ -n "${unresolved_paths}" ]]; then
@@ -267,7 +267,7 @@ append_pr_summary() {
     echo "- Release kind: \`codex\`"
     echo "- Release train branch: \`${RELEASE_BRANCH}\`"
     echo "- Work branch: \`${WORK_BRANCH}\`"
-    echo "- Patch source: \`${PATCH_BRANCH}\`"
+    echo "- Patch source: \`${patch_source_label}\`"
     if [[ -n "${pr_url}" ]]; then
       echo "- PR: ${pr_url}"
     fi
@@ -357,6 +357,36 @@ delete_existing_release_branch_if_safe() {
 }
 
 capture_seeded_release_files
+
+patch_source_ref="origin/${PATCH_BRANCH}"
+patch_source_label="${PATCH_BRANCH}"
+patch_source_sha="$(git rev-parse "${patch_source_ref}")"
+
+if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
+  release_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+  mapfile -t target_termux_tags < <(
+    git tag \
+      --merged "origin/${PATCH_BRANCH}" \
+      --list 'rust-v*-termux' \
+      --sort=-v:refname
+  )
+  if (( ${#target_termux_tags[@]} > 0 )) \
+    && [[ "${target_termux_tags[0]}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]] \
+    && [[ "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" != "${release_line}" ]]; then
+    for candidate_tag in "${target_termux_tags[@]}"; do
+      if [[ "${candidate_tag}" == "${TERMUX_TAG}" ]]; then
+        continue
+      fi
+      if [[ "${candidate_tag}" == rust-v${release_line}.*-termux ]]; then
+        patch_source_ref="refs/tags/${candidate_tag}"
+        patch_source_label="${candidate_tag}"
+        patch_source_sha="$(git rev-parse "${patch_source_ref}")"
+        echo "Using ${candidate_tag} as the patch source because ${PATCH_BRANCH} has advanced to ${target_termux_tags[0]}."
+        break
+      fi
+    done
+  fi
+fi
 
 existing_prs="$(title_prs_json)"
 existing_merged_pr="$(
@@ -452,10 +482,13 @@ if git ls-remote --exit-code --heads origin "${WORK_BRANCH}" >/dev/null 2>&1; th
   git fetch origin "${WORK_BRANCH}"
 fi
 
-if [[ "${work_branch_exists}" == true && -n "${existing_open_train_pr_url}" && "${existing_open_train_pr_matches_upstream}" == "true" ]]; then
+if [[ "${work_branch_exists}" == true \
+  && -n "${existing_open_train_pr_url}" \
+  && "${existing_open_train_pr_matches_upstream}" == "true" \
+  && "${patch_source_ref}" == "origin/${PATCH_BRANCH}" ]]; then
   git checkout -B "${WORK_BRANCH}" "origin/${WORK_BRANCH}"
 else
-  git checkout -B "${WORK_BRANCH}" "origin/${PATCH_BRANCH}"
+  git checkout -B "${WORK_BRANCH}" "${patch_source_ref}"
 fi
 normalize_workspace_version_to_upstream_tag
 git add -- codex-rs/Cargo.toml
@@ -481,7 +514,7 @@ jq -n \
   --arg release_branch "${RELEASE_BRANCH}" \
   --arg work_branch "${WORK_BRANCH}" \
   --arg patch_branch "${PATCH_BRANCH}" \
-  --arg patch_source_sha "$(git rev-parse "origin/${PATCH_BRANCH}")" \
+  --arg patch_source_sha "${patch_source_sha}" \
   --arg termux_tag "${TERMUX_TAG}" \
   --argjson upstream_prerelease "${UPSTREAM_PRERELEASE}" \
   '{
@@ -518,9 +551,9 @@ body_path="${RUNNER_TEMP}/termux-release-pr.md"
   echo "- Upstream tag: \`${UPSTREAM_TAG}\`"
   echo "- Termux release tag: \`${TERMUX_TAG}\`"
   echo "- Release train branch: \`${RELEASE_BRANCH}\`"
-  echo "- Patch source: \`${PATCH_BRANCH}\`"
+  echo "- Patch source: \`${patch_source_label}\`"
   echo
-  echo "This PR is intentionally created from \`${PATCH_BRANCH}\` with the Termux release automation files copied from \`dev\`, then targeted at the upstream release branch. If GitHub reports conflicts, resolve them manually by keeping the upstream release code while preserving the Termux compatibility fixes."
+  echo "This PR is intentionally created from \`${patch_source_label}\` with the Termux release automation files copied from \`dev\`, then targeted at the upstream release branch. If GitHub reports conflicts, resolve them manually by keeping the upstream release code while preserving the Termux compatibility fixes."
   echo
   echo "Auto-merge is enabled when GitHub reports the PR as mergeable. Required CI, including the Termux artifact smoke test, is the approval gate. After merge, the deployment workflow attaches the tested artifact to \`${TERMUX_TAG}\` and opens the checkpoint PR."
   echo
