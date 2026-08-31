@@ -640,6 +640,9 @@
             "collaboration_modes": {
               "type": "boolean"
             },
+            "compaction_image_budget": {
+              "type": "boolean"
+            },
             "computer_use": {
               "type": "boolean"
             },
@@ -647,6 +650,9 @@
               "type": "boolean"
             },
             "connectors": {
+              "type": "boolean"
+            },
+            "content_item_kinds": {
               "type": "boolean"
             },
             "current_time_reminder": {
@@ -746,6 +752,9 @@
               "type": "boolean"
             },
             "in_app_dictation": {
+              "type": "boolean"
+            },
+            "in_app_local_automation": {
               "type": "boolean"
             },
             "in_app_updates": {
@@ -920,6 +929,9 @@
               "type": "boolean"
             },
             "tool_suggest": {
+              "type": "boolean"
+            },
+            "transcript_v2": {
               "type": "boolean"
             },
             "tui_app_server": {
@@ -1438,6 +1450,10 @@
       "additionalProperties": false,
       "description": "Optional tool-call categories available to the Guardian v2 classifier.",
       "properties": {
+        "computer_use_only": {
+          "description": "Restrict asynchronous classification and fast approvals to browser and computer-use tools.",
+          "type": "boolean"
+        },
         "sandboxed_exec_commands": {
           "description": "Include sandboxed shell command calls in Guardian v2 classification.",
           "type": "boolean"
@@ -1665,6 +1681,13 @@
     },
     "HooksToml": {
       "properties": {
+        "Interrupt": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
         "PermissionRequest": {
           "default": [],
           "items": {
@@ -2370,6 +2393,9 @@
           "type": "boolean"
         },
         "allow_upstream_proxy": {
+          "type": "boolean"
+        },
+        "credential_broker": {
           "type": "boolean"
         },
         "dangerously_allow_all_unix_sockets": {
@@ -3778,6 +3804,7 @@
               "open_line_above": null,
               "open_line_below": null,
               "paste_after": null,
+              "repeat_last_change": null,
               "replace_char": null,
               "start_change_operator": null,
               "start_delete_operator": null,
@@ -4585,6 +4612,7 @@
             "open_line_above": null,
             "open_line_below": null,
             "paste_after": null,
+            "repeat_last_change": null,
             "replace_char": null,
             "start_change_operator": null,
             "start_delete_operator": null,
@@ -4992,6 +5020,14 @@
             }
           ],
           "description": "Paste after cursor (`p`)."
+        },
+        "repeat_last_change": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Repeat the last complete edit (`.`)."
         },
         "replace_char": {
           "allOf": [
@@ -5610,6 +5646,9 @@
         "collaboration_modes": {
           "type": "boolean"
         },
+        "compaction_image_budget": {
+          "type": "boolean"
+        },
         "computer_use": {
           "type": "boolean"
         },
@@ -5617,6 +5656,9 @@
           "type": "boolean"
         },
         "connectors": {
+          "type": "boolean"
+        },
+        "content_item_kinds": {
           "type": "boolean"
         },
         "current_time_reminder": {
@@ -5716,6 +5758,9 @@
           "type": "boolean"
         },
         "in_app_dictation": {
+          "type": "boolean"
+        },
+        "in_app_local_automation": {
           "type": "boolean"
         },
         "in_app_updates": {
@@ -5890,6 +5935,9 @@
           "type": "boolean"
         },
         "tool_suggest": {
+          "type": "boolean"
+        },
+        "transcript_v2": {
           "type": "boolean"
         },
         "tui_app_server": {

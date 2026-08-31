@@ -28,7 +28,6 @@ pub(super) struct McpDesiredState {
     pub(super) session_source: SessionSource,
     pub(super) environments: TurnEnvironmentSnapshot,
     pub(super) local_process_cwd: PathBuf,
-    pub(super) windows_sandbox_level: WindowsSandboxLevel,
 }
 
 impl Session {
@@ -38,6 +37,9 @@ impl Session {
         next: &SessionConfiguration,
         updates: &SessionSettingsUpdate,
     ) -> bool {
+        // TODO(anp): Reconcile invalidation with TurnEnvironment::sandbox_context.
+        // This gap predates that API: an internal Windows-level-only settings update
+        // can leave the published MCP configuration stale.
         current.cwd() != next.cwd()
             || current.approval_policy.value() != next.approval_policy.value()
             || current.approvals_reviewer != next.approvals_reviewer
@@ -97,7 +99,6 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments,
             local_process_cwd,
-            windows_sandbox_level: session_configuration.windows_sandbox_level,
         }
     }
 
@@ -124,7 +125,6 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments: resolved_environments.clone(),
             local_process_cwd,
-            windows_sandbox_level: session_configuration.windows_sandbox_level,
         };
         self.publish_mcp_runtime(
             &desired,
@@ -144,14 +144,13 @@ impl Session {
     /// Adds effective executor-owned configuration from this exact thread snapshot.
     pub(super) fn project_selected_environment_mcp_servers<'a>(
         &'a self,
+        session_source: &'a SessionSource,
         config: &'a Config,
         environments: &'a TurnEnvironmentSnapshot,
         mut projection: McpRuntimeProjection,
     ) -> BoxFuture<'a, McpRuntimeProjection> {
         Box::pin(async move {
-            if crate::guardian::is_guardian_reviewer_source(
-                &self.state.lock().await.session_configuration.session_source,
-            ) {
+            if crate::guardian::is_basic_session_source(session_source) {
                 return projection;
             }
 
@@ -286,6 +285,7 @@ impl Session {
     ) {
         let mcp_projection = self
             .project_selected_environment_mcp_servers(
+                &desired.session_source,
                 &desired.config,
                 &desired.environments,
                 mcp_projection,

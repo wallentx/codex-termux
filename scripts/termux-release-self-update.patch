@@ -1,8 +1,8 @@
 diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
-index f6c5fbfb98..8e16c4f110 100644
+index 0bfea04498..0f6739f3d1 100644
 --- a/codex-rs/cli/src/main.rs
 +++ b/codex-rs/cli/src/main.rs
-@@ -728,7 +728,7 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+@@ -784,7 +784,7 @@ fn parse_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
  }
  
  /// Handle the app exit and print the results. Optionally run the update action.
@@ -11,7 +11,7 @@ index f6c5fbfb98..8e16c4f110 100644
      let is_fatal = match &exit_info.exit_reason {
          ExitReason::Fatal(message) => {
              eprintln!("ERROR: {message}");
-@@ -747,13 +747,18 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+@@ -806,13 +806,18 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
          std::process::exit(1);
      }
      if let Some(action) = update_action {
@@ -32,8 +32,8 @@ index f6c5fbfb98..8e16c4f110 100644
      println!();
      let cmd_str = action.command_str();
      println!("Updating Codex via `{cmd_str}`...");
-@@ -795,7 +800,7 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
-     Ok(())
+@@ -878,7 +883,7 @@ fn resolve_windows_update_command_from_path(
+         .ok_or_else(|| anyhow::anyhow!("could not find update command `{command}` on PATH"))
  }
  
 -fn run_update_command() -> anyhow::Result<()> {
@@ -41,7 +41,7 @@ index f6c5fbfb98..8e16c4f110 100644
      #[cfg(debug_assertions)]
      {
          anyhow::bail!(
-@@ -805,15 +810,40 @@ fn run_update_command() -> anyhow::Result<()> {
+@@ -888,15 +893,40 @@ fn run_update_command() -> anyhow::Result<()> {
  
      #[cfg(not(debug_assertions))]
      {
@@ -83,7 +83,7 @@ index f6c5fbfb98..8e16c4f110 100644
  fn run_execpolicycheck(cmd: ExecPolicyCheckCommand) -> anyhow::Result<()> {
      cmd.run()
  }
-@@ -996,7 +1026,7 @@ async fn cli_main(
+@@ -1139,7 +1169,7 @@ async fn cli_main(
                  arg0_paths.clone(),
              )
              .await?;
@@ -92,7 +92,7 @@ index f6c5fbfb98..8e16c4f110 100644
          }
          Some(Subcommand::Exec(mut exec_cli)) => {
              reject_remote_mode_for_subcommand(
-@@ -1266,7 +1296,7 @@ async fn cli_main(
+@@ -1423,7 +1453,7 @@ async fn cli_main(
                  arg0_paths.clone(),
              )
              .await?;
@@ -101,7 +101,7 @@ index f6c5fbfb98..8e16c4f110 100644
          }
          Some(Subcommand::Archive(cmd)) => {
              let output = run_session_archive_cli_command(
-@@ -1333,7 +1363,7 @@ async fn cli_main(
+@@ -1510,7 +1540,7 @@ async fn cli_main(
                  arg0_paths.clone(),
              )
              .await?;
@@ -110,7 +110,7 @@ index f6c5fbfb98..8e16c4f110 100644
          }
          Some(Subcommand::Login(mut login_cli)) => {
              reject_remote_mode_for_subcommand(
-@@ -1405,7 +1435,7 @@ async fn cli_main(
+@@ -1582,7 +1612,7 @@ async fn cli_main(
                  root_remote_auth_token_env.as_deref(),
                  "update",
              )?;
@@ -120,10 +120,10 @@ index f6c5fbfb98..8e16c4f110 100644
          Some(Subcommand::Doctor(doctor_cli)) => {
              reject_remote_mode_for_subcommand(
 diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
-index b5540f878b..5bd763800e 100644
+index 0cd2d7ed24..6f92514c30 100644
 --- a/codex-rs/tui/src/lib.rs
 +++ b/codex-rs/tui/src/lib.rs
-@@ -177,6 +177,7 @@ mod terminal_palette;
+@@ -195,6 +195,7 @@ mod terminal_palette;
  mod terminal_probe;
  mod terminal_title;
  mod terminal_visualization_instructions;
@@ -133,10 +133,10 @@ index b5540f878b..5bd763800e 100644
  mod thread_transcript;
 diff --git a/codex-rs/tui/src/termux_update.rs b/codex-rs/tui/src/termux_update.rs
 new file mode 100644
-index 0000000000..a9e6be0d68
+index 0000000000..3d3e7d5b92
 --- /dev/null
 +++ b/codex-rs/tui/src/termux_update.rs
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,511 @@
 +use anyhow::Context;
 +use anyhow::Result;
 +use anyhow::bail;
@@ -316,8 +316,8 @@ index 0000000000..a9e6be0d68
 +        .await
 +        .context("failed to create update extraction directory")?;
 +    extract_archive(&archive_path, &extract_dir).await?;
-+    let extracted_codex = find_extracted_codex(&extract_dir)?;
-+    let executable = replace_current_exe(&extracted_codex)?;
++    let (extracted_codex, extracted_code_mode_host) = find_extracted_binaries(&extract_dir)?;
++    let executable = replace_install_binaries(&extracted_codex, &extracted_code_mode_host)?;
 +
 +    Ok(UpdateOutcome {
 +        previous_version: current.to_string(),
@@ -419,9 +419,11 @@ index 0000000000..a9e6be0d68
 +    Ok(())
 +}
 +
-+fn find_extracted_codex(root: &Path) -> Result<PathBuf> {
++fn find_extracted_binaries(root: &Path) -> Result<(PathBuf, PathBuf)> {
 +    let target_asset_stem = termux_asset_stem();
 +    let mut stack = vec![(root.to_path_buf(), 0usize)];
++    let mut codex = None;
++    let mut code_mode_host = None;
 +
 +    while let Some((dir, depth)) = stack.pop() {
 +        for entry in fs::read_dir(&dir)
@@ -432,10 +434,15 @@ index 0000000000..a9e6be0d68
 +            let file_type = entry.file_type()?;
 +            if file_type.is_file() {
 +                let name = entry.file_name();
-+                if let Some(name) = name.to_str()
-+                    && (name == "codex" || name == target_asset_stem)
-+                {
-+                    return Ok(path);
++                if let Some(name) = name.to_str() {
++                    if name == "codex-code-mode-host" {
++                        code_mode_host = Some(path);
++                    } else if name == "codex" || name == target_asset_stem {
++                        codex = Some(path);
++                    }
++                    if let (Some(codex), Some(code_mode_host)) = (&codex, &code_mode_host) {
++                        return Ok((codex.clone(), code_mode_host.clone()));
++                    }
 +                }
 +            } else if file_type.is_dir() && depth < 4 {
 +                stack.push((path, depth + 1));
@@ -443,14 +450,28 @@ index 0000000000..a9e6be0d68
 +        }
 +    }
 +
-+    bail!("could not find a codex executable in the downloaded update archive")
++    match (codex, code_mode_host) {
++        (None, None) => bail!(
++            "could not find codex or codex-code-mode-host executables in the downloaded update archive"
++        ),
++        (None, Some(_)) => {
++            bail!("could not find a codex executable in the downloaded update archive")
++        }
++        (Some(_), None) => bail!(
++            "could not find a codex-code-mode-host executable in the downloaded update archive"
++        ),
++        (Some(codex), Some(code_mode_host)) => Ok((codex, code_mode_host)),
++    }
 +}
 +
 +fn termux_asset_stem() -> String {
 +    format!("codex-{}-linux-android", termux_arch())
 +}
 +
-+fn replace_current_exe(extracted_codex: &Path) -> Result<PathBuf> {
++fn replace_install_binaries(
++    extracted_codex: &Path,
++    extracted_code_mode_host: &Path,
++) -> Result<PathBuf> {
 +    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
 +    let install_dir = current_exe
 +        .parent()
@@ -460,6 +481,8 @@ index 0000000000..a9e6be0d68
 +        .tempdir_in(install_dir)
 +        .with_context(|| format!("failed to create temp file in {}", install_dir.display()))?;
 +    let staged_exe = temp_dir.path().join("codex.new");
++    let staged_code_mode_host = temp_dir.path().join("codex-code-mode-host.new");
++    let code_mode_host = install_dir.join("codex-code-mode-host");
 +
 +    fs::copy(extracted_codex, &staged_exe).with_context(|| {
 +        format!(
@@ -472,6 +495,23 @@ index 0000000000..a9e6be0d68
 +        .permissions();
 +    fs::set_permissions(&staged_exe, current_permissions)
 +        .with_context(|| format!("failed to set permissions on {}", staged_exe.display()))?;
++    fs::copy(extracted_code_mode_host, &staged_code_mode_host).with_context(|| {
++        format!(
++            "failed to stage downloaded codex-code-mode-host binary from {}",
++            extracted_code_mode_host.display()
++        )
++    })?;
++    let host_permissions = fs::metadata(&staged_exe)
++        .with_context(|| format!("failed to read metadata for {}", staged_exe.display()))?
++        .permissions();
++    fs::set_permissions(&staged_code_mode_host, host_permissions).with_context(|| {
++        format!(
++            "failed to set permissions on {}",
++            staged_code_mode_host.display()
++        )
++    })?;
++    fs::rename(&staged_code_mode_host, &code_mode_host)
++        .with_context(|| format!("failed to replace {}", code_mode_host.display()))?;
 +    fs::rename(&staged_exe, &current_exe)
 +        .with_context(|| format!("failed to replace {}", current_exe.display()))?;
 +
@@ -576,9 +616,40 @@ index 0000000000..a9e6be0d68
 +                .unwrap();
 +        assert_eq!(candidate.tag_name, "rust-v0.141.0-alpha.7-termux");
 +    }
++
++    #[test]
++    fn finds_bundled_termux_binaries() -> Result<()> {
++        let root = tempfile::tempdir()?;
++        let nested = root.path().join("bundle");
++        fs::create_dir(&nested)?;
++        let codex = nested.join("codex");
++        let code_mode_host = nested.join("codex-code-mode-host");
++        fs::write(&codex, "codex")?;
++        fs::write(&code_mode_host, "host")?;
++
++        assert_eq!(
++            find_extracted_binaries(root.path())?,
++            (codex, code_mode_host)
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn rejects_update_archive_without_code_mode_host() -> Result<()> {
++        let root = tempfile::tempdir()?;
++        fs::write(root.path().join("codex"), "codex")?;
++
++        assert_eq!(
++            find_extracted_binaries(root.path())
++                .expect_err("host should be required")
++                .to_string(),
++            "could not find a codex-code-mode-host executable in the downloaded update archive"
++        );
++        Ok(())
++    }
 +}
 diff --git a/codex-rs/tui/src/update_action.rs b/codex-rs/tui/src/update_action.rs
-index 420562f13b..26d7b93a7c 100644
+index 0fe4408444..f4ca0d64c1 100644
 --- a/codex-rs/tui/src/update_action.rs
 +++ b/codex-rs/tui/src/update_action.rs
 @@ -8,6 +8,8 @@ use codex_install_context::StandalonePlatform;
@@ -590,7 +661,7 @@ index 420562f13b..26d7b93a7c 100644
      /// Update via `npm install -g @openai/codex@latest`.
      NpmGlobalLatest,
      /// Update via `bun install -g @openai/codex@latest`.
-@@ -23,6 +25,10 @@ pub enum UpdateAction {
+@@ -25,6 +27,10 @@ pub enum UpdateAction {
  impl UpdateAction {
      #[cfg(any(not(debug_assertions), test))]
      pub(crate) fn from_install_context(context: &InstallContext) -> Option<Self> {
@@ -601,15 +672,15 @@ index 420562f13b..26d7b93a7c 100644
          match &context.method {
              InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
              InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
-@@ -38,6 +44,7 @@ impl UpdateAction {
+@@ -41,6 +47,7 @@ impl UpdateAction {
      /// Returns the list of command-line arguments for invoking the update.
      pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
          match self {
 +            UpdateAction::TermuxSelfUpdate => ("codex", &["update"]),
              UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
              UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
-             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
-@@ -66,6 +73,18 @@ impl UpdateAction {
+             UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
+@@ -70,6 +77,18 @@ impl UpdateAction {
          shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
              .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
      }
@@ -628,7 +699,7 @@ index 420562f13b..26d7b93a7c 100644
  }
  
  #[cfg(not(debug_assertions))]
-@@ -139,6 +157,10 @@ mod tests {
+@@ -150,6 +169,10 @@ mod tests {
  
      #[test]
      fn standalone_update_commands_rerun_latest_installer() {
@@ -640,10 +711,10 @@ index 420562f13b..26d7b93a7c 100644
              UpdateAction::StandaloneUnix.command_args(),
              (
 diff --git a/codex-rs/tui/src/update_prompt.rs b/codex-rs/tui/src/update_prompt.rs
-index 8fec45590f..c833228a83 100644
+index 688d113487..bb6757f1da 100644
 --- a/codex-rs/tui/src/update_prompt.rs
 +++ b/codex-rs/tui/src/update_prompt.rs
-@@ -27,8 +27,6 @@ use ratatui::widgets::Clear;
+@@ -26,8 +26,6 @@ use ratatui::widgets::Clear;
  use ratatui::widgets::WidgetRef;
  use tokio_stream::StreamExt;
  
@@ -652,7 +723,7 @@ index 8fec45590f..c833228a83 100644
  pub(crate) enum UpdatePromptOutcome {
      Continue,
      RunUpdate(UpdateAction),
-@@ -189,6 +187,7 @@ impl WidgetRef for &UpdatePromptScreen {
+@@ -190,6 +188,7 @@ impl WidgetRef for &UpdatePromptScreen {
          let mut column = ColumnRenderable::new();
  
          let update_command = self.update_action.command_str();
@@ -660,7 +731,7 @@ index 8fec45590f..c833228a83 100644
  
          column.push("");
          column.push(Line::from(vec![
-@@ -206,7 +205,7 @@ impl WidgetRef for &UpdatePromptScreen {
+@@ -207,7 +206,7 @@ impl WidgetRef for &UpdatePromptScreen {
          column.push(
              Line::from(vec![
                  "Release notes: ".dim(),
@@ -669,7 +740,7 @@ index 8fec45590f..c833228a83 100644
              ])
              .inset(Insets::tlbr(0, 2, 0, 0)),
          );
-@@ -236,7 +235,7 @@ impl WidgetRef for &UpdatePromptScreen {
+@@ -237,7 +236,7 @@ impl WidgetRef for &UpdatePromptScreen {
              .inset(Insets::tlbr(0, 2, 0, 0)),
          );
          column.render(area, buf);
@@ -707,7 +778,7 @@ index 29ff04369b..953ccdb944 100644
  
      #[test]
 diff --git a/codex-rs/tui/src/updates.rs b/codex-rs/tui/src/updates.rs
-index 65a2317560..72f91180de 100644
+index 948551a65e..c3af79bed9 100644
 --- a/codex-rs/tui/src/updates.rs
 +++ b/codex-rs/tui/src/updates.rs
 @@ -3,6 +3,7 @@
@@ -718,11 +789,11 @@ index 65a2317560..72f91180de 100644
  use crate::update_action;
  use crate::update_action::UpdateAction;
  use crate::update_versions::extract_version_from_latest_tag;
-@@ -69,6 +70,7 @@ struct HomebrewCaskInfo {
- 
- async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> anyhow::Result<()> {
+@@ -82,6 +83,7 @@ async fn check_for_update(
+     )
+     .with_legacy_custom_ca_fallback();
      let latest_version = match action {
 +        Some(UpdateAction::TermuxSelfUpdate) => termux_update::latest_release_version().await?,
          Some(UpdateAction::BrewUpgrade) => {
-             let HomebrewCaskInfo { version } = create_client()
+             let HomebrewCaskInfo { version } = client_pool
                  .get(HOMEBREW_CASK_API_URL)

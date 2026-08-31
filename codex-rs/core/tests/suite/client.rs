@@ -384,8 +384,9 @@ async fn sends_audio_urls_to_responses() {
         .unwrap();
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    let user_message = response_mock
-        .single_request()
+    let request = response_mock.single_request();
+    assert!(request.has_content_kinds(&["user.audio"]));
+    let user_message = request
         .input()
         .into_iter()
         .rev()
@@ -428,8 +429,9 @@ async fn sends_local_audio_to_responses() -> anyhow::Result<()> {
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    let user_message = response_mock
-        .single_request()
+    let request = response_mock.single_request();
+    assert!(request.has_content_kinds(&["user.text", "user.audio", "user.text"]));
+    let user_message = request
         .input()
         .into_iter()
         .rev()
@@ -743,6 +745,9 @@ impl ProviderAuthCommandFixture {
             std::fs::write(
                 &script_path,
                 r#"#!/bin/sh
+if [ -f fail-until-401 ]; then
+    exit 1
+fi
 first_line=$(sed -n '1p' tokens.txt)
 printf '%s\n' "$first_line"
 tail -n +2 tokens.txt > tokens.next
@@ -765,6 +770,7 @@ mv tokens.next tokens.txt
                 &script_path,
                 r#"@echo off
 setlocal EnableExtensions DisableDelayedExpansion
+if exist fail-until-401 exit /b 1
 
 set "first_line="
 <tokens.txt set /p first_line=
@@ -1419,6 +1425,43 @@ async fn provider_auth_command_refreshes_after_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_auth_command_recovers_after_initial_resolution_failure() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let auth_fixture = ProviderAuthCommandFixture::new(&["recovered-token"]).unwrap();
+    let failure_marker = auth_fixture.tempdir.path().join("fail-until-401");
+    std::fs::write(&failure_marker, "").unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(|request: &wiremock::Request| !request.headers.contains_key("authorization"))
+        .respond_with(move |_request: &wiremock::Request| {
+            std::fs::remove_file(&failure_marker).unwrap();
+            ResponseTemplate::new(401).set_body_string("unauthorized")
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer recovered-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+                    "text/event-stream",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    send_provider_auth_request(&server, auth_fixture.auth()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn amazon_bedrock_proxy_uses_command_auth_and_custom_headers() {
     skip_if_no_network!();
 
@@ -1522,6 +1565,7 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         SessionSource::Exec,
         "test_originator".to_string(),
         config.model_verbosity,
+        config.features.enabled(Feature::ContentItemKinds),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
@@ -3007,6 +3051,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         SessionSource::Exec,
         "test_originator".to_string(),
         config.model_verbosity,
+        config.features.enabled(Feature::ContentItemKinds),
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,

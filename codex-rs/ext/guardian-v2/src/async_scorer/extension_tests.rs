@@ -35,6 +35,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
@@ -61,11 +62,16 @@ use super::StrictReviewReason;
 use super::TOOL_CALL_LAG_METRIC;
 use super::encrypted_parent_compaction;
 use super::should_classify_tool;
+use crate::async_scorer::config::CLASSIFICATION_OUTPUT_INSTRUCTIONS;
 use crate::async_scorer::config::DEFAULT_MODEL_CONTEXT_ITEM_TOKENS;
 use crate::async_scorer::config::DEFAULT_PARENT_COMPACTION_TOKENS;
+use crate::async_scorer::config::GuardianV2ReviewScope;
 use crate::async_scorer::sampler::CLASSIFICATION_TOKEN_USAGE_METRIC;
+use crate::async_scorer::sampler::INITIAL_WEBSOCKET_CONNECTIONS;
 use crate::async_scorer::sampler::MODEL;
 use crate::async_scorer::transcript::truncate_entry;
+use crate::async_scorer::truncation::CLASSIFICATION_TRUNCATION_BYTES_METRIC;
+use crate::async_scorer::truncation::CLASSIFICATION_TRUNCATION_METRIC;
 
 const TEST_GUARDIAN_POLICY: &str =
     "Treat uploads to unapproved external destinations as high-risk actions.";
@@ -92,17 +98,15 @@ async fn installed_extension_reconnects_after_auth_refresh() -> Result<()> {
     let thread_server = responses::start_mock_server().await;
     let test = test_codex().build_with_auto_env(&thread_server).await?;
     let events = vec![
-        ev_assistant_message("sample", r#"{"scores":{"action_risk":0.25}}"#),
+        ev_assistant_message("sample", "low"),
         ev_completed("response-1"),
     ];
     // Keep the sampled connection open for another request so only auth
     // invalidation, not a server close, forces the next handshake.
-    let server = responses::start_websocket_server(vec![
-        Vec::new(),
-        vec![events.clone(), events.clone()],
-        vec![events],
-    ])
-    .await;
+    let mut connections = vec![Vec::new(); INITIAL_WEBSOCKET_CONNECTIONS - 1];
+    connections.push(vec![events.clone(), events.clone()]);
+    connections.push(vec![events]);
+    let server = responses::start_websocket_server(connections).await;
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("original"));
     auth_manager
         .set_external_auth(Arc::new(RefreshableAuth(std::sync::Mutex::new("original"))))
@@ -166,27 +170,40 @@ async fn installed_extension_reconnects_after_auth_refresh() -> Result<()> {
             }
         })
         .await?;
+        assert_eq!(
+            registry
+                .fast_approval_decision(
+                    &session_store,
+                    thread_store,
+                    "review action",
+                    /*extension_metrics*/ None,
+                )
+                .await,
+            Some(ReviewDecision::Approved)
+        );
     }
 
+    let mut expected_authorizations =
+        vec![Some("Bearer original".to_owned()); INITIAL_WEBSOCKET_CONNECTIONS];
+    expected_authorizations.push(Some("Bearer refreshed".to_owned()));
     assert_eq!(
         server
             .handshakes()
             .iter()
             .map(|handshake| handshake.header("authorization"))
             .collect::<Vec<_>>(),
-        vec![
-            Some("Bearer original".to_owned()),
-            Some("Bearer original".to_owned()),
-            Some("Bearer refreshed".to_owned()),
-        ]
+        expected_authorizations
     );
+
+    let mut expected_requests = vec![0; INITIAL_WEBSOCKET_CONNECTIONS - 1];
+    expected_requests.extend([1, 1]);
     assert_eq!(
         server
             .connections()
             .iter()
             .map(Vec::len)
             .collect::<Vec<_>>(),
-        vec![0, 1, 1]
+        expected_requests
     );
     Ok(())
 }
@@ -279,31 +296,40 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
     };
 
     let tool_name = ToolName::plain("exec_command");
+    let standard_scope = GuardianV2ReviewScope::Standard {
+        sandboxed_exec_commands: false,
+    };
     assert!(!should_classify_tool(
-        &tool_name, &sandboxed, /*sandboxed_exec_commands*/ false
+        &tool_name,
+        &sandboxed,
+        standard_scope,
     ));
     assert!(!should_classify_tool(
         &tool_name,
         &additional_permissions,
-        /*sandboxed_exec_commands*/ false
+        standard_scope,
     ));
     assert!(should_classify_tool(
         &tool_name,
         &unsandboxed,
-        /*sandboxed_exec_commands*/ false
+        standard_scope,
     ));
     assert!(should_classify_tool(
-        &tool_name, &sandboxed, /*sandboxed_exec_commands*/ true
+        &tool_name,
+        &sandboxed,
+        GuardianV2ReviewScope::Standard {
+            sandboxed_exec_commands: true,
+        },
     ));
     assert!(should_classify_tool(
         &ToolName::plain("read_file"),
         &sandboxed,
-        /*sandboxed_exec_commands*/ false
+        standard_scope,
     ));
     assert!(should_classify_tool(
         &ToolName::namespaced("mcp", "exec_command"),
         &sandboxed,
-        /*sandboxed_exec_commands*/ false
+        standard_scope,
     ));
     skip_if_no_network!(Ok(()));
 
@@ -345,6 +371,123 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
             .load(Ordering::Acquire),
         latest_scored_tool_call
     );
+    Ok(())
+}
+
+#[test]
+fn computer_use_only_classification_recognizes_direct_and_code_mode_tools() {
+    let payload = ToolPayload::Function {
+        arguments: r#"{"code":"await browser.goto('https://example.com')"}"#.to_owned(),
+    };
+    for (tool_name, expected) in [
+        (ToolName::namespaced("mcp__node_repl__", "js"), true),
+        (ToolName::namespaced("mcp__cua_repl__", "js"), true),
+        (ToolName::plain("mcp__node_repl__js"), true),
+        (ToolName::plain("mcp__cua_repl__js"), true),
+        (ToolName::namespaced("mcp__ordinary__", "js"), false),
+        (ToolName::plain("read_file"), false),
+        (ToolName::plain("exec_command"), false),
+    ] {
+        assert_eq!(
+            should_classify_tool(&tool_name, &payload, GuardianV2ReviewScope::ComputerUseOnly),
+            expected,
+            "unexpected classification scope for {tool_name}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let fixture = GuardianFailureFixture::new().await?;
+    let thread_store = fixture.test.codex.thread_extension_data();
+    let mut config = thread_store
+        .get::<crate::async_scorer::config::GuardianV2Config>()
+        .expect("Guardian v2 should have initialized")
+        .as_ref()
+        .clone();
+    config.review_scope = GuardianV2ReviewScope::ComputerUseOnly;
+    thread_store.insert(config);
+    thread_store.insert(SecurityRiskScore {
+        scores: BTreeMap::from([("action_risk".to_owned(), 0.25)]),
+        sampled_at: None,
+    });
+    let progress = thread_store
+        .get::<GuardianV2ScoreProgress>()
+        .expect("Guardian v2 should track score progress per thread");
+    let latest_tool_call = progress.latest_tool_call.load(Ordering::Acquire);
+    let turn_store = ExtensionData::new("turn-1");
+    let ordinary_tool = ToolName::namespaced("mcp__ordinary__", "write_record");
+    let payload = ToolPayload::Function {
+        arguments: r#"{"record":"sensitive"}"#.to_owned(),
+    };
+    fixture.registry.tool_lifecycle_contributors()[0]
+        .on_tool_start(ToolStartInput {
+            session_store: &fixture.session_store,
+            thread_store,
+            turn_store: &turn_store,
+            turn_id: "turn-1",
+            call_id: "ordinary-call",
+            tool_name: &ordinary_tool,
+            payload: &payload,
+            conversation_history: Arc::new(TestConversationHistory(Vec::new())),
+            source: ToolCallSource::CodeMode {
+                cell_id: "cell-1".to_owned(),
+                runtime_tool_call_id: "nested-1".to_owned(),
+            },
+        })
+        .await;
+    assert_eq!(
+        progress.latest_tool_call.load(Ordering::Acquire),
+        latest_tool_call,
+        "unrelated code-mode calls must not age browser/CUA scores"
+    );
+
+    for (action, expected) in [
+        (
+            json!({"tool": "mcp_tool_call", "server": "node_repl", "tool_name": "js"}),
+            Some(ReviewDecision::Approved),
+        ),
+        (
+            json!({"tool": "mcp_tool_call", "server": "cua_repl", "tool_name": "js"}),
+            Some(ReviewDecision::Approved),
+        ),
+        (
+            json!({"tool": "mcp_tool_call", "server": "ordinary", "tool_name": "js"}),
+            None,
+        ),
+        (json!({"tool": "exec_command", "server": "node_repl"}), None),
+    ] {
+        let prompt = action.to_string();
+        assert_eq!(
+            fixture
+                .registry
+                .fast_approval_decision(
+                    &fixture.session_store,
+                    thread_store,
+                    &prompt,
+                    /*extension_metrics*/ None,
+                )
+                .await,
+            expected,
+            "unexpected fast approval for {action}"
+        );
+    }
+    assert_eq!(
+        fixture
+            .registry
+            .fast_approval_decision(
+                &fixture.session_store,
+                thread_store,
+                "not valid JSON",
+                /*extension_metrics*/ None,
+            )
+            .await,
+        None,
+        "malformed approval actions must not reuse a browser score"
+    );
+
     Ok(())
 }
 
@@ -574,11 +717,10 @@ async fn sample_configured_conversation_history(
         "output_tokens_details": {"reasoning_tokens": 10},
         "total_tokens": 150,
     });
-    let events = vec![
-        ev_assistant_message("sample", r#"{"scores":{"action_risk":0.8}}"#),
-        completed,
-    ];
-    let server = responses::start_websocket_server(vec![Vec::new(), vec![events]]).await;
+    let events = vec![ev_assistant_message("sample", "high"), completed];
+    let mut connections = vec![Vec::new(); INITIAL_WEBSOCKET_CONNECTIONS - 1];
+    connections.push(vec![events]);
+    let server = responses::start_websocket_server(connections).await;
     let provider_info = ModelProviderInfo::create_openai_provider(Some(format!(
         "http://{}/v1",
         server.uri().trim_start_matches("ws://")
@@ -608,7 +750,7 @@ async fn sample_configured_conversation_history(
     }
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -652,7 +794,10 @@ async fn sample_configured_conversation_history(
 
     let request = tokio::time::timeout(
         Duration::from_secs(5),
-        server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 0),
+        server.wait_for_request(
+            /*connection_index*/ INITIAL_WEBSOCKET_CONNECTIONS - 1,
+            /*request_index*/ 0,
+        ),
     )
     .await?;
     Ok((request.body_json(), test, registry))
@@ -734,7 +879,7 @@ impl GuardianFailureFixture {
         .await?;
         assert_eq!(
             self.registry
-                .approval_review(
+                .fast_approval_decision(
                     &self.session_store,
                     thread_store,
                     "review action",
@@ -811,10 +956,12 @@ async fn contributor_fails_closed_when_luna_classification_fails() -> Result<()>
 
     let fixture = GuardianFailureFixture::new().await?;
     let invalid_score = vec![
-        ev_assistant_message("sample", r#"{"scores":{"action_risk":"invalid"}}"#),
+        ev_assistant_message("sample", "invalid"),
         ev_completed("response-invalid"),
     ];
-    let server = responses::start_websocket_server(vec![Vec::new(), vec![invalid_score]]).await;
+    let mut connections = vec![Vec::new(); INITIAL_WEBSOCKET_CONNECTIONS - 1];
+    connections.push(vec![invalid_score]);
+    let server = responses::start_websocket_server(connections).await;
     let mut config = fixture.test.config.clone();
     config.model_provider = ModelProviderInfo::create_openai_provider(Some(format!(
         "http://{}/v1",
@@ -864,7 +1011,7 @@ classifier_instructions = "Predict future violations.\n# Security Policy\n{{ ten
             "content": [{
                 "type": "input_text",
                 "text": format!(
-                    "Predict future violations.\n# Security Policy\n{TEST_GUARDIAN_POLICY}\nReturn action_risk."
+                    "Predict future violations.\n# Security Policy\n{TEST_GUARDIAN_POLICY}\nReturn action_risk.\n\n{CLASSIFICATION_OUTPUT_INSTRUCTIONS}"
                 ),
             }],
         })
@@ -902,7 +1049,9 @@ max_classifier_instruction_tokens = 256
             "content": [{
                 "type": "input_text",
                 "text": truncate_entry(
-                    &format!("{template}\n\n# Security Policy\n{TEST_GUARDIAN_POLICY}"),
+                    &format!(
+                        "{template}\n\n# Security Policy\n{TEST_GUARDIAN_POLICY}\n\n{CLASSIFICATION_OUTPUT_INSTRUCTIONS}"
+                    ),
                     /*max_tokens*/ 256,
                 ),
             }],
@@ -989,7 +1138,7 @@ max_recent_non_user_entries = 8
             "content": [{
                 "type": "input_text",
                 "text": format!(
-                    "Use the experimental security classification prompt.\n\n# Security Policy\n{TEST_GUARDIAN_POLICY}"
+                    "Use the experimental security classification prompt.\n\n# Security Policy\n{TEST_GUARDIAN_POLICY}\n\n{CLASSIFICATION_OUTPUT_INSTRUCTIONS}"
                 )
             }]
         })
@@ -1015,7 +1164,15 @@ max_recent_non_user_entries = 8
         .as_str()
         .expect("planned action should be a text item");
     assert!(action.len() <= TruncationPolicy::Tokens(/*limit*/ 128).byte_budget());
+    let original_action_bytes = i64::try_from(
+        serde_json::to_string_pretty(&json!({
+            "body": "x".repeat(4_000),
+            "tool": "read_file",
+        }))?
+        .len(),
+    )?;
     let action: serde_json::Value = serde_json::from_str(action)?;
+    let retained_action_bytes = i64::try_from(serde_json::to_string_pretty(&action)?.len())?;
     assert_eq!(action["tool"], "read_file");
 
     let session_store = ExtensionData::new("session-1");
@@ -1042,7 +1199,7 @@ max_recent_non_user_entries = 8
     });
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1063,7 +1220,7 @@ max_recent_non_user_entries = 8
     });
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1086,7 +1243,7 @@ max_recent_non_user_entries = 8
         .store(/*val*/ 3, Ordering::Release);
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1105,7 +1262,7 @@ max_recent_non_user_entries = 8
         .store(/*val*/ 4, Ordering::Release);
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1126,7 +1283,7 @@ max_recent_non_user_entries = 8
         .store(/*val*/ 2, Ordering::Release);
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1177,6 +1334,35 @@ max_recent_non_user_entries = 8
                 classification_duration_ms,
                 vec![("outcome".to_owned(), "success".to_owned())],
             ),
+            RecordedMetric::Counter(
+                CLASSIFICATION_TRUNCATION_METRIC.to_owned(),
+                1,
+                vec![
+                    ("component".to_owned(), "action".to_owned()),
+                    ("disposition".to_owned(), "truncated".to_owned()),
+                ],
+            ),
+        ])
+        .chain(
+            [
+                ("original", original_action_bytes),
+                ("retained", retained_action_bytes),
+                ("omitted", original_action_bytes - retained_action_bytes),
+            ]
+            .into_iter()
+            .map(|(measurement, bytes)| {
+                RecordedMetric::Histogram(
+                    CLASSIFICATION_TRUNCATION_BYTES_METRIC.to_owned(),
+                    bytes,
+                    vec![
+                        ("component".to_owned(), "action".to_owned()),
+                        ("disposition".to_owned(), "truncated".to_owned()),
+                        ("measurement".to_owned(), measurement.to_owned()),
+                    ],
+                )
+            }),
+        )
+        .chain([
             RecordedMetric::Histogram(TOOL_CALL_LAG_METRIC.to_owned(), 0, vec![]),
             RecordedMetric::Histogram(TOOL_CALL_LAG_METRIC.to_owned(), 0, vec![]),
             RecordedMetric::Histogram(TOOL_CALL_LAG_METRIC.to_owned(), 2, vec![]),
@@ -1342,7 +1528,7 @@ async fn contributor_uses_model_defaults_and_preserves_local_overrides() -> Resu
             "content": [{
                 "type": "input_text",
                 "text": format!(
-                    "Use the experimental model-owned prompt.\n\n# Security Policy\n{TEST_GUARDIAN_POLICY}"
+                    "Use the experimental model-owned prompt.\n\n# Security Policy\n{TEST_GUARDIAN_POLICY}\n\n{CLASSIFICATION_OUTPUT_INSTRUCTIONS}"
                 )
             }]
         })
@@ -1389,7 +1575,7 @@ async fn contributor_uses_model_defaults_and_preserves_local_overrides() -> Resu
     });
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1478,8 +1664,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
             "thread_id": classifier_thread_id,
             "guardian_classifier_source_thread_id": thread_id.to_string(),
             "turn_id": "turn-1",
-            "request_kind": "guardian_classifier",
-            "is_guardian_mode": true,
+            "thread_source": "guardian_classifier",
         })
     );
     assert_eq!(request["client_metadata"]["x-openai-subagent"], "guardian");
@@ -1490,11 +1675,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
     assert_eq!(request["client_metadata"]["turn_id"], "turn-1");
     assert_eq!(request["reasoning"]["effort"], "low");
     assert_eq!(request["reasoning"]["context"], "all_turns");
-    assert_eq!(request["text"]["format"]["strict"], true);
-    assert_eq!(
-        request["text"]["format"]["schema"]["properties"]["scores"]["properties"]["action_risk"],
-        json!({"type": "number", "minimum": 0.0, "maximum": 1.0})
-    );
+    assert!(request.get("text").is_none());
     assert_eq!(
         request["input"][1],
         json!({
@@ -1543,14 +1724,14 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
     assert_eq!(
         score.as_ref(),
         &SecurityRiskScore {
-            scores: BTreeMap::from([("action_risk".to_string(), 0.8)]),
+            scores: BTreeMap::from([("action_risk".to_string(), 1.0)]),
             sampled_at: score.sampled_at,
         }
     );
     assert!(score.sampled_at.is_some());
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1565,7 +1746,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
     });
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1581,7 +1762,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
     });
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1598,7 +1779,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
     });
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 &disabled_thread_store,
                 "review action",
@@ -1641,7 +1822,8 @@ async fn contributor_skips_models_requiring_managed_guardian_review() -> Result<
         .build_with_auto_env(&thread_server)
         .await?;
 
-    let server = responses::start_websocket_server(vec![Vec::new(), Vec::new()]).await;
+    let server =
+        responses::start_websocket_server(vec![Vec::new(); INITIAL_WEBSOCKET_CONNECTIONS]).await;
     let provider_info = ModelProviderInfo::create_openai_provider(Some(format!(
         "http://{}/v1",
         server.uri().trim_start_matches("ws://")
@@ -1684,7 +1866,7 @@ async fn contributor_skips_models_requiring_managed_guardian_review() -> Result<
     });
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1764,7 +1946,7 @@ async fn contributor_counts_failed_thread_lookups_toward_score_lag() -> Result<(
     });
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1800,7 +1982,7 @@ async fn contributor_counts_failed_thread_lookups_toward_score_lag() -> Result<(
     assert_eq!(score_progress.latest_tool_call.load(Ordering::Acquire), 2);
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -1921,6 +2103,74 @@ async fn contributor_bounds_configured_policy_in_luna_developer_instructions() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contributor_preserves_final_assistant_messages_after_tool_eviction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut history = vec![
+        responses::user_message_item("Find a flight to New York."),
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_owned(),
+            content: vec![ContentItem::OutputText {
+                text: "I found a $450 flight. Should I book it?".to_owned(),
+            }],
+            phase: Some(MessagePhase::FinalAnswer),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        responses::user_message_item("Yes."),
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_owned(),
+            content: vec![ContentItem::OutputText {
+                text: "Searching airline websites.".to_owned(),
+            }],
+            phase: Some(MessagePhase::Commentary),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    history.extend((0..6).map(|index| ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".to_owned(),
+        namespace: None,
+        arguments: format!("booking step {index}"),
+        encrypted_function_args: None,
+        call_id: format!("call-{index}"),
+        internal_chat_message_metadata_passthrough: None,
+    }));
+    let configuration = "[features.guardianv2]\nenabled = true\n\n[features.guardianv2.transcript]\nmax_recent_non_user_entries = 4\n";
+
+    let (request, _test, _registry) = sample_configured_conversation_history(
+        history,
+        r#"{"path":"README.md"}"#,
+        Some(TEST_GUARDIAN_POLICY),
+        configuration,
+        /*model_defaults*/ None,
+    )
+    .await?;
+    let entries = request["input"][2]["content"]
+        .as_array()
+        .expect("Luna request should contain separate transcript text items")
+        .iter()
+        .filter_map(|entry| entry["text"].as_str())
+        .filter(|entry| entry.starts_with('['))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        entries,
+        vec![
+            "[1] user: Find a flight to New York.\n",
+            "[2] assistant: I found a $450 flight. Should I book it?\n",
+            "[3] user: Yes.\n",
+            "[8] tool exec_command call: booking step 3\n",
+            "[9] tool exec_command call: booking step 4\n",
+            "[10] tool exec_command call: booking step 5\n",
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contributor_sends_compacted_conversation_history_to_luna() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2019,10 +2269,12 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
         .build_with_auto_env(&thread_server)
         .await?;
     let events = vec![
-        ev_assistant_message("sample", r#"{"scores":{"action_risk":0.25}}"#),
+        ev_assistant_message("sample", "low"),
         ev_completed("response-1"),
     ];
-    let server = responses::start_websocket_server(vec![Vec::new(), vec![events]]).await;
+    let mut connections = vec![Vec::new(); INITIAL_WEBSOCKET_CONNECTIONS - 1];
+    connections.push(vec![events]);
+    let server = responses::start_websocket_server(connections).await;
     let provider_info = ModelProviderInfo::create_openai_provider(Some(format!(
         "http://{}/v1",
         server.uri().trim_start_matches("ws://")
@@ -2103,7 +2355,10 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
 
     let request = tokio::time::timeout(
         Duration::from_secs(5),
-        server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 0),
+        server.wait_for_request(
+            /*connection_index*/ INITIAL_WEBSOCKET_CONNECTIONS - 1,
+            /*request_index*/ 0,
+        ),
     )
     .await?
     .body_json();
@@ -2135,10 +2390,10 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
         }
     })
     .await?;
-    assert_eq!(previous_score.scores.get("action_risk"), Some(&0.25));
+    assert_eq!(previous_score.scores.get("action_risk"), Some(&0.0));
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -2182,7 +2437,7 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
     );
     assert_eq!(
         registry
-            .approval_review(
+            .fast_approval_decision(
                 &session_store,
                 thread_store,
                 "review action",
@@ -2260,7 +2515,7 @@ async fn contributor_can_disable_parent_compaction_reuse() -> Result<()> {
         }
     })
     .await?;
-    assert_eq!(score.scores.get("action_risk"), Some(&0.8));
+    assert_eq!(score.scores.get("action_risk"), Some(&1.0));
 
     Ok(())
 }
@@ -2344,7 +2599,7 @@ fn guardian_action_bounds_structurally_oversized_arrays() -> Result<()> {
         },
     };
 
-    let rendered = action.render(DEFAULT_MODEL_CONTEXT_ITEM_TOKENS)?;
+    let rendered = action.render(DEFAULT_MODEL_CONTEXT_ITEM_TOKENS)?.text;
     assert!(
         rendered.len().saturating_add(1)
             <= TruncationPolicy::Tokens(DEFAULT_MODEL_CONTEXT_ITEM_TOKENS).byte_budget()
@@ -2387,7 +2642,7 @@ fn guardian_action_bounds_structurally_oversized_object_keys() -> Result<()> {
         },
     };
 
-    let rendered = action.render(DEFAULT_MODEL_CONTEXT_ITEM_TOKENS)?;
+    let rendered = action.render(DEFAULT_MODEL_CONTEXT_ITEM_TOKENS)?.text;
     assert!(
         rendered.len().saturating_add(1)
             <= TruncationPolicy::Tokens(DEFAULT_MODEL_CONTEXT_ITEM_TOKENS).byte_budget()

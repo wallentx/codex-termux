@@ -16,6 +16,7 @@ use crate::inline_visualization::InlineVisualizationContext;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
+use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountTokenUsageResponse;
 use codex_app_server_protocol::MarketplaceAddResponse;
@@ -29,6 +30,7 @@ use codex_app_server_protocol::PluginMarketplaceEntry;
 use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
+use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadGoalStatus;
@@ -38,6 +40,7 @@ use codex_file_search::FileMatch;
 use codex_message_history::HistoryBatchCursor;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
 use strum_macros::IntoStaticStr;
@@ -59,7 +62,6 @@ use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ActivePermissionProfile;
-use codex_protocol::openai_models::ReasoningEffort;
 
 use crate::history_cell::HistoryCell;
 
@@ -193,6 +195,15 @@ pub(crate) enum TranscriptExportDestination {
     File(PathBuf),
 }
 
+/// Deliver a generated title to its originating automatic rename or editable prompt.
+#[derive(Debug)]
+pub(crate) enum ThreadTitleDestination {
+    /// Replace the provisional name only if the user has not renamed the thread.
+    Automatic { expected_title: String },
+    /// Prefill only the still-active rename prompt with the matching request ID.
+    RenameSuggestion { request_id: Uuid },
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
@@ -216,6 +227,26 @@ pub(crate) enum AppEvent {
     RenameAgentsOverviewThread {
         thread_id: ThreadId,
         name: String,
+    },
+    /// Generate an editable title suggestion for the active rename prompt.
+    SuggestThreadName {
+        thread_id: ThreadId,
+        request_id: Uuid,
+    },
+    /// Register a hidden title-generation thread started in the background.
+    ThreadTitleStarted {
+        thread_id: ThreadId,
+        destination: ThreadTitleDestination,
+        prompt: String,
+        effort: Option<ReasoningEffort>,
+        result: Result<String, String>,
+    },
+    /// Route a hidden title request to its automatic rename or editable prompt.
+    GeneratedThreadTitle {
+        thread_id: ThreadId,
+        temporary_thread_id: ThreadId,
+        destination: ThreadTitleDestination,
+        result: Result<String, String>,
     },
     /// Interrupt a task directly from the shared dashboard.
     StopAgentsOverviewThread {
@@ -336,6 +367,24 @@ pub(crate) enum AppEvent {
         result: Result<AppServerStartedThread, String>,
     },
 
+    /// Register a dynamically created background thread before its first turn starts.
+    DynamicToolThreadStarted {
+        thread_id: ThreadId,
+        task_tools_available: bool,
+        registered: tokio::sync::oneshot::Sender<()>,
+    },
+
+    /// Return a completed client-owned dynamic tool call to app server.
+    DynamicToolCallCompleted {
+        request_id: AppServerRequestId,
+        response: DynamicToolCallResponse,
+    },
+
+    /// Register task tools inherited by a dynamically created thread.
+    TaskToolsAvailable {
+        thread_id: ThreadId,
+    },
+
     /// Clear the terminal UI (screen + scrollback), start a fresh session, and keep the
     /// previous chat resumable.
     ClearUi {
@@ -424,6 +473,13 @@ pub(crate) enum AppEvent {
     FileSearchResult {
         query: String,
         matches: Vec<FileMatch>,
+    },
+
+    /// Same-host task results for the active unified mention query.
+    TaskSearchResult {
+        thread_id: ThreadId,
+        query: String,
+        matches: Vec<crate::task_mentions::TaskMention>,
     },
 
     /// Refresh account rate limits in the background.

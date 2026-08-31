@@ -52,16 +52,11 @@ readonly -a TERMUX_RELEASE_PATCH_AUTHORITATIVE_CODE_PATHS=(
 # These upstream-owned files have repeatedly retained stale checkpoint-side
 # content when a new release branch was merged into the release work branch.
 readonly -a TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS=(
-  .github/scripts/build-codex-package-archive.sh
-  .github/scripts/macos-signing/notarize_macos_binary_with_rcodesign.sh
-  .github/scripts/macos-signing/notarize_macos_dmg_with_rcodesign.sh
-  .github/scripts/macos-signing/notarize_with_akv.py
-  .github/scripts/macos-signing/test_notarize_with_akv.py
-  .github/scripts/publish_r2_release.py
-  .github/scripts/run-argument-comment-lint-bazel.sh
-  .github/workflows/python-runtime-build.yml
-  .github/workflows/python-runtime-release.yml
-  .github/workflows/r2-release.yml
+  .github
+  codex-rs/core/src/compact_remote_v2_image_budget_tests.rs
+  codex-rs/core/src/compact_remote_v2_images.rs
+  codex-rs/core/tests/suite/compact_remote.rs
+  codex-rs/features/src/lib.rs
   codex-rs/windows-sandbox-rs/BUILD.bazel
 )
 

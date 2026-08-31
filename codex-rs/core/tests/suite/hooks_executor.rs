@@ -2,11 +2,13 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_config::McpServerConfig;
 use codex_core::EnvironmentConfig;
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_features::Feature;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -141,7 +143,8 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
             (executor_url.to_string(), None)
         } else {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let executor_url = format!("ws://{}", listener.local_addr()?);
+            let executor_address = listener.local_addr()?;
+            let executor_url = format!("ws://{executor_address}");
             drop(listener);
             let runtime_paths = ExecServerRuntimePaths::new(
                 std::env::current_exe()?,
@@ -157,7 +160,19 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
                 )
                 .await
             });
-            tokio::task::yield_now().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if tokio::net::TcpStream::connect(executor_address)
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .context("timed out waiting for the mismatched executor to start")?;
             (executor_url, Some(executor))
         };
 
@@ -387,6 +402,13 @@ impl ExecutorStopHookFixture {
                         self.test.config.permissions.permission_profile().clone(),
                     ),
                     shell_environment_policy: Default::default(),
+                    windows_sandbox_level: WindowsSandboxLevel::from_config(&self.test.config),
+                    windows_sandbox_private_desktop: self
+                        .test
+                        .config
+                        .permissions
+                        .windows_sandbox_private_desktop,
+                    use_legacy_landlock: self.test.config.features.use_legacy_landlock(),
                     exec_policy: None,
                     mcp_policy: None,
                     network_policy: None,

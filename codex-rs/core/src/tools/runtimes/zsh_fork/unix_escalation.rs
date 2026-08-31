@@ -532,6 +532,8 @@ fn evaluate_intercepted_exec_policy(
 struct InterceptedExecPolicyContext {
     approval_policy: AskForApproval,
     permission_profile: PermissionProfile,
+    // TODO(anp): Reconcile this policy input with TurnEnvironment::sandbox_context
+    // so intercepted commands use the selected environment's Windows backend.
     windows_sandbox_level: WindowsSandboxLevel,
     sandbox_permissions: SandboxPermissions,
     enable_shell_wrapper_parsing: bool,
@@ -557,6 +559,8 @@ fn commands_for_intercepted_exec_policy(
     vec![join_program_and_argv(program, argv)]
 }
 
+// TODO(anp): Capture these Windows and Landlock settings from
+// TurnEnvironment::sandbox_context when preparing this executor, preserving its snapshot.
 struct CoreShellCommandExecutor {
     command: Vec<String>,
     cwd: AbsolutePathBuf,
@@ -672,7 +676,7 @@ impl CoreShellCommandExecutor {
         program: &AbsolutePathBuf,
         argv: &[String],
         workdir: &AbsolutePathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         execution: EscalationExecution,
     ) -> anyhow::Result<PreparedExec> {
         let command = join_program_and_argv(program, argv);
@@ -683,12 +687,20 @@ impl CoreShellCommandExecutor {
         };
 
         let prepared = match execution {
-            EscalationExecution::Unsandboxed => PreparedExec {
-                command,
-                cwd: workdir.to_path_buf(),
-                env: exec_env_for_sandbox_permissions(&env, SandboxPermissions::RequireEscalated),
-                arg0: Some(first_arg.clone()),
-            },
+            EscalationExecution::Unsandboxed => {
+                if let Some(network) = self.network.as_ref() {
+                    network.restore_brokered_credentials(&mut env, &mut []);
+                }
+                PreparedExec {
+                    command,
+                    cwd: workdir.to_path_buf(),
+                    env: exec_env_for_sandbox_permissions(
+                        &env,
+                        SandboxPermissions::RequireEscalated,
+                    ),
+                    arg0: Some(first_arg.clone()),
+                }
+            }
             EscalationExecution::TurnDefault => {
                 self.prepare_sandboxed_exec(PrepareSandboxedExecParams {
                     command,

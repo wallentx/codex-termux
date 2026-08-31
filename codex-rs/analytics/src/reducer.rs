@@ -143,6 +143,7 @@ use codex_app_server_protocol::RequestPermissionProfile;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerResponse;
+use codex_app_server_protocol::SubAgentActivityKind;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
@@ -476,6 +477,10 @@ impl TurnToolCounts {
             ThreadItem::FileChange { .. } => self.file_change += 1,
             ThreadItem::McpToolCall { .. } => self.mcp_tool_call += 1,
             ThreadItem::DynamicToolCall { .. } => self.dynamic_tool_call += 1,
+            ThreadItem::SubAgentActivity {
+                kind: SubAgentActivityKind::Completed,
+                ..
+            } => return,
             ThreadItem::CollabAgentToolCall { id, .. }
             | ThreadItem::SubAgentActivity { id, .. } => {
                 if !self.subagent_tool_call_ids.insert(id.clone()) {
@@ -773,6 +778,7 @@ impl AnalyticsReducer {
             CodeModeToolCallFact::Completed {
                 thread_id,
                 turn_id,
+                turn_metadata,
                 call_id,
                 cell_id,
                 tool_name,
@@ -837,6 +843,7 @@ impl AnalyticsReducer {
                 self.record_tool_event(
                     &thread_id,
                     &turn_id,
+                    turn_metadata.root_turn_id(),
                     event,
                     ToolEventEmission::AwaitResponse,
                     out,
@@ -853,6 +860,7 @@ impl AnalyticsReducer {
         let ControlToolCallFact {
             thread_id,
             turn_id,
+            turn_metadata,
             call_id,
             cell_id,
             tool_name,
@@ -916,6 +924,7 @@ impl AnalyticsReducer {
         self.record_tool_event(
             &thread_id,
             &turn_id,
+            turn_metadata.root_turn_id(),
             event,
             ToolEventEmission::AwaitResponse,
             out,
@@ -974,14 +983,16 @@ impl AnalyticsReducer {
         &mut self,
         thread_id: &str,
         turn_id: &str,
+        root_turn_id: Option<String>,
         mut event: TrackEventRequest,
         emission: ToolEventEmission,
         out: &mut Vec<TrackEventRequest>,
     ) {
-        if tool_event_base_mut(&mut event).is_none() {
+        let Some(base) = tool_event_base_mut(&mut event) else {
             out.push(event);
             return;
-        }
+        };
+        base.root_turn_id = root_turn_id;
         let state = self
             .tool_response_states
             .entry((thread_id.to_string(), turn_id.to_string()))
@@ -1069,7 +1080,7 @@ impl AnalyticsReducer {
             .metadata
             .get_or_insert_with(|| ThreadMetadataState {
                 session_id: input.session_id.clone(),
-                thread_source: Some(ThreadSource::Subagent),
+                thread_source: input.thread_source.clone(),
                 initialization_mode: ThreadInitializationMode::New,
                 subagent_source: Some(subagent_source_name(&input.subagent_source)),
                 parent_thread_id,
@@ -1868,9 +1879,15 @@ impl AnalyticsReducer {
                     thread_metadata,
                     review_summary: self.item_review_summaries.get(&key),
                 }) {
+                    let root_turn_id = self
+                        .turns
+                        .get(&notification.turn_id)
+                        .and_then(|turn| turn.resolved_config.as_ref())
+                        .and_then(|config| config.turn_metadata.root_turn_id());
                     self.record_tool_event(
                         &notification.thread_id,
                         &notification.turn_id,
+                        root_turn_id,
                         event,
                         ToolEventEmission::ImmediateUnlessCorrelated,
                         out,
@@ -2473,7 +2490,9 @@ fn item_review_summary_key(pending_review: &PendingReviewState) -> Option<ToolIt
             turn_id: pending_review.turn_id.clone(),
             item_id: pending_review.item_id.clone()?,
         }),
-        ReviewSubjectKind::Permissions | ReviewSubjectKind::NetworkAccess => None,
+        ReviewSubjectKind::WriteStdin
+        | ReviewSubjectKind::Permissions
+        | ReviewSubjectKind::NetworkAccess => None,
     }
 }
 
@@ -2812,6 +2831,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                         base,
                         revised_prompt_present: item.revised_prompt.is_some(),
                         saved_path_present: item.saved_path.is_some(),
+                        transparent_background: item.transparent_background,
                     },
                 },
             ))
@@ -2883,6 +2903,7 @@ fn tool_item_base(
         thread_id: thread_id.to_string(),
         session_id: thread_metadata.session_id.clone(),
         turn_id: turn_id.to_string(),
+        root_turn_id: None,
         item_id,
         cell_id: None,
         parent_call_id: None,
@@ -3012,6 +3033,11 @@ fn guardian_review_subject_metadata(
             "command_execution".to_string(),
             ReviewTrigger::Initial,
         ),
+        GuardianApprovalReviewAction::WriteStdin { .. } => (
+            ReviewSubjectKind::WriteStdin,
+            "write_stdin".to_string(),
+            ReviewTrigger::Initial,
+        ),
         GuardianApprovalReviewAction::Execve { .. } => (
             ReviewSubjectKind::CommandExecution,
             "command_execution".to_string(),
@@ -3063,6 +3089,7 @@ fn guardian_review_requested_additional_permissions(action: &GuardianApprovalRev
                 || permissions.file_system.is_some()
         }
         GuardianApprovalReviewAction::Command { .. }
+        | GuardianApprovalReviewAction::WriteStdin { .. }
         | GuardianApprovalReviewAction::Execve { .. }
         | GuardianApprovalReviewAction::McpToolCall { .. } => false,
     }
@@ -3076,6 +3103,7 @@ fn guardian_review_requested_network_access(action: &GuardianApprovalReviewActio
         }
         GuardianApprovalReviewAction::ApplyPatch { .. }
         | GuardianApprovalReviewAction::Command { .. }
+        | GuardianApprovalReviewAction::WriteStdin { .. }
         | GuardianApprovalReviewAction::Execve { .. }
         | GuardianApprovalReviewAction::McpToolCall { .. } => false,
     }
@@ -3184,6 +3212,7 @@ fn collab_tool_call_outcome(
     match status {
         CollabAgentToolCallStatus::InProgress => None,
         CollabAgentToolCallStatus::Completed => Some((ToolItemTerminalStatus::Completed, None)),
+        CollabAgentToolCallStatus::Interrupted => Some((ToolItemTerminalStatus::Interrupted, None)),
         CollabAgentToolCallStatus::Failed => Some((
             ToolItemTerminalStatus::Failed,
             Some(ToolItemFailureKind::ToolError),
@@ -3208,6 +3237,10 @@ fn collab_agent_tool_name(tool: &CollabAgentTool) -> &'static str {
         CollabAgentTool::ResumeAgent => "resume_agent",
         CollabAgentTool::Wait => "wait_agent",
         CollabAgentTool::CloseAgent => "close_agent",
+        CollabAgentTool::SendMessage => "send_message",
+        CollabAgentTool::FollowupTask => "followup_task",
+        CollabAgentTool::InterruptAgent => "interrupt_agent",
+        CollabAgentTool::ListAgents => "list_agents",
     }
 }
 
@@ -3337,6 +3370,7 @@ fn codex_turn_event_params(
     let TurnResolvedConfigFact {
         turn_id: _resolved_turn_id,
         thread_id: _resolved_thread_id,
+        turn_metadata,
         num_input_images: _resolved_num_input_images,
         submission_type,
         ephemeral,
@@ -3372,6 +3406,7 @@ fn codex_turn_event_params(
         thread_id,
         session_id: thread_metadata.session_id.clone(),
         turn_id,
+        root_turn_id: turn_metadata.root_turn_id(),
         app_server_client,
         runtime,
         submission_type,

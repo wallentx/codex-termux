@@ -54,6 +54,11 @@ pub enum AuthMode {
     #[ts(rename = "bedrockApiKey")]
     #[strum(serialize = "bedrockApiKey")]
     BedrockApiKey,
+    /// Amazon Bedrock AWS access keys managed by Codex.
+    #[serde(rename = "bedrockAccessKeys")]
+    #[ts(rename = "bedrockAccessKeys")]
+    #[strum(serialize = "bedrockAccessKeys")]
+    BedrockAccessKeys,
 }
 
 impl AuthMode {
@@ -61,7 +66,11 @@ impl AuthMode {
     pub fn has_chatgpt_account(self) -> bool {
         match self {
             Self::Chatgpt | Self::ChatgptAuthTokens | Self::PersonalAccessToken => true,
-            Self::ApiKey | Self::Headers | Self::AgentIdentity | Self::BedrockApiKey => false,
+            Self::ApiKey
+            | Self::Headers
+            | Self::AgentIdentity
+            | Self::BedrockApiKey
+            | Self::BedrockAccessKeys => false,
         }
     }
 
@@ -73,7 +82,7 @@ impl AuthMode {
             | Self::Headers
             | Self::AgentIdentity
             | Self::PersonalAccessToken => true,
-            Self::ApiKey | Self::BedrockApiKey => false,
+            Self::ApiKey | Self::BedrockApiKey | Self::BedrockAccessKeys => false,
         }
     }
 }
@@ -1005,6 +1014,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadRealtimeStopResponse,
     },
+    #[experimental("thread/timeline/list")]
+    ThreadTimelineList => "thread/timeline/list" {
+        params: v2::ThreadTimelineListParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadTimelineListResponse,
+    },
     #[experimental("thread/realtime/listVoices")]
     ThreadRealtimeListVoices => "thread/realtime/listVoices" {
         params: v2::ThreadRealtimeListVoicesParams,
@@ -1908,6 +1923,12 @@ server_notification_definitions! {
     ThreadRealtimeStarted => "thread/realtime/started" (v2::ThreadRealtimeStartedNotification),
     #[experimental("thread/realtime/itemAdded")]
     ThreadRealtimeItemAdded => "thread/realtime/itemAdded" (v2::ThreadRealtimeItemAddedNotification),
+    #[experimental("thread/realtime/item/started")]
+    ThreadRealtimeItemStarted => "thread/realtime/item/started" (v2::ThreadRealtimeItemStartedNotification),
+    #[experimental("thread/realtime/item/transcript/delta")]
+    ThreadRealtimeItemTranscriptDelta => "thread/realtime/item/transcript/delta" (v2::ThreadRealtimeItemTranscriptDeltaNotification),
+    #[experimental("thread/realtime/item/completed")]
+    ThreadRealtimeItemCompleted => "thread/realtime/item/completed" (v2::ThreadRealtimeItemCompletedNotification),
     #[experimental("thread/realtime/transcript/delta")]
     ThreadRealtimeTranscriptDelta => "thread/realtime/transcript/delta" (v2::ThreadRealtimeTranscriptDeltaNotification),
     #[experimental("thread/realtime/transcript/done")]
@@ -3234,25 +3255,47 @@ mod tests {
 
     #[test]
     fn serialize_account_login_amazon_bedrock() -> Result<()> {
-        let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(2),
-            params: v2::LoginAccountParams::AmazonBedrock {
-                api_key: "secret".to_string(),
-                region: "us-west-2".to_string(),
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/login/start",
-                "id": 2,
-                "params": {
+        for (params, expected_params) in [
+            (
+                v2::LoginAccountParams::AmazonBedrock {
+                    api_key: "secret".to_string(),
+                    region: "us-west-2".to_string(),
+                },
+                json!({
                     "type": "amazonBedrock",
                     "apiKey": "secret",
                     "region": "us-west-2"
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
+                }),
+            ),
+            (
+                v2::LoginAccountParams::AmazonBedrockAccessKeys {
+                    access_key_id: "access-key-id".to_string(),
+                    secret_access_key: "secret-access-key".to_string(),
+                    session_token: Some("session-token".to_string()),
+                    region: "us-west-2".to_string(),
+                },
+                json!({
+                    "type": "amazonBedrockAccessKeys",
+                    "accessKeyId": "access-key-id",
+                    "secretAccessKey": "secret-access-key",
+                    "sessionToken": "session-token",
+                    "region": "us-west-2"
+                }),
+            ),
+        ] {
+            let request = ClientRequest::LoginAccount {
+                request_id: RequestId::Integer(2),
+                params,
+            };
+            assert_eq!(
+                json!({
+                    "method": "account/login/start",
+                    "id": 2,
+                    "params": expected_params,
+                }),
+                serde_json::to_value(&request)?,
+            );
+        }
         assert_eq!(
             json!({"type": "amazonBedrock"}),
             serde_json::to_value(v2::LoginAccountResponse::AmazonBedrock {})?,
@@ -4425,6 +4468,7 @@ mod tests {
     #[test]
     fn command_execution_request_approval_additional_permissions_is_marked_experimental() {
         let params = v2::CommandExecutionRequestApprovalParams {
+            kind: Default::default(),
             thread_id: "thr_123".to_string(),
             turn_id: "turn_123".to_string(),
             item_id: "call_123".to_string(),

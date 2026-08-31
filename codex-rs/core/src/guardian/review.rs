@@ -19,7 +19,9 @@ use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
@@ -209,14 +211,12 @@ pub(crate) fn routes_approval_policy_to_guardian(
     ) && approvals_reviewer == ApprovalsReviewer::AutoReview
 }
 
-pub(crate) fn is_guardian_reviewer_source(
-    session_source: &codex_protocol::protocol::SessionSource,
-) -> bool {
-    matches!(
-        session_source,
-        codex_protocol::protocol::SessionSource::SubAgent(SubAgentSource::Other(label))
-            if label == GUARDIAN_REVIEWER_NAME
-    )
+pub(crate) fn is_basic_session_source(session_source: &SessionSource) -> bool {
+    match session_source {
+        SessionSource::SubAgent(SubAgentSource::Other(label)) => label == GUARDIAN_REVIEWER_NAME,
+        SessionSource::Internal(InternalSessionSource::Guardian) => true,
+        _ => false,
+    }
 }
 
 fn track_guardian_review(
@@ -347,7 +347,7 @@ async fn run_guardian_review(
         && let Some(decision) = session
             .services
             .extensions
-            .approval_review(
+            .fast_approval_decision(
                 &session.services.session_extension_data,
                 &session.services.thread_extension_data,
                 &action.to_string(),
@@ -906,7 +906,7 @@ pub(super) async fn guardian_review_session_config(
             .enable(Feature::RetainClientDeveloperMessages)
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "guardian review session could not preserve Node REPL developer policy: {error}"
+                    "guardian review session could not preserve REPL developer policy: {error}"
                 )
             })?;
     }
