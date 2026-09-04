@@ -27,8 +27,10 @@ use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 use codex_protocol::openai_models::ModelsResponse;
@@ -359,7 +361,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     let bundled_models = codex_models_manager::bundled_models_response()?.models;
     let catalog_auto_review = bundled_models
         .iter()
-        .find(|model| model.slug == "codex-auto-review")
+        .find(|model| model.slug == expected_model)
         .and_then(|model| model.model_messages.as_ref())
         .and_then(|messages| messages.auto_review.as_ref())
         .expect("bundled auto-review model Guardian policy");
@@ -380,14 +382,6 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     let use_responses_lite = review_model.use_responses_lite;
     if expected_model == "gpt-5.6-luna" {
         assert!(use_responses_lite, "Luna must use Responses Lite");
-        assert!(
-            review_model
-                .model_messages
-                .as_ref()
-                .and_then(|messages| messages.auto_review.as_ref())
-                .is_none(),
-            "Luna must exercise the bundled Guardian policy fallback"
-        );
     }
 
     let tool_args = json!({
@@ -1325,6 +1319,15 @@ async fn guardian_denial_rejects_tool_call_with_rationale(
                 ev_completed("resp-parent-tool-denied"),
             ]),
             sse(vec![
+                ev_response_created("resp-guardian-inspect"),
+                ev_function_call(
+                    "exec-guardian-inspect",
+                    "exec_command",
+                    &json!({"cmd": "printf guardian-inspection-evidence"}).to_string(),
+                ),
+                ev_completed("resp-guardian-inspect"),
+            ]),
+            sse(vec![
                 ev_response_created("resp-guardian-denied"),
                 ev_assistant_message(
                     "msg-guardian-denied",
@@ -1373,6 +1376,67 @@ async fn guardian_denial_rejects_tool_call_with_rationale(
         .expect("expected Guardian review request");
     assert!(guardian_request.body_contains_text(&command));
     assert_eq!(guardian_request.body_json()["model"], "gpt-5.6-luna");
+
+    let feedback = codex_feedback::guardian_review_failures(&[test.session_configured.thread_id])
+        .attachment
+        .expect("failed Guardian review");
+    let record: serde_json::Value = serde_json::from_slice(&feedback.buffer)?;
+    assert!(
+        guardian_request.body_contains_text(record["action"].as_str().expect("reviewed action"))
+    );
+    let recorded_history: Vec<ResponseItem> = serde_json::from_value(record["history"].clone())?;
+    let inspection_request = requests
+        .iter()
+        .find(|request| {
+            request
+                .function_call_output_text("exec-guardian-inspect")
+                .is_some()
+        })
+        .expect("Guardian request following its inspection tool");
+    assert!(
+        inspection_request
+            .function_call_output_text("exec-guardian-inspect")
+            .expect("inspection output")
+            .contains("guardian-inspection-evidence")
+    );
+    let inspection_output = inspection_request
+        .input()
+        .into_iter()
+        .find(|item| {
+            item["type"] == "function_call_output" && item["call_id"] == "exec-guardian-inspect"
+        })
+        .expect("inspection response item");
+    assert!(recorded_history.contains(&serde_json::from_value(inspection_output)?));
+    assert!(recorded_history.iter().any(|item| {
+        matches!(item, ResponseItem::Message { role, content, .. }
+        if role == "assistant" && content.iter().any(|part| {
+            matches!(part, ContentItem::OutputText { text }
+                if Some(text.as_str()) == record["decision"].as_str())
+        }))
+    }));
+    assert_eq!(
+        json!({
+            "reviewed_thread_id": record["reviewed_thread_id"],
+            "reviewer_thread_id": record["reviewer_thread_id"],
+            "status": record["status"],
+            "decision": serde_json::from_str::<serde_json::Value>(
+                record["decision"].as_str().expect("raw Guardian decision"),
+            )?,
+            "context_omitted": record["context_omitted"],
+        }),
+        json!({
+            "reviewed_thread_id": test.session_configured.thread_id,
+            "reviewer_thread_id": guardian_request.body_json()["client_metadata"]["thread_id"],
+            "status": "denied",
+            "decision": {
+                "risk_level": "high",
+                "user_authorization": "low",
+                "outcome": "deny",
+                "rationale": "The requested write has unacceptable test risk.",
+            },
+            "context_omitted": false,
+        })
+    );
 
     let tool_output = requests
         .iter()
