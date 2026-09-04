@@ -49,14 +49,24 @@ readonly -a TERMUX_RELEASE_PATCH_AUTHORITATIVE_CODE_PATHS=(
   codex-rs/tui/src/termux_update.rs
 )
 
+# These generated/manifests files contain both downstream Termux additions and
+# upstream release additions. Resolve overlapping insertions by retaining both.
+readonly -a TERMUX_RELEASE_UNION_MERGE_PATHS=(
+  codex-rs/Cargo.lock
+  codex-rs/core/Cargo.toml
+)
+
 # These upstream-owned files have repeatedly retained stale checkpoint-side
 # content when a new release branch was merged into the release work branch.
 readonly -a TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS=(
   .github
   codex-rs/core/src/compact_remote_v2_image_budget_tests.rs
   codex-rs/core/src/compact_remote_v2_images.rs
+  codex-rs/core/src/guardian/mod.rs
   codex-rs/core/tests/suite/compact_remote.rs
   codex-rs/features/src/lib.rs
+  codex-rs/tui/src/bottom_pane/chat_composer.rs
+  codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs
   codex-rs/windows-sandbox-rs/BUILD.bazel
 )
 

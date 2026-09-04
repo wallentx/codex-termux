@@ -278,7 +278,13 @@ cd "${work_update}"
 git config user.name "Termux Release Test"
 git config user.email "termux-release-test@example.invalid"
 
-mkdir -p .github/workflows codex-rs/cli/src codex-rs/features/src codex-rs/tui/src src
+mkdir -p \
+  .github/workflows \
+  codex-rs/cli/src \
+  codex-rs/core/src/guardian \
+  codex-rs/features/src \
+  codex-rs/tui/src/bottom_pane/textarea \
+  src
 printf 'base workflow\n' > .github/workflows/rust-release.yml
 cat > codex-rs/Cargo.toml <<'TOML'
 [workspace]
@@ -297,7 +303,38 @@ base = "1"
 release = "old"
 TOML
 printf 'upstream release code\n' > codex-rs/cli/src/main.rs
+cat > codex-rs/core/Cargo.toml <<'TOML'
+[dependencies]
+codex-utils-cache = { workspace = true }
+codex-utils-image = { workspace = true }
+
+[target.aarch64-unknown-linux-musl.dependencies]
+openssl-sys = { workspace = true, features = ["vendored"] }
+
+[target.'cfg(unix)'.dependencies]
+codex-shell-escalation = { workspace = true }
+TOML
+cat > codex-rs/Cargo.lock <<'LOCK'
+[[package]]
+name = "codex-core"
+version = "0.0.0"
+dependencies = [
+ "codex-utils-cache",
+ "codex-utils-image",
+]
+
+[[package]]
+name = "codex-utils-elapsed"
+version = "0.0.0"
+
+[[package]]
+name = "codex-utils-fuzzy-match"
+version = "0.0.0"
+LOCK
+printf 'old upstream guardian\n' > codex-rs/core/src/guardian/mod.rs
 printf 'old upstream feature\n' > codex-rs/features/src/lib.rs
+printf 'old upstream composer\n' > codex-rs/tui/src/bottom_pane/chat_composer.rs
+printf 'old upstream vim commands\n' > codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs
 for path in lib.rs termux_update.rs update_action.rs update_prompt.rs update_versions.rs updates.rs; do
   printf 'fixture\n' > "codex-rs/tui/src/${path}"
 done
@@ -333,8 +370,13 @@ done
 printf 'upstream windows build\n' > codex-rs/windows-sandbox-rs/BUILD.bazel
 printf 'new-release\n' > src/shared.txt
 printf 'new-tag\n' > src/new-tag.txt
+perl -0pi -e 's/(codex-utils-cache = .*\n)/$1codex-utils-git-discovery = { workspace = true }\n/' codex-rs/core/Cargo.toml
+perl -0pi -e 's/( "codex-utils-cache",\n)/$1 "codex-utils-git-discovery",\n/' codex-rs/Cargo.lock
+printf 'new upstream guardian\n' > codex-rs/core/src/guardian/mod.rs
 printf 'new upstream feature\n' > codex-rs/features/src/lib.rs
-git add .github/scripts/macos-signing codex-rs/Cargo.toml codex-rs/features/src/lib.rs codex-rs/utils/audio/Cargo.toml codex-rs/windows-sandbox-rs/BUILD.bazel src/shared.txt src/new-tag.txt
+printf 'new upstream composer\n' > codex-rs/tui/src/bottom_pane/chat_composer.rs
+printf 'new upstream vim commands\n' > codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs
+git add .github/scripts/macos-signing codex-rs/Cargo.lock codex-rs/Cargo.toml codex-rs/core/Cargo.toml codex-rs/core/src/guardian/mod.rs codex-rs/features/src/lib.rs codex-rs/tui/src/bottom_pane/chat_composer.rs codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs codex-rs/utils/audio/Cargo.toml codex-rs/windows-sandbox-rs/BUILD.bazel src/shared.txt src/new-tag.txt
 git commit -m "new upstream release" >/dev/null
 git tag rust-v1.0.0-alpha.2
 git push origin main rust-v1.0.0-alpha.2 >/dev/null
@@ -355,12 +397,19 @@ for path in \
   printf 'stale target %s\n' "${path}" > ".github/scripts/macos-signing/${path}"
 done
 printf 'stale target windows build\n' > codex-rs/windows-sandbox-rs/BUILD.bazel
+perl -0pi -e 's/(codex-utils-cache = .*\n)/$1codex-utils-file-lock = { workspace = true }\n/' codex-rs/core/Cargo.toml
+perl -0pi -e 's/(\[target\.\x27cfg\(unix\)\x27\.dependencies\]\n)/# Build OpenSSL from source for Android builds.\n[target.aarch64-linux-android.dependencies]\nopenssl-sys = { workspace = true, features = ["vendored"] }\n\n$1/' codex-rs/core/Cargo.toml
+perl -0pi -e 's/( "codex-utils-cache",\n)/$1 "codex-utils-file-lock",\n/' codex-rs/Cargo.lock
+perl -0pi -e 's/(\[\[package\]\]\nname = "codex-utils-fuzzy-match")/[[package]]\nname = "codex-utils-file-lock"\nversion = "0.0.0"\n\n$1/' codex-rs/Cargo.lock
+printf 'stale target guardian\n' > codex-rs/core/src/guardian/mod.rs
 printf 'stale target feature\n' > codex-rs/features/src/lib.rs
+printf 'stale target composer\n' > codex-rs/tui/src/bottom_pane/chat_composer.rs
+printf 'stale target vim commands\n' > codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs
 printf 'termux workflow\n' > .github/workflows/rust-release.yml
 printf 'compat\n' > termux/compat.txt
 printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
 printf 'termux updater with target drift\n' > codex-rs/tui/src/termux_update.rs
-git add .github/scripts/macos-signing .github/workflows/rust-release.yml codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/features/src/lib.rs codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml codex-rs/windows-sandbox-rs/BUILD.bazel termux/compat.txt
+git add .github/scripts/macos-signing .github/workflows/rust-release.yml codex-rs/Cargo.lock codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/core/Cargo.toml codex-rs/core/src/guardian/mod.rs codex-rs/features/src/lib.rs codex-rs/tui/src/bottom_pane/chat_composer.rs codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml codex-rs/windows-sandbox-rs/BUILD.bazel termux/compat.txt
 git commit -m "termux compatibility changes" >/dev/null
 git tag rust-v1.0.0-alpha.1-termux
 printf 'newer release line\n' > src/newer-release-line.txt
@@ -414,6 +463,14 @@ assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'codex-u
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml '"utils/file-lock",'
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'codex-utils-file-lock = { path = "utils/file-lock" }'
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'release = "new"'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/core/Cargo.toml 'codex-utils-file-lock = { workspace = true }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/core/Cargo.toml 'codex-utils-git-discovery = { workspace = true }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/core/Cargo.toml '[target.aarch64-linux-android.dependencies]'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.lock '"codex-utils-file-lock",'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.lock '"codex-utils-git-discovery",'
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/core/src/guardian/mod.rs "new upstream guardian"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/tui/src/bottom_pane/chat_composer.rs "new upstream composer"
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs "new upstream vim commands"
 for path in \
   notarize_macos_binary_with_rcodesign.sh \
   notarize_macos_dmg_with_rcodesign.sh \

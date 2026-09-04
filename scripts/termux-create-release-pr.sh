@@ -136,6 +136,30 @@ restore_release_workspace_manifest() {
   git add -- "${manifest}"
 }
 
+resolve_union_merge_paths() {
+  local path
+  local merge_dir
+
+  for path in "${TERMUX_RELEASE_UNION_MERGE_PATHS[@]}"; do
+    if [[ -z "$(git ls-files --unmerged -- "${path}")" ]]; then
+      continue
+    fi
+
+    merge_dir="$(mktemp -d "${RUNNER_TEMP}/termux-release-union.XXXXXX")"
+    git show ":2:${path}" > "${merge_dir}/ours"
+    git show ":1:${path}" > "${merge_dir}/base"
+    git show ":3:${path}" > "${merge_dir}/theirs"
+    git merge-file \
+      --union \
+      "${merge_dir}/ours" \
+      "${merge_dir}/base" \
+      "${merge_dir}/theirs"
+    cp "${merge_dir}/ours" "${path}"
+    rm -rf "${merge_dir}"
+    git add -- "${path}"
+  done
+}
+
 restore_merge_authoritative_paths() {
   local release_ref="origin/${RELEASE_BRANCH}"
   local path
@@ -187,6 +211,8 @@ restore_merge_authoritative_paths() {
   if (( ${#release_remove_paths[@]} > 0 )); then
     git rm -f --ignore-unmatch -- "${release_remove_paths[@]}"
   fi
+
+  resolve_union_merge_paths
 }
 
 merge_release_branch_into_work_branch() {
