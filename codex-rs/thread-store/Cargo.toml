@@ -23,6 +23,7 @@ codex-protocol = { workspace = true }
 codex-rollout = { workspace = true }
 codex-state = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-file-lock = { workspace = true }
 codex-utils-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 futures = { workspace = true }
