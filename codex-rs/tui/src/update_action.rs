@@ -83,14 +83,10 @@ impl UpdateAction {
     }
 
     pub fn release_notes_url(self) -> &'static str {
-        match self {
-            UpdateAction::TermuxSelfUpdate => crate::termux_update::TERMUX_RELEASES_URL,
-            UpdateAction::NpmGlobalLatest
-            | UpdateAction::BunGlobalLatest
-            | UpdateAction::PnpmGlobalLatest
-            | UpdateAction::BrewUpgrade
-            | UpdateAction::StandaloneUnix
-            | UpdateAction::StandaloneWindows => "https://github.com/openai/codex/releases/latest",
+        if self == UpdateAction::TermuxSelfUpdate {
+            crate::termux_update::TERMUX_RELEASES_URL
+        } else {
+            "https://github.com/openai/codex/releases/latest"
         }
     }
 }
