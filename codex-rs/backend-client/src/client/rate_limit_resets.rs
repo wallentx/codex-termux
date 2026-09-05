@@ -7,8 +7,9 @@ use crate::types::RateLimitResetCreditsDetails;
 use crate::types::RateLimitStatusWithResetCredits;
 use crate::types::RateLimitsWithResetCredits;
 use anyhow::Result;
-use reqwest::header::CONTENT_TYPE;
-use reqwest::header::HeaderValue;
+use http::Method;
+use http::header::CONTENT_TYPE;
+use http::header::HeaderValue;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -24,19 +25,22 @@ impl Client {
         Ok(RateLimitsWithResetCredits {
             rate_limits: Self::rate_limit_snapshots_from_payload(payload.rate_limits),
             rate_limit_reset_credits: payload.rate_limit_reset_credits,
+            account_id: payload.account_id,
+            user_id: payload.user_id,
+            rate_limit_upsell: payload.rate_limit_upsell,
         })
     }
 
     pub(super) async fn get_rate_limit_status(&self) -> Result<RateLimitStatusWithResetCredits> {
         let url = self.rate_limit_status_url();
-        let req = self.http.get(&url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers());
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
 
     pub async fn list_rate_limit_reset_credits(&self) -> Result<RateLimitResetCreditsDetails> {
         let url = self.rate_limit_reset_credits_url();
-        let req = self.http.get(&url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers());
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
@@ -65,8 +69,7 @@ impl Client {
     ) -> Result<ConsumeRateLimitResetCreditResponse> {
         let url = self.consume_rate_limit_reset_credit_url();
         let req = self
-            .http
-            .post(&url)
+            .request(Method::POST, &url)
             .headers(self.headers())
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&ConsumeRateLimitResetCreditRequest {

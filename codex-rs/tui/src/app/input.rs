@@ -7,6 +7,83 @@ use super::*;
 use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
 
 impl App {
+    pub(super) fn route_key_chord_event(
+        &mut self,
+        tui: &mut tui::Tui,
+        key_event: KeyEvent,
+    ) -> Option<KeyEvent> {
+        let contexts = self.active_keymap_contexts();
+        let was_pending = self.key_chord_matcher.is_pending();
+        match self.key_chord_matcher.advance(
+            key_event,
+            &self.keymap.chords,
+            contexts,
+            tokio::time::Instant::now(),
+        ) {
+            crate::keymap::KeyChordMatch::PassThrough => {
+                if was_pending && !self.key_chord_matcher.is_pending() {
+                    self.chat_widget.set_footer_hint_override(/*items*/ None);
+                }
+                Some(key_event)
+            }
+            crate::keymap::KeyChordMatch::Pending(prefix) => {
+                if self.backtrack.primed {
+                    self.reset_backtrack_state();
+                }
+                self.chat_widget.set_footer_hint_override(Some(vec![
+                    (
+                        format!("{} …", prefix.display_label()),
+                        "waiting for next key".to_string(),
+                    ),
+                    ("esc".to_string(), "cancel".to_string()),
+                ]));
+                tui.frame_requester()
+                    .schedule_frame_in(crate::keymap::KEY_CHORD_TIMEOUT);
+                None
+            }
+            crate::keymap::KeyChordMatch::Completed(dispatch_event) => {
+                self.chat_widget.set_footer_hint_override(/*items*/ None);
+                Some(dispatch_event)
+            }
+            crate::keymap::KeyChordMatch::Cancelled => {
+                self.chat_widget.set_footer_hint_override(/*items*/ None);
+                None
+            }
+            crate::keymap::KeyChordMatch::Ignored => None,
+        }
+    }
+
+    pub(super) fn expire_pending_key_chord(&mut self) {
+        let contexts = self.active_keymap_contexts();
+        if self
+            .key_chord_matcher
+            .expire(contexts, tokio::time::Instant::now())
+        {
+            self.chat_widget.set_footer_hint_override(/*items*/ None);
+        }
+    }
+
+    pub(super) fn cancel_pending_key_chord(&mut self) {
+        if self.key_chord_matcher.cancel() {
+            self.chat_widget.set_footer_hint_override(/*items*/ None);
+        }
+    }
+
+    fn active_keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        if self.overlay.is_some() {
+            return crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::Pager);
+        }
+
+        let contexts = self.chat_widget.keymap_contexts();
+        if self.chat_widget.no_modal_or_popup_active() {
+            contexts
+                .with(crate::keymap::KeymapContext::Global)
+                .with(crate::keymap::KeymapContext::Chat)
+        } else {
+            contexts
+        }
+    }
+
     pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
         let editor_cmd = match external_editor::resolve_editor_command() {
             Ok(cmd) => cmd,
@@ -30,9 +107,18 @@ impl App {
         };
 
         let seed = self.chat_widget.composer_text_with_pending();
+        let config = self.chat_widget.config_ref();
+        let file_system_policy = config.permissions.file_system_sandbox_policy();
         let editor_result = tui
-            .with_restored(tui::RestoreMode::KeepRaw, || async {
-                external_editor::run_editor(&seed, &editor_cmd).await
+            .with_restored(|| async {
+                external_editor::run_editor(
+                    &seed,
+                    &editor_cmd,
+                    config.codex_home.as_path(),
+                    &file_system_policy,
+                    config.cwd.as_path(),
+                )
+                .await
             })
             .await;
         self.reset_external_editor_state(tui);
@@ -81,7 +167,8 @@ impl App {
         } else {
             self.chat_widget.set_raw_output_mode(enabled);
         }
-        if let Err(err) = self.reflow_transcript_now(tui) {
+        let terminal_width = tui.terminal.last_known_screen_size.into();
+        if let Err(err) = self.reflow_transcript_now(tui, terminal_width) {
             tracing::warn!(error = %err, "failed to reflow transcript after raw output mode toggle");
             self.chat_widget
                 .add_error_message(format!("Failed to redraw transcript: {err}"));
@@ -136,6 +223,84 @@ impl App {
             }
             return;
         }
+        if matches!(self.app_server_target, AppServerTarget::LocalDaemon { .. })
+            && self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            && self.chat_widget.composer_is_empty()
+            && self.active_side_parent_thread_id().is_none()
+            && matches!(
+                key_event,
+                KeyEvent {
+                    code: KeyCode::Char(c),
+                    modifiers,
+                    kind: KeyEventKind::Press,
+                    ..
+                } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c')
+            )
+        {
+            let mut running_thread_id = if self.chat_widget.is_agent_turn_running() {
+                self.chat_widget.thread_id()
+            } else {
+                None
+            };
+            let mut running_side_thread_id =
+                running_thread_id.filter(|thread_id| self.side_threads.contains_key(thread_id));
+            if running_side_thread_id.is_none() {
+                for thread_id in self.side_threads.keys().copied() {
+                    if self.active_turn_id_for_thread(thread_id).await.is_some() {
+                        running_side_thread_id = Some(thread_id);
+                        break;
+                    }
+                }
+            }
+            if running_thread_id.is_none() {
+                running_thread_id = running_side_thread_id;
+            }
+
+            if let Some(thread_id) = running_thread_id {
+                let allow_background = running_side_thread_id.is_none()
+                    && !self.chat_widget.has_queued_follow_up_messages();
+                self.chat_widget.show_selection_view(SelectionViewParams {
+                    title: Some("Task is still running".to_string()),
+                    subtitle: Some("Choose what happens to the current task.".to_string()),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items: [
+                        (
+                            "Cancel task",
+                            "Stop the current task and stay in Codex",
+                            RunningTaskExitAction::CancelTask,
+                        ),
+                        (
+                            "Run in background",
+                            "Exit Codex and leave the task running",
+                            RunningTaskExitAction::RunInBackground,
+                        ),
+                        (
+                            "Exit",
+                            "Stop the current task and exit Codex",
+                            RunningTaskExitAction::Exit,
+                        ),
+                    ]
+                    .into_iter()
+                    .filter(|(_, _, action)| {
+                        allow_background || *action != RunningTaskExitAction::RunInBackground
+                    })
+                    .map(|(name, description, action)| SelectionItem {
+                        name: name.to_string(),
+                        description: Some(description.to_string()),
+                        actions: vec![Box::new(move |tx| {
+                            tx.send(AppEvent::RunningTaskExit { action, thread_id });
+                        })],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                    ..Default::default()
+                });
+                return;
+            }
+        }
+
         if side_return_shortcut_matches(key_event)
             && self.maybe_return_from_side(tui, app_server).await
         {
@@ -143,6 +308,19 @@ impl App {
         }
 
         let app_keymap_shortcuts_available = self.app_keymap_shortcuts_available();
+
+        let side_toggle_bindings = &self.keymap.app.toggle_side_conversation;
+        if app_keymap_shortcuts_available
+            && (side_toggle_bindings.is_pressed(key_event)
+                || side_toggle_bindings.contains(&crate::key_hint::ctrl(KeyCode::Char('/')))
+                    && crate::key_hint::ctrl(KeyCode::Char('7')).is_press(key_event))
+        {
+            if let Err(err) = self.toggle_side_conversation(tui, app_server).await {
+                self.chat_widget
+                    .add_error_message(format!("Failed to switch side conversation: {err}"));
+            }
+            return;
+        }
 
         if app_keymap_shortcuts_available && self.keymap.app.toggle_vim_mode.is_pressed(key_event) {
             self.chat_widget.toggle_vim_mode_and_notify();
@@ -164,14 +342,17 @@ impl App {
             return;
         }
 
+        if app_keymap_shortcuts_available && self.keymap.app.open_agents.is_pressed(key_event) {
+            self.open_agents_overview(app_server);
+            return;
+        }
+
         if app_keymap_shortcuts_available && self.keymap.app.open_transcript.is_pressed(key_event) {
-            // Enter alternate screen and set viewport to full size.
-            let _ = tui.enter_alt_screen();
-            self.overlay = Some(Overlay::new_transcript(
-                self.transcript_cells.clone(),
-                self.keymap.pager.clone(),
-            ));
-            tui.frame_requester().schedule_frame();
+            self.scrollback_has_older_history = self
+                .chat_widget
+                .thread_id()
+                .is_some_and(|thread_id| app_server.has_older_history(thread_id));
+            self.open_transcript_overlay(tui);
             return;
         }
 
@@ -186,6 +367,17 @@ impl App {
             {
                 self.request_external_editor_launch(tui);
             }
+            return;
+        }
+
+        if !self.chat_widget.has_active_view()
+            && self
+                .current_displayed_thread_id()
+                .is_some_and(|id| self.thread_unavailable(id))
+            && !(key_event.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key_event.code, KeyCode::Char('c' | 'd')))
+        {
+            self.chat_widget.handle_disconnected_key(key_event);
             return;
         }
 

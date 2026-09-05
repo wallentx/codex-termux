@@ -35,13 +35,15 @@ impl fmt::Debug for WindowsSandboxCancellationToken {
     }
 }
 
-/// Controls whether a Windows sandbox launch reconciles persistent proxy
-/// firewall settings or preserves the settings established by another launch.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum WindowsSandboxProxySettingsMode {
-    #[default]
-    Reconcile,
-    Preserve,
+pub use codex_protocol::config_types::WindowsSandboxProxySettingsMode;
+
+/// Network settings installed by an administrator during managed Windows sandbox setup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowsSandboxProvisioningSettings {
+    /// Loopback proxy ports permitted for the offline sandbox identity.
+    pub proxy_ports: Vec<u16>,
+    /// Whether the offline sandbox identity may exchange arbitrary loopback traffic.
+    pub allow_local_binding: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -147,6 +149,8 @@ pub use acl::ensure_allow_write_aces;
 pub use acl::fetch_dacl_handle;
 #[cfg(target_os = "windows")]
 pub use acl::path_mask_allows;
+#[cfg(target_os = "windows")]
+pub use acl::path_write_aces_need_refresh;
 #[cfg(target_os = "windows")]
 pub use audit::apply_world_writable_scan_and_denies_for_permissions;
 #[cfg(target_os = "windows")]
@@ -255,6 +259,10 @@ pub use resolved_permissions::WindowsSandboxTokenMode;
 #[cfg(target_os = "windows")]
 pub use resolved_permissions::token_mode_for_permission_profile;
 #[cfg(target_os = "windows")]
+pub use setup::OFFLINE_USERNAME;
+#[cfg(target_os = "windows")]
+pub use setup::ONLINE_USERNAME;
+#[cfg(target_os = "windows")]
 pub use setup::SETUP_VERSION;
 #[cfg(target_os = "windows")]
 pub use setup::SandboxSetupRequest;
@@ -282,6 +290,8 @@ pub use setup_error::SetupErrorReport;
 pub use setup_error::SetupFailure;
 #[cfg(target_os = "windows")]
 pub use setup_error::extract_failure as extract_setup_failure;
+#[cfg(target_os = "windows")]
+pub use setup_error::read_setup_error_report;
 #[cfg(target_os = "windows")]
 pub use setup_error::sanitize_setup_metric_tag_value;
 #[cfg(target_os = "windows")]
@@ -353,6 +363,7 @@ pub use stub::run_windows_sandbox_legacy_preflight;
 mod windows_impl {
     use super::WindowsSandboxCancellationToken;
     use super::logging::log_failure;
+    use super::logging::log_note;
     use super::logging::log_success;
     use super::process::ConsoleMode;
     use super::process::create_process_as_user;
@@ -372,6 +383,7 @@ mod windows_impl {
     use std::io;
     use std::path::Path;
     use std::ptr;
+    use std::sync::Arc;
     use std::time::Duration;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -564,7 +576,16 @@ mod windows_impl {
         )?;
         let (stdin_pair, stdout_pair, stderr_pair) = unsafe { setup_stdio_pipes()? };
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
-        let spawn_res = unsafe {
+        let spawn_res = crate::LaunchDesktop::prepare_legacy(
+            use_private_desktop,
+            &permissions,
+            &current_dir,
+            &env_map,
+            &security,
+            &additional_deny_write_paths,
+            logs_base_dir,
+        )
+        .and_then(|desktop| unsafe {
             create_process_as_user(
                 security.h_token,
                 &command,
@@ -573,9 +594,9 @@ mod windows_impl {
                 logs_base_dir,
                 Some((in_r, out_w, err_w)),
                 ConsoleMode::Inherit,
-                use_private_desktop,
+                desktop,
             )
-        };
+        });
         let created = match spawn_res {
             Ok(v) => v,
             Err(err) => {
@@ -592,6 +613,7 @@ mod windows_impl {
             }
         };
         let pi = created.process_info;
+        let job = Arc::clone(&created.job);
         let _desktop = created;
 
         unsafe {
@@ -655,10 +677,30 @@ mod windows_impl {
             unsafe {
                 GetExitCodeProcess(pi.hProcess, &mut exit_code_u32);
             }
-        } else {
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
+        }
+        if timed_out || cancelled {
+            if let Err(job_err) = job.terminate() {
+                log_note(
+                    &format!("capture failed to terminate process tree: {job_err}"),
+                    logs_base_dir,
+                );
+                let root_result = unsafe {
+                    windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1)
+                };
+                if root_result == 0 {
+                    log_note(
+                        &format!("capture failed to terminate root process: {}", unsafe {
+                            GetLastError()
+                        }),
+                        logs_base_dir,
+                    );
+                }
             }
+        } else if let Err(err) = job.preserve_descendants() {
+            log_note(
+                &format!("capture failed to preserve descendants after root exit: {err}"),
+                logs_base_dir,
+            );
         }
 
         unsafe {

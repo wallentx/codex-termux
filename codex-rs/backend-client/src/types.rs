@@ -45,6 +45,9 @@ pub struct RateLimitResetCreditDetails {
 pub struct RateLimitsWithResetCredits {
     pub rate_limits: Vec<RateLimitSnapshot>,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+    pub rate_limit_upsell: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -52,12 +55,26 @@ pub(crate) struct RateLimitStatusWithResetCredits {
     #[serde(flatten)]
     pub rate_limits: RateLimitStatusPayload,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+    // Preserve the backend-owned banner contract without making optional UI data break usage.
+    pub rate_limit_upsell: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct CodexWorkspaceMessagesResponse {
     #[serde(default)]
     pub messages: Vec<CodexWorkspaceMessage>,
+}
+
+/// Authenticated Codex user settings used by CLI runtime policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct CodexUserSettingsResponse {
+    /// Server-computed effective commit-attribution policy.
+    ///
+    /// Older backend responses omit this field, which safely defaults to disabled.
+    #[serde(default)]
+    pub commit_attribution_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

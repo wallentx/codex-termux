@@ -2,6 +2,7 @@ use codex_context_fragments::ContextualUserFragment;
 use codex_execpolicy::Policy;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ApprovalMessages;
@@ -177,6 +178,10 @@ impl ContextualUserFragment for PermissionsInstructions {
         "developer"
     }
 
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("permissions.instructions".to_string())
+    }
+
     fn markers(&self) -> (&'static str, &'static str) {
         Self::type_markers()
     }
@@ -229,12 +234,15 @@ fn approval_text(
     exec_permission_approvals_enabled: bool,
     request_permissions_tool_enabled: bool,
 ) -> String {
-    if approval_policy == AskForApproval::OnRequest
-        && let Some(approval_messages) = approval_messages
-    {
-        let selected = match approvals_reviewer {
-            ApprovalsReviewer::User => approval_messages.on_request.as_ref(),
-            ApprovalsReviewer::AutoReview => approval_messages.on_request_auto_review.as_ref(),
+    if let Some(approval_messages) = approval_messages {
+        let selected = match &approval_policy {
+            AskForApproval::OnRequest => match approvals_reviewer {
+                ApprovalsReviewer::User => approval_messages.on_request.as_ref(),
+                ApprovalsReviewer::AutoReview => approval_messages.on_request_auto_review.as_ref(),
+            },
+            AskForApproval::Never => approval_messages.never.as_ref(),
+            AskForApproval::UnlessTrusted => approval_messages.unless_trusted.as_ref(),
+            AskForApproval::Granular(_) => None,
         };
         if let Some(selected) = selected {
             return selected.clone();

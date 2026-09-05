@@ -1,3 +1,5 @@
+use crate::desktop::DesktopPolicy;
+use crate::desktop::shared_private_desktop_for_user;
 use crate::identity::SandboxCreds;
 use crate::ipc_framed::ErrorPayload;
 use crate::ipc_framed::ErrorStage;
@@ -41,7 +43,6 @@ use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetCurrentThread;
-use windows_sys::Win32::System::Threading::LOGON_WITH_PROFILE;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::TerminateProcess;
@@ -49,7 +50,7 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const RUNNER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const RUNNER_SPAWN_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RUNNER_SPAWN_READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const RUNNER_ERROR_MODE_FLAGS: u32 = 0x0001 | 0x0002;
 const WAIT_OBJECT_0: u32 = 0;
 
@@ -313,8 +314,12 @@ pub(crate) fn spawn_runner_transport(
     cwd: &Path,
     sandbox_creds: &SandboxCreds,
     log_dir: Option<&Path>,
-    spawn_request: SpawnRequest,
+    mut spawn_request: SpawnRequest,
+    desktop_policy: Option<&DesktopPolicy>,
 ) -> Result<RunnerTransport> {
+    spawn_request.private_desktop_name = desktop_policy
+        .map(|policy| shared_private_desktop_for_user(&sandbox_creds.username, policy, log_dir))
+        .transpose()?;
     let (pipe_in_name, pipe_out_name) = pipe_pair();
     let h_pipe_in =
         create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
@@ -344,12 +349,13 @@ pub(crate) fn spawn_runner_transport(
     let env_block: Option<Vec<u16>> = None;
 
     let previous_error_mode = unsafe { SetErrorMode(RUNNER_ERROR_MODE_FLAGS) };
+    // Sandbox users have no profile state that commands should inherit.
     let spawn_res = unsafe {
         CreateProcessWithLogonW(
             user_w.as_ptr(),
             domain_w.as_ptr(),
             password_w.as_ptr(),
-            LOGON_WITH_PROFILE,
+            /*dwlogonflags*/ 0,
             exe_w.as_ptr(),
             cmdline_vec.as_mut_ptr(),
             windows_sys::Win32::System::Threading::CREATE_NO_WINDOW

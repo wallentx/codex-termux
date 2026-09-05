@@ -32,7 +32,7 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct ExecServerHarness {
-    _codex_home: TempDir,
+    codex_home: TempDir,
     _helper_paths: TestCodexHelperPaths,
     child: Child,
     websocket_url: String,
@@ -76,10 +76,13 @@ pub(crate) fn test_codex_helper_paths() -> anyhow::Result<TestCodexHelperPaths> 
 }
 
 pub(crate) async fn exec_server() -> anyhow::Result<ExecServerHarness> {
-    exec_server_with_env(std::iter::empty::<(&str, &str)>()).await
+    exec_server_with_env(std::iter::empty::<(&str, &str)>(), &[]).await
 }
 
-pub(crate) async fn exec_server_with_env<I, K, V>(env: I) -> anyhow::Result<ExecServerHarness>
+pub(crate) async fn exec_server_with_env<I, K, V>(
+    env: I,
+    args: &[&str],
+) -> anyhow::Result<ExecServerHarness>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<std::ffi::OsStr>,
@@ -89,6 +92,7 @@ where
     let codex_home = TempDir::new()?;
     let mut child = Command::new(&helper_paths.codex_exe);
     child.args(["exec-server", "--listen", "ws://127.0.0.1:0"]);
+    child.args(args);
     child.stdin(Stdio::null());
     child.stdout(Stdio::piped());
     child.stderr(Stdio::inherit());
@@ -100,7 +104,7 @@ where
     let websocket_url = read_listen_url_from_stdout(&mut child).await?;
     let (websocket, _) = connect_websocket_when_ready(&websocket_url).await?;
     Ok(ExecServerHarness {
-        _codex_home: codex_home,
+        codex_home,
         _helper_paths: helper_paths,
         child,
         websocket_url,
@@ -110,6 +114,10 @@ where
 }
 
 impl ExecServerHarness {
+    pub(crate) fn codex_home(&self) -> &std::path::Path {
+        self.codex_home.path()
+    }
+
     pub(crate) fn websocket_url(&self) -> &str {
         &self.websocket_url
     }

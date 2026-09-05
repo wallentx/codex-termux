@@ -12,6 +12,7 @@ use codex_api::Compression;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient;
+use codex_api::ResponsesEndpoint;
 use codex_api::ResponsesOptions;
 use codex_client::HttpTransport;
 use codex_client::Request;
@@ -28,6 +29,7 @@ use http::HeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
 use pretty_assertions::assert_eq;
+use serde_json::value::RawValue;
 
 fn assert_path_ends_with(requests: &[Request], suffix: &str) {
     assert_eq!(requests.len(), 1);
@@ -36,6 +38,10 @@ fn assert_path_ends_with(requests: &[Request], suffix: &str) {
         url.ends_with(suffix),
         "expected url to end with {suffix}, got {url}"
     );
+}
+
+fn empty_tools() -> Arc<RawValue> {
+    Arc::from(RawValue::from_string("[]".to_string()).expect("valid tool JSON"))
 }
 
 fn request_body_bytes(request: &Request) -> &[u8] {
@@ -302,6 +308,26 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 }
 
 #[tokio::test]
+async fn responses_client_uses_guardian_path() -> Result<()> {
+    let state = RecordingState::default();
+    let transport = RecordingTransport::new(state.clone());
+    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth))
+        .with_endpoint(ResponsesEndpoint::Guardian);
+
+    let _stream = client
+        .stream(
+            serde_json::json!({ "echo": true }),
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        )
+        .await?;
+
+    assert_path_ends_with(&state.take_stream_requests(), "/guardian");
+    Ok(())
+}
+
+#[tokio::test]
 async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
     let state = RecordingState::default();
     let transport = RecordingTransport::new(state.clone());
@@ -316,7 +342,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }],
-        tools: Some(Vec::new()),
+        tools: Some(empty_tools().into()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
@@ -328,6 +354,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
         prompt_cache_key: None,
         text: None,
         client_metadata: None,
+        access_programs: None,
     };
     let expected = serde_json::to_value(&request)?;
 
@@ -403,7 +430,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         model: "gpt-test".into(),
         instructions: "Say hi".into(),
         input: Vec::new(),
-        tools: Some(Vec::new()),
+        tools: Some(empty_tools().into()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
@@ -415,6 +442,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         prompt_cache_key: None,
         text: None,
         client_metadata: None,
+        access_programs: None,
     };
     let client = ResponsesClient::new(transport.clone(), provider, Arc::new(NoAuth));
 
@@ -523,7 +551,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }],
-        tools: Some(Vec::new()),
+        tools: Some(empty_tools().into()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
@@ -535,6 +563,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
         prompt_cache_key: None,
         text: None,
         client_metadata: None,
+        access_programs: None,
     };
 
     let mut extra_headers = HeaderMap::new();

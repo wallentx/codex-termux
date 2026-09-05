@@ -31,7 +31,10 @@ impl ChatWidget {
                 }
                 let should_submit_now = self.is_session_configured()
                     && !self.is_plan_streaming_in_tui()
-                    && !self.input_queue.suppress_queue_autosend;
+                    && !self.input_queue.suppress_queue_autosend
+                    && !self.input_queue.rate_limit_recovery_pending
+                    && (!self.input_queue.user_turn_pending_start
+                        || self.turn_lifecycle.agent_turn_running);
                 if should_submit_now {
                     if self.only_user_shell_commands_running()
                         && !user_message.text.starts_with('!')
@@ -76,7 +79,6 @@ impl ChatWidget {
         if had_modal_or_popup && self.bottom_pane.no_modal_or_popup_active() {
             self.maybe_send_next_queued_input();
         }
-        self.refresh_plan_mode_nudge();
     }
 
     pub(super) fn defer_input_until_settings_applied(&mut self) {
@@ -108,10 +110,14 @@ impl ChatWidget {
         action: QueuedInputAction,
         pending_pastes: Vec<(String, String)>,
     ) {
-        if !self.is_session_configured()
-            || self.is_user_turn_pending_or_running()
-            || self.input_queue.suppress_queue_autosend
-        {
+        if self.misalignment_policy_violation {
+            return;
+        }
+        let should_run_now = self.is_session_configured()
+            && !self.is_user_turn_pending_or_running()
+            && !self.input_queue.suppress_queue_autosend
+            && !self.input_queue.rate_limit_recovery_pending;
+        if !should_run_now || action != QueuedInputAction::Plain {
             self.input_queue
                 .queued_user_messages
                 .push_back(QueuedUserMessage {
@@ -123,6 +129,9 @@ impl ChatWidget {
                 .queued_user_message_history_records
                 .push_back(UserMessageHistoryRecord::UserMessageText);
             self.refresh_pending_input_preview();
+            if should_run_now {
+                self.maybe_send_next_queued_input();
+            }
         } else {
             self.submit_user_message(user_message);
         }
@@ -130,7 +139,12 @@ impl ChatWidget {
 
     /// If idle and there are queued inputs, submit exactly one to start the next turn.
     pub(crate) fn maybe_send_next_queued_input(&mut self) -> bool {
-        if self.input_queue.suppress_queue_autosend {
+        if !self.is_session_configured()
+            || self.misalignment_policy_violation
+            || self.input_queue.suppress_queue_autosend
+            || self.input_queue.rate_limit_recovery_pending
+            || self.input_queue.recovered_queue
+        {
             return false;
         }
         if self.blocks_direct_input {
@@ -150,6 +164,48 @@ impl ChatWidget {
                         queued_message.into_user_message(),
                         history_record,
                     );
+                    break;
+                }
+                QueuedInputAction::Literal => {
+                    let QueuedUserMessage {
+                        user_message,
+                        pending_pastes,
+                        ..
+                    } = queued_message;
+                    let mut restored_pending_pastes = self.bottom_pane.composer_pending_pastes();
+                    let mut used_paste_placeholders = restored_pending_pastes
+                        .iter()
+                        .map(|(placeholder, _)| placeholder.clone())
+                        .collect();
+                    let (mut user_message, pending_pastes) =
+                        super::user_messages::remap_colliding_paste_placeholders(
+                            user_message,
+                            pending_pastes,
+                            &mut used_paste_placeholders,
+                        );
+                    if !self.current_model().trim().is_empty()
+                        && (self.current_model_supports_images()
+                            || (user_message.local_images.is_empty()
+                                && user_message.remote_image_urls.is_empty()))
+                    {
+                        (user_message.text, user_message.text_elements) =
+                            crate::bottom_pane::ChatComposer::expand_pending_pastes(
+                                &user_message.text,
+                                user_message.text_elements,
+                                &pending_pastes,
+                            );
+                    }
+                    submitted_follow_up = self
+                        .submit_user_message_with_shell_escape_policy(
+                            user_message,
+                            ShellEscapePolicy::Disallow,
+                        )
+                        .is_some();
+                    if !submitted_follow_up {
+                        restored_pending_pastes.extend(pending_pastes);
+                        self.bottom_pane
+                            .set_composer_pending_pastes(restored_pending_pastes);
+                    }
                     break;
                 }
                 QueuedInputAction::ParseSlash => {
@@ -173,8 +229,11 @@ impl ChatWidget {
         submitted_follow_up
     }
 
-    pub(super) fn is_user_turn_pending_or_running(&self) -> bool {
-        self.input_queue.user_turn_pending_start || self.bottom_pane.is_task_running()
+    pub(crate) fn is_user_turn_pending_or_running(&self) -> bool {
+        self.input_queue.user_turn_pending_start
+            || self.turn_lifecycle.agent_turn_running
+            || self.review.is_review_mode
+            || (self.bottom_pane.is_task_running() && self.mcp_startup_status.is_none())
     }
 
     pub(super) fn only_user_shell_commands_running(&self) -> bool {

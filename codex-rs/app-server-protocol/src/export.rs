@@ -1,8 +1,10 @@
 use crate::ClientNotification;
 use crate::ClientRequest;
+use crate::JsonSchema;
 use crate::ServerNotification;
 use crate::ServerNotificationEnvelope;
 use crate::ServerRequest;
+use crate::TS;
 use crate::experimental_api::experimental_fields;
 use crate::export_client_notification_schemas;
 use crate::export_client_param_schemas;
@@ -21,8 +23,7 @@ use crate::protocol::common::EXPERIMENTAL_SERVER_METHODS;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_protocol::protocol::RolloutLine;
-use schemars::JsonSchema;
+use codex_history::RolloutLine;
 use schemars::schema_for;
 use serde::Serialize;
 use serde_json::Map;
@@ -38,20 +39,22 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use ts_rs::TS;
 
 pub(crate) const GENERATED_TS_HEADER: &str = "// GENERATED CODE! DO NOT MODIFY BY HAND!\n\n";
 const IGNORED_DEFINITIONS: &[&str] = &["Option<()>"];
 const JSON_V1_ALLOWLIST: &[&str] = &["InitializeParams", "InitializeResponse"];
 const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
+    "AwsCredentialType",
+    "BedrockAwsProfile",
+    "BedrockEnvironmentCredential",
     "EnvironmentShellInfo",
     "EnvironmentStatusKind",
-    "PathUri",
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
     "ThreadSearchOccurrence",
     "ThreadSearchTextRange",
+    "TurnSettingsUpdateStatus",
 ];
 const SPECIAL_DEFINITIONS: &[&str] = &[
     "ClientNotification",
@@ -88,11 +91,6 @@ impl GeneratedSchema {
 }
 
 type JsonSchemaEmitter = fn(&Path) -> Result<GeneratedSchema>;
-pub fn generate_types(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
-    generate_ts(out_dir, prettier)?;
-    generate_json(out_dir)?;
-    Ok(())
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GenerateTsOptions {
@@ -111,10 +109,6 @@ impl Default for GenerateTsOptions {
             experimental_api: false,
         }
     }
-}
-
-pub fn generate_ts(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
-    generate_ts_with_options(out_dir, prettier, GenerateTsOptions::default())
 }
 
 pub fn generate_ts_with_options(
@@ -2155,6 +2149,17 @@ mod tests {
             client_request_ts.contains("MockExperimentalMethodParams"),
             false
         );
+        const LEGACY_ACCOUNT_USAGE_REQUEST: &str = concat!(
+            "{ \"method\": \"account/usage/read\", id: RequestId, ",
+            "params?: GetAccountTokenUsageParams | undefined, }"
+        );
+        assert!(client_request_ts.contains(LEGACY_ACCOUNT_USAGE_REQUEST));
+        let account_usage_response_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/GetAccountTokenUsageResponse.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing account usage response fixture"))?,
+        )?;
+        assert!(account_usage_response_ts.contains("threadUsage?: ThreadUsage | null"));
         let server_request_ts = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("ServerRequest.ts"))
@@ -2227,7 +2232,12 @@ mod tests {
                 });
 
             let contents = std::str::from_utf8(contents)?;
-            if contents.contains("| undefined") {
+            // The stable usage RPC originally required `params: undefined`. Keep that exact
+            // legacy value accepted while extending the same method with optional thread params.
+            let legacy_account_usage_undefined = path == Path::new("ClientRequest.ts")
+                && contents.matches("| undefined").count() == 1
+                && contents.contains(LEGACY_ACCOUNT_USAGE_REQUEST);
+            if contents.contains("| undefined") && !legacy_account_usage_undefined {
                 undefined_offenders.push(path.clone());
             }
 
@@ -2339,9 +2349,14 @@ mod tests {
 
                 // If the last non-whitespace before ':' is '?', then this is an
                 // optional field with a nullable type (i.e., "?: T | null").
-                // These are only allowed in *Params types.
+                // These are only allowed in *Params types, except the additive stable usage
+                // response field, which older servers omit and newer servers return as null.
+                let legacy_account_usage_response = path
+                    == Path::new("v2/GetAccountTokenUsageResponse.ts")
+                    && field_prefix.trim() == "threadUsage?";
                 if field_prefix.chars().rev().find(|c| !c.is_whitespace()) == Some('?')
                     && !allow_optional_nullable
+                    && !legacy_account_usage_response
                 {
                     let line_number =
                         contents[..abs_idx].chars().filter(|c| *c == '\n').count() + 1;

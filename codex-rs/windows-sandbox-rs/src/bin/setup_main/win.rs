@@ -1,4 +1,5 @@
 mod firewall;
+mod no_reparse_dir;
 mod read_acl_mutex;
 
 use anyhow::Context;
@@ -11,17 +12,16 @@ use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
 use codex_windows_sandbox::SetupFailure;
 use codex_windows_sandbox::add_deny_write_ace;
-use codex_windows_sandbox::canonicalize_path;
 use codex_windows_sandbox::convert_string_sid_to_sid;
 use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use codex_windows_sandbox::ensure_allow_write_aces;
 use codex_windows_sandbox::extract_setup_failure;
 use codex_windows_sandbox::hide_newly_created_users;
 use codex_windows_sandbox::install_wfp_filters;
-use codex_windows_sandbox::is_command_cwd_root;
 use codex_windows_sandbox::log_note;
 use codex_windows_sandbox::log_writer;
 use codex_windows_sandbox::path_mask_allows;
+use codex_windows_sandbox::path_write_aces_need_refresh;
 use codex_windows_sandbox::sandbox_bin_dir;
 use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
@@ -37,6 +37,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::io::Write;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -53,23 +54,25 @@ use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
 use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::CONTAINER_INHERIT_ACE;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
-use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 
 const DENY_ACCESS: i32 = 3;
+#[cfg(test)]
 const WRITE_ROOT_ALLOW_MASK: u32 =
     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
 
 mod sandbox_users;
 mod setup_runtime_bin;
+use no_reparse_dir::open_or_create_no_reparse;
 use read_acl_mutex::acquire_read_acl_mutex;
 use read_acl_mutex::read_acl_mutex_exists;
 use sandbox_users::commit_setup_marker;
@@ -158,23 +161,6 @@ fn workspace_write_cap_sids_for_path(
         }
     }
     Ok(sid_strs)
-}
-
-fn write_root_needs_refresh(root: &Path, psid: *mut c_void) -> Result<bool> {
-    if !path_mask_allows(
-        root,
-        &[psid],
-        WRITE_ROOT_ALLOW_MASK,
-        /*require_all_bits*/ true,
-    )? {
-        return Ok(true);
-    }
-    path_mask_allows(
-        root,
-        &[psid],
-        FILE_DELETE_CHILD,
-        /*require_all_bits*/ false,
-    )
 }
 
 fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> {
@@ -315,9 +301,17 @@ fn lock_sandbox_dir(
     sandbox_group_access_mode: i32,
     sandbox_group_mask: u32,
     real_user_mask: u32,
-    _log: &mut dyn Write,
+    setup_mode: SetupMode,
 ) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
+    // ProvisionOnly accepts another user's CODEX_HOME; keep its ACL mutation
+    // bound to a no-reparse handle without changing full setup behavior.
+    let directory = match setup_mode {
+        SetupMode::Full | SetupMode::ReadAclsOnly => {
+            std::fs::create_dir_all(dir)?;
+            None
+        }
+        SetupMode::ProvisionOnly => Some(open_or_create_no_reparse(dir)?),
+    };
     let system_sid = resolve_sid("SYSTEM")?;
     let admins_sid = resolve_sid("Administrators")?;
     let real_sid = resolve_sid(real_user)?;
@@ -378,20 +372,37 @@ fn lock_sandbox_dir(
                 "SetEntriesInAclW sandbox dir failed: {set}",
             ));
         }
-        let path_w = to_wide(dir.as_os_str());
-        let res = SetNamedSecurityInfoW(
-            path_w.as_ptr() as *mut u16,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            new_dacl,
-            std::ptr::null_mut(),
-        );
+        let (res, api) = match directory.as_ref() {
+            Some(directory) => (
+                SetSecurityInfo(
+                    directory.as_raw_handle() as _,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    new_dacl,
+                    std::ptr::null_mut(),
+                ),
+                "SetSecurityInfo",
+            ),
+            None => {
+                let path_w = to_wide(dir.as_os_str());
+                (
+                    SetNamedSecurityInfoW(
+                        path_w.as_ptr() as *mut u16,
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        new_dacl,
+                        std::ptr::null_mut(),
+                    ),
+                    "SetNamedSecurityInfoW",
+                )
+            }
+        };
         if res != 0 {
-            return Err(anyhow::anyhow!(
-                "SetNamedSecurityInfoW sandbox dir failed: {res}",
-            ));
+            return Err(anyhow::anyhow!("{api} sandbox dir failed: {res}"));
         }
         if !new_dacl.is_null() {
             LocalFree(new_dacl as HLOCAL);
@@ -649,11 +660,7 @@ fn configure_offline_sandbox_network(
     Ok(())
 }
 
-fn lock_persistent_sandbox_dirs(
-    payload: &Payload,
-    sandbox_group_sid: &[u8],
-    log: &mut dyn Write,
-) -> Result<()> {
+fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<()> {
     lock_sandbox_dir(
         &sandbox_dir(&payload.codex_home),
         &payload.real_user,
@@ -661,7 +668,7 @@ fn lock_persistent_sandbox_dirs(
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-        log,
+        payload.mode,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -679,7 +686,7 @@ fn lock_persistent_sandbox_dirs(
         DENY_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-        log,
+        payload.mode,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -697,11 +704,7 @@ fn lock_persistent_sandbox_dirs(
     Ok(())
 }
 
-fn lock_sandbox_bin_dir(
-    payload: &Payload,
-    sandbox_group_sid: &[u8],
-    log: &mut dyn Write,
-) -> Result<()> {
+fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<()> {
     lock_sandbox_dir(
         &sandbox_bin_dir(&payload.codex_home),
         &payload.real_user,
@@ -709,7 +712,7 @@ fn lock_sandbox_bin_dir(
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-        log,
+        payload.mode,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -744,8 +747,8 @@ fn run_provision_only(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
 
     configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
 
-    lock_sandbox_bin_dir(payload, &sandbox_group_sid, log)?;
-    lock_persistent_sandbox_dirs(payload, &sandbox_group_sid, log)?;
+    lock_sandbox_bin_dir(payload, &sandbox_group_sid)?;
+    lock_persistent_sandbox_dirs(payload, &sandbox_group_sid)?;
     log_note("setup provisioning binary completed", Some(sbx_dir));
     Ok(())
 }
@@ -849,8 +852,6 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 
     let mut seen_deny_paths: HashSet<PathBuf> = HashSet::new();
     let mut seen_write_roots: HashSet<PathBuf> = HashSet::new();
-    let canonical_command_cwd = canonicalize_path(&payload.command_cwd);
-
     for root in &payload.write_roots {
         if !seen_write_roots.insert(root.clone()) {
             continue;
@@ -862,35 +863,25 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             )?;
             continue;
         }
-        let mut need_grant = false;
-        let is_command_cwd = is_command_cwd_root(root, &canonical_command_cwd);
-        let cap_label = if is_command_cwd {
-            "workspace_cap"
-        } else {
-            "root_cap"
-        };
         let root_cap_sid_str =
             workspace_write_cap_sid_for_root(&payload.codex_home, &payload.command_cwd, root)?;
         let root_cap_psid = unsafe {
             convert_string_sid_to_sid(&root_cap_sid_str)
                 .ok_or_else(|| anyhow::anyhow!("convert write root capability SID failed"))?
         };
-        for (label, psid) in [
-            ("sandbox_group", sandbox_group_psid),
-            (cap_label, root_cap_psid),
-        ] {
-            let needs_refresh = match write_root_needs_refresh(root, psid) {
+        let need_grant =
+            match path_write_aces_need_refresh(root, &[sandbox_group_psid, root_cap_psid]) {
                 Ok(needs_refresh) => needs_refresh,
                 Err(e) => {
                     refresh_errors.push(format!(
-                        "write ACE check failed on {} for {label}: {}",
+                        "write ACE check failed on {}: {}",
                         root.display(),
                         e
                     ));
                     log_line(
                         log,
                         &format!(
-                            "write ACE check failed on {} for {label}: {}; continuing",
+                            "write ACE check failed on {}: {}; continuing",
                             root.display(),
                             e
                         ),
@@ -898,10 +889,6 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                     true
                 }
             };
-            if needs_refresh {
-                need_grant = true;
-            }
-        }
         unsafe {
             LocalFree(root_cap_psid as HLOCAL);
         }
@@ -1016,7 +1003,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         }
     }
 
-    lock_sandbox_bin_dir(payload, &sandbox_group_sid, log)?;
+    lock_sandbox_bin_dir(payload, &sandbox_group_sid)?;
 
     if refresh_only {
         log_line(
@@ -1029,7 +1016,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         )?;
     }
     if !refresh_only {
-        lock_persistent_sandbox_dirs(payload, &sandbox_group_sid, log)?;
+        lock_persistent_sandbox_dirs(payload, &sandbox_group_sid)?;
     }
 
     unsafe {
@@ -1049,17 +1036,22 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 }
 
 #[cfg(test)]
+#[path = "win_acl_tests.rs"]
+mod acl_tests;
+
+#[cfg(test)]
 mod tests {
     use super::Payload;
     use super::SETUP_VERSION;
     use super::WRITE_ROOT_ALLOW_MASK;
     use super::convert_string_sid_to_sid;
     use super::workspace_write_cap_sids_for_path;
-    use super::write_root_needs_refresh;
     use codex_otel::StatsigMetricsSettings;
     use codex_windows_sandbox::ensure_allow_mask_aces;
     use codex_windows_sandbox::ensure_allow_write_aces;
     use codex_windows_sandbox::load_or_create_cap_sids;
+    use codex_windows_sandbox::path_mask_allows;
+    use codex_windows_sandbox::path_write_aces_need_refresh;
     use codex_windows_sandbox::workspace_write_cap_sid_for_root;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -1129,11 +1121,11 @@ mod tests {
         let seeded = unsafe { ensure_allow_mask_aces(&workspace, &[psid], stale_write_mask) }
             .expect("seed stale write ACE");
         let needs_refresh_before =
-            write_root_needs_refresh(&workspace, psid).expect("check stale write ACE");
+            path_write_aces_need_refresh(&workspace, &[psid]).expect("check stale write ACE");
         let replaced = unsafe { ensure_allow_write_aces(&workspace, &[psid]) }
             .expect("replace stale write ACE");
         let needs_refresh_after =
-            write_root_needs_refresh(&workspace, psid).expect("check refreshed write ACE");
+            path_write_aces_need_refresh(&workspace, &[psid]).expect("check refreshed write ACE");
         unsafe {
             LocalFree(psid as HLOCAL);
         }
@@ -1141,6 +1133,96 @@ mod tests {
         assert_eq!(
             (seeded, needs_refresh_before, replaced, needs_refresh_after),
             (true, true, true, false)
+        );
+    }
+
+    #[test]
+    fn write_root_refresh_checks_each_sid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let workspace = temp.path().join("workspace");
+        let other_root = temp.path().join("other-root");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&other_root).expect("create other root");
+
+        let workspace_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &workspace)
+            .expect("workspace sid");
+        let other_sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &other_root)
+            .expect("other root sid");
+        let workspace_psid =
+            unsafe { convert_string_sid_to_sid(&workspace_sid).expect("convert workspace sid") };
+        let other_psid =
+            unsafe { convert_string_sid_to_sid(&other_sid).expect("convert other root sid") };
+
+        let seeded = unsafe { ensure_allow_write_aces(&workspace, &[workspace_psid]) }
+            .expect("seed workspace SID");
+        let needs_refresh_before =
+            path_write_aces_need_refresh(&workspace, &[workspace_psid, other_psid])
+                .expect("check both SIDs");
+        let refreshed =
+            unsafe { ensure_allow_write_aces(&workspace, &[workspace_psid, other_psid]) }
+                .expect("refresh both SIDs");
+        let needs_refresh_after =
+            path_write_aces_need_refresh(&workspace, &[workspace_psid, other_psid])
+                .expect("recheck both SIDs");
+        unsafe {
+            LocalFree(workspace_psid as HLOCAL);
+            LocalFree(other_psid as HLOCAL);
+        }
+
+        assert_eq!(
+            (seeded, needs_refresh_before, refreshed, needs_refresh_after,),
+            (true, true, true, false)
+        );
+    }
+
+    #[test]
+    fn write_root_refresh_ignores_inherited_delete_child_grant() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let parent = temp.path().join("parent");
+        let workspace = parent.join("workspace");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let sid = workspace_write_cap_sid_for_root(&codex_home, &workspace, &workspace)
+            .expect("workspace sid");
+        let psid = unsafe { convert_string_sid_to_sid(&sid).expect("convert workspace sid") };
+        let seeded_explicit =
+            unsafe { ensure_allow_mask_aces(&workspace, &[psid], WRITE_ROOT_ALLOW_MASK) }
+                .expect("seed explicit write ACE");
+        let seeded_parent = unsafe {
+            ensure_allow_mask_aces(&parent, &[psid], WRITE_ROOT_ALLOW_MASK | FILE_DELETE_CHILD)
+        }
+        .expect("seed inherited stale write ACE");
+        let has_inherited_delete_child = path_mask_allows(
+            &workspace,
+            &[psid],
+            FILE_DELETE_CHILD,
+            /*require_all_bits*/ false,
+        )
+        .expect("check inherited stale write ACE");
+        let needs_refresh = path_write_aces_need_refresh(&workspace, &[psid])
+            .expect("check inherited stale write ACE");
+        let first_refresh = unsafe { ensure_allow_write_aces(&workspace, &[psid]) }
+            .expect("first inherited write ACE refresh");
+        let second_refresh = unsafe { ensure_allow_write_aces(&workspace, &[psid]) }
+            .expect("second inherited write ACE refresh");
+        unsafe {
+            LocalFree(psid as HLOCAL);
+        }
+
+        assert_eq!(
+            (
+                seeded_explicit,
+                seeded_parent,
+                has_inherited_delete_child,
+                needs_refresh,
+                first_refresh,
+                second_refresh,
+            ),
+            (true, true, true, false, false, false)
         );
     }
 

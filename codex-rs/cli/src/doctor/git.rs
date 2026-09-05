@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
+use std::process::Stdio;
 use std::time::Duration;
 
 use codex_git_utils::get_git_repo_root;
@@ -193,8 +194,10 @@ async fn git_output(git_path: &Path, cwd: &Path, args: &[&str]) -> Option<String
     let mut command = Command::new(git_path);
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG])
         .args(args)
         .current_dir(cwd)
+        .stdin(Stdio::null())
         .kill_on_drop(true);
     let output = timeout(GIT_COMMAND_TIMEOUT, command.output())
         .await

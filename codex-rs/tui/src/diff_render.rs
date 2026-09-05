@@ -323,18 +323,21 @@ impl Renderable for FileChange {
 impl From<DiffSummary> for Box<dyn Renderable> {
     fn from(val: DiffSummary) -> Self {
         let mut rows: Vec<Box<dyn Renderable>> = vec![];
+        let mut changes: Vec<_> = val.changes.into_iter().collect();
+        changes.sort_by(|left, right| left.0.cmp(&right.0));
 
-        for (i, row) in collect_rows(&val.changes).into_iter().enumerate() {
+        for (i, (path, change)) in changes.into_iter().enumerate() {
             if i > 0 {
                 rows.push(Box::new(RtLine::from("")));
             }
-            let mut path = RtLine::from(display_path_for(&row.path, val.cwd.as_path()));
+            let (added, removed) = line_counts(&change);
+            let mut path = RtLine::from(display_path_for(&path, val.cwd.as_path()));
             path.push_span(" ");
-            path.extend(render_line_count_summary(row.added, row.removed));
+            path.extend(render_line_count_summary(added, removed));
             rows.push(Box::new(path));
             rows.push(Box::new(RtLine::from("")));
             rows.push(Box::new(InsetRenderable::new(
-                Box::new(row.change) as Box<dyn Renderable>,
+                Box::new(change) as Box<dyn Renderable>,
                 Insets::tlbr(
                     /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
                 ),
@@ -355,41 +358,43 @@ pub(crate) fn create_diff_summary(
 }
 
 // Shared row for per-file presentation
-#[derive(Clone)]
-struct Row {
-    #[allow(dead_code)]
-    path: PathBuf,
-    move_path: Option<PathBuf>,
+struct Row<'a> {
+    path: &'a Path,
+    move_path: Option<&'a Path>,
     added: usize,
     removed: usize,
-    change: FileChange,
+    change: &'a FileChange,
 }
 
-fn collect_rows(changes: &HashMap<PathBuf, FileChange>) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
+fn collect_rows(changes: &HashMap<PathBuf, FileChange>) -> Vec<Row<'_>> {
+    let mut rows = Vec::with_capacity(changes.len());
     for (path, change) in changes.iter() {
-        let (added, removed) = match change {
-            FileChange::Add { content } => (content.lines().count(), 0),
-            FileChange::Delete { content } => (0, content.lines().count()),
-            FileChange::Update { unified_diff, .. } => calculate_add_remove_from_diff(unified_diff),
-        };
+        let (added, removed) = line_counts(change);
         let move_path = match change {
             FileChange::Update {
                 move_path: Some(new),
                 ..
-            } => Some(new.clone()),
+            } => Some(new.as_path()),
             _ => None,
         };
         rows.push(Row {
-            path: path.clone(),
+            path: path.as_path(),
             move_path,
             added,
             removed,
-            change: change.clone(),
+            change,
         });
     }
-    rows.sort_by_key(|r| r.path.clone());
+    rows.sort_by(|left, right| left.path.cmp(right.path));
     rows
+}
+
+fn line_counts(change: &FileChange) -> (usize, usize) {
+    match change {
+        FileChange::Add { content } => (content.lines().count(), 0),
+        FileChange::Delete { content } => (0, content.lines().count()),
+        FileChange::Update { unified_diff, .. } => calculate_add_remove_from_diff(unified_diff),
+    }
 }
 
 fn render_line_count_summary(added: usize, removed: usize) -> Vec<RtSpan<'static>> {
@@ -402,13 +407,13 @@ fn render_line_count_summary(added: usize, removed: usize) -> Vec<RtSpan<'static
     spans
 }
 
-fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtLine<'static>> {
+fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec<RtLine<'static>> {
     let mut out: Vec<RtLine<'static>> = Vec::new();
 
-    let render_path = |row: &Row| -> Vec<RtSpan<'static>> {
+    let render_path = |row: &Row<'_>| -> Vec<RtSpan<'static>> {
         let mut spans = Vec::new();
-        spans.push(display_path_for(&row.path, cwd).into());
-        if let Some(move_path) = &row.move_path {
+        spans.push(display_path_for(row.path, cwd).into());
+        if let Some(move_path) = row.move_path {
             spans.push(format!(" → {}", display_path_for(move_path, cwd)).into());
         }
         spans
@@ -421,7 +426,7 @@ fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtL
     let noun = if file_count == 1 { "file" } else { "files" };
     let mut header_spans: Vec<RtSpan<'static>> = vec!["• ".dim()];
     if let [row] = &rows[..] {
-        let verb = match &row.change {
+        let verb = match row.change {
             FileChange::Add { .. } => "Added",
             FileChange::Delete { .. } => "Deleted",
             _ => "Edited",
@@ -456,11 +461,13 @@ fn render_changes_block(rows: Vec<Row>, wrap_cols: usize, cwd: &Path) -> Vec<RtL
 
         // For renames, use the destination extension for highlighting — the
         // diff content reflects the new file, not the old one.
-        let lang_path = r.move_path.as_deref().unwrap_or(&r.path);
+        let lang_path = r.move_path.unwrap_or(r.path);
         let lang = detect_lang_for_path(lang_path);
         let mut lines = vec![];
-        render_change(&r.change, &mut lines, wrap_cols - 4, lang.as_deref());
-        out.extend(prefix_lines(lines, "    ".into(), "    ".into()));
+        let prefix = "    ";
+        let content_width = wrap_cols.saturating_sub(prefix.len());
+        render_change(r.change, &mut lines, content_width, lang.as_deref());
+        out.extend(prefix_lines(lines, prefix.into(), prefix.into()));
     }
 
     out
@@ -1319,7 +1326,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::text::Text;
     use ratatui::widgets::Paragraph;
-    use ratatui::widgets::WidgetRef;
     use ratatui::widgets::Wrap;
 
     #[test]
@@ -1372,7 +1378,7 @@ mod tests {
             .draw(|f| {
                 Paragraph::new(Text::from(lines))
                     .wrap(Wrap { trim: false })
-                    .render_ref(f.area(), f.buffer_mut())
+                    .render(f.area(), f.buffer_mut())
             })
             .expect("draw");
         assert!(
@@ -1627,6 +1633,12 @@ mod tests {
             /*width*/ 80,
             /*height*/ 10,
         );
+
+        let narrow = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 3);
+        assert_snapshot!(format!("{}\n{}", narrow[1], narrow[2]), @r"
+            1 +a
+               l
+        ");
     }
 
     #[test]
@@ -2217,34 +2229,37 @@ mod tests {
 
     #[test]
     fn cpp_module_extensions_use_cpp_highlighting() {
-        let highlighted_tokens = ["cpp", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX"]
-            .into_iter()
-            .map(|extension| {
-                let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
-                changes.insert(
-                    PathBuf::from(format!("math.{extension}")),
-                    FileChange::Add {
-                        content:
-                            "export module math;\nexport int sum(int a, int b) { return a + b; }\n"
-                                .to_string(),
-                    },
-                );
+        let highlighted_tokens = [
+            "cpp",
+            // CUDA source and header extensions use C++ highlighting as a fallback.
+            "cu", "cuh", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX",
+        ]
+        .into_iter()
+        .map(|extension| {
+            let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+            changes.insert(
+                PathBuf::from(format!("math.{extension}")),
+                FileChange::Add {
+                    content:
+                        "export module math;\nexport int sum(int a, int b) { return a + b; }\n"
+                            .to_string(),
+                },
+            );
 
-                let lines =
-                    create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
-                let rgb_tokens = lines
-                    .iter()
-                    .flat_map(|line| &line.spans)
-                    .filter(|span| matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
-                    .map(|span| span.content.to_string())
-                    .collect::<Vec<_>>();
-                assert!(
-                    !rgb_tokens.is_empty(),
-                    "add diff for .{extension} file should produce syntax-highlighted (RGB) spans"
-                );
-                (extension, rgb_tokens.join("|"))
-            })
-            .collect::<Vec<_>>();
+            let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+            let rgb_tokens = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
+                .map(|span| span.content.to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                !rgb_tokens.is_empty(),
+                "add diff for .{extension} file should produce syntax-highlighted (RGB) spans"
+            );
+            (extension, rgb_tokens.join("|"))
+        })
+        .collect::<Vec<_>>();
 
         assert_debug_snapshot!("cpp_module_extension_highlighting", highlighted_tokens);
     }
@@ -2431,18 +2446,11 @@ mod tests {
     fn large_update_diff_skips_highlighting() {
         // Build a patch large enough to exceed MAX_HIGHLIGHT_LINES (10_000).
         // Without the pre-check this would attempt 10k+ parser initializations.
-        let line_count = 10_500;
-        let original: String = (0..line_count).map(|i| format!("line {i}\n")).collect();
-        let modified: String = (0..line_count)
-            .map(|i| {
-                if i % 2 == 0 {
-                    format!("line {i} changed\n")
-                } else {
-                    format!("line {i}\n")
-                }
-            })
-            .collect();
-        let patch = diffy::create_patch(&original, &modified).to_string();
+        let line_count = 10_001;
+        let patch = format!(
+            "--- a/huge.rs\n+++ b/huge.rs\n@@ -0,0 +1,{line_count} @@\n{}",
+            "+let value = 1;\n".repeat(line_count)
+        );
 
         let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
         changes.insert(

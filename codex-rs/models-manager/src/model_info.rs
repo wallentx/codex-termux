@@ -50,22 +50,53 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     }
 
     if let Some(base_instructions) = &config.base_instructions {
-        model.base_instructions = base_instructions.clone();
-        clear_instruction_messages(&mut model);
+        let model_messages = model.model_messages.get_or_insert(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
+            instructions_template: None,
+            instructions_variables: None,
+            approvals: None,
+            collaboration_modes: None,
+            auto_review: None,
+            permissions: None,
+            multi_agent: None,
+            token_budget: None,
+            confirmation_policies: None,
+            guardian_v2: None,
+        });
+        model_messages.instructions_template = Some(base_instructions.clone());
+        model_messages.instructions_variables = None;
     } else {
-        if config.personality_enabled && config.personality == Some(Personality::None) {
-            model.base_instructions = strip_personality_section(model.base_instructions);
-            if let Some(instructions_template) = model
+        if config.personality_enabled
+            && config.personality == Some(Personality::None)
+            && let Some(instructions_template) = model
                 .model_messages
                 .as_mut()
                 .and_then(|messages| messages.instructions_template.as_mut())
-            {
-                *instructions_template =
-                    strip_personality_section(std::mem::take(instructions_template));
-            }
+        {
+            *instructions_template =
+                strip_personality_section(std::mem::take(instructions_template));
         }
-        if !config.personality_enabled {
-            clear_instruction_messages(&mut model);
+        let uses_local_personality_template = model.used_fallback_model_metadata
+            && matches!(
+                model.slug.as_str(),
+                "gpt-5.2-codex" | "exp-codex-personality"
+            );
+        if !config.personality_enabled
+            && let Some(model_messages) = model.model_messages.as_mut()
+        {
+            if uses_local_personality_template {
+                model_messages.instructions_template = Some(BASE_INSTRUCTIONS.to_string());
+            } else {
+                let personality_default = model_messages
+                    .get_personality_message(/*personality*/ None)
+                    .unwrap_or_default();
+                if let Some(instructions_template) = model_messages.instructions_template.as_mut() {
+                    *instructions_template = instructions_template
+                        .replace(PERSONALITY_PLACEHOLDER, &personality_default);
+                }
+            }
+            model_messages.instructions_variables = None;
         }
     }
 
@@ -108,19 +139,6 @@ fn is_h1_heading(line: &str) -> bool {
     rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t')
 }
 
-fn clear_instruction_messages(model: &mut ModelInfo) {
-    if let Some(model_messages) = &mut model.model_messages {
-        model_messages.instructions_template = None;
-        model_messages.instructions_variables = None;
-        if model_messages.approvals.is_none()
-            && model_messages.auto_review.is_none()
-            && model_messages.permissions.is_none()
-        {
-            model.model_messages = None;
-        }
-    }
-}
-
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
@@ -130,7 +148,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         description: None,
         default_reasoning_level: None,
         supported_reasoning_levels: Vec::new(),
-        shell_type: ConfigShellToolType::Default,
+        shell_type: ConfigShellToolType::UnifiedExec,
         visibility: ModelVisibility::None,
         supported_in_api: true,
         priority: 99,
@@ -139,9 +157,10 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         default_service_tier: None,
         availability_nux: None,
         upgrade: None,
-        base_instructions: BASE_INSTRUCTIONS.to_string(),
-        model_messages: local_personality_messages_for_slug(slug),
+        model_messages: Some(local_model_messages_for_slug(slug)),
         include_skills_usage_instructions: false,
+        include_plugin_usage_instructions: false,
+        include_apps_usage_instructions: false,
         supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
@@ -149,7 +168,6 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         apply_patch_tool_type: None,
         web_search_tool_type: WebSearchToolType::Text,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-        supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
         max_context_window: Some(272_000),
@@ -161,15 +179,21 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         used_fallback_model_metadata: true, // this is the fallback model metadata
         supports_search_tool: false,
         use_responses_lite: false,
+        node_repl_auto_review_required: false,
+        node_repl_disabled: false,
         auto_review_model_override: None,
+        model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
     }
 }
 
-fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
+fn local_model_messages_for_slug(slug: &str) -> ModelMessages {
     match slug {
-        "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
+        "gpt-5.2-codex" | "exp-codex-personality" => ModelMessages {
+            persistent_instructions: None,
+            tools: None,
             instructions_template: Some(format!(
                 "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
             )),
@@ -179,10 +203,28 @@ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
                 personality_pragmatic: Some(LOCAL_PRAGMATIC_TEMPLATE.to_string()),
             }),
             approvals: None,
+            collaboration_modes: None,
             auto_review: None,
             permissions: None,
-        }),
-        _ => None,
+            multi_agent: None,
+            token_budget: None,
+            confirmation_policies: None,
+            guardian_v2: None,
+        },
+        _ => ModelMessages {
+            persistent_instructions: None,
+            tools: None,
+            instructions_template: Some(BASE_INSTRUCTIONS.to_string()),
+            instructions_variables: None,
+            approvals: None,
+            collaboration_modes: None,
+            auto_review: None,
+            permissions: None,
+            multi_agent: None,
+            token_budget: None,
+            confirmation_policies: None,
+            guardian_v2: None,
+        },
     }
 }
 

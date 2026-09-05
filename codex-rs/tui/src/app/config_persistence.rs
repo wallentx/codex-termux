@@ -30,22 +30,18 @@ pub(super) fn resume_model_settings_for_overrides(
     config: &Config,
     harness_overrides: &ConfigOverrides,
 ) -> crate::app_server_session::ResumeModelSettings {
-    let has_layer_override = config
-        .config_layer_stack
-        .layers_high_to_low()
-        .into_iter()
-        .any(|layer| {
-            matches!(
-                &layer.name,
-                ConfigLayerSource::SessionFlags
-                    | ConfigLayerSource::User {
-                        profile: Some(_),
-                        ..
-                    }
-            ) && ["model", "model_provider", "model_reasoning_effort"]
-                .iter()
-                .any(|key| layer.config.get(*key).is_some())
-        });
+    let has_layer_override = config.config_layer_stack.layers_high_to_low().any(|layer| {
+        matches!(
+            &layer.name,
+            ConfigLayerSource::SessionFlags
+                | ConfigLayerSource::User {
+                    profile: Some(_),
+                    ..
+                }
+        ) && ["model", "model_provider", "model_reasoning_effort"]
+            .iter()
+            .any(|key| layer.config.get(*key).is_some())
+    });
     if harness_overrides.model.is_some()
         || harness_overrides.model_provider.is_some()
         || has_layer_override
@@ -187,7 +183,8 @@ impl App {
         self.config = config;
 
         if let Some(policy) = approval_policy {
-            self.runtime_approval_policy_override = Some(policy);
+            self.runtime_approval_policy_override =
+                Some(RuntimeApprovalPolicyOverride::Explicit(policy));
             self.chat_widget.set_approval_policy(policy);
         }
         if let Err(err) = self.chat_widget.set_permission_profile_with_active_profile(
@@ -240,7 +237,7 @@ impl App {
         let mut config = self
             .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf())
             .await?;
-        self.apply_runtime_policy_overrides(&mut config);
+        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All);
         self.config = config;
         self.chat_widget.sync_plugin_mentions_config(&self.config);
         Ok(())
@@ -301,16 +298,40 @@ impl App {
         }
     }
 
-    pub(super) fn apply_runtime_policy_overrides(&mut self, config: &mut Config) {
-        if let Some(policy) = self.runtime_approval_policy_override.as_ref()
-            && let Err(err) = config.permissions.approval_policy.set(policy.to_core())
+    pub(super) fn apply_runtime_policy_overrides(
+        &mut self,
+        config: &mut Config,
+        scope: RuntimePolicyOverrideScope,
+    ) {
+        if let Some(policy) = self.runtime_approval_policy_override
+            && (scope == RuntimePolicyOverrideScope::All
+                || matches!(policy, RuntimeApprovalPolicyOverride::Explicit(_)))
+            && let Err(err) = config
+                .permissions
+                .approval_policy
+                .set(policy.policy().to_core())
         {
             tracing::warn!(%err, "failed to carry forward approval policy override");
             self.chat_widget.add_error_message(format!(
                 "Failed to carry forward approval policy override: {err}"
             ));
         }
-        if let Some(profile_override) = self.runtime_permission_profile_override.as_ref() {
+        if let Some(profile_override) = self.runtime_permission_profile_override.as_ref()
+            && (scope == RuntimePolicyOverrideScope::All
+                || profile_override.turn_override
+                    == RuntimePermissionProfileTurnOverride::LegacySandbox)
+        {
+            match config
+                .config_layer_stack
+                .requirements()
+                .approvals_reviewer
+                .can_set(&profile_override.approvals_reviewer)
+            {
+                Ok(()) => config.approvals_reviewer = profile_override.approvals_reviewer,
+                Err(error) => self.chat_widget.add_error_message(format!(
+                    "Failed to carry forward approvals reviewer: {error}"
+                )),
+            }
             match config
                 .permissions
                 .set_permission_profile_from_session_snapshot(
@@ -1419,21 +1440,21 @@ mod tests {
             .expect("session flags layer stack");
             assert_eq!(app.resume_model_settings(), expected);
 
-            app.config.config_layer_stack = ConfigLayerStack::default().with_user_config_profile(
-                &profile_path,
-                Some(&profile),
-                config,
-            );
+            app.config.config_layer_stack = ConfigLayerStack::default()
+                .with_user_config_profile(&profile_path, Some(&profile), config)
+                .expect("user config profile layer stack");
             assert_eq!(app.resume_model_settings(), expected);
         }
 
-        app.config.config_layer_stack = ConfigLayerStack::default().with_user_config(
-            &profile_path,
-            TomlValue::Table(toml::map::Map::from_iter([(
-                "model_reasoning_effort".to_string(),
-                TomlValue::String("high".to_string()),
-            )])),
-        );
+        app.config.config_layer_stack = ConfigLayerStack::default()
+            .with_user_config(
+                &profile_path,
+                TomlValue::Table(toml::map::Map::from_iter([(
+                    "model_reasoning_effort".to_string(),
+                    TomlValue::String("high".to_string()),
+                )])),
+            )
+            .expect("user config layer stack");
         assert_eq!(
             app.resume_model_settings(),
             crate::app_server_session::ResumeModelSettings::RestoreFromThread

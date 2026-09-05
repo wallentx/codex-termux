@@ -13,6 +13,7 @@ use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
+use codex_tools::ToolExposure;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -68,7 +69,14 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
         create_sleep_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::DirectModelOnly
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let ToolInvocation {
                 session,
@@ -148,4 +156,8 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
     }
 }
 
-impl CoreToolRuntime for SleepHandler {}
+impl CoreToolRuntime for SleepHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
+    }
+}

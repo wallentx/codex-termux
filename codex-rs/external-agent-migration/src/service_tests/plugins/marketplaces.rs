@@ -91,7 +91,7 @@ async fn import_plugins_defers_marketplace_source_validation_to_add_marketplace(
 }
 
 #[tokio::test]
-async fn import_plugins_supports_external_agent_plugin_marketplace_layout() {
+async fn import_plugins_treats_empty_cwd_as_home_scope() {
     let (_root, external_agent_home, codex_home) = fixture_paths();
     let marketplace_root = external_agent_home.join("my-marketplace");
     let plugin_root = marketplace_root.join("plugins").join("cloudflare");
@@ -139,7 +139,7 @@ async fn import_plugins_supports_external_agent_plugin_marketplace_layout() {
 
     let outcome = service_for_paths(external_agent_home, codex_home.clone())
         .import_plugins(
-            /*cwd*/ None,
+            /*cwd*/ Some(std::path::Path::new("")),
             Some(MigrationDetails {
                 plugins: vec![PluginsMigration {
                     marketplace_name: "my-plugins".to_string(),
@@ -529,7 +529,7 @@ async fn import_plugins_infers_external_official_marketplace_when_missing_from_s
 }
 
 #[tokio::test]
-async fn detect_repo_supports_project_relative_external_agent_plugin_marketplace_path() {
+async fn detect_repo_skips_project_relative_external_agent_plugin_marketplace_path() {
     let root = TempDir::new().expect("create tempdir");
     let external_agent_home = root.path().join(EXTERNAL_AGENT_DIR);
     let codex_home = root.path().join(".codex");
@@ -588,31 +588,11 @@ async fn detect_repo_supports_project_relative_external_agent_plugin_marketplace
         .await
         .expect("detect");
 
-    assert_eq!(
-        items,
-        vec![ExternalAgentConfigMigrationItem {
-            item_type: ExternalAgentConfigMigrationItemType::Plugins,
-            description: format!(
-                "Migrate enabled plugins from {}",
-                repo_root
-                    .join(EXTERNAL_AGENT_DIR)
-                    .join("settings.json")
-                    .display()
-            ),
-            cwd: Some(repo_root),
-            details: Some(MigrationDetails {
-                plugins: vec![PluginsMigration {
-                    marketplace_name: "my-plugins".to_string(),
-                    plugin_names: vec!["cloudflare".to_string()],
-                }],
-                ..Default::default()
-            }),
-        }]
-    );
+    assert_eq!(items, Vec::<ExternalAgentConfigMigrationItem>::new());
 }
 
 #[tokio::test]
-async fn import_plugins_supports_project_relative_external_agent_plugin_marketplace_path() {
+async fn import_rejects_forged_project_relative_external_agent_plugin_item() {
     let root = TempDir::new().expect("create tempdir");
     let external_agent_home = root.path().join(EXTERNAL_AGENT_DIR);
     let codex_home = root.path().join(".codex");
@@ -663,32 +643,66 @@ async fn import_plugins_supports_project_relative_external_agent_plugin_marketpl
     .expect("write plugin manifest");
 
     let outcome = service_for_paths(external_agent_home, codex_home.clone())
-        .import_plugins(
-            Some(repo_root.as_path()),
-            Some(MigrationDetails {
+        .import(vec![ExternalAgentConfigMigrationItem {
+            item_type: ExternalAgentConfigMigrationItemType::Plugins,
+            description: String::new(),
+            cwd: Some(repo_root.clone()),
+            details: Some(MigrationDetails {
                 plugins: vec![PluginsMigration {
                     marketplace_name: "my-plugins".to_string(),
                     plugin_names: vec!["cloudflare".to_string()],
                 }],
                 ..Default::default()
             }),
-        )
-        .await
-        .expect("import plugins");
+        }])
+        .await;
 
     assert_eq!(
         outcome,
-        PluginImportOutcome {
-            succeeded_marketplaces: vec!["my-plugins".to_string()],
-            succeeded_plugin_ids: vec!["cloudflare@my-plugins".to_string()],
-            failed_marketplaces: Vec::new(),
-            failed_plugin_ids: Vec::new(),
-            raw_errors: Vec::new(),
+        ExternalAgentConfigImportOutcome {
+            pending_plugin_imports: Vec::new(),
+            item_results: vec![ExternalAgentConfigImportItemResult {
+                item_type: ExternalAgentConfigMigrationItemType::Plugins,
+                description: String::new(),
+                cwd: Some(repo_root.clone()),
+                success_count: 0,
+                error_count: 1,
+                successes: Vec::new(),
+                raw_errors: vec![ExternalAgentConfigImportRawError {
+                    item_type: ExternalAgentConfigMigrationItemType::Plugins,
+                    error_type: None,
+                    sub_error_type: None,
+                    failure_stage: "plugin_import".to_string(),
+                    message: "repository-scoped plugin migration is not allowed".to_string(),
+                    cwd: Some(repo_root),
+                    source: None,
+                }],
+            }],
         }
     );
-    let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
-    assert!(config.contains(r#"[plugins."cloudflare@my-plugins"]"#));
-    assert!(config.contains("enabled = true"));
+    assert!(!codex_home.join("config.toml").exists());
+}
+
+#[tokio::test]
+async fn import_plugins_rejects_project_cwd_before_config_loading() {
+    let root = TempDir::new().expect("create tempdir");
+    let external_agent_home = root.path().join(EXTERNAL_AGENT_DIR);
+    let codex_home = root.path().join(".codex");
+    let repo_root = root.path().join("repo");
+    fs::create_dir_all(repo_root.join(".git")).expect("create git dir");
+    fs::create_dir_all(&codex_home).expect("create codex home");
+    fs::write(codex_home.join("config.toml"), "not valid toml").expect("write invalid config");
+
+    let error = service_for_paths(external_agent_home, codex_home)
+        .import_plugins(Some(repo_root.as_path()), Some(github_plugin_details()))
+        .await
+        .expect_err("reject project cwd before config loading");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "repository-scoped plugin migration is not allowed"
+    );
 }
 
 #[test]
@@ -709,4 +723,44 @@ fn import_skills_returns_only_new_skill_directory_names() {
         .expect("import skills");
 
     assert_eq!(copied_names, vec!["skill-b".to_string()]);
+}
+
+#[test]
+fn import_cursor_skills_reads_user_and_managed_directories() {
+    let root = TempDir::new().expect("create tempdir");
+    let external_agent_home = root.path().join(".cursor");
+    let codex_home = root.path().join(".codex");
+    let user_skill = external_agent_home.join("skills").join("user-skill");
+    let managed_skill = external_agent_home
+        .join("skills-cursor")
+        .join("managed-skill");
+    let target_skills = codex_home
+        .parent()
+        .map(|parent| parent.join(".agents").join("skills"))
+        .unwrap_or_else(|| PathBuf::from(".agents").join("skills"));
+    fs::create_dir_all(&user_skill).expect("create user skill");
+    fs::create_dir_all(&managed_skill).expect("create managed skill");
+    fs::write(user_skill.join("SKILL.md"), "# Imported user skill").expect("write user skill");
+    fs::write(managed_skill.join("SKILL.md"), "# Imported managed skill")
+        .expect("write managed skill");
+    let mut service = service_for_paths(external_agent_home, codex_home);
+    service.source = ExternalAgentSource::Cur;
+
+    let mut copied_names = service.import_skills(/*cwd*/ None).expect("import skills");
+    copied_names.sort();
+
+    assert_eq!(
+        copied_names,
+        vec!["managed-skill".to_string(), "user-skill".to_string()]
+    );
+    assert_eq!(
+        fs::read_to_string(target_skills.join("user-skill").join("SKILL.md"))
+            .expect("read user skill"),
+        "# Imported user skill"
+    );
+    assert_eq!(
+        fs::read_to_string(target_skills.join("managed-skill").join("SKILL.md"))
+            .expect("read managed skill"),
+        "# Imported managed skill"
+    );
 }

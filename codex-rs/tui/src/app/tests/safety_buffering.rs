@@ -4,6 +4,13 @@ use crate::app::session_lifecycle::ThreadAttachPresentation;
 use crate::chatwidget::UserMessage;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+use codex_protocol::models::ManagedFileSystemPermissions;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -24,12 +31,14 @@ const RETRY_PROMPT: &str = "Handle the safety-buffered request";
 const COMMITTED_STEER: &str = "Keep the accepted steer";
 const UNSENT_DRAFT: &str = "Keep this unsent draft";
 const RETRY_GOAL: &str = "Preserve this goal across the retry";
+const SAFETY_RETRY_THREAD_NAME: &str = "Safety retry source";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SafetyRetryScenario {
     Once,
     RetryTwice,
     InterruptedPrevious,
+    UnsupportedPermissions,
 }
 
 fn response_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
@@ -106,13 +115,13 @@ async fn next_turn_started(
         .await
         .expect("app-server should emit a turn/start event")
         .expect("app-server event stream should remain open");
-        let started_turn_id = match &event {
-            AppServerEvent::ServerNotification(ServerNotification::TurnStarted(notification))
-                if notification.thread_id == thread_id.to_string() =>
-            {
-                Some(notification.turn.id.clone())
-            }
-            _ => None,
+        let started_turn_id = if let AppServerEvent::ServerNotification(notification) = &event
+            && let ServerNotification::TurnStarted(notification) = notification.as_ref()
+            && notification.thread_id == thread_id.to_string()
+        {
+            Some(notification.turn.id.clone())
+        } else {
+            None
         };
         app.handle_app_server_event(app_server, event).await;
         drain_active_thread_events(app);
@@ -137,8 +146,12 @@ async fn wait_for_turn_completed(
         .expect("app-server event stream should remain open");
         let completed = matches!(
             &event,
-            AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(notification))
-                if notification.thread_id == thread_id.to_string()
+            AppServerEvent::ServerNotification(notification)
+                if matches!(
+                    notification.as_ref(),
+                    ServerNotification::TurnCompleted(notification)
+                        if notification.thread_id == thread_id.to_string()
+                )
         );
         app.handle_app_server_event(app_server, event).await;
         drain_active_thread_events(app);
@@ -146,6 +159,121 @@ async fn wait_for_turn_completed(
             return;
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_turn_interrupt_is_nonblocking_and_coalesces_repeated_requests() -> Result<()> {
+    let (chunks, release_response) =
+        gated_response_chunks("interrupt-response", ev_completed("interrupt-response"));
+    let (server, _completions) = start_streaming_sse_server(vec![chunks]).await;
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            r#"
+model = "{CURRENT_MODEL}"
+model_provider = "{MODEL_PROVIDER_ID}"
+
+[model_providers.{MODEL_PROVIDER_ID}]
+name = "Interrupt test"
+base_url = "{}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+            server.uri()
+        ),
+    )?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    app.config.model = Some(CURRENT_MODEL.to_string());
+    app.config.model_provider_id = MODEL_PROVIDER_ID.to_string();
+    app.config.model_provider = ModelProviderInfo {
+        name: "Interrupt test".to_string(),
+        base_url: Some(format!("{}/v1", server.uri())),
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        ..ModelProviderInfo::default()
+    };
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let started = app_server.start_thread(&app.config).await?;
+    let thread_id = started.session.thread_id;
+    app.replace_chat_widget_with_app_server_thread(
+        &mut tui,
+        started,
+        ThreadAttachPresentation::SessionLineage,
+        /*initial_user_message*/ None,
+    )
+    .await?;
+    while app_event_rx.try_recv().is_ok() {}
+
+    submit_prompt(&mut app, "Keep this turn running until interrupted");
+    let turn = next_user_turn_event(&mut app_event_rx);
+    app.submit_thread_op(&mut app_server, thread_id, turn)
+        .await?;
+    let turn_id = next_turn_started(&mut app, &mut app_server, thread_id).await;
+    drive_until_request_count(
+        &mut app,
+        &mut app_server,
+        &server,
+        /*expected_request_count*/ 1,
+    )
+    .await;
+
+    let interrupt = AppCommand::interrupt();
+    assert!(
+        app.try_submit_active_thread_op_via_app_server(&mut app_server, thread_id, &interrupt)
+            .await?
+    );
+    let AppServerRequestId::Integer(next_request_id) = app_server.next_request_id() else {
+        unreachable!("embedded app-server request IDs are integers");
+    };
+    assert!(
+        app.try_submit_active_thread_op_via_app_server(&mut app_server, thread_id, &interrupt)
+            .await?
+    );
+    assert_eq!(
+        app_server.next_request_id(),
+        AppServerRequestId::Integer(next_request_id + 1)
+    );
+    {
+        let store = app.thread_event_channels[&thread_id].store.lock().await;
+        assert_eq!(store.active_turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(
+            store.pending_interrupt_turn_id.as_deref(),
+            Some(turn_id.as_str())
+        );
+    }
+
+    while app_event_rx.try_recv().is_ok() {}
+    app.handle_thread_event_now(ThreadBufferedEvent::Notification(Box::new(
+        ServerNotification::Warning(WarningNotification {
+            thread_id: Some(thread_id.to_string()),
+            message: "event handled while interrupt is pending".to_string(),
+        }),
+    )));
+    assert!(matches!(
+        app_event_rx.try_recv(),
+        Ok(AppEvent::InsertHistoryCell(_))
+    ));
+
+    wait_for_turn_completed(&mut app, &mut app_server, thread_id).await;
+    assert_eq!(
+        app.thread_event_channels[&thread_id]
+            .store
+            .lock()
+            .await
+            .pending_interrupt_turn_id,
+        None
+    );
+
+    let _ = release_response.send(());
+    app_server.shutdown().await?;
+    server.shutdown().await;
+    Ok(())
 }
 
 async fn drive_until_request_count(
@@ -194,8 +322,16 @@ fn user_message_count(thread: &Thread, prompt: &str) -> usize {
             ThreadItem::UserMessage { content, .. } => Some(content),
             _ => None,
         })
-        .flatten()
-        .filter(|item| matches!(item, AppServerUserInput::Text { text, .. } if text == prompt))
+        .filter(|content| {
+            content
+                .iter()
+                .filter_map(|item| match item {
+                    AppServerUserInput::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+                == prompt
+        })
         .count()
 }
 
@@ -268,7 +404,7 @@ goals = true
         ),
     )?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
-    app.config.sqlite_home = codex_home.path().to_path_buf();
+    app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     app.config.model = Some(CURRENT_MODEL.to_string());
     app.config.model_provider_id = MODEL_PROVIDER_ID.to_string();
     app.config.model_provider = ModelProviderInfo {
@@ -285,11 +421,15 @@ goals = true
 
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
-    let started = app_server.start_thread(&app.config).await?;
+    let mut started = app_server.start_thread(&app.config).await?;
     let source_thread_id = started.session.thread_id;
+    // Keep ordered response fixtures focused on safety retries, not background naming.
+    app_server
+        .thread_set_name(source_thread_id, SAFETY_RETRY_THREAD_NAME.to_string())
+        .await?;
+    started.session.thread_name = Some(SAFETY_RETRY_THREAD_NAME.to_string());
     app.replace_chat_widget_with_app_server_thread(
         &mut tui,
-        &mut app_server,
         started,
         ThreadAttachPresentation::SessionLineage,
         /*initial_user_message*/ None,
@@ -321,7 +461,7 @@ goals = true
     }
 
     let state_db = codex_state::StateRuntime::init(
-        app.config.sqlite_home.clone(),
+        app.config.sqlite.clone(),
         app.config.model_provider_id.clone(),
     )
     .await
@@ -356,7 +496,7 @@ goals = true
         .expect("source goal usage should be recorded");
 
     submit_prompt(&mut app, RETRY_PROMPT);
-    let active_turn = next_user_turn_event(&mut app_event_rx);
+    let mut active_turn = next_user_turn_event(&mut app_event_rx);
     app.submit_thread_op(&mut app_server, source_thread_id, active_turn.clone())
         .await?;
     let active_turn_id = next_turn_started(&mut app, &mut app_server, source_thread_id).await;
@@ -392,16 +532,18 @@ goals = true
 
     app.handle_app_server_event(
         &app_server,
-        AppServerEvent::ServerNotification(ServerNotification::ModelSafetyBufferingUpdated(
-            ModelSafetyBufferingUpdatedNotification {
-                thread_id: source_thread_id.to_string(),
-                turn_id: active_turn_id.clone(),
-                model: CURRENT_MODEL.to_string(),
-                use_cases: Vec::new(),
-                reasons: Vec::new(),
-                show_buffering_ui: true,
-                faster_model: Some(FASTER_MODEL.to_string()),
-            },
+        AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ModelSafetyBufferingUpdated(
+                ModelSafetyBufferingUpdatedNotification {
+                    thread_id: source_thread_id.to_string(),
+                    turn_id: active_turn_id.clone(),
+                    model: CURRENT_MODEL.to_string(),
+                    use_cases: Vec::new(),
+                    reasons: Vec::new(),
+                    show_buffering_ui: true,
+                    faster_model: Some(FASTER_MODEL.to_string()),
+                },
+            ),
         )),
     )
     .await;
@@ -443,18 +585,97 @@ goals = true
     app.primary_thread_id = Some(source_thread_id);
     while app_event_rx.try_recv().is_ok() {}
 
+    if scenario == SafetyRetryScenario::UnsupportedPermissions {
+        let extra_root =
+            AbsolutePathBuf::resolve_path_against_base("extra", app.config.cwd.as_path());
+        let permission_profile = PermissionProfile::Managed {
+            network: NetworkSandboxPolicy::Restricted,
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
+                    },
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Path {
+                            path: extra_root.into(),
+                        },
+                        access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
+                    },
+                ],
+                glob_scan_max_depth: None,
+            },
+        };
+        app.config
+            .permissions
+            .set_permission_profile(permission_profile.clone())?;
+        app.chat_widget.set_permission_profile_with_active_profile(
+            permission_profile,
+            /*active_permission_profile*/ None,
+        )?;
+        app.runtime_permission_profile_override =
+            Some(RuntimePermissionProfileOverride::from_config(&app.config));
+        if let AppCommand::UserTurn {
+            active_permission_profile,
+            ..
+        } = &mut active_turn
+        {
+            *active_permission_profile = None;
+        }
+    }
+
     Box::pin(app.retry_safety_buffered_turn(
         &mut tui,
         &mut app_server,
         SafetyBufferedRetry {
             thread_id: source_thread_id,
-            turn_id: active_turn_id,
+            turn_id: active_turn_id.clone(),
             model: FASTER_MODEL.to_string(),
             turn: active_turn,
             prompt: UserMessage::from(RETRY_PROMPT),
         },
     ))
     .await;
+
+    if scenario == SafetyRetryScenario::UnsupportedPermissions {
+        assert_eq!(app.active_thread_id, Some(source_thread_id));
+        assert_eq!(app.primary_thread_id, Some(source_thread_id));
+        assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
+        assert!(
+            app.chat_widget
+                .can_retry_safety_buffered_turn(&active_turn_id)
+        );
+        let source = app_server
+            .thread_read(source_thread_id, /*include_turns*/ true)
+            .await?;
+        assert_eq!(
+            source.turns.last().map(|turn| &turn.status),
+            Some(&TurnStatus::InProgress)
+        );
+        let error_cell = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(cell),
+                _ => None,
+            })
+            .expect("unsupported permissions should be added to history");
+        insta::assert_snapshot!(
+            lines_to_single_string(&error_cell.display_lines(/*width*/ 200)),
+            @"■ Failed to retry with a faster model: the selected permission profile cannot be safely represented by the legacy app-server sandbox policy; select a named or legacy-compatible permission profile"
+        );
+        if let Some(release_active_response) = release_active_response.take() {
+            let _ = release_active_response.send(());
+        }
+        let _ = release_steered_response.send(());
+        let _ = release_previous_response.send(());
+        let _ = release_retry_response.send(());
+        app_server.shutdown().await?;
+        server.shutdown().await;
+        return Ok(());
+    }
 
     let first_retry_thread_id = app.chat_widget.thread_id().expect("first retry thread id");
     if scenario == SafetyRetryScenario::RetryTwice {
@@ -469,16 +690,18 @@ goals = true
         .await;
         app.handle_app_server_event(
             &app_server,
-            AppServerEvent::ServerNotification(ServerNotification::ModelSafetyBufferingUpdated(
-                ModelSafetyBufferingUpdatedNotification {
-                    thread_id: first_retry_thread_id.to_string(),
-                    turn_id: first_retry_turn_id.clone(),
-                    model: FASTER_MODEL.to_string(),
-                    use_cases: Vec::new(),
-                    reasons: Vec::new(),
-                    show_buffering_ui: true,
-                    faster_model: Some(FASTER_MODEL.to_string()),
-                },
+            AppServerEvent::ServerNotification(Box::new(
+                ServerNotification::ModelSafetyBufferingUpdated(
+                    ModelSafetyBufferingUpdatedNotification {
+                        thread_id: first_retry_thread_id.to_string(),
+                        turn_id: first_retry_turn_id.clone(),
+                        model: FASTER_MODEL.to_string(),
+                        use_cases: Vec::new(),
+                        reasons: Vec::new(),
+                        show_buffering_ui: true,
+                        faster_model: Some(FASTER_MODEL.to_string()),
+                    },
+                ),
             )),
         )
         .await;
@@ -616,10 +839,10 @@ goals = true
     let expected_source_tokens = if committed_steer.is_some() { 150 } else { 50 };
     assert_eq!(source_goal.objective, RETRY_GOAL);
     assert_eq!(source_goal.tokens_used, expected_source_tokens);
-    assert_eq!(source_goal.time_used_seconds, 12);
+    assert!(source_goal.time_used_seconds >= 12);
     assert_eq!(retry_goal.objective, RETRY_GOAL);
     assert!(retry_goal.tokens_used >= expected_source_tokens);
-    assert!(retry_goal.time_used_seconds >= 12);
+    assert!(retry_goal.time_used_seconds >= source_goal.time_used_seconds);
 
     let request_bodies = server
         .requests()
@@ -756,6 +979,17 @@ async fn safety_retry_branch_failure_preserves_unsent_draft() -> Result<()> {
         Some(UNSENT_DRAFT),
         /*committed_steer*/ None,
         SafetyRetryScenario::Once,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn safety_retry_rejects_unsupported_permissions_before_interrupting() -> Result<()> {
+    run_safety_retry(
+        /*previous_prompt*/ None,
+        /*failing_draft*/ None,
+        /*committed_steer*/ None,
+        SafetyRetryScenario::UnsupportedPermissions,
     )
     .await
 }

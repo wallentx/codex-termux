@@ -88,10 +88,7 @@ fn external_sandbox_auto_approves_in_on_request() {
             &cwd_uri,
             WindowsSandboxLevel::Disabled
         ),
-        SafetyCheck::AutoApprove {
-            sandbox_type: SandboxType::None,
-            user_explicitly_approved: false,
-        }
+        SafetyCheck::AutoApprove
     );
 }
 
@@ -230,12 +227,14 @@ fn explicit_unreadable_paths_prevent_auto_approval_for_external_sandbox() {
                 value: FileSystemSpecialPath::Root,
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: blocked_absolute,
+                path: blocked_absolute.into(),
             },
             access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
     ]);
 
@@ -278,12 +277,14 @@ fn explicit_read_only_subpaths_prevent_auto_approval_for_external_sandbox() {
                 value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: docs_absolute,
+                path: docs_absolute.into(),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
     ]);
 
@@ -324,9 +325,10 @@ fn missing_project_dot_codex_config_requires_approval() {
         .entries
         .push(FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: cwd.join(".codex"),
+                path: cwd.join(".codex").into(),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         });
 
     assert!(!is_write_patch_constrained_to_writable_paths(

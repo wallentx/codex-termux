@@ -1,4 +1,5 @@
 use super::*;
+use codex_app_server_protocol::AuthRecoveryNotification;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ActivePermissionProfile;
@@ -289,6 +290,28 @@ fn runtime_warnings_are_filtered_to_the_primary_thread() {
     });
 
     assert_eq!(outcomes, [true, true, false]);
+
+    let recovery = AuthRecoveryNotification {
+        thread_id: primary_thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        provider: "example".to_string(),
+        message: "Refresh authentication".to_string(),
+    };
+    let outcomes = [
+        ServerNotification::AuthRecoveryStarted(recovery.clone()),
+        ServerNotification::AuthRecoveryCompleted(recovery.clone()),
+        ServerNotification::AuthRecoveryStarted(AuthRecoveryNotification {
+            thread_id: "thread-2".to_string(),
+            ..recovery.clone()
+        }),
+        ServerNotification::AuthRecoveryCompleted(AuthRecoveryNotification {
+            turn_id: "turn-2".to_string(),
+            ..recovery
+        }),
+    ]
+    .map(|notification| should_process_notification(&notification, primary_thread_id, turn_id));
+
+    assert_eq!(outcomes, [true, true, false, false]);
 }
 
 #[tokio::test]
@@ -335,8 +358,13 @@ fn turn_items_for_thread_returns_matching_turn_items() {
         parent_thread_id: None,
         preview: String::new(),
         ephemeral: false,
+        section: None,
+        section_entered_at: None,
+        project_id: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
+        model: None,
+        reasoning_effort: None,
         created_at: 0,
         updated_at: 0,
         recency_at: Some(0),
@@ -360,6 +388,8 @@ fn turn_items_for_thread_returns_matching_turn_items() {
                     text: "hello".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
+                    questions: None,
                 }],
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
@@ -390,19 +420,21 @@ fn turn_items_for_thread_returns_matching_turn_items() {
             text: "hello".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
+            questions: None,
         }])
     );
     assert_eq!(turn_items_for_thread(&thread, "missing-turn"), None);
 }
 
 #[test]
-fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
+fn should_backfill_turn_completed_items_backfills_persisted_summaries_only() {
     let notification =
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn: codex_app_server_protocol::Turn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items_view: codex_app_server_protocol::TurnItemsView::Summary,
                 items: Vec::new(),
                 status: codex_app_server_protocol::TurnStatus::Completed,
                 error: None,
@@ -414,6 +446,10 @@ fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
 
     assert!(!should_backfill_turn_completed_items(
         /*thread_ephemeral*/ true,
+        &notification
+    ));
+    assert!(should_backfill_turn_completed_items(
+        /*thread_ephemeral*/ false,
         &notification
     ));
 }
@@ -451,7 +487,7 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
         .await
         .expect("build config with manual-only review policy");
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
 
     assert_eq!(
         params.approvals_reviewer,
@@ -479,7 +515,7 @@ async fn thread_start_params_include_review_policy_when_auto_review_is_enabled()
         .await
         .expect("build config with guardian review policy");
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
 
     assert_eq!(
         params.approvals_reviewer,
@@ -607,22 +643,33 @@ async fn build_exec_config_preserves_headless_error_when_retry_fails() {
 }
 
 #[tokio::test]
-async fn thread_start_params_include_user_thread_source() {
+async fn thread_start_params_match_history_to_persistence() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(cwd.path().to_path_buf()))
         .build()
         .await
         .expect("build config");
 
-    let params = thread_start_params_from_config(&config);
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
 
     assert_eq!(
         params.thread_source,
         Some(codex_app_server_protocol::ThreadSource::User)
     );
+    assert_eq!(params.history_mode, Some(ThreadHistoryMode::Paginated));
+
+    let thread_source = ThreadSource::Feature("automated_review".to_string());
+    let params = thread_start_params_from_config(&config, &thread_source);
+    assert_eq!(params.thread_source, Some(thread_source));
+
+    config.ephemeral = true;
+    let params = thread_start_params_from_config(&config, &ThreadSource::User);
+
+    assert_eq!(params.ephemeral, Some(true));
+    assert_eq!(params.history_mode, None);
 }
 
 #[tokio::test]
@@ -644,7 +691,7 @@ async fn thread_lifecycle_params_preserve_hook_trust_bypass() {
         serde_json::Value::Bool(true),
     )]));
 
-    let start_params = thread_start_params_from_config(&config);
+    let start_params = thread_start_params_from_config(&config, &ThreadSource::User);
     let resume_params = thread_resume_params_from_config(
         &config,
         "thread-id".to_string(),
@@ -680,7 +727,7 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
         .await
         .expect("build config with legacy sandbox override");
 
-    let start_params = thread_start_params_from_config(&config);
+    let start_params = thread_start_params_from_config(&config, &ThreadSource::User);
     let resume_params = thread_resume_params_from_config(
         &config,
         "thread-id".to_string(),
@@ -779,13 +826,16 @@ async fn session_configured_from_thread_response_preserves_parent_thread_id() {
         .await
         .expect("build config");
     let parent_thread_id = ThreadId::new();
+    let forked_from_id = ThreadId::new();
     let mut response = sample_thread_start_response();
     response.thread.parent_thread_id = Some(parent_thread_id.to_string());
+    response.thread.forked_from_id = Some(forked_from_id.to_string());
 
     let event = session_configured_from_thread_start_response(&response, &config)
         .expect("build bootstrap session configured event");
 
     assert_eq!(event.parent_thread_id, Some(parent_thread_id));
+    assert_eq!(event.forked_from_id, Some(forked_from_id));
 }
 
 fn sample_thread_start_response() -> ThreadStartResponse {
@@ -798,8 +848,13 @@ fn sample_thread_start_response() -> ThreadStartResponse {
             parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,
+            section: None,
+            section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 0,
             updated_at: 0,
             recency_at: Some(0),

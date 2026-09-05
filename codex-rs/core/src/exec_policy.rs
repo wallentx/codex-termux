@@ -7,7 +7,6 @@ use arc_swap::ArcSwap;
 
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
-use codex_config::ConfigLayerStackOrdering;
 use codex_execpolicy::AmendError;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Error as ExecPolicyRuleError;
@@ -16,6 +15,7 @@ use codex_execpolicy::MatchOptions;
 use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
 use codex_execpolicy::PolicyParser;
+use codex_execpolicy::RequirementsExecPolicy;
 use codex_execpolicy::RuleMatch;
 use codex_execpolicy::blocking_append_allow_prefix_rule;
 use codex_execpolicy::blocking_append_network_rule;
@@ -25,8 +25,8 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::protocol::AskForApproval;
 use codex_shell_command::is_dangerous_command::DangerousCommandMatch;
-use codex_shell_command::is_dangerous_command::dangerous_command_match;
-use codex_shell_command::is_safe_command::is_known_safe_command;
+use codex_shell_command::is_dangerous_command::DangerousCommandPlatform;
+use codex_shell_command::is_dangerous_command::dangerous_command_match_for_platform;
 use thiserror::Error;
 use tokio::fs;
 use tokio::sync::Semaphore;
@@ -37,9 +37,13 @@ use crate::config::Config;
 use crate::sandboxing::SandboxPermissions;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use codex_shell_command::bash::parse_shell_lc_plain_commands;
-use codex_shell_command::bash::parse_shell_lc_single_command_prefix;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use shlex::try_join as shlex_try_join;
+
+mod executable_identity;
+mod model_policy;
+
+pub(crate) use model_policy::AllowPrefixRules;
 
 const PROMPT_CONFLICT_REASON: &str =
     "approval required by policy, but AskForApproval is set to Never";
@@ -50,53 +54,95 @@ const REJECT_RULES_APPROVAL_REASON: &str =
 const RULES_DIR_NAME: &str = "rules";
 const RULE_EXTENSION: &str = "rules";
 const DEFAULT_POLICY_FILE: &str = "default.rules";
-static BANNED_PREFIX_SUGGESTIONS: &[&[&str]] = &[
-    &["python3"],
-    &["python3", "-"],
-    &["python3", "-c"],
-    &["python"],
-    &["python", "-"],
-    &["python", "-c"],
-    &["py"],
-    &["py", "-3"],
-    &["pythonw"],
-    &["pyw"],
-    &["pypy"],
-    &["pypy3"],
-    &["git"],
-    &["bash"],
-    &["bash", "-lc"],
-    &["sh"],
-    &["sh", "-c"],
-    &["sh", "-lc"],
-    &["zsh"],
-    &["zsh", "-lc"],
-    &["/bin/zsh"],
-    &["/bin/zsh", "-lc"],
+pub(crate) static BANNED_PREFIX_SUGGESTIONS: &[&[&str]] = &[
     &["/bin/bash"],
+    &["/bin/bash", "-c"],
     &["/bin/bash", "-lc"],
-    &["pwsh"],
-    &["pwsh", "-Command"],
-    &["pwsh", "-c"],
+    &["/bin/sh"],
+    &["/bin/sh", "-c"],
+    &["/bin/sh", "-lc"],
+    &["/bin/zsh"],
+    &["/bin/zsh", "-c"],
+    &["/bin/zsh", "-lc"],
+    &["Rscript"],
+    &["bash"],
+    &["bash", "-c"],
+    &["bash", "-lc"],
+    &["bun"],
+    &["bun", "-e"],
+    &["bun", "run"],
+    &["cmd"],
+    &["cmd", "/c"],
+    &["cmd", "/k"],
+    &["cmd.exe"],
+    &["cmd.exe", "/c"],
+    &["cmd.exe", "/k"],
+    &["dash"],
+    &["dash", "-c"],
+    &["deno"],
+    &["deno", "eval"],
+    &["env"],
+    &["fish"],
+    &["fish", "-c"],
+    &["git"],
+    &["julia"],
+    &["julia", "-e"],
+    &["ksh"],
+    &["ksh", "-c"],
+    &["lua"],
+    &["lua", "-e"],
+    &["node"],
+    &["node", "-e"],
+    &["nodejs"],
+    &["nodejs", "-e"],
+    &["npm", "run"],
+    &["osascript"],
+    &["perl"],
+    &["perl", "-e"],
+    &["php"],
+    &["php", "-r"],
+    &["pnpm", "run"],
     &["powershell"],
     &["powershell", "-Command"],
+    &["powershell", "-EncodedCommand"],
+    &["powershell", "-File"],
     &["powershell", "-c"],
     &["powershell.exe"],
     &["powershell.exe", "-Command"],
+    &["powershell.exe", "-EncodedCommand"],
+    &["powershell.exe", "-File"],
     &["powershell.exe", "-c"],
-    &["env"],
-    &["sudo"],
-    &["node"],
-    &["node", "-e"],
-    &["perl"],
-    &["perl", "-e"],
+    &["pwsh"],
+    &["pwsh", "-Command"],
+    &["pwsh", "-EncodedCommand"],
+    &["pwsh", "-File"],
+    &["pwsh", "-c"],
+    &["pwsh", "-e"],
+    &["pwsh", "-ec"],
+    &["pwsh", "-f"],
+    &["py"],
+    &["py", "-3"],
+    &["pypy"],
+    &["pypy3"],
+    &["python"],
+    &["python", "-"],
+    &["python", "-c"],
+    &["python3"],
+    &["python3", "-"],
+    &["python3", "-c"],
+    &["pythonw"],
+    &["pyw"],
+    &["rm"],
     &["ruby"],
     &["ruby", "-e"],
-    &["php"],
-    &["php", "-r"],
-    &["lua"],
-    &["lua", "-e"],
-    &["osascript"],
+    &["sh"],
+    &["sh", "-c"],
+    &["sh", "-lc"],
+    &["sudo"],
+    &["yarn", "run"],
+    &["zsh"],
+    &["zsh", "-c"],
+    &["zsh", "-lc"],
 ];
 
 /// Describes which unmatched-command heuristics should classify the command
@@ -104,14 +150,13 @@ static BANNED_PREFIX_SUGGESTIONS: &[&[&str]] = &[
 ///
 /// The command tokens may be the original argv or a shell-specific lowering of
 /// a wrapper such as `bash -lc ...` or `powershell.exe -Command ...`. We only
-/// need to distinguish the PowerShell case because its safelist and dangerous
+/// need to distinguish the PowerShell case because its dangerous-command
 /// heuristics operate on PowerShell-flavored inner command words rather than
 /// the generic command classifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecPolicyCommandOrigin {
     /// Use the generic unmatched-command heuristics.
     Generic,
-    #[cfg(windows)]
     /// The command words came from the `-Command` body of a top-level
     /// PowerShell wrapper, so use PowerShell-specific unmatched-command
     /// heuristics for the lowered words.
@@ -122,16 +167,16 @@ pub(crate) enum ExecPolicyCommandOrigin {
 pub(crate) struct UnmatchedCommandContext<'a> {
     pub(crate) approval_policy: AskForApproval,
     pub(crate) permission_profile: &'a PermissionProfile,
+    // TODO(anp): Reconcile this decision input with TurnEnvironment::sandbox_context
+    // so approval heuristics match the selected environment's Windows backend.
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) sandbox_permissions: SandboxPermissions,
-    pub(crate) used_complex_parsing: bool,
     pub(crate) command_origin: ExecPolicyCommandOrigin,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct ExecPolicyCommands {
     commands: Vec<Vec<String>>,
-    used_complex_parsing: bool,
     command_origin: ExecPolicyCommandOrigin,
 }
 
@@ -139,11 +184,7 @@ pub(crate) fn child_uses_parent_exec_policy(parent_config: &Config, child_config
     fn exec_policy_config_folders(config: &Config) -> Vec<AbsolutePathBuf> {
         config
             .config_layer_stack
-            .get_layers(
-                ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                /*include_disabled*/ false,
-            )
-            .into_iter()
+            .layers_low_to_high()
             .filter_map(codex_config::ConfigLayerEntry::config_folder)
             .collect()
     }
@@ -241,9 +282,13 @@ pub(crate) struct ExecApprovalRequest<'a> {
     pub(crate) command: &'a [String],
     pub(crate) approval_policy: AskForApproval,
     pub(crate) permission_profile: PermissionProfile,
+    pub(crate) environment_policy: Option<&'a RequirementsExecPolicy>,
+    // TODO(anp): Reconcile this approval snapshot with TurnEnvironment::sandbox_context
+    // rather than taking the Windows backend from the turn-wide default.
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) sandbox_permissions: SandboxPermissions,
     pub(crate) prefix_rule: Option<Vec<String>>,
+    pub(crate) allow_prefix_rules: AllowPrefixRules,
 }
 
 impl ExecPolicyManager {
@@ -267,39 +312,61 @@ impl ExecPolicyManager {
         self.policy.load_full()
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_exec_approval_requirement_for_command(
         &self,
         req: ExecApprovalRequest<'_>,
+    ) -> ExecApprovalRequirement {
+        self.create_exec_approval_requirement_for_command_platform(
+            req,
+            DangerousCommandPlatform::host(),
+        )
+        .await
+    }
+
+    async fn create_exec_approval_requirement_for_command_platform(
+        &self,
+        req: ExecApprovalRequest<'_>,
+        command_platform: DangerousCommandPlatform,
+    ) -> ExecApprovalRequirement {
+        let commands = commands_for_exec_policy_for_platform(req.command, command_platform);
+        self.create_exec_approval_requirement_for_parsed_commands(req, commands, command_platform)
+            .await
+    }
+
+    async fn create_exec_approval_requirement_for_parsed_commands(
+        &self,
+        req: ExecApprovalRequest<'_>,
+        ExecPolicyCommands {
+            commands,
+            command_origin,
+        }: ExecPolicyCommands,
+        command_platform: DangerousCommandPlatform,
     ) -> ExecApprovalRequirement {
         let ExecApprovalRequest {
             command,
             approval_policy,
             permission_profile,
+            environment_policy,
             windows_sandbox_level,
             sandbox_permissions,
             prefix_rule,
+            allow_prefix_rules,
         } = req;
-        let exec_policy = self.current();
-        let ExecPolicyCommands {
-            commands,
-            used_complex_parsing,
-            command_origin,
-        } = commands_for_exec_policy(command);
-        // Keep heredoc prefix parsing for rule evaluation so existing
-        // allow/prompt/forbidden rules still apply, but avoid auto-derived
-        // amendments when only the heredoc fallback parser matched.
-        let auto_amendment_allowed = !used_complex_parsing;
+        let exec_policy = self.current_for_environment(environment_policy, allow_prefix_rules);
+        // Avoid reusable approvals when this model does not honor prefix rules.
+        let auto_amendment_allowed = allow_prefix_rules == AllowPrefixRules::Honor;
         let exec_policy_fallback = |cmd: &[String]| {
-            render_decision_for_unmatched_command(
+            render_decision_for_unmatched_command_for_platform(
                 cmd,
                 UnmatchedCommandContext {
                     approval_policy,
                     permission_profile: &permission_profile,
                     windows_sandbox_level,
                     sandbox_permissions,
-                    used_complex_parsing,
                     command_origin,
                 },
+                command_platform,
             )
         };
         let match_options = MatchOptions {
@@ -333,6 +400,7 @@ impl ExecPolicyManager {
                         &evaluation,
                         Decision::Forbidden,
                         command_origin,
+                        command_platform,
                     ),
                 ),
             },
@@ -351,6 +419,7 @@ impl ExecPolicyManager {
                                 &evaluation,
                                 Decision::Prompt,
                                 command_origin,
+                                command_platform,
                             ),
                         ),
                     },
@@ -597,10 +666,7 @@ pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy,
     // from each layer, so that higher-precedence layers can override
     // rules defined in lower-precedence ones.
     let mut policy_paths = Vec::new();
-    for layer in config_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ false,
-    ) {
+    for layer in config_stack.layers_low_to_high() {
         if config_stack.ignore_user_and_project_exec_policy_rules()
             && matches!(
                 layer.name,
@@ -652,12 +718,17 @@ pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy,
 fn dangerous_command_match_for_origin(
     command: &[String],
     command_origin: ExecPolicyCommandOrigin,
+    command_platform: DangerousCommandPlatform,
 ) -> Option<DangerousCommandMatch> {
     match command_origin {
-        ExecPolicyCommandOrigin::Generic => dangerous_command_match(command),
-        #[cfg(windows)]
+        ExecPolicyCommandOrigin::Generic => {
+            dangerous_command_match_for_platform(command, command_platform)
+        }
         ExecPolicyCommandOrigin::PowerShell => {
-            codex_shell_command::is_dangerous_command::dangerous_powershell_words_match(command)
+            codex_shell_command::is_dangerous_command::dangerous_powershell_words_match(
+                command,
+                command_platform,
+            )
         }
     }
 }
@@ -667,6 +738,7 @@ fn dangerous_command_match_for_heuristics(
     evaluation: &Evaluation,
     decision: Decision,
     command_origin: ExecPolicyCommandOrigin,
+    command_platform: DangerousCommandPlatform,
 ) -> Option<DangerousCommandMatch> {
     evaluation
         .matched_rules
@@ -676,36 +748,40 @@ fn dangerous_command_match_for_heuristics(
                 command,
                 decision: matched_decision,
             } if *matched_decision == decision => {
-                dangerous_command_match_for_origin(command, command_origin)
+                dangerous_command_match_for_origin(command, command_origin, command_platform)
             }
             _ => None,
         })
 }
 
 /// If a command is not matched by any execpolicy rule, derive a [`Decision`].
+#[cfg(any(test, unix))]
 pub(crate) fn render_decision_for_unmatched_command(
     command: &[String],
     context: UnmatchedCommandContext<'_>,
 ) -> Decision {
+    render_decision_for_unmatched_command_for_platform(
+        command,
+        context,
+        DangerousCommandPlatform::host(),
+    )
+}
+
+fn render_decision_for_unmatched_command_for_platform(
+    command: &[String],
+    context: UnmatchedCommandContext<'_>,
+    command_platform: DangerousCommandPlatform,
+) -> Decision {
     let dangerous_command_match =
-        dangerous_command_match_for_origin(command, context.command_origin);
+        dangerous_command_match_for_origin(command, context.command_origin, command_platform);
     let UnmatchedCommandContext {
         approval_policy,
         permission_profile,
         windows_sandbox_level,
         sandbox_permissions,
-        used_complex_parsing,
-        command_origin,
+        command_origin: _,
     } = context;
     let file_system_sandbox_policy = permission_profile.file_system_sandbox_policy();
-    let is_known_safe = match command_origin {
-        ExecPolicyCommandOrigin::Generic => is_known_safe_command(command),
-        #[cfg(windows)]
-        ExecPolicyCommandOrigin::PowerShell => {
-            codex_shell_command::is_safe_command::is_safe_powershell_words(command)
-        }
-    };
-
     // When the Windows sandbox backend is disabled, managed filesystem
     // restrictions are only a policy shape; there is no platform sandbox to
     // enforce the boundary. Keep that legacy case conservative while still
@@ -713,14 +789,6 @@ pub(crate) fn render_decision_for_unmatched_command(
     let windows_managed_fs_restrictions_without_sandbox_backend = cfg!(windows)
         && windows_sandbox_level == WindowsSandboxLevel::Disabled
         && profile_has_managed_filesystem_restrictions(permission_profile);
-
-    if is_known_safe
-        && !used_complex_parsing
-        && (approval_policy == AskForApproval::UnlessTrusted
-            || windows_managed_fs_restrictions_without_sandbox_backend)
-    {
-        return Decision::Allow;
-    }
 
     // If the command is flagged as dangerous or we have no sandbox protection,
     // we should never allow it to run without approval.
@@ -745,8 +813,8 @@ pub(crate) fn render_decision_for_unmatched_command(
             Decision::Allow
         }
         AskForApproval::UnlessTrusted => {
-            // We already checked the unmatched-command safelist and it
-            // returned false, so we must prompt.
+            // Projects marked untrusted require approval for every command
+            // that is not explicitly allowed by an exec policy rule.
             Decision::Prompt
         }
         AskForApproval::OnRequest => {
@@ -796,46 +864,41 @@ fn profile_has_managed_filesystem_restrictions(permission_profile: &PermissionPr
         && !file_system_sandbox_policy.has_full_disk_write_access()
 }
 
-fn default_policy_path(codex_home: &Path) -> PathBuf {
+pub(crate) fn default_policy_path(codex_home: &Path) -> PathBuf {
     codex_home.join(RULES_DIR_NAME).join(DEFAULT_POLICY_FILE)
 }
 
+#[cfg(test)]
 fn commands_for_exec_policy(command: &[String]) -> ExecPolicyCommands {
+    commands_for_exec_policy_for_platform(command, DangerousCommandPlatform::host())
+}
+
+fn commands_for_exec_policy_for_platform(
+    command: &[String],
+    command_platform: DangerousCommandPlatform,
+) -> ExecPolicyCommands {
     if let Some(commands) = parse_shell_lc_plain_commands(command)
         && !commands.is_empty()
     {
         return ExecPolicyCommands {
             commands,
-            used_complex_parsing: false,
             command_origin: ExecPolicyCommandOrigin::Generic,
         };
     }
 
-    #[cfg(windows)]
-    {
-        if let Some(commands) =
+    if command_platform == DangerousCommandPlatform::Windows
+        && let Some(commands) =
             codex_shell_command::powershell::parse_powershell_command_into_plain_commands(command)
-            && !commands.is_empty()
-        {
-            return ExecPolicyCommands {
-                commands,
-                used_complex_parsing: false,
-                command_origin: ExecPolicyCommandOrigin::PowerShell,
-            };
-        }
-    }
-
-    if let Some(single_command) = parse_shell_lc_single_command_prefix(command) {
+        && !commands.is_empty()
+    {
         return ExecPolicyCommands {
-            commands: vec![single_command],
-            used_complex_parsing: true,
-            command_origin: ExecPolicyCommandOrigin::Generic,
+            commands,
+            command_origin: ExecPolicyCommandOrigin::PowerShell,
         };
     }
 
     ExecPolicyCommands {
         commands: vec![command.to_vec()],
-        used_complex_parsing: false,
         command_origin: ExecPolicyCommandOrigin::Generic,
     }
 }

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config_manager::ConfigManager;
 use crate::error_code::internal_error;
@@ -13,10 +14,14 @@ use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportHistoriesReadResponse;
+use codex_app_server_protocol::ExternalAgentConfigImportHistoryRecordParams;
+use codex_app_server_protocol::ExternalAgentConfigImportHistoryRecordResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportItemTypeFailure as ProtocolImportFailure;
+use codex_app_server_protocol::ExternalAgentConfigImportItemTypeSuccess as ProtocolImportSuccess;
 use codex_app_server_protocol::ExternalAgentConfigImportParams;
 use codex_app_server_protocol::ExternalAgentConfigImportProgressNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportResponse;
+use codex_app_server_protocol::ExternalAgentConfigImportTypeResult as ProtocolImportTypeResult;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItem;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItemType;
 use codex_app_server_protocol::ExternalAgentImportedConnectorCandidate;
@@ -25,20 +30,24 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ServerNotification;
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::ThreadManager;
+use codex_external_agent_migration::DetectedConnectorCandidate;
 use codex_external_agent_migration::ExternalAgentConfigDetectOptions;
 use codex_external_agent_migration::ExternalAgentConfigImportItemResult as CoreImportItemResult;
 use codex_external_agent_migration::ExternalAgentConfigImportOutcome as CoreImportOutcome;
 use codex_external_agent_migration::ExternalAgentConfigMigrationItemType as CoreMigrationItemType;
 use codex_external_agent_migration::ExternalAgentConfigService;
+use codex_external_agent_migration::ExternalAgentSessionImportLimits;
 use codex_external_agent_migration::PluginImportOutcome;
 use codex_external_agent_migration::record_import_error;
 use codex_external_agent_migration::sessions::ExternalAgentSessionMigration as CoreSessionMigration;
 use codex_external_agent_migration::sessions::read_imported_connector_candidates;
+use codex_external_agent_migration::sessions::record_detected_session_connectors;
 use codex_features::Feature;
 use codex_rollout::StateDbHandle;
 use codex_state::ExternalAgentConfigImportFailureRecord;
 use codex_state::ExternalAgentConfigImportSuccessRecord;
 use codex_thread_store::ThreadStore;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -89,6 +98,7 @@ impl ExternalAgentConfigRequestProcessor {
         } = args;
         let migration_service = ExternalAgentConfigService::new(
             codex_home.clone(),
+            thread_manager.auth_manager(),
             analytics_events_client.clone(),
             state_db.clone(),
         );
@@ -119,6 +129,18 @@ impl ExternalAgentConfigRequestProcessor {
         let migration_service = self
             .migration_service
             .with_migration_source(params.migration_source.as_deref());
+        let default_session_import_limits = ExternalAgentSessionImportLimits::default();
+        let migration_service =
+            migration_service.with_session_import_limits(ExternalAgentSessionImportLimits {
+                max_age: params
+                    .max_session_age_days
+                    .map(|days| Duration::from_secs(u64::from(days) * 24 * 60 * 60))
+                    .unwrap_or(default_session_import_limits.max_age),
+                max_sessions: params
+                    .max_sessions
+                    .map(|max_sessions| max_sessions as usize)
+                    .unwrap_or(default_session_import_limits.max_sessions),
+            });
         let options = ExternalAgentConfigDetectOptions {
             include_home: params.include_home,
             include_memory: self.external_agent_memory_import_enabled().await,
@@ -128,8 +150,24 @@ impl ExternalAgentConfigRequestProcessor {
             .detect(options)
             .await
             .map_err(|err| internal_error(err.to_string()))?;
+        let sessions = items
+            .iter()
+            .filter_map(|item| item.details.as_ref())
+            .flat_map(|details| details.sessions.iter().cloned())
+            .collect::<Vec<_>>();
+        let (connector_names_by_source_path, connectors) =
+            detected_session_connectors(&migration_service, &sessions);
+        record_detected_session_connectors(
+            self.migration_service.codex_home(),
+            connector_names_by_source_path,
+        )
+        .map_err(|err| {
+            internal_error(format!(
+                "failed to record detected connector candidates: {err}"
+            ))
+        })?;
 
-        Ok(detect_response(items))
+        Ok(detect_response(items, connectors))
     }
 
     pub(crate) async fn import(
@@ -158,6 +196,7 @@ impl ExternalAgentConfigRequestProcessor {
         }
         let import_id = Uuid::new_v4().to_string();
         let analytics_source = params.source.clone().unwrap_or_default();
+        let provider_id = params.provider_id.clone();
         let migration_service = self
             .migration_service
             .with_migration_source(params.migration_source.as_deref());
@@ -209,6 +248,7 @@ impl ExternalAgentConfigRequestProcessor {
                 &self.analytics_events_client,
                 import_id,
                 analytics_source,
+                provider_id,
                 &completed_item_results,
             )
             .await;
@@ -231,6 +271,8 @@ impl ExternalAgentConfigRequestProcessor {
         });
         let pending_plugin_imports = import_outcome.pending_plugin_imports;
         tokio::spawn(async move {
+            let connector_names_by_source_path =
+                detected_session_connectors(&plugin_migration_service, &pending_session_imports).0;
             let session_progress_outgoing = Arc::clone(&outgoing);
             let session_import_id = import_id.clone();
             let session_imports = async move {
@@ -240,6 +282,7 @@ impl ExternalAgentConfigRequestProcessor {
                         pending_session_imports,
                         session_import_result,
                         session_metadata_mode,
+                        connector_names_by_source_path,
                     )
                     .await;
                 send_import_progress(&session_progress_outgoing, &session_import_id, &item_result)
@@ -303,6 +346,7 @@ impl ExternalAgentConfigRequestProcessor {
                 &analytics_events_client,
                 import_id,
                 analytics_source,
+                provider_id,
                 &completed_item_results,
             )
             .await;
@@ -359,6 +403,46 @@ impl ExternalAgentConfigRequestProcessor {
             .collect();
 
         Ok(ExternalAgentConfigImportHistoriesReadResponse { data, connectors })
+    }
+
+    pub(crate) async fn record_import_history(
+        &self,
+        params: ExternalAgentConfigImportHistoryRecordParams,
+    ) -> Result<ExternalAgentConfigImportHistoryRecordResponse, JSONRPCErrorError> {
+        let state_db = self
+            .state_db
+            .as_ref()
+            .ok_or_else(|| internal_error("state database is unavailable"))?;
+        let import_id = Uuid::new_v4().to_string();
+        let item_type_results = params
+            .item_type_results
+            .into_iter()
+            .map(|type_result| ProtocolImportTypeResult {
+                item_type: type_result.item_type,
+                successes: type_result
+                    .successes
+                    .into_iter()
+                    .map(|success| ProtocolImportSuccess {
+                        item_type: success.item_type,
+                        cwd: success.cwd,
+                        source: success.source,
+                        target: success.target,
+                        title: success.title,
+                    })
+                    .collect(),
+                failures: type_result.failures,
+            })
+            .collect::<Vec<_>>();
+        record_import_history(
+            state_db,
+            import_id.as_str(),
+            Some(params.provider_id.as_str()),
+            &item_type_results,
+        )
+        .await
+        .map_err(|err| internal_error(format!("failed to record import history: {err}")))?;
+
+        Ok(ExternalAgentConfigImportHistoryRecordResponse { import_id })
     }
 
     fn validate_pending_session_imports(
@@ -466,13 +550,21 @@ async fn send_completed_import_notification(
     analytics_events_client: &AnalyticsEventsClient,
     import_id: String,
     analytics_source: String,
+    provider_id: Option<String>,
     item_results: &[CoreImportItemResult],
 ) {
     let notification = completed_notification(import_id, item_results);
     log_completed_import_failures(&notification);
-    track_completed_import_notification(analytics_events_client, &analytics_source, &notification);
+    track_completed_import_notification(
+        analytics_events_client,
+        &analytics_source,
+        provider_id.as_deref().unwrap_or_default(),
+        &notification,
+    );
     if let Some(state_db) = state_db
-        && let Err(err) = record_completed_import_notification(state_db, &notification).await
+        && let Err(err) =
+            record_completed_import_notification(state_db, provider_id.as_deref(), &notification)
+                .await
     {
         tracing::warn!(
             import_id = %notification.import_id,
@@ -508,6 +600,7 @@ fn log_completed_import_failures(notification: &ExternalAgentConfigImportComplet
 fn track_completed_import_notification(
     analytics_events_client: &AnalyticsEventsClient,
     analytics_source: &str,
+    provider_id: &str,
     notification: &ExternalAgentConfigImportCompletedNotification,
 ) {
     for type_result in &notification.item_type_results {
@@ -516,6 +609,7 @@ fn track_completed_import_notification(
             ExternalAgentConfigImportCompletedInput {
                 import_id: notification.import_id.clone(),
                 source: analytics_source.to_string(),
+                provider_id: provider_id.to_string(),
                 item_type: item_type.clone(),
                 success_count: type_result.successes.len(),
                 failed_count: type_result.failures.len(),
@@ -526,6 +620,7 @@ fn track_completed_import_notification(
                 ExternalAgentConfigImportFailureInput {
                     import_id: notification.import_id.clone(),
                     source: analytics_source.to_string(),
+                    provider_id: provider_id.to_string(),
                     item_type: item_type.clone(),
                     failure_stage: failure.failure_stage.clone(),
                     error_type: import_failure_error_type(failure),
@@ -560,10 +655,25 @@ fn analytics_migration_item_type(item_type: ExternalAgentConfigMigrationItemType
 
 async fn record_completed_import_notification(
     state_db: &StateDbHandle,
+    provider_id: Option<&str>,
     notification: &ExternalAgentConfigImportCompletedNotification,
 ) -> anyhow::Result<()> {
-    let successes = notification
-        .item_type_results
+    record_import_history(
+        state_db,
+        notification.import_id.as_str(),
+        provider_id,
+        &notification.item_type_results,
+    )
+    .await
+}
+
+async fn record_import_history(
+    state_db: &StateDbHandle,
+    import_id: &str,
+    provider_id: Option<&str>,
+    item_type_results: &[ProtocolImportTypeResult],
+) -> anyhow::Result<()> {
+    let successes = item_type_results
         .iter()
         .flat_map(|type_result| type_result.successes.iter())
         .map(|success| {
@@ -572,11 +682,11 @@ async fn record_completed_import_notification(
                 cwd: success.cwd.clone(),
                 source: success.source.clone(),
                 target: success.target.clone(),
+                title: success.title.clone(),
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let failures = notification
-        .item_type_results
+    let failures = item_type_results
         .iter()
         .flat_map(|type_result| type_result.failures.iter())
         .map(|failure| {
@@ -593,11 +703,53 @@ async fn record_completed_import_notification(
         .collect::<anyhow::Result<Vec<_>>>()?;
     state_db
         .record_external_agent_config_import_completed(
-            notification.import_id.as_str(),
+            import_id,
+            provider_id,
             &successes,
             &failures,
         )
         .await
+}
+
+fn detected_session_connectors(
+    migration_service: &ExternalAgentConfigService,
+    sessions: &[CoreSessionMigration],
+) -> (
+    BTreeMap<PathBuf, Vec<String>>,
+    Vec<DetectedConnectorCandidate>,
+) {
+    let mut connector_names_by_source_path = BTreeMap::new();
+    let mut connectors_by_name = BTreeMap::<String, DetectedConnectorCandidate>::new();
+    let sessions = sessions
+        .iter()
+        .filter(|session| session.path.is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    for (source_path, session_connectors) in
+        migration_service.detect_session_connectors_by_source_path(&sessions)
+    {
+        connector_names_by_source_path.insert(
+            source_path,
+            session_connectors
+                .iter()
+                .map(|candidate| candidate.name.clone())
+                .collect(),
+        );
+        for candidate in session_connectors {
+            let key = candidate.name.to_lowercase();
+            let session_count = candidate.session_count;
+            let connector = connectors_by_name.entry(key).or_insert_with(|| {
+                let mut connector = candidate;
+                connector.session_count = 0;
+                connector
+            });
+            connector.session_count = connector.session_count.saturating_add(session_count);
+        }
+    }
+    (
+        connector_names_by_source_path,
+        connectors_by_name.into_values().collect(),
+    )
 }
 
 fn apply_plugin_outcome_to_item_result(
@@ -605,7 +757,11 @@ fn apply_plugin_outcome_to_item_result(
     plugin_outcome: PluginImportOutcome,
 ) {
     for plugin_id in plugin_outcome.succeeded_plugin_ids {
-        item_result.record_success(Some(plugin_id.clone()), Some(plugin_id));
+        item_result.record_success(
+            Some(plugin_id.clone()),
+            Some(plugin_id),
+            /*title*/ None,
+        );
     }
     for raw_error in plugin_outcome.raw_errors {
         item_result.record_error(raw_error);

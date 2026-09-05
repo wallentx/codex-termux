@@ -112,12 +112,18 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
                         path: FileSystemPath::Path {
-                            path: "/tmp/writable".try_into().expect("absolute path"),
+                            path: codex_utils_absolute_path::AbsolutePathBuf::try_from(
+                                "/tmp/writable",
+                            )
+                            .expect("absolute path")
+                            .into(),
                         },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     },
                 ],
                 glob_scan_max_depth: None,

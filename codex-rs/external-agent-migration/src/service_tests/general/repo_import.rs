@@ -1,6 +1,77 @@
 use super::super::*;
 use pretty_assertions::assert_eq;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn repo_migration_skips_redirected_generated_destinations() -> std::io::Result<()> {
+    let root = TempDir::new()?;
+    let repo = root.path().join("repo");
+    let source = repo.join(EXTERNAL_AGENT_DIR);
+    let target = repo.join(".codex");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(repo.join(".git"))?;
+    fs::create_dir_all(source.join("agents"))?;
+    fs::create_dir_all(source.join("hooks/nested"))?;
+    fs::create_dir_all(target.join("agents"))?;
+    fs::create_dir_all(target.join("hooks"))?;
+    fs::create_dir_all(&outside)?;
+    fs::write(
+        source.join("agents/researcher.md"),
+        "---\nname: researcher\ndescription: Research\n---\nInstructions\n",
+    )?;
+    fs::write(
+        source.join("settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"command":"echo done"}]}]}}"#,
+    )?;
+    fs::write(source.join("hooks/nested/escaped.sh"), "nested")?;
+    fs::write(source.join("hooks/escaped.sh"), "dangling")?;
+    fs::write(source.join("hooks/safe.sh"), "safe")?;
+    std::os::unix::fs::symlink(
+        outside.join("researcher.toml"),
+        target.join("agents/researcher.toml"),
+    )?;
+    std::os::unix::fs::symlink(&outside, target.join("hooks/nested"))?;
+    std::os::unix::fs::symlink(outside.join("escaped.sh"), target.join("hooks/escaped.sh"))?;
+
+    let service = service_for_paths(
+        root.path().join(EXTERNAL_AGENT_DIR),
+        root.path().join(".codex"),
+    );
+    let mut items = service
+        .detect(ExternalAgentConfigDetectOptions {
+            include_home: false,
+            include_memory: false,
+            cwds: Some(vec![repo.clone()]),
+        })
+        .await?;
+    assert_eq!(
+        items.iter().map(|item| item.item_type).collect::<Vec<_>>(),
+        vec![ExternalAgentConfigMigrationItemType::Hooks]
+    );
+    items.push(ExternalAgentConfigMigrationItem {
+        item_type: ExternalAgentConfigMigrationItemType::Subagents,
+        description: String::new(),
+        cwd: Some(repo),
+        details: None,
+    });
+    let outcome = service.import(items).await;
+
+    assert_eq!(
+        outcome
+            .item_results
+            .iter()
+            .map(|result| (result.item_type, result.success_count, result.error_count))
+            .collect::<Vec<_>>(),
+        vec![
+            (ExternalAgentConfigMigrationItemType::Hooks, 1, 0),
+            (ExternalAgentConfigMigrationItemType::Subagents, 0, 0),
+        ]
+    );
+    assert_eq!(fs::read_to_string(target.join("hooks/safe.sh"))?, "safe");
+    assert!(fs::read_dir(&outside)?.next().is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn import_repo_agents_md_from_nested_cwd_rewrites_terms_and_skips_non_empty_targets() {
     let root = TempDir::new().expect("create tempdir");
@@ -140,6 +211,81 @@ async fn import_repo_agents_md_overwrites_empty_targets() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn repo_agents_md_migration_skips_symlink_targets() {
+    let root = TempDir::new().expect("create tempdir");
+    let service = service_for_paths(
+        root.path().join(EXTERNAL_AGENT_DIR),
+        root.path().join(".codex"),
+    );
+
+    for (repo_name, initial_target_contents) in [
+        ("repo-with-existing-target", Some("")),
+        ("repo-with-dangling-target", None),
+    ] {
+        let repo_root = root.path().join(repo_name);
+        let linked_target = root.path().join(format!("{repo_name}-target"));
+        let agents_md = repo_root.join("AGENTS.md");
+        fs::create_dir_all(repo_root.join(".git")).expect("create git");
+        fs::write(
+            repo_root.join(EXTERNAL_AGENT_CONFIG_MD),
+            format!("{SOURCE_EXTERNAL_AGENT_DISPLAY_NAME} code guidance"),
+        )
+        .expect("write source");
+        if let Some(contents) = initial_target_contents {
+            fs::write(&linked_target, contents).expect("write linked target");
+        }
+        std::os::unix::fs::symlink(&linked_target, &agents_md).expect("create symlink");
+
+        let items = service
+            .detect(ExternalAgentConfigDetectOptions {
+                include_home: false,
+                include_memory: false,
+                cwds: Some(vec![repo_root.clone()]),
+            })
+            .await
+            .expect("detect");
+        assert_eq!(items, Vec::<ExternalAgentConfigMigrationItem>::new());
+
+        let outcome = service
+            .import(vec![ExternalAgentConfigMigrationItem {
+                item_type: ExternalAgentConfigMigrationItemType::AgentsMd,
+                description: String::new(),
+                cwd: Some(repo_root.clone()),
+                details: None,
+            }])
+            .await;
+        assert_eq!(
+            outcome.item_results,
+            vec![ExternalAgentConfigImportItemResult {
+                item_type: ExternalAgentConfigMigrationItemType::AgentsMd,
+                description: String::new(),
+                cwd: Some(repo_root),
+                success_count: 0,
+                error_count: 0,
+                successes: Vec::new(),
+                raw_errors: Vec::new(),
+            }]
+        );
+
+        assert_eq!(
+            fs::read_link(&agents_md).expect("read migration target symlink"),
+            linked_target
+        );
+        match initial_target_contents {
+            Some(contents) => assert_eq!(
+                fs::read_to_string(&linked_target).expect("read linked target"),
+                contents
+            ),
+            None => assert!(
+                !linked_target.exists(),
+                "dangling migration symlink target must not be created"
+            ),
+        }
+    }
+}
+
 #[tokio::test]
 async fn detect_repo_prefers_non_empty_external_agent_agents_source() {
     let root = TempDir::new().expect("create tempdir");
@@ -253,6 +399,83 @@ async fn import_repo_hooks_preserves_disabled_codex_hooks_feature() {
             }
         })
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn repo_hooks_migration_skips_symlink_targets() {
+    let root = TempDir::new().expect("create tempdir");
+    let service = service_for_paths(
+        root.path().join(EXTERNAL_AGENT_DIR),
+        root.path().join(".codex"),
+    );
+
+    for (repo_name, initial_target_contents) in [
+        ("repo-with-existing-hook-target", Some("")),
+        ("repo-with-dangling-hook-target", None),
+    ] {
+        let repo_root = root.path().join(repo_name);
+        let linked_target = root.path().join(format!("{repo_name}-target"));
+        let hooks_json = repo_root.join(".codex").join("hooks.json");
+        fs::create_dir_all(repo_root.join(".git")).expect("create git dir");
+        fs::create_dir_all(repo_root.join(EXTERNAL_AGENT_DIR)).expect("create external agent dir");
+        fs::create_dir_all(repo_root.join(".codex")).expect("create codex dir");
+        fs::write(
+            repo_root.join(EXTERNAL_AGENT_DIR).join("settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"echo done"}]}]}}"#,
+        )
+        .expect("write hooks");
+        if let Some(contents) = initial_target_contents {
+            fs::write(&linked_target, contents).expect("write linked target");
+        }
+        std::os::unix::fs::symlink(&linked_target, &hooks_json).expect("create symlink");
+
+        let items = service
+            .detect(ExternalAgentConfigDetectOptions {
+                include_home: false,
+                include_memory: false,
+                cwds: Some(vec![repo_root.clone()]),
+            })
+            .await
+            .expect("detect");
+        assert_eq!(items, Vec::<ExternalAgentConfigMigrationItem>::new());
+
+        let outcome = service
+            .import(vec![ExternalAgentConfigMigrationItem {
+                item_type: ExternalAgentConfigMigrationItemType::Hooks,
+                description: String::new(),
+                cwd: Some(repo_root.clone()),
+                details: None,
+            }])
+            .await;
+        assert_eq!(
+            outcome.item_results,
+            vec![ExternalAgentConfigImportItemResult {
+                item_type: ExternalAgentConfigMigrationItemType::Hooks,
+                description: String::new(),
+                cwd: Some(repo_root),
+                success_count: 0,
+                error_count: 0,
+                successes: Vec::new(),
+                raw_errors: Vec::new(),
+            }]
+        );
+
+        assert_eq!(
+            fs::read_link(&hooks_json).expect("read migration target symlink"),
+            linked_target
+        );
+        match initial_target_contents {
+            Some(contents) => assert_eq!(
+                fs::read_to_string(&linked_target).expect("read linked target"),
+                contents
+            ),
+            None => assert!(
+                !linked_target.exists(),
+                "dangling migration symlink target must not be created"
+            ),
+        }
+    }
 }
 
 #[tokio::test]

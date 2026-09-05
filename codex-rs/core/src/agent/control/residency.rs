@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
@@ -94,9 +95,9 @@ impl V2Residency {
                 .try_unload_one_resident(manager, protected_thread_id)
                 .await
             {
-                return Err(CodexErr::AgentLimitReached {
+                return Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
                     max_threads: capacity,
-                });
+                }));
             }
         }
     }
@@ -143,6 +144,13 @@ impl V2Residency {
                 self.touch(candidate_thread_id);
                 continue;
             }
+            let environments = candidate_thread.environment_selections().await;
+            candidate_thread
+                .session
+                .services
+                .agent_control
+                .state
+                .save_evicted_environments(candidate_thread_id, environments);
             let _ = manager.remove_thread(&candidate_thread_id).await;
             return true;
         }

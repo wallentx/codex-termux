@@ -83,6 +83,10 @@ pub struct InitializeParams {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
     pub session_id: String,
+    /// Executor metadata at initialization, with the same shape as `environment/info`.
+    // TODO: Make this required once all supported exec-server versions return environmentInfo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_info: Option<EnvironmentInfo>,
 }
 
 /// Information about an execution/filesystem environment.
@@ -93,6 +97,19 @@ pub struct EnvironmentInfo {
     /// Working directory inherited by the exec-server process.
     #[serde(default)]
     pub cwd: Option<PathUri>,
+    /// Executor user home used to expand `~` in path-bearing values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_home_dir: Option<PathUri>,
+    /// Operating system reported by the executor; absent for legacy exec-servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_os: Option<String>,
+    /// Executor-local default directories for resolving `:tmpdir`, when reported.
+    /// On Windows, a command's `TEMP` or `TMP` overrides take precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporary_directories: Option<Vec<PathUri>>,
+    /// Executor-native temporary directory for child-visible sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_dir: Option<PathUri>,
     /// Optional executor features that clients must gate before sending newer request fields.
     #[serde(default)]
     pub capabilities: EnvironmentCapabilities,
@@ -105,6 +122,21 @@ pub struct EnvironmentCapabilities {
     /// Whether `exec` accepts instructions for launching an executor-local network proxy.
     #[serde(default)]
     pub network_proxy_launch: bool,
+    /// Whether capability discovery applies the filesystem sandbox sent with each root.
+    #[serde(default)]
+    pub capability_discovery_sandbox: bool,
+    /// Whether this executor supports the `environmentConfig/read` request.
+    #[serde(default)]
+    pub environment_config_read: bool,
+    /// Whether HTTP headers can resolve values from the executor environment.
+    #[serde(default)]
+    pub http_header_env_vars: bool,
+    /// Whether filesystem streams can use the requested platform sandbox.
+    #[serde(default)]
+    pub sandboxed_file_streaming: bool,
+    /// Whether shell state can be cached and restored entirely inside the executor.
+    #[serde(default)]
+    pub shell_snapshot_v2: bool,
 }
 
 /// Status returned by an initialized exec-server connection.
@@ -127,15 +159,73 @@ pub enum EnvironmentStatusKind {
 }
 
 impl EnvironmentInfo {
+    /// Returns executor-local default directories used to resolve `:tmpdir`.
+    ///
+    /// This is separate from `local` so orchestrator startup can cache the
+    /// directories without repeating local shell detection.
+    pub fn local_temporary_directories() -> Vec<PathUri> {
+        let cwd = std::env::current_dir().ok();
+        Self::local_temporary_directories_with_cwd(cwd.as_deref())
+    }
+
+    fn local_temporary_directories_with_cwd(cwd: Option<&std::path::Path>) -> Vec<PathUri> {
+        let temporary_directory_env_vars: &[&str] = if cfg!(windows) {
+            &["TEMP", "TMP"]
+        } else {
+            &["TMPDIR"]
+        };
+        let normalize_temp_path = |path: std::ffi::OsString| {
+            PathUri::from_host_native_path(&path).ok().or_else(|| {
+                if cfg!(unix) {
+                    PathUri::from_host_native_path(cwd.as_ref()?.join(path)).ok()
+                } else {
+                    None
+                }
+            })
+        };
+        let mut temporary_directories = Vec::new();
+        for name in temporary_directory_env_vars {
+            if let Some(path) = std::env::var_os(name)
+                .filter(|path| !path.is_empty())
+                .filter(|path| cfg!(unix) || std::path::Path::new(path).is_absolute())
+                .and_then(&normalize_temp_path)
+                && !temporary_directories.contains(&path)
+            {
+                temporary_directories.push(path);
+            }
+        }
+        temporary_directories
+    }
+
     /// Returns information about the current local exec-server process.
     pub fn local() -> Self {
+        let cwd = std::env::current_dir().ok();
+        let temporary_directories = Self::local_temporary_directories_with_cwd(cwd.as_deref());
+        let normalize_temp_path = |path: std::ffi::OsString| {
+            PathUri::from_host_native_path(&path).ok().or_else(|| {
+                if cfg!(unix) {
+                    PathUri::from_host_native_path(cwd.as_ref()?.join(path)).ok()
+                } else {
+                    None
+                }
+            })
+        };
+        let temp_dir = normalize_temp_path(std::env::temp_dir().into_os_string());
+
         Self {
             shell: codex_shell_command::shell_detect::default_user_shell().into(),
-            cwd: std::env::current_dir()
-                .ok()
-                .and_then(|cwd| PathUri::from_host_native_path(cwd).ok()),
+            cwd: cwd.and_then(|cwd| PathUri::from_host_native_path(cwd).ok()),
+            user_home_dir: PathUri::from_host_native_path("~").ok(),
+            platform_os: Some(std::env::consts::OS.to_string()),
+            temporary_directories: Some(temporary_directories),
+            temp_dir,
             capabilities: EnvironmentCapabilities {
                 network_proxy_launch: true,
+                capability_discovery_sandbox: true,
+                environment_config_read: true,
+                http_header_env_vars: true,
+                sandboxed_file_streaming: true,
+                shell_snapshot_v2: cfg!(unix),
             },
         }
     }
@@ -172,6 +262,9 @@ pub struct ExecParams {
     pub cwd: PathUri,
     #[serde(default)]
     pub env_policy: Option<ExecEnvPolicy>,
+    /// Optional request to restore executor-owned, attachment-scoped shell state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_snapshot: Option<ShellSnapshotRequest>,
     pub env: HashMap<String, String>,
     pub tty: bool,
     /// Keep non-tty stdin writable through `process/write`.
@@ -207,10 +300,34 @@ pub struct ExecEnvPolicy {
     pub include_only: Vec<String>,
 }
 
+/// Identifies shell state owned by one attachment within an executor session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellSnapshotRequest {
+    /// Attachment identity; executor sessions independently scope every cache.
+    pub scope_id: String,
+    /// Executor-native shell used to capture and restore the snapshot.
+    pub shell: ShellInfo,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecResponse {
     pub process_id: ProcessId,
+    /// `None` means the peer did not report its sandbox type. Current peers
+    /// report [`ProcessSandboxType::None`] when the process was not sandboxed.
+    #[serde(default)]
+    pub sandbox_type: Option<ProcessSandboxType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessSandboxType {
+    /// The process was explicitly started without a platform sandbox.
+    None,
+    MacosSeatbelt,
+    LinuxSeccomp,
+    WindowsRestrictedToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +417,8 @@ pub struct TerminateResponse {
 #[serde(rename_all = "camelCase")]
 pub struct FsReadFileParams {
     pub path: PathUri,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -353,6 +472,8 @@ pub struct FsCloseResponse {}
 pub struct FsWriteFileParams {
     pub path: PathUri,
     pub data_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -365,6 +486,8 @@ pub struct FsWriteFileResponse {}
 pub struct FsCreateDirectoryParams {
     pub path: PathUri,
     pub recursive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -376,6 +499,8 @@ pub struct FsCreateDirectoryResponse {}
 #[serde(rename_all = "camelCase")]
 pub struct FsGetMetadataParams {
     pub path: PathUri,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -440,6 +565,8 @@ pub struct FsRemoveParams {
     pub path: PathUri,
     pub recursive: Option<bool>,
     pub force: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -475,6 +602,9 @@ pub struct CapabilityRootDiscoverRequest {
     pub id: String,
     /// Absolute root URI interpreted using the exec-server host's path rules.
     pub path: PathUri,
+    /// Filesystem permissions for this root and its symlink targets.
+    #[serde(default)]
+    pub sandbox: Option<FileSystemSandboxContext>,
 }
 
 /// Executor-local discovery results in request order.
@@ -539,6 +669,7 @@ pub struct CapabilityRootDiscovery {
 #[derive(Clone, Debug)]
 pub struct ExecutorCapabilityDiscoverySnapshot {
     roots: Arc<[ExecutorCapabilityDiscoverySnapshotEntry]>,
+    sandbox_contexts: Arc<HashMap<String, FileSystemSandboxContext>>,
 }
 
 #[derive(Clone, Debug)]
@@ -551,6 +682,7 @@ impl ExecutorCapabilityDiscoverySnapshot {
     pub fn new(
         selected_roots: &[SelectedCapabilityRoot],
         discoveries: Vec<Result<Arc<CapabilityRootDiscovery>, String>>,
+        sandbox_contexts: HashMap<String, FileSystemSandboxContext>,
     ) -> Self {
         debug_assert_eq!(selected_roots.len(), discoveries.len());
         Self {
@@ -565,11 +697,16 @@ impl ExecutorCapabilityDiscoverySnapshot {
                     },
                 )
                 .collect(),
+            sandbox_contexts: Arc::new(sandbox_contexts),
         }
     }
 
     pub fn roots(&self) -> &[ExecutorCapabilityDiscoverySnapshotEntry] {
         &self.roots
+    }
+
+    pub fn sandbox_contexts(&self) -> &HashMap<String, FileSystemSandboxContext> {
+        self.sandbox_contexts.as_ref()
     }
 }
 
@@ -579,8 +716,11 @@ impl ExecutorCapabilityDiscoverySnapshot {
 pub struct HttpHeader {
     /// Header name as it appears on the HTTP wire.
     pub name: String,
-    /// Header value after UTF-8 conversion.
+    /// Literal header value, or prefix for an executor-local environment value.
     pub value: String,
+    /// Environment variable resolved by the process that sends the HTTP request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_env_var: Option<String>,
 }
 
 /// Redirect behavior for an executor-side HTTP request.
@@ -733,9 +873,11 @@ mod tests {
     use super::EnvironmentInfo;
     use super::ExecExitedNotification;
     use super::ExecParams;
+    use super::ExecResponse;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
     use super::ProcessId;
+    use super::ProcessSandboxType;
     use super::ShellInfo;
     use codex_file_system::FileSystemSandboxContext;
     use codex_network_proxy::ManagedNetworkSandboxContext;
@@ -743,11 +885,14 @@ mod tests {
     use codex_network_proxy::NetworkProxyConfig;
     use codex_network_proxy::RemoteNetworkProxyConfig;
     use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
+    use codex_protocol::config_types::WindowsSandboxProxySettingsMode;
+    use codex_protocol::models::ManagedFileSystemPermissions;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
     use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
@@ -763,6 +908,7 @@ mod tests {
             argv: vec!["true".to_string()],
             cwd,
             env_policy: None,
+            shell_snapshot: None,
             env: HashMap::new(),
             tty: false,
             pipe_stdin: false,
@@ -835,9 +981,118 @@ mod tests {
                     path: "/bin/zsh".to_string(),
                 },
                 cwd: None,
+                user_home_dir: None,
+                platform_os: None,
+                temporary_directories: None,
+                temp_dir: None,
                 capabilities: EnvironmentCapabilities::default(),
             }
         );
+    }
+
+    #[test]
+    fn environment_capabilities_accept_legacy_response_without_environment_config_read() {
+        let capabilities: EnvironmentCapabilities = serde_json::from_value(serde_json::json!({
+            "networkProxyLaunch": true,
+            "capabilityDiscoverySandbox": true,
+        }))
+        .expect("legacy environment capabilities should deserialize");
+
+        assert_eq!(
+            capabilities,
+            EnvironmentCapabilities {
+                network_proxy_launch: true,
+                capability_discovery_sandbox: true,
+                environment_config_read: false,
+                http_header_env_vars: false,
+                sandboxed_file_streaming: false,
+                shell_snapshot_v2: false,
+            }
+        );
+    }
+
+    #[test]
+    fn environment_info_preserves_executor_temporary_directories() {
+        let expected = serde_json::json!({
+            "shell": { "name": "powershell", "path": "powershell.exe" },
+            "cwd": null,
+            "userHomeDir": "file:///C:/Users/remote",
+            "platformOs": "windows",
+            "temporaryDirectories": ["file:///C:/Temp", "file:///D:/Temp"],
+            "capabilities": {
+                "networkProxyLaunch": false,
+                "capabilityDiscoverySandbox": false,
+                "environmentConfigRead": false,
+                "httpHeaderEnvVars": false,
+                "sandboxedFileStreaming": false,
+                "shellSnapshotV2": false,
+            },
+        });
+        let info: EnvironmentInfo = serde_json::from_value(expected.clone())
+            .expect("environment info with executor temporary directories should deserialize");
+
+        assert_eq!(
+            serde_json::to_value(info).expect("environment info should serialize"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn local_environment_info_reads_platform_temporary_directories() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let names: &[&str] = if cfg!(windows) {
+            &["TEMP", "TMP"]
+        } else {
+            &["TMPDIR"]
+        };
+        let mut expected = names
+            .iter()
+            .filter_map(std::env::var_os)
+            .filter(|path| !path.is_empty())
+            .filter(|path| cfg!(unix) || std::path::Path::new(path).is_absolute())
+            .filter_map(|path| {
+                PathUri::from_host_native_path(&path).ok().or_else(|| {
+                    if cfg!(unix) {
+                        PathUri::from_host_native_path(cwd.join(path)).ok()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        expected.dedup();
+
+        let info = EnvironmentInfo::local();
+        assert_eq!(info.temporary_directories, Some(expected));
+        assert_eq!(info.user_home_dir, PathUri::from_host_native_path("~").ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_environment_info_resolves_relative_temporary_directory() {
+        if std::env::var_os("CODEX_TEST_RELATIVE_TMPDIR").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg(
+                    "protocol::tests::local_environment_info_resolves_relative_temporary_directory",
+                )
+                .env("CODEX_TEST_RELATIVE_TMPDIR", "1")
+                .env("TMPDIR", "relative-temp")
+                .status()
+                .expect("run relative TMPDIR subprocess");
+            assert!(status.success(), "relative TMPDIR subprocess failed");
+            return;
+        }
+
+        let expected = PathUri::from_host_native_path(
+            std::env::current_dir()
+                .expect("current directory")
+                .join("relative-temp"),
+        )
+        .expect("absolute temporary directory URI");
+        let info = EnvironmentInfo::local();
+        assert_eq!(info.temporary_directories, Some(vec![expected.clone()]));
+        assert_eq!(info.temp_dir, Some(expected));
     }
 
     #[test]
@@ -871,15 +1126,97 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_protocol_round_trips_permission_paths_as_uris() {
+    fn filesystem_protocol_round_trips_permission_entries() {
+        let native_cwd = std::env::current_dir().expect("current directory");
+        let cwd = PathUri::from_host_native_path(&native_cwd).expect("cwd URI");
+        let file_system = ManagedFileSystemPermissions::Restricted {
+            entries: vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Path { path: cwd.clone() },
+                    access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
+                },
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Path {
+                        path: PathUri::from_host_native_path(native_cwd.join(".git"))
+                            .expect("absolute path"),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::ProjectRoots {
+                            subpath: Some(".codex".into()),
+                        },
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+            ],
+            glob_scan_max_depth: Some(2.try_into().expect("non-zero depth")),
+        };
+        let permissions = PermissionProfile::Managed {
+            file_system,
+            network: NetworkSandboxPolicy::Restricted,
+        };
+        let mut sandbox =
+            FileSystemSandboxContext::from_permission_profile_with_cwd(permissions, cwd.clone());
+        sandbox.user_home_dir = Some(cwd.clone());
+
+        let serialized = serde_json::to_value(&sandbox).expect("serialize sandbox");
+
+        assert_eq!(
+            serialized["userHomeDir"],
+            serde_json::json!(cwd.to_string())
+        );
+        assert_eq!(
+            serialized["permissions"]["file_system"]["entries"][0]["path"]["path"],
+            serde_json::json!(cwd.to_string())
+        );
+        assert_eq!(
+            serialized["permissions"]["file_system"]["entries"][1]["path"]["type"],
+            serde_json::json!("path")
+        );
+        assert_eq!(
+            serialized["permissions"]["file_system"]["entries"][1]["missing_path_behavior"],
+            serde_json::json!("skip")
+        );
+        assert_eq!(
+            serialized["permissions"]["file_system"]["entries"][2]["path"]["type"],
+            serde_json::json!("special")
+        );
+        assert_eq!(
+            serialized["permissions"]["file_system"]["entries"][2]["missing_path_behavior"],
+            serde_json::json!("skip")
+        );
+        assert!(!serialized.to_string().contains("generated_default_path"));
+        assert!(!serialized.to_string().contains("generated_default_special"));
+        assert_eq!(
+            serde_json::from_value::<FileSystemSandboxContext>(serialized)
+                .expect("deserialize sandbox"),
+            sandbox
+        );
+        let preserve = FileSystemSandboxContext {
+            windows_sandbox_proxy_settings_mode: Some(WindowsSandboxProxySettingsMode::Preserve),
+            ..sandbox
+        };
+        let serialized = serde_json::to_value(&preserve).expect("serialize preserve mode");
+        assert_eq!(serialized["windowsSandboxProxySettingsMode"], "preserve");
+        assert_eq!(
+            serde_json::from_value::<FileSystemSandboxContext>(serialized)
+                .expect("deserialize preserve mode"),
+            preserve
+        );
+    }
+
+    #[test]
+    fn filesystem_protocol_round_trips_legacy_policy_paths_as_uris() {
         let native_cwd = std::env::current_dir().expect("current directory");
         let cwd = PathUri::from_host_native_path(&native_cwd).expect("cwd URI");
         let mut file_system_policy =
             FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: native_cwd.try_into().expect("absolute cwd"),
-                },
+                path: FileSystemPath::Path { path: cwd.clone() },
                 access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
             }]);
         file_system_policy.glob_scan_max_depth = Some(2);
         let permissions = PermissionProfile::from_runtime_permissions(
@@ -952,5 +1289,23 @@ mod tests {
         .expect("legacy exited notification should deserialize");
 
         assert_eq!(notification.sandbox_denied, None);
+    }
+
+    #[test]
+    fn exec_response_distinguishes_unknown_from_explicitly_unsandboxed() {
+        let unknown: ExecResponse = serde_json::from_value(serde_json::json!({
+            "processId": "legacy",
+        }))
+        .expect("legacy response should deserialize");
+        let unsandboxed: ExecResponse = serde_json::from_value(serde_json::json!({
+            "processId": "current",
+            "sandboxType": "none",
+        }))
+        .expect("explicitly unsandboxed response should deserialize");
+
+        assert_eq!(
+            (unknown.sandbox_type, unsandboxed.sandbox_type),
+            (None, Some(ProcessSandboxType::None))
+        );
     }
 }

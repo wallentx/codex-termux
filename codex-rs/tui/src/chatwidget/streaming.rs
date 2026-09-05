@@ -20,15 +20,27 @@ impl ChatWidget {
     }
 
     pub(super) fn flush_answer_stream_with_separator(&mut self) {
+        self.flush_answer_stream(/*completed_message*/ None);
+    }
+
+    fn flush_answer_stream(&mut self, completed_message: Option<&str>) {
         let had_stream_controller = self.stream_controller.is_some();
         if let Some(mut controller) = self.stream_controller.take() {
-            let scrollback_reflow = if controller.has_live_tail() {
+            let had_live_tail = controller.has_live_tail();
+            self.clear_active_stream_tail();
+            let (cell, streamed_source) = controller.finalize();
+            let completed_message_differs = completed_message.is_some_and(|completed| {
+                let Some(streamed) = streamed_source.as_deref() else {
+                    return true;
+                };
+                // Stream finalization supplies one trailing newline when the last delta omitted it.
+                streamed != completed && streamed.strip_suffix('\n') != Some(completed)
+            });
+            let scrollback_reflow = if had_live_tail || completed_message_differs {
                 crate::app_event::ConsolidationScrollbackReflow::Required
             } else {
                 crate::app_event::ConsolidationScrollbackReflow::IfResizeReflowRan
             };
-            self.clear_active_stream_tail();
-            let (cell, source) = controller.finalize();
             // Match newline-committed streaming behavior: once assistant output is ready to be
             // committed into history, hide the inline status row so transcript content replaces it.
             if cell.is_some() {
@@ -45,9 +57,12 @@ impl ChatWidget {
                 };
             // Consolidate the run of streaming AgentMessageCells into a single AgentMarkdownCell
             // that can re-render from source on resize.
+            let source = completed_message.map(str::to_owned).or_else(|| {
+                streamed_source.map(|source| {
+                    parse_assistant_markdown(&source, self.config.cwd.as_path()).visible_markdown
+                })
+            });
             if let Some(source) = source {
-                let source =
-                    parse_assistant_markdown(&source, self.config.cwd.as_path()).visible_markdown;
                 let inline_visualization_context = self.thread_id.and_then(|thread_id| {
                     crate::inline_visualization::InlineVisualizationContext::from_config(
                         &self.config,
@@ -110,15 +125,15 @@ impl ChatWidget {
     }
 
     pub(super) fn finalize_completed_assistant_message(&mut self, message: Option<&str>) {
-        // If we have a stream_controller, the finalized message payload is redundant because the
-        // visible content has already been accumulated through deltas.
         if self.stream_controller.is_none()
             && let Some(message) = message
             && !message.is_empty()
         {
             self.handle_streaming_delta(message.to_string());
         }
-        self.flush_answer_stream_with_separator();
+        // Item completion is authoritative. Use it for consolidation so any
+        // deltas dropped by a saturated transport cannot truncate the transcript.
+        self.flush_answer_stream(message);
         self.handle_stream_finished();
         self.request_redraw();
     }
@@ -159,14 +174,17 @@ impl ChatWidget {
     }
 
     pub(super) fn on_plan_item_completed(&mut self, text: String) {
-        let streamed_plan = self.transcript.plan_delta_buffer.trim().to_string();
-        let plan_text = if text.trim().is_empty() {
-            streamed_plan
+        let (plan_text, source) = if text.trim().is_empty() {
+            (
+                self.transcript.plan_delta_buffer.trim().to_string(),
+                self.transcript.plan_delta_buffer.clone(),
+            )
         } else {
-            text
+            (text.clone(), text)
         };
         if !plan_text.trim().is_empty() {
-            self.record_agent_markdown(&plan_text);
+            self.transcript
+                .record_agent_markdown(plan_text.clone(), source);
             self.transcript.latest_proposed_plan_markdown = Some(plan_text.clone());
         }
         // Plan commit ticks can hide the status row; remember whether we streamed plan output so
@@ -301,8 +319,10 @@ impl ChatWidget {
     pub(super) fn on_agent_message_item_completed(
         &mut self,
         item: AgentMessageItem,
+        turn_id: &str,
         from_replay: bool,
     ) {
+        self.transcript.last_completed_agent_message = Some((turn_id.to_string(), item.id.clone()));
         let mut message = String::new();
         for content in &item.content {
             match content {
@@ -310,26 +330,30 @@ impl ChatWidget {
             }
         }
         let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
-        self.finalize_completed_assistant_message(
-            (!parsed.visible_markdown.is_empty()).then_some(parsed.visible_markdown.as_str()),
-        );
+        self.finalize_completed_assistant_message(Some(parsed.visible_markdown.as_str()));
         if matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
             && !parsed.visible_markdown.is_empty()
         {
-            self.record_agent_markdown(&parsed.visible_markdown);
+            self.transcript
+                .record_agent_markdown(parsed.visible_markdown.clone(), message);
         }
         if !from_replay
             && let Some(cwd) = parsed.last_created_branch_cwd()
             && let Some(thread_id) = self.thread_id
             && let Some(runner) = self.workspace_command_runner.clone()
         {
-            let cwd = PathBuf::from(cwd);
+            let branch_cwd = PathBuf::from(cwd);
+            let cwd = self.config.cwd.to_path_buf();
             let tx = self.app_event_tx.clone();
             tokio::spawn(async move {
                 if let Some(branch) =
-                    crate::branch_summary::current_branch_name(runner.as_ref(), &cwd).await
+                    crate::branch_summary::current_branch_name(runner.as_ref(), &branch_cwd).await
                 {
-                    tx.send(AppEvent::SyncThreadGitBranch { thread_id, branch });
+                    tx.send(AppEvent::SyncThreadGitBranch {
+                        thread_id,
+                        branch,
+                        cwd,
+                    });
                 }
             });
         }
@@ -396,19 +420,21 @@ impl ChatWidget {
         self.interrupts = mgr;
     }
 
+    /// Move a lifecycle payload into the interrupt queue or its immediate handler.
     #[inline]
-    pub(super) fn defer_or_handle(
+    pub(super) fn defer_or_handle<T>(
         &mut self,
-        push: impl FnOnce(&mut InterruptManager),
-        handle: impl FnOnce(&mut Self),
+        payload: T,
+        push: impl FnOnce(&mut InterruptManager, T),
+        handle: impl FnOnce(&mut Self, T),
     ) {
         // Preserve deterministic FIFO across queued interrupts: once anything
         // is queued due to an active write cycle, continue queueing until the
         // queue is flushed to avoid reordering (e.g., ExecEnd before ExecBegin).
         if self.stream_controller.is_some() || !self.interrupts.is_empty() {
-            push(&mut self.interrupts);
+            push(&mut self.interrupts, payload);
         } else {
-            handle(self);
+            handle(self, payload);
         }
     }
 

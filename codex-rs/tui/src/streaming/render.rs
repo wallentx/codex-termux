@@ -3,12 +3,14 @@
 //! Completed top-level blocks are retained while the final block stays mutable, avoiding repeated
 //! rendering of the stable prefix as newline-bearing deltas arrive.
 
+use super::code_fence::OpenCodeFence;
 use crate::history_cell::HistoryRenderMode;
 use crate::history_cell::raw_lines_from_source;
-use crate::inline_visualization::DIRECTIVE_PREFIX;
 use crate::inline_visualization::InlineVisualizationContext;
+use crate::inline_visualization::contains_inline_visualization;
 use crate::markdown::render_markdown_agent_with_links_cwd_and_visualizations;
 use crate::markdown::render_streaming_markdown_agent_with_links_and_cwd;
+use crate::render::highlight::syntax_theme_revision;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use ratatui::text::Line;
@@ -26,6 +28,10 @@ pub(super) struct StreamingRender {
     stable_rendered_len: usize,
     /// Reference-style link definitions can affect any earlier or later markdown block.
     has_reference_link_definition: bool,
+    /// Inline visualization directives require source-wide rewriting once one is committed.
+    has_inline_visualization_directive: bool,
+    /// Parser state for a directly appendable, open top-level code fence.
+    open_code_fence: Option<OpenCodeFence>,
 }
 
 impl StreamingRender {
@@ -35,6 +41,8 @@ impl StreamingRender {
             stable_source_len: 0,
             stable_rendered_len: 0,
             has_reference_link_definition: false,
+            has_inline_visualization_directive: false,
+            open_code_fence: None,
         }
     }
 
@@ -43,6 +51,8 @@ impl StreamingRender {
         self.stable_source_len = 0;
         self.stable_rendered_len = 0;
         self.has_reference_link_definition = false;
+        self.has_inline_visualization_directive = false;
+        self.open_code_fence = None;
     }
 
     /// Re-render the full source and reset both stable-prefix boundaries.
@@ -57,8 +67,10 @@ impl StreamingRender {
         render_mode: HistoryRenderMode,
         inline_visualization_context: Option<&InlineVisualizationContext>,
     ) {
+        self.open_code_fence = None;
+        self.has_inline_visualization_directive = contains_inline_visualization(source);
         self.lines = match (render_mode, inline_visualization_context) {
-            (HistoryRenderMode::Rich, None) if !source.contains(DIRECTIVE_PREFIX) => {
+            (HistoryRenderMode::Rich, None) if !self.has_inline_visualization_directive => {
                 let rendered =
                     render_streaming_markdown_agent_with_links_and_cwd(source, width, Some(cwd));
                 self.has_reference_link_definition = rendered.has_reference_link_definition;
@@ -102,7 +114,8 @@ impl StreamingRender {
             return;
         }
 
-        if inline_visualization_context.is_some() || raw_source.contains(DIRECTIVE_PREFIX) {
+        self.has_inline_visualization_directive |= contains_inline_visualization(committed_source);
+        if self.has_inline_visualization_directive {
             self.recompute(
                 raw_source,
                 width,
@@ -124,7 +137,16 @@ impl StreamingRender {
             return;
         }
 
+        if let Some(fence) = self.open_code_fence.take()
+            && let Some((fence, lines)) = fence.append(raw_source, committed_source)
+        {
+            self.lines.extend(lines);
+            self.open_code_fence = Some(fence);
+            return;
+        }
+
         let pending_source = &raw_source[self.stable_source_len..];
+        let theme_revision = syntax_theme_revision();
         let pending =
             render_streaming_markdown_agent_with_links_and_cwd(pending_source, width, Some(cwd));
         if pending.has_reference_link_definition {
@@ -138,6 +160,13 @@ impl StreamingRender {
             );
             return;
         }
+
+        let final_block_start = pending.last_top_level_block_start.unwrap_or(/*default*/ 0);
+        self.open_code_fence = OpenCodeFence::detect(
+            &pending_source[final_block_start..],
+            raw_source.len(),
+            theme_revision,
+        );
 
         let mut newly_stable_rendered_len = None;
         if let Some(boundary) = pending.last_top_level_block_start {

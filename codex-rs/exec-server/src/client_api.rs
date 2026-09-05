@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_http_client::HttpClientFactory;
 use futures::future::BoxFuture;
-use futures::future::Shared;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use crate::ExecServerError;
 use crate::HttpRequestParams;
@@ -33,6 +33,7 @@ pub struct RemoteExecServerConnectArgs {
     pub connect_timeout: Duration,
     pub initialize_timeout: Duration,
     pub resume_session_id: Option<String>,
+    pub http_client_factory: HttpClientFactory,
 }
 
 /// Registry-authorized material for one Noise rendezvous connection attempt.
@@ -61,6 +62,7 @@ pub struct NoiseRendezvousConnectArgs {
     pub connect_timeout: Duration,
     pub initialize_timeout: Duration,
     pub resume_session_id: Option<String>,
+    pub http_client_factory: HttpClientFactory,
 }
 
 /// Supplies fresh registry-authorized material for Noise rendezvous connections.
@@ -90,7 +92,7 @@ pub(crate) struct StdioExecServerCommand {
     pub cwd: Option<PathBuf>,
 }
 
-pub(crate) type DeferredEnvironmentReadiness = Shared<oneshot::Receiver<Result<(), String>>>;
+pub(crate) type DeferredEnvironmentReadiness = watch::Receiver<Option<Result<(), String>>>;
 
 #[derive(Clone)]
 pub(crate) struct Deferred<T> {

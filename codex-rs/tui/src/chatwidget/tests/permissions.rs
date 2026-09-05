@@ -20,28 +20,33 @@ fn app_server_workspace_write_profile(extra_root: AbsolutePathBuf) -> Permission
                         value: FileSystemSpecialPath::Root,
                     },
                     access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
                         value: FileSystemSpecialPath::ProjectRoots { subpath: None },
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
                         value: FileSystemSpecialPath::SlashTmp,
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
                         value: FileSystemSpecialPath::Tmpdir,
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
-                    path: FileSystemPath::Path { path: extra_root },
+                    path: extra_root.into(),
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
             ],
             glob_scan_max_depth: None,
@@ -55,13 +60,16 @@ fn windows_sandbox_requirements_stack(
     let requirements_toml = codex_config::ConfigRequirementsToml {
         windows: Some(codex_config::WindowsRequirementsToml {
             allowed_sandbox_implementations: Some(allowed_sandbox_implementations),
+            sandbox_private_desktop: None,
         }),
         ..Default::default()
     };
     requirements_stack(requirements_toml)
 }
 
-fn requirements_stack(requirements_toml: codex_config::ConfigRequirementsToml) -> ConfigLayerStack {
+pub(super) fn requirements_stack(
+    requirements_toml: codex_config::ConfigRequirementsToml,
+) -> ConfigLayerStack {
     let mut requirements_with_sources = codex_config::ConfigRequirementsWithSources::default();
     requirements_with_sources
         .merge_unset_fields(RequirementSource::Unknown, requirements_toml.clone());
@@ -358,12 +366,14 @@ async fn preset_matching_does_not_treat_non_cwd_writable_profile_as_read_only() 
                         value: FileSystemSpecialPath::Root,
                     },
                     access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Path {
-                        path: test_path_buf("/tmp/writable").abs(),
+                        path: test_path_buf("/tmp/writable").abs().into(),
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
             ],
             glob_scan_max_depth: None,
@@ -515,6 +525,102 @@ async fn windows_sandbox_required_enable_prompt_reopens_on_cancel_when_unelevate
 }
 
 #[tokio::test]
+async fn fragmented_terminal_response_cannot_select_non_admin_windows_sandbox() {
+    for use_fallback_prompt in [false, true] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let preset = builtin_approval_presets()
+            .into_iter()
+            .find(|preset| preset.id == "auto")
+            .expect("auto preset");
+
+        if use_fallback_prompt {
+            chat.open_windows_sandbox_fallback_prompt(preset, /*profile_selection*/ None);
+        } else {
+            chat.open_windows_sandbox_enable_prompt(preset, /*profile_selection*/ None);
+        }
+
+        for character in "20;rgb:2222/ffff/ffff".chars() {
+            chat.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+            assert!(
+                !matches!(
+                    rx.try_recv(),
+                    Ok(AppEvent::BeginWindowsSandboxLegacySetup { .. })
+                ),
+                "a fragmented terminal response must not choose the non-admin sandbox"
+            );
+        }
+
+        assert!(chat.has_active_view());
+        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::BeginWindowsSandboxLegacySetup { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn fragmented_terminal_response_cannot_acknowledge_world_writable_warning() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.open_world_writable_warning_confirmation(
+        /*preset*/ None,
+        /*profile_selection*/ None,
+        Vec::new(),
+        /*extra_count*/ 0,
+        /*failed_scan*/ true,
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert!(chat.has_active_view());
+    assert!(rx.try_recv().is_err());
+
+    for character in "20;rgb:2222/ffff/ffff".chars() {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        assert!(
+            !matches!(
+                rx.try_recv(),
+                Ok(AppEvent::UpdateWorldWritableWarningAcknowledged(_)
+                    | AppEvent::PersistWorldWritableWarningAcknowledged)
+            ),
+            "a fragmented terminal response must not acknowledge the world-writable warning"
+        );
+    }
+
+    assert!(chat.has_active_view());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::UpdateWorldWritableWarningAcknowledged(true))
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::PersistWorldWritableWarningAcknowledged)
+    ));
+}
+
+#[tokio::test]
+async fn windows_sandbox_setup_starts_a_fresh_status_clock() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.bottom_pane
+        .reset_status_timer(Duration::from_secs(/*secs*/ 125));
+
+    chat.show_windows_sandbox_setup_status();
+    let setup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(setup.contains("Setting up sandbox"));
+    assert!(setup.contains("(0s"));
+    assert_chatwidget_snapshot!(
+        "windows_sandbox_setup_fresh_clock",
+        setup.replace(&chat.config.cwd.display().to_string(), "[CWD]")
+    );
+
+    chat.clear_windows_sandbox_setup_status();
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    let working = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(working.contains("Working"));
+    assert!(!working.contains("Setting up sandbox"));
+}
+
+#[tokio::test]
 async fn required_windows_sandbox_setup_defers_configured_initial_prompt() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let initial_prompt = "fix required sandbox startup".to_string();
@@ -627,7 +733,6 @@ async fn approvals_popup_shows_disabled_presets() {
     let height = chat.desired_height(width);
     let mut terminal =
         ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("render approvals popup");

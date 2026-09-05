@@ -3,20 +3,24 @@
 use std::sync::Arc;
 
 use crate::app_server_session::AppServerSession;
+use crate::app_server_session::HistoryHydrationScope;
 use crate::git_action_directives::parse_assistant_markdown;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
+use crate::history_cell::PrefixedWrappedHistoryCell;
 use crate::history_cell::ReasoningSummaryCell;
 use crate::history_cell::UserHistoryCell;
 use crate::history_cell::split_reasoning_summary_parts;
 use crate::inline_visualization::InlineVisualizationContext;
+use crate::legacy_core::config::Config;
 use crate::multi_agents::sub_agent_activity_summary;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::ThreadId;
 use codex_protocol::items::UserMessageItem;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use ratatui::style::Stylize as _;
 use ratatui::text::Line;
 
@@ -32,32 +36,63 @@ pub(crate) async fn load_session_transcript(
     app_server: &mut AppServerSession,
     thread_id: ThreadId,
     raw_reasoning_visibility: RawReasoningVisibility,
-    codex_home: Option<&std::path::Path>,
+    config: Option<&Config>,
 ) -> std::io::Result<TranscriptCells> {
-    let thread = app_server
-        .thread_read(thread_id, /*include_turns*/ true)
+    let mut thread = app_server
+        .thread_read(thread_id, /*include_turns*/ false)
+        .await
+        .map_err(std::io::Error::other)?;
+    app_server
+        .hydrate_initial_thread_history(
+            &mut thread,
+            /*turn_cursor*/ None,
+            /*item_cursor*/ None,
+            /*config*/ None,
+            HistoryHydrationScope::Complete,
+        )
         .await
         .map_err(std::io::Error::other)?;
     Ok(thread_to_transcript_cells(
-        &thread,
+        thread,
         raw_reasoning_visibility,
-        codex_home,
+        config,
     ))
 }
 
 pub(crate) fn thread_to_transcript_cells(
-    thread: &Thread,
+    thread: Thread,
     raw_reasoning_visibility: RawReasoningVisibility,
-    codex_home: Option<&std::path::Path>,
+    config: Option<&Config>,
 ) -> TranscriptCells {
-    let cwd = thread.cwd.as_path();
-    let inline_visualization_context = codex_home.and_then(|codex_home| {
-        ThreadId::from_string(&thread.id)
-            .ok()
-            .and_then(|thread_id| InlineVisualizationContext::new(codex_home, thread_id))
+    let cwd = thread.cwd;
+    let thread_id = ThreadId::from_string(&thread.id).ok();
+    let mut cells = thread_items_to_transcript_cells(
+        thread_id,
+        &cwd,
+        thread.turns.into_iter().flat_map(|turn| turn.items),
+        raw_reasoning_visibility,
+        config,
+    );
+    if cells.is_empty() {
+        cells.push(Arc::new(PlainHistoryCell::new(vec![
+            "No transcript content available".italic().dim().into(),
+        ])));
+    }
+    cells
+}
+
+pub(crate) fn thread_items_to_transcript_cells(
+    thread_id: Option<ThreadId>,
+    cwd: &AbsolutePathBuf,
+    items: impl IntoIterator<Item = ThreadItem>,
+    raw_reasoning_visibility: RawReasoningVisibility,
+    config: Option<&Config>,
+) -> TranscriptCells {
+    let inline_visualization_context = config.and_then(|config| {
+        thread_id.and_then(|thread_id| InlineVisualizationContext::from_config(config, thread_id))
     });
     let mut cells: TranscriptCells = Vec::new();
-    for item in thread.turns.iter().flat_map(|turn| turn.items.iter()) {
+    for item in items {
         match item {
             ThreadItem::UserMessage {
                 id,
@@ -76,11 +111,10 @@ pub(crate) fn thread_to_transcript_cells(
                     );
                 }
                 let item = UserMessageItem {
-                    id: id.clone(),
-                    client_id: client_id.clone(),
+                    id,
+                    client_id,
                     content: content
-                        .iter()
-                        .cloned()
+                        .into_iter()
                         .map(codex_app_server_protocol::UserInput::into_core)
                         .collect(),
                 };
@@ -92,20 +126,40 @@ pub(crate) fn thread_to_transcript_cells(
                 }));
             }
             ThreadItem::AgentMessage { text, .. } => {
-                let parsed = parse_assistant_markdown(text, cwd);
+                let parsed = parse_assistant_markdown(&text, cwd.as_path());
                 if !parsed.visible_markdown.trim().is_empty() {
                     cells.push(Arc::new(AgentMarkdownCell::new_with_inline_visualizations(
                         parsed.visible_markdown,
-                        cwd,
+                        cwd.as_path(),
                         inline_visualization_context.clone(),
+                    )));
+                }
+            }
+            ThreadItem::FunctionCallOutput {
+                name,
+                namespace,
+                output,
+                ..
+            } => {
+                if let Some((source_thread_id, prompt)) =
+                    crate::dynamic_tools::parse_delegated_tool_output(
+                        &name,
+                        namespace.as_deref(),
+                        &output,
+                    )
+                {
+                    cells.push(Arc::new(PrefixedWrappedHistoryCell::new(
+                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
+                        "• ".dim(),
+                        "  ",
                     )));
                 }
             }
             ThreadItem::Plan { text, .. } => {
                 if !text.trim().is_empty() {
                     cells.push(Arc::new(crate::history_cell::new_proposed_plan(
-                        text.clone(),
-                        cwd,
+                        text,
+                        cwd.as_path(),
                     )));
                 }
             }
@@ -118,25 +172,23 @@ pub(crate) fn thread_to_transcript_cells(
                     {
                         ("Reasoning".to_string(), content.join("\n\n"))
                     } else {
-                        split_reasoning_summary_parts(summary)
+                        split_reasoning_summary_parts(&summary)
                     };
                 if !text.trim().is_empty() {
                     cells.push(Arc::new(ReasoningSummaryCell::new(
-                        header, text, cwd, /*transcript_only*/ false,
+                        header,
+                        text,
+                        cwd.as_path(),
+                        /*transcript_only*/ false,
                     )));
                 }
             }
             other => {
-                if let Some(cell) = fallback_transcript_cell(other) {
+                if let Some(cell) = fallback_transcript_cell(&other) {
                     cells.push(Arc::new(cell));
                 }
             }
         }
-    }
-    if cells.is_empty() {
-        cells.push(Arc::new(PlainHistoryCell::new(vec![
-            "No transcript content available".italic().dim().into(),
-        ])));
     }
     cells
 }
@@ -250,6 +302,7 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
         }
         ThreadItem::UserMessage { .. }
         | ThreadItem::AgentMessage { .. }
+        | ThreadItem::FunctionCallOutput { .. }
         | ThreadItem::Plan { .. }
         | ThreadItem::Reasoning { .. }
         | ThreadItem::Sleep(_) => return None,

@@ -2,10 +2,14 @@ use super::*;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::HistoryRenderMode;
+use crate::keymap::RuntimeKeymap;
+use crate::pager_overlay::TranscriptOverlay;
 use crate::streaming::controller::StreamController;
 use pretty_assertions::assert_eq;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::style::Stylize;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 fn context_with_fragment(fragment: &str) -> (TempDir, InlineVisualizationContext) {
@@ -45,6 +49,28 @@ fn line_text(line: &ratatui::text::Line<'_>) -> String {
         .iter()
         .map(|span| span.content.as_ref())
         .collect()
+}
+
+fn buffer_to_text(buffer: &Buffer, width: u16) -> String {
+    buffer
+        .content
+        .chunks(usize::from(width))
+        .map(|row| {
+            row.iter()
+                .map(|cell| {
+                    let symbol = cell.symbol();
+                    symbol
+                        .strip_prefix("\x1b]8;;")
+                        .and_then(|symbol| symbol.split_once('\x07'))
+                        .and_then(|(_, symbol)| symbol.strip_suffix("\x1b]8;;\x07"))
+                        .unwrap_or(symbol)
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -95,6 +121,41 @@ fn hides_incomplete_streaming_directive() {
 
     assert_eq!(rewritten.markdown, "Before\n");
     assert!(rewritten.trusted_file_links.is_empty());
+}
+
+#[test]
+fn hides_incomplete_streaming_content_reference() {
+    for reference in [
+        "Before\n\u{e200}visualize\u{e202}{\"path\":\"/tmp/chart",
+        "Before\n\u{e200}visualize\u{e202}{\"path\":\"/tmp/chart.html\"}",
+    ] {
+        let rewritten = rewrite_inline_visualizations(reference, /*context*/ None);
+
+        assert_eq!(rewritten.markdown, "Before\n");
+        assert!(rewritten.trusted_file_links.is_empty());
+    }
+}
+
+#[test]
+fn unavailable_or_invalid_content_reference_has_explicit_fallback() {
+    let (_codex_home, context) = context_with_fragment("<div>chart</div>");
+    let outside = tempfile::tempdir().expect("outside visualization directory");
+    let outside_path = outside.path().join("chart.html");
+    fs::write(&outside_path, "<div>outside</div>").expect("write outside fragment");
+
+    let references = [
+        serde_json::json!({ "path": outside_path }).to_string(),
+        serde_json::json!({ "path": "chart.html" }).to_string(),
+        "{\"path\":".to_string(),
+    ];
+
+    for payload in references {
+        let reference = format!("\u{e200}visualize\u{e202}{payload}\u{e201}");
+        assert_eq!(
+            rewrite_inline_visualizations(&reference, Some(&context)).markdown,
+            "_Visualization unavailable on this device._"
+        );
+    }
 }
 
 #[test]
@@ -183,11 +244,36 @@ fn viewer_reuses_path_and_refreshes_static_document() {
     let (_codex_home, context) = context_with_fragment("<div>first</div>");
     let first_url = context.link_for("chart.html").expect("first viewer link");
     let viewer_path = first_url.to_file_path().expect("viewer file path");
+    let original_viewer_metadata = fs::metadata(&viewer_path).expect("read viewer metadata");
     assert!(
         fs::read_to_string(&viewer_path)
             .expect("read first viewer")
             .contains("first")
     );
+
+    let reused_url = context.link_for("chart.html").expect("reused viewer link");
+
+    assert_eq!(reused_url, first_url);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&viewer_path)
+                .expect("read reused viewer metadata")
+                .ino(),
+            original_viewer_metadata.ino()
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&viewer_path)
+                .expect("read reused viewer metadata")
+                .creation_time(),
+            original_viewer_metadata.creation_time()
+        );
+    }
 
     fs::write(context.thread_dir.join("chart.html"), "<div>second</div>").expect("update fragment");
     let second_url = context.link_for("chart.html").expect("second viewer link");
@@ -201,8 +287,12 @@ fn viewer_reuses_path_and_refreshes_static_document() {
 #[test]
 fn finalized_agent_cell_replays_visualization_link() {
     let (_codex_home, context) = context_with_fragment("<div>chart</div>");
+    let fragment_path = context.thread_dir.join("chart.html");
     let cell = AgentMarkdownCell::new_with_inline_visualizations(
-        "Before\n\n::codex-inline-vis{file=\"chart.html\"}\n\nAfter".to_string(),
+        format!(
+            "Before\n\n\u{e200}visualize\u{e202}{}\u{e201}\n\nAfter",
+            serde_json::json!({ "path": fragment_path })
+        ),
         Path::new("/workspace"),
         Some(context),
     );
@@ -247,6 +337,60 @@ fn finalized_agent_cell_replays_visualization_link() {
         destinations
             .iter()
             .all(|destination| destination.starts_with("file://"))
+    );
+}
+
+#[test]
+fn transcript_overlay_remeasures_visualization_when_artifact_becomes_available() {
+    let codex_home = tempfile::tempdir().expect("temp codex home");
+    let context = InlineVisualizationContext::new(codex_home.path(), ThreadId::new())
+        .expect("UUIDv7 thread id should provide a timestamp");
+    fs::create_dir_all(&context.thread_dir).expect("create visualization directory");
+
+    let cell = AgentMarkdownCell::new_with_inline_visualizations(
+        "::codex-inline-vis{file=\"chart.html\"}".to_string(),
+        Path::new("/workspace"),
+        Some(context.clone()),
+    );
+    let mut overlay = TranscriptOverlay::new(vec![Arc::new(cell)], RuntimeKeymap::defaults().pager);
+    let area = Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 240, /*height*/ 12,
+    );
+    let mut buffer = Buffer::empty(area);
+
+    overlay.render(area, &mut buffer);
+    let unavailable = buffer_to_text(&buffer, area.width);
+    assert!(unavailable.contains("Visualization unavailable on this device"));
+
+    fs::write(context.thread_dir.join("chart.html"), "<div>chart</div>")
+        .expect("write visualization fragment");
+    overlay.insert_cell(Arc::new(AgentMarkdownCell::new(
+        "next message".to_string(),
+        Path::new("/workspace"),
+    )));
+    buffer = Buffer::empty(area);
+    overlay.render(area, &mut buffer);
+
+    let available = buffer_to_text(&buffer, area.width);
+    assert!(available.contains("Open chart visualization in the browser"));
+    assert!(
+        available.contains("file://"),
+        "viewer URL was clipped: {available:?}"
+    );
+
+    let available = available
+        .lines()
+        .map(|line| {
+            line.find("file://").map_or_else(
+                || line.to_string(),
+                |start| format!("{}file://<viewer-path>", &line[..start]),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(
+        "transcript_overlay_visualization_becomes_available",
+        format!("before:\n{unavailable}\n\nafter:\n{available}")
     );
 }
 

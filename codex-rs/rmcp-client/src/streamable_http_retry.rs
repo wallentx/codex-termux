@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_exec_server::ExecServerError;
-use reqwest::StatusCode;
+use http::StatusCode;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpError;
@@ -35,7 +35,8 @@ impl RmcpClient {
         let should_retry = match &initial_transport {
             PendingTransport::InProcess { .. } | PendingTransport::Stdio { .. } => false,
             PendingTransport::StreamableHttp { .. }
-            | PendingTransport::StreamableHttpWithOAuth { .. } => true,
+            | PendingTransport::StreamableHttpWithOAuth { .. }
+            | PendingTransport::StreamableHttpWithAccessTokenOnly { .. } => true,
         };
         let mut retry_deadline = timeout.map(|duration| Instant::now() + duration);
         let mut pending_transport = Some(initial_transport);
@@ -76,12 +77,9 @@ impl RmcpClient {
             }
             let attempt_timeout = remaining_initialize_timeout(timeout, retry_deadline)?;
 
-            match Self::connect_pending_transport(
-                transport,
-                client_service.clone(),
-                attempt_timeout,
-            )
-            .await
+            match self
+                .connect_pending_transport(transport, client_service.clone(), attempt_timeout)
+                .await
             {
                 Ok(result) => return Ok(result),
                 Err(error) if should_retry && Self::is_retryable_initialize_error(&error) => {
@@ -123,8 +121,14 @@ impl RmcpClient {
 
     fn is_retryable_client_initialize_error(error: &rmcp::service::ClientInitializeError) -> bool {
         match error {
+            rmcp::service::ClientInitializeError::LegacyFallbackFailed { fallback, .. } => {
+                Self::is_retryable_client_initialize_error(fallback)
+            }
             rmcp::service::ClientInitializeError::TransportError { error, context }
-                if context.as_ref() == "send initialize request" =>
+                if matches!(
+                    context.as_ref(),
+                    "send initialize request" | "send discover request"
+                ) =>
             {
                 error
                     .error

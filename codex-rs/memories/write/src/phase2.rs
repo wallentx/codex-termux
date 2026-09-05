@@ -11,6 +11,7 @@ use crate::runtime::SpawnedConsolidationAgent;
 use crate::sync_rollout_summaries_from_memories;
 use crate::workspace::memory_workspace_diff;
 use crate::workspace::prepare_memory_workspace;
+use crate::workspace::remove_memory_symlinks;
 use crate::workspace::reset_memory_workspace_baseline;
 use crate::workspace::validate_consolidation_artifacts;
 use crate::workspace::write_workspace_diff;
@@ -321,12 +322,13 @@ mod agent {
         agent_config.ephemeral = true;
         agent_config.memories.generate_memories = false;
         agent_config.memories.use_memories = false;
+        // Background memory work must not send user-facing completion notifications.
+        agent_config.notify = None;
         agent_config.include_apps_instructions = false;
         agent_config.mcp_servers = Constrained::allow_only(HashMap::new());
         // Approval policy
         agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
         // Consolidation runs as an internal worker and must not recursively delegate.
-        let _ = agent_config.features.disable(Feature::SpawnCsv);
         let _ = agent_config.features.disable(Feature::Collab);
         let _ = agent_config.features.disable(Feature::MemoryTool);
         let _ = agent_config.features.disable(Feature::Apps);
@@ -407,6 +409,17 @@ mod agent {
             {
                 emit_token_usage_metrics(context.as_ref(), &token_usage);
             }
+
+            if let Err(err) = context
+                .shutdown_consolidation_agent(SpawnedConsolidationAgent { thread_id, thread })
+                .await
+            {
+                warn!("failed to auto-close global memory consolidation agent {thread_id}: {err}");
+                // Keep the existing lease until it expires so another worker cannot race a
+                // consolidation agent whose shutdown has not completed.
+                return;
+            }
+
             let artifacts_valid = if agent_completed {
                 match validate_consolidation_artifacts(&memory_root).await {
                     Ok(()) => true,
@@ -468,20 +481,11 @@ mod agent {
                     }
                 }
             } else if !agent_completed {
+                if let Err(err) = remove_memory_symlinks(&memory_root).await {
+                    tracing::error!("failed removing memory workspace symbolic links: {err}");
+                }
                 job::failed(context.as_ref(), &db, &claim, "failed_agent").await;
             }
-
-            let cleanup_context = Arc::clone(&context);
-            tokio::spawn(async move {
-                if let Err(err) = cleanup_context
-                    .shutdown_consolidation_agent(SpawnedConsolidationAgent { thread_id, thread })
-                    .await
-                {
-                    warn!(
-                        "failed to auto-close global memory consolidation agent {thread_id}: {err}"
-                    );
-                }
-            });
         });
     }
 

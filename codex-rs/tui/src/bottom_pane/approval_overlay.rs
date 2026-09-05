@@ -33,13 +33,14 @@ use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
 use crate::keymap::ApprovalKeymap;
+use crate::keymap::ListAction;
 use crate::keymap::ListKeymap;
-use crate::keymap::primary_binding;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use codex_app_server_protocol::AdditionalPermissionProfile;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionApprovalKind;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileSystemAccessMode;
 use codex_app_server_protocol::FileSystemPath;
@@ -79,6 +80,7 @@ pub(crate) enum ApprovalRequest {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecApprovalRequest {
+    pub kind: CommandExecutionApprovalKind,
     pub thread_id: ThreadId,
     pub thread_label: Option<String>,
     pub id: String,
@@ -120,7 +122,7 @@ pub(crate) struct McpElicitationApprovalRequest {
 }
 
 impl ApprovalRequest {
-    fn thread_id(&self) -> ThreadId {
+    pub(super) fn thread_id(&self) -> ThreadId {
         match self {
             ApprovalRequest::Exec(request) => request.thread_id,
             ApprovalRequest::Permissions(request) => request.thread_id,
@@ -142,16 +144,16 @@ impl ApprovalRequest {
         match (self, request) {
             (
                 ApprovalRequest::Exec(request),
-                ResolvedAppServerRequest::ExecApproval { id: resolved_id },
-            ) => request.id == *resolved_id,
+                ResolvedAppServerRequest::ExecApproval { thread_id, id },
+            ) => request.thread_id.to_string() == *thread_id && request.id == *id,
             (
                 ApprovalRequest::Permissions(request),
-                ResolvedAppServerRequest::PermissionsApproval { id },
-            ) => request.call_id == *id,
+                ResolvedAppServerRequest::PermissionsApproval { thread_id, id },
+            ) => request.thread_id.to_string() == *thread_id && request.call_id == *id,
             (
                 ApprovalRequest::ApplyPatch(request),
-                ResolvedAppServerRequest::FileChangeApproval { id: resolved_id },
-            ) => request.id == *resolved_id,
+                ResolvedAppServerRequest::FileChangeApproval { thread_id, id },
+            ) => request.thread_id.to_string() == *thread_id && request.id == *id,
             (
                 ApprovalRequest::McpElicitation(request),
                 ResolvedAppServerRequest::McpElicitation {
@@ -250,23 +252,35 @@ impl ApprovalOverlay {
         list_keymap: &ListKeymap,
     ) -> (Vec<ApprovalOption>, SelectionViewParams) {
         let (options, title) = match request {
-            ApprovalRequest::Exec(request) => (
-                exec_options(
-                    &request.available_decisions,
-                    request.network_approval_context.as_ref(),
-                    request.additional_permissions.as_ref(),
-                    approval_keymap,
-                ),
-                request.network_approval_context.as_ref().map_or_else(
-                    || "Would you like to run the following command?".to_string(),
-                    |network_approval_context| {
-                        format!(
-                            "Do you want to approve network access to \"{}\"?",
-                            network_approval_context.host
-                        )
-                    },
-                ),
-            ),
+            ApprovalRequest::Exec(request) => {
+                let title = if request.kind == CommandExecutionApprovalKind::WriteStdin {
+                    request.command.get(2).map_or_else(
+                        || "Would you like to send input to the existing terminal?".to_string(),
+                        |process_id| {
+                            format!("Would you like to send input to terminal {process_id}?")
+                        },
+                    )
+                } else {
+                    request.network_approval_context.as_ref().map_or_else(
+                        || "Would you like to run the following command?".to_string(),
+                        |network_approval_context| {
+                            format!(
+                                "Do you want to approve network access to \"{}\"?",
+                                network_approval_context.host
+                            )
+                        },
+                    )
+                };
+                (
+                    exec_options(
+                        &request.available_decisions,
+                        request.network_approval_context.as_ref(),
+                        request.additional_permissions.as_ref(),
+                        approval_keymap,
+                    ),
+                    title,
+                )
+            }
             ApprovalRequest::Permissions(_) => (
                 permissions_options(approval_keymap),
                 "Would you like to grant these permissions?".to_string(),
@@ -291,7 +305,7 @@ impl ApprovalOverlay {
             .iter()
             .map(|opt| SelectionItem {
                 name: opt.label.clone(),
-                display_shortcut: opt.shortcuts.first().copied(),
+                display_shortcut: approval_keymap.hint_for_bindings(&opt.shortcuts),
                 dismiss_on_select: false,
                 ..Default::default()
             })
@@ -563,6 +577,11 @@ impl ApprovalOverlay {
 }
 
 impl BottomPaneView for ApprovalOverlay {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::Approval)
+            .with(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         if self.try_handle_shortcut(&key_event) {
             return;
@@ -619,14 +638,15 @@ fn approval_footer_hint(
     list_keymap: &ListKeymap,
 ) -> Line<'static> {
     let mut spans = accept_cancel_hint_line(
-        primary_binding(&list_keymap.accept),
+        list_keymap.primary_hint(ListAction::Accept),
         "to confirm",
-        primary_binding(&list_keymap.cancel),
+        list_keymap.primary_hint(ListAction::Cancel),
         "to cancel",
     )
     .spans;
     if request.thread_label().is_some()
-        && let Some(open_thread) = primary_binding(&approval_keymap.open_thread)
+        && let Some(open_thread) =
+            approval_keymap.primary_hint("open_thread", &approval_keymap.open_thread)
     {
         if !spans.is_empty() {
             spans.push(" or ".into());
@@ -698,13 +718,18 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
                 ]));
                 header.push(Line::from(""));
             }
-            let full_cmd = strip_bash_lc_and_escape(&request.command);
-            let mut full_cmd_lines = highlight_bash_to_lines(&full_cmd);
-            if let Some(first) = full_cmd_lines.first_mut() {
-                first.spans.insert(0, Span::from("$ "));
-            }
-            if request.network_approval_context.is_none() {
-                header.extend(full_cmd_lines);
+            if request.kind == CommandExecutionApprovalKind::WriteStdin {
+                let input = request.command.last().map_or("", String::as_str);
+                header.push(vec!["Input: ".into(), format!("{input:?}").into()].into());
+            } else {
+                let full_cmd = strip_bash_lc_and_escape(&request.command);
+                let mut full_cmd_lines = highlight_bash_to_lines(&full_cmd);
+                if let Some(first) = full_cmd_lines.first_mut() {
+                    first.spans.insert(0, Span::from("$ "));
+                }
+                if request.network_approval_context.is_none() {
+                    header.extend(full_cmd_lines);
+                }
             }
             Box::new(Paragraph::new(header).wrap(Wrap { trim: false }))
         }
@@ -736,30 +761,7 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
             }
             Box::new(Paragraph::new(header).wrap(Wrap { trim: false }))
         }
-        ApprovalRequest::ApplyPatch(request) => {
-            let mut header: Vec<Box<dyn Renderable>> = Vec::new();
-            if let Some(thread_label) = &request.thread_label {
-                header.push(Box::new(Line::from(vec![
-                    "Thread: ".into(),
-                    thread_label.clone().bold(),
-                ])));
-            }
-            if let Some(reason) = &request.reason
-                && !reason.is_empty()
-            {
-                if !header.is_empty() {
-                    header.push(Box::new(Line::from("")));
-                }
-                header.push(Box::new(
-                    Paragraph::new(Line::from_iter([
-                        "Reason: ".into(),
-                        reason.clone().italic(),
-                    ]))
-                    .wrap(Wrap { trim: false }),
-                ));
-            }
-            Box::new(ColumnRenderable::with(header))
-        }
+        ApprovalRequest::ApplyPatch(request) => super::apply_patch_header::build_header(request),
         ApprovalRequest::McpElicitation(request) => {
             let mut lines = Vec::new();
             if let Some(thread_label) = &request.thread_label {
@@ -1106,14 +1108,20 @@ fn elicitation_options(keymap: &ApprovalKeymap) -> Vec<ApprovalOption> {
 mod tests {
     use super::*;
     use crate::app_event::AppEvent;
+    use crate::keymap::RuntimeKeymap;
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
     use codex_app_server_protocol::ExecPolicyAmendment;
     use codex_app_server_protocol::NetworkApprovalProtocol;
     use codex_app_server_protocol::NetworkPolicyAmendment;
+    use codex_config::types::KeybindingSpec;
+    use codex_config::types::KeybindingsSpec;
+    use codex_config::types::TuiKeymap;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_absolute_path::test_support::PathExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
@@ -1198,6 +1206,7 @@ mod tests {
 
     fn make_exec_request() -> ApprovalRequest {
         ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".to_string(),
@@ -1240,6 +1249,58 @@ mod tests {
             request_id: RequestId::String("request-1".to_string()),
             message: "Need more information".to_string(),
         })
+    }
+
+    #[test]
+    fn approval_shortcuts_display_chords_in_configured_order() {
+        let chord = crate::key_hint::ShortcutHint::Chord {
+            prefix: key_hint::ctrl(KeyCode::Char('x')),
+            completion: key_hint::plain(KeyCode::Char('y')),
+        };
+        let single = crate::key_hint::ShortcutHint::Single(key_hint::plain(KeyCode::Char('y')));
+        let binding = |spec: &str| KeybindingSpec(spec.to_string());
+        for (specs, expected_shortcut) in [
+            (KeybindingsSpec::One(binding("ctrl-x y")), chord),
+            (
+                KeybindingsSpec::Many(vec![binding("y"), binding("ctrl-x y")]),
+                single,
+            ),
+            (
+                KeybindingsSpec::Many(vec![binding("ctrl-x y"), binding("y")]),
+                chord,
+            ),
+        ] {
+            let mut config = TuiKeymap::default();
+            config.approval.approve = Some(specs);
+            let keymap = RuntimeKeymap::from_config(&config).expect("valid approval keymap");
+            let request = make_exec_request();
+            let (_, params) = ApprovalOverlay::build_options(
+                &request,
+                build_header(&request),
+                &Features::with_defaults(),
+                &keymap.approval,
+                &keymap.list,
+            );
+            let approval = params
+                .items
+                .iter()
+                .find(|item| item.name == "Yes, proceed")
+                .expect("approval selection");
+
+            assert_eq!(approval.display_shortcut, Some(expected_shortcut));
+            if matches!(
+                expected_shortcut,
+                crate::key_hint::ShortcutHint::Chord { .. }
+            ) {
+                let dispatch_token = keymap.approval.approve.last().expect("chord token");
+                assert_eq!(
+                    keymap
+                        .approval
+                        .hint_for_bindings(std::slice::from_ref(dispatch_token)),
+                    Some(expected_shortcut)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1339,6 +1400,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
@@ -1383,6 +1445,7 @@ mod tests {
         };
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
@@ -1434,10 +1497,20 @@ mod tests {
     fn resolved_request_dismisses_overlay_without_emitting_abort() {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-        let mut view = make_overlay(make_exec_request(), tx, Features::with_defaults());
+        let request = make_exec_request();
+        let thread_id = request.thread_id();
+        let mut view = make_overlay(request, tx, Features::with_defaults());
 
         assert!(
+            !view.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: ThreadId::new().to_string(),
+                id: "test".to_string(),
+            })
+        );
+        assert!(!view.is_complete());
+        assert!(
             view.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: thread_id.to_string(),
                 id: "test".to_string(),
             })
         );
@@ -1458,6 +1531,7 @@ mod tests {
         let thread_id = ThreadId::new();
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id,
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
@@ -1493,6 +1567,7 @@ mod tests {
         keymap.approval.open_thread = vec![key_hint::plain(KeyCode::Char('x'))];
         let mut view = make_overlay_with_keymap(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id,
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
@@ -1532,6 +1607,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
@@ -1561,6 +1637,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
@@ -1614,6 +1691,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
@@ -1654,6 +1732,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let command = vec!["echo".into(), "hello".into(), "world".into()];
         let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
@@ -1955,6 +2034,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
@@ -2012,6 +2092,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
@@ -2066,12 +2147,30 @@ mod tests {
                 content: "one\ntwo\nthree\n".to_string(),
             },
         );
+        changes.insert(
+            PathBuf::from("old.txt"),
+            FileChange::Update {
+                unified_diff: String::new(),
+                move_path: Some(PathBuf::from("new.txt")),
+            },
+        );
+        #[cfg(windows)]
+        let (foreign_path, foreign_move_path) = ("/remote/old.txt", "/remote/new.txt");
+        #[cfg(not(windows))]
+        let (foreign_path, foreign_move_path) = (r"C:\workspace\old.txt", r"C:\workspace\new.txt");
+        changes.insert(
+            PathBuf::from(foreign_path),
+            FileChange::Update {
+                unified_diff: String::new(),
+                move_path: Some(PathBuf::from(foreign_move_path)),
+            },
+        );
         let request = ApprovalRequest::ApplyPatch(ApplyPatchApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: Some("Banach [worker]".to_string()),
             id: "test".to_string(),
             reason: None,
-            cwd: absolute_path("/tmp"),
+            cwd: test_path_buf("/tmp").abs(),
             changes,
         });
         let keymap = crate::keymap::RuntimeKeymap::defaults();
@@ -2084,8 +2183,34 @@ mod tests {
         );
         let rendered = render_overlay_lines(&view, /*width*/ 120);
         assert!(rendered.contains("Thread: Banach [worker]"));
+        assert!(rendered.contains("Description: Apply proposed file edits"));
+        for path in ["/tmp/bug1.txt", "/tmp/new.txt", "/tmp/old.txt"] {
+            assert!(rendered.contains(&format!("Destination: {}", test_path_buf(path).display())));
+        }
+        for path in [foreign_path, foreign_move_path] {
+            assert!(rendered.contains(&format!("Destination: {path}")));
+        }
         assert!(rendered.contains("o to open thread"));
         assert!(!rendered.contains("$ apply_patch"));
+    }
+
+    #[test]
+    fn apply_patch_prompt_without_changes_shows_unavailable_destination() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let request = ApprovalRequest::ApplyPatch(ApplyPatchApprovalRequest {
+            thread_id: ThreadId::new(),
+            thread_label: None,
+            id: "test".to_string(),
+            reason: None,
+            cwd: absolute_path("/tmp"),
+            changes: HashMap::new(),
+        });
+        let view = make_overlay(request, tx, Features::with_defaults());
+        assert_snapshot!(
+            "approval_overlay_patch_destination_unavailable",
+            normalize_snapshot_paths(render_overlay_lines(&view, /*width*/ 120))
+        );
     }
 
     #[test]
@@ -2093,6 +2218,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
@@ -2230,6 +2356,7 @@ mod tests {
         let tx = AppEventSender::new(tx_raw);
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".into(),

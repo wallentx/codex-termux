@@ -8,7 +8,6 @@ use serde::Deserialize;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::DefaultEnvironmentProvider;
-use crate::Environment;
 use crate::EnvironmentProvider;
 use crate::EnvironmentProviderFuture;
 use crate::ExecServerError;
@@ -94,19 +93,8 @@ impl TomlEnvironmentProvider {
     }
 
     async fn snapshot(&self) -> Result<EnvironmentProviderSnapshot, ExecServerError> {
-        let mut environments = Vec::with_capacity(self.environments.len());
-        for (id, transport_params) in &self.environments {
-            environments.push((
-                id.clone(),
-                Environment::remote_with_transport(
-                    transport_params.clone(),
-                    /*local_runtime_paths*/ None,
-                ),
-            ));
-        }
-
         Ok(EnvironmentProviderSnapshot {
-            environments,
+            environments: self.environments.clone(),
             default: self.default.clone(),
             include_local: self.include_local,
         })
@@ -209,16 +197,10 @@ pub(crate) fn environment_provider_from_codex_home(
     codex_home: &Path,
 ) -> Result<Box<dyn EnvironmentProvider>, ExecServerError> {
     let path = codex_home.join(ENVIRONMENTS_TOML_FILE);
-    if !path.try_exists().map_err(|err| {
-        ExecServerError::Protocol(format!(
-            "failed to inspect environment config `{}`: {err}",
-            path.display()
-        ))
-    })? {
+    let Some(environments) = load_environments_toml(&path)? else {
         return Ok(Box::new(DefaultEnvironmentProvider::from_env()));
-    }
+    };
 
-    let environments = load_environments_toml(&path)?;
     Ok(Box::new(TomlEnvironmentProvider::new_with_config_dir(
         environments,
         Some(codex_home),
@@ -307,20 +289,27 @@ fn validate_websocket_url(url: String) -> Result<String, ExecServerError> {
     Ok(url.to_string())
 }
 
-fn load_environments_toml(path: &Path) -> Result<EnvironmentsToml, ExecServerError> {
-    let contents = std::fs::read_to_string(path).map_err(|err| {
-        ExecServerError::Protocol(format!(
-            "failed to read environment config `{}`: {err}",
-            path.display()
-        ))
-    })?;
+/// Returns `None` when the config is missing; other I/O and parse failures remain errors.
+fn load_environments_toml(path: &Path) -> Result<Option<EnvironmentsToml>, ExecServerError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(ExecServerError::Protocol(format!(
+                "failed to read environment config `{}`: {err}",
+                path.display()
+            )));
+        }
+    };
 
-    toml::from_str(&contents).map_err(|err| {
-        ExecServerError::Protocol(format!(
-            "failed to parse environment config `{}`: {err}",
-            path.display()
-        ))
-    })
+    toml::from_str(&contents)
+        .map_err(|err| {
+            ExecServerError::Protocol(format!(
+                "failed to parse environment config `{}`: {err}",
+                path.display()
+            ))
+        })
+        .map(Some)
 }
 
 mod option_duration_secs {
@@ -389,8 +378,14 @@ mod tests {
 
         assert!(include_local);
         assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
-        assert!(environments["devbox"].is_remote());
-        assert!(environments["ssh-dev"].is_remote());
+        assert!(matches!(
+            &environments["devbox"],
+            ExecServerTransportParams::WebSocketUrl { .. }
+        ));
+        assert!(matches!(
+            &environments["ssh-dev"],
+            ExecServerTransportParams::StdioCommand { .. }
+        ));
         assert_eq!(
             default,
             EnvironmentDefault::EnvironmentId("ssh-dev".to_string())
@@ -762,7 +757,9 @@ CODEX_LOG = "debug"
         )
         .expect("write environments.toml");
 
-        let environments = load_environments_toml(&path).expect("environments.toml");
+        let environments = load_environments_toml(&path)
+            .expect("environments.toml")
+            .expect("environments.toml should exist");
 
         assert_eq!(environments.default.as_deref(), Some("ssh-dev"));
         assert_eq!(environments.include_local, Some(false));

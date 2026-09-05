@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use crate::AuthProvider;
 use bytes::Bytes;
-use codex_http_client::BuildRouteAwareHttpClientError;
-use codex_http_client::ClientRouteClass;
-use codex_http_client::HttpClientFactory;
-use codex_http_client::OutboundProxyPolicy;
+use codex_http_client::HttpResponse;
+use codex_http_client::RouteAwareClientPool;
+use codex_http_client::RouteAwareRequestBuilder;
+use codex_http_client::RouteAwareRequestError;
 use futures::Stream;
-use reqwest::StatusCode;
-use reqwest::header::CONTENT_LENGTH;
+use http::Method;
+use http::StatusCode;
+use http::header::CONTENT_LENGTH;
 use serde::Deserialize;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -20,6 +21,13 @@ const OPENAI_FILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const OPENAI_FILE_FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENAI_FILE_FINALIZE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const OPENAI_FILE_USE_CASE: &str = "codex";
+
+#[derive(Debug)]
+pub struct HostedFileUploadContext {
+    pub connector_id: String,
+    pub action_name: String,
+    pub model: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadedOpenAiFile {
@@ -45,7 +53,7 @@ pub enum OpenAiFileError {
     Request {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: RouteAwareRequestError,
     },
     #[error(
         "OpenAI file blob upload to {host} failed after {elapsed_ms} ms ({error_kind}, azure_client_request_id={azure_client_request_id}): {source}"
@@ -56,7 +64,7 @@ pub enum OpenAiFileError {
         error_kind: &'static str,
         azure_client_request_id: String,
         #[source]
-        source: reqwest::Error,
+        source: RouteAwareRequestError,
     },
     #[error(
         "OpenAI file blob upload to {host} failed with status {status} (azure_client_request_id={azure_client_request_id}, azure_request_id={azure_request_id}, azure_error_code={azure_error_code})"
@@ -80,12 +88,6 @@ pub enum OpenAiFileError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("failed to build OpenAI file client for {url}: {source}")]
-    ClientBuild {
-        url: String,
-        #[source]
-        source: BuildRouteAwareHttpClientError,
-    },
     #[error("OpenAI file upload for `{file_id}` is not ready yet")]
     UploadNotReady { file_id: String },
     #[error("OpenAI file upload for `{file_id}` failed: {message}")]
@@ -96,6 +98,8 @@ pub enum OpenAiFileError {
 struct CreateFileResponse {
     file_id: String,
     upload_url: String,
+    #[serde(default)]
+    pdf_c2pa_reservation: bool,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +110,8 @@ struct DownloadLinkResponse {
     file_name: Option<String>,
     mime_type: Option<String>,
     error_message: Option<String>,
+    #[serde(default)]
+    file_size_bytes: Option<u64>,
 }
 
 pub fn openai_file_uri(file_id: &str) -> String {
@@ -115,10 +121,11 @@ pub fn openai_file_uri(file_id: &str) -> String {
 pub async fn upload_openai_file(
     base_url: &str,
     auth: &dyn AuthProvider,
-    http_client_factory: &HttpClientFactory,
+    client_pool: &RouteAwareClientPool,
     file_name: String,
     file_size_bytes: u64,
     contents: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    hosted_upload: Option<&HostedFileUploadContext>,
 ) -> Result<UploadedOpenAiFile, OpenAiFileError> {
     if file_size_bytes > OPENAI_FILE_UPLOAD_LIMIT_BYTES {
         return Err(OpenAiFileError::FileTooLarge {
@@ -129,23 +136,31 @@ pub async fn upload_openai_file(
     }
 
     let create_url = format!("{}/files", base_url.trim_end_matches('/'));
-    let create_response = authorized_request(
-        http_client_factory,
-        auth,
-        reqwest::Method::POST,
-        &create_url,
-    )?
-    .json(&serde_json::json!({
+    let create_request = serde_json::json!({
         "file_name": file_name.as_str(),
         "file_size": file_size_bytes,
         "use_case": OPENAI_FILE_USE_CASE,
-    }))
-    .send()
-    .await
-    .map_err(|source| OpenAiFileError::Request {
-        url: create_url.clone(),
-        source,
-    })?;
+    });
+    let request = authorized_request(client_pool, auth, Method::POST, &create_url);
+    let create_request = match hosted_upload {
+        Some(context) => serde_json::json!({
+            "file_name": file_name.as_str(),
+            "file_size": file_size_bytes,
+            "use_case": OPENAI_FILE_USE_CASE,
+            "codex_connector_id": context.connector_id,
+            "codex_action_name": context.action_name,
+            "codex_model": context.model,
+        }),
+        None => create_request,
+    };
+    let create_response = request
+        .json(&create_request)
+        .send()
+        .await
+        .map_err(|source| OpenAiFileError::Request {
+            url: create_url.clone(),
+            source,
+        })?;
     let create_status = create_response.status();
     let create_body = create_response.text().await.unwrap_or_default();
     if !create_status.is_success() {
@@ -167,13 +182,13 @@ pub async fn upload_openai_file(
         .unwrap_or_else(|| "unknown-host".to_string());
     let azure_client_request_id = Uuid::new_v4().to_string();
     let upload_started_at = Instant::now();
-    let upload_response = build_reqwest_client(http_client_factory, &create_payload.upload_url)?
+    let upload_response = client_pool
         .put(&create_payload.upload_url)
         .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
         .header("x-ms-blob-type", "BlockBlob")
         .header("x-ms-client-request-id", &azure_client_request_id)
         .header(CONTENT_LENGTH, file_size_bytes)
-        .body(reqwest::Body::wrap_stream(contents))
+        .body_stream(contents)
         .send()
         .await
         .map_err(|source| {
@@ -243,21 +258,22 @@ pub async fn upload_openai_file(
         base_url.trim_end_matches('/'),
         create_payload.file_id,
     );
+    let finalize_request = serde_json::json!({});
+    let finalize_request = if create_payload.pdf_c2pa_reservation {
+        serde_json::json!({"pdf_c2pa_create_request": create_request})
+    } else {
+        finalize_request
+    };
     let finalize_started_at = Instant::now();
     loop {
-        let finalize_response = authorized_request(
-            http_client_factory,
-            auth,
-            reqwest::Method::POST,
-            &finalize_url,
-        )?
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .map_err(|source| OpenAiFileError::Request {
-            url: finalize_url.clone(),
-            source,
-        })?;
+        let finalize_response = authorized_request(client_pool, auth, Method::POST, &finalize_url)
+            .json(&finalize_request)
+            .send()
+            .await
+            .map_err(|source| OpenAiFileError::Request {
+                url: finalize_url.clone(),
+                source,
+            })?;
         let finalize_status = finalize_response.status();
         let finalize_body = finalize_response.text().await.unwrap_or_default();
         if !finalize_status.is_success() {
@@ -275,6 +291,7 @@ pub async fn upload_openai_file(
 
         match finalize_payload.status.as_str() {
             "success" => {
+                let file_size_bytes = finalize_payload.file_size_bytes.unwrap_or(file_size_bytes);
                 return Ok(UploadedOpenAiFile {
                     file_id: create_payload.file_id.clone(),
                     uri: openai_file_uri(&create_payload.file_id),
@@ -310,48 +327,21 @@ pub async fn upload_openai_file(
 }
 
 fn authorized_request(
-    http_client_factory: &HttpClientFactory,
+    client_pool: &RouteAwareClientPool,
     auth: &dyn AuthProvider,
-    method: reqwest::Method,
+    method: Method,
     url: &str,
-) -> Result<reqwest::RequestBuilder, OpenAiFileError> {
+) -> RouteAwareRequestBuilder {
     let mut headers = http::HeaderMap::new();
     auth.add_auth_headers(&mut headers);
 
-    let client = build_reqwest_client(http_client_factory, url)?;
-    Ok(client
+    client_pool
         .request(method, url)
         .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
-        .headers(headers))
+        .headers(headers)
 }
 
-fn build_reqwest_client(
-    http_client_factory: &HttpClientFactory,
-    url: &str,
-) -> Result<reqwest::Client, OpenAiFileError> {
-    match http_client_factory.build_reqwest_client(
-        reqwest::Client::builder(),
-        url,
-        ClientRouteClass::Api,
-    ) {
-        Ok(client) => Ok(client),
-        Err(error)
-            if matches!(
-                http_client_factory.outbound_proxy_policy(),
-                OutboundProxyPolicy::ReqwestDefault
-            ) =>
-        {
-            tracing::warn!(%error, "failed to build OpenAI file upload client");
-            Ok(reqwest::Client::new())
-        }
-        Err(source) => Err(OpenAiFileError::ClientBuild {
-            url: url.to_string(),
-            source,
-        }),
-    }
-}
-
-fn upload_response_header(response: &reqwest::Response, header: &str) -> String {
+fn upload_response_header(response: &HttpResponse, header: &str) -> String {
     response
         .headers()
         .get(header)
@@ -363,8 +353,11 @@ fn upload_response_header(response: &reqwest::Response, header: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_http_client::ClientRouteClass;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
+    use http::header::HeaderValue;
     use pretty_assertions::assert_eq;
-    use reqwest::header::HeaderValue;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -381,14 +374,18 @@ mod tests {
     #[derive(Clone, Copy)]
     struct ChatGptTestAuth;
 
-    fn default_http_client_factory() -> HttpClientFactory {
-        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+    fn default_http_client_pool() -> RouteAwareClientPool {
+        RouteAwareClientPool::new_without_request_logging(
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            ClientRouteClass::Api,
+        )
+        .with_legacy_custom_ca_fallback()
     }
 
     impl AuthProvider for ChatGptTestAuth {
-        fn add_auth_headers(&self, headers: &mut reqwest::header::HeaderMap) {
+        fn add_auth_headers(&self, headers: &mut http::HeaderMap) {
             headers.insert(
-                reqwest::header::AUTHORIZATION,
+                http::header::AUTHORIZATION,
                 HeaderValue::from_static("Bearer token"),
             );
             headers.insert("ChatGPT-Account-ID", HeaderValue::from_static("account_id"));
@@ -456,10 +453,11 @@ mod tests {
         let uploaded = upload_openai_file(
             &base_url,
             &chatgpt_auth(),
-            &default_http_client_factory(),
+            &default_http_client_pool(),
             "hello.txt".to_string(),
             /*file_size_bytes*/ 5,
             contents,
+            /*hosted_upload*/ None,
         )
         .await
         .expect("upload succeeds");
@@ -473,6 +471,213 @@ mod tests {
         assert_eq!(uploaded.file_name, "hello.txt");
         assert_eq!(uploaded.mime_type, Some("text/plain".to_string()));
         assert_eq!(finalize_attempts.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn upload_hosted_app_context_and_finalizes_reservation() {
+        let server = MockServer::start().await;
+        let create_request = serde_json::json!({
+            "file_name": "report.pdf",
+            "file_size": 8,
+            "use_case": "codex",
+            "codex_connector_id": "library",
+            "codex_action_name": "create_library_file",
+            "codex_model": "gpt-work",
+        });
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .and(header("chatgpt-account-id", "account_id"))
+            .and(body_json(create_request.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file_pdf",
+                "upload_url": format!("{}/upload/file_pdf", server.uri()),
+                "pdf_c2pa_reservation": true,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload/file_pdf"))
+            .and(header("content-length", "8"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files/file_pdf/uploaded"))
+            .and(body_json(serde_json::json!({
+                "pdf_c2pa_create_request": create_request,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "download_url": format!("{}/download/file_pdf", server.uri()),
+                "file_name": "report.pdf",
+                "mime_type": "application/pdf",
+                "file_size_bytes": 24,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let hosted_upload = HostedFileUploadContext {
+            connector_id: "library".to_string(),
+            action_name: "create_library_file".to_string(),
+            model: "gpt-work".to_string(),
+        };
+        let uploaded = upload_openai_file(
+            &base_url_for(&server),
+            &chatgpt_auth(),
+            &default_http_client_pool(),
+            "report.pdf".to_string(),
+            /*file_size_bytes*/ 8,
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"%PDF-1.4"))]),
+            Some(&hosted_upload),
+        )
+        .await
+        .expect("hosted PDF upload succeeds");
+
+        assert_eq!(uploaded.file_id, "file_pdf");
+        assert_eq!(uploaded.file_size_bytes, 24);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn upload_hosted_app_preserves_empty_finalization_for_older_servers() {
+        let server = MockServer::start().await;
+        let hosted_upload = HostedFileUploadContext {
+            connector_id: "library".to_string(),
+            action_name: "create_library_file".to_string(),
+            model: "gpt-work".to_string(),
+        };
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file_pdf",
+                "upload_url": format!("{}/upload/file_pdf", server.uri()),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload/file_pdf"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files/file_pdf/uploaded"))
+            .and(body_json(serde_json::json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "download_url": format!("{}/download/file_pdf", server.uri()),
+                "file_name": "report.pdf",
+                "mime_type": "application/pdf",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uploaded = upload_openai_file(
+            &base_url_for(&server),
+            &chatgpt_auth(),
+            &default_http_client_pool(),
+            "report.pdf".to_string(),
+            /*file_size_bytes*/ 8,
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"%PDF-1.4"))]),
+            Some(&hosted_upload),
+        )
+        .await
+        .expect("older servers retain the normal upload behavior");
+
+        assert_eq!(uploaded.file_size_bytes, 8);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn upload_openai_file_reuses_client_pool_across_uploads() {
+        let server = MockServer::start().await;
+        let files = [
+            ("first.txt", "file_1", &b"first"[..]),
+            ("second.txt", "file_2", &b"second"[..]),
+        ];
+
+        for (file_name, file_id, contents) in files {
+            Mock::given(method("POST"))
+                .and(path("/backend-api/files"))
+                .and(header("chatgpt-account-id", "account_id"))
+                .and(body_json(serde_json::json!({
+                    "file_name": file_name,
+                    "file_size": contents.len(),
+                    "use_case": "codex",
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "file_id": file_id,
+                    "upload_url": format!("{}/upload/{file_id}", server.uri()),
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path(format!("/upload/{file_id}")))
+                .and(header("content-length", contents.len().to_string()))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(format!("/backend-api/files/{file_id}/uploaded")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "success",
+                    "download_url": format!("{}/download/{file_id}", server.uri()),
+                    "file_name": file_name,
+                    "mime_type": "text/plain",
+                    "file_size_bytes": contents.len(),
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let client_pool = default_http_client_pool();
+        let mut uploaded_files = Vec::new();
+        for (file_name, _, contents) in files {
+            let contents_stream =
+                futures::stream::iter([Ok::<_, std::io::Error>(Bytes::copy_from_slice(contents))]);
+            let uploaded = upload_openai_file(
+                &base_url_for(&server),
+                &chatgpt_auth(),
+                &client_pool,
+                file_name.to_string(),
+                u64::try_from(contents.len()).expect("file size should fit in a u64"),
+                contents_stream,
+                /*hosted_upload*/ None,
+            )
+            .await
+            .expect("upload succeeds with the shared client pool");
+            uploaded_files.push(uploaded);
+        }
+
+        assert_eq!(
+            uploaded_files,
+            vec![
+                UploadedOpenAiFile {
+                    file_id: "file_1".to_string(),
+                    uri: "sediment://file_1".to_string(),
+                    download_url: format!("{}/download/file_1", server.uri()),
+                    file_name: "first.txt".to_string(),
+                    file_size_bytes: 5,
+                    mime_type: Some("text/plain".to_string()),
+                },
+                UploadedOpenAiFile {
+                    file_id: "file_2".to_string(),
+                    uri: "sediment://file_2".to_string(),
+                    download_url: format!("{}/download/file_2", server.uri()),
+                    file_name: "second.txt".to_string(),
+                    file_size_bytes: 6,
+                    mime_type: Some("text/plain".to_string()),
+                },
+            ]
+        );
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -500,10 +705,11 @@ mod tests {
         let error = upload_openai_file(
             &base_url_for(&server),
             &chatgpt_auth(),
-            &default_http_client_factory(),
+            &default_http_client_pool(),
             "hello.txt".to_string(),
             /*file_size_bytes*/ 5,
             futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"hello"))]),
+            /*hosted_upload*/ None,
         )
         .await
         .expect_err("blob response failure should be returned");
@@ -537,10 +743,11 @@ mod tests {
         let error = upload_openai_file(
             &base_url_for(&server),
             &chatgpt_auth(),
-            &default_http_client_factory(),
+            &default_http_client_pool(),
             "hello.txt".to_string(),
             /*file_size_bytes*/ 5,
             futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"hello"))]),
+            /*hosted_upload*/ None,
         )
         .await
         .expect_err("blob transport failure should be returned");
