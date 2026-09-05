@@ -172,7 +172,7 @@ cd "${work}"
 git config user.name "Termux Release Test"
 git config user.email "termux-release-test@example.invalid"
 
-mkdir -p .github/workflows codex-rs/cli/src codex-rs/tui/src src
+mkdir -p .github/workflows codex-rs/cli/src codex-rs/core codex-rs/tui/src src
 printf 'base workflow\n' > .github/workflows/rust-release.yml
 cat > codex-rs/Cargo.toml <<'TOML'
 [workspace]
@@ -188,6 +188,34 @@ version = "1.0.0"
 base = "1"
 TOML
 printf 'upstream release code\n' > codex-rs/cli/src/main.rs
+cat > codex-rs/core/Cargo.toml <<'TOML'
+[dependencies]
+codex-utils-cache = { workspace = true }
+codex-utils-git-discovery = { workspace = true }
+codex-utils-image = { workspace = true }
+TOML
+cat > codex-rs/Cargo.lock <<'LOCK'
+[[package]]
+name = "codex-core"
+version = "0.0.0"
+dependencies = [
+ "codex-utils-cache",
+ "codex-utils-git-discovery",
+ "codex-utils-image",
+]
+
+[[package]]
+name = "codex-utils-elapsed"
+version = "0.0.0"
+
+[[package]]
+name = "codex-utils-fuzzy-match"
+version = "0.0.0"
+
+[[package]]
+name = "codex-utils-git-discovery"
+version = "0.0.0"
+LOCK
 for path in lib.rs termux_update.rs update_action.rs update_prompt.rs update_versions.rs updates.rs; do
   printf 'fixture\n' > "codex-rs/tui/src/${path}"
 done
@@ -218,9 +246,18 @@ printf 'compat\n' > termux/compat.txt
 printf 'termux\n' > src/shared.txt
 printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
 printf 'termux updater with target drift\n' > codex-rs/tui/src/termux_update.rs
-git add codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml termux/compat.txt src/shared.txt
+perl -0pi -e 's/(codex-utils-cache = .*\n)/$1codex-utils-file-lock = { workspace = true }\n/' codex-rs/core/Cargo.toml
+perl -0pi -e 's/( "codex-utils-cache",\n)/$1 "codex-utils-file-lock",\n/' codex-rs/Cargo.lock
+perl -0pi -e 's/(\[\[package\]\]\nname = "codex-utils-fuzzy-match")/[[package]]\nname = "codex-utils-file-lock"\nversion = "0.0.0"\n\n$1/' codex-rs/Cargo.lock
+git add codex-rs/Cargo.lock codex-rs/Cargo.toml codex-rs/cli/src/main.rs codex-rs/core/Cargo.toml codex-rs/tui/src/termux_update.rs codex-rs/utils/file-lock/Cargo.toml termux/compat.txt src/shared.txt
 git commit -m "termux compatibility changes" >/dev/null
-git push origin wallentx/termux-target >/dev/null
+git tag rust-v1.0.0-termux
+perl -0pi -e 's/^codex-utils-git-discovery = .*\n//' codex-rs/core/Cargo.toml
+perl -0pi -e 's/^ "codex-utils-git-discovery",\n//' codex-rs/Cargo.lock
+perl -0pi -e 's/\n\[\[package\]\]\nname = "codex-utils-git-discovery"\nversion = "0\.0\.0"\n//' codex-rs/Cargo.lock
+git add codex-rs/Cargo.lock codex-rs/core/Cargo.toml
+git commit -m "simulate stale checkpoint Cargo metadata" >/dev/null
+git push origin wallentx/termux-target rust-v1.0.0-termux >/dev/null
 
 git checkout -B release-train/1.0.0 rust-v1.0.0 >/dev/null
 printf 'stale\n' > stale-work-branch.txt
@@ -251,6 +288,10 @@ assert_ref_file_equals origin/release-train/1.0.0 codex-rs/tui/src/termux_update
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'version = "1.0.0"'
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml '"utils/file-lock",'
 assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'codex-utils-file-lock = { path = "utils/file-lock" }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/core/Cargo.toml 'codex-utils-file-lock = { workspace = true }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/core/Cargo.toml 'codex-utils-git-discovery = { workspace = true }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.lock '"codex-utils-file-lock",'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.lock '"codex-utils-git-discovery",'
 assert_ref_has_file origin/release-train/1.0.0 src/upstream-after-tag.txt
 assert_ref_has_file origin/release-train/1.0.0 termux/compat.txt
 assert_ref_file_equals origin/release-train/1.0.0 codex-rs/tui/src/update_versions.rs "fixture"

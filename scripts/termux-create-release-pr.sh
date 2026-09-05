@@ -140,7 +140,7 @@ resolve_union_merge_paths() {
   local path
   local merge_dir
 
-  for path in "${TERMUX_RELEASE_UNION_MERGE_PATHS[@]}"; do
+  for path in "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}"; do
     if [[ -z "$(git ls-files --unmerged -- "${path}")" ]]; then
       continue
     fi
@@ -158,6 +158,40 @@ resolve_union_merge_paths() {
     rm -rf "${merge_dir}"
     git add -- "${path}"
   done
+}
+
+restore_release_cargo_overlay() {
+  local release_ref="origin/${RELEASE_BRANCH}"
+  local overlay_dir
+  local overlay_patch
+
+  if [[ -z "${cargo_overlay_source_ref:-}" || -z "${cargo_overlay_base_ref:-}" ]]; then
+    echo "No tested same-line Termux tag found; retaining conflict-only Cargo resolution."
+    resolve_union_merge_paths
+    return
+  fi
+
+  overlay_dir="$(mktemp -d "${RUNNER_TEMP}/termux-release-cargo-overlay.XXXXXX")"
+  overlay_patch="${overlay_dir}/cargo.patch"
+  git diff \
+    --binary \
+    "${cargo_overlay_base_ref}" \
+    "${cargo_overlay_source_ref}" \
+    -- "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}" \
+    > "${overlay_patch}"
+
+  git restore \
+    --source="${release_ref}" \
+    --staged \
+    --worktree \
+    -- "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}"
+  if [[ -s "${overlay_patch}" ]]; then
+    if ! git apply --3way --index "${overlay_patch}"; then
+      echo "Cargo overlay reported conflicts; retaining both tested Termux and upstream additions."
+      resolve_union_merge_paths
+    fi
+  fi
+  rm -rf "${overlay_dir}"
 }
 
 restore_merge_authoritative_paths() {
@@ -212,7 +246,7 @@ restore_merge_authoritative_paths() {
     git rm -f --ignore-unmatch -- "${release_remove_paths[@]}"
   fi
 
-  resolve_union_merge_paths
+  restore_release_cargo_overlay
 }
 
 merge_release_branch_into_work_branch() {
@@ -387,6 +421,8 @@ capture_seeded_release_files
 patch_source_ref="origin/${PATCH_BRANCH}"
 patch_source_label="${PATCH_BRANCH}"
 patch_source_sha="$(git rev-parse "${patch_source_ref}")"
+cargo_overlay_source_ref=""
+cargo_overlay_base_ref=""
 
 if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
   release_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
@@ -396,6 +432,18 @@ if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
       --list 'rust-v*-termux' \
       --sort=-v:refname
   )
+  for candidate_tag in "${target_termux_tags[@]}"; do
+    if [[ "${candidate_tag}" != rust-v${release_line}.*-termux ]]; then
+      continue
+    fi
+    candidate_upstream_tag="${candidate_tag%-termux}"
+    if git rev-parse --verify --quiet "refs/tags/${candidate_upstream_tag}^{commit}" >/dev/null; then
+      cargo_overlay_source_ref="refs/tags/${candidate_tag}"
+      cargo_overlay_base_ref="refs/tags/${candidate_upstream_tag}"
+      echo "Using ${candidate_tag} Cargo changes as the tested overlay for ${UPSTREAM_TAG}."
+      break
+    fi
+  done
   if (( ${#target_termux_tags[@]} > 0 )) \
     && [[ "${target_termux_tags[0]}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]] \
     && [[ "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" != "${release_line}" ]]; then

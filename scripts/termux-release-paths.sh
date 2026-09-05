@@ -49,9 +49,9 @@ readonly -a TERMUX_RELEASE_PATCH_AUTHORITATIVE_CODE_PATHS=(
   codex-rs/tui/src/termux_update.rs
 )
 
-# These generated/manifests files contain both downstream Termux additions and
-# upstream release additions. Resolve overlapping insertions by retaining both.
-readonly -a TERMUX_RELEASE_UNION_MERGE_PATHS=(
+# These generated/manifest files must start from the new upstream release, then
+# receive the Cargo delta from the latest tested same-line Termux tag.
+readonly -a TERMUX_RELEASE_CARGO_OVERLAY_PATHS=(
   codex-rs/Cargo.lock
   codex-rs/core/Cargo.toml
 )
