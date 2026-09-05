@@ -680,26 +680,22 @@ index 0fe4408444..f4ca0d64c1 100644
              UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
              UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
              UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
-@@ -70,6 +77,18 @@ impl UpdateAction {
+@@ -70,6 +77,14 @@ impl UpdateAction {
          shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
              .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
      }
 +
 +    pub fn release_notes_url(self) -> &'static str {
-+        match self {
-+            UpdateAction::TermuxSelfUpdate => crate::termux_update::TERMUX_RELEASES_URL,
-+            UpdateAction::NpmGlobalLatest
-+            | UpdateAction::BunGlobalLatest
-+            | UpdateAction::PnpmGlobalLatest
-+            | UpdateAction::BrewUpgrade
-+            | UpdateAction::StandaloneUnix
-+            | UpdateAction::StandaloneWindows => "https://github.com/openai/codex/releases/latest",
++        if self == UpdateAction::TermuxSelfUpdate {
++            crate::termux_update::TERMUX_RELEASES_URL
++        } else {
++            "https://github.com/openai/codex/releases/latest"
 +        }
 +    }
  }
  
  #[cfg(not(debug_assertions))]
-@@ -150,6 +169,10 @@ mod tests {
+@@ -150,6 +165,10 @@ mod tests {
  
      #[test]
      fn standalone_update_commands_rerun_latest_installer() {
