@@ -477,7 +477,6 @@ mod tests {
                 .unwrap();
         assert_eq!(candidate.tag_name, "rust-v0.141.0-alpha.7-termux");
     }
-
     #[test]
     fn finds_bundled_termux_binaries() -> Result<()> {
         let root = tempfile::tempdir()?;
