@@ -25,6 +25,8 @@ readonly -a TERMUX_RELEASE_BRANCH_SCRIPT_PATHS=(
   scripts/termux-find-release-pr.sh
   scripts/termux-read-release-metadata.sh
   scripts/termux-release-self-update.patch
+  scripts/termux-release-rollout-locks.patch
+  scripts/termux-sync-file-lock.py
   scripts/termux-release-asset-state.sh
   scripts/termux-release-paths.sh
   scripts/termux-resolve-release-ref.sh
@@ -50,10 +52,20 @@ readonly -a TERMUX_RELEASE_PATCH_AUTHORITATIVE_CODE_PATHS=(
 )
 
 # These generated/manifest files must start from the new upstream release, then
-# receive the Cargo delta from the latest tested same-line Termux tag.
+# receive the Cargo delta from a tested Termux tag (prefer the same release line).
 readonly -a TERMUX_RELEASE_CARGO_OVERLAY_PATHS=(
   codex-rs/Cargo.lock
   codex-rs/core/Cargo.toml
+)
+
+# Upstream moved writer ownership from thread-store into rollout in 0.155.
+# Reapply the adapted lock fallback to current upstream source, not the old file.
+readonly -a TERMUX_RELEASE_ROLLOUT_LOCK_PATHS=(
+  codex-rs/app-server-transport/src/transport/unix_socket.rs
+  codex-rs/rollout/Cargo.toml
+  codex-rs/rollout/src/writer_lock.rs
+  codex-rs/rollout/src/writer_lock_tests.rs
+  codex-rs/thread-store/Cargo.toml
 )
 
 # These upstream-owned files have repeatedly retained stale checkpoint-side

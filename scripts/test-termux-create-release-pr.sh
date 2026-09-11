@@ -187,8 +187,14 @@ version = "1.0.0"
 [workspace.dependencies]
 base = "1"
 TOML
+# Exercise version extraction on a manifest larger than a pipe buffer. The
+# reader must drain git show instead of intermittently failing with SIGPIPE.
+printf '# workspace manifest padding %s\n' {1..6000} >> codex-rs/Cargo.toml
 printf 'upstream release code\n' > codex-rs/cli/src/main.rs
 cat > codex-rs/core/Cargo.toml <<'TOML'
+[package]
+name = "codex-core"
+
 [dependencies]
 codex-utils-cache = { workspace = true }
 codex-utils-git-discovery = { workspace = true }
@@ -345,6 +351,9 @@ release = "old"
 TOML
 printf 'upstream release code\n' > codex-rs/cli/src/main.rs
 cat > codex-rs/core/Cargo.toml <<'TOML'
+[package]
+name = "codex-core"
+
 [dependencies]
 codex-utils-cache = { workspace = true }
 codex-utils-image = { workspace = true }
@@ -544,3 +553,66 @@ if [[ "$(cat "${github_output_update}")" != "pr_url=https://github.com/wallentx/
 fi
 
 echo "ok - newer upstream tag rebuilds and merges the release base into the open train"
+
+# A stable release and the next alpha may contain different cherry-picks. Their
+# Git merge base predates both, but an unchanged downstream file is not a Termux
+# patch. Use arbitrary paths outside the authoritative-path allowlist.
+git checkout --detach rust-v1.0.0-alpha.2 >/dev/null
+printf 'next upstream content\n' > src/cherry-picked.txt
+printf 'next upstream ownership\n' > src/ownership.txt
+perl -0pi -e 's/version = "1\.0\.0-alpha\.2"/version = "1.1.0-alpha.1"/' codex-rs/Cargo.toml
+git add codex-rs/Cargo.toml src/cherry-picked.txt src/ownership.txt
+git commit -m "next minor upstream release" >/dev/null
+git tag rust-v1.1.0-alpha.1
+git push origin rust-v1.1.0-alpha.1 >/dev/null
+
+git checkout --detach rust-v1.0.0-alpha.1 >/dev/null
+printf 'stable cherry-pick\n' > src/cherry-picked.txt
+printf 'stable ownership\n' > src/ownership.txt
+git add src/cherry-picked.txt src/ownership.txt
+git commit -m "stable upstream cherry-picks" >/dev/null
+git tag rust-v1.0.1
+git push origin rust-v1.0.1 >/dev/null
+git checkout -B wallentx/termux-target >/dev/null
+git restore --source=rust-v1.0.0-alpha.1-termux --staged --worktree -- codex-rs
+git commit -m "stable Termux compatibility changes" >/dev/null
+git tag rust-v1.0.1-termux
+git push --force origin wallentx/termux-target rust-v1.0.1-termux >/dev/null
+
+# CI has the new upstream tag and the fork's release tags, not necessarily the
+# historical upstream counterpart. Fetch it from a local upstream stub.
+git remote add upstream "${origin_update}"
+git tag -d rust-v1.0.1 >/dev/null
+run_release_pr_script \
+  "${runner_temp_update}" "${github_output_update}" "rust-v1.1.0-alpha.1" \
+  > "${tmp_dir}/stdout-next" 2> "${tmp_dir}/stderr-next" || {
+    cat "${tmp_dir}/stdout-next" >&2
+    cat "${tmp_dir}/stderr-next" >&2
+    fail "release PR script failed on the first alpha of a new minor line"
+  }
+assert_ref_file_equals origin/release-train/1.0.0 src/cherry-picked.txt "next upstream content"
+assert_ref_file_equals origin/release-train/1.0.0 src/ownership.txt "next upstream ownership"
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/core/Cargo.toml 'codex-utils-file-lock = { workspace = true }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/core/Cargo.toml 'codex-utils-git-discovery = { workspace = true }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.lock '"codex-utils-file-lock",'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.lock '"codex-utils-git-discovery",'
+git rev-parse --verify refs/tags/rust-v1.0.1 >/dev/null
+grep -q 'Cargo changes across release lines' "${tmp_dir}/stdout-next" \
+  || fail "next minor release did not use the tested Cargo overlay"
+echo "ok - first minor alpha fetches its baseline and resolves upstream-only cherry-picks"
+
+git checkout wallentx/termux-target >/dev/null
+printf 'genuine Termux edit\n' > src/ownership.txt
+git add src/ownership.txt
+git commit -m "deliberate downstream ownership change" >/dev/null
+git push origin wallentx/termux-target >/dev/null
+if run_release_pr_script \
+  "${runner_temp_update}" "${github_output_update}" "rust-v1.1.0-alpha.1" \
+  > "${tmp_dir}/stdout-conflict" 2> "${tmp_dir}/stderr-conflict"; then
+  fail "release PR script silently discarded a genuine downstream conflict"
+fi
+if [[ "$(git diff --name-only --diff-filter=U)" != "src/ownership.txt" ]]; then
+  cat "${tmp_dir}/stderr-conflict" >&2
+  fail "expected only the genuine downstream conflict to remain"
+fi
+echo "ok - genuine downstream edits still fail closed for manual resolution"

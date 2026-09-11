@@ -85,7 +85,9 @@ workspace_version_from_ref() {
       gsub(/^version = "/, "")
       gsub(/"$/, "")
       print
-      exit
+      # Drain git show under pipefail; an early exit can give it SIGPIPE when
+      # the workspace manifest grows beyond the pipe buffer.
+      in_workspace_package = 0
     }
   '
 }
@@ -166,7 +168,7 @@ restore_release_cargo_overlay() {
   local overlay_patch
 
   if [[ -z "${cargo_overlay_source_ref:-}" || -z "${cargo_overlay_base_ref:-}" ]]; then
-    echo "No tested same-line Termux tag found; retaining conflict-only Cargo resolution."
+    echo "No paired tested Termux tag found; retaining conflict-only Cargo resolution."
     resolve_union_merge_paths
     return
   fi
@@ -187,11 +189,58 @@ restore_release_cargo_overlay() {
     -- "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}"
   if [[ -s "${overlay_patch}" ]]; then
     if ! git apply --3way --index "${overlay_patch}"; then
+      if [[ -z "$(git ls-files --unmerged -- "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}")" ]]; then
+        echo "Cargo overlay failed without resolvable conflicts." >&2
+        rm -rf "${overlay_dir}"
+        return 1
+      fi
       echo "Cargo overlay reported conflicts; retaining both tested Termux and upstream additions."
       resolve_union_merge_paths
     fi
   fi
   rm -rf "${overlay_dir}"
+}
+
+resolve_unmodified_upstream_conflicts() {
+  local path
+  local release_ref="origin/${RELEASE_BRANCH}"
+
+  [[ -n "${patch_upstream_ref:-}" ]] || return 0
+  # Stable releases can cherry-pick upstream changes without sharing their
+  # ancestry with the next alpha. Resolve only paths that the patch branch has
+  # not changed relative to its paired upstream tag. Real Termux edits remain
+  # conflicts, including renamed files absent from the old tag.
+  while IFS= read -r -d '' path; do
+    if git cat-file -e "${patch_upstream_ref}:${path}" 2>/dev/null \
+      && git diff --quiet "${patch_upstream_ref}" HEAD -- "${path}"; then
+      echo "Taking current upstream for unchanged downstream path: ${path}"
+      if git cat-file -e "${release_ref}:${path}" 2>/dev/null; then
+        git restore --source="${release_ref}" --staged --worktree -- "${path}"
+      else
+        git rm -f -- "${path}"
+      fi
+    fi
+  done < <(git diff --name-only --diff-filter=U -z)
+}
+
+restore_release_rollout_locks() {
+  local release_ref="origin/${RELEASE_BRANCH}"
+
+  # Only adapt the thread-store -> rollout migration. Older releases and patch
+  # branches that already checkpointed the move keep their own implementation,
+  # including any later fixes, rather than being reset to this seed patch.
+  if ! git cat-file -e "${release_ref}:codex-rs/rollout/src/writer_lock.rs" 2>/dev/null \
+    || ! git cat-file -e "HEAD:codex-rs/thread-store/src/local/writer_lock.rs" 2>/dev/null; then
+    return 0
+  fi
+  if ! git cat-file -e "HEAD:codex-rs/utils/file-lock/Cargo.toml" 2>/dev/null; then
+    echo "Rollout lock fallback requires the Termux file-lock crate." >&2
+    return 1
+  fi
+
+  git restore --source="${release_ref}" --staged --worktree \
+    -- "${TERMUX_RELEASE_ROLLOUT_LOCK_PATHS[@]}"
+  git apply --index "${seed_dir}/scripts/termux-release-rollout-locks.patch"
 }
 
 restore_merge_authoritative_paths() {
@@ -258,7 +307,13 @@ merge_release_branch_into_work_branch() {
   fi
 
   restore_merge_authoritative_paths
+  resolve_unmodified_upstream_conflicts
+  restore_release_rollout_locks
   restore_release_workspace_manifest
+  # Similar dependency lists can make a historical patch apply to the wrong
+  # package. Derive file-lock edges from the actual merged crate manifests.
+  python3 "${seed_dir}/scripts/termux-sync-file-lock.py"
+  git add -- codex-rs/Cargo.lock
   seed_release_branch_workflows
   git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
 
@@ -418,11 +473,21 @@ delete_existing_release_branch_if_safe() {
 
 capture_seeded_release_files
 
+ensure_upstream_tag() {
+  local tag="$1"
+  if ! git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null; then
+    # Checkout fetches fork tags; configure-git fetches only the new release tag.
+    # Fetch the paired historical upstream tag explicitly on fresh CI runners.
+    git fetch --no-tags upstream "refs/tags/${tag}:refs/tags/${tag}"
+  fi
+}
+
 patch_source_ref="origin/${PATCH_BRANCH}"
 patch_source_label="${PATCH_BRANCH}"
 patch_source_sha="$(git rev-parse "${patch_source_ref}")"
 cargo_overlay_source_ref=""
 cargo_overlay_base_ref=""
+patch_upstream_ref=""
 
 if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
   release_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
@@ -437,12 +502,11 @@ if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
       continue
     fi
     candidate_upstream_tag="${candidate_tag%-termux}"
-    if git rev-parse --verify --quiet "refs/tags/${candidate_upstream_tag}^{commit}" >/dev/null; then
-      cargo_overlay_source_ref="refs/tags/${candidate_tag}"
-      cargo_overlay_base_ref="refs/tags/${candidate_upstream_tag}"
-      echo "Using ${candidate_tag} Cargo changes as the tested overlay for ${UPSTREAM_TAG}."
-      break
-    fi
+    ensure_upstream_tag "${candidate_upstream_tag}"
+    cargo_overlay_source_ref="refs/tags/${candidate_tag}"
+    cargo_overlay_base_ref="refs/tags/${candidate_upstream_tag}"
+    echo "Using ${candidate_tag} Cargo changes as the tested overlay for ${UPSTREAM_TAG}."
+    break
   done
   if (( ${#target_termux_tags[@]} > 0 )) \
     && [[ "${target_termux_tags[0]}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]] \
@@ -461,6 +525,21 @@ if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
     done
   fi
 fi
+
+# The first release in a new minor line has no same-line Termux tag yet. Use
+# the patch source's latest paired upstream/Termux tags to identify untouched
+# upstream files and, if needed, carry only the tested Cargo delta forward.
+while IFS= read -r candidate_tag; do
+  candidate_upstream_tag="${candidate_tag%-termux}"
+  ensure_upstream_tag "${candidate_upstream_tag}"
+  patch_upstream_ref="refs/tags/${candidate_upstream_tag}"
+  if [[ -z "${cargo_overlay_source_ref}" ]]; then
+    cargo_overlay_source_ref="refs/tags/${candidate_tag}"
+    cargo_overlay_base_ref="${patch_upstream_ref}"
+    echo "Using ${candidate_tag} Cargo changes across release lines for ${UPSTREAM_TAG}."
+  fi
+  break
+done < <(git tag --merged "${patch_source_ref}" --list 'rust-v*-termux' --sort=-v:refname)
 
 existing_prs="$(title_prs_json)"
 existing_merged_pr="$(
