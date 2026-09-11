@@ -1,4 +1,4 @@
-//! Turn-scoped state and active turn metadata scaffolding.
+//! Turn-scoped state, input waiters, and active turn metadata.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
+use super::TurnTokenUsage;
 use crate::agent::control::AgentExecutionGuard;
 use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::session::TurnInputQueue;
@@ -90,7 +91,7 @@ pub(crate) struct RunningTask {
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_request_permissions: HashMap<String, PendingRequestPermissions>,
-    pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
+    pending_user_input: HashMap<String, oneshot::Sender<AcceptedUserInputResponse>>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     mcp_tool_approval_metadata: HashMap<String, (Option<McpInvocation>, McpToolApprovalMetadata)>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
@@ -101,9 +102,17 @@ pub(crate) struct TurnState {
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+    pub(crate) token_usage_by_model: TurnTokenUsage,
     /// The last step captured for execution or selected from a speculative fallback.
     /// Remains absent until a step is captured; standalone local compaction has no step.
     pub(crate) last_known_step_context: Option<Arc<StepContext>>,
+}
+
+/// Host receipt metadata follows the response through the asynchronous tool waiter.
+pub(crate) struct AcceptedUserInputResponse {
+    pub(crate) response: RequestUserInputResponse,
+    /// Absent in legacy mode, which does not reserve or persist acceptance order.
+    pub(crate) acceptance_order: Option<u64>,
 }
 
 pub(crate) struct PendingRequestPermissions {
@@ -156,15 +165,15 @@ impl TurnState {
     pub(crate) fn insert_pending_user_input(
         &mut self,
         key: String,
-        tx: oneshot::Sender<RequestUserInputResponse>,
-    ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
+        tx: oneshot::Sender<AcceptedUserInputResponse>,
+    ) -> Option<oneshot::Sender<AcceptedUserInputResponse>> {
         self.pending_user_input.insert(key, tx)
     }
 
     pub(crate) fn remove_pending_user_input(
         &mut self,
         key: &str,
-    ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
+    ) -> Option<oneshot::Sender<AcceptedUserInputResponse>> {
         self.pending_user_input.remove(key)
     }
 
