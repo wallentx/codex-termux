@@ -20,6 +20,7 @@ readonly -a TERMUX_RELEASE_GITHUB_SCRIPT_PATHS=(
 readonly -a TERMUX_RELEASE_BRANCH_SCRIPT_PATHS=(
   scripts/termux-configure-git.sh
   scripts/termux-create-checkpoint-pr.sh
+  scripts/termux-checkpoint-tree.sh
   scripts/termux-create-or-update-mirrored-release.sh
   scripts/termux-download-release-artifact.sh
   scripts/termux-find-release-pr.sh

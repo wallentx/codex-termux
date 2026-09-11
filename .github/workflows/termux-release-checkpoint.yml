@@ -39,7 +39,7 @@ permissions:
   statuses: read
 
 concurrency:
-  group: termux-release-checkpoint-${{ inputs.source_branch || github.ref_name }}
+  group: termux-release-checkpoint-${{ inputs.destination_branch || 'wallentx/termux-target' }}
   cancel-in-progress: false
 
 defaults:
