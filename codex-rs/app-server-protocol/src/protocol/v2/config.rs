@@ -1,3 +1,4 @@
+use super::ApplicationRequirements;
 use super::ApprovalsReviewer;
 use super::AskForApproval;
 use super::BrowserUseConfig;
@@ -407,6 +408,10 @@ pub struct ConfigReadResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ConfigRequirements {
+    /// Exact provider selection required by managed policy.
+    pub model_provider: Option<String>,
+    /// Complete required provider definitions, using config.toml field names.
+    pub model_providers: Option<HashMap<String, JsonValue>>,
     pub cli_auth_credentials_store: Option<CliAuthCredentialsStoreMode>,
     pub chatgpt_base_url: Option<String>,
     pub additional_developer_instructions: Option<String>,
@@ -432,6 +437,8 @@ pub struct ConfigRequirements {
     pub enforce_residency: Option<ResidencyRequirement>,
     #[experimental("configRequirements/read.network")]
     pub network: Option<NetworkRequirements>,
+    #[experimental("configRequirements/read.application")]
+    pub application: Option<ApplicationRequirements>,
     pub auto_review: Option<AutoReviewRequirements>,
     pub models: Option<ModelsRequirements>,
     #[schemars(with = "Option<String>")]
@@ -502,6 +509,7 @@ pub struct ComputerUseRequirements {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct BrowserUseRequirements {
+    pub allow_webmcp: Option<bool>,
     pub allow_history_access: Option<bool>,
     pub disable_auto_review: Option<bool>,
     pub allow_global_persistent_approval: Option<bool>,

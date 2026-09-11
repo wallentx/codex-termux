@@ -17,6 +17,7 @@ use codex_code_mode::CodeModeSession;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::RuntimeResponse;
+use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use futures::future::join_all;
 use serde_json::Value as JsonValue;
@@ -30,7 +31,8 @@ use crate::original_image_detail::sanitize_original_image_detail as sanitize_ima
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
-use crate::tools::ExecutedToolCallRecorder;
+use crate::tools::ExecutedToolCalls;
+use crate::tools::call_trace;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
@@ -78,11 +80,12 @@ pub(crate) struct CodeModeService {
 
 impl CodeModeService {
     pub(crate) fn new(
+        thread_id: ThreadId,
         session_provider: Arc<dyn CodeModeSessionProvider>,
         config: &CodeModeConfig,
-        executed_tool_calls: Option<Arc<ExecutedToolCallRecorder>>,
+        executed_tool_calls: ExecutedToolCalls,
     ) -> Self {
-        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new(executed_tool_calls));
+        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new(thread_id, executed_tool_calls));
         let availability = session_provider.availability();
         Self {
             session: OnceCell::new(),
@@ -248,24 +251,25 @@ impl CodeModeService {
 }
 
 pub(super) async fn handle_runtime_response(
-    exec: &ExecContext,
+    model_info: &codex_protocol::openai_models::ModelInfo,
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
     wall_time: Duration,
 ) -> Result<FunctionToolOutput, String> {
     let script_status = format_script_status(&response);
+    let supports_original = can_request_original_image_detail(model_info);
 
     match response {
         RuntimeResponse::Yielded { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
+            sanitize_image_detail_items(supports_original, &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, wall_time);
             Ok(FunctionToolOutput::from_content(content_items, Some(true)))
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
+            sanitize_image_detail_items(supports_original, &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, wall_time);
             Ok(FunctionToolOutput::from_content(content_items, Some(true)))
@@ -276,7 +280,7 @@ pub(super) async fn handle_runtime_response(
             ..
         } => {
             let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
+            sanitize_image_detail_items(supports_original, &mut content_items);
             let success = error_text.is_none();
             if let Some(error_text) = error_text {
                 content_items.push(FunctionCallOutputContentItem::InputText {
@@ -291,10 +295,6 @@ pub(super) async fn handle_runtime_response(
             ))
         }
     }
-}
-
-fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem]) {
-    sanitize_image_detail_items(can_request_original_image_detail(turn.model_info()), items);
 }
 
 fn format_script_status(response: &RuntimeResponse) -> String {
@@ -346,6 +346,7 @@ fn submit_nested_tool(
     exec: ExecContext,
     tool_runtime: ToolCallRuntime,
     invocation: CodeModeNestedToolCall,
+    call_id: String,
     cancellation_token: CancellationToken,
 ) -> Result<
     impl std::future::Future<Output = Result<JsonValue, FunctionCallError>> + Send + 'static,
@@ -358,20 +359,43 @@ fn submit_nested_tool(
         tool_kind,
         input,
     } = invocation;
-    if is_exec_tool_name(&tool_name) {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{PUBLIC_TOOL_NAME} cannot invoke itself"
-        )));
-    }
-
-    let payload = match build_nested_tool_payload(tool_kind, &tool_name, input) {
+    let thread_id = exec.session.thread_id;
+    let turn_id = exec.turn.sub_id.clone();
+    let tool_name = tool_name.with_default_namespace();
+    // A cell can outlive a turn; the broker records arrival before a dispatching turn is known.
+    tracing::event!(
+        name: "codex.code_mode.nested_tool_dispatched",
+        target: "codex_otel.trace_safe",
+        tracing::Level::INFO,
+        event.name = "codex.code_mode.nested_tool_dispatched",
+        conversation.id = %thread_id,
+        turn_id = turn_id.as_str(),
+        cell.id = telemetry::trace_id(cell_id.as_str()),
+        runtime_tool_call_id = telemetry::trace_id(&runtime_tool_call_id),
+        call_id = call_id.as_str(),
+    );
+    let payload = if is_exec_tool_name(&tool_name) {
+        Err(format!("{PUBLIC_TOOL_NAME} cannot invoke itself"))
+    } else {
+        build_nested_tool_payload(tool_kind, &tool_name, input)
+    };
+    let payload = match payload {
         Ok(payload) => payload,
-        Err(error) => return Err(FunctionCallError::RespondToModel(error)),
+        Err(error) => {
+            call_trace::result_ready(
+                thread_id,
+                &turn_id,
+                &tool_name,
+                &call_id,
+                call_trace::Source::CodeMode,
+            );
+            return Err(FunctionCallError::RespondToModel(error));
+        }
     };
 
     let call = ToolCall {
-        tool_name: tool_name.with_default_namespace(),
-        call_id: format!("{PUBLIC_TOOL_NAME}-{}", uuid::Uuid::new_v4()),
+        tool_name,
+        call_id,
         payload,
         encrypted_function_args: None,
     };

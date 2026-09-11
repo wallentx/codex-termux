@@ -28,6 +28,7 @@ pub(super) struct McpDesiredState {
     pub(super) session_source: SessionSource,
     pub(super) environments: TurnEnvironmentSnapshot,
     pub(super) local_process_cwd: PathBuf,
+    pub(super) disabled_plugin_ids: Vec<String>,
 }
 
 impl Session {
@@ -75,9 +76,12 @@ impl Session {
         &self,
         auth: Option<CodexAuth>,
     ) -> McpDesiredState {
-        let session_configuration = {
+        let (session_configuration, disabled_plugin_ids) = {
             let state = self.state.lock().await;
-            state.session_configuration.clone()
+            (
+                state.session_configuration.clone(),
+                state.active_disabled_plugin_ids.clone(),
+            )
         };
         let environments = self.services.turn_environments.snapshot().await;
         let cwd = environments
@@ -98,6 +102,7 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments,
             local_process_cwd,
+            disabled_plugin_ids,
         }
     }
 
@@ -124,6 +129,7 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments: resolved_environments.clone(),
             local_process_cwd,
+            disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
         };
         self.publish_mcp_runtime(
             &desired,
@@ -143,13 +149,12 @@ impl Session {
     /// Adds effective executor-owned configuration from this exact thread snapshot.
     pub(super) fn project_selected_environment_mcp_servers<'a>(
         &'a self,
-        session_source: &'a SessionSource,
         config: &'a Config,
         environments: &'a TurnEnvironmentSnapshot,
         mut projection: McpRuntimeProjection,
     ) -> BoxFuture<'a, McpRuntimeProjection> {
         Box::pin(async move {
-            if crate::guardian::is_basic_session_source(session_source) {
+            if self.isolation == codex_extension_api::SessionIsolation::Isolated {
                 return projection;
             }
 
@@ -306,7 +311,6 @@ impl Session {
     ) {
         let mcp_projection = self
             .project_selected_environment_mcp_servers(
-                &desired.session_source,
                 &desired.config,
                 &desired.environments,
                 mcp_projection,
