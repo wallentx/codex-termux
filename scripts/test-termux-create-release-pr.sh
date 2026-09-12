@@ -327,6 +327,7 @@ git config user.email "termux-release-test@example.invalid"
 
 mkdir -p \
   .github/workflows \
+  codex-rs/app-server-transport/src/transport \
   codex-rs/cli/src \
   codex-rs/core/src/guardian \
   codex-rs/features/src \
@@ -382,6 +383,7 @@ name = "codex-utils-fuzzy-match"
 version = "0.0.0"
 LOCK
 printf 'old upstream guardian\n' > codex-rs/core/src/guardian/mod.rs
+printf 'use futures::StreamExt;\n' > codex-rs/app-server-transport/src/transport/unix_socket.rs
 printf 'old upstream feature\n' > codex-rs/features/src/lib.rs
 printf 'old upstream composer\n' > codex-rs/tui/src/bottom_pane/chat_composer.rs
 printf 'old upstream vim commands\n' > codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs
@@ -426,6 +428,8 @@ printf 'new upstream guardian\n' > codex-rs/core/src/guardian/mod.rs
 printf 'new upstream feature\n' > codex-rs/features/src/lib.rs
 printf 'new upstream composer\n' > codex-rs/tui/src/bottom_pane/chat_composer.rs
 printf 'new upstream vim commands\n' > codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs
+printf 'use futures::SinkExt;\nuse futures::StreamExt;\n' > codex-rs/app-server-transport/src/transport/unix_socket.rs
+git add codex-rs/app-server-transport/src/transport/unix_socket.rs
 git add .github/scripts/macos-signing codex-rs/Cargo.lock codex-rs/Cargo.toml codex-rs/core/Cargo.toml codex-rs/core/src/guardian/mod.rs codex-rs/features/src/lib.rs codex-rs/tui/src/bottom_pane/chat_composer.rs codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs codex-rs/utils/audio/Cargo.toml codex-rs/windows-sandbox-rs/BUILD.bazel src/shared.txt src/new-tag.txt
 git commit -m "new upstream release" >/dev/null
 git tag rust-v1.0.0-alpha.2
@@ -455,6 +459,14 @@ printf 'stale target guardian\n' > codex-rs/core/src/guardian/mod.rs
 printf 'stale target feature\n' > codex-rs/features/src/lib.rs
 printf 'stale target composer\n' > codex-rs/tui/src/bottom_pane/chat_composer.rs
 printf 'stale target vim commands\n' > codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs
+printf '%s\n' \
+  'use codex_utils_file_lock::FileLockOutcome;' \
+  'use codex_utils_file_lock::LockDirGuard;' \
+  'use codex_utils_file_lock::acquire_sibling_lock_dir;' \
+  'use codex_utils_file_lock::lock_exclusive_optional;' \
+  'use futures::StreamExt;' \
+  > codex-rs/app-server-transport/src/transport/unix_socket.rs
+git add codex-rs/app-server-transport/src/transport/unix_socket.rs
 printf 'termux workflow\n' > .github/workflows/rust-release.yml
 printf 'compat\n' > termux/compat.txt
 printf 'termux release code with target drift\n' > codex-rs/cli/src/main.rs
@@ -554,6 +566,9 @@ fi
 
 echo "ok - newer upstream tag rebuilds and merges the release base into the open train"
 
+assert_ref_file_equals origin/release-train/1.0.0 codex-rs/app-server-transport/src/transport/unix_socket.rs \
+  $'use codex_utils_file_lock::FileLockOutcome;\nuse codex_utils_file_lock::LockDirGuard;\nuse codex_utils_file_lock::acquire_sibling_lock_dir;\nuse codex_utils_file_lock::lock_exclusive_optional;\nuse futures::SinkExt;\nuse futures::StreamExt;'
+
 # A stable release and the next alpha may contain different cherry-picks. Their
 # Git merge base predates both, but an unchanged downstream file is not a Termux
 # patch. Use arbitrary paths outside the authoritative-path allowlist.
@@ -616,3 +631,51 @@ if [[ "$(git diff --name-only --diff-filter=U)" != "src/ownership.txt" ]]; then
   fail "expected only the genuine downstream conflict to remain"
 fi
 echo "ok - genuine downstream edits still fail closed for manual resolution"
+
+git merge --abort
+git checkout --detach rust-v1.1.0-alpha.1 >/dev/null
+perl -0pi -e 's/version = "1\.1\.0-alpha\.1"/version = "1.1.0"/' codex-rs/Cargo.toml
+git add codex-rs/Cargo.toml
+git commit -m "stable release after next alpha" >/dev/null
+git tag rust-v1.1.0
+git push origin rust-v1.1.0 >/dev/null
+
+git checkout -B wallentx/termux-target rust-v1.0.1-termux >/dev/null
+mkdir -p codex-rs/network-proxy
+printf '[package]\nname = "codex-network-proxy"\n[dependencies]\nrand_regex.workspace = true\n' > codex-rs/network-proxy/Cargo.toml
+printf 'newer release line\n' > src/newer-release-line.txt
+git add codex-rs/network-proxy/Cargo.toml src/newer-release-line.txt
+git commit -m "checkpoint a newer minor alpha" >/dev/null
+git tag rust-v1.2.0-alpha.1-termux
+git push --force origin wallentx/termux-target rust-v1.2.0-alpha.1-termux >/dev/null
+# Simulate retrying an already-open broken PR built from the advanced target.
+git push --force origin HEAD:release-train/1.0.0 >/dev/null
+TERMUX_TEST_OPEN_PR_TAG="rust-v1.1.0" \
+run_release_pr_script \
+  "${runner_temp_update}" "${github_output_update}" "rust-v1.1.0" \
+  > "${tmp_dir}/stdout-stable" 2> "${tmp_dir}/stderr-stable" || {
+    cat "${tmp_dir}/stdout-stable" >&2
+    cat "${tmp_dir}/stderr-stable" >&2
+    fail "first stable release did not fall back to an older tested line"
+  }
+assert_ref_lacks_file origin/release-train/1.0.0 src/newer-release-line.txt
+assert_ref_lacks_file origin/release-train/1.0.0 codex-rs/network-proxy/Cargo.toml
+assert_ref_file_contains origin/release-train/1.0.0 .github/termux-release.json \
+  "\"patch_source_sha\": \"$(git rev-parse rust-v1.0.1-termux)\""
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/core/Cargo.toml 'codex-utils-file-lock = { workspace = true }'
+assert_ref_file_contains origin/release-train/1.0.0 codex-rs/Cargo.toml 'version = "1.1.0"'
+assert_ref_file_equals origin/release-train/1.0.0 src/cherry-picked.txt "next upstream content"
+echo "ok - first stable line avoids newer alpha code, including on an existing PR retry"
+
+git tag -d rust-v1.0.1-termux >/dev/null
+published_head="$(git rev-parse origin/release-train/1.0.0)"
+if run_release_pr_script \
+  "${runner_temp_update}" "${github_output_update}" "rust-v1.1.0" \
+  > "${tmp_dir}/stdout-no-baseline" 2> "${tmp_dir}/stderr-no-baseline"; then
+  fail "release PR script accepted newer target code without a safe tested baseline"
+fi
+grep -q 'No tested Termux tag at or before release line' "${tmp_dir}/stderr-no-baseline" \
+  || fail "missing safe baseline did not produce the expected diagnostic"
+[[ "$(git rev-parse origin/release-train/1.0.0)" == "${published_head}" ]] \
+  || fail "missing baseline changed the published PR"
+echo "ok - missing older tested baseline fails before changing release refs"

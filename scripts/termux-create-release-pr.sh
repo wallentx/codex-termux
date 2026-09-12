@@ -223,6 +223,42 @@ resolve_unmodified_upstream_conflicts() {
   done < <(git diff --name-only --diff-filter=U -z)
 }
 
+resolve_startup_lock_import_conflict() {
+  local path="codex-rs/app-server-transport/src/transport/unix_socket.rs"
+  [[ -n "$(git ls-files --unmerged -- "${path}")" ]] || return 0
+
+  # 0.154 adds SinkExt at the same location as our lock fallback imports.
+  # Resolve only these exact additive imports, not arbitrary Rust conflicts.
+  # Include the base to prove that neither side replaces existing code.
+  git checkout --conflict=diff3 -- "${path}"
+  python3 - "${path}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+ours = (
+    "use codex_utils_file_lock::FileLockOutcome;\n"
+    "use codex_utils_file_lock::LockDirGuard;\n"
+    "use codex_utils_file_lock::acquire_sibling_lock_dir;\n"
+    "use codex_utils_file_lock::lock_exclusive_optional;\n"
+)
+theirs = "use futures::SinkExt;\n"
+pattern = (
+    r"^<<<<<<< [^\n]*\n" + re.escape(ours)
+    + r"\|\|\|\|\|\|\|[^\n]*\n=======\n" + re.escape(theirs)
+    + r">>>>>>> [^\n]*\n"
+)
+resolved, count = re.subn(pattern, ours + theirs, text, flags=re.MULTILINE)
+if count and not re.search(r"^(?:<<<<<<<|=======|>>>>>>>)", resolved, re.MULTILINE):
+    path.write_text(resolved)
+PY
+  if ! grep -qE '^(<<<<<<<|=======|>>>>>>>)' "${path}"; then
+    git add -- "${path}"
+  fi
+}
+
 restore_release_rollout_locks() {
   local release_ref="origin/${RELEASE_BRANCH}"
 
@@ -308,6 +344,7 @@ merge_release_branch_into_work_branch() {
 
   restore_merge_authoritative_paths
   resolve_unmodified_upstream_conflicts
+  resolve_startup_lock_import_conflict
   restore_release_rollout_locks
   restore_release_workspace_manifest
   # Similar dependency lists can make a historical patch apply to the wrong
@@ -490,6 +527,8 @@ cargo_overlay_base_ref=""
 patch_upstream_ref=""
 
 if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
+  release_major="${BASH_REMATCH[1]}"
+  release_minor="${BASH_REMATCH[2]}"
   release_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
   mapfile -t target_termux_tags < <(
     git tag \
@@ -510,12 +549,18 @@ if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
   done
   if (( ${#target_termux_tags[@]} > 0 )) \
     && [[ "${target_termux_tags[0]}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]] \
-    && [[ "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" != "${release_line}" ]]; then
+    && (( BASH_REMATCH[1] > release_major \
+      || (BASH_REMATCH[1] == release_major && BASH_REMATCH[2] > release_minor) )); then
+    # A stable line can debut after the target has checkpointed the next alpha.
+    # With no same-line tag, fall back to the nearest older tested line, never
+    # merge newer product code and then downgrade only its workspace manifest.
     for candidate_tag in "${target_termux_tags[@]}"; do
       if [[ "${candidate_tag}" == "${TERMUX_TAG}" ]]; then
         continue
       fi
-      if [[ "${candidate_tag}" == rust-v${release_line}.*-termux ]]; then
+      if [[ "${candidate_tag}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]] \
+        && (( BASH_REMATCH[1] < release_major \
+          || (BASH_REMATCH[1] == release_major && BASH_REMATCH[2] <= release_minor) )); then
         patch_source_ref="refs/tags/${candidate_tag}"
         patch_source_label="${candidate_tag}"
         patch_source_sha="$(git rev-parse "${patch_source_ref}")"
@@ -523,6 +568,10 @@ if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
         break
       fi
     done
+    if [[ "${patch_source_ref}" == "origin/${PATCH_BRANCH}" ]]; then
+      echo "No tested Termux tag at or before release line ${release_line}; refusing to use newer target code." >&2
+      exit 1
+    fi
   fi
 fi
 
