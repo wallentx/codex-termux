@@ -38,8 +38,7 @@
         "startup",
         "resume",
         "clear",
-        "compact",
-        "fork"
+        "compact"
       ],
       "type": "string"
     },

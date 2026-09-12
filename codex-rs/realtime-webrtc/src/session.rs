@@ -26,10 +26,7 @@ const ANSWER_WAIT: Duration = Duration::from_secs(/*secs*/ 40);
 static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
 
 enum Command {
-    Answer(
-        SessionDescription,
-        blocking::SyncSender<std::result::Result<(), crate::ConnectionError>>,
-    ),
+    Answer(SessionDescription, blocking::SyncSender<()>),
     Controls(AudioControls),
 }
 
@@ -133,14 +130,11 @@ impl RealtimeWebrtcSession {
             .name("voice-session".into())
             .spawn(move || {
                 let task = async {
-                    let host = report_failure(
-                        "connect",
-                        VoiceHost::connect(&package, &build_commit).await,
-                    )?;
-                    let host =
-                        report_failure("initialize_runtime", host.initialize_runtime().await)?;
-                    let (host, sdp) =
-                        report_failure("start_transport", host.start_transport().await)?;
+                    let host = VoiceHost::connect(&package, &build_commit)
+                        .await?
+                        .initialize_runtime()
+                        .await?;
+                    let (host, sdp) = host.start_transport().await?;
                     offer
                         .send(sdp.into_sdp())
                         .map_err(|_| anyhow::anyhow!("voice startup cancelled"))?;
@@ -202,22 +196,15 @@ impl RealtimeWebrtcSessionHandle {
     }
 
     /// Called off the UI thread; return only after negotiation, device startup and restored controls.
-    pub fn apply_answer_sdp(
-        &self,
-        answer: String,
-    ) -> std::result::Result<(), crate::ConnectionError> {
-        let sdp =
-            SessionDescription::try_from(answer).map_err(|_| crate::ConnectionError::Failed)?;
+    pub fn apply_answer_sdp(&self, answer: String) -> Result<()> {
+        let sdp = SessionDescription::try_from(answer).map_err(anyhow::Error::msg)?;
         let (complete, result) = blocking::sync_channel(/*bound*/ 1);
-        self.send(Command::Answer(sdp, complete))
-            .map_err(|_| crate::ConnectionError::Failed)?;
-        match result.recv_timeout(ANSWER_WAIT) {
-            Ok(result) => result,
-            Err(_) => {
-                self.close();
-                Err(crate::ConnectionError::Failed)
-            }
+        self.send(Command::Answer(sdp, complete))?;
+        if result.recv_timeout(ANSWER_WAIT).is_err() {
+            self.close();
+            anyhow::bail!("voice connection failed");
         }
+        Ok(())
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -267,60 +254,29 @@ async fn run(
             biased;
             command = commands.recv() => match command {
                 Some(Command::Answer(sdp, complete)) if !connected => {
-                    host = match host.apply_answer(sdp).await {
-                        Ok(host) => host,
-                        Err(error) => {
-                            let failure = error.downcast_ref::<crate::ConnectionError>()
-                                .copied().unwrap_or(crate::ConnectionError::Failed);
-                            let _ = complete.send(Err(failure));
-                            // This failure is delivered by the startup completion only.
-                            return Ok(());
-                        }
-                    };
-                    host = report_failure("open_devices", host.open_devices().await)?;
+                    host = host.apply_answer(sdp).await?.open_devices().await?;
                     let applied = startup_controls(&mut commands, controls, |initial| {
                         host.begin_audio_controls(initial)
-                    });
-                    let applied = report_failure("queue_startup_controls", applied)?;
-                    report_failure("apply_startup_controls", applied.await)?;
+                    })?;
+                    applied.await?;
                     connected = true;
-                    let _ = complete.send(Ok(()));
+                    let _ = complete.send(());
                 }
                 Some(Command::Controls(next)) => {
                     if connected {
-                        report_failure("set_audio_controls", host.set_audio_controls(next).await)?;
+                        host.set_audio_controls(next).await?;
                     }
                 }
                 Some(Command::Answer(..)) => anyhow::bail!("voice answer already applied"),
-                None => return report_failure("close", host.close().await),
+                None => return host.close().await,
             },
             _ = poll.tick() => {
-                let audio = report_failure("inspect_audio", host.inspect_audio().await)?;
+                let audio = host.inspect_audio().await?;
                 state.microphone.fetch_max(audio.microphone_peak, Ordering::Release);
                 state.speaker.fetch_max(audio.speaker_peak, Ordering::Release);
             }
         }
     }
-}
-
-// Keep diagnostics bounded and independent of untyped native, SDP, or device error text.
-fn report_failure<T>(stage: &'static str, result: Result<T>) -> Result<T> {
-    result.inspect_err(|error| {
-        let kind = if error.is::<tokio::time::error::Elapsed>() {
-            "timeout"
-        } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
-            match error.kind() {
-                std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset => "closed",
-                std::io::ErrorKind::InvalidData => "protocol",
-                _ => "io",
-            }
-        } else {
-            "other"
-        };
-        tracing::warn!(stage, kind, "voice session operation failed");
-    })
 }
 
 // Devices are still disabled. The snapshot and request enqueue share the setters' lock;

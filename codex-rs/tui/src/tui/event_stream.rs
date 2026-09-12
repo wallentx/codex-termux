@@ -3,8 +3,7 @@
 //! - [`EventBroker`] holds the shared crossterm stream so multiple callers reuse the same
 //!   input source and can drop/recreate it on pause/resume without rebuilding consumers.
 //! - [`TuiEventStream`] wraps a draw event subscription plus the shared [`EventBroker`] and maps crossterm
-//!   events into [`TuiEvent`]. The broker also owns the tmux size monitor; its samples
-//!   wake the draw subscription and become resize events before rendering.
+//!   events into [`TuiEvent`].
 //! - [`EventSource`] abstracts the underlying event producer; the real implementation is
 //!   [`CrosstermEventSource`] and tests can swap in [`FakeEventSource`].
 //!
@@ -35,7 +34,6 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::TuiEvent;
-use super::size_monitor::SizeMonitor;
 
 /// Result type produced by an event source.
 pub type EventResult = std::io::Result<Event>;
@@ -53,7 +51,6 @@ pub trait EventSource: Send + 'static {
 pub struct EventBroker<S: EventSource = CrosstermEventSource> {
     state: Mutex<EventBrokerState<S>>,
     resume_events_tx: watch::Sender<()>,
-    pub(super) size_monitor: Option<SizeMonitor>,
 }
 
 /// Tracks state of underlying [`EventSource`].
@@ -86,15 +83,11 @@ impl<S: EventSource + Default> EventBroker<S> {
         Self {
             state: Mutex::new(EventBrokerState::Start),
             resume_events_tx,
-            size_monitor: None,
         }
     }
 
     /// Drop the underlying event source
     pub fn pause_events(&self) {
-        if let Some(monitor) = &self.size_monitor {
-            monitor.set_active(/*active*/ false);
-        }
         let mut state = self
             .state
             .lock()
@@ -104,9 +97,6 @@ impl<S: EventSource + Default> EventBroker<S> {
 
     /// Create a new instance of the underlying event source
     pub fn resume_events(&self) {
-        if let Some(monitor) = &self.size_monitor {
-            monitor.set_active(/*active*/ true);
-        }
         let mut state = self
             .state
             .lock()
@@ -248,15 +238,9 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
     /// Poll the draw broadcast stream for the next draw event. Draw events are used to trigger a redraw of the TUI.
     pub fn poll_draw_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
         match Pin::new(&mut self.draw_stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(())))
-            | Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
-                let event = self
-                    .broker
-                    .size_monitor
-                    .as_ref()
-                    .and_then(SizeMonitor::take_resize)
-                    .map_or(TuiEvent::Draw, TuiEvent::Resize);
-                Poll::Ready(Some(event))
+            Poll::Ready(Some(Ok(()))) => Poll::Ready(Some(TuiEvent::Draw)),
+            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
+                Poll::Ready(Some(TuiEvent::Draw))
             }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -284,11 +268,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 Some(TuiEvent::Key(key_event))
             }
             Event::Resize(width, height) => {
-                let size = ratatui::layout::Size { width, height };
-                if let Some(monitor) = &self.broker.size_monitor {
-                    monitor.observe(size);
-                }
-                Some(TuiEvent::Resize(size))
+                Some(TuiEvent::Resize(ratatui::layout::Size { width, height }))
             }
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {

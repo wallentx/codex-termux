@@ -63,10 +63,8 @@ const BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE: &str =
     "background_paginated_rollout_migration";
 
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
-    "api_key_model_discovery",
     "auth_elicitation",
     BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE,
-    "codex_apps_mcp_2026_07_28",
     "mcp_2026_07_28",
     "memories",
     "mentions_v2",
@@ -316,11 +314,6 @@ impl ConfigRequestProcessor {
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        self.thread_manager
-            .get_models_manager()
-            .set_api_key_model_discovery_enabled(
-                config.features.enabled(Feature::ApiKeyModelDiscovery),
-            );
         if should_start_background_rollout_migration && config.features.enabled(feature) {
             self.thread_manager.start_background_rollout_migration();
         }
@@ -388,13 +381,6 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
         .and_then(|windows| windows.sandbox_private_desktop);
 
     ConfigRequirements {
-        model_provider: requirements.model_provider,
-        model_providers: requirements.model_providers.map(|providers| {
-            providers
-                .into_iter()
-                .map(|(id, provider)| (id, serde_json::json!(provider)))
-                .collect()
-        }),
         application: requirements.application.map(|application| {
             codex_app_server_protocol::ApplicationRequirements {
                 network: application.network.map(|network| {

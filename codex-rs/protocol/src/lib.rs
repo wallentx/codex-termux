@@ -32,8 +32,6 @@ pub mod mcp;
 pub mod mcp_approval_meta;
 pub mod mcp_policy;
 pub mod memory_citation;
-mod memory_version;
-pub use memory_version::MemoryVersion;
 pub mod models;
 pub mod network_policy;
 pub mod num_format;

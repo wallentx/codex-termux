@@ -13,9 +13,7 @@ use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_IP_PROTOCOL_UDP;
 use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_MODIFY_STATE;
 use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_MODIFY_STATE_OK;
 use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_PROFILE2_ALL;
-use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_RULE_DIR_IN;
 use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_RULE_DIR_OUT;
-use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_RULE_DIRECTION;
 use windows::Win32::NetworkManagement::WindowsFirewall::NetFwPolicy2;
 use windows::Win32::NetworkManagement::WindowsFirewall::NetFwRule;
 use windows::Win32::System::Com::CLSCTX_INPROC_SERVER;
@@ -32,14 +30,11 @@ use codex_windows_sandbox::SetupFailure;
 // This is the stable identifier we use to find/update the rule idempotently.
 // It intentionally does not change between installs.
 const OFFLINE_BLOCK_RULE_NAME: &str = "codex_sandbox_offline_block_outbound";
-const OFFLINE_BLOCK_INBOUND_RULE_NAME: &str = "codex_sandbox_offline_block_inbound";
 const OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME: &str = "codex_sandbox_offline_block_loopback_tcp";
 const OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME: &str = "codex_sandbox_offline_block_loopback_udp";
 
 // Friendly text shown in the firewall UI.
 const OFFLINE_BLOCK_RULE_FRIENDLY: &str = "Codex Sandbox Offline - Block Non-Loopback Outbound";
-const OFFLINE_BLOCK_INBOUND_RULE_FRIENDLY: &str =
-    "Codex Sandbox Offline - Block Non-Loopback Inbound";
 const OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY: &str =
     "Codex Sandbox Offline - Block Loopback TCP (Except Proxy)";
 const OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY: &str = "Codex Sandbox Offline - Block Loopback UDP";
@@ -50,7 +45,6 @@ const NON_LOOPBACK_REMOTE_ADDRESSES: &str = "0.0.0.0-126.255.255.255,128.0.0.0-2
 struct BlockRuleSpec<'a> {
     internal_name: &'a str,
     friendly_desc: &'a str,
-    direction: NET_FW_RULE_DIRECTION,
     protocol: i32,
     local_user_spec: &'a str,
     offline_sid: &'a str,
@@ -105,7 +99,6 @@ pub fn ensure_offline_proxy_allowlist(
                 &BlockRuleSpec {
                     internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
                     friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
-                    direction: NET_FW_RULE_DIR_OUT,
                     protocol: NET_FW_IP_PROTOCOL_UDP.0,
                     local_user_spec: &local_user_spec,
                     offline_sid,
@@ -122,7 +115,6 @@ pub fn ensure_offline_proxy_allowlist(
                 &BlockRuleSpec {
                     internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
                     friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
-                    direction: NET_FW_RULE_DIR_OUT,
                     protocol: NET_FW_IP_PROTOCOL_TCP.0,
                     local_user_spec: &local_user_spec,
                     offline_sid,
@@ -142,7 +134,6 @@ pub fn ensure_offline_proxy_allowlist(
                     &BlockRuleSpec {
                         internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
                         friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
-                        direction: NET_FW_RULE_DIR_OUT,
                         protocol: NET_FW_IP_PROTOCOL_TCP.0,
                         local_user_spec: &local_user_spec,
                         offline_sid,
@@ -162,7 +153,7 @@ pub fn ensure_offline_proxy_allowlist(
     result
 }
 
-pub fn ensure_offline_network_blocks(offline_sid: &str, log: &mut dyn Write) -> Result<()> {
+pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> Result<()> {
     let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
 
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -196,21 +187,6 @@ pub fn ensure_offline_network_blocks(offline_sid: &str, log: &mut dyn Write) -> 
                 &BlockRuleSpec {
                     internal_name: OFFLINE_BLOCK_RULE_NAME,
                     friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
-                    direction: NET_FW_RULE_DIR_OUT,
-                    protocol: NET_FW_IP_PROTOCOL_ANY.0,
-                    local_user_spec: &local_user_spec,
-                    offline_sid,
-                    remote_addresses: Some(NON_LOOPBACK_REMOTE_ADDRESSES),
-                    remote_ports: None,
-                },
-                log,
-            )?;
-            ensure_block_rule(
-                &rules,
-                &BlockRuleSpec {
-                    internal_name: OFFLINE_BLOCK_INBOUND_RULE_NAME,
-                    friendly_desc: OFFLINE_BLOCK_INBOUND_RULE_FRIENDLY,
-                    direction: NET_FW_RULE_DIR_IN,
                     protocol: NET_FW_IP_PROTOCOL_ANY.0,
                     local_user_spec: &local_user_spec,
                     offline_sid,
@@ -359,7 +335,7 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
                     format!("SetDescription failed: {err:?}"),
                 ))
             })?;
-        rule.SetDirection(spec.direction).map_err(|err| {
+        rule.SetDirection(NET_FW_RULE_DIR_OUT).map_err(|err| {
             anyhow::Error::new(SetupFailure::new(
                 SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
                 format!("SetDirection failed: {err:?}"),
@@ -543,7 +519,6 @@ mod tests {
             BlockRuleSpec {
                 internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
                 friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
-                direction: NET_FW_RULE_DIR_OUT,
                 protocol: NET_FW_IP_PROTOCOL_UDP.0,
                 local_user_spec,
                 offline_sid,
@@ -553,7 +528,6 @@ mod tests {
             BlockRuleSpec {
                 internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
                 friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
-                direction: NET_FW_RULE_DIR_OUT,
                 protocol: NET_FW_IP_PROTOCOL_TCP.0,
                 local_user_spec,
                 offline_sid,
@@ -563,7 +537,6 @@ mod tests {
             BlockRuleSpec {
                 internal_name: OFFLINE_BLOCK_RULE_NAME,
                 friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
-                direction: NET_FW_RULE_DIR_OUT,
                 protocol: NET_FW_IP_PROTOCOL_ANY.0,
                 local_user_spec,
                 offline_sid,

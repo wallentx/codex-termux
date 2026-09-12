@@ -10,7 +10,6 @@ use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
 use codex_utils_path_uri::PathUri;
 
 use crate::CODEX_APPS_MCP_SERVER_NAME;
-use crate::McpProtocolMode;
 
 /// Plugin identity retained with an MCP registration for tool attribution.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,7 +137,6 @@ pub struct McpServerRegistration {
     name: String,
     source: McpServerSource,
     config: McpServerConfig,
-    protocol_mode: Option<McpProtocolMode>,
     precedence: RegistrationPrecedence,
 }
 
@@ -211,12 +209,6 @@ impl McpServerRegistration {
         )
     }
 
-    /// Overrides the protocol for this registration if it wins HTTP server resolution.
-    pub fn with_protocol_mode(mut self, protocol_mode: McpProtocolMode) -> Self {
-        self.protocol_mode = Some(protocol_mode);
-        self
-    }
-
     /// Registers the controller-owned Apps server contributed by a host extension.
     pub fn from_hosted_apps(
         id: impl Into<String>,
@@ -245,7 +237,6 @@ impl McpServerRegistration {
             name,
             source,
             config,
-            protocol_mode: None,
             precedence,
         }
     }
@@ -480,7 +471,6 @@ impl McpCatalogBuilder {
                         ResolvedMcpServer {
                             source: registration.source,
                             config: registration.config,
-                            protocol_mode: registration.protocol_mode,
                         },
                     ))
                 }
@@ -502,7 +492,6 @@ impl McpCatalogBuilder {
 pub struct ResolvedMcpServer {
     source: McpServerSource,
     config: McpServerConfig,
-    protocol_mode: Option<McpProtocolMode>,
 }
 
 impl ResolvedMcpServer {
@@ -512,10 +501,6 @@ impl ResolvedMcpServer {
 
     pub fn config(&self) -> &McpServerConfig {
         &self.config
-    }
-
-    pub fn protocol_mode(&self) -> Option<McpProtocolMode> {
-        self.protocol_mode
     }
 }
 
@@ -562,8 +547,8 @@ impl ResolvedMcpCatalog {
     pub fn with_materialized_servers(&self, servers: HashMap<String, McpServerConfig>) -> Self {
         let mut builder = Self::builder();
         for (name, config) in servers {
-            let previous = self.server(&name);
-            let source = previous
+            let source = self
+                .server(&name)
                 .map(|server| server.source.clone())
                 .unwrap_or(McpServerSource::Config);
             let precedence = match &source {
@@ -575,9 +560,7 @@ impl ResolvedMcpCatalog {
                 McpServerSource::Compatibility { .. } => RegistrationPrecedence::Compatibility,
                 McpServerSource::Extension { .. } => RegistrationPrecedence::Extension(0),
             };
-            let mut registration = McpServerRegistration::new(name, source, config, precedence);
-            registration.protocol_mode = previous.and_then(ResolvedMcpServer::protocol_mode);
-            builder.register(registration);
+            builder.register(McpServerRegistration::new(name, source, config, precedence));
         }
         builder.build()
     }

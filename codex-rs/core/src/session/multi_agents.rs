@@ -1,6 +1,6 @@
 use crate::config::MultiAgentV2Config;
 use crate::context::MultiAgentRoleInstructions;
-use crate::session::step_context::StepContext;
+use crate::session::turn_context::TurnContext;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::openai_models::MultiAgentRoleMessages;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -65,17 +65,15 @@ pub(crate) struct ResolvedMultiAgentV2UsageHints {
 }
 
 pub(super) fn usage_hint_text(
-    step_context: &StepContext,
+    turn_context: &TurnContext,
     session_source: &SessionSource,
 ) -> Option<MultiAgentRoleInstructions> {
-    let turn_context = step_context.turn.as_ref();
     if turn_context.multi_agent_version != MultiAgentVersion::V2 {
         return None;
     }
 
-    let catalog = step_context
-        .settings
-        .model_info
+    let catalog = turn_context
+        .model_info()
         .model_messages
         .as_ref()
         .and_then(|messages| messages.multi_agent.as_ref())
@@ -154,15 +152,13 @@ pub(crate) fn resolve_usage_hints(
     }
 }
 
-pub(crate) fn effective_multi_agent_mode(step_context: &StepContext) -> Option<MultiAgentMode> {
-    let turn_context = step_context.turn.as_ref();
-    let settings = &step_context.settings;
+pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<MultiAgentMode> {
     if turn_context.multi_agent_version != MultiAgentVersion::V2 {
         return None;
     }
 
-    let catalog_mode = settings
-        .model_info
+    let catalog_mode = turn_context
+        .model_info()
         .model_messages
         .as_ref()
         .and_then(|messages| messages.multi_agent.as_ref())
@@ -178,7 +174,7 @@ pub(crate) fn effective_multi_agent_mode(step_context: &StepContext) -> Option<M
     // of an effort-derived built-in policy.
     let multi_agent_mode = match mode_hint_text {
         Some(hint_text) => MultiAgentMode::Custom(hint_text.to_string()),
-        None => match settings.effective_reasoning_effort() {
+        None => match turn_context.effective_reasoning_effort() {
             Some(ReasoningEffort::Ultra) => catalog_mode
                 .and_then(|messages| messages.proactive.clone())
                 .map(MultiAgentMode::Custom)

@@ -158,7 +158,6 @@ impl ImageGenerationTool {
                     failure: None,
                     saved_path: None,
                     imagegen_request_id: None,
-                    generation_id: None,
                 },
                 EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
                     call_id: call.call_id.clone(),
@@ -185,17 +184,10 @@ impl ImageGenerationTool {
                 .data
                 .into_iter()
                 .next()
-                .map(|data| {
-                    (
-                        data.b64_json,
-                        transparent_background,
-                        imagegen_request_id,
-                        data.generation_id,
-                    )
-                })
+                .map(|data| (data.b64_json, transparent_background, imagegen_request_id))
                 .ok_or_else(|| ("image generation returned no image data".to_string(), None))
         });
-        let (result, transparent_background, imagegen_request_id, generation_id) = match result {
+        let (result, transparent_background, imagegen_request_id) = match result {
             Ok(result) => result,
             Err((message, failure)) => {
                 let item = ImageGenerationItem {
@@ -207,7 +199,6 @@ impl ImageGenerationTool {
                     failure,
                     saved_path: None,
                     imagegen_request_id: None,
-                    generation_id: None,
                 };
                 let legacy_event = legacy_end_event(&item);
                 call.turn_item_emitter
@@ -233,7 +224,6 @@ impl ImageGenerationTool {
             failure: None,
             saved_path: saved_path.clone(),
             imagegen_request_id,
-            generation_id,
         };
         let legacy_event = legacy_end_event(&item);
         call.turn_item_emitter

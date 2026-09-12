@@ -522,10 +522,6 @@ pub struct ThreadSettingsOverrides {
     /// Updated fallback `cwd` and environments supplied together as a complete pair.
     pub environments: Option<TurnEnvironmentSelections>,
 
-    /// Updated top-level runtime workspace roots for default environments.
-    /// Explicit environment selections own their roots separately.
-    pub runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
-
     /// Updated profile-defined workspace roots for status summaries and
     /// per-turn config reconstruction.
     pub profile_workspace_roots: Option<Vec<AbsolutePathBuf>>,
@@ -573,10 +569,6 @@ pub struct ThreadSettingsOverrides {
 
     /// Updated personality preference.
     pub personality: Option<Personality>,
-
-    /// Replace the thread's disabled plugin IDs. Omission preserves the current
-    /// selection, and an empty list clears it.
-    pub disabled_plugin_ids: Option<Vec<String>>,
 }
 
 /// Source classification for client-supplied context.
@@ -2174,10 +2166,6 @@ pub struct TurnCompleteEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnStartedEvent {
     pub turn_id: String,
-    /// ID of the originating turn in the root thread; equals `turn_id` for root turns.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub root_turn_id: Option<String>,
     // Persist for rollout consumers that correlate turns with telemetry traces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2215,12 +2203,6 @@ pub struct ThreadSettingsSnapshot {
     #[ts(optional)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub cwd: AbsolutePathBuf,
-    /// Top-level runtime workspace roots for default environments, excluding roots
-    /// supplied by explicit environment selections or permission profiles.
-    /// An absent value means unknown; an empty list means no roots.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub runtime_workspace_roots: Option<Vec<AbsolutePathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2228,9 +2210,6 @@ pub struct ThreadSettingsSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personality: Option<Personality>,
     pub collaboration_mode: CollaborationMode,
-    /// Thread-owned plugin selection, retained even when a plugin is unavailable.
-    #[serde(default)]
-    pub disabled_plugin_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, JsonSchema, TS)]
@@ -3072,13 +3051,6 @@ pub struct SessionMeta {
     pub parent_thread_id: Option<ThreadId>,
     pub timestamp: String,
     pub cwd: PathBuf,
-    /// Top-level runtime workspace roots at creation for default environments,
-    /// excluding roots supplied by explicit environment selections or permission profiles.
-    /// An absent value means unknown; an empty list means no roots.
-    /// Keep native paths parseable across hosts; validate them when restoring settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub runtime_workspace_roots: Option<Vec<PathBuf>>,
     pub originator: String,
     pub cli_version: String,
     #[serde(default)]
@@ -3140,7 +3112,6 @@ impl Default for SessionMeta {
             parent_thread_id: None,
             timestamp: String::new(),
             cwd: PathBuf::new(),
-            runtime_workspace_roots: None,
             originator: String::new(),
             cli_version: String::new(),
             source: SessionSource::default(),
@@ -3235,10 +3206,6 @@ pub struct TurnContextItem {
     /// Only set for subagent turns; persisted so resume keeps the scope frozen at turn start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_turn_id: Option<String>,
-    /// Plugin selection captured for this turn. Absent in older histories.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub disabled_plugin_ids: Option<Vec<String>>,
     pub cwd: AbsolutePathBuf,
     /// Effective workspace roots used to materialize symbolic
     /// `:workspace_roots` filesystem permissions in `permission_profile`.
@@ -4471,16 +4438,6 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
-
-    #[test]
-    fn old_turn_started_records_have_no_root_attribution() {
-        let event: TurnStartedEvent = serde_json::from_value(serde_json::json!({
-            "turn_id": "old-turn",
-            "model_context_window": null
-        }))
-        .unwrap();
-        assert_eq!(event.root_turn_id, None);
-    }
 
     #[test]
     fn review_decision_denied_round_trip() -> Result<()> {
@@ -6086,7 +6043,6 @@ mod tests {
         let item = TurnContextItem {
             turn_id: None,
             root_turn_id: None,
-            disabled_plugin_ids: None,
             cwd: test_path_buf("/tmp").abs(),
             workspace_roots: None,
             current_date: None,

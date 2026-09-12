@@ -118,7 +118,6 @@ pub(crate) async fn load_project_instructions(
 /// discovered doc. If no documentation file is found the function returns
 /// `Ok(None)`. Unexpected I/O failures bubble up as `Err` so callers can
 /// decide how to handle them.
-#[tracing::instrument(name = "agents_md.load", skip_all, fields(max_total = max_total))]
 async fn read_agents_md(
     config: &Config,
     fs: &dyn ExecutorFileSystem,
@@ -185,7 +184,6 @@ async fn read_agents_md(
 
 /// Discovers AGENTS.md files from the project root to the current working
 /// directory, inclusive. Symlinks are allowed.
-#[tracing::instrument(name = "agents_md.discover", skip_all)]
 async fn agents_md_paths(
     config: &Config,
     cwd: &PathUri,
@@ -314,15 +312,6 @@ impl LoadedAgentsMd {
                 .filter(|instructions| !instructions.text.trim().is_empty()),
             entries: Vec::new(),
         }
-    }
-
-    pub(crate) fn with_user_instructions(
-        mut self,
-        user_instructions: Option<Instructions>,
-    ) -> Option<Self> {
-        self.user_instructions =
-            user_instructions.filter(|instructions| !instructions.text.trim().is_empty());
-        (!self.is_empty()).then_some(self)
     }
 
     /// Creates source-less user instructions for tests.

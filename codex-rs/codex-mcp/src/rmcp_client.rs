@@ -29,7 +29,7 @@ use crate::codex_apps::prepare_openai_file_params_for_model;
 use crate::elicitation::ElicitationRequestManager;
 use crate::executor_environment_http_client::ExecutorEnvironmentHttpClient;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
-use crate::mcp::ToolPluginContext;
+use crate::mcp::ToolPluginProvenance;
 use crate::openai_docs_source_attribution::maybe_with_openai_docs_source_attribution;
 use crate::pagination::collect_paginated_with_limit;
 use crate::runtime::McpRuntimeContext;
@@ -688,21 +688,20 @@ pub(crate) async fn list_tools_for_client_uncached(
     Ok(tools)
 }
 
-/// Filters disabled connectors, presents declared Codex Apps file parameters to the model as
-/// local-path inputs, and adds plugin names to each tool. Plugin membership is resolved by
-/// connector ID, falling back to the MCP server when absent.
+/// Presents declared Codex Apps file parameters to the model as local-path inputs and adds plugin
+/// names to each tool. Plugin membership is resolved by connector ID, falling back to the MCP
+/// server when absent.
 pub(crate) fn prepare_codex_apps_tools_for_model(
     mut tools: Vec<ToolInfo>,
-    tool_plugin_context: &ToolPluginContext,
+    tool_plugin_provenance: &ToolPluginProvenance,
 ) -> Vec<ToolInfo> {
-    tools.retain(|tool| tool_plugin_context.allows_connector_id(tool.connector_id.as_deref()));
     for tool in &mut tools {
         prepare_openai_file_params_for_model(tool);
         let plugin_names = match tool.connector_id.as_deref() {
             Some(connector_id) => {
-                tool_plugin_context.plugin_display_names_for_connector_id(connector_id)
+                tool_plugin_provenance.plugin_display_names_for_connector_id(connector_id)
             }
-            None => tool_plugin_context
+            None => tool_plugin_provenance
                 .plugin_display_names_for_mcp_server_name(tool.server_name.as_str()),
         };
         add_plugin_provenance_to_tool(tool, plugin_names);
@@ -748,11 +747,11 @@ fn add_plugin_provenance_to_tool(tool: &mut ToolInfo, plugin_names: &[String]) {
 /// Adds server-scoped plugin names to regular MCP tools without changing their input schemas.
 pub(crate) fn prepare_regular_mcp_tools_for_model(
     mut tools: Vec<ToolInfo>,
-    tool_plugin_context: &ToolPluginContext,
+    tool_plugin_provenance: &ToolPluginProvenance,
 ) -> Vec<ToolInfo> {
     for tool in &mut tools {
-        let plugin_names =
-            tool_plugin_context.plugin_display_names_for_mcp_server_name(tool.server_name.as_str());
+        let plugin_names = tool_plugin_provenance
+            .plugin_display_names_for_mcp_server_name(tool.server_name.as_str());
         add_plugin_provenance_to_tool(tool, plugin_names);
     }
     tools
@@ -1006,12 +1005,7 @@ async fn start_server_task(
         _auth_change_notifications: auth_change_notifications,
         client: Arc::clone(&client),
         server_info,
-        tool_catalog: Arc::new(ClientToolCatalog::new(
-            client_tools,
-            codex_apps_tools_cache_context
-                .as_ref()
-                .and_then(ConnectorRuntimeContext::subscribe),
-        )),
+        tool_catalog: Arc::new(ClientToolCatalog::new(client_tools)),
         tool_timeout: None,
         server_instructions: initialize_result.instructions,
         server_supports_sandbox_state_meta_capability,

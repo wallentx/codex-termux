@@ -42,7 +42,6 @@ fn write_rollout_with_source_and_provider(
                 parent_thread_id: None,
                 timestamp,
                 cwd: ".".into(),
-                runtime_workspace_roots: None,
                 originator: "test_originator".into(),
                 cli_version: "test_version".into(),
                 source,

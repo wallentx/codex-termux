@@ -10,7 +10,6 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use codex_extension_api::ConversationHistorySnapshot;
-use codex_guardian_context::MAX_PREVIOUS_REVIEWS;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::GuardianAssessmentEvent;
@@ -24,7 +23,7 @@ use crate::codex_thread::GuardianAuthorizationVersion;
 use crate::codex_thread::GuardianRootMessage;
 use crate::guardian::guardian_truncate_text;
 
-const MAX_RETAINED_USER_INPUTS: usize = 8;
+const MAX_RETAINED_REVIEWS: usize = 8;
 const MAX_TRUSTED_SKILLS: usize = 16;
 const MAX_TRUSTED_SKILL_PATHS_BYTES: usize = 2_048;
 const MAX_GUARDIAN_USER_INPUT_ANSWERS: usize = 8;
@@ -118,7 +117,7 @@ impl GuardianReviewEvidence {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.user_input_response_count = state.user_input_response_count.saturating_add(1);
         state.user_inputs.push_back((call_id.to_owned(), fragment));
-        while state.user_inputs.len() > MAX_RETAINED_USER_INPUTS {
+        while state.user_inputs.len() > MAX_RETAINED_REVIEWS {
             state.user_inputs.pop_front();
         }
     }
@@ -266,7 +265,7 @@ impl GuardianReviewEvidence {
             .reviews
             .make_contiguous()
             .sort_by_key(|review| review.completed_at_ms);
-        while state.reviews.len() > MAX_PREVIOUS_REVIEWS {
+        while state.reviews.len() > MAX_RETAINED_REVIEWS {
             state.reviews.pop_front();
         }
     }

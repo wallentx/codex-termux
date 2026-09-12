@@ -1,5 +1,4 @@
 use codex_config::ConfigLayerStack;
-use codex_config::ConfigPathContext;
 use codex_config::RequirementSource;
 use codex_config::SandboxModeRequirement;
 use codex_config::Sourced;
@@ -14,7 +13,7 @@ use super::merge_managed_permission_profiles;
 use super::permissions::BUILT_IN_DANGER_FULL_ACCESS_PROFILE;
 use super::permissions::BUILT_IN_READ_ONLY_PROFILE;
 use super::permissions::BUILT_IN_WORKSPACE_PROFILE;
-use super::permissions::compile_permission_profile;
+use super::permissions::compile_permission_profile_selection;
 use super::permissions::validate_user_permission_profile_names;
 use super::validate_required_permission_profile_catalog;
 
@@ -26,10 +25,9 @@ pub struct PermissionProfileCatalogEntry {
     pub allowed: bool,
 }
 
-/// Builds the effective catalog using supplied execution-host path facts.
+/// Builds the effective permission profile catalog for a config layer stack.
 pub fn permission_profile_catalog(
     config_layer_stack: &ConfigLayerStack,
-    context: &ConfigPathContext,
 ) -> std::io::Result<Vec<PermissionProfileCatalogEntry>> {
     let permissions = config_layer_stack
         .effective_config()
@@ -41,50 +39,58 @@ pub fn permission_profile_catalog(
     let requirements_toml = config_layer_stack.requirements_toml();
     let permissions = merge_managed_permission_profiles(permissions.as_ref(), requirements_toml)?;
 
-    permission_profile_catalog_from_permissions(config_layer_stack, permissions.as_ref(), context)
+    permission_profile_catalog_from_permissions(config_layer_stack, permissions.as_ref())
 }
 
 pub(super) fn permission_profile_catalog_from_permissions(
     config_layer_stack: &ConfigLayerStack,
     permissions: Option<&PermissionsToml>,
-    context: &ConfigPathContext,
 ) -> std::io::Result<Vec<PermissionProfileCatalogEntry>> {
     let requirements_toml = config_layer_stack.requirements_toml();
     validate_user_permission_profile_names(permissions)?;
     validate_required_permission_profile_catalog(requirements_toml, permissions)?;
 
-    let entries = [
-        BUILT_IN_READ_ONLY_PROFILE,
-        BUILT_IN_WORKSPACE_PROFILE,
-        BUILT_IN_DANGER_FULL_ACCESS_PROFILE,
+    let mut catalog = [
+        (BUILT_IN_READ_ONLY_PROFILE, PermissionProfile::read_only()),
+        (
+            BUILT_IN_WORKSPACE_PROFILE,
+            PermissionProfile::workspace_write(),
+        ),
+        (
+            BUILT_IN_DANGER_FULL_ACCESS_PROFILE,
+            PermissionProfile::Disabled,
+        ),
     ]
     .into_iter()
-    .map(|id| (id, None))
-    .chain(
-        permissions
-            .into_iter()
-            .flat_map(|permissions| &permissions.entries)
-            .map(|(id, profile)| (id.as_str(), profile.description.clone())),
-    );
-    let catalog = entries
-        .map(|(id, description)| {
-            let allowed = compile_permission_profile(
-                permissions,
+    .map(|(id, permission_profile)| PermissionProfileCatalogEntry {
+        id: id.to_string(),
+        description: None,
+        allowed: permission_profile_is_allowed(config_layer_stack, id, &permission_profile),
+    })
+    .collect::<Vec<_>>();
+
+    if let Some(permissions) = permissions {
+        catalog.extend(permissions.entries.iter().map(|(id, profile)| {
+            let mut warnings = Vec::new();
+            let allowed = compile_permission_profile_selection(
+                Some(permissions),
                 id,
-                context,
                 /*workspace_write*/ None,
-                &mut Vec::new(),
+                &mut warnings,
             )
-            .is_ok_and(|compiled| {
-                permission_profile_is_allowed(config_layer_stack, id, &compiled.permission_profile)
+            .map(|(file_system, network)| {
+                PermissionProfile::from_runtime_permissions(&file_system, network)
+            })
+            .is_ok_and(|permission_profile| {
+                permission_profile_is_allowed(config_layer_stack, id, &permission_profile)
             });
             PermissionProfileCatalogEntry {
-                id: id.to_string(),
-                description,
+                id: id.clone(),
+                description: profile.description.clone(),
                 allowed,
             }
-        })
-        .collect();
+        }));
+    }
 
     Ok(catalog)
 }

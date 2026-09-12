@@ -102,9 +102,7 @@ impl PlaybackWriter {
                 return Ok(bytes);
             }
             if Instant::now() >= deadline {
-                // The sink must consume this chunk to catch up with the device clock.
-                // Dropping it keeps the bounded queue and current epoch intact.
-                return Ok(frame.len * 4);
+                return Err("speaker fell behind");
             }
             std::thread::park_timeout(Duration::from_millis(/*millis*/ 1));
         }

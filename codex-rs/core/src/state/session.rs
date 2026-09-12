@@ -3,7 +3,6 @@
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -30,46 +29,9 @@ use codex_protocol::protocol::TurnContextItem;
 use codex_utils_output_truncation::TruncationPolicy;
 use tokio_util::task::AbortOnDropHandle;
 
-/// Runtime request effort, initially unset and established by prewarm or sampling.
-/// Rollback clears it after startup prewarm is consumed; successful compaction allows
-/// a fresh baseline without an override.
-pub(crate) enum ReasoningEffortPin {
-    Unset,
-    Compacted,
-    Active {
-        model: String,
-        effort: ReasoningEffort,
-    },
-}
-
-impl ReasoningEffortPin {
-    pub(crate) fn get(&self, model: &str) -> Option<ReasoningEffort> {
-        match self {
-            Self::Active {
-                model: pinned_model,
-                effort,
-            } if pinned_model == model => Some(effort.clone()),
-            Self::Unset | Self::Compacted | Self::Active { .. } => None,
-        }
-    }
-
-    pub(crate) fn pin(&mut self, model: &str, effort: ReasoningEffort) -> ReasoningEffort {
-        if let Some(pinned) = self.get(model) {
-            return pinned;
-        }
-        *self = Self::Active {
-            model: model.to_owned(),
-            effort: effort.clone(),
-        };
-        effort
-    }
-}
-
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
-    /// Plugin selection of the last admitted task; settings updates take effect on the next task.
-    pub(crate) active_disabled_plugin_ids: Vec<String>,
     /// Persisted origin of the session base instructions, when known.
     pub(crate) base_instructions_provenance: Option<BaseInstructionsProvenance>,
     pub(crate) history: ContextManager,
@@ -84,8 +46,6 @@ pub(crate) struct SessionState {
     previous_turn_settings: Option<PreviousTurnSettings>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
-    /// Original request effort for the current model while configuration updates remain active.
-    pub(crate) reasoning_effort_pin: ReasoningEffortPin,
     /// Startup prewarmed session prepared during session initialization.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     /// Retained after completion so later turns do not repeat speculative captures.
@@ -114,7 +74,6 @@ impl SessionState {
         history: ContextManager,
     ) -> Self {
         Self {
-            active_disabled_plugin_ids: Vec::new(),
             session_configuration,
             base_instructions_provenance: None,
             history,
@@ -125,7 +84,6 @@ impl SessionState {
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
-            reasoning_effort_pin: ReasoningEffortPin::Unset,
             startup_prewarm: None,
             shell_snapshot_prewarm: None,
             current_time_reminder: CurrentTimeReminderState::default(),

@@ -90,7 +90,6 @@ impl ChatWidget {
             user_message,
             history_record,
             ShellEscapePolicy::Allow,
-            UserMessageSource::Prompt,
         )
         .0
     }
@@ -104,7 +103,6 @@ impl ChatWidget {
             user_message,
             UserMessageHistoryRecord::UserMessageText,
             shell_escape_policy,
-            UserMessageSource::Prompt,
         )
         .1
     }
@@ -114,48 +112,29 @@ impl ChatWidget {
         user_message: UserMessage,
         history_record: UserMessageHistoryRecord,
         shell_escape_policy: ShellEscapePolicy,
-        source: UserMessageSource,
     ) -> (bool, Option<AppCommand>) {
         if self.has_misalignment_policy_violation() {
             return (false, None);
         }
         if self.input_queue.rate_limit_recovery_pending {
-            let model_prompt = source == UserMessageSource::Prompt
-                && (shell_escape_policy == ShellEscapePolicy::Disallow
-                    || !user_message.text.starts_with('!'));
             self.input_queue
                 .queued_user_messages
-                .push_back(QueuedUserMessage {
-                    source,
-                    ..QueuedUserMessage::from(user_message)
-                });
+                .push_back(QueuedUserMessage::from(user_message));
             self.input_queue
                 .queued_user_message_history_records
                 .push_back(history_record);
             self.refresh_pending_input_preview();
-            if model_prompt {
-                self.bottom_pane.clear_pending_questions();
-            }
             return (true, None);
         }
         if !self.is_session_configured() {
-            let model_prompt = source == UserMessageSource::Prompt
-                && (shell_escape_policy == ShellEscapePolicy::Disallow
-                    || !user_message.text.starts_with('!'));
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.input_queue
                 .queued_user_messages
-                .push_front(QueuedUserMessage {
-                    source,
-                    ..QueuedUserMessage::from(user_message)
-                });
+                .push_front(QueuedUserMessage::from(user_message));
             self.input_queue
                 .queued_user_message_history_records
                 .push_front(history_record);
             self.refresh_pending_input_preview();
-            if model_prompt {
-                self.bottom_pane.clear_pending_questions();
-            }
             return (true, None);
         }
         if user_message.text.is_empty()
@@ -379,7 +358,6 @@ impl ChatWidget {
                 mention_bindings: mention_bindings.clone(),
             },
             history_record: history_record.clone(),
-            source,
             compare_key: Self::pending_steer_compare_key_from_items(&items),
         });
         let personality = self
@@ -431,11 +409,7 @@ impl ChatWidget {
         if !self.submit_op(op.clone()) {
             return (false, None);
         }
-        if source == UserMessageSource::Prompt {
-            self.bottom_pane.clear_pending_questions();
-        }
         self.dismiss_backend_banner_for_new_turn();
-        self.note_realtime_typed_input(&submitted_message.text);
         if render_in_history {
             self.input_queue.user_turn_pending_start = true;
         }
@@ -481,7 +455,6 @@ impl ChatWidget {
 
         if render_in_history {
             self.safety_buffering_prompt = Some(submitted_message.clone());
-            self.safety_buffering_source = source;
             if !render_before_submit {
                 self.on_user_message_display(user_message_display_for_history(
                     submitted_message,
@@ -490,6 +463,7 @@ impl ChatWidget {
             }
         }
 
+        self.transcript.needs_final_message_separator = false;
         (true, Some(op))
     }
 

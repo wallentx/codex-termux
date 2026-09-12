@@ -1,9 +1,8 @@
 //! Local hard-delete support for persisted threads.
 //!
 //! Existing rollout files are deleted before this operation reports success. A rollout file that
-//! vanishes after discovery counts as already deleted. Main state DB rows are deleted after every
-//! associated rollout is removed, under the same lifecycle lock, so queued artifact mutations cannot
-//! use deleted thread metadata.
+//! vanishes after discovery counts as already deleted. The app-server deletes main state DB rows
+//! after every associated rollout is removed; this module deletes local history projection rows.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -73,19 +72,7 @@ pub(super) async fn delete_thread(
     let thread_rollouts = ThreadRollouts::from_index(&reference_index, thread_id);
     ensure_no_external_references(&reference_index, std::slice::from_ref(&thread_rollouts))?;
     let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
-    let found_rollout =
-        match delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
-        {
-            Ok(()) => true,
-            Err(ThreadStoreError::ThreadNotFound { .. }) => false,
-            Err(err) => return Err(err),
-        };
-    let deleted_state_rows = delete_state_rows(store, &[thread_id]).await?;
-    if found_rollout || deleted_state_rows > 0 {
-        Ok(())
-    } else {
-        Err(ThreadStoreError::ThreadNotFound { thread_id })
-    }
+    delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
 }
 
 pub(super) async fn delete_threads(
@@ -124,24 +111,7 @@ pub(super) async fn delete_threads(
             Err(err) => return Err(err),
         }
     }
-    // Retain the complete retry graph until every rollout has been removed.
-    delete_state_rows(store, &thread_ids).await?;
     Ok(())
-}
-
-async fn delete_state_rows(
-    store: &LocalThreadStore,
-    thread_ids: &[codex_protocol::ThreadId],
-) -> ThreadStoreResult<u64> {
-    let Some(state_db) = store.state_db.as_ref() else {
-        return Ok(0);
-    };
-    state_db
-        .delete_threads_strict(thread_ids)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to delete thread state: {err}"),
-        })
 }
 
 fn ensure_no_external_references(
@@ -196,7 +166,7 @@ fn referenced_thread_error(thread_id: codex_protocol::ThreadId) -> ThreadStoreEr
 async fn delete_thread_after_reference_check(
     store: &LocalThreadStore,
     mut thread_rollouts: ThreadRollouts,
-    writer_guards: &mut Vec<super::WriterLockGuard>,
+    writer_guards: &mut Vec<super::writer_lock::WriterLockGuard>,
 ) -> ThreadStoreResult<()> {
     let thread_id = thread_rollouts.thread_id;
     let thread_id_str = thread_id.to_string();
@@ -236,17 +206,9 @@ async fn delete_thread_after_reference_check(
         super::thread_history::delete_thread(store, rollout_id).await?;
     }
 
-    // Stop queued file work before removing files, retaining ownership until cleanup finishes.
-    let live_entry = store.live_recorders.lock().await.remove(&thread_id);
-    if let Some(entry) = live_entry {
+    // Drop the recorder before removing files, but retain its writer lock until cleanup finishes.
+    if let Some(entry) = store.live_recorders.lock().await.remove(&thread_id) {
         writer_guards.push(entry.writer_lock);
-        entry
-            .recorder
-            .discard()
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!("failed to stop thread writer before deletion: {err}"),
-            })?;
     }
     let found_rollout_path = !thread_rollouts.paths.is_empty();
     for rollout_path in thread_rollouts.paths {
@@ -584,7 +546,8 @@ mod tests {
             )
             .expect("child session file");
             let _owner_guard = owner
-                .acquire_writer_lock(child_thread_id)
+                .writer_lock_coordinator
+                .acquire(child_thread_id)
                 .expect("acquire child writer lock");
 
             let error = store
@@ -607,7 +570,8 @@ mod tests {
         let owner = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let thread_id = ThreadId::default();
         let _owner_guard = owner
-            .acquire_writer_lock(thread_id)
+            .writer_lock_coordinator
+            .acquire(thread_id)
             .expect("acquire writer lock before rollout exists");
 
         let error = store

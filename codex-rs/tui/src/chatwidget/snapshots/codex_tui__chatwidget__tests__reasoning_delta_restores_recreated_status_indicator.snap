@@ -1,10 +1,9 @@
 ---
 source: tui/src/chatwidget/tests/status_and_layout.rs
-assertion_line: 4833
 expression: normalized_backend_snapshot(terminal.backend())
 ---
 "                                                                                "
-"• Checking files and preparing a response (0s • esc to interrupt) · 1 backgroun…"
+"• Checking files (0s • esc to interrupt) · 1 background terminal running · /ps …"
 "                                                                                "
 "                                                                                "
 "› Ask Codex to do anything                                                      "

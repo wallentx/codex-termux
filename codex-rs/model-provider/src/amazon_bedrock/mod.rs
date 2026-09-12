@@ -1,7 +1,6 @@
 mod auth;
 mod auth_refresh;
 mod catalog;
-mod credential_export;
 mod error;
 mod mantle;
 mod runtime;
@@ -44,7 +43,6 @@ use auth::resolve_provider_auth as resolve_bedrock_provider_auth;
 pub(crate) use auth_refresh::AwsAuthRecovery;
 use catalog::normalize_bedrock_catalog;
 pub(crate) use catalog::static_model_catalog;
-pub(crate) use credential_export::AwsCredentialExport;
 use mantle::bedrock_mantle_runtime_base_url;
 pub use mantle::is_supported_amazon_bedrock_region;
 use runtime::bedrock_runtime_base_url;
@@ -63,7 +61,6 @@ pub(crate) struct AmazonBedrockModelProvider {
     aws: ModelProviderAwsAuthInfo,
     endpoint: BedrockEndpoint,
     auth_manager: Option<Arc<AuthManager>>,
-    credential_export: Option<Arc<AwsCredentialExport>>,
     auth_recovery: Option<Arc<AwsAuthRecovery>>,
 }
 
@@ -83,20 +80,11 @@ impl AmazonBedrockModelProvider {
             .unwrap_or(ModelProviderAwsAuthInfo {
                 profile: None,
                 region: None,
-                credential_export: None,
                 auth_refresh: None,
             });
-        let auth_source = auth::auth_source(&provider_info, auth_manager.as_deref(), std::env::var);
-        let credential_export = if auth_source == auth::BedrockAuthSource::CredentialExport {
-            process_shared_state().aws_credential_export(&aws)
-        } else {
-            None
-        };
         let uses_aws_sdk_auth = matches!(
-            auth_source,
-            auth::BedrockAuthSource::CredentialExport
-                | auth::BedrockAuthSource::ConfiguredAwsProfile
-                | auth::BedrockAuthSource::AwsSdk
+            auth::auth_source(&provider_info, auth_manager.as_deref(), std::env::var),
+            auth::BedrockAuthSource::ConfiguredAwsProfile | auth::BedrockAuthSource::AwsSdk
         );
         let auth_recovery = if uses_aws_sdk_auth && aws.auth_refresh.is_some() {
             process_shared_state().aws_auth_recovery(&aws)
@@ -109,7 +97,6 @@ impl AmazonBedrockModelProvider {
             aws,
             endpoint,
             auth_manager,
-            credential_export,
             auth_recovery,
         }
     }
@@ -138,13 +125,11 @@ impl AmazonBedrockModelProvider {
     }
 
     fn uses_aws_auth_recovery(&self) -> bool {
-        let source = self.auth_source();
-        source == auth::BedrockAuthSource::CredentialExport
-            || (self.auth_recovery.is_some()
-                && matches!(
-                    source,
-                    auth::BedrockAuthSource::ConfiguredAwsProfile | auth::BedrockAuthSource::AwsSdk
-                ))
+        self.auth_recovery.is_some()
+            && matches!(
+                self.auth_source(),
+                auth::BedrockAuthSource::ConfiguredAwsProfile | auth::BedrockAuthSource::AwsSdk
+            )
     }
 
     async fn auth(&self) -> Option<CodexAuth> {
@@ -155,8 +140,7 @@ impl AmazonBedrockModelProvider {
             },
             auth::BedrockAuthSource::ManagedBearerToken
             | auth::BedrockAuthSource::ManagedAccessKeys => self.managed_auth(),
-            auth::BedrockAuthSource::CredentialExport
-            | auth::BedrockAuthSource::ConfiguredAwsProfile
+            auth::BedrockAuthSource::ConfiguredAwsProfile
             | auth::BedrockAuthSource::EnvBearerToken
             | auth::BedrockAuthSource::EnvAwsCredentials
             | auth::BedrockAuthSource::AwsSdk => None,
@@ -247,8 +231,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
             auth::BedrockAuthSource::CommandBearerToken
             | auth::BedrockAuthSource::ManagedBearerToken
             | auth::BedrockAuthSource::ManagedAccessKeys => self.auth_manager.clone(),
-            auth::BedrockAuthSource::CredentialExport
-            | auth::BedrockAuthSource::ConfiguredAwsProfile
+            auth::BedrockAuthSource::ConfiguredAwsProfile
             | auth::BedrockAuthSource::EnvBearerToken
             | auth::BedrockAuthSource::EnvAwsCredentials
             | auth::BedrockAuthSource::AwsSdk => None,
@@ -274,39 +257,16 @@ impl ModelProvider for AmazonBedrockModelProvider {
         &self,
     ) -> ModelProviderFuture<'_, Result<ProviderUnauthorizedRecovery>> {
         Box::pin(async move {
-            if !self.uses_aws_auth_recovery() {
+            let Some(recovery) = self
+                .auth_recovery
+                .as_ref()
+                .filter(|_| self.uses_aws_auth_recovery())
+            else {
                 return Ok(ProviderUnauthorizedRecovery::NotConfigured);
-            }
-
-            // Hold the cache guard across both steps so concurrent callers share recovery.
-            let export_refresh = if let Some(exporter) = &self.credential_export {
-                let refresh = exporter.begin_refresh().await;
-                if refresh.is_none() {
-                    // Another caller completed recovery while we were waiting.
-                    return Ok(ProviderUnauthorizedRecovery::Recovered);
-                }
-                refresh
-            } else {
-                None
             };
-            let result: std::io::Result<()> = async {
-                if let Some(recovery) = &self.auth_recovery {
-                    recovery.refresh().await?;
-                }
-                if let Some(exporter) = export_refresh {
-                    exporter.refresh().await?;
-                }
-                Ok(())
-            }
-            .await;
-            result.map_err(|error| {
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::InvalidData
-                        | std::io::ErrorKind::InvalidInput
-                        | std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::PermissionDenied
-                ) {
+
+            recovery.refresh().await.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
                     CodexErr::InvalidRequest(error.to_string())
                 } else {
                     CodexErr::Io(error)
@@ -428,7 +388,6 @@ mod tests {
         provider_info.aws = Some(ModelProviderAwsAuthInfo {
             profile: Some("aws-profile-that-should-not-be-loaded".to_string()),
             region: Some("us-west-2".to_string()),
-            credential_export: None,
             auth_refresh: Some(AwsAuthRefreshConfig {
                 command: "aws".to_string(),
                 args: vec!["login".into()],
@@ -464,7 +423,6 @@ mod tests {
         regional_provider_info.aws = Some(ModelProviderAwsAuthInfo {
             profile: None,
             region: Some("us-west-2".to_string()),
-            credential_export: None,
             auth_refresh: None,
         });
         let regional_provider =
@@ -490,7 +448,6 @@ mod tests {
         let aws = ModelProviderAwsAuthInfo {
             profile: None,
             region: Some("us-west-2".to_string()),
-            credential_export: None,
             auth_refresh: Some(AwsAuthRefreshConfig {
                 command: "aws".to_string(),
                 args: vec!["login".into()],

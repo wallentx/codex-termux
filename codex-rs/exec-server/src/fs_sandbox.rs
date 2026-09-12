@@ -73,7 +73,6 @@ impl FileSystemSandboxRunner {
         }
     }
 
-    #[tracing::instrument(name = "fs.sandbox_request", skip_all)]
     pub(crate) async fn run(
         &self,
         sandbox: &FileSystemSandboxContext,
@@ -84,11 +83,6 @@ impl FileSystemSandboxRunner {
         run_command(command, request_json).await
     }
 
-    #[tracing::instrument(
-        name = "fs.sandbox_prepare",
-        skip_all,
-        fields(permission_entries = tracing::field::Empty)
-    )]
     pub(crate) fn sandbox_command(
         &self,
         sandbox: &FileSystemSandboxContext,
@@ -107,7 +101,6 @@ impl FileSystemSandboxRunner {
         let native_permissions =
             native_permissions.materialize_project_roots_with_workspace_roots(workspace_roots);
         let mut file_system_policy = native_permissions.file_system_sandbox_policy();
-        tracing::Span::current().record("permission_entries", file_system_policy.entries.len());
         let helper_read_roots = if sandbox.use_legacy_landlock {
             Vec::new()
         } else {
@@ -331,7 +324,6 @@ fn bazel_bwrap_env_key_is_allowed(_key: &str) -> bool {
     false
 }
 
-#[tracing::instrument(name = "fs.sandbox_execute", skip_all)]
 async fn run_command(
     command: SandboxExecRequest,
     request_json: Vec<u8>,

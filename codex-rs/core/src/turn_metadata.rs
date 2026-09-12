@@ -99,7 +99,6 @@ pub async fn detached_memory_responses_metadata(
         root_turn_id: Some(turn_id),
         request_kind: Some(CodexResponsesRequestKind::Memory),
         thread_source: Some(ThreadSource::MemoryConsolidation),
-        turn_trigger: Some("memory_consolidation".to_owned()),
         subagent_header: subagent_header_value(session_source),
         sandbox: sandbox.map(ToString::to_string),
         workspaces: memory_workspaces(
@@ -338,10 +337,6 @@ impl TurnMetadataState {
             return;
         }
         let _ = self.turn_trigger.set(turn_trigger);
-    }
-
-    pub(crate) fn current_turn_trigger(&self) -> Option<String> {
-        self.turn_trigger.get().cloned()
     }
 
     pub(crate) fn root_turn_id(&self) -> Option<String> {

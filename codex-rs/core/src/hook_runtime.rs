@@ -33,7 +33,6 @@ use codex_protocol::items::FunctionCallOutputItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
@@ -127,14 +126,14 @@ pub(crate) async fn run_pending_session_start_hooks(
     turn_context: &Arc<TurnContext>,
 ) -> bool {
     while let Some(session_start_source) = sess.take_pending_session_start_source().await {
-        // Spawned subagents can start fresh or fork their parent's history, so both
-        // sources dispatch SubagentStart. Internal/system subagents skip start hooks.
+        // Pending session-start hooks are reused to dispatch thread-spawn subagent
+        // starts. Other subagent sessions are internal/system work and do not run
+        // start hooks.
         let target = match &turn_context.session_source {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. })
                 if matches!(
                     session_start_source,
                     codex_hooks::SessionStartSource::Startup
-                        | codex_hooks::SessionStartSource::Fork
                 ) =>
             {
                 let context = subagent_hook_context(sess, agent_role);
@@ -346,14 +345,6 @@ fn executor_hook_sources_for_step(step_context: &StepContext) -> Vec<ExecutorPlu
                             .enabled
                     })
             })
-            .into_iter()
-            .filter(|source| {
-                !step_context
-                    .turn
-                    .disabled_plugin_ids
-                    .contains(&source.plugin_id.as_key())
-            })
-            .collect()
         })
         .unwrap_or_default()
 }
@@ -709,7 +700,6 @@ pub(crate) async fn inspect_pending_input(
 pub(crate) async fn record_pending_input(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    model_info: &ModelInfo,
     pending_input: TurnInput,
     additional_contexts: Vec<String>,
     persist_context: PersistContext,
@@ -722,7 +712,6 @@ pub(crate) async fn record_pending_input(
         } => {
             sess.record_user_prompt_and_emit_turn_item(
                 turn_context.as_ref(),
-                model_info,
                 content.as_slice(),
                 client_id,
                 acceptance_order,
@@ -731,11 +720,11 @@ pub(crate) async fn record_pending_input(
             .await;
         }
         TurnInput::ResponseItem(item) => {
-            sess.record_annotated_conversation_items(turn_context, model_info, vec![item])
+            sess.record_annotated_conversation_items(turn_context, vec![item])
                 .await;
         }
         TurnInput::FunctionCallOutput(item) => {
-            sess.record_conversation_items(turn_context, model_info, std::slice::from_ref(&item))
+            sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
                 .await;
             if let ResponseItem::FunctionCallOutput {
                 id: Some(id),
@@ -757,7 +746,7 @@ pub(crate) async fn record_pending_input(
             sess.ensure_rollout_materialized(persist_context).await;
         }
         TurnInput::InterAgentCommunication(communication) => {
-            sess.record_inter_agent_communication(turn_context, model_info, communication)
+            sess.record_inter_agent_communication(turn_context, communication)
                 .await;
         }
     }
@@ -848,12 +837,8 @@ pub(crate) async fn record_additional_contexts(
         return;
     }
 
-    sess.record_conversation_items(
-        turn_context,
-        turn_context.model_info(),
-        developer_messages.as_slice(),
-    )
-    .await;
+    sess.record_conversation_items(turn_context, developer_messages.as_slice())
+        .await;
 }
 
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem> {

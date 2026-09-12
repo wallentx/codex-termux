@@ -1,6 +1,5 @@
 //! Experimental controls with popup-owned discovery and configured enablement.
 //! Failed saves retain intent for explicit retry; cancellation remains available.
-//! Server voice discovery is gated by the client package's native runtime.
 
 use crate::experimental_features::FeatureWriteResult;
 use codex_app_server_protocol::ExperimentalFeature;
@@ -54,7 +53,6 @@ pub(crate) struct ExperimentalFeatureItem {
 
 pub(crate) struct ExperimentalFeaturesView {
     features: Vec<ExperimentalFeatureItem>,
-    voice_supported: bool,
     initial_enabled: Vec<bool>,
     unconfirmed: Vec<String>,
     catalog_rx: Option<oneshot::Receiver<Result<Vec<ExperimentalFeature>, String>>>,
@@ -84,7 +82,6 @@ impl ExperimentalFeaturesView {
             }
             .to_string(),
             thread_id,
-            voice_supported: codex_realtime_webrtc::RealtimeWebrtcSession::is_supported(),
             write_rx: None,
             catalog_rx,
             unconfirmed: Vec::new(),
@@ -315,10 +312,7 @@ impl BottomPaneView for ExperimentalFeaturesView {
             Ok(features) => {
                 let mut count = 0;
                 for feature in features {
-                    if feature.stage != ExperimentalFeatureStage::Beta
-                        || (feature.name == Feature::RealtimeConversation.key()
-                            && !self.voice_supported)
-                    {
+                    if feature.stage != ExperimentalFeatureStage::Beta {
                         continue;
                     }
                     self.initial_enabled.push(feature.enabled);

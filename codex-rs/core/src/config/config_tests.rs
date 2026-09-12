@@ -334,8 +334,6 @@ consolidation_model = "gpt-5.2"
         toml::from_str::<ConfigToml>(memories).expect("TOML deserialization should succeed");
     assert_eq!(
         Some(MemoriesToml {
-            dual_write: None,
-            version: None,
             disable_on_external_context: Some(true),
             generate_memories: Some(false),
             use_memories: Some(false),
@@ -362,8 +360,6 @@ consolidation_model = "gpt-5.2"
     assert_eq!(
         config.memories,
         MemoriesConfig {
-            dual_write: false,
-            version: codex_protocol::MemoryVersion::V1,
             disable_on_external_context: true,
             generate_memories: false,
             use_memories: false,
@@ -1217,9 +1213,9 @@ command = "print-token"
     assert_eq!(config.model_provider, expected_provider);
 }
 
-#[test]
-fn config_toml_rejects_unsupported_amazon_bedrock_overrides() {
-    let err = toml::from_str::<ConfigToml>(
+#[tokio::test]
+async fn load_config_rejects_unsupported_amazon_bedrock_overrides() {
+    let cfg = toml::from_str::<ConfigToml>(
         r#"
 model_provider = "amazon-bedrock"
 
@@ -1229,9 +1225,19 @@ requires_openai_auth = true
 supports_websockets = true
 "#,
     )
-    .expect_err("Amazon Bedrock unsupported overrides should fail validation");
+    .expect("Amazon Bedrock unsupported overrides should deserialize");
+
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(err.to_string().contains(
-        "model_providers.amazon-bedrock only supports changing `base_url`, `auth`, `http_headers`, `aws.profile`, `aws.region`, `aws.credential_export`, and `aws.auth_refresh`; other non-default provider fields are not supported"
+        "model_providers.amazon-bedrock only supports changing `base_url`, `auth`, `http_headers`, `aws.profile`, `aws.region`, and `aws.auth_refresh`; other non-default provider fields are not supported"
     ));
 }
 
@@ -1252,7 +1258,6 @@ fn config_toml_deserializes_model_availability_nux() {
             animations: true,
             whimsy: true,
             show_tooltips: true,
-            show_server_version_notice: true,
             auto_recap: true,
             disable_paste_burst: None,
             vim_mode_default: false,
@@ -4268,7 +4273,6 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             animations: true,
             whimsy: true,
             show_tooltips: true,
-            show_server_version_notice: true,
             auto_recap: true,
             disable_paste_burst: None,
             vim_mode_default: false,
@@ -7008,7 +7012,7 @@ async fn to_mcp_config_flows_mcp_tool_prefix_from_feature() -> std::io::Result<(
 }
 
 #[tokio::test]
-async fn to_mcp_config_flows_independent_mcp_2026_features() -> std::io::Result<()> {
+async fn to_mcp_config_flows_mcp_2026_feature_from_config() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let mut config = Config::load_from_base_config_with_overrides(
         ConfigToml::default(),
@@ -7020,42 +7024,13 @@ async fn to_mcp_config_flows_independent_mcp_2026_features() -> std::io::Result<
         plugins_manager_for_config(&config, auth_manager_from_optional_auth(/*auth*/ None));
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
-    assert_eq!(
-        (
-            mcp_config.protocol_mode,
-            mcp_config.host_owned_apps_protocol_mode,
-        ),
-        (
-            codex_mcp::McpProtocolMode::Legacy,
-            codex_mcp::McpProtocolMode::Legacy,
-        )
-    );
+    assert_eq!(mcp_config.protocol_mode, codex_mcp::McpProtocolMode::Legacy);
 
     let _ = config.features.enable(Feature::Mcp20260728);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert_eq!(
-        (
-            mcp_config.protocol_mode,
-            mcp_config.host_owned_apps_protocol_mode,
-        ),
-        (
-            codex_mcp::McpProtocolMode::V20260728,
-            codex_mcp::McpProtocolMode::Legacy,
-        )
-    );
-
-    let _ = config.features.disable(Feature::Mcp20260728);
-    let _ = config.features.enable(Feature::CodexAppsMcp20260728);
-    let mcp_config = config.to_mcp_config(&plugins_manager).await;
-    assert_eq!(
-        (
-            mcp_config.protocol_mode,
-            mcp_config.host_owned_apps_protocol_mode,
-        ),
-        (
-            codex_mcp::McpProtocolMode::Legacy,
-            codex_mcp::McpProtocolMode::V20260728,
-        )
+        mcp_config.protocol_mode,
+        codex_mcp::McpProtocolMode::V20260728
     );
 
     Ok(())
@@ -9987,8 +9962,6 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
     let fixture = create_test_fixture()?;
 
     let requirements_toml = codex_config::ConfigRequirementsToml {
-        model_provider: None,
-        model_providers: None,
         allowed_login_methods: None,
         allowed_chatgpt_workspaces: None,
         cli_auth_credentials_store: None,

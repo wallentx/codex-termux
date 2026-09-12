@@ -22,21 +22,17 @@ mod audio_track;
 mod devices;
 mod incoming;
 mod runtime;
-mod service_failure;
 mod transport;
 mod transport_runtime;
 
-use std::cell::Cell;
 use std::io;
 use std::io::Write;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use codex_realtime_webrtc::HelperExitStage;
 use codex_realtime_webrtc::Message;
 use codex_realtime_webrtc::encode_frame;
 use codex_realtime_webrtc::read_message;
-use service_failure::ServiceFailure;
 
 const DEVICE_SERVICE_INTERVAL: Duration = Duration::from_millis(/*millis*/ 5);
 
@@ -51,16 +47,14 @@ fn main() {
     match (args.next(), args.next()) {
         (Some(arg), None) if arg == "--build-commit" => println!("{BUILD_COMMIT}"),
         (None, None) => {
-            let phase = Cell::new(HelperExitStage::ControlSequence);
-            if run(&phase, |executor| {
-                phase.set(HelperExitStage::Transport);
+            if run(|executor| {
                 executor
                     .block_on(transport::Transport::new())
                     .map_err(io::Error::other)
             })
             .is_err()
             {
-                std::process::exit(phase.get().code());
+                std::process::exit(/*code*/ 1);
             }
         }
         _ => std::process::exit(/*code*/ 2),
@@ -68,7 +62,6 @@ fn main() {
 }
 
 fn run(
-    phase: &Cell<HelperExitStage>,
     start_transport: impl Fn(&tokio::runtime::Runtime) -> io::Result<transport::Transport>,
 ) -> io::Result<()> {
     let (sender, receiver) = mpsc::sync_channel(/*bound*/ 1);
@@ -80,17 +73,17 @@ fn run(
                 match read_message(&mut input) {
                     Ok(Some(message)) => {
                         if sender.try_send(message).is_err() {
-                            std::process::exit(HelperExitStage::ControlQueue.code());
+                            std::process::exit(/*code*/ 1);
                         }
                     }
                     Ok(None) => break,
-                    Err(_) => std::process::exit(HelperExitStage::ControlRead.code()),
+                    Err(_) => std::process::exit(/*code*/ 1),
                 }
             }
             drop(sender);
             // Independent of the main worker or a blocked stdout write, including after parent death.
             std::thread::sleep(Duration::from_secs(/*secs*/ 2));
-            std::process::exit(HelperExitStage::ParentGone.code());
+            std::process::exit(/*code*/ 1);
         })?;
     let Ok(hello) = receiver.recv() else {
         return Ok(());
@@ -103,7 +96,6 @@ fn run(
     {
         return Err(io::Error::other("incompatible voice helper"));
     }
-    phase.set(HelperExitStage::Reply);
     let mut output = io::stdout().lock();
     output.write_all(&encode_frame(&Message::Ready {})?)?;
     output.flush()?;
@@ -113,7 +105,6 @@ fn run(
     let mut answered = false;
     let mut devices: Option<devices::Devices> = None;
     loop {
-        phase.set(HelperExitStage::ControlSequence);
         let message = if let Some(devices) = &mut devices {
             let peer = transport
                 .as_mut()
@@ -122,29 +113,12 @@ fn run(
                 // Bound one pass to the ingress queue capacity so new media
                 // cannot indefinitely postpone a waiting privacy control.
                 for _ in 0..64 {
-                    phase.set(HelperExitStage::AudioIngress);
                     let Some(packet) = peer.incoming.take().map_err(io::Error::other)? else {
                         break;
                     };
-                    phase.set(HelperExitStage::Playout);
                     devices.receive(packet)?;
                 }
-                phase.set(HelperExitStage::AudioService);
-                if let Err(error) = executor.block_on(devices.service(&mut peer.audio)) {
-                    if let Some(failure) = error
-                        .get_ref()
-                        .and_then(|error| error.downcast_ref::<ServiceFailure>())
-                    {
-                        phase.set(match failure {
-                            ServiceFailure::Playout => HelperExitStage::Playout,
-                            ServiceFailure::Render => HelperExitStage::Render,
-                            ServiceFailure::Capture => HelperExitStage::Capture,
-                            ServiceFailure::Device => HelperExitStage::Device,
-                            ServiceFailure::Send => HelperExitStage::Send,
-                        });
-                    }
-                    return Err(error);
-                }
+                executor.block_on(devices.service(&mut peer.audio))?;
                 Ok(())
             })?
             .ok_or(mpsc::RecvTimeoutError::Disconnected)
@@ -155,7 +129,6 @@ fn run(
         };
         let reply = match message {
             Ok(Message::InspectAudio {}) => {
-                phase.set(HelperExitStage::InspectAudio);
                 if answered && transport.as_ref().is_none_or(|peer| !*peer.ready.borrow()) {
                     return Err(io::Error::other("voice connection closed"));
                 }
@@ -163,18 +136,15 @@ fn run(
                     state: devices
                         .as_ref()
                         .map(devices::Devices::take_state)
-                        .transpose()
-                        .inspect_err(|_| phase.set(HelperExitStage::Device))?
+                        .transpose()?
                         .unwrap_or_default(),
                 }
             }
             Ok(Message::OpenDevices {}) if devices.is_none() && runtime.is_some() && answered => {
-                phase.set(HelperExitStage::OpenDevices);
                 devices = Some(devices::Devices::open()?);
                 Message::DevicesOpened {}
             }
             Ok(Message::SetAudioControls { controls }) => {
-                phase.set(HelperExitStage::AudioControls);
                 let peer = transport
                     .as_ref()
                     .ok_or_else(|| io::Error::other("voice peer not started"))?;
@@ -195,7 +165,6 @@ fn run(
                 Message::AudioControlsApplied {}
             }
             Ok(Message::StartTransport {}) if transport.is_none() => {
-                phase.set(HelperExitStage::Transport);
                 let peer = start_transport(&executor)?;
                 let sdp = executor.block_on(peer.offer()).map_err(io::Error::other)?;
                 transport = Some(peer);
@@ -204,24 +173,16 @@ fn run(
                 }
             }
             Ok(Message::ApplyAnswer { sdp }) if !answered => {
-                phase.set(HelperExitStage::Transport);
                 let Some(peer) = transport.as_ref() else {
                     return Err(io::Error::other("voice transport not started"));
                 };
-                let outcome = executor
+                executor
                     .block_on(peer.apply_answer(sdp.into_sdp()))
                     .map_err(io::Error::other)?;
-                if outcome == transport::AnswerOutcome::TimedOut {
-                    // The client reaps this helper before considering a fresh negotiation.
-                    output.write_all(&encode_frame(&Message::TransportTimedOut {})?)?;
-                    output.flush()?;
-                    return Ok(());
-                }
                 answered = true;
                 Message::TransportReady {}
             }
             Ok(Message::InitializeRuntime {}) => {
-                phase.set(HelperExitStage::Runtime);
                 if runtime.is_some() {
                     return Err(io::Error::other("runtime already initialized"));
                 }
@@ -229,7 +190,6 @@ fn run(
                 Message::RuntimeReady {}
             }
             Ok(Message::Close {}) => {
-                phase.set(HelperExitStage::Shutdown);
                 let _ = devices.take();
                 if let Some(mut peer) = transport.take() {
                     executor.block_on(peer.close()).map_err(io::Error::other)?;
@@ -247,7 +207,6 @@ fn run(
                 | Message::ApplyAnswer { .. }
                 | Message::Offer { .. }
                 | Message::TransportReady {}
-                | Message::TransportTimedOut {}
                 | Message::OpenDevices {}
                 | Message::DevicesOpened {}
                 | Message::AudioControlsApplied {}
@@ -255,7 +214,6 @@ fn run(
                 | Message::Closed {},
             ) => return Err(io::Error::other("invalid voice control sequence")),
         };
-        phase.set(HelperExitStage::Reply);
         output.write_all(&encode_frame(&reply)?)?;
         output.flush()?;
     }

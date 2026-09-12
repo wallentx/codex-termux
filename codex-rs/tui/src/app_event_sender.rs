@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 
 use crate::app_command::AppCommand;
-use crate::app_command::UserVerificationResponse;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::McpServerElicitationAction;
@@ -120,19 +119,6 @@ impl AppEventSender {
         self.send(AppEvent::SubmitThreadOp {
             thread_id,
             op: AppCommand::resolve_elicitation(server_name, request_id, decision, content, meta),
-        });
-    }
-
-    pub(crate) fn resolve_user_verification(
-        &self,
-        thread_id: ThreadId,
-        server_name: String,
-        request_id: AppServerRequestId,
-        response: UserVerificationResponse,
-    ) {
-        self.send(AppEvent::SubmitThreadOp {
-            thread_id,
-            op: AppCommand::resolve_user_verification(server_name, request_id, response),
         });
     }
 }

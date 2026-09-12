@@ -26,6 +26,7 @@ use std::sync::atomic::Ordering;
 use std::thread::sleep;
 #[cfg(unix)]
 use std::thread::spawn;
+#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::Result;
@@ -55,8 +56,6 @@ use rmcp::transport::Transport;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
-use tokio::sync::watch;
-use tokio::time::Instant;
 use tracing::info;
 use tracing::warn;
 
@@ -217,10 +216,6 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 #[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
-// Keep queued stderr diagnostics before closing the reader, even when an
-// escaped descendant prevents the pipe from reaching EOF.
-const STDERR_READER_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
-
 #[cfg(unix)]
 struct LocalProcessTerminator {
     process_group_id: u32,
@@ -244,8 +239,6 @@ struct StdioServerProcessHandleInner {
     program_name: String,
     kind: StdioServerProcessKind,
     terminated: AtomicBool,
-    // An escaped descendant can keep stderr open after the MCP server exits.
-    stderr_reader: Option<watch::Sender<()>>,
 }
 
 enum StdioServerProcessKind {
@@ -356,44 +349,25 @@ impl LocalStdioServerLauncher {
         };
         #[cfg(not(windows))]
         let terminator = process_id.map(LocalProcessTerminator::new);
-        let stderr_reader = stderr.map(|stderr| {
-            let program_name = program_name.clone();
-            let (stop_tx, mut stop_rx) = watch::channel(());
-            std::mem::drop(tokio::spawn(async move {
+        let process = StdioServerProcessHandle::local(program_name.clone(), terminator);
+
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
-                // Give queued diagnostics time to reach the logs without waiting
-                // indefinitely for a descendant that still has stderr open.
-                let drain_deadline = tokio::time::sleep(STDERR_READER_DRAIN_GRACE_PERIOD);
-                tokio::pin!(drain_deadline);
-                let mut draining = false;
                 loop {
-                    tokio::select! {
-                        biased;
-                        _ = &mut drain_deadline, if draining => break,
-                        _ = stop_rx.changed(), if !draining => {
-                            draining = true;
-                            drain_deadline.as_mut().reset(
-                                Instant::now() + STDERR_READER_DRAIN_GRACE_PERIOD
-                            );
+                    match reader.next_line().await {
+                        Ok(Some(line)) => {
+                            info!("MCP server stderr ({program_name}): {line}");
                         }
-                        line = reader.next_line() => {
-                            match line {
-                                Ok(Some(line)) => {
-                                    info!("MCP server stderr ({program_name}): {line}");
-                                }
-                                Ok(None) => break,
-                                Err(error) => {
-                                    warn!("Failed to read MCP server stderr ({program_name}): {error}");
-                                    break;
-                                }
-                            }
-                        },
+                        Ok(None) => break,
+                        Err(error) => {
+                            warn!("Failed to read MCP server stderr ({program_name}): {error}");
+                            break;
+                        }
                     }
                 }
-            }));
-            stop_tx
-        });
-        let process = StdioServerProcessHandle::local(program_name, terminator, stderr_reader);
+            });
+        }
 
         Ok(StdioServerTransport {
             inner: transport,
@@ -454,17 +428,12 @@ impl LocalProcessTerminator {
 }
 
 impl StdioServerProcessHandle {
-    fn local(
-        program_name: String,
-        terminator: Option<LocalProcessTerminator>,
-        stderr_reader: Option<watch::Sender<()>>,
-    ) -> Self {
+    fn local(program_name: String, terminator: Option<LocalProcessTerminator>) -> Self {
         Self {
             inner: Arc::new(StdioServerProcessHandleInner {
                 program_name,
                 kind: StdioServerProcessKind::Local(terminator),
                 terminated: AtomicBool::new(false),
-                stderr_reader,
             }),
         }
     }
@@ -475,7 +444,6 @@ impl StdioServerProcessHandle {
                 program_name,
                 kind: StdioServerProcessKind::Executor(process),
                 terminated: AtomicBool::new(false),
-                stderr_reader: None,
             }),
         }
     }
@@ -485,7 +453,7 @@ impl StdioServerProcessHandle {
             return Ok(());
         }
 
-        let result = match &self.inner.kind {
+        match &self.inner.kind {
             StdioServerProcessKind::Local(Some(terminator)) => {
                 terminator.terminate();
                 Ok(())
@@ -498,11 +466,7 @@ impl StdioServerProcessHandle {
                     Err(io::Error::other(error))
                 }
             },
-        };
-        if let Some(stderr_reader) = &self.inner.stderr_reader {
-            stderr_reader.send_replace(());
         }
-        result
     }
 }
 
@@ -536,9 +500,6 @@ impl Drop for StdioServerProcessHandleInner {
                     }
                 }));
             }
-        }
-        if let Some(stderr_reader) = &self.stderr_reader {
-            stderr_reader.send_replace(());
         }
     }
 }

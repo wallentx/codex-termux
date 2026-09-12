@@ -10,6 +10,6 @@
   "release_branch": "release/0.154.0",
   "work_branch": "upstream/rust-v0.154.0",
   "patch_branch": "wallentx/termux-target",
-  "patch_source_sha": "5605a24df4741f75742a56b964ed99a59354896f",
+  "patch_source_sha": "f3b937747529a52ff0bc8111e1088e422e3c6cfb",
   "termux_tag": "rust-v0.154.0-termux"
 }

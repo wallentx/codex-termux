@@ -168,7 +168,6 @@ pub(super) fn completed_item(
                 failure: event.failure.clone(),
                 saved_path: event.saved_path.clone(),
                 imagegen_request_id: None,
-                generation_id: None,
             })),
             None,
         )),

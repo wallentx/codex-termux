@@ -239,7 +239,7 @@ pub(crate) async fn handle_mcp_tool_call(
         let status = if result.is_ok() { "ok" } else { "error" };
         let outcome = McpCallMetricOutcome::from_status(status);
         emit_mcp_call_metrics(
-            &step_context.session_telemetry,
+            turn_context.as_ref(),
             &outcome,
             &server,
             &tool_name,
@@ -348,7 +348,7 @@ pub(crate) async fn handle_mcp_tool_call(
         let status = if result.is_ok() { "ok" } else { "error" };
         let outcome = McpCallMetricOutcome::from_status(status);
         emit_mcp_call_metrics(
-            &step_context.session_telemetry,
+            turn_context.as_ref(),
             &outcome,
             &server,
             &tool_name,
@@ -489,7 +489,7 @@ async fn handle_approved_mcp_tool_call(
                         .map(|(connector_id, action_name)| HostedFileUploadContext {
                             connector_id: connector_id.clone(),
                             action_name: action_name.clone(),
-                            model: step_context.settings.model_info.slug.clone(),
+                            model: turn_context.model_info().slug.clone(),
                         });
                     let rewritten_arguments = rewrite_mcp_tool_arguments_for_openai_files(
                         sess,
@@ -545,7 +545,7 @@ async fn handle_approved_mcp_tool_call(
             )
             .await;
             let result = sanitize_mcp_tool_result_for_model(
-                &step_context.settings.model_info.input_modalities,
+                &turn_context.model_info().input_modalities,
                 Ok(result),
             )?;
             Ok(maybe_request_codex_apps_auth_elicitation(
@@ -590,11 +590,11 @@ async fn handle_approved_mcp_tool_call(
         truncate_mcp_tool_result_for_event(&result),
     )
     .await;
-    maybe_track_codex_app_used(sess, step_context, &server, &metadata).await;
+    maybe_track_codex_app_used(sess, turn_context, &server, &metadata).await;
 
     let outcome = mcp_call_metric_outcome(&result);
     emit_mcp_call_metrics(
-        &step_context.session_telemetry,
+        turn_context,
         &outcome,
         &server,
         &tool_name,
@@ -1055,7 +1055,7 @@ async fn notify_mcp_tool_call_completed(
 
 async fn maybe_track_codex_app_used(
     sess: &Session,
-    step_context: &StepContext,
+    turn_context: &TurnContext,
     server: &str,
     metadata: &McpToolApprovalMetadata,
 ) {
@@ -1075,9 +1075,8 @@ async fn maybe_track_codex_app_used(
         InvocationType::Implicit
     };
 
-    let turn_context = &step_context.turn;
     let tracking = build_track_events_context(
-        step_context.settings.model_info.slug.clone(),
+        turn_context.model_info().slug.clone(),
         sess.thread_id.to_string(),
         turn_context.sub_id.clone(),
         turn_context.originator.clone(),
@@ -1374,7 +1373,6 @@ const MCP_TOOL_APPROVAL_CANCEL: &str = "Cancel";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct McpToolApprovalKey {
     server: String,
-    plugin_id: Option<String>,
     connector_id: Option<String>,
     link_id: Option<String>,
     tool_name: String,
@@ -1643,7 +1641,6 @@ fn session_mcp_tool_approval_key(
 
     Some(McpToolApprovalKey {
         server: invocation.server.clone(),
-        plugin_id: metadata.and_then(|metadata| metadata.plugin_id.clone()),
         connector_id,
         link_id: metadata.and_then(|metadata| metadata.link_id.clone()),
         tool_name: invocation.tool.clone(),
@@ -2156,13 +2153,7 @@ async fn maybe_persist_mcp_tool_approval(
         };
         persist_codex_app_tool_approval(&turn_context.config, &connector_id, &tool_name).await
     } else {
-        persist_non_app_mcp_tool_approval(
-            &turn_context.config,
-            &key.server,
-            &tool_name,
-            key.plugin_id.as_deref(),
-        )
-        .await
+        persist_non_app_mcp_tool_approval(sess, &turn_context.config, &key.server, &tool_name).await
     };
 
     if let Err(err) = persist_result {
@@ -2215,22 +2206,33 @@ async fn persist_custom_mcp_tool_approval(
 }
 
 async fn persist_non_app_mcp_tool_approval(
+    sess: &Session,
     config: &Config,
     server: &str,
     tool_name: &str,
-    plugin_id: Option<&str>,
 ) -> anyhow::Result<()> {
     if let Some(config_edits_builder) = custom_mcp_tool_approval_config_builder(config, server)? {
         return persist_custom_mcp_tool_approval_with(config_edits_builder, server, tool_name)
             .await;
     }
 
-    if let Some(plugin_id) = plugin_id {
+    let plugin_config_name = sess
+        .services
+        .plugins_manager
+        .plugins_for_config(&config.plugins_config_input())
+        .await
+        .plugins()
+        .iter()
+        .filter(|plugin| plugin.is_active())
+        .find(|plugin| plugin.mcp_servers.contains_key(server))
+        .map(|plugin| plugin.config_name.clone());
+
+    if let Some(plugin_config_name) = plugin_config_name {
         return ConfigEditsBuilder::for_config(config)
             .with_edits([ConfigEdit::SetPath {
                 segments: vec![
                     "plugins".to_string(),
-                    plugin_id.to_string(),
+                    plugin_config_name,
                     "mcp_servers".to_string(),
                     server.to_string(),
                     "tools".to_string(),

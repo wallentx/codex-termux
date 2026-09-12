@@ -34,22 +34,12 @@ mod misalignment_policy;
 mod model_catalog;
 #[path = "tests/model_defaults_tests.rs"]
 mod model_defaults;
-#[path = "tests/pagination_completion_tests.rs"]
-mod pagination_completion_tests;
 #[path = "tests/patch_approval_tests.rs"]
 mod patch_approval_tests;
 #[path = "tests/permission_shortcuts_tests.rs"]
 mod permission_shortcuts_tests;
 mod plugin_catalog;
 mod rate_limits;
-#[path = "tests/realtime_handoff_e2e.rs"]
-mod realtime_handoff_e2e;
-#[path = "tests/realtime_requests.rs"]
-mod realtime_requests;
-#[path = "tests/realtime_start.rs"]
-mod realtime_start;
-#[path = "tests/reasoning_resume_tests.rs"]
-mod reasoning_resume_tests;
 #[path = "tests/recap_generation_tests.rs"]
 mod recap_generation;
 mod safety_buffering;
@@ -67,8 +57,6 @@ mod thread_usage;
 mod transcript_composer;
 #[path = "tests/turn_submission.rs"]
 mod turn_submission;
-#[path = "tests/user_verification_routes_tests.rs"]
-mod user_verification_routes;
 
 use super::*;
 use crate::app_backtrack::BacktrackSelection;
@@ -135,8 +123,6 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchivedNotification;
-use codex_app_server_protocol::ThreadAttachmentOperation;
-use codex_app_server_protocol::ThreadAttachmentUpdatedNotification;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadSettings;
@@ -1346,13 +1332,11 @@ async fn replayed_turn_complete_submits_restored_queued_follow_up() {
     while new_op_rx.try_recv().is_ok() {}
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: Vec::new(),
             events: vec![ThreadBufferedEvent::Notification(Box::new(
                 turn_completed_notification(thread_id, "turn-1", TurnStatus::Completed),
             ))],
-            active_reasoning_item: None,
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -1401,13 +1385,11 @@ async fn replay_only_thread_keeps_restored_queue_visible() {
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: Vec::new(),
             events: vec![ThreadBufferedEvent::Notification(Box::new(
                 turn_completed_notification(thread_id, "turn-1", TurnStatus::Completed),
             ))],
-            active_reasoning_item: None,
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ false,
@@ -1454,11 +1436,9 @@ async fn replay_thread_snapshot_keeps_queue_when_running_state_only_comes_from_s
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: Vec::new(),
             events: vec![],
-            active_reasoning_item: None,
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -1505,11 +1485,9 @@ async fn replay_thread_snapshot_in_progress_turn_restores_running_queue_state() 
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: vec![test_turn("turn-1", TurnStatus::InProgress, Vec::new())],
             events: Vec::new(),
-            active_reasoning_item: None,
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -1536,11 +1514,9 @@ async fn replay_thread_snapshot_in_progress_turn_restores_running_state_without_
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: vec![test_turn("turn-1", TurnStatus::InProgress, Vec::new())],
             events: Vec::new(),
-            active_reasoning_item: None,
             input_state: None,
         },
         /*resume_restored_queue*/ false,
@@ -1580,7 +1556,6 @@ async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up()
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: Vec::new(),
             events: vec![
@@ -1593,7 +1568,6 @@ async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up()
                     thread_id, "turn-1",
                 ))),
             ],
-            active_reasoning_item: None,
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -1723,11 +1697,9 @@ async fn replay_thread_snapshot_restores_collaboration_mode_for_draft_submit() {
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: Vec::new(),
             events: vec![],
-            active_reasoning_item: None,
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -1805,11 +1777,9 @@ async fn replay_thread_snapshot_restores_collaboration_mode_without_input() {
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: Vec::new(),
             events: vec![],
-            active_reasoning_item: None,
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -1857,13 +1827,11 @@ async fn replayed_interrupted_turn_restores_queued_input_to_composer() {
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: Vec::new(),
             events: vec![ThreadBufferedEvent::Notification(Box::new(
                 turn_completed_notification(thread_id, "turn-1", TurnStatus::Interrupted),
             ))],
-            active_reasoning_item: None,
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -1978,8 +1946,7 @@ async fn archived_untracked_threads_do_not_appear_in_agent_picker() -> Result<()
         app.chat_widget.config_ref(),
     ))
     .await?;
-    let primary_thread_id =
-        ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
+    let primary_thread_id = ThreadId::new();
     app.enqueue_primary_thread_session(
         test_thread_session(primary_thread_id, test_path_buf("/tmp/project")),
         Vec::new(),
@@ -1999,32 +1966,8 @@ async fn archived_untracked_threads_do_not_appear_in_agent_picker() -> Result<()
 
     assert!(!app.thread_event_channels.contains_key(&archived_thread_id));
 
-    let attachment_thread_id = ThreadId::new();
-    app.handle_app_server_event(
-        &app_server,
-        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
-            ServerNotification::ThreadAttachmentUpdated(ThreadAttachmentUpdatedNotification {
-                thread_id: attachment_thread_id.to_string(),
-                attachment_type: "pull_request".to_string(),
-                identity_key: r#"["github.com","openai","codex",123]"#.to_string(),
-                attachment_id: "attachment-1".to_string(),
-                operation: ThreadAttachmentOperation::Deleted,
-            }),
-        )),
-    )
-    .await;
-
-    assert!(
-        !app.thread_event_channels
-            .contains_key(&attachment_thread_id)
-    );
-
     Box::pin(app.open_agent_picker(&mut app_server)).await;
 
-    assert_app_snapshot!(
-        "untracked_thread_notifications_agent_picker",
-        render_bottom_popup(&app.chat_widget, /*width*/ 80)
-    );
     assert_eq!(
         app.agent_navigation.ordered_thread_ids(),
         vec![primary_thread_id]
@@ -2396,7 +2339,7 @@ fn open_agent_picker_marks_loaded_threads_open() -> Result<()> {
 #[test]
 fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -> Result<()> {
     const WORKER_THREADS: usize = 1;
-    const TEST_STACK_SIZE_BYTES: usize = 12 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKER_THREADS)
@@ -2404,9 +2347,8 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
         .enable_all()
         .build()?;
 
-    // Keep the scenario and its large setup/resume futures off the test thread's stack.
-    runtime.block_on(Box::pin(async {
-        let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+    runtime.block_on(async {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let root_thread_id = ThreadId::new();
         let rollout_dir = app
             .config
@@ -2478,17 +2420,16 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
         }
 
         // Cold-resume the persisted V2 root so its children are registered before selection.
-        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
-            app.chat_widget.config_ref(),
-        ))
-        .await?;
-        let root = Box::pin(app_server.resume_thread(
-            &app.local_settings,
-            app.config.clone(),
-            root_thread_id,
-            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
-        ))
-        .await?;
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+        let root = app_server
+            .resume_thread(
+                &app.local_settings,
+                app.config.clone(),
+                root_thread_id,
+                crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+            )
+            .await?;
         app.enqueue_primary_thread_session(root.session, root.turns)
             .await?;
         for (child_thread_id, multi_agent_version) in child_thread_ids
@@ -2560,13 +2501,14 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 .any(|event| matches!(event, AppEvent::CodexOp(Op::UserTurn { .. })))
         );
 
-        let resumed = Box::pin(app_server.resume_thread(
-            &app.local_settings,
-            app.config.clone(),
-            child_thread_ids[1],
-            app.resume_model_settings(),
-        ))
-        .await?;
+        let resumed = app_server
+            .resume_thread(
+                &app.local_settings,
+                app.config.clone(),
+                child_thread_ids[1],
+                app.resume_model_settings(),
+            )
+            .await?;
         assert!(resumed.blocks_direct_input);
         app.replace_chat_widget_with_app_server_thread(
             &mut tui,
@@ -2588,7 +2530,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 .any(|event| matches!(event, AppEvent::CodexOp(Op::UserTurn { .. })))
         );
         Ok(())
-    }))
+    })
 }
 
 #[test]
@@ -3770,7 +3712,6 @@ async fn replay_snapshot_with_pending_request_suppresses_replay_notices() {
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: Some(test_thread_session(thread_id, test_path_buf("/tmp/main"))),
             turns: Vec::new(),
             events: vec![
@@ -3787,7 +3728,6 @@ async fn replay_snapshot_with_pending_request_suppresses_replay_notices() {
                     /*approval_id*/ None,
                 ))),
             ],
-            active_reasoning_item: None,
             input_state: None,
         },
         /*resume_restored_queue*/ false,
@@ -4154,7 +4094,6 @@ async fn replayed_file_change_approval_recovers_snapshot_changes() {
     let cwd = test_path_buf("/tmp/project").abs();
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: Some(test_thread_session(thread_id, cwd.clone().into_path_buf())),
             turns: vec![test_turn(
                 "turn-replayed-approval",
@@ -4182,7 +4121,6 @@ async fn replayed_file_change_approval_recovers_snapshot_changes() {
                     },
                 },
             ))],
-            active_reasoning_item: None,
             input_state: None,
         },
         /*resume_restored_queue*/ false,
@@ -5113,14 +5051,12 @@ async fn side_thread_snapshot_does_not_refresh_from_fork_history() {
         .insert(side_thread_id, SideThreadState::new(parent_thread_id));
 
     let snapshot = ThreadEventSnapshot {
-        delegated_turns: Vec::new(),
         session: Some(ThreadSessionState {
             rollout_path: None,
             ..test_thread_session(side_thread_id, test_path_buf("/tmp/side"))
         }),
         turns: Vec::new(),
         events: Vec::new(),
-        active_reasoning_item: None,
         input_state: None,
     };
 
@@ -5143,7 +5079,6 @@ async fn side_thread_snapshot_skips_session_header_preamble() {
         .insert(side_thread_id, SideThreadState::new(parent_thread_id));
 
     let snapshot = ThreadEventSnapshot {
-        delegated_turns: Vec::new(),
         session: Some(ThreadSessionState {
             forked_from_id: Some(parent_thread_id),
             fork_parent_title: None,
@@ -5151,7 +5086,6 @@ async fn side_thread_snapshot_skips_session_header_preamble() {
         }),
         turns: Vec::new(),
         events: Vec::new(),
-        active_reasoning_item: None,
         input_state: None,
     };
 
@@ -5320,14 +5254,12 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
     app.activate_thread_channel(side_thread_id).await;
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: Some(test_thread_session(
                 side_thread_id,
                 test_path_buf("/tmp/side"),
             )),
             turns: Vec::new(),
             events: Vec::new(),
-            active_reasoning_item: None,
             input_state: None,
         },
         /*resume_restored_queue*/ false,
@@ -5711,7 +5643,6 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
 
     let user_cell = |text: &str| -> Arc<dyn HistoryCell> {
         Arc::new(UserHistoryCell {
-            spoken: false,
             message: text.to_string(),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
@@ -5887,7 +5818,6 @@ async fn make_test_app() -> App {
         has_emitted_history_lines: false,
         transcript_reflow: TranscriptReflowState::default(),
         initial_history_replay_buffer: None,
-        pending_thread_switch_resets: 0,
         scrollback_has_older_history: false,
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -5907,9 +5837,6 @@ async fn make_test_app() -> App {
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
-        pending_realtime_speech_replay: HashMap::new(),
-        pending_realtime_transcript_replay: HashMap::new(),
-        realtime_replay_order: VecDeque::new(),
         temporary_structured_requests: HashMap::new(),
         pending_thread_titles: HashSet::new(),
         thread_event_listener_tasks: HashMap::new(),
@@ -5928,7 +5855,6 @@ async fn make_test_app() -> App {
         dynamic_tool_status_updates: tokio::sync::broadcast::channel(/*capacity*/ 64).0,
         dynamic_tool_tasks: HashMap::new(),
         pending_startup_thread_start: false,
-        pending_server_version_notice: None,
         pending_open_resume_picker: false,
         pending_managed_worktree_creation: false,
         pending_working_directory_change: None,
@@ -5986,7 +5912,6 @@ pub(super) async fn make_test_app_with_channels() -> (
             has_emitted_history_lines: false,
             transcript_reflow: TranscriptReflowState::default(),
             initial_history_replay_buffer: None,
-            pending_thread_switch_resets: 0,
             scrollback_has_older_history: false,
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -6006,9 +5931,6 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
-            pending_realtime_speech_replay: HashMap::new(),
-            pending_realtime_transcript_replay: HashMap::new(),
-            realtime_replay_order: VecDeque::new(),
             temporary_structured_requests: HashMap::new(),
             pending_thread_titles: HashSet::new(),
             thread_event_listener_tasks: HashMap::new(),
@@ -6027,7 +5949,6 @@ pub(super) async fn make_test_app_with_channels() -> (
             dynamic_tool_status_updates: tokio::sync::broadcast::channel(/*capacity*/ 64).0,
             dynamic_tool_tasks: HashMap::new(),
             pending_startup_thread_start: false,
-            pending_server_version_notice: None,
             pending_open_resume_picker: false,
             pending_managed_worktree_creation: false,
             pending_working_directory_change: None,
@@ -6295,152 +6216,6 @@ fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState 
 
 fn plain_line_cell(text: impl Into<String>) -> Arc<dyn HistoryCell> {
     Arc::new(PlainHistoryCell::new(vec![Line::from(text.into())])) as Arc<dyn HistoryCell>
-}
-
-#[tokio::test]
-async fn app_server_thread_replacement_clears_previous_transcript_before_replay() -> Result<()> {
-    let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
-    app.local_settings.tui.show_tooltips = false;
-    let previous_thread_id = ThreadId::new();
-    app.enqueue_primary_thread_session(
-        test_thread_session(previous_thread_id, test_path_buf("/tmp/previous")),
-        Vec::new(),
-    )
-    .await?;
-    while events.try_recv().is_ok() {}
-    app.transcript_cells = vec![plain_line_cell("Previous thread transcript")];
-    app.deferred_history_lines = vec![Line::from("Previous pending history").into()];
-    let mut tui = crate::tui::test_support::make_test_tui()?;
-    tui.insert_history_lines(vec![Line::from("Previous pending history")]);
-    app.chat_widget
-        .add_plain_history_lines(vec![Line::from("Previous queued history")]);
-    app.open_transcript_overlay(&mut tui);
-    assert!(tui.is_alt_screen_active());
-
-    let next_thread_id = ThreadId::new();
-    app.replace_chat_widget_with_app_server_thread(
-        &mut tui,
-        AppServerStartedThread {
-            session: test_thread_session(next_thread_id, test_path_buf("/tmp/next")),
-            turns: vec![test_turn(
-                "next-turn",
-                TurnStatus::Completed,
-                vec![ThreadItem::UserMessage {
-                    id: "next-user".to_string(),
-                    client_id: None,
-                    content: vec![AppServerUserInput::Text {
-                        text: "Next thread prompt".to_string(),
-                        text_elements: Vec::new(),
-                    }],
-                }],
-            )],
-            blocks_direct_input: false,
-            task_tools_available: false,
-        },
-        session_lifecycle::ThreadAttachPresentation::SessionLineage,
-        /*initial_user_message*/ None,
-    )
-    .await?;
-
-    assert_eq!(app.chat_widget.thread_id(), Some(next_thread_id));
-    assert!(!tui.is_alt_screen_active());
-    assert!(app.transcript_cells.is_empty());
-    assert!(app.deferred_history_lines.is_empty());
-    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-    // The reset must still run if the transport disconnects before queued events are handled.
-    app.reconnect.offline = true;
-    while let Ok(event) = events.try_recv() {
-        app.handle_event(&mut tui, &mut app_server, event).await?;
-    }
-    let replayed_prompts = app
-        .transcript_cells
-        .iter()
-        .filter_map(|cell| {
-            cell.as_any()
-                .downcast_ref::<UserHistoryCell>()
-                .map(|user| user.message.as_str())
-        })
-        .collect::<Vec<_>>();
-    assert_snapshot!(replayed_prompts.join("\n"), @"Next thread prompt");
-    assert!(app.transcript_cells.iter().all(|cell| {
-        !lines_to_single_string(&cell.display_lines(/*width*/ 80))
-            .contains("Previous queued history")
-    }));
-    let rendered = app
-        .render_transcript_lines_for_reflow(/*width*/ 80)
-        .lines
-        .iter()
-        .map(|line| {
-            let text = rendered_line_text(line);
-            if text.contains("│ directory: ") {
-                "│ directory: <thread cwd>                │".to_string()
-            } else {
-                text
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!rendered.contains("Previous thread transcript"));
-    assert!(!rendered.contains("Previous queued history"));
-    assert_snapshot!(rendered);
-    app_server.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn snapshot_thread_switch_discards_queued_previous_history() -> Result<()> {
-    let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
-    app.transcript_cells = vec![plain_line_cell("Previous thread transcript")];
-    app.chat_widget
-        .add_plain_history_lines(vec![Line::from("Previous queued history")]);
-    let mut tui = crate::tui::test_support::make_test_tui()?;
-    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-    let next_thread_id = ThreadId::new();
-    app.render_thread_snapshot(
-        &mut tui,
-        &app_server,
-        next_thread_id,
-        ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
-            session: Some(test_thread_session(
-                next_thread_id,
-                test_path_buf("/tmp/next"),
-            )),
-            turns: vec![test_turn(
-                "next-turn",
-                TurnStatus::Completed,
-                vec![ThreadItem::UserMessage {
-                    id: "next-user".to_string(),
-                    client_id: None,
-                    content: vec![AppServerUserInput::Text {
-                        text: "Next thread prompt".to_string(),
-                        text_elements: Vec::new(),
-                    }],
-                }],
-            )],
-            events: Vec::new(),
-            active_reasoning_item: None,
-            input_state: None,
-        },
-        /*resume_restored_queue*/ false,
-    )?;
-    assert_eq!(app.pending_thread_switch_resets, 1);
-    while let Ok(event) = events.try_recv() {
-        app.handle_event(&mut tui, &mut app_server, event).await?;
-    }
-    assert_eq!(app.pending_thread_switch_resets, 0);
-    let rendered = app
-        .render_transcript_lines_for_reflow(/*width*/ 80)
-        .lines
-        .iter()
-        .map(rendered_line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!rendered.contains("Previous thread transcript"));
-    assert!(!rendered.contains("Previous queued history"));
-    assert!(rendered.contains("Next thread prompt"));
-    app_server.shutdown().await?;
-    Ok(())
 }
 
 fn rendered_line_text(line: &crate::terminal_hyperlinks::HyperlinkLine) -> String {
@@ -7291,7 +7066,6 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
                      remote_image_urls: Vec<String>|
      -> Arc<dyn HistoryCell> {
         Arc::new(UserHistoryCell {
-            spoken: false,
             message: text.to_string(),
             text_elements,
             local_image_paths,
@@ -7982,7 +7756,6 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
         for item in [
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -8274,7 +8047,6 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
     let thread_id = ThreadId::new();
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: Some(test_thread_session(
                 thread_id,
                 test_path_buf("/home/user/project"),
@@ -8326,7 +8098,6 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                 },
             ],
             events: Vec::new(),
-            active_reasoning_item: None,
             input_state: None,
         },
         /*resume_restored_queue*/ false,
@@ -8392,7 +8163,6 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
 
     app.replay_thread_snapshot(
         ThreadEventSnapshot {
-            delegated_turns: Vec::new(),
             session: None,
             turns: Vec::new(),
             events: vec![ThreadBufferedEvent::Notification(Box::new(
@@ -8416,7 +8186,6 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
                     },
                 ),
             ))],
-            active_reasoning_item: None,
             input_state: None,
         },
         /*resume_restored_queue*/ false,
@@ -8469,11 +8238,9 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
         ..initial_session.clone()
     };
     let mut snapshot = ThreadEventSnapshot {
-        delegated_turns: Vec::new(),
         session: Some(initial_session),
         turns: Vec::new(),
         events: Vec::new(),
-        active_reasoning_item: None,
         input_state: None,
     };
 
@@ -8824,8 +8591,8 @@ async fn selecting_cyber_model_defaults_active_thread_to_auto_review() {
             .try_list_models()
             .expect("model catalog")
             .into_iter()
-            .find(|model| model.model == "gpt-5.5")
-            .expect("gpt-5.5 model");
+            .find(|model| model.model == "gpt-5.4")
+            .expect("gpt-5.4 model");
         model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
         app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
 
@@ -8862,7 +8629,7 @@ async fn selecting_cyber_model_defaults_active_thread_to_auto_review() {
             &mut tui,
             &mut app_server,
             AppEvent::ApplyAdvancedReasoning {
-                model: "gpt-5.5".to_string(),
+                model: "gpt-5.4".to_string(),
                 effort: ReasoningEffortConfig::High,
             },
         )
@@ -8873,7 +8640,7 @@ async fn selecting_cyber_model_defaults_active_thread_to_auto_review() {
         app.handle_event(
             &mut tui,
             &mut app_server,
-            AppEvent::UpdateModel("gpt-5.5".to_string()),
+            AppEvent::UpdateModel("gpt-5.4".to_string()),
         )
         .await
         .expect("model selection should succeed");
@@ -9021,8 +8788,8 @@ async fn selecting_cyber_model_falls_back_to_user_when_auto_review_is_unavailabl
         .try_list_models()
         .expect("model catalog")
         .into_iter()
-        .find(|model| model.model == "gpt-5.5")
-        .expect("gpt-5.5 model");
+        .find(|model| model.model == "gpt-5.4")
+        .expect("gpt-5.4 model");
     model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
     app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
     let _ = app.config.features.disable(Feature::GuardianApproval);
@@ -9031,7 +8798,7 @@ async fn selecting_cyber_model_falls_back_to_user_when_auto_review_is_unavailabl
     app.active_thread_id = Some(ThreadId::new());
 
     let params = app
-        .active_thread_model_setting_update_params("gpt-5.5".to_string())
+        .active_thread_model_setting_update_params("gpt-5.4".to_string())
         .expect("active thread should produce update params");
 
     assert_eq!(
@@ -9076,8 +8843,8 @@ async fn selecting_cyber_model_respects_auto_review_requirements() {
             .try_list_models()
             .expect("model catalog")
             .into_iter()
-            .find(|model| model.model == "gpt-5.5")
-            .expect("gpt-5.5 model");
+            .find(|model| model.model == "gpt-5.4")
+            .expect("gpt-5.4 model");
         model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
         app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
 
@@ -9102,7 +8869,7 @@ async fn selecting_cyber_model_respects_auto_review_requirements() {
         app.handle_event(
             &mut tui,
             &mut app_server,
-            AppEvent::UpdateModel("gpt-5.5".to_string()),
+            AppEvent::UpdateModel("gpt-5.4".to_string()),
         )
         .await
         .expect("model selection should succeed");
@@ -9307,7 +9074,6 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
     app.chat_widget
         .apply_external_edit("draft prompt".to_string());
     app.transcript_cells = vec![Arc::new(UserHistoryCell {
-        spoken: false,
         message: "old message".to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),

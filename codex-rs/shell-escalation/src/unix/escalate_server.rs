@@ -336,7 +336,6 @@ async fn handle_escalate_session_with_policy(
             command
                 .args(args)
                 .arg0(arg0.unwrap_or_else(|| program.clone()))
-                .env_clear()
                 .envs(&env)
                 .current_dir(&cwd)
                 .stdin(Stdio::null())

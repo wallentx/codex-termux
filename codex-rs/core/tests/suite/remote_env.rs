@@ -4023,6 +4023,3 @@ async fn remote_test_env_copy_preserves_symlink_source() -> Result<()> {
         .await?;
     Ok(())
 }
-
-#[path = "remote_env_failure_tests.rs"]
-mod failure_tests;

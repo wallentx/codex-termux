@@ -172,10 +172,8 @@ pub struct McpConfig {
     pub prefix_mcp_tool_names: bool,
     /// MCP servers whose model-visible tool namespaces omit the `mcp__` prefix.
     pub non_prefixed_mcp_tool_servers: Vec<String>,
-    /// Protocol mode for servers other than the host-owned Codex Apps registration.
+    /// Protocol compatibility policy captured when this MCP configuration is created.
     pub protocol_mode: McpProtocolMode,
-    /// Independent protocol mode for the trusted, HTTP Codex Apps registration.
-    pub host_owned_apps_protocol_mode: McpProtocolMode,
     /// Client-side elicitation capabilities advertised during MCP initialization.
     pub client_elicitation_capability: ElicitationCapability,
     /// Resolved MCP registrations keyed by logical server name.
@@ -240,21 +238,15 @@ impl McpConfig {
     }
 }
 
-/// Plugin attribution and selection data derived from the current MCP configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ToolPluginContext {
+pub struct ToolPluginProvenance {
     plugin_display_names_by_connector_id: HashMap<String, Vec<String>>,
-    disabled_connector_ids: HashSet<String>,
     plugin_display_names_by_mcp_server_name: HashMap<String, Vec<String>>,
     plugin_ids_by_mcp_server_name: HashMap<String, String>,
     selected_plugin_mcp_server_names: HashSet<String>,
 }
 
-impl ToolPluginContext {
-    pub(crate) fn allows_connector_id(&self, connector_id: Option<&str>) -> bool {
-        connector_id.is_none_or(|id| !self.disabled_connector_ids.contains(id))
-    }
-
+impl ToolPluginProvenance {
     pub fn plugin_display_names_for_connector_id(&self, connector_id: &str) -> &[String] {
         self.plugin_display_names_by_connector_id
             .get(connector_id)
@@ -280,12 +272,9 @@ impl ToolPluginContext {
     }
 
     fn from_config(config: &McpConfig) -> Self {
-        let mut tool_plugin_context = Self {
-            disabled_connector_ids: config.connector_snapshot.disabled_connector_ids().clone(),
-            ..Self::default()
-        };
+        let mut tool_plugin_provenance = Self::default();
         for connector_id in config.connector_snapshot.connector_ids() {
-            tool_plugin_context
+            tool_plugin_provenance
                 .plugin_display_names_by_connector_id
                 .insert(
                     connector_id.0.clone(),
@@ -300,28 +289,30 @@ impl ToolPluginContext {
             .mcp_server_catalog
             .plugin_attributions_by_server_name()
         {
-            tool_plugin_context
+            tool_plugin_provenance
                 .plugin_display_names_by_mcp_server_name
                 .insert(
                     server_name.clone(),
                     vec![attribution.display_name().to_string()],
                 );
-            tool_plugin_context
+            tool_plugin_provenance
                 .plugin_ids_by_mcp_server_name
                 .insert(server_name, attribution.plugin_id().to_string());
         }
-        tool_plugin_context.selected_plugin_mcp_server_names.extend(
-            config
-                .mcp_server_catalog
-                .selected_plugin_server_names()
-                .map(str::to_string),
-        );
+        tool_plugin_provenance
+            .selected_plugin_mcp_server_names
+            .extend(
+                config
+                    .mcp_server_catalog
+                    .selected_plugin_server_names()
+                    .map(str::to_string),
+            );
 
-        for plugin_names in tool_plugin_context
+        for plugin_names in tool_plugin_provenance
             .plugin_display_names_by_connector_id
             .values_mut()
             .chain(
-                tool_plugin_context
+                tool_plugin_provenance
                     .plugin_display_names_by_mcp_server_name
                     .values_mut(),
             )
@@ -329,7 +320,7 @@ impl ToolPluginContext {
             plugin_names.sort_unstable();
             plugin_names.dedup();
         }
-        tool_plugin_context
+        tool_plugin_provenance
     }
 }
 
@@ -416,8 +407,8 @@ pub fn effective_mcp_servers_from_configured(
     servers
 }
 
-pub fn tool_plugin_context(config: &McpConfig) -> ToolPluginContext {
-    ToolPluginContext::from_config(config)
+pub fn tool_plugin_provenance(config: &McpConfig) -> ToolPluginProvenance {
+    ToolPluginProvenance::from_config(config)
 }
 
 pub async fn read_mcp_resource(
@@ -809,22 +800,13 @@ async fn collect_mcp_server_status_snapshot_from_manager(
             .insert(tool_name, tool);
     }
 
-    // Status-only discovery has no event channel. Report OAuth failures from the completed
-    // connection attempt instead of retaining the credential-presence status read beforehand.
-    let mut auth_statuses = auth_statuses_from_entries(&auth_status_entries);
-    for server_name in mcp_connection_manager.authentication_failed_servers().await {
-        if auth_statuses.get(&server_name) == Some(&McpAuthStatus::OAuth) {
-            auth_statuses.insert(server_name, McpAuthStatus::NotLoggedIn);
-        }
-    }
-
     McpServerStatusSnapshot {
         server_infos,
         tools_by_server,
         tools_errors,
         resources: convert_mcp_resources(resources),
         resource_templates: convert_mcp_resource_templates(resource_templates),
-        auth_statuses,
+        auth_statuses: auth_statuses_from_entries(&auth_status_entries),
         server_names,
     }
 }

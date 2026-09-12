@@ -16,7 +16,6 @@ use async_channel::Sender;
 use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
 #[cfg(windows)]
 use codex_utils_pty::JobObject;
-use futures::future::try_join;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -223,12 +222,7 @@ pub(crate) async fn run_command(
         .kill_on_drop(true);
 
     #[cfg(unix)]
-    // Keep process-group cleanup without inheriting the controlling terminal, where
-    // shell startup can otherwise stop the hook on background terminal I/O.
-    // SAFETY: detach_from_tty only performs async-signal-safe process setup.
-    unsafe {
-        command.pre_exec(codex_utils_pty::process_group::detach_from_tty);
-    }
+    command.process_group(0);
 
     #[cfg(windows)]
     let mut process_tree_job = JobObject::create().ok();
@@ -270,28 +264,27 @@ pub(crate) async fn run_command(
         job: process_tree_job,
     };
 
-    let stdin = child.stdin.take();
-    let write_stdin = async {
-        if let Some(mut stdin) = stdin
-            && let Err(err) = stdin.write_all(input_json.as_bytes()).await
-            && err.kind() != ErrorKind::BrokenPipe
-        {
-            return Err(("stdin_error", format!("failed to write hook stdin: {err}")));
-        }
-        Ok(())
-    };
-    let wait_with_output = async {
-        child
-            .wait_with_output()
-            .await
-            .map_err(|err| ("wait_error", err.to_string()))
-    };
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(err) = stdin.write_all(input_json.as_bytes()).await
+        && err.kind() != ErrorKind::BrokenPipe
+    {
+        let _ = child.kill().await;
+        return finish_command_run(
+            started_at,
+            started,
+            CommandRunCompletion {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(format!("failed to write hook stdin: {err}")),
+                outcome: "stdin_error",
+            },
+        );
+    }
 
     let timeout_duration = Duration::from_secs(handler.timeout_sec);
-    // Drain output while sending input so neither pipe can block the other, and
-    // include stdin writes in the deadline even when the hook never reads them.
-    match timeout(timeout_duration, try_join(write_stdin, wait_with_output)).await {
-        Ok(Ok(((), output))) => {
+    match timeout(timeout_duration, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
             // Successfully completed hooks may intentionally leave detached helpers running.
             #[cfg(windows)]
             if let Some(job) = process_tree_guard.job.as_ref() {
@@ -310,15 +303,15 @@ pub(crate) async fn run_command(
                 },
             )
         }
-        Ok(Err((outcome, error))) => finish_command_run(
+        Ok(Err(err)) => finish_command_run(
             started_at,
             started,
             CommandRunCompletion {
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
-                error: Some(error),
-                outcome,
+                error: Some(err.to_string()),
+                outcome: "wait_error",
             },
         ),
         Err(_) => finish_command_run(

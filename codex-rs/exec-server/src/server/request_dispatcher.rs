@@ -195,21 +195,13 @@ impl RequestDispatcher {
                 .is_err()
             {
                 request_span.record("result", "disconnected");
-                self.telemetry.request_completed(
-                    method,
-                    "disconnected",
-                    started_at.elapsed(),
-                    queued_at.elapsed(),
-                );
+                self.telemetry
+                    .request_completed(method, "disconnected", started_at.elapsed());
                 return RequestTaskResult::ConnectionClosed;
             }
             request_span.record("result", "error");
-            self.telemetry.request_completed(
-                method,
-                "error",
-                started_at.elapsed(),
-                queued_at.elapsed(),
-            );
+            self.telemetry
+                .request_completed(method, "error", started_at.elapsed());
             return RequestTaskResult::Completed;
         };
 
@@ -229,12 +221,7 @@ impl RequestDispatcher {
                 message = route.instrument(request_span.clone()) => message,
                 _ = disconnected_rx.changed() => {
                     request_span.record("result", "disconnected");
-                    telemetry.request_completed(
-                        method,
-                        "disconnected",
-                        started_at.elapsed(),
-                        queued_at.elapsed(),
-                    );
+                    telemetry.request_completed(method, "disconnected", started_at.elapsed());
                     return RequestTaskResult::ConnectionClosed;
                 }
             };
@@ -248,16 +235,11 @@ impl RequestDispatcher {
             };
             if !response_sent {
                 request_span.record("result", "disconnected");
-                telemetry.request_completed(
-                    method,
-                    "disconnected",
-                    started_at.elapsed(),
-                    queued_at.elapsed(),
-                );
+                telemetry.request_completed(method, "disconnected", started_at.elapsed());
                 return RequestTaskResult::ConnectionClosed;
             }
             request_span.record("result", result);
-            telemetry.request_completed(method, result, started_at.elapsed(), queued_at.elapsed());
+            telemetry.request_completed(method, result, started_at.elapsed());
             RequestTaskResult::Completed
         };
 

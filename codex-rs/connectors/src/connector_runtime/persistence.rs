@@ -64,7 +64,6 @@ pub(crate) fn load_cached_connector_runtime_for_identity<T: ConnectorRuntimePayl
         ConnectorRuntimeSnapshot {
             tools: cache.tools,
             refreshed_at: modified_at,
-            generation: 0,
         },
     )
 }
@@ -234,7 +233,6 @@ pub(crate) fn write_cached_codex_apps_tools_for_test<T>(
     let snapshot = ConnectorRuntimeSnapshot {
         tools: tools.to_vec(),
         refreshed_at: SystemTime::now(),
-        generation: 0,
     };
     cache_context
         .entry
@@ -265,7 +263,6 @@ where
     let snapshot = ConnectorRuntimeSnapshot {
         tools: tools.to_vec(),
         refreshed_at: SystemTime::now(),
-        generation: 0,
     };
     write_cached_connector_runtime(cache_context, &snapshot)
 }

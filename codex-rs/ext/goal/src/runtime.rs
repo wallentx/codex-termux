@@ -40,7 +40,6 @@ pub(crate) enum ActiveGoalStopReason {
     TurnError,
     UsageLimit,
     ExecutionUnavailable { expected_goal_id: String },
-    EmptyResponse,
 }
 
 struct GoalRuntimeInner {
@@ -158,8 +157,6 @@ impl GoalRuntimeHandle {
         if !self.is_enabled() {
             return Ok(());
         }
-        // Invalidate the old turn before the persisted objective/status changes.
-        self.inner.accounting_state.reset_empty_responses();
 
         if let Some(turn_id) = self.inner.accounting_state.current_turn_id() {
             self.account_active_goal_progress(
@@ -190,7 +187,6 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
 
-        self.inner.accounting_state.reset_empty_responses();
         let replaced_existing_goal = previous_goal
             .as_ref()
             .is_some_and(|previous_goal| previous_goal.goal_id != goal.goal_id);
@@ -266,7 +262,7 @@ impl GoalRuntimeHandle {
             .await
     }
 
-    /// Accounts the ending turn and stops its active goal after an error or repeated empty output.
+    /// Accounts the ending turn and stops its active goal after a terminal error.
     pub(crate) async fn stop_active_goal_for_turn(
         &self,
         turn_id: &str,
@@ -301,21 +297,6 @@ impl GoalRuntimeHandle {
                 codex_state::ThreadGoalStatus::UsageLimited,
                 None,
             ),
-            ActiveGoalStopReason::EmptyResponse => {
-                let Some(expected_goal_id) =
-                    self.inner.accounting_state.empty_response_goal(turn_id)
-                else {
-                    return Ok(());
-                };
-                if accounting_goal_id != expected_goal_id {
-                    return Ok(());
-                }
-                (
-                    "empty-response",
-                    codex_state::ThreadGoalStatus::Blocked,
-                    Some(expected_goal_id),
-                )
-            }
             ActiveGoalStopReason::ExecutionUnavailable { expected_goal_id } => (
                 "execution-unavailable",
                 codex_state::ThreadGoalStatus::Blocked,
@@ -478,11 +459,7 @@ impl GoalRuntimeHandle {
             )
             .await
         {
-            Ok(StartIfIdleSubmission::Started { turn_id }) => {
-                // Turn-stop evaluation takes the same permit, so even a fast response
-                // cannot finish before this host-admitted continuation is identified.
-                self.inner.accounting_state.mark_goal_continuation(turn_id);
-            }
+            Ok(StartIfIdleSubmission::Started { .. }) => {}
             Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
                 tracing::debug!(
                     ?reason,

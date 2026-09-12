@@ -1,12 +1,9 @@
 mod client;
-mod helper_exit;
 mod message_reader;
 mod protocol;
 mod session;
 
-pub use client::ConnectionError;
 pub use client::VoiceHost;
-pub use helper_exit::HelperExitStage;
 pub use protocol::AudioControls;
 pub use protocol::AudioState;
 pub use protocol::MAX_FRAME_BYTES;

@@ -98,12 +98,11 @@ impl Session {
         config: &Config,
     ) -> (McpConfig, McpRuntimeContext) {
         let originator = self.originator().await;
-        let (session_source, host_fallback_cwd, disabled_plugin_ids) = {
+        let (session_source, host_fallback_cwd) = {
             let state = self.state.lock().await;
             (
                 state.session_configuration.session_source.clone(),
                 state.session_configuration.cwd().clone(),
-                state.active_disabled_plugin_ids.clone(),
             )
         };
         let environments = self.services.turn_environments.snapshot().await;
@@ -129,7 +128,6 @@ impl Session {
                 McpThreadIdentity {
                     session_source: &session_source,
                     originator: &originator,
-                    disabled_plugin_ids: &disabled_plugin_ids,
                     environments: McpEnvironmentScope::Live(&self.services.turn_environments),
                 },
                 &ready_selected_capability_roots,
@@ -137,7 +135,12 @@ impl Session {
             )
             .await;
         let mcp_config = self
-            .project_selected_environment_mcp_servers(config, &environments, mcp_projection)
+            .project_selected_environment_mcp_servers(
+                &session_source,
+                config,
+                &environments,
+                mcp_projection,
+            )
             .await
             .config;
         let local_process_cwd = environments
@@ -235,7 +238,6 @@ impl Session {
                     McpThreadIdentity {
                         session_source: &desired.session_source,
                         originator: &desired.originator,
-                        disabled_plugin_ids: &desired.disabled_plugin_ids,
                         environments: McpEnvironmentScope::Live(&self.services.turn_environments),
                     },
                     &ready_selected_capability_roots,
@@ -302,7 +304,6 @@ impl Session {
                 McpThreadIdentity {
                     session_source: &desired.session_source,
                     originator: &desired.originator,
-                    disabled_plugin_ids: &desired.disabled_plugin_ids,
                     environments: McpEnvironmentScope::Live(&self.services.turn_environments),
                 },
                 &ready_selected_capability_roots,
@@ -311,6 +312,7 @@ impl Session {
             .await;
         let mcp_projection = self
             .project_selected_environment_mcp_servers(
+                &desired.session_source,
                 &desired.config,
                 &desired.environments,
                 mcp_projection,
@@ -666,13 +668,12 @@ impl Session {
             return;
         };
         let auth = self.services.auth_manager.auth().await;
-        let disabled_plugin_ids = {
+        {
             let mut state = self.state.lock().await;
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
             config.mcp_servers = refresh_config.mcp_servers.clone();
             state.session_configuration.original_config_do_not_use = Arc::new(config);
-            state.active_disabled_plugin_ids.clone()
-        };
+        }
         let ready_selected_capability_roots = self
             .services
             .mcp_runtime
@@ -695,7 +696,6 @@ impl Session {
                 McpThreadIdentity {
                     session_source: &turn_context.session_source,
                     originator: &turn_context.originator,
-                    disabled_plugin_ids: &disabled_plugin_ids,
                     environments: McpEnvironmentScope::Live(&self.services.turn_environments),
                 },
                 &ready_selected_capability_roots,

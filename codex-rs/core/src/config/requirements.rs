@@ -35,10 +35,6 @@ pub(super) fn apply_to_config(
     apply_exact!(sqlite_home);
     apply_exact!(log_dir);
     apply_exact!(model_catalog_json);
-    apply_exact!(model_provider);
-    if let Some(providers) = &requirements.model_providers {
-        config.model_providers.extend(providers.value.clone());
-    }
     apply_exact!(check_for_update_on_startup);
     apply_exact!(allow_login_shell);
     if requirements

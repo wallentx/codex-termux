@@ -1,6 +1,3 @@
-#[path = "memory_readiness.rs"]
-mod readiness;
-
 use super::threads::ThreadFilterOptions;
 use super::threads::push_thread_filters;
 use super::*;
@@ -1298,12 +1295,6 @@ WHERE thread_id = ? AND source_updated_at = ?
             .await?;
         }
 
-        sqlx::query(
-            "UPDATE consolidation_progress SET max_thread_count = MAX(max_thread_count, ?)",
-        )
-        .bind(i64::try_from(selected_outputs.len())?)
-        .execute(&mut *tx)
-        .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1429,9 +1420,6 @@ WHERE kind = ? AND job_key = ?
 
 pub(super) async fn clear_memory_data_in_pool(pool: &SqlitePool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE consolidation_progress SET max_thread_count = 0")
-        .execute(&mut *tx)
-        .await?;
 
     sqlx::query(
         r#"

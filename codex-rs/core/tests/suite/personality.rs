@@ -44,7 +44,6 @@ use wiremock::MockServer;
 
 const LOCAL_FRIENDLY_TEMPLATE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
-const BUNDLED_FRIENDLY_TEMPLATE: &str = "You have a vivid inner life as Codex:";
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
 
 fn read_only_text_turn(
@@ -94,7 +93,7 @@ async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Res
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let mut builder = test_codex().with_model("gpt-5.5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config
             .features
             .enable(Feature::Personality)
@@ -131,7 +130,7 @@ async fn config_personality_some_sets_instructions_template() -> anyhow::Result<
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let mut builder = test_codex().with_model("gpt-5.5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config
             .features
             .enable(Feature::Personality)
@@ -155,7 +154,7 @@ async fn config_personality_some_sets_instructions_template() -> anyhow::Result<
     let instructions_text = request.instructions_text();
 
     assert!(
-        instructions_text.contains(BUNDLED_FRIENDLY_TEMPLATE),
+        instructions_text.contains(LOCAL_FRIENDLY_TEMPLATE),
         "expected personality update to include the local friendly template, got: {instructions_text:?}"
     );
 
@@ -176,7 +175,7 @@ async fn config_personality_none_sends_no_personality() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let mut builder = test_codex().with_model("gpt-5.5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config
             .features
             .enable(Feature::Personality)
@@ -199,7 +198,7 @@ async fn config_personality_none_sends_no_personality() -> anyhow::Result<()> {
     let request = resp_mock.single_request();
     let instructions_text = request.instructions_text();
     assert!(
-        !instructions_text.contains(BUNDLED_FRIENDLY_TEMPLATE),
+        !instructions_text.contains(LOCAL_FRIENDLY_TEMPLATE),
         "expected no friendly personality template, got: {instructions_text:?}"
     );
     assert!(
@@ -229,7 +228,7 @@ async fn config_personality_none_strips_baked_personality_section() -> anyhow::R
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
     let mut builder = test_codex()
-        .with_model_info_override("gpt-5.5", |model_info| {
+        .with_model_info_override("gpt-5.4", |model_info| {
             if let Some(model_messages) = model_info.model_messages.as_mut() {
                 model_messages.instructions_template = Some("Base instructions\n# Personality\nBaked personality\n## Writing Style\nNested writing style\n# General\nGeneral instructions".to_string());
                 model_messages.instructions_variables = None;
@@ -271,7 +270,7 @@ async fn config_personality_none_preserves_explicit_base_instructions() -> anyho
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let mut builder = test_codex().with_model("gpt-5.5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config
             .features
             .enable(Feature::Personality)
@@ -306,7 +305,7 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
 
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(&server, sse_completed("resp-1")).await;
-    let mut builder = test_codex().with_model("gpt-5.5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
         config
             .features
             .enable(Feature::Personality)
@@ -491,8 +490,8 @@ async fn disabled_personality_sends_remote_default_instructions() -> anyhow::Res
     let mut remote_model = bundled_models_response()?
         .models
         .into_iter()
-        .find(|model| model.slug == "gpt-5.5")
-        .expect("bundled gpt-5.5 model");
+        .find(|model| model.slug == "gpt-5.4")
+        .expect("bundled gpt-5.4 model");
     remote_model.slug = remote_slug.to_string();
     if let Some(model_messages) = remote_model.model_messages.as_mut() {
         model_messages.instructions_template = Some("remote base\n{{ personality }}".to_string());
@@ -838,7 +837,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
                 .features
                 .enable(Feature::Personality)
                 .expect("test config should allow feature update");
-            config.model = Some("gpt-5.5".to_string());
+            config.model = Some("gpt-5.4".to_string());
         });
     let test = builder.build(&server).await?;
 

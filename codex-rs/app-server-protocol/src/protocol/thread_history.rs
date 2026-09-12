@@ -104,7 +104,6 @@ pub struct ThreadHistoryItemChange {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadHistoryTurnChange {
     pub turn_id: String,
-    pub root_turn_id: Option<String>,
     pub status: TurnStatus,
     pub error: Option<TurnError>,
     pub started_at: Option<i64>,
@@ -132,7 +131,6 @@ impl ThreadHistoryTurnChange {
     fn from_pending_turn(turn: &PendingTurn) -> Self {
         Self {
             turn_id: turn.id.clone(),
-            root_turn_id: turn.root_turn_id.clone(),
             status: turn.status.clone(),
             error: turn.error.clone(),
             started_at: turn.started_at,
@@ -862,7 +860,6 @@ impl ThreadHistoryBuilder {
             failure: None,
             saved_path: None,
             imagegen_request_id: None,
-            generation_id: None,
         });
         self.upsert_item_in_current_turn(item);
     }
@@ -877,7 +874,6 @@ impl ThreadHistoryBuilder {
             failure: payload.failure.clone(),
             saved_path: payload.saved_path.clone(),
             imagegen_request_id: None,
-            generation_id: None,
         });
         self.upsert_item_in_current_turn(item);
     }
@@ -1244,12 +1240,11 @@ impl ThreadHistoryBuilder {
 
     fn handle_turn_started(&mut self, payload: &TurnStartedEvent) {
         self.finish_current_turn();
-        let mut turn = self
+        let turn = self
             .new_turn(Some(payload.turn_id.clone()))
             .with_status(TurnStatus::InProgress)
             .with_started_at(payload.started_at)
             .opened_explicitly();
-        turn.root_turn_id = payload.root_turn_id.clone();
         self.record_changed_pending_turn(&turn);
         self.current_turn = Some(turn);
     }
@@ -1365,7 +1360,6 @@ impl ThreadHistoryBuilder {
         });
         PendingTurn {
             id,
-            root_turn_id: None,
             items: Vec::new(),
             item_index: TurnItemIndex::default(),
             error: None,
@@ -1597,7 +1591,6 @@ impl TurnItemIndex {
 
 struct PendingTurn {
     id: String,
-    root_turn_id: Option<String>,
     items: Vec<ThreadItem>,
     item_index: TurnItemIndex,
     error: Option<TurnError>,
@@ -2038,7 +2031,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -2104,7 +2096,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -2173,7 +2164,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -2192,7 +2182,6 @@ mod tests {
                         failure: None,
                         saved_path: Some(saved_path.clone()),
                         imagegen_request_id: None,
-                        generation_id: None,
                     },
                 )),
                 started_at_ms: Some(0),
@@ -2226,7 +2215,6 @@ mod tests {
                 failure: None,
                 saved_path: Some(saved_path),
                 imagegen_request_id: None,
-                generation_id: None,
             })]
         );
     }
@@ -2267,7 +2255,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -2385,7 +2372,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -2486,7 +2472,6 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-image".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -2560,7 +2545,6 @@ mod tests {
                         ),
                         saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
                         imagegen_request_id: None,
-                        generation_id: None,
                     }),
                 ],
             }
@@ -2880,7 +2864,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -2948,7 +2931,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3084,7 +3066,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3164,7 +3145,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3249,7 +3229,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3346,7 +3325,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3441,7 +3419,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3513,7 +3490,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3538,7 +3514,6 @@ mod tests {
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3621,7 +3596,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3646,7 +3620,6 @@ mod tests {
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3723,7 +3696,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3792,7 +3764,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3861,7 +3832,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3886,7 +3856,6 @@ mod tests {
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -3943,7 +3912,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: Some(10),
                 model_context_window: None,
@@ -3959,7 +3927,6 @@ mod tests {
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: Some(30),
                 model_context_window: None,
@@ -4047,7 +4014,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -4072,7 +4038,6 @@ mod tests {
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -4119,7 +4084,6 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-compact".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -4392,7 +4356,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -4455,7 +4418,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -4515,7 +4477,6 @@ mod tests {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: Some(10),
                 model_context_window: None,
@@ -4586,7 +4547,6 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -4647,7 +4607,6 @@ mod tests {
         let mut builder = ThreadHistoryBuilder::new();
         builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-a".into(),
-            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -4676,7 +4635,6 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -4724,7 +4682,6 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -4790,7 +4747,6 @@ mod tests {
                 }],
                 changed_turns: vec![ThreadHistoryTurnChange {
                     turn_id: "rollout-0".into(),
-                    root_turn_id: None,
                     status: TurnStatus::Completed,
                     error: None,
                     started_at: None,
@@ -4885,7 +4841,6 @@ mod tests {
         let start_changes = builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: Some("root-turn".into()),
                 trace_id: None,
                 started_at: Some(10),
                 model_context_window: None,
@@ -4898,7 +4853,6 @@ mod tests {
                 changed_items: Vec::new(),
                 changed_turns: vec![ThreadHistoryTurnChange {
                     turn_id: "turn-a".into(),
-                    root_turn_id: Some("root-turn".into()),
                     status: TurnStatus::InProgress,
                     error: None,
                     started_at: Some(10),
@@ -4937,7 +4891,6 @@ mod tests {
                 changed_items: Vec::new(),
                 changed_turns: vec![ThreadHistoryTurnChange {
                     turn_id: "turn-a".into(),
-                    root_turn_id: Some("root-turn".into()),
                     status: TurnStatus::Completed,
                     error: None,
                     started_at: Some(10),
@@ -4985,7 +4938,6 @@ mod tests {
                 }],
                 changed_turns: vec![ThreadHistoryTurnChange {
                     turn_id: "rollout-0".into(),
-                    root_turn_id: None,
                     status: TurnStatus::Completed,
                     error: None,
                     started_at: None,
@@ -5003,7 +4955,6 @@ mod tests {
         let changes = builder.handle_rollout_items_with_changes(&[
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: Some("root-turn".into()),
                 trace_id: None,
                 started_at: Some(10),
                 model_context_window: None,
@@ -5026,7 +4977,6 @@ mod tests {
                 changed_items: Vec::new(),
                 changed_turns: vec![ThreadHistoryTurnChange {
                     turn_id: "turn-a".into(),
-                    root_turn_id: Some("root-turn".into()),
                     status: TurnStatus::Completed,
                     error: None,
                     started_at: Some(10),
@@ -5044,7 +4994,6 @@ mod tests {
         let changes = builder.handle_rollout_items_with_changes(&[
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
-                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,

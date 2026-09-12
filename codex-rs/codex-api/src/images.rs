@@ -67,6 +67,4 @@ pub struct ImageResponse {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ImageData {
     pub b64_json: String,
-    #[serde(default)]
-    pub generation_id: Option<String>,
 }

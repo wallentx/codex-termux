@@ -18,10 +18,18 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path_uri::PathConvention;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use tempfile::TempDir;
+
+#[test]
+fn normalize_absolute_path_for_platform_simplifies_windows_verbatim_paths() {
+    let parsed = normalize_absolute_path_for_platform(
+        r"\\?\D:\c\x\worktrees\2508\swift-base",
+        /*is_windows*/ true,
+    );
+    assert_eq!(parsed, PathBuf::from(r"D:\c\x\worktrees\2508\swift-base"));
+}
 
 #[test]
 fn windows_verbatim_path_prefix_does_not_count_as_glob_syntax() {
@@ -424,9 +432,9 @@ fn profile_network_proxy_config_keeps_proxy_disabled_for_proxy_policy() {
 }
 
 #[test]
-fn compile_permission_profile_resolves_enabled_workspace_roots() -> std::io::Result<()> {
+fn compile_permission_profile_workspace_roots_resolves_enabled_entries() -> std::io::Result<()> {
     let cwd = TempDir::new()?;
-    let compiled = compile_permission_profile(
+    let workspace_roots = compile_permission_profile_workspace_roots(
         Some(&PermissionsToml {
             entries: BTreeMap::from([(
                 "workspace".to_string(),
@@ -445,22 +453,15 @@ fn compile_permission_profile_resolves_enabled_workspace_roots() -> std::io::Res
             )]),
         }),
         "workspace",
-        &ConfigPathContext::new(
-            PathConvention::native(),
-            Some(PathUri::from_host_native_path(cwd.path())?),
-            /*user_home_dir*/ None,
-        ),
-        /*workspace_write*/ None,
-        &mut Vec::new(),
+        cwd.path(),
     )?;
 
     assert_eq!(
-        compiled.workspace_roots,
-        vec![
-            PathUri::from_host_native_path(cwd.path())?
-                .join("backend")
-                .unwrap()
-        ]
+        workspace_roots,
+        vec![AbsolutePathBuf::resolve_path_against_base(
+            "backend",
+            cwd.path()
+        )]
     );
     Ok(())
 }
@@ -488,50 +489,24 @@ docs = "read"
     let cwd = TempDir::new()?;
     let docs = cwd.path().join("docs");
     let mut startup_warnings = Vec::new();
-    let context = ConfigPathContext::new(
-        PathConvention::native(),
-        Some(PathUri::from_host_native_path(cwd.path())?),
-        /*user_home_dir*/ None,
-    );
 
-    let read_deny_policy = compile_permission_profile(
-        Some(&permissions),
-        "read_deny",
-        &context,
-        /*workspace_write*/ None,
-        &mut startup_warnings,
-    )?
-    .permission_profile
-    .file_system_sandbox_policy();
+    let (read_deny_policy, _) =
+        compile_permission_profile(&permissions, "read_deny", &mut startup_warnings)?;
     assert_eq!(
         read_deny_policy.resolve_access_for_local_path_with_cwd(cwd.path(), cwd.path()),
         FileSystemAccessMode::Deny
     );
 
-    let write_deny_policy = compile_permission_profile(
-        Some(&permissions),
-        "write_deny",
-        &context,
-        /*workspace_write*/ None,
-        &mut startup_warnings,
-    )?
-    .permission_profile
-    .file_system_sandbox_policy();
+    let (write_deny_policy, _) =
+        compile_permission_profile(&permissions, "write_deny", &mut startup_warnings)?;
     assert!(!write_deny_policy.has_full_disk_write_access());
     assert_eq!(
         write_deny_policy.resolve_access_for_local_path_with_cwd(cwd.path(), cwd.path()),
         FileSystemAccessMode::Deny
     );
 
-    let write_read_policy = compile_permission_profile(
-        Some(&permissions),
-        "write_read",
-        &context,
-        /*workspace_write*/ None,
-        &mut startup_warnings,
-    )?
-    .permission_profile
-    .file_system_sandbox_policy();
+    let (write_read_policy, _) =
+        compile_permission_profile(&permissions, "write_read", &mut startup_warnings)?;
     assert!(!write_read_policy.has_full_disk_write_access());
     assert_eq!(
         write_read_policy.resolve_access_for_local_path_with_cwd(&docs, cwd.path()),
@@ -566,15 +541,7 @@ fn read_write_glob_warnings_skip_supported_deny_read_globs_and_trailing_subpaths
     };
 
     assert_eq!(
-        unsupported_read_write_glob_paths(
-            &filesystem,
-            &ConfigPathContext::new(
-                PathConvention::native(),
-                /*base_dir*/ None,
-                /*user_home_dir*/ None,
-            )
-        )
-        .unwrap(),
+        unsupported_read_write_glob_paths(&filesystem),
         vec![
             "/tmp/**/*.log".to_string(),
             ":workspace_roots/src/**/*.rs".to_string()
@@ -627,8 +594,8 @@ fn glob_scan_max_depth_must_be_positive() {
 #[test]
 fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> {
     let mut startup_warnings = Vec::new();
-    let compiled = compile_permission_profile(
-        Some(&PermissionsToml {
+    let (file_system_policy, _) = compile_permission_profile(
+        &PermissionsToml {
             entries: BTreeMap::from([(
                 "workspace".to_string(),
                 PermissionProfileToml {
@@ -648,19 +615,13 @@ fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> 
                     network: None,
                 },
             )]),
-        }),
+        },
         "workspace",
-        &ConfigPathContext::new(
-            PathConvention::native(),
-            /*base_dir*/ None,
-            /*user_home_dir*/ None,
-        ),
-        /*workspace_write*/ None,
         &mut startup_warnings,
     )?;
 
     assert_eq!(
-        compiled.permission_profile.file_system_sandbox_policy(),
+        file_system_policy,
         FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(Some("docs".into())),
@@ -675,16 +636,8 @@ fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> 
 
 #[test]
 fn read_write_glob_patterns_still_reject_non_subpath_globs() {
-    let err = compile_read_write_glob_path(
-        "src/**/*.rs",
-        FileSystemAccessMode::Read,
-        &ConfigPathContext::new(
-            PathConvention::native(),
-            /*base_dir*/ None,
-            /*user_home_dir*/ None,
-        ),
-    )
-    .expect_err("non-subpath read/write glob should be rejected");
+    let err = compile_read_write_glob_path("src/**/*.rs", FileSystemAccessMode::Read)
+        .expect_err("non-subpath read/write glob should be rejected");
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert!(

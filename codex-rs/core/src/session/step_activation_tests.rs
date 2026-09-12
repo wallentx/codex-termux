@@ -1,6 +1,4 @@
 use super::*;
-use crate::agents_md_manager::AgentsMdManager;
-use crate::agents_md_manager::SessionInstructions;
 use crate::guardian::BUNDLED_GUARDIAN_POLICY;
 use crate::session::handlers::submission_loop;
 use crate::session::step_context::StepContext;
@@ -17,10 +15,6 @@ use codex_config::ConfigRequirementsToml;
 use codex_config::ConfigRequirementsWithSources;
 use codex_config::RequirementSource;
 use codex_config::Sourced;
-use codex_extension_api::Instructions;
-use codex_extension_api::LoadUserInstructionsFuture;
-use codex_extension_api::LoadedUserInstructions;
-use codex_extension_api::UserInstructionsProvider;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_models_manager::ModelsManagerConfig;
@@ -47,8 +41,6 @@ use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use test_case::test_case;
 use tokio::sync::Notify;
@@ -60,102 +52,13 @@ use tokio_util::sync::CancellationToken;
 const MODEL_A: &str = "step-activation-a";
 const MODEL_B: &str = "step-activation-b";
 
-#[tokio::test]
-async fn instruction_refresh_serializes_reads_and_releases_on_cancellation() {
-    struct GatedInstructionsProvider {
-        instructions: StdMutex<Option<Instructions>>,
-        block_next_read: AtomicBool,
-        read_started: Notify,
-    }
-
-    impl UserInstructionsProvider for GatedInstructionsProvider {
-        fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_> {
-            let instructions = self
-                .instructions
-                .lock()
-                .expect("instruction snapshot")
-                .clone();
-            let block = self.block_next_read.swap(/*val*/ false, Ordering::SeqCst);
-            Box::pin(async move {
-                if block {
-                    self.read_started.notify_one();
-                    std::future::pending::<()>().await;
-                }
-                LoadedUserInstructions {
-                    instructions,
-                    warnings: Vec::new(),
-                }
-            })
-        }
-    }
-
-    let (mut session, turn) = make_session_and_context().await;
-    let turn = Arc::new(turn);
-    let source = turn.config.codex_home.join("AGENTS.md");
-    let instructions = |text: &str| {
-        Some(Instructions {
-            text: text.to_string(),
-            source: source.clone(),
-        })
-    };
-    let provider = Arc::new(GatedInstructionsProvider {
-        instructions: StdMutex::new(instructions("initial")),
-        block_next_read: AtomicBool::new(/*v*/ false),
-        read_started: Notify::new(),
-    });
-    session.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
-        user_provider: Some(provider.clone()),
-        ..Default::default()
-    }));
-    let session = Arc::new(session);
-    session
-        .services
-        .agents_md_manager
-        .refresh(&turn.config, &turn.environments)
-        .await
-        .0
-        .expect("install initial provider");
-    *provider.instructions.lock().expect("instruction snapshot") = instructions("cancelled");
-    provider
-        .block_next_read
-        .store(/*val*/ true, Ordering::SeqCst);
-
-    let cancellation = CancellationToken::new();
-    let first_capture = session.capture_step_context(Arc::clone(&turn), &cancellation);
-    tokio::pin!(first_capture);
-    tokio::select! {
-        _ = &mut first_capture => panic!("capture must wait for provider"),
-        () = provider.read_started.notified() => {}
-    }
-
-    *provider.instructions.lock().expect("instruction snapshot") = instructions("latest");
-    let next_cancellation = CancellationToken::new();
-    let next_capture = session.capture_step_context(turn, &next_cancellation);
-    tokio::pin!(next_capture);
-    assert!(futures::poll!(&mut next_capture).is_pending());
-    assert_eq!(
-        session.inherited_instructions().await.user,
-        instructions("initial")
-    );
-
-    cancellation.cancel();
-    assert!(first_capture.await.is_err());
-    next_capture
-        .await
-        .expect("cancelled read releases the refresh guard");
-    assert_eq!(
-        session.inherited_instructions().await.user,
-        instructions("latest")
-    );
-}
-
 fn activation_models() -> Vec<ModelInfo> {
     let model = bundled_models_response()
         .expect("bundled models")
         .models
         .into_iter()
-        .find(|model| model.slug == "gpt-5.5")
-        .expect("bundled gpt-5.5");
+        .find(|model| model.slug == "gpt-5.4")
+        .expect("bundled gpt-5.4");
     [MODEL_A, MODEL_B]
         .into_iter()
         .map(|slug| ModelInfo {
@@ -530,27 +433,6 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         ]
     );
     assert!(Arc::ptr_eq(&before.turn, &after.turn));
-    assert_eq!(
-        turn.to_turn_context_item().summary,
-        ReasoningSummary::Concise
-    );
-    // Even after the live update, an already-captured request retains its own
-    // summary setting in the durable context.
-    for step in [&before, &during, &after] {
-        let world_state = session
-            .record_context_updates_and_set_reference_context_item(step)
-            .await
-            .expect("record captured settings");
-        assert_eq!(
-            session.reference_context_item().await.unwrap().summary,
-            step.settings.reasoning_summary,
-        );
-        session.start_new_context_window(step, world_state).await;
-        assert_eq!(
-            session.reference_context_item().await.unwrap().summary,
-            step.settings.reasoning_summary,
-        );
-    }
     assert_eq!(after.settings.model_info.as_ref(), &expected_destination);
     let initial_budget = turn
         .config

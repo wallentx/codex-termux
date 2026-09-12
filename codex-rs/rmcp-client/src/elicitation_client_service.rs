@@ -68,7 +68,7 @@ pub(crate) struct ElicitationClientService {
 }
 
 // A notification handler can run before its request handler. Never evict an early
-// cancellation: after saturation, cancel new elicitations for this connection.
+// cancellation: after saturation, cancel new verifications for this connection.
 const MAX_EARLY_CANCELLATIONS: usize = 1024;
 
 #[derive(Default)]
@@ -142,7 +142,7 @@ impl ElicitationClientService {
         let request = restore_context_meta(request, meta);
         let user_verification = matches!(&request, Elicitation::UserVerification { .. });
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let _pending = {
+        let _pending = if user_verification {
             let mut cancellations = self
                 .pending_verifications
                 .lock()
@@ -155,22 +155,24 @@ impl ElicitationClientService {
                 });
             }
             cancellations.pending.insert(id.clone(), cancel_tx);
-            PendingVerification {
+            Some(PendingVerification {
                 request_id: id.clone(),
                 cancellations: Arc::clone(&self.pending_verifications),
-            }
+            })
+        } else {
+            None
         };
         let _pause = self.pause_state.enter();
         let response = tokio::select! {
             biased;
-            _ = ct.cancelled() => {
+            _ = ct.cancelled(), if user_verification => {
                 return Ok(ElicitationResponse {
                     action: ElicitationAction::Cancel,
                     content: None,
                     meta: None,
                 });
             }
-            _ = cancel_rx => {
+            _ = cancel_rx, if user_verification => {
                 return Ok(ElicitationResponse {
                     action: ElicitationAction::Cancel,
                     content: None,
@@ -268,8 +270,24 @@ impl Service<RoleClient> for ElicitationClientService {
                 if request.method == OPENAI_ELICITATION_METHOD
                     && self.supports_openai_elicitation_form =>
             {
+                let params = request
+                    .params_as::<OpenAiElicitationRequestParams>()
+                    .map_err(|err| {
+                        rmcp::ErrorData::invalid_params(err.to_string(), /*data*/ None)
+                    })?
+                    .ok_or_else(|| {
+                        rmcp::ErrorData::invalid_params("missing params", /*data*/ None)
+                    })?;
+                let OpenAiElicitationRequestParams::Form(params) = params;
                 let response = self
-                    .create_elicitation(openai_elicitation_form(request)?, context)
+                    .create_elicitation(
+                        Elicitation::OpenAiElicitationForm {
+                            meta: params.meta,
+                            message: params.message,
+                            requested_schema: params.requested_schema,
+                        },
+                        context,
+                    )
                     .await?;
                 Ok(ClientResult::CustomResult(elicitation_response_result(
                     response,
@@ -301,6 +319,7 @@ impl Service<RoleClient> for ElicitationClientService {
         context: NotificationContext<RoleClient>,
     ) -> Result<(), rmcp::ErrorData> {
         if let ServerNotification::CancelledNotification(cancelled) = &notification
+            && self.supports_user_verification
             && let Some(request_id) = cancelled.params.request_id.as_ref()
         {
             let mut cancellations = self
@@ -349,21 +368,6 @@ fn openai_form_elicitation(request: CustomRequest) -> Result<Elicitation, rmcp::
         .map_err(|err| rmcp::ErrorData::invalid_params(err.to_string(), None))?
         .ok_or_else(|| rmcp::ErrorData::invalid_params("missing params", None))?;
     Ok(Elicitation::OpenAiForm {
-        meta: params.meta,
-        message: params.message,
-        requested_schema: params.requested_schema,
-    })
-}
-
-pub(crate) fn openai_elicitation_form(
-    request: CustomRequest,
-) -> Result<Elicitation, rmcp::ErrorData> {
-    let params = request
-        .params_as::<OpenAiElicitationRequestParams>()
-        .map_err(|err| rmcp::ErrorData::invalid_params(err.to_string(), /*data*/ None))?
-        .ok_or_else(|| rmcp::ErrorData::invalid_params("missing params", /*data*/ None))?;
-    let OpenAiElicitationRequestParams::Form(params) = params;
-    Ok(Elicitation::OpenAiElicitationForm {
         meta: params.meta,
         message: params.message,
         requested_schema: params.requested_schema,

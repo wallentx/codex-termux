@@ -1,8 +1,8 @@
 //! Collects bounded conversation evidence before consumer-specific rendering.
 //!
 //! Both Guardian consumers receive the same role and tool-source attribution,
-//! with complete user messages and capped non-user entries. Resolved context profiles
-//! apply aggregate retention after the host selects its full/delta slice. Tool outputs with a
+//! with per-entry caps applied before accumulation. Consumers retain their own
+//! transcript selection, aggregate budgets, and formatting. Tool outputs with a
 //! call ID retain their generic label when the call is unavailable. Outputs
 //! without a call ID require an explicit name.
 
@@ -55,7 +55,7 @@ impl Default for ConversationTranscriptOptions {
 /// Per-entry caps resolved by the caller for the current review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TranscriptEntryLimits {
-    /// Cap for assistant and plaintext reasoning entries; user and manual approvals stay complete.
+    /// Cap for user, developer, assistant, and plaintext reasoning entries.
     pub message_tokens: usize,
     /// Cap for tool calls and ordinary tool outputs.
     pub tool_tokens: usize,
@@ -65,16 +65,16 @@ pub struct TranscriptEntryLimits {
 
 /// Aggregate limits for retaining rendered transcript entries.
 ///
-/// Context profiles apply the sync or async selection rules using these limits.
-/// User messages and manual approvals survive these soft limits; the complete
-/// request budget can shorten them with markers after other recovery is exhausted.
+/// Sync and async consumers keep their existing selection rules. These limits
+/// configure those rules without introducing another sync/async policy selector.
+/// Collection applies per-entry caps; aggregate retention remains with the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TranscriptRetentionConfig {
     /// Budget for rendered user, developer, assistant, and reasoning entries.
     pub max_message_transcript_tokens: usize,
     /// Separate budget for rendered tool calls and results.
     pub max_tool_transcript_tokens: usize,
-    /// Maximum retained entries other than user messages and manual approvals.
+    /// Maximum retained entries other than user messages.
     pub max_recent_non_user_entries: usize,
 }
 
@@ -105,8 +105,8 @@ impl SectionContributor for ConversationTranscriptSection {
 
 /// Extracts bounded transcript entries without composing other context sections.
 ///
-/// Entries preserve conversation order and role/tool attribution. Non-user
-/// limits apply during collection; context profiles own aggregate retention.
+/// Entries preserve conversation order and role/tool attribution. Per-entry
+/// limits apply during collection; consumers own aggregate retention and rendering.
 pub fn collect_transcript(
     history: &dyn SectionHistory,
     config: &ConversationTranscriptConfig,
@@ -303,28 +303,22 @@ pub fn collect_transcript(
         if text.trim().is_empty() {
             continue;
         }
-        let original_bytes = text.len();
-        let text = match &kind {
-            ConversationTranscriptEntryKind::User | ConversationTranscriptEntryKind::Developer => {
-                text
-            }
-            ConversationTranscriptEntryKind::Assistant
+        let token_cap = match &kind {
+            ConversationTranscriptEntryKind::User
+            | ConversationTranscriptEntryKind::Developer
+            | ConversationTranscriptEntryKind::Assistant
             | ConversationTranscriptEntryKind::ProtectedAssistant
-            | ConversationTranscriptEntryKind::Reasoning => {
-                truncate_text(&text, config.entry_limits.message_tokens)
-            }
+            | ConversationTranscriptEntryKind::Reasoning => config.entry_limits.message_tokens,
             ConversationTranscriptEntryKind::ToolCall(_)
-            | ConversationTranscriptEntryKind::ToolOutput(_) => {
-                truncate_text(&text, config.entry_limits.tool_tokens)
-            }
+            | ConversationTranscriptEntryKind::ToolOutput(_) => config.entry_limits.tool_tokens,
             ConversationTranscriptEntryKind::NodeReplToolOutput(_) => {
-                truncate_text(&text, config.entry_limits.node_repl_output_tokens)
+                config.entry_limits.node_repl_output_tokens
             }
         };
         entries.push(ConversationTranscriptEntry {
             kind,
-            text,
-            original_bytes,
+            text: truncate_text(&text, token_cap),
+            original_bytes: text.len(),
         });
     }
 

@@ -45,7 +45,6 @@ use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::local;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
@@ -124,25 +123,20 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
             defer_loading: false,
         })]
     };
-    let codex_core::NewThread { thread, .. } = test
+    let thread = test
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools,
             ..StartThreadOptions::new(test.config.clone())
         })
-        .await?;
+        .await?
+        .thread;
 
     thread
-        .start_or_steer_turn(
-            TurnInputRequest::user_input(vec![UserInput::Text {
-                text: "use the planning tool".to_string(),
-                text_elements: Vec::new(),
-            }])
-            .on_start(codex_core::TurnStartOptions {
-                root_turn_id: Some("root-turn".into()),
-                ..Default::default()
-            }),
-        )
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "use the planning tool".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let EventMsg::Error(error) =
@@ -163,18 +157,6 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
         unreachable!("event predicate guarantees turn completion");
     };
     assert_eq!(completed.error, Some(error));
-    thread.flush_rollout().await?;
-    let history = thread.load_history(/*include_archived*/ false).await?;
-    let attribution = history.items.iter().find_map(|item| match item {
-        codex_history::RolloutItem::EventMsg(EventMsg::TurnStarted(event))
-            if event.turn_id == completed.turn_id =>
-        {
-            event.root_turn_id.as_deref()
-        }
-        _ => None,
-    });
-    assert_eq!(attribution, Some("root-turn"));
-
     assert!(
         server
             .received_requests()

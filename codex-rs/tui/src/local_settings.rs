@@ -3,7 +3,6 @@
 //! The resolved core config is a temporary input at local load/reload boundaries. Server thread
 //! responses must never refresh these values; live preference changes belong here. The remaining
 //! Config-based lifecycle adapters also use this conversion until their interfaces are migrated.
-//! Effective animations also respect the TUI host's launch-time accessibility preference.
 
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::TerminalResizeReflowConfig;
@@ -24,20 +23,12 @@ pub(crate) struct LocalSettings {
 
 impl From<&Config> for LocalSettings {
     fn from(config: &Config) -> Self {
-        Self::with_system_motion(config, crate::system_motion::mode())
-    }
-}
-
-impl LocalSettings {
-    fn with_system_motion(config: &Config, system_motion: crate::motion::MotionMode) -> Self {
         Self {
             tui: Tui {
                 notification_settings: config.tui_notifications.clone(),
-                animations: config.animations
-                    && system_motion == crate::motion::MotionMode::Animated,
+                animations: config.animations,
                 whimsy: config.tui_whimsy,
                 show_tooltips: config.show_tooltips,
-                show_server_version_notice: config.tui_show_server_version_notice,
                 auto_recap: config.tui_auto_recap,
                 disable_paste_burst: Some(config.disable_paste_burst),
                 vim_mode_default: config.tui_vim_mode_default,

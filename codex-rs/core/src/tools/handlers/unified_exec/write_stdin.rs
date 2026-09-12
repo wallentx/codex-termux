@@ -91,12 +91,7 @@ impl WriteStdinHandler {
                     input: &args.chars,
                     yield_time_ms: args.yield_time_ms,
                     max_output_tokens: args.max_output_tokens,
-                    truncation_policy: context
-                        .step_context
-                        .settings
-                        .model_info
-                        .truncation_policy
-                        .into(),
+                    truncation_policy: turn.model_info().truncation_policy.into(),
                     interaction_event: Some(WriteStdinInteractionEvent {
                         session: &session,
                         turn: &turn,

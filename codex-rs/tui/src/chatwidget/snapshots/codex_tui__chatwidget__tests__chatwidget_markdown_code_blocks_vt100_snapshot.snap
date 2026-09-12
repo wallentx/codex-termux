@@ -1,7 +1,8 @@
 ---
-source: tui/src/chatwidget/tests/status_and_layout.rs
-expression: "normalize_completion_timestamps(&\n(normalize_snapshot_paths(term.backend().vt100().screen().contents())))"
+source: tui/src/chatwidget/tests.rs
+expression: term.backend().vt100().screen().contents()
 ---
+
 
 
 
@@ -50,4 +51,3 @@ expression: "normalize_completion_timestamps(&\n(normalize_snapshot_paths(term.b
     "path": "C:\\Program Files\\App",
     "regex": "^foo.*(bar)?$"
   }
-  done [completion time]

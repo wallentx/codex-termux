@@ -12,7 +12,6 @@ use test_case::test_case;
 
 use super::CapturePurpose;
 use super::MAX_SNAPSHOT_ATTEMPTS;
-use super::MAX_SNAPSHOT_BYTES;
 use super::SNAPSHOT_RETRY_BACKOFF;
 use super::ShellSnapshotCache;
 use super::parse_snapshot;
@@ -230,20 +229,6 @@ async fn snapshot_failure_retries_are_bounded_and_single_flight(
 }
 
 #[test]
-fn snapshot_size_limit_counts_state_and_environment_before_filtering() {
-    let half = "x".repeat(MAX_SNAPSHOT_BYTES / 2);
-    let oversized = format!("# Snapshot file\n# {half}\n\0\0\0FILTERED={half}\0");
-    let policy = ExecEnvPolicy {
-        inherit: ShellEnvironmentPolicyInherit::All,
-        ignore_default_excludes: false,
-        exclude: vec!["FILTERED".to_string()],
-        r#set: HashMap::new(),
-        include_only: Vec::new(),
-    };
-    assert!(parse_snapshot(ShellType::Bash, oversized.as_bytes(), Some(&policy)).is_err());
-}
-
-#[test]
 fn snapshot_filters_profile_exports_after_capture() {
     let policy = ExecEnvPolicy {
         inherit: ShellEnvironmentPolicyInherit::All,
@@ -253,8 +238,7 @@ fn snapshot_filters_profile_exports_after_capture() {
         include_only: vec!["PROFILE_*".to_string()],
     };
     let snapshot = parse_snapshot(
-        ShellType::Bash,
-        b"profile \xff noise\n# Snapshot file\nfunction profile_helper() { :; }\n\0alias profile_alias='profile_helper'\n\0PROFILE_DENIED\0export PROFILE_DENIED=denied\n\0NON_UTF8\0export NON_UTF8='\xff'\n\0\0PROFILE_ALLOWED=profile\0PROFILE_DENIED=denied\0PROFILE_SECRET=secret\0PWD=/tmp\0NON_UTF8=\xff\0",
+        b"profile noise\n# Snapshot file\nfunction profile_helper() { :; }\n\0PROFILE_ALLOWED=profile\0PROFILE_DENIED=denied\0PROFILE_SECRET=secret\0PWD=/tmp\0",
         Some(&policy),
     )
     .expect("snapshot should parse");
@@ -265,7 +249,7 @@ fn snapshot_filters_profile_exports_after_capture() {
     );
     assert_eq!(
         snapshot.state,
-        "# Snapshot file\nfunction profile_helper() { :; }\nalias profile_alias='profile_helper'\n"
+        "# Snapshot file\nfunction profile_helper() { :; }\n"
     );
 }
 
@@ -283,8 +267,7 @@ fn snapshot_preserves_profile_exports_with_restrictive_inheritance() {
             include_only: Vec::new(),
         };
         let snapshot = parse_snapshot(
-            ShellType::Bash,
-            b"# Snapshot file\n\0\0\0PROFILE_ALLOWED=profile\0SDKROOT=/sdk\0PROFILE_SECRET=secret\0PROFILE_DENIED=denied\0",
+            b"# Snapshot file\n\0PROFILE_ALLOWED=profile\0SDKROOT=/sdk\0PROFILE_SECRET=secret\0PROFILE_DENIED=denied\0",
             Some(&policy),
         )
         .expect("snapshot should parse");
@@ -317,11 +300,10 @@ fn snapshot_caches_only_unmanaged_proxy_state() {
             ]),
         ),
     ] {
-        let output = format!("# Snapshot file\n\0\0\0{exports}");
-        let snapshot = parse_snapshot(ShellType::Bash, output.as_bytes(), /*env_policy*/ None)
-            .expect("snapshot should parse");
+        let output = format!("# Snapshot file\n\0{exports}");
+        let snapshot =
+            parse_snapshot(output.as_bytes(), /*env_policy*/ None).expect("snapshot should parse");
 
         assert_eq!(snapshot.environment, expected);
     }
 }
-use codex_shell_command::shell_detect::ShellType;

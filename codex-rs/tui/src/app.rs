@@ -206,7 +206,6 @@ mod agent_navigation;
 mod agent_picker;
 mod agent_status_feed;
 mod agents_overview;
-mod agents_overview_actions;
 mod agents_overview_details;
 mod agents_overview_threads;
 mod agents_overview_view;
@@ -230,23 +229,18 @@ mod managed_worktree_creation;
 mod misalignment_policy;
 mod model_defaults;
 mod new_session;
-pub(crate) use new_session::has_launch_setting;
 mod pending_interactive_replay;
 mod permission_shortcuts;
 mod pets;
 mod platform_actions;
 mod plugin_mentions;
 mod rate_limit_refresh;
-mod realtime_delivery;
-mod realtime_settings;
-mod reasoning_replay;
 mod recap;
 mod reconnect;
 mod replay_filter;
 mod resize_reflow;
 mod resume_config;
 mod safety_buffering;
-mod server_version_notice;
 mod session_lifecycle;
 mod session_picker;
 mod side;
@@ -261,9 +255,6 @@ mod thread_session_state;
 mod thread_settings;
 mod thread_title;
 mod transcript_export;
-mod user_verification;
-mod user_verification_errors;
-mod user_verification_requests;
 mod working_directory;
 
 use self::agent_navigation::AgentNavigationDirection;
@@ -285,10 +276,6 @@ enum ThreadInteractiveRequest {
     AppLink(AppLinkViewParams),
     Approval(ApprovalRequest),
     McpServerElicitation(McpServerElicitationFormRequest),
-    UserVerification {
-        thread_id: ThreadId,
-        request: crate::bottom_pane::user_verification::UserVerificationRequest,
-    },
 }
 
 /// Extracts `receiver_thread_ids` from collab agent tool-call notifications.
@@ -587,7 +574,6 @@ pub(crate) struct App {
     has_emitted_history_lines: bool,
     transcript_reflow: TranscriptReflowState,
     initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
-    pending_thread_switch_resets: usize,
     pub(crate) scrollback_has_older_history: bool,
 
     pub(crate) enhanced_keys_supported: bool,
@@ -631,10 +617,6 @@ pub(crate) struct App {
     windows_sandbox: WindowsSandboxState,
 
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
-    pending_realtime_speech_replay: HashMap<ThreadId, Vec<(String, ThreadItem)>>,
-    pending_realtime_transcript_replay:
-        HashMap<ThreadId, VecDeque<crate::chatwidget::RealtimeTranscriptRecord>>,
-    realtime_replay_order: VecDeque<ThreadId>,
     temporary_structured_requests: HashMap<ThreadId, mpsc::UnboundedSender<ServerNotification>>,
     /// Track title generation across thread switches and deduplicate automatic requests.
     pending_thread_titles: HashSet<(ThreadId, ThreadTitleDestination)>,
@@ -654,7 +636,6 @@ pub(crate) struct App {
         tokio::sync::broadcast::Sender<codex_app_server_protocol::ThreadStatusChangedNotification>,
     dynamic_tool_tasks: HashMap<codex_app_server_protocol::RequestId, (String, JoinHandle<()>)>,
     pending_startup_thread_start: bool,
-    pending_server_version_notice: Option<crate::status::remote_connection::ServerVersionNotice>,
     /// Opens the session picker after event dispatch returns, with a fresh stack.
     pending_open_resume_picker: bool,
     /// Runs a requested /cd after event dispatch returns, with a fresh stack.

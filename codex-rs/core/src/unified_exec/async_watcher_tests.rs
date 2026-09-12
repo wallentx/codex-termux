@@ -208,7 +208,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         stdout_tx,
         exit_tx,
         transcript,
-        mut context,
+        context,
         rx_event,
     } = streaming_output_harness().await?;
 
@@ -226,15 +226,11 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
 
     #[allow(deprecated)]
     let cwd = context.step_context.turn.cwd.clone().into();
-    let step = Arc::get_mut(&mut context.step_context).expect("unshared test step");
-    let model_info = Arc::make_mut(&mut Arc::make_mut(&mut step.settings).model_info);
-    model_info.truncation_policy = codex_protocol::openai_models::TruncationPolicyConfig {
-        mode: codex_protocol::openai_models::TruncationMode::Bytes,
-        limit: 4,
-    };
     spawn_exit_watcher(
         Arc::clone(&process),
-        &context,
+        Arc::clone(&context.session),
+        Arc::clone(&context.step_context.turn),
+        context.call_id,
         vec!["proof".to_string()],
         cwd,
         /*process_id*/ 123,
@@ -269,13 +265,6 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
             Some(-1),
             Some("LATE_DENIAL")
         )
-    );
-    assert_eq!(
-        item.formatted_output,
-        Some(codex_utils_output_truncation::formatted_truncate_text(
-            "LATE_DENIAL",
-            codex_utils_output_truncation::TruncationPolicy::Bytes(4),
-        ))
     );
     assert!(
         elapsed >= Duration::from_millis(10) && elapsed < TRAILING_OUTPUT_GRACE,

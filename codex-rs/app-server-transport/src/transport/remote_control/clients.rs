@@ -1,4 +1,3 @@
-use super::auth::RemoteControlAuth;
 use super::auth::RemoteControlConnectionAuth;
 use super::auth::load_remote_control_auth;
 use super::auth::recover_remote_control_auth;
@@ -12,10 +11,12 @@ use codex_app_server_protocol::RemoteControlClientsListParams;
 use codex_app_server_protocol::RemoteControlClientsListResponse;
 use codex_app_server_protocol::RemoteControlClientsRevokeParams;
 use codex_app_server_protocol::RemoteControlClientsRevokeResponse;
+use codex_login::AuthManager;
 use codex_login::default_client::create_client_without_request_logging;
 use serde::Deserialize;
 use std::io;
 use std::io::ErrorKind;
+use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use url::Url;
@@ -67,7 +68,7 @@ struct ClientManagementResponse {
 
 pub(super) async fn list_remote_control_clients(
     remote_control_url: &str,
-    auth_manager: &RemoteControlAuth,
+    auth_manager: &Arc<AuthManager>,
     params: RemoteControlClientsListParams,
 ) -> io::Result<RemoteControlClientsListResponse> {
     if params.environment_id.is_empty() {
@@ -122,7 +123,7 @@ pub(super) async fn list_remote_control_clients(
 
 pub(super) async fn revoke_remote_control_client(
     remote_control_url: &str,
-    auth_manager: &RemoteControlAuth,
+    auth_manager: &Arc<AuthManager>,
     params: RemoteControlClientsRevokeParams,
 ) -> io::Result<RemoteControlClientsRevokeResponse> {
     if params.environment_id.is_empty() {
@@ -163,7 +164,7 @@ pub(super) async fn revoke_remote_control_client(
 }
 
 async fn send_client_management_request(
-    auth_manager: &RemoteControlAuth,
+    auth_manager: &Arc<AuthManager>,
     request: ClientManagementRequest<'_>,
     action: &str,
 ) -> io::Result<ClientManagementResponse> {

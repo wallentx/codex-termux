@@ -123,17 +123,14 @@ impl WindowsSandboxRequestProcessor {
                         let service_setup_request = setup_request.clone();
                         let service_setup_start = Instant::now();
                         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                            let Ok(permissions) = codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                            if codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                                 &service_setup_request.permission_profile,
                                 &service_setup_request.workspace_roots,
-                            ) else {
+                            ).is_err() {
                                 // The existing setup path can still succeed for completed
                                 // provisioning without resolving the current profile.
                                 return Ok(());
-                            };
-                            permissions.validate_elevated_filesystem_policy(
-                                &service_setup_request.command_cwd,
-                            )?;
+                            }
                             // The shared setup path below handles helper fallback and
                             // refreshes workspace ACLs after provisioning.
                             codex_windows_sandbox::provision_windows_sandbox_via_service(

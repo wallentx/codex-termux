@@ -127,8 +127,7 @@ impl Sink {
         let sink: Self = glib::Object::new();
         assert!(sink.imp().writer.set(writer).is_ok());
         sink.set_provide_clock(false);
-        sink.set_property_from_str("slave-method", "none");
-        sink.set_sync(false);
+        sink.set_property_from_str("slave-method", "resample");
         sink.set_async(false);
         sink.set_enable_last_sample(false);
         sink

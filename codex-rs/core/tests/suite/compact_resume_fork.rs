@@ -16,7 +16,6 @@ use codex_core::TurnInputRequest;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Config;
 use codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
-use codex_extension_api::ExtensionRegistryBuilder;
 use codex_history::CodexHarnessMetadata;
 use codex_history::RolloutItem;
 use codex_protocol::config_types::CollaborationMode;
@@ -30,7 +29,6 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
-use core_test_support::ThreadIdle;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
@@ -545,13 +543,8 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
     base.submit(Op::ThreadRollback { num_turns: 1 })
         .await
         .expect("submit thread rollback");
-    let rollback_event = wait_for_event(&base, |ev| {
-        if let EventMsg::Error(error) = ev {
-            panic!("rollback failed: {error:?}");
-        }
-        matches!(ev, EventMsg::ThreadRolledBack(_))
-    })
-    .await;
+    let rollback_event =
+        wait_for_event(&base, |ev| matches!(ev, EventMsg::ThreadRolledBack(_))).await;
     let EventMsg::ThreadRolledBack(rollback_event) = rollback_event else {
         panic!("expected thread rolled back event");
     };
@@ -665,9 +658,6 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
         .submit(Op::ThreadRollback { num_turns: 1 })
         .await?;
     let rollback_event = wait_for_event(&conversation, |ev| {
-        if let EventMsg::Error(error) = ev {
-            panic!("rollback failed: {error:?}");
-        }
         matches!(ev, EventMsg::ThreadRolledBack(_))
     })
     .await;
@@ -854,19 +844,15 @@ async fn start_test_conversation(
 ) -> (Arc<TempDir>, Config, Arc<ThreadManager>, Arc<CodexThread>) {
     let base_url = format!("{}/v1", server.uri());
     let model = model.map(str::to_string);
-    let mut extensions = ExtensionRegistryBuilder::new();
-    extensions.thread_lifecycle_contributor(Arc::new(ThreadIdle));
-    let mut builder = test_codex()
-        .with_extensions(Arc::new(extensions.build()))
-        .with_config(move |config| {
-            config.update_plan_enabled = true;
-            config.model_provider.name = "Non-OpenAI Model provider".to_string();
-            config.model_provider.base_url = Some(base_url);
-            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
-            if let Some(model) = model {
-                config.model = Some(model);
-            }
-        });
+    let mut builder = test_codex().with_config(move |config| {
+        config.update_plan_enabled = true;
+        config.model_provider.name = "Non-OpenAI Model provider".to_string();
+        config.model_provider.base_url = Some(base_url);
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+        if let Some(model) = model {
+            config.model = Some(model);
+        }
+    });
     let test = Box::pin(builder.build(server))
         .await
         .expect("create conversation");
@@ -882,7 +868,6 @@ async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {
         .await
         .expect("submit user turn");
     wait_for_event(conversation, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    ThreadIdle::wait(conversation).await;
 }
 
 async fn compact_conversation(conversation: &Arc<CodexThread>) {
@@ -902,7 +887,6 @@ async fn compact_conversation(conversation: &Arc<CodexThread>) {
     };
     assert_eq!(message, COMPACT_WARNING_MESSAGE);
     wait_for_event(conversation, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    ThreadIdle::wait(conversation).await;
 }
 
 fn fetch_conversation_path(conversation: &Arc<CodexThread>) -> std::path::PathBuf {
@@ -945,8 +929,10 @@ async fn fork_thread(
 ) -> Arc<CodexThread> {
     Box::pin(manager.fork_thread(
         nth_user_message,
-        codex_core::StartThreadOptions::new(config.clone()),
+        config.clone(),
         path,
+        /*thread_source*/ None,
+        /*parent_trace*/ None,
     ))
     .await
     .expect("fork conversation")

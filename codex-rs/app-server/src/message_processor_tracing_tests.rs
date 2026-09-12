@@ -129,9 +129,7 @@ impl TracingHarness {
             _codex_home: codex_home,
             processor,
             outgoing_rx,
-            session: Arc::new(ConnectionSessionState::new(
-                crate::transport::ConnectionOrigin::Stdio,
-            )),
+            session: Arc::new(ConnectionSessionState::new()),
             tracing,
         };
 
@@ -267,9 +265,6 @@ async fn build_test_processor(
         state_db: None,
         config_warnings: Vec::new(),
         session_source: SessionSource::VSCode,
-        user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
-            &auth_manager,
-        ))),
         auth_manager,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         code_mode_session_provider: None,

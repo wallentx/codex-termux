@@ -742,8 +742,10 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
         .thread_manager
         .fork_thread(
             ForkSnapshot::Interrupted,
-            codex_core::StartThreadOptions::new(fork_config.clone()),
+            fork_config.clone(),
             rollout_path,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
         )
         .await?;
     forked

@@ -15,7 +15,6 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
-use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
@@ -34,12 +33,10 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
-use crate::session::turn_context::ShellSnapshotCache;
 use crate::session::turn_context::ShellSnapshotTask;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell_snapshot::ShellSnapshot;
-use crate::shell_snapshot::SnapshotCredentialBrokerState;
 
 /// Records whether a normalized config should follow later thread setting updates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,8 +142,6 @@ struct ResolvedEnvironment {
     executor_platform_os: Option<String>,
     temporary_directories: Option<Vec<PathUri>>,
     shell_snapshot: ShellSnapshotTask,
-    shell_snapshot_builder: ShellSnapshot,
-    shell_snapshot_cache: ShellSnapshotCache,
     shell_snapshot_v2_supported: bool,
     installed_config: Option<EnvironmentConfig>,
 }
@@ -261,13 +256,6 @@ impl ThreadEnvironments {
                 let selection = environment.selection;
                 let config_origin = environment.config_origin;
                 let selected_environment = Arc::clone(&environment.environment);
-                let inherited_snapshot = if !selected_environment.is_remote()
-                    && shell_snapshot.should_rebuild_inherited()
-                {
-                    futures::future::ready(None).boxed().shared()
-                } else {
-                    environment.shell_snapshot
-                };
                 let resolution: TurnEnvironmentResolution =
                     futures::future::ready(Ok(ResolvedEnvironment {
                         environment: environment.environment,
@@ -275,12 +263,8 @@ impl ThreadEnvironments {
                         user_home_dir: environment.user_home_dir,
                         executor_platform_os: environment.executor_platform_os,
                         temporary_directories: environment.temporary_directories,
-                        shell_snapshot: inherited_snapshot,
-                        shell_snapshot_builder: shell_snapshot.clone(),
-                        shell_snapshot_cache: Arc::default(),
-                        shell_snapshot_v2_supported: environment.shell_snapshot_v2_supported
-                            && (selected_environment.is_remote()
-                                || !shell_snapshot.should_rebuild_inherited()),
+                        shell_snapshot: environment.shell_snapshot,
+                        shell_snapshot_v2_supported: environment.shell_snapshot_v2_supported,
                         installed_config: None,
                     }))
                     .boxed()
@@ -306,36 +290,6 @@ impl ThreadEnvironments {
             environments: ArcSwap::from_pointee(environments),
             connection_event_tx: OnceLock::new(),
         }
-    }
-
-    fn start_shell_snapshot_task(
-        shell_snapshot: ShellSnapshot,
-        environment: Arc<Environment>,
-        cwd: PathUri,
-        shell: Option<Shell>,
-    ) -> ShellSnapshotTask {
-        // Protected snapshots require the command's sandbox and are captured lazily.
-        if shell_snapshot.should_rebuild_inherited() {
-            return futures::future::ready(None).boxed().shared();
-        }
-        let shell_snapshot = shell_snapshot
-            .build(
-                environment,
-                cwd,
-                shell,
-                /*allow_login_shell*/ true,
-                ShellEnvironmentPolicy::default(),
-                /*sandbox*/ None,
-            )
-            .boxed()
-            .shared();
-        drop(tokio::spawn(
-            shell_snapshot
-                .clone()
-                .in_current_span()
-                .with_current_subscriber(),
-        ));
-        shell_snapshot
     }
 
     pub(crate) fn update_selections(
@@ -371,22 +325,9 @@ impl ThreadEnvironments {
                         );
 
                 if !failed && !restarting_as_pending {
-                    let shell_settings_changed = matches!(
-                        (&environment.selection.config, &selected_environment.config),
-                        (EnvironmentConfigState::Ready(previous), EnvironmentConfigState::Ready(current))
-                            if previous.allow_login_shell != current.allow_login_shell
-                                || previous.shell_environment_policy != current.shell_environment_policy
-                    );
                     let mut environment = environment.clone();
                     environment.selection = selected_environment;
                     environment.config_origin = config_origin;
-                    if shell_settings_changed
-                        && !environment.environment.is_remote()
-                        && self.shell_snapshot.should_rebuild_inherited()
-                        && let Some(Ok(resolved)) = environment.resolution.clone().now_or_never()
-                    {
-                        self.restart_shell_snapshot(&mut environment, resolved);
-                    }
                     next.push(environment);
                     continue;
                 }
@@ -534,68 +475,11 @@ impl ThreadEnvironments {
             .iter()
             .map(|environment| {
                 let mut environment = environment.clone();
-                let shell_settings_changed = environment.config_origin
-                    == EnvironmentConfigOrigin::Thread
-                    && matches!(
-                        &environment.selection.config,
-                        EnvironmentConfigState::Ready(previous)
-                            if previous.allow_login_shell != config.allow_login_shell
-                                || previous.shell_environment_policy != config.shell_environment_policy
-                    );
                 environment.refresh_thread_config(config);
-                if shell_settings_changed
-                    && !environment.environment.is_remote()
-                    && self.shell_snapshot.should_rebuild_inherited()
-                    && let Some(Ok(resolved)) = environment.resolution.clone().now_or_never()
-                {
-                    self.restart_shell_snapshot(&mut environment, resolved);
-                }
                 environment
             })
             .collect();
         self.environments.store(Arc::new(environments));
-    }
-
-    pub(crate) fn set_snapshot_credential_broker(&self, state: SnapshotCredentialBrokerState) {
-        if !self.shell_snapshot.set_credential_broker(state) {
-            return;
-        }
-
-        let mut environments = Vec::clone(&self.environments.load());
-        let mut changed = false;
-        for selected in &mut environments {
-            if !selected.environment.is_remote()
-                && let Some(Ok(resolved)) = selected.resolution.clone().now_or_never()
-            {
-                self.restart_shell_snapshot(selected, resolved);
-                changed = true;
-            }
-        }
-        if changed {
-            self.environments.store(Arc::new(environments));
-        }
-    }
-
-    fn restart_shell_snapshot(
-        &self,
-        selected: &mut SelectedTurnEnvironment,
-        resolved: ResolvedEnvironment,
-    ) {
-        let shell_snapshot = Self::start_shell_snapshot_task(
-            self.shell_snapshot.clone(),
-            Arc::clone(&resolved.environment),
-            selected.selection.cwd.clone(),
-            resolved.shell.clone(),
-        );
-        selected.resolution = futures::future::ready(Ok(ResolvedEnvironment {
-            shell_snapshot,
-            shell_snapshot_cache: Arc::default(),
-            shell_snapshot_v2_supported: cfg!(unix)
-                && !self.shell_snapshot.should_rebuild_inherited(),
-            ..resolved
-        }))
-        .boxed()
-        .shared();
     }
 
     /// Combines persisted thread roots with installed attachment roots, keeping
@@ -783,15 +667,13 @@ impl ThreadEnvironments {
                 cfg!(unix),
             )
         };
-        let shell_snapshot_builder = shell_snapshot.clone();
-        let task = Self::start_shell_snapshot_task(
-            shell_snapshot,
-            Arc::clone(&environment),
-            selection.cwd,
-            shell.clone(),
-        );
-        let shell_snapshot_v2_supported = snapshot_v2
-            && (environment.is_remote() || !shell_snapshot_builder.should_rebuild_inherited());
+        let task = shell_snapshot
+            .build(Arc::clone(&environment), selection.cwd, shell.clone())
+            .boxed()
+            .shared();
+        drop(tokio::spawn(
+            task.clone().in_current_span().with_current_subscriber(),
+        ));
         Ok(ResolvedEnvironment {
             environment,
             shell,
@@ -799,9 +681,7 @@ impl ThreadEnvironments {
             executor_platform_os,
             temporary_directories: temporary_dirs,
             shell_snapshot: task,
-            shell_snapshot_builder,
-            shell_snapshot_cache: Arc::default(),
-            shell_snapshot_v2_supported,
+            shell_snapshot_v2_supported: snapshot_v2,
             installed_config,
         })
     }
@@ -818,11 +698,11 @@ impl ThreadEnvironments {
         let selected = self.environments.load_full();
         let mut environments = Vec::with_capacity(selected.len());
         for environment in selected.iter() {
-            if let EnvironmentConfigState::Failed(error) = &environment.selection.config {
-                environments.push(TurnEnvironmentState::Failed {
-                    selection: environment.selection.clone(),
-                    error: error.clone(),
-                });
+            if matches!(
+                environment.selection.config,
+                EnvironmentConfigState::Failed(_)
+            ) {
+                environments.push(TurnEnvironmentState::Failed);
                 continue;
             }
             let pending = matches!(
@@ -857,10 +737,7 @@ pub(crate) enum TurnEnvironmentState {
     Ready(TurnEnvironment),
     Starting(StartingTurnEnvironment),
     /// Unavailable for execution, but still selected when evaluating permissions.
-    Failed {
-        selection: TurnEnvironmentSelection,
-        error: String,
-    },
+    Failed,
 }
 
 impl TurnEnvironmentState {
@@ -873,10 +750,7 @@ impl TurnEnvironmentState {
                 let mut selection = starting.selection;
                 if matches!(selection.config, EnvironmentConfigState::Pending) {
                     let Some(config) = environment.installed_config else {
-                        return Self::Failed {
-                            selection,
-                            error: "Environment configuration was not supplied.".to_string(),
-                        };
+                        return Self::Failed;
                     };
                     selection.config = EnvironmentConfigState::Ready(config);
                 }
@@ -888,9 +762,6 @@ impl TurnEnvironmentState {
                 );
                 turn_environment.executor_platform_os = environment.executor_platform_os;
                 turn_environment.shell_snapshot = environment.shell_snapshot;
-                turn_environment.shell_snapshot_builder =
-                    Some(Box::new(environment.shell_snapshot_builder));
-                turn_environment.shell_snapshot_cache = environment.shell_snapshot_cache;
                 turn_environment.shell_snapshot_v2_supported =
                     environment.shell_snapshot_v2_supported;
                 turn_environment.user_home_dir = environment.user_home_dir;
@@ -902,20 +773,15 @@ impl TurnEnvironmentState {
                     environment_id = %starting.selection.environment_id,
                     "skipping failed turn environment: {err}"
                 );
-                Self::Failed {
-                    selection: starting.selection,
-                    error: err.to_string(),
-                }
+                Self::Failed
             }
             None => Self::Starting(starting),
         }
     }
 }
 
-/// Existing environment bindings captured for a turn. Internal child threads can
-/// retain these bindings without resolving a different set of environments.
 #[derive(Clone, Debug, Default)]
-pub struct TurnEnvironmentSnapshot {
+pub(crate) struct TurnEnvironmentSnapshot {
     // Keep every selected environment, including failures, in its original order.
     pub(crate) environments: Vec<TurnEnvironmentState>,
 }
@@ -934,7 +800,7 @@ impl TurnEnvironmentSnapshot {
                 .iter()
                 .map(|environment| match environment {
                     TurnEnvironmentState::Ready(environment) => &environment.selection.config,
-                    TurnEnvironmentState::Starting(_) | TurnEnvironmentState::Failed { .. } => {
+                    TurnEnvironmentState::Starting(_) | TurnEnvironmentState::Failed => {
                         &EnvironmentConfigState::Pending
                     }
                 }),
@@ -956,7 +822,7 @@ impl TurnEnvironmentSnapshot {
                         environment.resolution.clone().now_or_never(),
                     )
                 }
-                TurnEnvironmentState::Failed { .. } => environment.clone(),
+                TurnEnvironmentState::Failed => TurnEnvironmentState::Failed,
             })
             .collect();
         Self { environments }
@@ -1031,7 +897,7 @@ impl TurnEnvironmentSnapshot {
                 {
                     environment.selection.cwd.to_abs_path().ok()
                 }
-                TurnEnvironmentState::Starting(_) | TurnEnvironmentState::Failed { .. } => None,
+                TurnEnvironmentState::Starting(_) | TurnEnvironmentState::Failed => None,
             })
     }
 

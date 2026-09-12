@@ -367,7 +367,6 @@ async fn selected_plugin_contributions(
             }),
             McpServerContribution::SelectedPluginPackage { .. } => None,
             McpServerContribution::Set { .. }
-            | McpServerContribution::SetWithProtocolMode { .. }
             | McpServerContribution::HostedApps { .. }
             | McpServerContribution::Remove { .. } => {
                 panic!("expected selected plugin contribution")

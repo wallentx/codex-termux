@@ -81,7 +81,6 @@ pub enum Message {
     Offer { sdp: SessionDescription },
     ApplyAnswer { sdp: SessionDescription },
     TransportReady {},
-    TransportTimedOut {},
     OpenDevices {},
     DevicesOpened {},
     SetAudioControls { controls: AudioControls },

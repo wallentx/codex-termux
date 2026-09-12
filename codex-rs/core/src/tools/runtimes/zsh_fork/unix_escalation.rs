@@ -293,9 +293,8 @@ impl CoreShellActionProvider {
                     })?;
                 let approval_ctx = ApprovalContext {
                     review_context: GuardianReviewContext::from_resolved_settings(
-                        Arc::clone(&turn_context),
+                        turn_context,
                         &step_settings,
-                        &turn_context.environments,
                     ),
                     // The running process can outlive its launching tool or code-mode cell.
                     cancellation_token: None,

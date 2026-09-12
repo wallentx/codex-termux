@@ -59,12 +59,6 @@ impl PeerConnectionEventHandler for Events {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) enum AnswerOutcome {
-    Ready,
-    TimedOut,
-}
-
 pub(crate) struct Transport {
     pub(crate) incoming: crate::incoming::Incoming,
     pub(crate) audio: crate::audio_track::AudioTrack,
@@ -168,7 +162,7 @@ impl Transport {
         .map_err(|_| "timed out gathering voice candidates")?
     }
 
-    pub(crate) async fn apply_answer(&self, sdp: String) -> Result<AnswerOutcome> {
+    pub(crate) async fn apply_answer(&self, sdp: String) -> Result<()> {
         let answer = RTCSessionDescription::answer(sdp).map_err(|_| "invalid voice answer")?;
         let parsed = answer.unmarshal().map_err(|_| "invalid voice answer")?;
         let mut seen = HashSet::new();
@@ -219,9 +213,7 @@ impl Transport {
                 .map_err(|_| "voice event channel closed")
         })
         .await
-        .map_or(Ok(AnswerOutcome::TimedOut), |result| {
-            result.map(|()| AnswerOutcome::Ready)
-        })
+        .map_err(|_| "timed out connecting voice peer")?
     }
 
     pub(crate) async fn close(&mut self) -> Result<()> {

@@ -349,10 +349,7 @@ impl ConfigDocument {
                             item.as_table_like()?.get(segment)
                         })
                         .and_then(TomlItem::as_table_like)
-                        .is_some_and(|feature| {
-                            feature.contains_key("credential_broker")
-                                || feature.contains_key("credentials")
-                        });
+                        .is_some_and(|feature| feature.contains_key("credential_broker"));
                 if preserves_broker_settings {
                     let mut enabled_segments = segments.clone();
                     enabled_segments.push("enabled".to_string());

@@ -4,8 +4,6 @@
 //! configuration and app-server initialization remain responsive to safe local editing.
 
 use super::*;
-use codex_terminal_detection::Multiplexer;
-use codex_terminal_detection::TerminalName;
 
 pub(super) async fn run_main_inner(
     mut cli: Cli,
@@ -458,37 +456,10 @@ pub(super) async fn run_main_inner(
             AppServerTarget::LocalDaemon { .. } => "local_daemon",
             AppServerTarget::Remote { .. } => "remote",
         };
-        // Use a fixed category, not the versioned or user-provided terminal identifier.
-        let terminal_info = codex_terminal_detection::terminal_info();
-        let terminal_name = match terminal_info.name {
-            TerminalName::AppleTerminal => "apple_terminal",
-            TerminalName::Ghostty => "ghostty",
-            TerminalName::Iterm2 => "iterm2",
-            TerminalName::WarpTerminal => "warp",
-            TerminalName::VsCode => "vscode",
-            TerminalName::WezTerm => "wezterm",
-            TerminalName::Kitty => "kitty",
-            TerminalName::Alacritty => "alacritty",
-            TerminalName::Konsole => "konsole",
-            TerminalName::GnomeTerminal => "gnome_terminal",
-            TerminalName::Vte => "vte",
-            TerminalName::WindowsTerminal => "windows_terminal",
-            TerminalName::Dumb => "dumb",
-            TerminalName::Unknown => "unknown",
-        };
-        let multiplexer = match terminal_info.multiplexer {
-            Some(Multiplexer::Tmux { .. }) => "tmux",
-            Some(Multiplexer::Zellij { .. }) => "zellij",
-            None => "none",
-        };
         let _ = metrics.counter(
             "codex.tui.start",
             /*inc*/ 1,
-            &[
-                ("app_server_mode", app_server_mode),
-                ("terminal_name", terminal_name),
-                ("multiplexer", multiplexer),
-            ],
+            &[("app_server_mode", app_server_mode)],
         );
         let telemetry =
             codex_rollout::sqlite_telemetry_recorder(metrics.clone(), otel_originator.as_str());
@@ -562,9 +533,7 @@ pub(super) async fn run_main_inner(
         let log_file = log_file_opts.open(log_dir.join(TUI_LOG_FILE_NAME))?;
         let (non_blocking, guard) = non_blocking(log_file);
         let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(
-                "codex_core=info,codex_tui=info,codex_rmcp_client=info,codex_realtime_webrtc=warn",
-            )
+            EnvFilter::new("codex_core=info,codex_tui=info,codex_rmcp_client=info")
         });
         let file_layer = tracing_subscriber::fmt::layer()
             .with_writer(non_blocking)
