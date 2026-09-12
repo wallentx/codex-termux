@@ -9,6 +9,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use codex_protocol::ThreadId;
+use codex_utils_file_lock::FileLockOutcome;
+use codex_utils_file_lock::LockDirGuard;
+use codex_utils_file_lock::TryFileLockOutcome;
+use codex_utils_file_lock::TryLockDirOutcome;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
+use codex_utils_file_lock::lock_exclusive_optional;
+use codex_utils_file_lock::try_acquire_sibling_lock_dir;
+use codex_utils_file_lock::try_lock_exclusive_optional;
 use tracing::warn;
 
 use crate::ThreadStoreError;
@@ -26,6 +34,17 @@ pub(super) struct WriterLockGuard {
     coordinator: Arc<WriterLockCoordinator>,
     path: PathBuf,
     file: Option<File>,
+    fallback_lock: Option<LockDirGuard>,
+}
+
+struct CoordinationLockGuard {
+    _file: File,
+    _fallback_lock: Option<LockDirGuard>,
+}
+
+enum TryWriterLockOutcome {
+    Acquired(Option<LockDirGuard>),
+    WouldBlock,
 }
 
 impl WriterLockCoordinator {
@@ -61,14 +80,14 @@ impl WriterLockCoordinator {
                 ),
             })?;
 
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
+        let fallback_lock = match try_lock_writer_file(&file, &path) {
+            Ok(TryWriterLockOutcome::Acquired(fallback_lock)) => fallback_lock,
+            Ok(TryWriterLockOutcome::WouldBlock) => {
                 return Err(ThreadStoreError::Conflict {
                     message: format!("thread {thread_id} already has an active writer"),
                 });
             }
-            Err(std::fs::TryLockError::Error(err)) => {
+            Err(err) => {
                 return Err(ThreadStoreError::Internal {
                     message: format!(
                         "failed to acquire thread writer lock {}: {err}",
@@ -76,17 +95,18 @@ impl WriterLockCoordinator {
                     ),
                 });
             }
-        }
+        };
 
         drop(coordination_lock);
         Ok(WriterLockGuard {
             coordinator: Arc::clone(self),
             path,
             file: Some(file),
+            fallback_lock,
         })
     }
 
-    fn lock_coordination(&self) -> ThreadStoreResult<File> {
+    fn lock_coordination(&self) -> ThreadStoreResult<CoordinationLockGuard> {
         fs::create_dir_all(&self.directory).map_err(|err| ThreadStoreError::Internal {
             message: format!(
                 "failed to create thread writer lock directory {}: {err}",
@@ -106,13 +126,27 @@ impl WriterLockCoordinator {
                     path.display()
                 ),
             })?;
-        file.lock().map_err(|err| ThreadStoreError::Internal {
-            message: format!(
-                "failed to acquire thread writer coordination lock {}: {err}",
-                path.display()
-            ),
-        })?;
-        Ok(file)
+        let fallback_lock =
+            match lock_exclusive_optional(&file).map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to acquire thread writer coordination lock {}: {err}",
+                    path.display()
+                ),
+            })? {
+                FileLockOutcome::Acquired => None,
+                FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path).map_err(
+                    |err| ThreadStoreError::Internal {
+                        message: format!(
+                            "failed to acquire thread writer coordination fallback lock {}: {err}",
+                            path.display()
+                        ),
+                    },
+                )?),
+            };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
     }
 
     fn remove_stale_thread_locks(&self) -> io::Result<()> {
@@ -140,8 +174,8 @@ impl WriterLockCoordinator {
                     continue;
                 }
             };
-            match file.try_lock() {
-                Ok(()) => {
+            match try_lock_writer_file(&file, &path) {
+                Ok(TryWriterLockOutcome::Acquired(fallback_lock)) => {
                     drop(file);
                     if let Err(err) = fs::remove_file(&path)
                         && err.kind() != io::ErrorKind::NotFound
@@ -151,9 +185,10 @@ impl WriterLockCoordinator {
                             path.display()
                         );
                     }
+                    drop(fallback_lock);
                 }
-                Err(std::fs::TryLockError::WouldBlock) => {}
-                Err(std::fs::TryLockError::Error(err)) => {
+                Ok(TryWriterLockOutcome::WouldBlock) => {}
+                Err(err) => {
                     warn!(
                         "failed to inspect thread writer lock {}: {err}",
                         path.display()
@@ -185,7 +220,19 @@ impl Drop for WriterLockGuard {
                 self.path.display()
             );
         }
+        drop(self.fallback_lock.take());
         drop(coordination_lock);
+    }
+}
+
+fn try_lock_writer_file(file: &File, path: &Path) -> io::Result<TryWriterLockOutcome> {
+    match try_lock_exclusive_optional(file)? {
+        TryFileLockOutcome::Acquired => Ok(TryWriterLockOutcome::Acquired(None)),
+        TryFileLockOutcome::WouldBlock => Ok(TryWriterLockOutcome::WouldBlock),
+        TryFileLockOutcome::Unsupported => match try_acquire_sibling_lock_dir(path)? {
+            TryLockDirOutcome::Acquired(guard) => Ok(TryWriterLockOutcome::Acquired(Some(guard))),
+            TryLockDirOutcome::WouldBlock => Ok(TryWriterLockOutcome::WouldBlock),
+        },
     }
 }
 
