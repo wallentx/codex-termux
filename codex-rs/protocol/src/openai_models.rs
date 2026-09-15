@@ -33,6 +33,7 @@ use crate::config_types::ServiceTier;
 use crate::config_types::Verbosity;
 use crate::protocol::MultiAgentVersion;
 
+mod access_programs;
 #[path = "openai_models/guardian.rs"]
 mod guardian;
 pub use guardian::GuardianModelPolicy;
@@ -44,10 +45,10 @@ mod guardian_v2;
 #[path = "openai_models/reasoning_effort.rs"]
 mod reasoning_effort;
 
+pub use access_programs::ModelAccessPrograms;
 pub use guardian_v2::GuardianV2ModelConfig;
 pub use guardian_v2::GuardianV2TranscriptModelConfig;
 
-const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 /// Backend model-catalog specialty identifying cybersecurity-focused models.
 pub const MODEL_SPECIALTY_CYBER: &str = "cyber";
 pub const SPEED_TIER_FAST: &str = "fast";
@@ -246,7 +247,7 @@ pub struct ModelPreset {
     pub default_reasoning_effort: ReasoningEffort,
     /// Supported reasoning effort options.
     pub supported_reasoning_efforts: Vec<ReasoningEffortPreset>,
-    /// Whether this model supports personality-specific instructions.
+    /// Deprecated catalog field, always false for new model presets.
     #[serde(default)]
     pub supports_personality: bool,
     /// Deprecated: use `service_tiers` instead.
@@ -258,6 +259,9 @@ pub struct ModelPreset {
     /// Catalog default service tier id for this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_service_tier: Option<String>,
+    /// Caller-specific explicit access programs, when discovery resolved them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_access_programs: Option<ModelAccessPrograms>,
     /// Whether this is the default model for new users.
     pub is_default: bool,
     /// recommended upgrade model
@@ -419,6 +423,8 @@ pub struct ModelInfo {
     pub service_tiers: Vec<ModelServiceTier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_access_programs: Option<ModelAccessPrograms>,
     pub availability_nux: Option<ModelAvailabilityNux>,
     pub upgrade: Option<ModelInfoUpgrade>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -525,23 +531,13 @@ impl ModelInfo {
         config_limit
     }
 
-    pub fn supports_personality(&self) -> bool {
-        self.model_messages
-            .as_ref()
-            .is_some_and(ModelMessages::supports_personality)
-    }
-
-    pub fn get_model_instructions(&self, personality: Option<Personality>) -> String {
+    /// Returns the literal instruction template. The personality argument remains for older
+    /// callers; the `None` opt-out is applied separately by models-manager.
+    pub fn get_model_instructions(&self, _personality: Option<Personality>) -> String {
         if let Some(model_messages) = &self.model_messages
             && let Some(template) = &model_messages.instructions_template
         {
-            if model_messages.instructions_variables.is_none() {
-                return template.clone();
-            }
-            let personality_message = model_messages
-                .get_personality_message(personality)
-                .unwrap_or_default();
-            template.replace(PERSONALITY_PLACEHOLDER, personality_message.as_str())
+            template.clone()
         } else {
             warn!(
                 model = %self.slug,
@@ -554,8 +550,8 @@ impl ModelInfo {
 
 /// A strongly-typed template for assembling model instructions and developer messages.
 ///
-/// When `instructions_variables` is absent, `instructions_template` is treated as literal text.
-/// When variables are present but incomplete, missing values render as empty strings.
+/// `instructions_template` is literal text. The deprecated `instructions_variables` field is
+/// retained to decode catalogs produced before personality selection was removed.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelMessages {
     /// Additional developer instructions for persistent mode. Missing or null uses the built-in
@@ -674,54 +670,11 @@ pub struct MultiAgentModeMessages {
     pub hint_text: Option<String>,
 }
 
-impl ModelMessages {
-    fn has_personality_placeholder(&self) -> bool {
-        self.instructions_template
-            .as_ref()
-            .map(|spec| spec.contains(PERSONALITY_PLACEHOLDER))
-            .unwrap_or(false)
-    }
-
-    fn supports_personality(&self) -> bool {
-        self.has_personality_placeholder()
-            && self
-                .instructions_variables
-                .as_ref()
-                .is_some_and(ModelInstructionsVariables::is_complete)
-    }
-
-    pub fn get_personality_message(&self, personality: Option<Personality>) -> Option<String> {
-        self.instructions_variables
-            .as_ref()
-            .and_then(|variables| variables.get_personality_message(personality))
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInstructionsVariables {
     pub personality_default: Option<String>,
     pub personality_friendly: Option<String>,
     pub personality_pragmatic: Option<String>,
-}
-
-impl ModelInstructionsVariables {
-    pub fn is_complete(&self) -> bool {
-        self.personality_default.is_some()
-            && self.personality_friendly.is_some()
-            && self.personality_pragmatic.is_some()
-    }
-
-    pub fn get_personality_message(&self, personality: Option<Personality>) -> Option<String> {
-        if let Some(personality) = personality {
-            match personality {
-                Personality::None => Some(String::new()),
-                Personality::Friendly => self.personality_friendly.clone(),
-                Personality::Pragmatic => self.personality_pragmatic.clone(),
-            }
-        } else {
-            self.personality_default.clone()
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
@@ -868,7 +821,6 @@ where
 // convert ModelInfo to ModelPreset
 impl From<ModelInfo> for ModelPreset {
     fn from(info: ModelInfo) -> Self {
-        let supports_personality = info.supports_personality();
         ModelPreset {
             id: info.slug.clone(),
             model: info.slug.clone(),
@@ -879,10 +831,11 @@ impl From<ModelInfo> for ModelPreset {
                 .default_reasoning_level
                 .unwrap_or(ReasoningEffort::None),
             supported_reasoning_efforts: info.supported_reasoning_levels.clone(),
-            supports_personality,
+            supports_personality: false,
             additional_speed_tiers: info.additional_speed_tiers,
             service_tiers: info.service_tiers,
             default_service_tier: info.default_service_tier,
+            available_access_programs: info.available_access_programs,
             is_default: false, // default is the highest priority available model
             upgrade: info.upgrade.as_ref().map(|upgrade| ModelUpgrade {
                 id: upgrade.model.clone(),
@@ -991,6 +944,7 @@ mod tests {
             additional_speed_tiers: Vec::new(),
             service_tiers: Vec::new(),
             default_service_tier: None,
+            available_access_programs: None,
             availability_nux: None,
             upgrade: None,
             model_messages: spec,
@@ -1026,14 +980,6 @@ mod tests {
             multi_agent_reasoning_effort: None,
         }
     }
-    fn personality_variables() -> ModelInstructionsVariables {
-        ModelInstructionsVariables {
-            personality_default: Some("default".to_string()),
-            personality_friendly: Some("friendly".to_string()),
-            personality_pragmatic: Some("pragmatic".to_string()),
-        }
-    }
-
     #[test]
     fn model_messages_deserialize_without_optional_sections() {
         let messages: ModelMessages = from_str(
@@ -1343,37 +1289,15 @@ mod tests {
     }
 
     #[test]
-    fn get_model_instructions_uses_template_when_placeholder_present() {
+    fn get_model_instructions_ignores_legacy_personality_variables() {
         let model = test_model(Some(ModelMessages {
             persistent_instructions: None,
             tools: None,
             instructions_template: Some("Hello {{ personality }}".to_string()),
-            instructions_variables: Some(personality_variables()),
-            approvals: None,
-            collaboration_modes: None,
-            auto_review: None,
-            permissions: None,
-            multi_agent: None,
-            token_budget: None,
-            confirmation_policies: None,
-            guardian_v2: None,
-        }));
-
-        let instructions = model.get_model_instructions(Some(Personality::Friendly));
-
-        assert_eq!(instructions, "Hello friendly");
-    }
-
-    #[test]
-    fn get_model_instructions_strips_placeholder_with_incomplete_variables() {
-        let model = test_model(Some(ModelMessages {
-            persistent_instructions: None,
-            tools: None,
-            instructions_template: Some("Hello\n{{ personality }}".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
-                personality_default: None,
+                personality_default: Some("default".to_string()),
                 personality_friendly: Some("friendly".to_string()),
-                personality_pragmatic: None,
+                personality_pragmatic: Some("pragmatic".to_string()),
             }),
             approvals: None,
             collaboration_modes: None,
@@ -1384,49 +1308,16 @@ mod tests {
             confirmation_policies: None,
             guardian_v2: None,
         }));
-        assert_eq!(
-            model.get_model_instructions(Some(Personality::Pragmatic)),
-            "Hello\n"
-        );
-        assert_eq!(
-            model.get_model_instructions(/*personality*/ None),
-            "Hello\n"
-        );
 
-        let model_no_personality = test_model(Some(ModelMessages {
-            persistent_instructions: None,
-            tools: None,
-            instructions_template: Some("Hello\n{{ personality }}".to_string()),
-            instructions_variables: Some(ModelInstructionsVariables {
-                personality_default: None,
-                personality_friendly: None,
-                personality_pragmatic: None,
-            }),
-            approvals: None,
-            collaboration_modes: None,
-            auto_review: None,
-            permissions: None,
-            multi_agent: None,
-            token_budget: None,
-            confirmation_policies: None,
-            guardian_v2: None,
-        }));
-        assert_eq!(
-            model_no_personality.get_model_instructions(Some(Personality::Friendly)),
-            "Hello\n"
-        );
-        assert_eq!(
-            model_no_personality.get_model_instructions(Some(Personality::Pragmatic)),
-            "Hello\n"
-        );
-        assert_eq!(
-            model_no_personality.get_model_instructions(Some(Personality::None)),
-            "Hello\n"
-        );
-        assert_eq!(
-            model_no_personality.get_model_instructions(/*personality*/ None),
-            "Hello\n"
-        );
+        let instructions = "Hello {{ personality }}";
+        for personality in [
+            Some(Personality::Friendly),
+            Some(Personality::Pragmatic),
+            Some(Personality::None),
+            None,
+        ] {
+            assert_eq!(model.get_model_instructions(personality), instructions);
+        }
     }
 
     #[test]
@@ -1528,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn models_response_serializes_rendered_legacy_base_instructions() {
+    fn models_response_serializes_literal_legacy_base_instructions() {
         let response = ModelsResponse {
             models: vec![test_model(Some(ModelMessages {
                 persistent_instructions: None,
@@ -1554,7 +1445,7 @@ mod tests {
 
         assert_eq!(
             serialized["models"][0]["base_instructions"],
-            "before default after"
+            "before {{ personality }} after"
         );
     }
 
@@ -1659,80 +1550,6 @@ mod tests {
         let response: ModelsResponse =
             serde_json::from_value(value).expect("deserialize mixed models response");
         assert_eq!(response.models[0].model_messages, Some(canonical_messages));
-    }
-
-    #[test]
-    fn get_personality_message_returns_default_when_personality_is_none() {
-        let personality_template = personality_variables();
-        assert_eq!(
-            personality_template.get_personality_message(/*personality*/ None),
-            Some("default".to_string())
-        );
-    }
-
-    #[test]
-    fn get_personality_message() {
-        let personality_variables = personality_variables();
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Friendly)),
-            Some("friendly".to_string())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Pragmatic)),
-            Some("pragmatic".to_string())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::None)),
-            Some(String::new())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(/*personality*/ None),
-            Some("default".to_string())
-        );
-
-        let personality_variables = ModelInstructionsVariables {
-            personality_default: Some("default".to_string()),
-            personality_friendly: None,
-            personality_pragmatic: None,
-        };
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Friendly)),
-            None
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Pragmatic)),
-            None
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::None)),
-            Some(String::new())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(/*personality*/ None),
-            Some("default".to_string())
-        );
-
-        let personality_variables = ModelInstructionsVariables {
-            personality_default: None,
-            personality_friendly: Some("friendly".to_string()),
-            personality_pragmatic: Some("pragmatic".to_string()),
-        };
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Friendly)),
-            Some("friendly".to_string())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::Pragmatic)),
-            Some("pragmatic".to_string())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(Some(Personality::None)),
-            Some(String::new())
-        );
-        assert_eq!(
-            personality_variables.get_personality_message(/*personality*/ None),
-            None
-        );
     }
 
     #[test]
@@ -2033,6 +1850,40 @@ mod tests {
             preset.default_service_tier,
             Some(ServiceTier::Fast.request_value().to_string())
         );
+    }
+
+    #[test]
+    fn model_access_programs_preserve_explicit_selection_availability() {
+        use crate::turn_input::CyberAccessProgram;
+
+        for (metadata, expected) in [
+            (None, None),
+            (Some(serde_json::Value::Null), None),
+            (
+                Some(serde_json::json!({ "cyber": [] })),
+                Some(ModelAccessPrograms { cyber: vec![] }),
+            ),
+            (
+                Some(serde_json::json!({
+                    "cyber": ["standard", "daybreak_blue", "future_program", "daybreak_red"]
+                })),
+                Some(ModelAccessPrograms {
+                    cyber: vec![
+                        CyberAccessProgram::Standard,
+                        CyberAccessProgram::DaybreakBlue,
+                        CyberAccessProgram::DaybreakRed,
+                    ],
+                }),
+            ),
+        ] {
+            let mut value = serde_json::to_value(test_model(/*spec*/ None)).unwrap();
+            if let Some(metadata) = metadata {
+                value["available_access_programs"] = metadata;
+            }
+            let model: ModelInfo = serde_json::from_value(value).unwrap();
+            assert_eq!(model.available_access_programs, expected);
+            assert_eq!(ModelPreset::from(model).available_access_programs, expected);
+        }
     }
 
     #[test]

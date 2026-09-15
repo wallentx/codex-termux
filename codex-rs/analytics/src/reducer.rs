@@ -6,6 +6,7 @@ use crate::events::AppServerRpcTransport;
 use crate::events::CodexAppMentionedEventRequest;
 use crate::events::CodexAppServerClientMetadata;
 use crate::events::CodexAppUsedEventRequest;
+use crate::events::CodexAppUsedMetadata;
 use crate::events::CodexCollabAgentToolCallEventParams;
 use crate::events::CodexCollabAgentToolCallEventRequest;
 use crate::events::CodexCommandExecutionEventParams;
@@ -60,6 +61,7 @@ use crate::events::ThreadArchiveEvent;
 use crate::events::ThreadArchiveEventParams;
 use crate::events::ThreadInitializedEvent;
 use crate::events::ThreadInitializedEventParams;
+use crate::events::ToolEventType;
 use crate::events::ToolItemFailureKind;
 use crate::events::ToolItemTerminalStatus;
 use crate::events::TrackEventRequest;
@@ -87,12 +89,14 @@ use crate::facts::CodexGoalEvent;
 use crate::facts::ControlToolCallFact;
 use crate::facts::ControlToolCallStatus;
 use crate::facts::CustomAnalyticsFact;
+use crate::facts::ElicitationType;
 use crate::facts::ExternalAgentConfigImportCompletedInput;
 use crate::facts::ExternalAgentConfigImportFailureInput;
 use crate::facts::HookRunInput;
 use crate::facts::ImagePreparationFact;
 use crate::facts::ImagePreparationMetadata;
 use crate::facts::InvocationType;
+use crate::facts::McpToolCallElicitation;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequestedInput;
 use crate::facts::PluginMeasurementRow;
@@ -159,6 +163,7 @@ use codex_login::default_client::originator;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::items::ModelInvocationContext;
 use codex_protocol::items::is_safe_plugin_relative_path;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::SessionSource;
@@ -203,11 +208,13 @@ pub(crate) struct AnalyticsReducer {
     turns: HashMap<String, TurnState>,
     connections: HashMap<u64, ConnectionState>,
     threads: HashMap<String, ThreadAnalyticsState>,
-    tool_items_started_at_ms: HashMap<ToolItemKey, u64>,
+    tool_items_started_at_ms: HashMap<ToolItemKey, (u64, Option<ModelInvocationContext>)>,
     tool_response_states: HashMap<(String, String), ToolResponseState>,
     code_mode_cells: HashMap<String, HashMap<String, CodeModeCellState>>,
     pending_reviews: HashMap<RequestId, PendingReviewState>,
     item_review_summaries: HashMap<ToolItemKey, ItemReviewSummary>,
+    // Bounded to 256 entries, keeping linear lookups small; evict the oldest entry when full.
+    pending_mcp_tool_elicitations: VecDeque<(ToolItemKey, ElicitationType)>,
 }
 
 struct ConnectionState {
@@ -709,6 +716,34 @@ impl AnalyticsReducer {
                 }
                 CustomAnalyticsFact::AppUsed(input) => {
                     self.ingest_app_used(input, out);
+                }
+                CustomAnalyticsFact::McpToolCallElicitation(input) => {
+                    let McpToolCallElicitation {
+                        thread_id,
+                        turn_id,
+                        item_id,
+                        elicitation_type,
+                    } = input;
+                    let key = ToolItemKey {
+                        thread_id,
+                        turn_id,
+                        item_id,
+                    };
+                    if self
+                        .pending_mcp_tool_elicitations
+                        .iter()
+                        .any(|(pending, _)| pending == &key)
+                    {
+                        return;
+                    }
+                    if self.pending_mcp_tool_elicitations.len() >= MAX_TOOL_RESPONSE_ENTRIES {
+                        self.pending_mcp_tool_elicitations.pop_front();
+                        tracing::warn!(
+                            "expiring oldest MCP elicitation classification: state is full"
+                        );
+                    }
+                    self.pending_mcp_tool_elicitations
+                        .push_back((key, elicitation_type));
                 }
                 CustomAnalyticsFact::HookRun(input) => {
                     self.ingest_hook_run(input, out);
@@ -1363,8 +1398,15 @@ impl AnalyticsReducer {
     }
 
     fn ingest_app_used(&mut self, input: AppUsedInput, out: &mut Vec<TrackEventRequest>) {
-        let AppUsedInput { tracking, app } = input;
-        let event_params = codex_app_metadata(&tracking, app);
+        let AppUsedInput {
+            tracking,
+            app,
+            elicitation_type,
+        } = input;
+        let event_params = CodexAppUsedMetadata {
+            app: codex_app_metadata(&tracking, app),
+            elicitation_type,
+        };
         out.push(TrackEventRequest::AppUsed(CodexAppUsedEventRequest {
             event_type: "codex_app_used",
             event_params,
@@ -1891,14 +1933,18 @@ impl AnalyticsReducer {
                 else {
                     return;
                 };
-                self.tool_items_started_at_ms.insert(
-                    ToolItemKey {
+                let model_context = match &notification.item {
+                    ThreadItem::CommandExecution { model_context, .. } => model_context.clone(),
+                    _ => None,
+                };
+                self.tool_items_started_at_ms
+                    .entry(ToolItemKey {
                         thread_id: notification.thread_id,
                         turn_id: notification.turn_id,
                         item_id: item_id.to_string(),
-                    },
-                    started_at_ms,
-                );
+                    })
+                    .and_modify(|(timestamp, _)| *timestamp = started_at_ms)
+                    .or_insert((started_at_ms, model_context));
             }
             ServerNotification::ItemCompleted(notification) => {
                 if matches!(notification.item, ThreadItem::SubAgentActivity { .. }) {
@@ -1916,6 +1962,23 @@ impl AnalyticsReducer {
                 let Some(item_id) = tracked_tool_item_id(&notification.item) else {
                     return;
                 };
+                let key = ToolItemKey {
+                    thread_id: notification.thread_id.clone(),
+                    turn_id: notification.turn_id.clone(),
+                    item_id: item_id.to_string(),
+                };
+                let elicitation_type =
+                    if matches!(notification.item, ThreadItem::McpToolCall { .. }) {
+                        // Producers enqueue known classifications before completion on
+                        // the same analytics queue, so completed keys need no history.
+                        self.pending_mcp_tool_elicitations
+                            .iter()
+                            .position(|(pending, _)| pending == &key)
+                            .and_then(|index| self.pending_mcp_tool_elicitations.remove(index))
+                            .map(|(_, elicitation_type)| elicitation_type)
+                    } else {
+                        None
+                    };
                 let Some(turn_state) = self.turns.get_mut(&notification.turn_id) else {
                     tracing::warn!(
                         thread_id = %notification.thread_id,
@@ -1926,12 +1989,9 @@ impl AnalyticsReducer {
                     return;
                 };
                 turn_state.tool_counts.record(&notification.item);
-                let key = ToolItemKey {
-                    thread_id: notification.thread_id.clone(),
-                    turn_id: notification.turn_id.clone(),
-                    item_id: item_id.to_string(),
-                };
-                let Some(started_at_ms) = self.tool_items_started_at_ms.remove(&key) else {
+                let Some((started_at_ms, model_context)) =
+                    self.tool_items_started_at_ms.remove(&key)
+                else {
                     tracing::warn!(
                         thread_id = %notification.thread_id,
                         turn_id = %notification.turn_id,
@@ -1953,12 +2013,14 @@ impl AnalyticsReducer {
                     thread_id: &notification.thread_id,
                     turn_id: &notification.turn_id,
                     item: &notification.item,
+                    model_context: model_context.as_ref(),
                     started_at_ms,
                     completed_at_ms,
                     connection_state,
                     thread_state,
                     thread_metadata,
                     review_summary: self.item_review_summaries.get(&key),
+                    elicitation_type,
                 }) {
                     let root_turn_id = self
                         .turns
@@ -2008,6 +2070,8 @@ impl AnalyticsReducer {
                     }
                 });
                 self.code_mode_cells.remove(&notification.thread_id);
+                self.pending_mcp_tool_elicitations
+                    .retain(|(key, _)| key.thread_id != notification.thread_id);
             }
             ServerNotification::TurnStarted(notification) => {
                 let turn_state = self.turns.entry(notification.turn.id).or_default();
@@ -2063,6 +2127,8 @@ impl AnalyticsReducer {
             turn_id,
             item_id,
             originator,
+            model_slug,
+            reasoning_effort,
             plugin_id,
             execution_id,
             operation,
@@ -2079,6 +2145,8 @@ impl AnalyticsReducer {
                             turn_id: turn_id.clone(),
                             item_id: item_id.clone(),
                             originator: originator.clone(),
+                            model_slug: model_slug.clone(),
+                            reasoning_effort: reasoning_effort.clone(),
                             plugin_id: plugin_id.clone(),
                             execution_id: execution_id.clone(),
                             operation: operation.clone(),
@@ -2557,6 +2625,16 @@ fn enrich_tool_response_event(
     let Some(base) = tool_event_base_mut(event) else {
         return;
     };
+    // A cell association can also describe a separately sampled wait call. Classify
+    // only from evidence about this exact call ID, not its parent or response lineage.
+    base.tool_event_type = match (
+        state.response_ids_by_call_id.contains_key(&base.item_id),
+        state.cell_ids_by_child_call_id.contains_key(&base.item_id),
+    ) {
+        (true, false) => Some(ToolEventType::ModelToolCall),
+        (false, true) => Some(ToolEventType::InnerToolCall),
+        (false, false) | (true, true) => None,
+    };
     if base.cell_id.is_none() {
         base.cell_id = state.cell_ids_by_child_call_id.get(&base.item_id).cloned();
     }
@@ -2598,12 +2676,14 @@ struct ToolItemEventInput<'a> {
     thread_id: &'a str,
     turn_id: &'a str,
     item: &'a ThreadItem,
+    model_context: Option<&'a ModelInvocationContext>,
     started_at_ms: u64,
     completed_at_ms: u64,
     connection_state: &'a ConnectionState,
     thread_state: &'a ThreadAnalyticsState,
     thread_metadata: &'a ThreadMetadataState,
     review_summary: Option<&'a ItemReviewSummary>,
+    elicitation_type: Option<ElicitationType>,
 }
 
 fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
@@ -2611,12 +2691,14 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
         thread_id,
         turn_id,
         item,
+        model_context,
         started_at_ms,
         completed_at_ms,
         connection_state,
         thread_state,
         thread_metadata,
         review_summary,
+        elicitation_type,
     } = input;
     match item {
         ThreadItem::CommandExecution {
@@ -2655,6 +2737,9 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                 CodexCommandExecutionEventRequest {
                     event_type: "codex_command_execution_event",
                     event_params: CodexCommandExecutionEventParams {
+                        model_slug: model_context.map(|context| context.model_slug.clone()),
+                        reasoning_effort: model_context
+                            .and_then(|context| context.reasoning_effort.clone()),
                         base,
                         plugin_id: plugin_id.clone(),
                         script_path: safe_plugin_relative_script_path(
@@ -2753,6 +2838,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                         connector_id: app_context
                             .as_ref()
                             .map(|app_context| app_context.connector_id.clone()),
+                        elicitation_type,
                     },
                 },
             ))
@@ -3017,6 +3103,7 @@ fn tool_item_base(
         subagent_source: thread_metadata.subagent_source.clone(),
         parent_thread_id: thread_metadata.parent_thread_id.clone(),
         tool_name,
+        tool_event_type: None,
         started_at_ms: context.started_at_ms,
         completed_at_ms: context.completed_at_ms,
         // duration_ms reflects item lifecycle observed by app-server. For web
@@ -3701,11 +3788,115 @@ pub(crate) fn normalize_path_for_skill_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::ItemCompletedNotification;
     use codex_app_server_protocol::JSONRPCErrorError;
+    use codex_app_server_protocol::ThreadClosedNotification;
     use codex_protocol::models::SandboxEnforcement;
     use codex_protocol::permissions::FileSystemSandboxPolicy;
     use codex_protocol::permissions::NetworkSandboxPolicy;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn pending_classifications_evict_oldest_and_clean_up() {
+        let mut reducer = AnalyticsReducer::default();
+        let mut events = Vec::new();
+        let keys = (0..=MAX_TOOL_RESPONSE_ENTRIES)
+            .map(|index| ToolItemKey {
+                thread_id: if index == MAX_TOOL_RESPONSE_ENTRIES {
+                    "other-thread"
+                } else {
+                    "thread"
+                }
+                .to_string(),
+                turn_id: "turn".to_string(),
+                item_id: index.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let assert_pending = |reducer: &AnalyticsReducer, keys: &[ToolItemKey]| {
+            let expected = keys
+                .iter()
+                .cloned()
+                .map(|key| (key, ElicitationType::AuthOrLink))
+                .collect::<VecDeque<_>>();
+            assert!(reducer.pending_mcp_tool_elicitations == expected);
+        };
+        for key in &keys {
+            reducer
+                .ingest(
+                    AnalyticsFact::Custom(CustomAnalyticsFact::McpToolCallElicitation(
+                        McpToolCallElicitation {
+                            thread_id: key.thread_id.clone(),
+                            turn_id: key.turn_id.clone(),
+                            item_id: key.item_id.clone(),
+                            elicitation_type: ElicitationType::AuthOrLink,
+                        },
+                    )),
+                    &mut events,
+                )
+                .await;
+        }
+        assert_pending(&reducer, &keys[1..]);
+
+        // A duplicate at capacity keeps the first value and original arrival order.
+        reducer
+            .ingest(
+                AnalyticsFact::Custom(CustomAnalyticsFact::McpToolCallElicitation(
+                    McpToolCallElicitation {
+                        thread_id: keys[1].thread_id.clone(),
+                        turn_id: keys[1].turn_id.clone(),
+                        item_id: keys[1].item_id.clone(),
+                        elicitation_type: ElicitationType::Approval,
+                    },
+                )),
+                &mut events,
+            )
+            .await;
+        assert_pending(&reducer, &keys[1..]);
+
+        // Out-of-order completion consumes its marker even without turn context.
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(ServerNotification::ItemCompleted(
+                    ItemCompletedNotification {
+                        thread_id: keys[2].thread_id.clone(),
+                        turn_id: keys[2].turn_id.clone(),
+                        completed_at_ms: 1_000,
+                        item: ThreadItem::McpToolCall {
+                            id: keys[2].item_id.clone(),
+                            server: "server".to_string(),
+                            tool: "tool".to_string(),
+                            status: McpToolCallStatus::Failed,
+                            arguments: serde_json::json!({}),
+                            app_context: None,
+                            mcp_app_resource_uri: None,
+                            plugin_id: None,
+                            read_only_hint: None,
+                            result: None,
+                            error: None,
+                            duration_ms: None,
+                        },
+                    },
+                ))),
+                &mut events,
+            )
+            .await;
+        let mut remaining = keys[1..].to_vec();
+        remaining.remove(1);
+        assert_pending(&reducer, &remaining);
+
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(ServerNotification::ThreadClosed(
+                    ThreadClosedNotification {
+                        thread_id: "thread".to_string(),
+                    },
+                ))),
+                &mut events,
+            )
+            .await;
+        assert_pending(&reducer, &keys[MAX_TOOL_RESPONSE_ENTRIES..]);
+        assert!(events.is_empty());
+    }
 
     #[tokio::test]
     async fn rejected_turn_interrupt_removes_pending_analytics_request() {

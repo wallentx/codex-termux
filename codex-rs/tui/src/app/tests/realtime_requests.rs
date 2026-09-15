@@ -5,6 +5,7 @@ use crate::app::tests::session_lifecycle_requests::RealtimeRequestBehavior;
 use crate::app::tests::session_lifecycle_requests::recorded_params;
 use crate::app::tests::session_lifecycle_requests::start_recording_realtime_speech_app_server;
 use crate::app::tests::session_lifecycle_requests::start_recording_remote_app_server;
+use crate::chatwidget::commit_realtime_history_events;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
@@ -410,6 +411,7 @@ async fn switching_threads_keeps_the_source_voice_partial_only_on_reattach() {
         ),
         /*replay_kind*/ None,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut source_events);
     let rendered = std::iter::from_fn(|| source_events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -553,6 +555,7 @@ async fn queued_voice_caption_after_switch_returns_once_to_its_source_thread() {
         empty_thread_snapshot(&app, source),
         /*resume_restored_queue*/ false,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut source_events);
     let rendered = std::iter::from_fn(|| source_events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -588,6 +591,7 @@ async fn replay_reconciles_only_matching_voice_captions_one_for_one() {
         role: role.to_string(),
         text: text.to_string(),
         complete: true,
+        before_turn_id: None,
     })
     .collect();
     app.pending_realtime_transcript_replay
@@ -624,6 +628,7 @@ async fn replay_reconciles_only_matching_voice_captions_one_for_one() {
         },
         /*resume_restored_queue*/ false,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut events);
     let rendered = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -648,7 +653,7 @@ async fn replay_reconciles_only_matching_voice_captions_one_for_one() {
 }
 
 #[tokio::test]
-async fn retained_caption_consumes_only_one_matching_answer_fallback_on_reattach() {
+async fn retained_caption_consumes_only_one_matching_answer_fallback_on_reattach() -> Result<()> {
     let (mut app, _initial_events, _ops) = make_test_app_with_channels().await;
     let source = ThreadId::new();
     let (widget, _, mut events, _) = make_chatwidget_manual_with_sender().await;
@@ -660,6 +665,7 @@ async fn retained_caption_consumes_only_one_matching_answer_fallback_on_reattach
             role: "assistant".into(),
             text: "Same   answer".into(),
             complete: true,
+            before_turn_id: None,
         }]
         .into(),
     );
@@ -683,23 +689,26 @@ async fn retained_caption_consumes_only_one_matching_answer_fallback_on_reattach
         empty_thread_snapshot(&app, source),
         /*resume_restored_queue*/ false,
     );
-    let rendered = std::iter::from_fn(|| events.try_recv().ok())
-        .filter_map(|event| match event {
-            AppEvent::InsertHistoryCell(cell) => Some(
-                cell.display_lines(/*width*/ 80)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            _ => None,
-        })
+    let (mut app_server, _requests, proxy) = start_recording_remote_app_server(&app.config).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    while let Ok(event) = events.try_recv() {
+        Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+        app.chat_widget.pre_draw_tick();
+    }
+    let rendered = app
+        .transcript_cells
+        .iter()
+        .flat_map(|cell| cell.display_lines(/*width*/ 80))
+        .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(rendered.matches("Same answer").count(), 1);
     assert_eq!(rendered.matches("Same   answer").count(), 1);
     assert_eq!(rendered.matches("Different answer").count(), 1);
     assert!(!rendered.contains("[FINAL]"));
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -755,6 +764,7 @@ async fn buffered_voice_items_reconcile_captions_after_thread_switch() {
             role: role.to_string(),
             text: text.to_string(),
             complete: true,
+            before_turn_id: None,
         })
         .collect(),
     );
@@ -834,6 +844,7 @@ async fn unrendered_buffered_items_do_not_consume_retained_captions() {
             role: role.to_string(),
             text: text.to_string(),
             complete: true,
+            before_turn_id: None,
         })
         .collect(),
     );
@@ -895,6 +906,7 @@ async fn unrendered_buffered_items_do_not_consume_retained_captions() {
         },
         /*resume_restored_queue*/ false,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut events);
     let rendered = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -935,6 +947,7 @@ async fn completed_voice_caption_survives_repeated_thread_replacement() {
         ),
         /*replay_kind*/ None,
     );
+    commit_realtime_history_events(&mut app.chat_widget, &mut initial_events);
     let initial = std::iter::from_fn(|| initial_events.try_recv().ok())
         .filter_map(|event| match event {
             AppEvent::InsertHistoryCell(cell) => Some(
@@ -947,6 +960,16 @@ async fn completed_voice_caption_survives_repeated_thread_replacement() {
         })
         .collect::<String>();
     assert_eq!(initial.matches("spoken complete").count(), 1);
+
+    let typed = test_turn(
+        "later-typed-turn",
+        TurnStatus::Completed,
+        vec![test_user_message("later-user", "Later typed question")],
+    );
+    app.chat_widget.handle_server_notification(
+        turn_started_notification(source, &typed.id),
+        /*replay_kind*/ None,
+    );
 
     for cycle in 0..2 {
         let side = ThreadId::new();
@@ -969,11 +992,16 @@ async fn completed_voice_caption_survives_repeated_thread_replacement() {
         let (source_widget, _, mut source_events, _) = make_chatwidget_manual_with_sender().await;
         app.active_thread_id = Some(source);
         app.replace_chat_widget(source_widget);
-        app.replay_thread_snapshot(
-            empty_thread_snapshot(&app, source),
-            /*resume_restored_queue*/ false,
-        );
+        let mut snapshot = empty_thread_snapshot(&app, source);
+        snapshot.turns.push(Turn {
+            id: "earlier-typed-turn".into(),
+            items: vec![test_agent_message("earlier-answer", "Earlier answer")],
+            ..typed.clone()
+        });
+        snapshot.turns.push(typed.clone());
+        app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ false);
         assert!(!app.pending_realtime_transcript_replay.contains_key(&source));
+        commit_realtime_history_events(&mut app.chat_widget, &mut source_events);
         let rendered = std::iter::from_fn(|| source_events.try_recv().ok())
             .filter_map(|event| match event {
                 AppEvent::InsertHistoryCell(cell) => Some(
@@ -988,12 +1016,91 @@ async fn completed_voice_caption_survives_repeated_thread_replacement() {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(rendered.matches("spoken complete").count(), 1);
+        assert!(
+            rendered.find("Earlier answer").unwrap() < rendered.find("spoken complete").unwrap()
+        );
+        assert!(
+            rendered.find("spoken complete").unwrap()
+                < rendered.find("Later typed question").unwrap()
+        );
         if cycle == 0 {
             insta::assert_snapshot!(
                 "voice_completed_after_thread_switch",
                 normalize_voice_snapshot_directory(&rendered, &app.config.cwd)
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn inactive_caption_precedes_later_buffered_turn_without_start_event() {
+    for include_delta in [false, true] {
+        let (mut app, _initial_events, _ops) = make_test_app_with_channels().await;
+        let source = ThreadId::new();
+        app.retain_inactive_realtime_transcript(
+            source,
+            &ServerNotification::ThreadRealtimeTranscriptDone(
+                codex_app_server_protocol::ThreadRealtimeTranscriptDoneNotification {
+                    thread_id: source.to_string(),
+                    role: "assistant".into(),
+                    text: "Earlier spoken answer".into(),
+                },
+            ),
+        );
+        app.retain_inactive_realtime_transcript(
+            source,
+            &turn_started_notification(source, "later-turn"),
+        );
+        let (widget, _, mut events, _) = make_chatwidget_manual_with_sender().await;
+        app.active_thread_id = Some(source);
+        app.replace_chat_widget(widget);
+        let mut snapshot = empty_thread_snapshot(&app, source);
+        if include_delta {
+            snapshot
+                .events
+                .push(ThreadBufferedEvent::Notification(Box::new(
+                    ServerNotification::AgentMessageDelta(
+                        codex_app_server_protocol::AgentMessageDeltaNotification {
+                            thread_id: source.to_string(),
+                            turn_id: "later-turn".into(),
+                            item_id: "later-answer".into(),
+                            delta: "Later typed question".into(),
+                        },
+                    ),
+                )));
+        }
+        // The bounded replay buffer may have evicted both the start and item notifications.
+        snapshot
+            .events
+            .push(ThreadBufferedEvent::Notification(Box::new(
+                ServerNotification::TurnCompleted(TurnCompletedNotification {
+                    thread_id: source.to_string(),
+                    turn: test_turn(
+                        "later-turn",
+                        TurnStatus::Completed,
+                        vec![test_agent_message("later-answer", "Later typed question")],
+                    ),
+                }),
+            )));
+        app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ false);
+        let rendered = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(
+                    cell.transcript_lines(/*width*/ 80)
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered.matches("Earlier spoken answer").count(), 1);
+        assert!(
+            rendered.find("Earlier spoken answer").unwrap()
+                < rendered.find("Later typed question").unwrap()
+        );
     }
 }
 

@@ -98,7 +98,6 @@ pub(crate) struct TurnSummary {
 #[derive(Default)]
 pub(crate) struct ThreadState {
     pub(crate) pending_interrupts: PendingInterruptQueue,
-    pub(crate) pending_rollbacks: Option<(ConnectionRequestId, oneshot::Sender<()>)>,
     pub(crate) turn_summary: TurnSummary,
     pub(crate) last_terminal_turn_id: Option<String>,
     /// Lets an internal runtime replacement wait until the old listener has processed Core's
@@ -146,7 +145,6 @@ impl ThreadState {
             let _ = cancel_tx.send(());
         }
         self.shutdown_drain_waiter = None;
-        self.pending_rollbacks = None;
         self.listener_command_tx = None;
         self.current_turn_history.reset();
         self.listener_thread = None;
@@ -252,28 +250,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn clear_listener_releases_pending_rollback() {
-        let (completion_tx, mut completion_rx) = oneshot::channel();
-        let mut state = ThreadState {
-            pending_rollbacks: Some((
-                ConnectionRequestId {
-                    connection_id: ConnectionId(1),
-                    request_id: RequestId::Integer(1),
-                },
-                completion_tx,
-            )),
-            ..Default::default()
-        };
-
-        state.clear_listener();
-
-        assert_eq!(
-            completion_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Closed)
-        );
-    }
-
-    #[test]
     fn note_thread_settings_reports_only_effective_changes() {
         let mut state = ThreadState::default();
         let initial = thread_settings("mock-model");
@@ -291,6 +267,7 @@ mod tests {
 
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
+            disabled_plugin_ids: Vec::new(),
             cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: ApprovalsReviewer::User,

@@ -4,11 +4,11 @@
 use super::authorization::ScoreAuthorization;
 use super::config::GuardianV2Config;
 use super::coverage::GuardianPolicy;
-use super::extension::GuardianV2ScoreProgress;
 use super::metrics::TOOL_CALL_LAG_METRIC;
 use super::metrics::record_fast_decision;
 use super::parent_compaction::select_parent_compaction;
 use super::sampler::LunaSampler;
+use super::score::GuardianV2ScoreProgress;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::context::GuardianContextMode;
@@ -37,7 +37,7 @@ impl ApprovalReviewContributor for GuardianApprovalReviewer {
         input: &'a ApprovalDecisionInput<'_>,
     ) -> ExtensionFuture<'a, Option<ApprovalDecision>> {
         Box::pin(async move {
-            // If the extension is unavailable, core keeps its existing synchronous fallback.
+            // If the scorer is unavailable, the reviewer extension runs its synchronous fallback.
             let manager = self.thread_manager.upgrade()?;
             let Ok(thread) = manager.get_thread(input.thread_id).await else {
                 record_fast_decision(input.metrics.as_deref(), "deferred", "scoring_failure");

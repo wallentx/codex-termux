@@ -152,6 +152,9 @@ pub struct EnvironmentCapabilities {
     /// Whether shell state can be cached and restored entirely inside the executor.
     #[serde(default)]
     pub shell_snapshot_v2: bool,
+    /// Whether requests may explicitly select the MXC Windows sandbox backend.
+    #[serde(default)]
+    pub windows_mxc: bool,
 }
 
 /// Status returned by an initialized exec-server connection.
@@ -214,6 +217,10 @@ impl EnvironmentInfo {
 
     /// Returns information about the current local exec-server process.
     pub fn local() -> Self {
+        #[cfg(windows)]
+        let windows_mxc = codex_mxc_sandbox::is_available();
+        #[cfg(not(windows))]
+        let windows_mxc = false;
         let cwd = std::env::current_dir().ok();
         let temporary_directories = Self::local_temporary_directories_with_cwd(cwd.as_deref());
         let normalize_temp_path = |path: std::ffi::OsString| {
@@ -243,6 +250,7 @@ impl EnvironmentInfo {
                 http_header_env_vars: true,
                 sandboxed_file_streaming: true,
                 shell_snapshot_v2: cfg!(unix),
+                windows_mxc,
             },
         }
     }
@@ -358,6 +366,7 @@ pub enum ProcessSandboxType {
     MacosSeatbelt,
     LinuxSeccomp,
     WindowsRestrictedToken,
+    WindowsMxc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -911,6 +920,7 @@ mod tests {
     use super::ProcessSandboxType;
     use super::ShellInfo;
     use codex_file_system::FileSystemSandboxContext;
+    use codex_file_system::WindowsSandboxSelection;
     use codex_network_proxy::ManagedNetworkSandboxContext;
     use codex_network_proxy::NetworkProxyAuditMetadata;
     use codex_network_proxy::NetworkProxyConfig;
@@ -953,6 +963,8 @@ mod tests {
             managed_network: Some(ManagedNetworkSandboxContext {
                 loopback_ports: vec![43123, 48081],
                 allow_local_binding: false,
+                allow_unix_sockets: vec!["/tmp/allowed.sock".to_string()],
+                dangerously_allow_all_unix_sockets: true,
             }),
             network_proxy: Some(
                 RemoteNetworkProxyLaunchConfig::new(
@@ -981,6 +993,8 @@ mod tests {
             serde_json::json!({
                 "loopbackPorts": [43123, 48081],
                 "allowLocalBinding": false,
+                "allowUnixSockets": ["/tmp/allowed.sock"],
+                "dangerouslyAllowAllUnixSockets": true,
             })
         );
         assert_eq!(
@@ -1012,6 +1026,52 @@ mod tests {
         assert!(legacy_serialized.get("threadId").is_none());
         assert!(legacy_serialized.get("toolCallId").is_none());
         assert!(legacy_serialized.get("metadata").is_none());
+    }
+
+    #[test]
+    fn exec_params_defaults_legacy_managed_network_unix_socket_policy() {
+        let cwd =
+            PathUri::from_host_native_path(std::env::current_dir().expect("current directory"))
+                .expect("cwd URI");
+        let legacy: ExecParams = serde_json::from_value(serde_json::json!({
+            "processId": "legacy-managed-network",
+            "argv": ["true"],
+            "cwd": cwd,
+            "env": {},
+            "tty": false,
+            "arg0": null,
+            "enforceManagedNetwork": true,
+            "managedNetwork": {
+                "loopbackPorts": [43123],
+                "allowLocalBinding": true,
+            },
+        }))
+        .expect("deserialize legacy managed network context");
+
+        assert_eq!(
+            legacy,
+            ExecParams {
+                process_id: ProcessId::from("legacy-managed-network"),
+                metadata: None,
+                argv: vec!["true".to_string()],
+                cwd,
+                env_policy: None,
+                shell_snapshot: None,
+                env: HashMap::new(),
+                tty: false,
+                pipe_stdin: false,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: true,
+                managed_network: Some(ManagedNetworkSandboxContext {
+                    loopback_ports: vec![43123],
+                    allow_local_binding: true,
+                    allow_unix_sockets: Vec::new(),
+                    dangerously_allow_all_unix_sockets: false,
+                }),
+                network_proxy: None,
+            }
+        );
     }
 
     #[test]
@@ -1057,6 +1117,7 @@ mod tests {
                 http_header_env_vars: false,
                 sandboxed_file_streaming: false,
                 shell_snapshot_v2: false,
+                windows_mxc: false,
             }
         );
     }
@@ -1078,6 +1139,7 @@ mod tests {
                 "httpHeaderEnvVars": false,
                 "sandboxedFileStreaming": false,
                 "shellSnapshotV2": false,
+                "windowsMxc": false,
             },
         });
         let info: EnvironmentInfo = serde_json::from_value(expected.clone())
@@ -1213,9 +1275,11 @@ mod tests {
         let mut sandbox =
             FileSystemSandboxContext::from_permission_profile_with_cwd(permissions, cwd.clone());
         sandbox.user_home_dir = Some(cwd.clone());
+        sandbox.windows_sandbox_selection = WindowsSandboxSelection::Mxc;
 
         let serialized = serde_json::to_value(&sandbox).expect("serialize sandbox");
 
+        assert_eq!(serialized["windowsSandboxLevel"], "mxc");
         assert_eq!(
             serialized["userHomeDir"],
             serde_json::json!(cwd.to_string())
