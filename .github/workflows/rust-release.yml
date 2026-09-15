@@ -591,10 +591,12 @@ jobs:
           set -euo pipefail
 
           if [[ "${{ matrix.target }}" == 'aarch64-linux-android' ]]; then
-            export CARGO_BUILD_JOBS=4
+            export CARGO_BUILD_JOBS=2
             export CARGO_PROFILE_RELEASE_LTO=thin
             export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
-            cargo build --target ${{ matrix.target }} --release --bin codex --bin codex-code-mode-host
+            # Keep the large final links sequential to limit peak resource use on hosted runners.
+            cargo build --target ${{ matrix.target }} --release --bin codex
+            cargo build --target ${{ matrix.target }} --release --bin codex-code-mode-host
             exit 0
           fi
 
