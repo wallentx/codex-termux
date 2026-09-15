@@ -18,6 +18,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
@@ -715,7 +716,9 @@ fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
                     text: "keep".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,abc".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,abc".to_string(),
+                    },
                     detail: None,
                 },
             ],
@@ -796,7 +799,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                     text: "look at this".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: "https://example.com/img.png".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "https://example.com/img.png".to_string(),
+                    },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 ContentItem::InputAudio {
@@ -838,7 +843,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                     text: "image result".to_string(),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "https://example.com/result.png".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "https://example.com/result.png".to_string(),
+                    },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 FunctionCallOutputContentItem::InputAudio {
@@ -865,7 +872,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                     text: "js repl result".to_string(),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "https://example.com/js-repl-result.png".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "https://example.com/js-repl-result.png".to_string(),
+                    },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 FunctionCallOutputContentItem::InputAudio {
@@ -991,7 +1000,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                 text: "look".to_string(),
             },
             ContentItem::InputImage {
-                image_url: "https://example.com/img.png".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "https://example.com/img.png".to_string(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
@@ -2414,7 +2425,7 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
                 text: "Here is the screenshot".to_string(),
             },
             ContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
@@ -2433,7 +2444,7 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
 
     let raw_len = serde_json::to_string(&image_item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&image_item);
-    let expected = raw_len - payload.len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
+    let expected = "Here is the screenshot".len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
     let text_only_estimated = estimate_response_item_model_visible_bytes(&text_only_item);
 
     assert_eq!(estimated, expected);
@@ -2455,7 +2466,7 @@ fn image_data_url_payload_does_not_dominate_function_call_output_estimate() {
                 text: "Screenshot captured".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]),
@@ -2464,7 +2475,8 @@ fn image_data_url_payload_does_not_dominate_function_call_output_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
+    let expected =
+        "call-abc".len() as i64 + "Screenshot captured".len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2483,7 +2495,7 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
                 text: "Screenshot captured".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]),
@@ -2492,7 +2504,9 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
+    let expected = "call-js-repl".len() as i64
+        + "Screenshot captured".len() as i64
+        + RESIZED_IMAGE_BYTES_ESTIMATE;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2500,7 +2514,7 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 
 #[test]
 fn audio_data_url_payload_does_not_dominate_message_estimate() {
-    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 801);
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 801);
     let item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -2511,7 +2525,7 @@ fn audio_data_url_payload_does_not_dominate_message_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 2) as i64;
+    let expected = approx_bytes_for_tokens(/*tokens*/ 2) as i64;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2519,7 +2533,7 @@ fn audio_data_url_payload_does_not_dominate_message_estimate() {
 
 #[test]
 fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
-    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 800);
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 800);
     let item = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: Some("call-audio".to_string()),
@@ -2533,7 +2547,7 @@ fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 1) as i64;
+    let expected = "call-audio".len() as i64 + approx_bytes_for_tokens(/*tokens*/ 1) as i64;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2541,7 +2555,7 @@ fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
 
 #[test]
 fn audio_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
-    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 80_000);
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 80_000);
     let item = ResponseItem::CustomToolCallOutput {
         id: None,
         call_id: "call-custom-audio".to_string(),
@@ -2554,7 +2568,8 @@ fn audio_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 100) as i64;
+    let expected =
+        "call-custom-audio".len() as i64 + approx_bytes_for_tokens(/*tokens*/ 100) as i64;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2573,10 +2588,9 @@ fn malformed_audio_data_url_falls_back_to_whole_url_size_cost() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
 
-    assert_eq!(estimated, raw_len - payload.len() as i64 + fallback_bytes);
+    assert_eq!(estimated, fallback_bytes);
 }
 
 #[test]
@@ -2620,12 +2634,14 @@ fn record_items_omits_audio_that_exceeds_the_output_budget() {
 }
 
 #[test]
-fn non_base64_image_urls_are_unchanged() {
+fn non_base64_image_urls_use_image_estimates() {
     let message_item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputImage {
-            image_url: "https://example.com/foo.png".to_string(),
+            image: ImageReference::Inline {
+                image_url: "https://example.com/foo.png".to_string(),
+            },
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
         phase: None,
@@ -2638,7 +2654,9 @@ fn non_base64_image_urls_are_unchanged() {
         namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url: "file:///tmp/foo.png".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "file:///tmp/foo.png".to_string(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]),
@@ -2647,12 +2665,53 @@ fn non_base64_image_urls_are_unchanged() {
 
     assert_eq!(
         estimate_response_item_model_visible_bytes(&message_item),
-        serde_json::to_string(&message_item).unwrap().len() as i64
+        RESIZED_IMAGE_BYTES_ESTIMATE
     );
     assert_eq!(
         estimate_response_item_model_visible_bytes(&function_output_item),
-        serde_json::to_string(&function_output_item).unwrap().len() as i64
+        "call-1".len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE
     );
+}
+
+#[test]
+fn passthrough_metadata_does_not_change_context_estimates() {
+    for output in [
+        serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}),
+        serde_json::json!({"type": "function_call_output", "call_id": "call", "output": "result"}),
+        serde_json::json!({"type": "custom_tool_call_output", "call_id": "call", "output": "result"}),
+        serde_json::json!({"type": "tool_search_output", "call_id": "call", "execution": "client", "status": "completed", "tools": []}),
+    ] {
+        let original: ResponseItem = serde_json::from_value(output.clone()).expect("response item");
+        let before = estimate_response_item_model_visible_bytes(&original);
+        for turn_metadata in [
+            None,
+            Some(InternalChatMessageMetadataPassthrough::default()),
+            Some(InternalChatMessageMetadataPassthrough {
+                turn_id: Some("turn-\"你好\"".to_string()),
+                create_time: Some(123.into()),
+                ..unknown_content_metadata()
+            }),
+        ] {
+            let mut output = output.clone();
+            output["internal_chat_message_metadata_passthrough"] =
+                serde_json::to_value(turn_metadata).expect("turn metadata");
+            let mut item: ResponseItem = serde_json::from_value(output).expect("response item");
+            assert_eq!(estimate_response_item_model_visible_bytes(&item), before);
+            let mut call = codex_protocol::models::ExecutedToolCall::new(
+                "test_tool".to_string(),
+                serde_json::json!({"input": "x".repeat(8 * 1024)}),
+            );
+            call.set_tool_result_metadata(codex_protocol::models::ToolResultMetadata::new(
+                &serde_json::json!({"provider": "x".repeat(16 * 1024)}),
+            ));
+            item.append_executed_tool_calls(vec![call]);
+            item.set_tool_call_cell_id("cell");
+            item.mark_tool_calls_complete();
+            assert_eq!(estimate_response_item_model_visible_bytes(&item), before);
+            item.clear_internal_chat_message_metadata_passthrough();
+            assert_eq!(item, original);
+        }
+    }
 }
 
 #[test]
@@ -2671,9 +2730,8 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - encrypted_content.len() as i64
+    let expected = "call-encrypted".len() as i64
         + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
 
     assert_eq!(estimated, expected);
@@ -2686,8 +2744,9 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
         /*trigger_turn*/ true,
     )
     .to_model_input_item();
-    let agent_raw_len = serde_json::to_string(&agent_message).unwrap().len() as i64;
-    let expected_agent = agent_raw_len - encrypted_content.len() as i64
+    let expected_agent = "/root".len() as i64
+        + "/root/worker".len() as i64
+        + "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n".len() as i64
         + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
 
     assert_eq!(
@@ -2697,12 +2756,15 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
 }
 
 #[test]
-fn data_url_without_base64_marker_is_unchanged() {
+fn data_url_without_base64_marker_uses_image_estimate() {
     let item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputImage {
-            image_url: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>".to_string(),
+            image: ImageReference::Inline {
+                image_url: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>"
+                    .to_string(),
+            },
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
         phase: None,
@@ -2711,14 +2773,15 @@ fn data_url_without_base64_marker_is_unchanged() {
 
     assert_eq!(
         estimate_response_item_model_visible_bytes(&item),
-        serde_json::to_string(&item).unwrap().len() as i64
+        RESIZED_IMAGE_BYTES_ESTIMATE
     );
 }
 
 #[test]
-fn non_image_base64_data_url_is_unchanged() {
+fn non_image_base64_data_url_uses_image_estimate() {
     let payload = "C".repeat(4_096);
     let image_url = format!("data:application/octet-stream;base64,{payload}");
+    let expected = "call-octet".len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
     let item = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: Some("call-octet".to_string()),
@@ -2726,17 +2789,16 @@ fn non_image_base64_data_url_is_unchanged() {
         namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]),
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
 
-    assert_eq!(estimated, raw_len);
+    assert_eq!(estimated, expected);
 }
 
 #[test]
@@ -2747,16 +2809,15 @@ fn mixed_case_data_url_markers_are_adjusted() {
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputImage {
-            image_url,
+            image: ImageReference::Inline { image_url },
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
+    let expected = RESIZED_IMAGE_BYTES_ESTIMATE;
 
     assert_eq!(estimated, expected);
 }
@@ -2775,11 +2836,15 @@ fn multiple_inline_images_apply_multiple_fixed_costs() {
                 text: "images".to_string(),
             },
             ContentItem::InputImage {
-                image_url: image_url_one,
+                image: ImageReference::Inline {
+                    image_url: image_url_one,
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputImage {
-                image_url: image_url_two,
+                image: ImageReference::Inline {
+                    image_url: image_url_two,
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
@@ -2787,10 +2852,8 @@ fn multiple_inline_images_apply_multiple_fixed_costs() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
-    let payload_sum = (payload_one.len() + payload_two.len()) as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload_sum + (2 * RESIZED_IMAGE_BYTES_ESTIMATE);
+    let expected = "images".len() as i64 + (2 * RESIZED_IMAGE_BYTES_ESTIMATE);
 
     assert_eq!(estimated, expected);
 }
@@ -2817,16 +2880,15 @@ fn original_detail_images_scale_with_dimensions() {
         namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(ImageDetail::Original),
             },
         ]),
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
+    let expected = "call-original".len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
 
     assert_eq!(estimated, expected);
 }
@@ -2851,18 +2913,17 @@ fn original_detail_images_are_capped_at_max_patch_count() {
         namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(ImageDetail::Original),
             },
         ]),
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
     let capped_original_detail_image_bytes =
         i64::try_from(approx_bytes_for_tokens(ORIGINAL_IMAGE_MAX_PATCHES)).unwrap();
-    let expected = raw_len - payload.len() as i64 + capped_original_detail_image_bytes;
+    let expected = "call-original-capped".len() as i64 + capped_original_detail_image_bytes;
 
     assert_eq!(estimated, expected);
 }
@@ -2888,22 +2949,21 @@ fn original_detail_webp_images_scale_with_dimensions() {
         namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url,
+                image: ImageReference::Inline { image_url },
                 detail: Some(ImageDetail::Original),
             },
         ]),
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
+    let expected = "call-original-webp".len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
 
     assert_eq!(estimated, expected);
 }
 
 #[test]
-fn text_only_items_unchanged() {
+fn text_only_items_count_decoded_content() {
     let item = ResponseItem::Message {
         id: None,
         role: "assistant".to_string(),
@@ -2915,7 +2975,6 @@ fn text_only_items_unchanged() {
     };
 
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
 
-    assert_eq!(estimated, raw_len);
+    assert_eq!(estimated, "Hello, \"world\"!\nこんにちは".len() as i64);
 }

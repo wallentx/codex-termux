@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::TranscriptExportDestination;
+use crate::bottom_pane::BottomPaneView;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
@@ -111,6 +112,12 @@ async fn same_thread_retry_keeps_subscription_and_restores_draft() -> Result<()>
     app.ensure_thread_channel(thread_id).mark_external_writer();
     app.chat_widget.insert_str("Retained draft");
     app.chat_widget.show_external_writer_thread();
+    crate::legacy_core::config::set_project_trust_level(
+        app.config.codex_home.as_path(),
+        app.config.cwd.as_path(),
+        codex_protocol::config_types::TrustLevel::Trusted,
+    )
+    .map_err(std::io::Error::other)?;
     app.harness_overrides.cwd = Some(app.config.cwd.to_path_buf());
     requests.lock().expect("request recorder lock").clear();
     let mut tui = crate::tui::test_support::make_test_tui()?;
@@ -143,6 +150,7 @@ pub(super) enum HistoryCapabilities {
     LegacyOnlyUnsupportedVariant,
     LegacyDynamicToolsAndHistory,
     ForkHydrationFails,
+    ReadAfterResumeFails,
     ThreadListFails,
     ThreadStartFails,
     ConfigReadUnsupported(i64),
@@ -351,6 +359,22 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                         JSONRPCMessage::Response(JSONRPCResponse {
                             id: request_id,
                             result: serde_json::json!({}),
+                        })
+                    } else if history_capabilities == HistoryCapabilities::ReadAfterResumeFails
+                        && request.method == "thread/read"
+                        && request_sink
+                            .lock()
+                            .expect("request recorder lock")
+                            .iter()
+                            .any(|recorded| recorded.method == "thread/resume")
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32603,
+                                data: None,
+                                message: "saved history unavailable".to_string(),
+                            },
                         })
                     } else if let HistoryCapabilities::ConfigReadUnsupported(code) =
                         history_capabilities
@@ -2853,10 +2877,7 @@ async fn agents_overview_seeds_loaded_threads_when_recent_listing_is_unavailable
             if attempt == 0 {
                 app.refresh_agents_overview_threads(&app_server);
             } else {
-                app.open_agents_overview(
-                    &app_server,
-                    crate::app::agents_overview_view::AgentsOverviewFocus::List,
-                );
+                app.open_agents_overview(&app_server);
             }
             let Some(AppEvent::AgentsOverviewThreadsLoaded { request_id, result }) =
                 tokio::time::timeout(Duration::from_secs(10), rx.recv()).await?
@@ -4224,6 +4245,12 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     .count();
                 assert!(loaded_threads.contains(&child_thread_id.to_string()));
                 take_backfill_counts(&requests);
+                crate::legacy_core::config::set_project_trust_level(
+                    app.config.codex_home.as_path(),
+                    app.config.cwd.as_path(),
+                    codex_protocol::config_types::TrustLevel::Trusted,
+                )
+                .map_err(std::io::Error::other)?;
                 app.harness_overrides.cwd = Some(app.config.cwd.to_path_buf());
 
                 let control = app
@@ -4443,6 +4470,89 @@ async fn external_writer_escape_preserves_snapshot_and_explicit_quits() -> Resul
             request.method.as_str(),
             "thread/read" | "thread/list" | "thread/loaded/list" | "thread/turns/list"
         )));
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn command_center_read_only_open_requests_and_failure_preservation() -> Result<()> {
+    for history_capabilities in [
+        HistoryCapabilities::Current,
+        HistoryCapabilities::ReadAfterResumeFails,
+    ] {
+        let (mut app, _codex_home) = Box::pin(make_history_test_app()).await?;
+        std::fs::write(
+            app.config.codex_home.join("config.toml"),
+            "[tui]\nresume_cwd = \"current\"\n",
+        )?;
+        for cwd in [test_path_buf("/"), app.config.cwd.to_path_buf()] {
+            crate::legacy_core::config::set_project_trust_level(
+                app.config.codex_home.as_path(),
+                &cwd,
+                codex_protocol::config_types::TrustLevel::Trusted,
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        let thread_id =
+            create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "Locked task")?;
+        let mut owner = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+        Box::pin(owner.resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            thread_id,
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        ))
+        .await?;
+        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            history_capabilities,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides::default(),
+        )
+        .await?;
+        app.app_server_target = AppServerTarget::LocalDaemon {
+            endpoint: crate::resolve_remote_addr("ws://127.0.0.1:4500")?,
+        };
+        let current = Box::pin(server.start_thread(&app.config)).await?;
+        let current_id = current.session.thread_id;
+        app.enqueue_primary_thread_session(current.session, current.turns)
+            .await?;
+        let thread = owner
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await?;
+        let mut view = app.agents_overview_view(vec![thread], Some(thread_id));
+        view.handle_paste("Keep this draft".into());
+        app.chat_widget.show_bottom_pane_view(Box::new(view));
+        let before = render_bottom_popup(&app.chat_widget, /*width*/ 96);
+        requests.lock().unwrap().clear();
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+
+        Box::pin(app.select_agents_overview_thread(&mut tui, &mut server, thread_id)).await?;
+        assert_eq!(recorded_params(&requests, "thread/resume").len(), 1);
+        assert!(recorded_params(&requests, "turn/start").is_empty());
+        if history_capabilities == HistoryCapabilities::ReadAfterResumeFails {
+            let error = render_bottom_popup(&app.chat_widget, /*width*/ 96);
+            assert!(
+                error.contains("Failed to view task open elsewhere"),
+                "{error}"
+            );
+            assert_eq!(app.current_displayed_thread_id(), Some(current_id));
+            assert!(recorded_params(&requests, "thread/unsubscribe").is_empty());
+            app.chat_widget.handle_key_event(KeyCode::Esc.into());
+            assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 96), before);
+        } else {
+            assert_eq!(app.current_displayed_thread_id(), Some(thread_id));
+            assert!(app.chat_widget.is_external_writer_view());
+            assert_eq!(
+                app.thread_event_channels[&thread_id].attachment(),
+                ThreadEventAttachment::ExternalWriter
+            );
+        }
+        owner.shutdown().await?;
         server.shutdown().await?;
         proxy.await??;
     }

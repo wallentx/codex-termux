@@ -4,7 +4,7 @@ use super::AskForApproval;
 use super::BrowserUseConfig;
 use super::ComputerUseConfig;
 use super::SandboxMode;
-use super::WindowsSandboxSetupMode;
+use super::WindowsSandboxImplementation;
 use super::shared::default_enabled;
 use crate::JsonSchema;
 use crate::TS;
@@ -412,6 +412,9 @@ pub struct ConfigRequirements {
     pub model_provider: Option<String>,
     /// Complete required provider definitions, using config.toml field names.
     pub model_providers: Option<HashMap<String, JsonValue>>,
+    /// Effective login methods after managed, forced-login, and workspace restrictions.
+    /// An empty list permits no login method. Older servers may omit this field.
+    pub allowed_login_methods: Option<Vec<ForcedLoginMethod>>,
     pub cli_auth_credentials_store: Option<CliAuthCredentialsStoreMode>,
     pub chatgpt_base_url: Option<String>,
     pub additional_developer_instructions: Option<String>,
@@ -420,7 +423,7 @@ pub struct ConfigRequirements {
     #[experimental("configRequirements/read.allowedApprovalsReviewers")]
     pub allowed_approvals_reviewers: Option<Vec<ApprovalsReviewer>>,
     pub allowed_sandbox_modes: Option<Vec<SandboxMode>>,
-    pub allowed_windows_sandbox_implementations: Option<Vec<WindowsSandboxSetupMode>>,
+    pub allowed_windows_sandbox_implementations: Option<Vec<WindowsSandboxImplementation>>,
     pub allowed_permission_profiles: Option<BTreeMap<String, bool>>,
     pub default_permissions: Option<String>,
     pub allowed_web_search_modes: Option<Vec<WebSearchMode>>,

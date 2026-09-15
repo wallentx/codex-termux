@@ -77,9 +77,11 @@ fn permission_profile_sandbox_tag(
             }
         }
     }
-    if cfg!(target_os = "windows") && matches!(windows_sandbox_level, WindowsSandboxLevel::Elevated)
-    {
-        return "windows_elevated";
+    if cfg!(target_os = "windows") {
+        match windows_sandbox_level {
+            WindowsSandboxLevel::Elevated => return "windows_elevated",
+            WindowsSandboxLevel::Disabled | WindowsSandboxLevel::RestrictedToken => {}
+        }
     }
 
     get_platform_sandbox(windows_sandbox_level != WindowsSandboxLevel::Disabled)

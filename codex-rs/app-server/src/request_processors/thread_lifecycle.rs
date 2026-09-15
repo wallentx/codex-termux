@@ -11,8 +11,6 @@ pub(super) struct ListenerTaskContext {
     pub(super) outgoing: Arc<OutgoingMessageSender>,
     pub(super) pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     pub(super) thread_watch_manager: ThreadWatchManager,
-    pub(super) thread_list_state_permit: Arc<Semaphore>,
-    pub(super) fallback_model_provider: String,
     pub(super) codex_home: PathBuf,
     pub(super) thread_unload_delay: Duration,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
@@ -271,8 +269,6 @@ pub(super) async fn ensure_listener_task_running(
         thread_state_manager,
         pending_thread_unloads,
         thread_watch_manager,
-        thread_list_state_permit,
-        fallback_model_provider,
         codex_home,
         turn_cost_worker,
         ..
@@ -353,8 +349,6 @@ pub(super) async fn ensure_listener_task_running(
                         thread_outgoing,
                         thread_state.clone(),
                         thread_watch_manager.clone(),
-                        thread_list_state_permit.clone(),
-                        fallback_model_provider.clone(),
                     )
                     .await;
                     if matches!(event.msg, EventMsg::ShutdownComplete)
@@ -730,6 +724,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     let cwd = config_snapshot.cwd().clone();
     let ThreadConfigSnapshot {
         model,
+        disabled_plugin_ids,
         model_provider_id,
         service_tier,
         approval_policy,
@@ -737,6 +732,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         active_permission_profile,
         workspace_roots,
         reasoning_effort,
+        collaboration_mode,
         originator,
         ..
     } = config_snapshot;
@@ -748,6 +744,7 @@ pub(super) async fn handle_pending_thread_resume_request(
 
     let response = ThreadResumeResponse {
         thread,
+        disabled_plugin_ids,
         model,
         model_provider: model_provider_id,
         service_tier,
@@ -759,6 +756,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         sandbox,
         active_permission_profile,
         reasoning_effort,
+        collaboration_mode: Some(collaboration_mode),
         multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         initial_turns_page,
         turns_backwards_cursor,

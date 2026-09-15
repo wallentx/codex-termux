@@ -753,11 +753,6 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadBackgroundTerminalsTerminateResponse,
     },
-    ThreadRollback => "thread/rollback" {
-        params: v2::ThreadRollbackParams,
-        serialization: thread_id(params.thread_id),
-        response: v2::ThreadRollbackResponse,
-    },
     ThreadRevert => "thread/revert" {
         params: v2::ThreadRevertParams,
         serialization: thread_id(params.thread_id),
@@ -3184,6 +3179,7 @@ mod tests {
         let response = ClientResponse::ThreadStart {
             request_id: RequestId::Integer(7),
             response: v2::ThreadStartResponse {
+                disabled_plugin_ids: Vec::new(),
                 thread: v2::Thread {
                     originator: None,
                     environments: None,
@@ -3283,6 +3279,7 @@ mod tests {
                     "model": "gpt-5",
                     "modelProvider": "openai",
                     "serviceTier": null,
+                    "disabledPluginIds": [],
                     "cwd": absolute_path_string("tmp"),
                     "runtimeWorkspaceRoots": [],
                     "instructionSources": [absolute_path_string("tmp/AGENTS.md")],
@@ -4477,6 +4474,7 @@ mod tests {
             ServerNotification::ThreadSettingsUpdated(v2::ThreadSettingsUpdatedNotification {
                 thread_id: "thr_123".to_string(),
                 thread_settings: v2::ThreadSettings {
+                    disabled_plugin_ids: Vec::new(),
                     cwd: absolute_path("/tmp/repo"),
                     approval_policy: v2::AskForApproval::Never,
                     approvals_reviewer: v2::ApprovalsReviewer::User,

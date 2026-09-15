@@ -43,6 +43,12 @@ class AmazonBedrockAccount(BaseModel):
     ] = False
 
 
+class AccountRoutingOverride(Enum):
+    no_constraint = "NO_CONSTRAINT"
+    us = "us"
+    us_cr = "us_cr"
+
+
 class AccountTokenUsageDailyBucket(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -2698,6 +2704,13 @@ class MisalignmentSteer(BaseModel):
 class ModeKind(Enum):
     plan = "plan"
     default = "default"
+
+
+class ModelAccessPrograms(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cyber: Annotated[list[CyberAccessProgram], Field(description="Accepted explicit selections.")]
 
 
 class ModelAvailabilityNux(BaseModel):
@@ -5826,21 +5839,6 @@ class ThreadRevertedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
-class ThreadRollbackParams(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    num_turns: Annotated[
-        int,
-        Field(
-            alias="numTurns",
-            description="The number of turns to drop from the end of the thread. Must be >= 1.\n\nThis only modifies the thread's history and does not revert local file changes that have been made by the agent. Clients are responsible for reverting these changes.",
-            ge=0,
-        ),
-    ]
-    thread_id: Annotated[str, Field(alias="threadId")]
-
-
 class ThreadSearchSortKey(Enum):
     created_at = "created_at"
     updated_at = "updated_at"
@@ -6425,6 +6423,12 @@ class WebSearchToolConfig(BaseModel):
     location: WebSearchLocation | None = None
 
 
+class WindowsSandboxImplementation(Enum):
+    elevated = "elevated"
+    unelevated = "unelevated"
+    mxc = "mxc"
+
+
 class WindowsSandboxReadiness(Enum):
     ready = "ready"
     not_configured = "notConfigured"
@@ -6471,6 +6475,17 @@ class WorkspaceMessageType(Enum):
     headline = "headline"
     announcement = "announcement"
     unknown = "unknown"
+
+
+class WorkspaceRouting(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    account_routing_override: Annotated[
+        AccountRoutingOverride, Field(alias="accountRoutingOverride")
+    ]
+    backend_origin: Annotated[str, Field(alias="backendOrigin")]
+    chatgpt_account_id: Annotated[str, Field(alias="chatgptAccountId")]
 
 
 class WriteStatus(Enum):
@@ -6806,15 +6821,6 @@ class ThreadApproveGuardianDeniedActionRequest(BaseModel):
         Field(title="Thread/approveGuardianDeniedActionRequestMethod"),
     ]
     params: ThreadApproveGuardianDeniedActionParams
-
-
-class ThreadRollbackRequest(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    id: RequestId
-    method: Annotated[Literal["thread/rollback"], Field(title="Thread/rollbackRequestMethod")]
-    params: ThreadRollbackParams
 
 
 class ThreadRevertRequest(BaseModel):
@@ -7784,8 +7790,8 @@ class InputImageContentItem(BaseModel):
         populate_by_name=True,
     )
     detail: ImageDetail | None = None
-    image_url: str
     type: Annotated[Literal["input_image"], Field(title="InputImageContentItemType")]
+    image_url: str
 
 
 class ContentItem(
@@ -7796,9 +7802,7 @@ class ContentItem(
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    root: (
-        InputTextContentItem | InputImageContentItem | InputAudioContentItem | OutputTextContentItem
-    )
+    root: InputTextContentItem | InputImageContentItem | InputAudioContentItem | OutputTextContentItem
 
 
 class ExperimentalFeature(BaseModel):
@@ -7980,10 +7984,10 @@ class InputImageFunctionCallOutputContentItem(BaseModel):
         populate_by_name=True,
     )
     detail: ImageDetail | None = None
-    image_url: str
     type: Annotated[
         Literal["input_image"], Field(title="InputImageFunctionCallOutputContentItemType")
     ]
+    image_url: str
 
 
 class FunctionCallOutputContentItem(
@@ -8340,6 +8344,13 @@ class McpServerStatus(BaseModel):
             description="Current thread-runtime connection state; null when unavailable or the configuration changed.",
         ),
     ] = None
+    server_capabilities: Annotated[
+        Any | None,
+        Field(
+            alias="serverCapabilities",
+            description="Capabilities advertised by the initialized MCP server; null when unavailable.",
+        ),
+    ] = None
     server_info: Annotated[McpServerInfo | None, Field(alias="serverInfo")] = None
     tools: dict[str, Tool]
     tools_error: Annotated[
@@ -8408,6 +8419,13 @@ class Model(BaseModel):
         Field(alias="additionalSpeedTiers", description="Deprecated: use `serviceTiers` instead."),
     ] = []
     availability_nux: Annotated[ModelAvailabilityNux | None, Field(alias="availabilityNux")] = None
+    available_access_programs: Annotated[
+        ModelAccessPrograms | None,
+        Field(
+            alias="availableAccessPrograms",
+            description="Null when the catalog does not provide access-program metadata.",
+        ),
+    ] = None
     default_reasoning_effort: Annotated[ReasoningEffort, Field(alias="defaultReasoningEffort")]
     default_service_tier: Annotated[
         str | None,
@@ -9878,6 +9896,13 @@ class ThreadSettings(BaseModel):
     approvals_reviewer: Annotated[ApprovalsReviewer, Field(alias="approvalsReviewer")]
     collaboration_mode: Annotated[CollaborationMode, Field(alias="collaborationMode")]
     cwd: AbsolutePathBuf
+    disabled_plugin_ids: Annotated[
+        list[str] | None,
+        Field(
+            alias="disabledPluginIds",
+            description="Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+        ),
+    ] = []
     effort: ReasoningEffort | None = None
     model: str
     model_provider: Annotated[str, Field(alias="modelProvider")]
@@ -11276,6 +11301,13 @@ class ConfigRequirements(BaseModel):
     allowed_approval_policies: Annotated[
         list[AskForApproval] | None, Field(alias="allowedApprovalPolicies")
     ] = None
+    allowed_login_methods: Annotated[
+        list[ForcedLoginMethod] | None,
+        Field(
+            alias="allowedLoginMethods",
+            description="Effective login methods after managed, forced-login, and workspace restrictions. An empty list permits no login method. Older servers may omit this field.",
+        ),
+    ] = None
     allowed_permission_profiles: Annotated[
         dict[str, Any] | None, Field(alias="allowedPermissionProfiles")
     ] = None
@@ -11286,7 +11318,8 @@ class ConfigRequirements(BaseModel):
         list[WebSearchMode] | None, Field(alias="allowedWebSearchModes")
     ] = None
     allowed_windows_sandbox_implementations: Annotated[
-        list[WindowsSandboxSetupMode] | None, Field(alias="allowedWindowsSandboxImplementations")
+        list[WindowsSandboxImplementation] | None,
+        Field(alias="allowedWindowsSandboxImplementations"),
     ] = None
     auto_review: Annotated[AutoReviewRequirements | None, Field(alias="autoReview")] = None
     browser_use: Annotated[BrowserUseRequirements | None, Field(alias="browserUse")] = None
@@ -11739,7 +11772,7 @@ class Thread(BaseModel):
     turns: Annotated[
         list[Turn],
         Field(
-            description="Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list."
+            description="Only populated on `thread/resume`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list."
         ),
     ]
     updated_at: Annotated[
@@ -11764,6 +11797,13 @@ class ThreadForkResponse(BaseModel):
         ),
     ]
     cwd: AbsolutePathBuf
+    disabled_plugin_ids: Annotated[
+        list[str] | None,
+        Field(
+            alias="disabledPluginIds",
+            description="Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+        ),
+    ] = []
     instruction_sources: Annotated[
         list[LegacyAppPathString] | None,
         Field(
@@ -11831,7 +11871,21 @@ class ThreadResumeResponse(BaseModel):
             description="Reviewer currently used for approval requests on this thread.",
         ),
     ]
+    collaboration_mode: Annotated[
+        CollaborationMode | None,
+        Field(
+            alias="collaborationMode",
+            description="Effective collaboration mode. Absent when resuming from an older server.",
+        ),
+    ] = None
     cwd: AbsolutePathBuf
+    disabled_plugin_ids: Annotated[
+        list[str] | None,
+        Field(
+            alias="disabledPluginIds",
+            description="Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+        ),
+    ] = []
     instruction_sources: Annotated[
         list[LegacyAppPathString] | None,
         Field(
@@ -11892,18 +11946,6 @@ class ThreadRevertResponse(BaseModel):
     ] = None
 
 
-class ThreadRollbackResponse(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    thread: Annotated[
-        Thread,
-        Field(
-            description="The updated thread after applying the rollback, with `turns` populated.\n\nThe ThreadItems stored in each Turn are lossy since we explicitly do not persist all agent interactions, such as command executions. This is the same behavior as `thread/resume`."
-        ),
-    ]
-
-
 class ThreadSearchResult(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -11925,6 +11967,13 @@ class ThreadStartResponse(BaseModel):
         ),
     ]
     cwd: AbsolutePathBuf
+    disabled_plugin_ids: Annotated[
+        list[str] | None,
+        Field(
+            alias="disabledPluginIds",
+            description="Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+        ),
+    ] = []
     instruction_sources: Annotated[
         list[LegacyAppPathString] | None,
         Field(
@@ -12002,6 +12051,13 @@ class TurnStartParams(BaseModel):
     cwd: Annotated[
         str | None,
         Field(description="Override the working directory for this turn and subsequent turns."),
+    ] = None
+    disabled_plugin_ids: Annotated[
+        list[str] | None,
+        Field(
+            alias="disabledPluginIds",
+            description="Replace this thread's disabled plugin IDs. Omitted/null preserves the list; [] clears it.",
+        ),
     ] = None
     effort: Annotated[
         ReasoningEffort | None,
@@ -12113,7 +12169,6 @@ class ClientRequest(
         | ThreadCompactStartRequest
         | ThreadShellCommandRequest
         | ThreadApproveGuardianDeniedActionRequest
-        | ThreadRollbackRequest
         | ThreadRevertRequest
         | ThreadListRequest
         | ThreadSectionListRequest
@@ -12221,7 +12276,6 @@ class ClientRequest(
         | ThreadCompactStartRequest
         | ThreadShellCommandRequest
         | ThreadApproveGuardianDeniedActionRequest
-        | ThreadRollbackRequest
         | ThreadRevertRequest
         | ThreadListRequest
         | ThreadSectionListRequest

@@ -391,10 +391,31 @@ pub enum InvocationType {
     Implicit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitationType {
+    /// Authentication or account linking blocked the original attempt, as reported
+    /// by trusted connector auth-failure metadata. Both are treated the same when
+    /// identifying elicitation-only usage. This does not imply that an
+    /// authentication prompt was shown or completed.
+    AuthOrLink,
+    Approval,
+}
+
 pub struct AppInvocation {
     pub connector_id: Option<String>,
     pub app_name: Option<String>,
     pub invocation_type: Option<InvocationType>,
+}
+
+/// A known classification, queued before the corresponding item completion.
+/// Ordinary calls do not send this fact; their emitted classification stays null.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpToolCallElicitation {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub elicitation_type: ElicitationType,
 }
 
 #[derive(Clone)]
@@ -576,6 +597,7 @@ pub(crate) enum CustomAnalyticsFact {
     SkillInvoked(SkillInvokedInput),
     AppMentioned(AppMentionedInput),
     AppUsed(AppUsedInput),
+    McpToolCallElicitation(McpToolCallElicitation),
     HookRun(HookRunInput),
     PluginUsed(PluginUsedInput),
     PluginInstallRequested(PluginInstallRequestedInput),
@@ -604,6 +626,8 @@ pub struct PluginMeasurementsInput {
     pub turn_id: String,
     pub item_id: String,
     pub originator: String,
+    pub model_slug: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub plugin_id: String,
     pub execution_id: String,
     pub operation: String,
@@ -623,6 +647,7 @@ pub(crate) struct AppMentionedInput {
 pub(crate) struct AppUsedInput {
     pub tracking: TrackEventsContext,
     pub app: AppInvocation,
+    pub elicitation_type: Option<ElicitationType>,
 }
 
 pub(crate) struct HookRunInput {

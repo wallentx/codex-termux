@@ -166,6 +166,20 @@
           "type": "object"
         },
         {
+          "anyOf": [
+            {
+              "properties": {
+                "image_url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "image_url"
+              ],
+              "title": "ImageUrlFunctionCallOutputContentItem",
+              "type": "object"
+            }
+          ],
           "properties": {
             "detail": {
               "anyOf": [
@@ -177,9 +191,6 @@
                 }
               ]
             },
-            "image_url": {
-              "type": "string"
-            },
             "type": {
               "enum": [
                 "input_image"
@@ -189,7 +200,6 @@
             }
           },
           "required": [
-            "image_url",
             "type"
           ],
           "title": "InputImageFunctionCallOutputContentItem",
@@ -734,6 +744,16 @@
       "description": "Override the working directory for this turn and subsequent turns.",
       "type": [
         "string",
+        "null"
+      ]
+    },
+    "disabledPluginIds": {
+      "description": "Replace this thread's disabled plugin IDs. Omitted/null preserves the list; [] clears it.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
         "null"
       ]
     },
