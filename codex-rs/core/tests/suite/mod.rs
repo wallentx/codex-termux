@@ -64,6 +64,7 @@ mod cyber_access_program;
 mod cyber_exec_policy;
 mod daybreak_access;
 mod deprecation_notice;
+mod direct_tool_metadata;
 mod exec;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]
@@ -98,8 +99,11 @@ mod interrupt_hooks;
 mod items;
 mod json_result;
 mod live_cli;
+#[path = "managed_threads_tests.rs"]
+mod managed_threads;
 mod mcp_auth_elicitation;
 mod mcp_auth_refresh;
+mod mcp_ema_config;
 mod mcp_extension_protocol;
 mod mcp_optional_startup_grace;
 #[cfg(unix)]
@@ -127,6 +131,7 @@ mod openai_file_mcp;
 mod otel;
 mod override_updates;
 mod pending_input;
+mod pending_input_persistence;
 mod permissions_messages;
 mod personality;
 mod plugins;
@@ -163,6 +168,7 @@ mod rollout_compression;
 mod rollout_list_find;
 mod safety_buffering;
 mod safety_check_downgrade;
+mod scenarios;
 mod search_tool;
 mod settings_commits;
 mod settings_constraints;

@@ -126,6 +126,12 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.projectId")]
     #[ts(optional = nullable)]
     pub project_id: Option<String>,
+    /// Initial Daybreak choice for this persistent thread. Omitted or null
+    /// leaves it unset. This does not select a turn's `cyberAccessProgram`
+    /// or grant access. Not supported for ephemeral threads.
+    #[experimental("thread/start.daybreakEnabled")]
+    #[ts(optional = nullable)]
+    pub daybreak_enabled: Option<bool>,
     /// Optional sticky environments for this thread.
     ///
     /// Omitted selects the default environment when environment access is
@@ -183,6 +189,9 @@ pub struct ThreadStartResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<String>,
+    /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+    #[serde(default)]
+    pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
@@ -225,6 +234,10 @@ impl ThreadStartResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadSettingsUpdateParams {
     pub thread_id: String,
+    /// Replace this thread's disabled plugin IDs.
+    /// Omitted/null preserves the list; [] clears it.
+    #[ts(optional = nullable)]
+    pub disabled_plugin_ids: Option<Vec<String>>,
     /// Override the working directory for subsequent turns.
     #[ts(optional = nullable)]
     pub cwd: Option<PathBuf>,
@@ -287,6 +300,9 @@ pub struct ThreadSettingsUpdateResponse {}
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSettings {
+    /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+    #[serde(default)]
+    pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
@@ -417,6 +433,9 @@ pub struct ThreadResumeResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<String>,
+    /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+    #[serde(default)]
+    pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
@@ -439,6 +458,8 @@ pub struct ThreadResumeResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Effective collaboration mode. Absent when resuming from an older server.
+    pub collaboration_mode: Option<CollaborationMode>,
     /// @deprecated Always `explicitRequestOnly`. Use `reasoningEffort` for Ultra behavior.
     #[experimental("thread/resume.multiAgentMode")]
     #[serde(default)]
@@ -608,6 +629,9 @@ pub struct ThreadForkResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<String>,
+    /// Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.
+    #[serde(default)]
+    pub disabled_plugin_ids: Vec<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
@@ -1223,31 +1247,6 @@ pub struct ThreadBackgroundTerminalsTerminateParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadBackgroundTerminalsTerminateResponse {
     pub terminated: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-/// DEPRECATED: `thread/rollback` will be removed soon.
-pub struct ThreadRollbackParams {
-    pub thread_id: String,
-    /// The number of turns to drop from the end of the thread. Must be >= 1.
-    ///
-    /// This only modifies the thread's history and does not revert local file changes
-    /// that have been made by the agent. Clients are responsible for reverting these changes.
-    pub num_turns: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ThreadRollbackResponse {
-    /// The updated thread after applying the rollback, with `turns` populated.
-    ///
-    /// The ThreadItems stored in each Turn are lossy since we explicitly do not
-    /// persist all agent interactions, such as command executions. This is the same
-    /// behavior as `thread/resume`.
-    pub thread: Thread,
 }
 
 /// Replace a paginated thread's durable history with the prefix before one turn.

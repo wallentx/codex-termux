@@ -18,6 +18,7 @@ use codex_config::ConfigRequirementsToml;
 use codex_config::ConstrainedWithSource;
 use codex_config::FeatureRequirementsToml;
 use codex_config::ManagedAuthPolicy;
+use codex_config::McpEnterpriseManagedAuthConfig;
 use codex_config::McpServerRequirement;
 use codex_config::PluginRequirementsToml;
 use codex_config::ProfileV2Name;
@@ -164,6 +165,7 @@ mod auth_keyring;
 pub mod edit;
 mod managed_features;
 mod metrics;
+mod network_config;
 mod network_proxy_spec;
 mod otel;
 mod permission_path;
@@ -175,6 +177,7 @@ mod resolved_permission_profile;
 #[cfg(test)]
 mod schema;
 mod token_budget_startup;
+mod windows_sandbox_config;
 pub use auth_keyring::bootstrap_auth_config;
 pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
 pub use codex_agent_roles::AgentRoleConfig;
@@ -188,22 +191,30 @@ use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
 pub use codex_sandboxing::system_bwrap_warning;
 pub use managed_features::ManagedFeatures;
 pub(crate) use metrics::emit_session_start_metrics;
+pub use network_config::EnvironmentNetworkConfigError;
+pub use network_config::NetworkConfigInputs;
+pub use network_config::PreparedNetworkConfig;
+pub use network_config::project_environment_profile_network;
+pub use network_config::validate_environment_network_policy;
 pub use network_proxy_spec::NetworkProxySpec;
 pub use network_proxy_spec::StartedNetworkProxy;
 pub use permission_profile_catalog::PermissionProfileCatalogEntry;
 pub use permission_profile_catalog::permission_profile_catalog;
 use permission_profile_catalog::permission_profile_catalog_from_permissions;
 use permission_profile_catalog::permission_profile_is_allowed;
-use permission_profile_catalog::validate_permission_profile_for_deny_read;
+pub use permission_profile_catalog::validate_permission_profile_for_deny_read;
 pub use permission_profile_selection::ResolvedPermissionProfileSelection;
 pub use permission_profile_selection::resolve_permission_profile_selection;
 pub use permissions::CompiledPermissionProfile;
 pub use permissions::WorkspaceWriteSettings;
 pub use permissions::compile_permission_profile;
 pub(crate) use permissions::is_builtin_permission_profile_name;
+pub use permissions::network_proxy_config_from_profile_network;
 pub use permissions::resolve_permission_profile;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
 pub use token_budget_startup::TokenBudgetStartupConfig;
+pub use windows_sandbox_config::PreparedWindowsSandboxConfig;
+pub use windows_sandbox_config::prepare_windows_sandbox_config;
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
@@ -573,32 +584,10 @@ fn build_network_proxy_spec(
     environment_overrides: &HashMap<String, String>,
 ) -> std::io::Result<Option<NetworkProxySpec>> {
     configured_network_proxy_config.configure_credential_broker_environment(environment_overrides);
-    let (network_requirements, network_requirements_source) = match network_requirements {
-        Some(Sourced { value, source }) => (Some(value), Some(source)),
-        None => (None, None),
-    };
-    let has_network_requirements = network_requirements.is_some();
-    let network = NetworkProxySpec::from_config_and_constraints(
-        configured_network_proxy_config,
-        network_requirements,
-        permission_profile,
-    )
-    .map_err(|err| {
-        if let Some(source) = network_requirements_source.as_ref() {
-            std::io::Error::new(
-                err.kind(),
-                format!("failed to build managed network proxy from {source}: {err}"),
-            )
-        } else {
-            err
-        }
-    })?;
-
-    Ok(if has_network_requirements {
-        Some(network)
-    } else {
-        network.enabled().then_some(network)
-    })
+    PreparedNetworkConfig {
+        configured_proxy: configured_network_proxy_config,
+    }
+    .build(network_requirements, permission_profile)
 }
 
 /// Configured thread persistence backend.
@@ -693,6 +682,11 @@ pub struct Config {
     /// `# Policy Configuration` section rather than replacing the whole
     /// guardian developer prompt.
     pub guardian_policy_config: Option<String>,
+
+    /// Guardian prompt template override from config.toml.
+    /// The resolved policy config replaces its `{{ tenant_policy_config }}`
+    /// placeholder when a review session is built.
+    pub guardian_policy_template: Option<String>,
 
     /// Whether to inject the `<permissions instructions>` developer block.
     pub include_permissions_instructions: bool,
@@ -845,6 +839,9 @@ pub struct Config {
 
     /// Definition for MCP servers that Codex can reach out to for tool calls.
     pub mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
+
+    /// Trusted IdP shared by all permitted EMA MCP registrations.
+    pub mcp_enterprise_managed_auth: Option<McpEnterpriseManagedAuthConfig>,
 
     /// When present, only these MCP servers omit the legacy `mcp__` namespace prefix.
     pub non_prefixed_mcp_tool_servers: Option<Vec<String>>,
@@ -1525,17 +1522,6 @@ impl Config {
         &self.sqlite
     }
 
-    /// Whether Guardian may use the unmetered Codex inference endpoints.
-    pub fn free_guardian_enabled(&self) -> bool {
-        self.config_layer_stack
-            .effective_config()
-            .get("features")
-            .and_then(|features| features.get("guardianv2"))
-            .and_then(|guardian| guardian.get("free_guardian"))
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(false)
-    }
-
     /// Resolves the configured, reviewer-catalog, or bundled Guardian policy.
     pub fn resolve_guardian_policy<'a>(
         &'a self,
@@ -1717,6 +1703,11 @@ impl Config {
         additional_plugin_registrations: impl IntoIterator<Item = McpServerRegistration>,
     ) -> McpConfig {
         let mut catalog = ResolvedMcpCatalog::builder();
+        if self.features.enabled(Feature::UseXaa)
+            && let Some(auth) = &self.mcp_enterprise_managed_auth
+        {
+            catalog.enable_ema(auth.idp.clone());
+        }
         for (plugin_order, plugin) in loaded_plugins
             .plugins()
             .iter()
@@ -1760,6 +1751,9 @@ impl Config {
             chatgpt_base_url: self.chatgpt_base_url.clone(),
             apps_mcp_product_sku: self.apps_mcp_product_sku.clone(),
             codex_home: self.codex_home.to_path_buf(),
+            mcp_enterprise_managed_auth: self.mcp_enterprise_managed_auth.clone(),
+            xaa_enabled: self.features.enabled(Feature::UseXaa)
+                && self.mcp_enterprise_managed_auth.is_some(),
             mcp_oauth_credentials_store_mode: self.mcp_oauth_credentials_store_mode,
             oauth_refresh_mode: if self.features.enabled(Feature::McpOAuthRefreshCoordination) {
                 McpOAuthRefreshMode::Coordinated
@@ -1833,33 +1827,8 @@ impl Config {
         &self,
         refreshed_config: &Config,
     ) -> std::io::Result<Self> {
-        let mut layers = refreshed_config
-            .config_layer_stack
-            .all_layers_low_to_high()
-            .filter(|layer| !is_session_layer(&layer.name))
-            .cloned()
-            .collect::<Vec<_>>();
-        layers.extend(
-            self.config_layer_stack
-                .all_layers_low_to_high()
-                .filter(|layer| is_session_layer(&layer.name))
-                .cloned(),
-        );
-        layers.sort_by_key(|layer| layer.name.precedence());
-
-        let config_layer_stack = ConfigLayerStack::new(
-            layers,
-            refreshed_config.config_layer_stack.requirements().clone(),
-            refreshed_config
-                .config_layer_stack
-                .requirements_toml()
-                .clone(),
-        )?
-        .with_user_and_project_exec_policy_rules_ignored(
-            refreshed_config
-                .config_layer_stack
-                .ignore_user_and_project_exec_policy_rules(),
-        );
+        let config_layer_stack =
+            self.layer_stack_preserving_session(&refreshed_config.config_layer_stack)?;
         let cfg: ConfigToml = config_layer_stack
             .effective_config()
             .try_into()
@@ -1882,6 +1851,33 @@ impl Config {
             config_layer_stack,
         )
         .await
+    }
+
+    fn layer_stack_preserving_session(
+        &self,
+        refreshed_layers: &ConfigLayerStack,
+    ) -> std::io::Result<ConfigLayerStack> {
+        let mut layers = refreshed_layers
+            .all_layers_low_to_high()
+            .filter(|layer| !is_session_layer(&layer.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        layers.extend(
+            self.config_layer_stack
+                .all_layers_low_to_high()
+                .filter(|layer| is_session_layer(&layer.name))
+                .cloned(),
+        );
+        layers.sort_by_key(|layer| layer.name.precedence());
+
+        Ok(ConfigLayerStack::new(
+            layers,
+            refreshed_layers.requirements().clone(),
+            refreshed_layers.requirements_toml().clone(),
+        )?
+        .with_user_and_project_exec_policy_rules_ignored(
+            refreshed_layers.ignore_user_and_project_exec_policy_rules(),
+        ))
     }
 
     /// This is the preferred way to create an instance of [Config].
@@ -3302,6 +3298,12 @@ impl Config {
             feature_requirements,
             &mut startup_warnings,
         )?;
+        let mcp_enterprise_managed_auth = McpEnterpriseManagedAuthConfig::resolve(
+            &config_layer_stack,
+            cfg.mcp_enterprise_managed_auth.as_ref(),
+            &cfg.mcp_servers,
+            features.enabled(Feature::UseXaa),
+        )?;
         let non_prefixed_mcp_tool_servers = if features.enabled(Feature::NonPrefixedMcpToolNames) {
             cfg.features
                 .as_ref()
@@ -3315,28 +3317,15 @@ impl Config {
         };
         let respect_system_proxy = features.enabled(Feature::RespectSystemProxy);
         let enable_network_proxy = features.enabled(Feature::NetworkProxy);
-        let configured_windows_sandbox_mode = resolve_windows_sandbox_mode(&cfg);
-        // Keep the configured mode separate so a requirement-constrained mode
-        // does not look like it was explicitly selected in config.
-        let selected_windows_sandbox_mode = configured_windows_sandbox_mode.or_else(|| {
-            match WindowsSandboxLevel::from_features(&features) {
-                WindowsSandboxLevel::Elevated => Some(WindowsSandboxModeToml::Elevated),
-                WindowsSandboxLevel::RestrictedToken => Some(WindowsSandboxModeToml::Unelevated),
-                WindowsSandboxLevel::Disabled => None,
-            }
-        });
-        apply_requirement_constrained_value(
-            "windows.sandbox",
-            selected_windows_sandbox_mode,
+        let PreparedWindowsSandboxConfig {
+            mode: windows_sandbox_mode,
+            level: windows_sandbox_level,
+        } = prepare_windows_sandbox_config(
+            resolve_windows_sandbox_mode(&cfg),
+            WindowsSandboxLevel::from_features(&features),
             &mut constrained_windows_sandbox_mode,
             &mut startup_warnings,
         )?;
-        let effective_windows_sandbox_mode = *constrained_windows_sandbox_mode.get();
-        let windows_sandbox_mode = if constrained_windows_sandbox_mode.source.is_some() {
-            effective_windows_sandbox_mode
-        } else {
-            configured_windows_sandbox_mode
-        };
         let windows_sandbox_private_desktop = resolve_windows_sandbox_private_desktop(&cfg);
         let resolved_cwd = AbsolutePathBuf::try_from(normalize_for_native_workdir({
             use std::env;
@@ -3373,11 +3362,6 @@ impl Config {
             sandbox_mode,
         );
         let requirements_toml = config_layer_stack.requirements_toml();
-        let windows_sandbox_level = match effective_windows_sandbox_mode {
-            Some(WindowsSandboxModeToml::Elevated) => WindowsSandboxLevel::Elevated,
-            Some(WindowsSandboxModeToml::Unelevated) => WindowsSandboxLevel::RestrictedToken,
-            None => WindowsSandboxLevel::Disabled,
-        };
         let persisted_permission_profile_id = if sandbox_mode.is_some()
             || permission_profile.is_some()
             || default_permissions_override.is_some()
@@ -3472,7 +3456,7 @@ impl Config {
         };
         dedupe_absolute_paths(&mut workspace_roots);
         let (
-            mut configured_network_proxy_config,
+            configured_network_proxy_config,
             permission_profile,
             file_system_sandbox_policy,
             mut active_permission_profile,
@@ -3610,17 +3594,13 @@ impl Config {
                 Vec::new(),
             )
         };
-        if enable_network_proxy && permission_profile.network_sandbox_policy().is_enabled() {
-            if let Some(network_proxy) = network_proxy_toml_config(cfg.features.as_ref()) {
-                apply_network_proxy_feature_config(
-                    &mut configured_network_proxy_config,
-                    network_proxy,
-                );
-            }
-            configured_network_proxy_config
-                .set_credential_broker_openai_base_url(cfg.openai_base_url.as_deref());
-            configured_network_proxy_config.enabled = true;
-        }
+        let prepared_network = PreparedNetworkConfig::from_inputs(NetworkConfigInputs {
+            configured_proxy: configured_network_proxy_config,
+            feature_enabled: enable_network_proxy,
+            features: cfg.features.as_ref(),
+            candidate_permission_profile: &permission_profile,
+            credential_broker_base_url: cfg.openai_base_url.as_deref(),
+        });
         if cfg.approval_policy == Some(AskForApproval::UnlessTrusted) {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
@@ -3924,13 +3904,15 @@ impl Config {
                             auto_review.policy.as_deref(),
                         ))
                 });
-        let personality = personality
-            .or(cfg.personality)
-            .or_else(|| {
-                features
-                    .enabled(Feature::Personality)
-                    .then_some(Personality::Pragmatic)
+        let guardian_policy_template = cfg
+            .auto_review
+            .as_ref()
+            .and_then(|auto_review| {
+                normalize_guardian_policy_config(
+                    auto_review.experimental_policy_template.as_deref(),
+                )
             });
+        let personality = personality.or(cfg.personality);
 
         let experimental_compact_prompt_path = cfg.experimental_compact_prompt_file.as_ref();
         let file_compact_prompt = Self::try_read_non_empty_file(
@@ -4032,7 +4014,7 @@ impl Config {
 
         let network_permission_profile = constrained_permission_profile.get().clone();
         let network = build_network_proxy_spec(
-            configured_network_proxy_config,
+            prepared_network.configured_proxy,
             network_requirements,
             &network_permission_profile,
             &shell_environment_policy.r#set,
@@ -4203,6 +4185,7 @@ impl Config {
             },
             mcp_servers,
             non_prefixed_mcp_tool_servers,
+            mcp_enterprise_managed_auth,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
             mcp_oauth_credentials_store_mode: resolve_mcp_oauth_credentials_store_mode(
@@ -4272,6 +4255,7 @@ impl Config {
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
             guardian_policy_config,
+            guardian_policy_template,
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,

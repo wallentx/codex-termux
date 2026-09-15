@@ -159,7 +159,6 @@ use super::analytics::wait_for_matching_analytics_event;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
 #[tokio::test]
 async fn thread_resume_paginated_model_context_preserves_original_metadata() -> Result<()> {
@@ -1449,11 +1448,11 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
             thread_id: thread_id.clone(),
             cwd: Some(persisted_cwd.clone()),
             collaboration_mode: Some(CollaborationMode {
-                mode: ModeKind::Default,
+                mode: ModeKind::Plan,
                 settings: Settings {
                     model: "gpt-5.2-codex".to_string(),
                     reasoning_effort: None,
-                    developer_instructions: None,
+                    developer_instructions: Some("Persisted plan instructions".to_string()),
                 },
             }),
             ..Default::default()
@@ -1482,18 +1481,102 @@ async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewe
         .await?;
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id,
+            thread_id: thread_id.clone(),
+            model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
         .await?;
     let ThreadResumeResponse {
         cwd,
         reasoning_effort,
+        collaboration_mode,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
-    assert_eq!(reasoning_effort, None);
+    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(cwd.as_path(), persisted_cwd);
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    let mode = items.iter().rev().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+            if event
+                .thread_id
+                .is_some_and(|id| id.to_string() == thread_id) =>
+        {
+            Some(event.thread_settings.collaboration_mode.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(collaboration_mode, mode);
+    assert_eq!(
+        mode,
+        Some(CollaborationMode {
+            mode: ModeKind::Plan,
+            settings: Settings {
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: Some(ReasoningEffort::High),
+                developer_instructions: Some("Persisted plan instructions".to_string())
+            },
+        })
+    );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_restores_collaboration_mode_from_legacy_turn_context() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let fixture = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
+    mock_responses_config(&server.uri())
+        .with_root_config("model_reasoning_effort = \"high\"")
+        .write(codex_home.path())?;
+    let saved_mode = CollaborationMode {
+        mode: ModeKind::Plan,
+        settings: Settings {
+            model: "gpt-5.2-codex".into(),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            developer_instructions: Some("Legacy plan instructions".into()),
+        },
+    };
+    let context = serde_json::from_value(json!({
+        "cwd": codex_home.path(),
+        "approval_policy": "never",
+        "sandbox_policy": {"type": "read-only"},
+        "model": saved_mode.settings.model,
+        "effort": saved_mode.settings.reasoning_effort,
+        "summary": "auto",
+        "collaboration_mode": saved_mode,
+    }))?;
+    append_rollout_item_to_path(
+        &fixture.rollout_file_path,
+        &RolloutItem::TurnContext(context),
+    )
+    .await?;
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&fixture.rollout_file_path).await?;
+    assert!(!items.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+    )));
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: fixture.conversation_id,
+            model: Some("gpt-5.4".into()),
+            ..Default::default()
+        })
+        .await?;
+    let response: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(
+        response.collaboration_mode,
+        Some(saved_mode.with_updates(
+            Some("gpt-5.4".into()),
+            Some(Some(ReasoningEffort::High)),
+            /*developer_instructions*/ None,
+        ))
+    );
     Ok(())
 }
 
@@ -2678,6 +2761,7 @@ fn append_resume_redaction_history(
     let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
     let appended_rollout = [
         EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+            turn_id: String::new(),
             call_id: "mcp-1".to_string(),
             invocation: McpInvocation {
                 server: "docs".to_string(),
@@ -6059,7 +6143,7 @@ async fn start_materialized_thread_and_restart(
 }
 
 #[tokio::test]
-async fn thread_resume_accepts_personality_override() -> Result<()> {
+async fn thread_resume_accepts_deprecated_personality_override() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -6085,7 +6169,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
 
     let start_id = primary
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("gpt-5.4".to_string()),
+            model: Some("exp-codex-personality".to_string()),
             ..Default::default()
         })
         .await?;
@@ -6123,7 +6207,7 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let resume_id = secondary
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id,
-            model: Some("gpt-5.4".to_string()),
+            model: Some("exp-codex-personality".to_string()),
             personality: Some(Personality::Friendly),
             ..Default::default()
         })
@@ -6156,6 +6240,8 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     .await??;
 
     let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected initial and resumed turns");
+    let initial_instructions_text = requests[0].instructions_text();
     let request = requests
         .last()
         .expect("expected request for resumed thread turn");
@@ -6163,13 +6249,13 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected a personality update message in developer input, got {developer_texts:?}"
+            .all(|text| !text.contains("<personality_spec>")),
+        "deprecated personality override emitted a developer update: {developer_texts:?}"
     );
     let instructions_text = request.instructions_text();
-    assert!(
-        instructions_text.contains(CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT),
-        "expected default base instructions from history, got {instructions_text:?}"
+    assert_eq!(
+        instructions_text, initial_instructions_text,
+        "resume should retain the original base instructions"
     );
 
     Ok(())

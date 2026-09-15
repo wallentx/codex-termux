@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use codex_config::ConfigLayerStack;
 use codex_config::Constrained;
+use codex_config::McpEnterpriseManagedAuthConfig;
 use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
@@ -127,6 +128,9 @@ pub struct McpConfig {
     pub apps_mcp_product_sku: Option<String>,
     /// Codex home directory used for MCP OAuth state and app-tool cache files.
     pub codex_home: PathBuf,
+    /// Trusted enterprise IdP inherited after normal catalog and policy resolution.
+    pub mcp_enterprise_managed_auth: Option<McpEnterpriseManagedAuthConfig>,
+    pub xaa_enabled: bool,
     /// Preferred credential store for MCP OAuth tokens.
     pub mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode,
     /// OAuth refresh ownership selected for new MCP connections.
@@ -398,7 +402,7 @@ pub fn effective_mcp_servers_from_configured(
                         server.auth = McpServerAuth::OAuth;
                     }
                 }
-                McpServerAuth::OAuth => {}
+                McpServerAuth::OAuth | McpServerAuth::EmaAuth => {}
             }
             let agent_plugin = config
                 .mcp_server_catalog
@@ -467,6 +471,7 @@ pub async fn read_mcp_resource(
 #[derive(Debug, Clone)]
 pub struct McpServerStatusSnapshot {
     pub server_infos: HashMap<String, McpServerInfo>,
+    pub server_capabilities: HashMap<String, serde_json::Value>,
     pub tools_by_server: HashMap<String, HashMap<String, Tool>>,
     pub tools_errors: HashMap<String, String>,
     pub resources: HashMap<String, Vec<Resource>>,
@@ -488,6 +493,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
     if mcp_servers.is_empty() {
         return McpServerStatusSnapshot {
             server_infos: HashMap::new(),
+            server_capabilities: HashMap::new(),
             tools_by_server: HashMap::new(),
             tools_errors: HashMap::new(),
             resources: HashMap::new(),
@@ -819,6 +825,7 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     }
 
     McpServerStatusSnapshot {
+        server_capabilities: mcp_connection_manager.list_available_server_capabilities(),
         server_infos,
         tools_by_server,
         tools_errors,

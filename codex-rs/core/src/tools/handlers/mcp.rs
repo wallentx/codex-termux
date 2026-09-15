@@ -157,9 +157,9 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
                 .map(str::to_string),
         });
 
-        ToolSearchInfo::from_spec(
+        ToolSearchInfo::from_shared_spec(
             build_mcp_search_text(&self.tool_info),
-            self.spec(),
+            Arc::clone(&self.spec),
             source_info,
         )
     }
@@ -200,7 +200,7 @@ impl McpHandler {
         });
         notify_tool_start(&invocation, mcp_tool.as_ref()).await;
 
-        let originating_item_id = invocation.originating_item_id().await;
+        let originating_call = invocation.originating_call().await;
         let ToolInvocation {
             session,
             step_context,
@@ -232,7 +232,7 @@ impl McpHandler {
             &step_context,
             &cancellation_token,
             call_id.clone(),
-            originating_item_id,
+            originating_call,
             &self.tool_info,
             prepared_mcp_call,
             self.hook_tool_name(),
@@ -748,7 +748,14 @@ mod tests {
             })
         );
 
-        // Reuse the direct invocation to catch recording placed after the Code Mode-only return.
+        // Nested MCP result metadata still reaches the owning Code Mode cell.
+        let cell_id = codex_code_mode::CellId::new("mcp-cell".to_string());
+        recorder.start_cell(&cell_id, "exec-mcp-post");
+        let mut invocation = invocation;
+        invocation.source = ToolCallSource::CodeMode {
+            cell_id: cell_id.as_str().to_string(),
+            runtime_tool_call_id: "mcp-runtime-call".to_string(),
+        };
         let mut output = output;
         output.result.meta = Some(json!({ "provider/custom": { "items": [1, null] } }));
         output.result_metadata_capture_allowed = true;
@@ -763,9 +770,10 @@ mod tests {
             &invocation.step_context,
         );
         handler.on_tool_result_accepted(&invocation, &output);
-        let mut items = [codex_protocol::models::ResponseItem::from(
-            output.to_response_item(&invocation.call_id, &invocation.payload),
-        )];
+        let mut items = [serde_json::from_value(json!({
+            "type": "custom_tool_call_output", "call_id": "exec-mcp-post", "output": "notes",
+        }))
+        .expect("Code Mode output")];
         recorder.attach_to_prompt(&mut items, &mut Default::default());
         assert_eq!(
             serde_json::to_value(items[0].executed_tool_call_metadata()).unwrap()["executed_tool_calls"],

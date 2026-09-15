@@ -788,7 +788,11 @@ impl ThreadHistoryBuilder {
             error: None,
             duration_ms: None,
         };
-        self.upsert_item_in_current_turn(item);
+        if payload.turn_id.is_empty() {
+            self.upsert_item_in_current_turn(item);
+        } else {
+            self.upsert_item_in_turn_id(&payload.turn_id, item);
+        }
     }
 
     fn handle_mcp_tool_call_end(&mut self, payload: &McpToolCallEndEvent) {
@@ -841,7 +845,11 @@ impl ThreadHistoryBuilder {
             error,
             duration_ms,
         };
-        self.upsert_item_in_current_turn(item);
+        if payload.turn_id.is_empty() {
+            self.upsert_item_in_current_turn(item);
+        } else {
+            self.upsert_item_in_turn_id(&payload.turn_id, item);
+        }
     }
 
     fn handle_view_image_tool_call(&mut self, payload: &ViewImageToolCallEvent) {
@@ -2247,6 +2255,7 @@ mod tests {
                 .to_string(),
         }];
         let command_item = CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
+            model_context: None,
             id: "exec-1".to_string(),
             plugin_id: Some("sample@openai-curated".to_string()),
             script_path: Some("scripts/run.py".to_string()),
@@ -2332,6 +2341,7 @@ mod tests {
         assert_eq!(
             build_turns_from_rollout_items(&items[..2])[0].items,
             vec![ThreadItem::CommandExecution {
+                model_context: None,
                 id: "exec-1".to_string(),
                 plugin_id: Some("sample@openai-curated".to_string()),
                 script_path: Some("scripts/run.py".to_string()),
@@ -2357,6 +2367,7 @@ mod tests {
         assert_eq!(
             turns[0].items,
             vec![ThreadItem::CommandExecution {
+                model_context: None,
                 id: "exec-1".to_string(),
                 plugin_id: Some("sample@openai-curated".to_string()),
                 script_path: Some("scripts/run.py".to_string()),
@@ -2998,6 +3009,7 @@ mod tests {
                 status: CoreExecCommandStatus::Completed,
             }),
             EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+                turn_id: String::new(),
                 call_id: "mcp-1".into(),
                 invocation: McpInvocation {
                     server: "docs".into(),
@@ -3042,6 +3054,7 @@ mod tests {
         assert_eq!(
             turns[0].items[2],
             ThreadItem::CommandExecution {
+                model_context: None,
                 id: "exec-1".into(),
                 plugin_id: None,
                 script_path: None,
@@ -3091,6 +3104,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             }),
             EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+                turn_id: String::new(),
                 call_id: "mcp-1".into(),
                 invocation: McpInvocation {
                     server: "docs".into(),
@@ -3311,6 +3325,7 @@ mod tests {
         assert_eq!(
             turns[0].items[1],
             ThreadItem::CommandExecution {
+                model_context: None,
                 id: "exec-declined".into(),
                 plugin_id: None,
                 script_path: None,
@@ -3362,6 +3377,7 @@ mod tests {
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
                 review_reason: None,
+                model_context: None,
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 plugin_id: Some("sample@openai-curated".into()),
@@ -3384,6 +3400,7 @@ mod tests {
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
                 review_reason: None,
+                model_context: None,
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 plugin_id: Some("sample@openai-curated".into()),
@@ -3418,6 +3435,7 @@ mod tests {
         assert_eq!(
             turns[0].items[1],
             ThreadItem::CommandExecution {
+                model_context: None,
                 id: "guardian-exec".into(),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
@@ -3457,6 +3475,7 @@ mod tests {
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
                 review_reason: None,
+                model_context: None,
                 id: "review-guardian-execve".into(),
                 target_item_id: Some("guardian-execve".into()),
                 plugin_id: Some("sample@openai-curated".into()),
@@ -3490,6 +3509,7 @@ mod tests {
         assert_eq!(
             turns[0].items[1],
             ThreadItem::CommandExecution {
+                model_context: None,
                 id: "guardian-execve".into(),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
@@ -3506,6 +3526,99 @@ mod tests {
                 duration_ms: None,
             }
         );
+    }
+
+    #[test]
+    fn assigns_late_legacy_mcp_completion_to_original_turn() {
+        use codex_protocol::items::McpToolCallItem;
+        use codex_protocol::items::McpToolCallStatus as CoreMcpToolCallStatus;
+        use codex_protocol::protocol::HasLegacyEvent;
+
+        let completion = ItemCompletedEvent {
+            thread_id: ThreadId::new(),
+            turn_id: "turn-a".into(),
+            started_at_ms: None,
+            completed_at_ms: 0,
+            item: CoreTurnItem::McpToolCall(McpToolCallItem {
+                id: "mcp-1".into(),
+                server: "slack".into(),
+                tool: "search".into(),
+                arguments: serde_json::json!({"query": "incident"}),
+                connector_id: None,
+                mcp_app_resource_uri: None,
+                link_id: None,
+                app_name: None,
+                action_name: None,
+                plugin_id: None,
+                read_only_hint: Some(true),
+                status: CoreMcpToolCallStatus::Completed,
+                result: Some(CallToolResult {
+                    content: vec![serde_json::json!({"type": "text", "text": "Found incident"})],
+                    structured_content: None,
+                    is_error: None,
+                    meta: None,
+                }),
+                error: None,
+                duration: Some(Duration::from_millis(8)),
+            }),
+        };
+        let events = vec![
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                root_turn_id: None,
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "Find related incident discussions".into(),
+                ..Default::default()
+            }),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                started_at: None,
+                last_agent_message: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-b".into(),
+                root_turn_id: None,
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "Explain retry logic while that runs".into(),
+                ..Default::default()
+            }),
+        ];
+        let mut items: Vec<_> = events.into_iter().map(RolloutItem::EventMsg).collect();
+        let mut expected = build_turns_from_rollout_items(&items);
+        expected[0]
+            .items
+            .push(ThreadItem::from(completion.item.clone()));
+
+        let legacy = completion.as_legacy_events(/*show_raw_agent_reasoning*/ false);
+        let serialized = serde_json::to_string(&legacy[0]).unwrap();
+        items.push(RolloutItem::EventMsg(
+            serde_json::from_str(&serialized).unwrap(),
+        ));
+        assert_eq!(build_turns_from_rollout_items(&items), expected);
+
+        // Old records have no owner, so retain their current-turn fallback.
+        let mut old_record: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        old_record.as_object_mut().unwrap().remove("turn_id");
+        *items.last_mut().unwrap() =
+            RolloutItem::EventMsg(serde_json::from_value(old_record).unwrap());
+        let mut expected_old = expected;
+        let mcp_item = expected_old[0].items.pop().unwrap();
+        expected_old[1].items.push(mcp_item);
+        assert_eq!(build_turns_from_rollout_items(&items), expected_old);
     }
 
     #[test]
@@ -3598,6 +3711,7 @@ mod tests {
         assert_eq!(
             turns[0].items[1],
             ThreadItem::CommandExecution {
+                model_context: None,
                 id: "exec-late".into(),
                 plugin_id: None,
                 script_path: None,

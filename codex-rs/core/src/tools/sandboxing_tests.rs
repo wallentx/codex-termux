@@ -255,7 +255,7 @@ fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backend() {
         manager: &manager,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd_uri),
-        codex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: false,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Elevated,
         windows_sandbox_private_desktop: false,
@@ -326,7 +326,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         manager: &manager,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd_uri),
-        codex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: false,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
@@ -336,6 +336,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     let managed_network = ManagedNetworkSandboxContext {
         loopback_ports: vec![43123],
         allow_local_binding: false,
+        ..Default::default()
     };
     let command = || SandboxCommand {
         program: "/bin/bash".into(),
@@ -372,10 +373,10 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
             workspace_roots: vec![cwd_uri.clone()],
             user_home_dir: None,
             temporary_directories: None,
-            windows_sandbox_level: if cfg!(windows) {
-                codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken
+            windows_sandbox_selection: if cfg!(windows) {
+                codex_file_system::WindowsSandboxSelection::RestrictedToken
             } else {
-                codex_protocol::config_types::WindowsSandboxLevel::Disabled
+                codex_file_system::WindowsSandboxSelection::Disabled
             },
             windows_sandbox_private_desktop: false,
             windows_sandbox_proxy_settings_mode: None,

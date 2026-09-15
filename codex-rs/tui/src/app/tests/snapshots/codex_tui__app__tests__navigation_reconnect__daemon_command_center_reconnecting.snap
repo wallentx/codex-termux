@@ -12,6 +12,7 @@ expression: "render_bottom_popup(&app.chat_widget, 100)"
                                                           │
                                                           │ Project
                                                           │ /tmp/project
+                                                          │ Model: Unknown
                                                           │
                                                           │ Prompt
                                                           │ Selected task
@@ -21,8 +22,7 @@ expression: "render_bottom_popup(&app.chat_widget, 100)"
                                                           │
                                                           │
                                                           │
-  New task
-
-› Keep this task draft!
-
-   esc tasks · dispatch paused
+                                                          │
+                                                          │
+  Rename › Keep this task draft!
+  esc cancel · actions paused until reconnected

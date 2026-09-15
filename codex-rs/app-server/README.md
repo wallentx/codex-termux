@@ -1,3 +1,14 @@
+# Initial Daybreak choice (experimental)
+
+Persistent threads accept `daybreakEnabled` on `thread/start` with the
+`experimentalApi` opt-in. The response and `thread/started` notification both
+include the initial choice in `thread.daybreakEnabled`. The choice is staged
+with the thread's other initial metadata and saved when the thread is persisted.
+An unused thread is not guaranteed to survive restart. Omitted or null leaves
+the choice unset. Ephemeral threads cannot save it.
+Use `thread/metadata/update` for later changes. This preference does not select
+`turn/start.cyberAccessProgram` or grant access to an access program.
+
 # User verification cancellation (experimental)
 
 Local UI clients can cancel a native user-verification RPC by sending
@@ -65,7 +76,7 @@ ChatGPT account identity.
 | Method | Params | Result |
 | --- | --- | --- |
 | `userVerification/status` | `{}` | `{credentialId, unavailableReason, unavailableMessage}` |
-| `userVerification/enroll` | `{}` | `{credentialId}` |
+| `userVerification/enroll` | `{}` | `{credentialId, algorithm?, publicKey?}` |
 | `userVerification/delete` | `{}` | `{}` |
 | `userVerification/verify` | `{challenge, title, description}` | `{proof: {credentialId, signature}}` |
 | `userVerification/cancel` | `{requestId}` | `{}` |
@@ -74,9 +85,17 @@ Status reads local readiness without prompting or contacting a backend. A null
 `unavailableReason` means local checks passed, not that registration is valid.
 Unsupported platforms and missing account identity are reported in the status
 response's `unavailableReason` field.
-The initial enrollment creates or reuses the local key only. Backend
-registration and revocation are integration TODOs; local success is not server
-enrollment. Deletion currently removes that local key synchronously.
+Enrollment creates or reuses the local key and returns its public metadata. The
+`publicKey` is unpadded base64url SPKI-DER; `algorithm` is `ecdsaP256Sha256X962`.
+During the experimental rollout, `algorithm` and `publicKey` are optional for
+compatibility with older app-servers. Current servers populate both fields;
+callers must check that both are present and non-null before backend registration.
+The trusted UI host owns backend registration: obtain an enrollment challenge,
+sign it with `userVerification/verify`, check that the proof's `credentialId`
+matches this response, and submit the public metadata and proof to the backend.
+Local success is not server enrollment. The caller must preserve the authenticated
+account across this flow and reconcile uncertain registration before retrying.
+Deletion removes the local key; the caller owns backend revocation.
 Enrollment and deletion coordinate credential lifecycle; callers do not issue
 separate generate or rotate commands. Identity comes from the authenticated
 account; this API exposes no caller-selected scope.
@@ -104,6 +123,15 @@ until that worker exits.
 Failures use the normal JSON-RPC error envelope with closed `{type, reason}` data:
 `invalidRequest`, `unavailable`, `cancelled`, or `failed`. UI clients branch on
 these values rather than message text. Native diagnostic payloads stay private.
+
+## Managed model provider requirements
+
+Existing threads retain their provider configuration. Input RPCs reject requests when managed
+`model_provider` or `model_providers` requirements no longer match that configuration, or cannot
+be loaded. This covers turn start/steer, review, compaction, manual queue start, and active goal
+updates. Realtime connections use separate routing configuration and are not checked here.
+Interrupt, realtime stop, and goal pause/clear remain available. User and project
+configuration changes alone do not invalidate existing threads.
 
 # Amazon Bedrock authentication
 
@@ -173,4 +201,60 @@ Attachments record the resources currently associated with a thread, independent
 
 `thread/attachment/list` accepts one `threadId` and returns at most 100 attachments per page, ordered by creation time and attachment id. Continue with `nextCursor` and the same `threadId` until the cursor is `null`. Each thread can retain up to 100 attachments. Removing an attachment frees a slot for a new attachment.
 
+A non-ephemeral fork copies the source thread's current attachments, even when forking at an earlier turn. The copies have new attachment IDs and creation timestamps, but retain the same resource identities and payloads. Clients use `forkedFromId` on `thread/started` to detect forks and call `thread/attachment/list` with the new thread ID to load their attachments. Fork copying does not emit per-attachment updates; explicit add/remove operations still do. Copying is awaited before publishing the fork, but is best effort: a copy failure is logged and the conversation fork succeeds without attachments. Membership can then change independently on either thread; the referenced resources themselves are not copied. Resuming a fork does not repeat the copy.
+
 Attachment creation and deletion requests using the same thread ID are serialized across connections. The requesting client receives its response before the compact update is broadcast, and duplicate creates or absent deletes do not emit updates. Deleting the owning thread removes its attachments under the same lifecycle exclusion; queued attachment mutations then report that the thread was not found.
+
+# Thread plugin settings
+
+`thread/settings/update` and `turn/start` accept `disabledPluginIds`, a list of
+`PluginSummary.id` values from `plugin/list`, in the
+`<plugin-name>@<marketplace-name>` format. A supplied list replaces the selection;
+omission or `null` preserves it, and `[]` clears it. Saving this selection does
+not yet filter plugin capabilities.
+
+Read the selection from `threadSettings.disabledPluginIds` in
+`thread/settings/updated` notifications, or from `disabledPluginIds` in
+`thread/start`, `thread/resume`, and `thread/fork` responses. Selections persist
+across resume. Forks restore the selection from the history retained at the
+requested fork boundary.
+
+# MCP server capabilities
+
+`mcpServerStatus/list` returns `serverCapabilities` for each initialized MCP server
+in both `full` and `toolsAndAuthOnly` detail modes, including thread-scoped reads.
+This is the server's advertised MCP capabilities object, including its `extensions`
+map. It is null when the connection has not initialized successfully; capabilities
+are never inferred from tools or copied from a shared catalog cache.
+
+# Thread rollback
+
+`thread/rollback` has been removed from the API, including its request and response
+types. Requests use the generic unknown-method rejection path. Use `thread/revert`
+for paginated threads instead.
+
+Existing rollouts may contain historical `ThreadRolledBack` events. Their replay
+and migration remain supported so resuming, reading, and forking those threads
+preserves the surviving history. This disk compatibility does not require restoring
+support for new `thread/rollback` requests.
+
+# Selected workspace routing
+
+The experimental `account/read.workspaceRouting` response field returns the selected ChatGPT workspace's `chatgptAccountId`, resolved HTTPS `backendOrigin`, and backend-provided `accountRoutingOverride`. The routing value is `us`, `us_cr`, or the explicit `NO_CONSTRAINT` value. API-only and signed-out accounts return `null` and do not need `accounts/check`.
+
+App-server discovers routing for saved ChatGPT logins at startup and for new logins or workspace switches. After requirements and routing are ready, it sends the existing `account/updated` notification. Newly initialized connections also receive this notification once saved-workspace routing is ready, including when discovery finished before the connection initialized. Clients then reread `configRequirements/read` and `account/read`. Saved ChatGPT credentials without a selected workspace ID retain their account information and return `workspaceRouting: null`; app-server does not guess a workspace from the backend's default account. Discovery failures for a selected workspace, including missing or null fields from older backends, return an `account/read` error. They never produce a successful unrestricted result. A later read retries failed discovery. Logout clears the cached routing, and results from earlier authentication owners are discarded. Token refreshes for the same known user and workspace invalidate cached routing without cancelling discovery or failing sign-in. Configuration is reloaded after discovery; a changed backend, model provider, or required backend rejects the result so the next read discovers against current configuration. Account notifications recheck the auth owner generation after waiting for outbound queue capacity. Superseded sign-in attempts emit a failed `account/login/completed` event instead of silently dropping completion. Notifications remain snapshots: clients reread current account and requirements state rather than treating a queued notification as authorization.
+
+The origin of a required `chatgpt_base_url` must match the discovered origin by scheme, host, and effective port. The base URL's API path is not part of this comparison. Either origin alone is sufficient. If requirements specify no base URL and discovery explicitly returns `NO_CONSTRAINT`, the effective `chatgpt_base_url` supplies the origin, including its existing default. `backendOrigin` is always a resolved origin; `accountRoutingOverride` preserves `NO_CONSTRAINT` when the backend explicitly returns it. Discovering an origin does not change API paths or apply routing headers to requests.
+
+## Windows sandbox implementation selection
+
+`windowsSandbox/setupStart` and `windowsSandbox/readiness` apply only to the
+legacy `elevated` and `unelevated` backends. Clients resolve the desired sandbox
+implementation from configuration. When it is `mxc`, they skip both methods;
+`allowedWindowsSandboxImplementations` can allow `mxc` independently of the
+legacy setup modes. Non-Windows hosts report `notConfigured` for the legacy
+readiness API.
+
+MXC uses the standard `command/exec` streaming and process-control path, including
+ConPTY when `tty` is enabled. The buffered legacy Windows sandbox restrictions on
+process control and custom output caps do not apply to MXC.

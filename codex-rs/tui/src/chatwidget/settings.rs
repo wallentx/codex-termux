@@ -83,9 +83,6 @@ impl ChatWidget {
         if feature == Feature::Worktrees {
             self.sync_worktrees_enabled();
         }
-        if feature == Feature::Personality {
-            self.sync_personality_command_enabled();
-        }
         if feature == Feature::Plugins {
             self.sync_plugins_command_enabled();
             self.refresh_plugin_mentions();
@@ -140,18 +137,6 @@ impl ChatWidget {
         self.refresh_status_surfaces();
     }
 
-    pub(crate) fn set_world_writable_warning_acknowledged(&mut self, acknowledged: bool) {
-        self.local_settings.notices.hide_world_writable_warning = Some(acknowledged);
-    }
-
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub(crate) fn world_writable_warning_hidden(&self) -> bool {
-        self.local_settings
-            .notices
-            .hide_world_writable_warning
-            .unwrap_or(false)
-    }
-
     /// Override the reasoning effort used when Plan mode is active.
     ///
     /// When the active mask is already Plan, the override is applied immediately
@@ -193,11 +178,6 @@ impl ChatWidget {
             mask.reasoning_effort = Some(effort);
         }
         self.refresh_model_dependent_surfaces();
-    }
-
-    /// Set the personality in the widget's config copy.
-    pub(crate) fn set_personality(&mut self, personality: Personality) {
-        self.config.personality = Some(personality);
     }
 
     pub(crate) fn status_account_display(&self) -> Option<&StatusAccountDisplay> {
@@ -321,11 +301,6 @@ impl ChatWidget {
         );
     }
 
-    pub(super) fn sync_personality_command_enabled(&mut self) {
-        self.bottom_pane
-            .set_personality_command_enabled(self.config.features.enabled(Feature::Personality));
-    }
-
     pub(super) fn sync_plugins_command_enabled(&mut self) {
         self.bottom_pane
             .set_plugins_command_enabled(self.config.features.enabled(Feature::Plugins));
@@ -339,20 +314,6 @@ impl ChatWidget {
     pub(super) fn sync_mentions_v2_enabled(&mut self) {
         self.bottom_pane
             .set_mentions_v2_enabled(self.config.features.enabled(Feature::MentionsV2));
-    }
-
-    pub(super) fn current_model_supports_personality(&self) -> bool {
-        let model = self.current_model();
-        self.model_catalog
-            .try_list_models()
-            .ok()
-            .and_then(|models| {
-                models
-                    .into_iter()
-                    .find(|preset| preset.model == model)
-                    .map(|preset| preset.supports_personality)
-            })
-            .unwrap_or(false)
     }
 
     /// Return whether the effective model currently advertises image-input support.
@@ -467,8 +428,6 @@ impl ChatWidget {
     pub(super) fn refresh_model_display(&mut self) {
         let effective = self.effective_collaboration_mode();
         self.session_header.set_model(effective.model());
-        self.bottom_pane
-            .set_astra_sparkle(effective.model(), &self.local_settings.tui);
         // Keep composer paste affordances aligned with the currently effective model.
         self.sync_image_paste_enabled();
         self.sync_service_tier_commands();
@@ -535,7 +494,6 @@ impl ChatWidget {
         self.refresh_effective_service_tier();
         self.refresh_status_surfaces();
         self.sync_service_tier_commands();
-        self.sync_personality_command_enabled();
         if cwd_changed {
             self.invalidate_connector_scope();
             self.refresh_skills_for_current_cwd(/*force_reload*/ true);
@@ -566,7 +524,7 @@ impl ChatWidget {
             .set_workspace_roots(self.config.workspace_roots.clone());
     }
 
-    pub(super) fn set_effective_collaboration_mode(&mut self, mode: CollaborationMode) {
+    pub(crate) fn set_effective_collaboration_mode(&mut self, mode: CollaborationMode) {
         let mode_kind = mode.mode;
         let settings = mode.settings;
         if mode_kind == ModeKind::Default {

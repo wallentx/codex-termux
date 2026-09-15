@@ -34,9 +34,9 @@ impl CodeModeExecuteHandler {
     async fn execute(
         &self,
         session: std::sync::Arc<crate::session::session::Session>,
-        step_context: std::sync::Arc<crate::session::step_context::StepContext>,
+        step_context: Arc<crate::session::step_context::StepContext>,
         call_id: String,
-        originating_item_id: Option<codex_protocol::ResponseItemId>,
+        originating_call: Option<crate::tools::context::ToolCallOrigin>,
         code: String,
         telemetry: &mut CodeModeToolCallGuard,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
@@ -71,13 +71,16 @@ impl CodeModeExecuteHandler {
             .session
             .services
             .code_mode_service
-            .execute(codex_code_mode::ExecuteRequest {
-                tool_call_id: call_id.clone(),
-                enabled_tools,
-                source: args.code.clone(),
-                yield_time_ms: args.yield_time_ms,
-                max_output_tokens: args.max_output_tokens,
-            })
+            .execute(
+                codex_code_mode::ExecuteRequest {
+                    tool_call_id: call_id.clone(),
+                    enabled_tools,
+                    source: args.code.clone(),
+                    yield_time_ms: args.yield_time_ms,
+                    max_output_tokens: args.max_output_tokens,
+                },
+                Arc::clone(&step_context),
+            )
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();
@@ -110,7 +113,7 @@ impl CodeModeExecuteHandler {
         exec.session
             .services
             .code_mode_service
-            .mark_cell_ready_for_dispatch(&cell_id, originating_item_id);
+            .mark_cell_ready_for_dispatch(&cell_id, originating_call);
         let response = started_cell
             .initial_response()
             .await
@@ -191,7 +194,7 @@ impl CodeModeExecuteHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let handler_span = tracing::Span::current();
-        let originating_item_id = invocation.originating_item_id().await;
+        let originating_call = invocation.originating_call().await;
         let ToolInvocation {
             session,
             turn,
@@ -217,7 +220,7 @@ impl CodeModeExecuteHandler {
                     session,
                     step_context,
                     call_id,
-                    originating_item_id,
+                    originating_call,
                     input,
                     &mut telemetry,
                 )

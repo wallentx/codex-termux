@@ -5,6 +5,7 @@ use super::*;
 
 impl ChatWidget {
     pub(crate) fn pause_for_disconnect(&mut self) {
+        self.cancel_image_submission();
         // The app-server transport can fail while the separate WebRTC helper
         // still sends microphone audio. Retire local media before showing offline UI.
         if matches!(
@@ -51,7 +52,7 @@ impl ChatWidget {
                 input.recovered_queue = true;
             }
             input.current_collaboration_mode = self.current_collaboration_mode.clone();
-            // Resume supplies model/effort, but not the user's selected collaboration mode.
+            // Keep the local selection for older servers. Replay reapplies a supplied mode.
             if let Some(mask) = input.active_collaboration_mask.as_mut() {
                 mask.model = Some(self.current_model().to_string());
                 mask.reasoning_effort = Some(self.effective_reasoning_effort());
