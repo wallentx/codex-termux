@@ -1344,7 +1344,9 @@ async fn managed_auth_policy_survives_unusable_requirements_file_changes() -> Re
     )?;
     for refreshed in [
         service.load_latest_config(/*fallback_cwd*/ None).await?,
-        service.load_latest_config_for_thread(&startup).await?,
+        service
+            .load_latest_config_with_session_layers(&startup.config_layer_stack, &startup.cwd)
+            .await?,
     ] {
         assert_eq!(refreshed.forced_login_method, None);
         assert_eq!(refreshed.forced_chatgpt_workspace_id, None);
@@ -1535,7 +1537,7 @@ async fn write_value_rejects_feature_requirement_conflict() {
         CloudConfigBundleFixture::loader_with_enterprise_requirement(
             r#"
 [features]
-personality = true
+fast_mode = true
 "#,
         ),
     );
@@ -1543,7 +1545,7 @@ personality = true
     let error = service
         .write_value(ConfigValueWriteParams {
             file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-            key_path: "features.personality".to_string(),
+            key_path: "features.fast_mode".to_string(),
             value: serde_json::json!(false),
             merge_strategy: MergeStrategy::Replace,
             expected_version: None,
@@ -1558,7 +1560,7 @@ personality = true
     assert!(
         error
             .to_string()
-            .contains("invalid value for `features`: `features.personality=false`"),
+            .contains("invalid value for `features`: `features.fast_mode=false`"),
         "{error}"
     );
     assert_eq!(

@@ -640,7 +640,7 @@ pub struct Config {
     /// Info needed to make an API request to the model.
     pub model_provider: ModelProviderInfo,
 
-    /// Optionally specify the personality of the model
+    /// Deprecated: `friendly` and `pragmatic` no longer select a style.
     pub personality: Option<Personality>,
 
     /// Effective permission configuration for shell tool execution.
@@ -1622,7 +1622,6 @@ impl Config {
                     Some(BaseInstructionsProvenance::Model { .. })
                 )
             }),
-            personality_enabled: self.features.enabled(Feature::Personality),
             personality: self.personality,
             model_catalog: self.model_catalog.clone(),
         }
@@ -1827,12 +1826,23 @@ impl Config {
         }
     }
 
-    pub async fn rebuild_preserving_session_layers(
-        &self,
+    pub fn workspace_routing_context(&self) -> codex_model_provider::WorkspaceRoutingContext {
+        codex_model_provider::WorkspaceRoutingContext::new(self.chatgpt_base_url.clone())
+            .with_session(codex_login::WorkspaceRoutingSession {
+                cwd: self.cwd.to_path_buf(),
+                config_layer_stack: self.config_layer_stack.clone(),
+            })
+    }
+
+    pub async fn rebuild_with_session_layers(
+        session_layers: &ConfigLayerStack,
+        cwd: PathBuf,
         refreshed_config: &Config,
     ) -> std::io::Result<Self> {
-        let config_layer_stack =
-            self.layer_stack_preserving_session(&refreshed_config.config_layer_stack)?;
+        let config_layer_stack = Self::layer_stack_preserving_session(
+            session_layers,
+            &refreshed_config.config_layer_stack,
+        )?;
         let cfg: ConfigToml = config_layer_stack
             .effective_config()
             .try_into()
@@ -1847,7 +1857,7 @@ impl Config {
             LOCAL_FS.as_ref(),
             cfg,
             ConfigOverrides {
-                cwd: Some(self.cwd.to_path_buf()),
+                cwd: Some(cwd),
                 default_zsh_path,
                 ..Default::default()
             },
@@ -1858,7 +1868,7 @@ impl Config {
     }
 
     fn layer_stack_preserving_session(
-        &self,
+        session_layers: &ConfigLayerStack,
         refreshed_layers: &ConfigLayerStack,
     ) -> std::io::Result<ConfigLayerStack> {
         let mut layers = refreshed_layers
@@ -1867,7 +1877,7 @@ impl Config {
             .cloned()
             .collect::<Vec<_>>();
         layers.extend(
-            self.config_layer_stack
+            session_layers
                 .all_layers_low_to_high()
                 .filter(|layer| is_session_layer(&layer.name))
                 .cloned(),
@@ -2575,6 +2585,7 @@ pub struct ConfigOverrides {
     pub default_zsh_path: Option<AbsolutePathBuf>,
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
+    /// Deprecated: `friendly` and `pragmatic` no longer select a style.
     pub personality: Option<Personality>,
     pub compact_prompt: Option<String>,
     pub show_raw_agent_reasoning: Option<bool>,
