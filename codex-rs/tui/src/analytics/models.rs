@@ -22,6 +22,18 @@ impl From<Option<PlanType>> for AccountKind {
     }
 }
 
+/// Match the existing CLI thread-usage capability without widening other workspace reports.
+pub(super) fn thread_usage_supported(plan: Option<PlanType>) -> bool {
+    matches!(
+        plan,
+        Some(
+            PlanType::Business
+                | PlanType::EnterpriseCbpUsageBased
+                | PlanType::EnterpriseCbpAutomation
+        )
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccountAnalyticsReport {
     Usage,
@@ -48,7 +60,8 @@ impl AccountAnalyticsGrouping {
         match AccountKind::from(plan) {
             AccountKind::Business => &[Self::Surface, Self::Model, Self::Speed],
             AccountKind::Enterprise => &[Self::Surface, Self::Model, Self::Speed, Self::Reasoning],
-            AccountKind::Consumer | AccountKind::Unknown => &[Self::Surface],
+            AccountKind::Consumer => &[Self::Surface],
+            AccountKind::Unknown => &[],
         }
     }
 }
