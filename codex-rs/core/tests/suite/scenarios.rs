@@ -23,6 +23,7 @@ use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::items::AgentMessageDelivery;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ImageReference;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -382,7 +383,9 @@ async fn astra_kickoff_with_skills_plugins_and_remote_compaction() -> Result<()>
         .start_or_steer_turn(TurnInputRequest::user_input(vec![
             text("Check the final kickoff brief and attached sketch with $final-check and $calendar:agenda."),
             UserInput::Image {
-                image_url: format!("data:image/png;base64,{ONE_PIXEL_PNG_BASE64}"),
+                image: ImageReference::Inline {
+                    image_url: format!("data:image/png;base64,{ONE_PIXEL_PNG_BASE64}"),
+                },
                 detail: None,
             },
             selected_skill("final-check", &skills.final_check),
@@ -632,5 +635,33 @@ async fn astra_refreshes_plugin_tools_and_skills_in_an_existing_thread() -> Resu
             &ContextSnapshotOptions::default().include_request_settings(),
         )
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_checkpoint_migration_request_history() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    use super::guardian_checkpoint_migration::migration_scenario;
+    let requests = migration_scenario().await?;
+    let mut snapshot = context_snapshot::format_request_history_snapshot(
+        "An old checkpoint retains a user restriction and verified answer. Incompatible automatic compaction keeps legacy review across restart with its saved answer; compatible manual compaction immediately activates thread-owned review.",
+        &requests,
+        &ContextSnapshotOptions::default()
+            .rewrite_known_segments()
+            .include_request_settings(),
+    );
+    // Normalize executor paths and shell wrappers in the reviewed actions.
+    for (pattern, replacement) in [
+        (r#"(?m)^(\s*"cwd": )"[^"]*""#, "$1\"<CWD>\""),
+        (
+            r#""command": \[\s*(?:"[^"]*",\s*)*"exit 0"\s*\]"#,
+            "\"command\": [\"<SHELL>\", \"exit 0\"]",
+        ),
+    ] {
+        snapshot = regex_lite::Regex::new(pattern)?
+            .replace_all(&snapshot, replacement)
+            .into_owned();
+    }
+    insta::assert_snapshot!("guardian_checkpoint_migration", snapshot);
     Ok(())
 }
