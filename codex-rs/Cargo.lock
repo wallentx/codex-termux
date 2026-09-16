@@ -4040,6 +4040,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "wiremock",
 ]
 
@@ -5233,7 +5234,6 @@ name = "codex-windows-sandbox-service"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "codex-cloud-config",
  "codex-config",
  "codex-core",

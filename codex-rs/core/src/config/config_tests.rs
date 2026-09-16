@@ -5307,7 +5307,7 @@ fn filter_plugin_mcp_servers_by_matchers_enforces_name_and_invocation() {
 }
 
 #[tokio::test]
-async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::Result<()> {
+async fn rebuild_with_session_layers_refreshes_requirements() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let user_file = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home.path());
     let project_dot_codex =
@@ -5476,9 +5476,12 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
         thread_layer_stack,
     )
     .await?;
-    let config = thread_config
-        .rebuild_preserving_session_layers(&refreshed_config)
-        .await?;
+    let config = Config::rebuild_with_session_layers(
+        &thread_config.config_layer_stack,
+        thread_config.cwd.to_path_buf(),
+        &refreshed_config,
+    )
+    .await?;
 
     assert_eq!(
         config.mcp_servers.get(),
@@ -5516,8 +5519,7 @@ async fn rebuild_preserving_session_layers_refreshes_requirements() -> std::io::
 }
 
 #[tokio::test]
-async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
--> anyhow::Result<()> {
+async fn rebuild_with_session_layers_refreshes_plugin_derived_mcp_config() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
     let plugin_root = codex_home
         .path()
@@ -5599,9 +5601,12 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
         thread_layer_stack,
     )
     .await?;
-    let config = thread_config
-        .rebuild_preserving_session_layers(&refreshed_config)
-        .await?;
+    let config = Config::rebuild_with_session_layers(
+        &thread_config.config_layer_stack,
+        thread_config.cwd.to_path_buf(),
+        &refreshed_config,
+    )
+    .await?;
     let plugins_manager =
         plugins_manager_for_config(&config, auth_manager_from_optional_auth(/*auth*/ None));
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
@@ -11201,7 +11206,7 @@ async fn feature_requirements_normalize_effective_feature_values() -> std::io::R
             CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 r#"
 [features]
-personality = true
+view_image = true
 shell_tool = false
 use_xaa = true
 "#,
@@ -11210,7 +11215,7 @@ use_xaa = true
         .build()
         .await?;
 
-    assert!(config.features.enabled(Feature::Personality));
+    assert!(config.features.enabled(Feature::ViewImage));
     assert!(!config.features.enabled(Feature::ShellTool));
     assert!(
         !config
@@ -11396,7 +11401,7 @@ async fn explicit_feature_config_is_normalized_by_requirements() -> std::io::Res
         codex_home.path().join(CONFIG_TOML_FILE),
         r#"
 [features]
-personality = false
+view_image = false
 shell_tool = true
 "#,
     )?;
@@ -11408,7 +11413,7 @@ shell_tool = true
             CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 r#"
 [features]
-personality = true
+view_image = true
 shell_tool = false
 "#,
             ),
@@ -11416,7 +11421,7 @@ shell_tool = false
         .build()
         .await?;
 
-    assert!(config.features.enabled(Feature::Personality));
+    assert!(config.features.enabled(Feature::ViewImage));
     assert!(!config.features.enabled(Feature::ShellTool));
     assert!(
         !config
@@ -11426,6 +11431,55 @@ shell_tool = false
         "{:?}",
         config.startup_warnings
     );
+
+    Ok(())
+}
+
+#[test]
+fn retired_personality_feature_requirements_do_not_reject_configured_values() -> std::io::Result<()>
+{
+    for (configured, required) in [(true, false), (false, true)] {
+        let cfg: ConfigToml = toml::from_str(&format!(
+            "[features]\npersonality = {configured}\nshell_tool = false\n"
+        ))
+        .expect("valid config");
+        let requirement = Sourced::new(
+            FeatureRequirementsToml {
+                entries: BTreeMap::from([
+                    ("personality".to_string(), required),
+                    ("shell_tool".to_string(), false),
+                ]),
+            },
+            RequirementSource::EnterpriseManaged {
+                id: "enterprise-id".to_string(),
+                name: "enterprise".to_string(),
+            },
+        );
+        validate_feature_requirements_for_config_toml(&cfg, Some(&requirement))?;
+
+        let configured_features = Features::from_sources(
+            FeatureConfigSource {
+                features: cfg.features.as_ref(),
+                ..Default::default()
+            },
+            FeatureConfigSource::default(),
+            FeatureOverrides::default(),
+        );
+        let mut warnings = Vec::new();
+        let features = ManagedFeatures::from_configured_with_warnings(
+            configured_features,
+            Some(requirement),
+            &mut warnings,
+        )?;
+        assert_eq!(
+            (
+                features.enabled(Feature::Personality),
+                features.enabled(Feature::ShellTool),
+                warnings,
+            ),
+            (false, false, Vec::new()),
+        );
+    }
 
     Ok(())
 }
@@ -12327,7 +12381,7 @@ async fn feature_requirements_normalize_runtime_feature_mutations() -> std::io::
             CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 r#"
 [features]
-personality = true
+view_image = true
 shell_tool = false
 "#,
             ),
@@ -12337,7 +12391,7 @@ shell_tool = false
 
     let mut requested = config.features.get().clone();
     requested
-        .disable(Feature::Personality)
+        .disable(Feature::ViewImage)
         .enable(Feature::ShellTool);
     assert!(config.features.can_set(&requested).is_ok());
     config
@@ -12345,7 +12399,7 @@ shell_tool = false
         .set(requested)
         .expect("managed feature mutations should normalize successfully");
 
-    assert!(config.features.enabled(Feature::Personality));
+    assert!(config.features.enabled(Feature::ViewImage));
     assert!(!config.features.enabled(Feature::ShellTool));
 
     Ok(())
