@@ -246,7 +246,7 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
         manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
-        sandbox_exe: None,
+        codex_linux_sandbox_exe: None,
         use_legacy_landlock: true,
         windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
         windows_sandbox_private_desktop: true,
@@ -276,12 +276,8 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
         Some(codex_utils_path_uri::PathUri::from_abs_path(&path))
     );
     assert_eq!(
-        sandbox.windows_sandbox_selection,
-        if cfg!(windows) {
-            codex_file_system::WindowsSandboxSelection::RestrictedToken
-        } else {
-            codex_file_system::WindowsSandboxSelection::Disabled
-        }
+        sandbox.windows_sandbox_level,
+        WindowsSandboxLevel::RestrictedToken
     );
     assert_eq!(sandbox.windows_sandbox_private_desktop, true);
     assert_eq!(sandbox.use_legacy_landlock, true);
@@ -319,7 +315,7 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
         manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
-        sandbox_exe: None,
+        codex_linux_sandbox_exe: None,
         use_legacy_landlock: false,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
@@ -353,7 +349,7 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
             workspace_roots: vec![cwd],
             user_home_dir: Some(user_home_dir),
             temporary_directories: None,
-            windows_sandbox_selection: codex_file_system::WindowsSandboxSelection::RestrictedToken,
+            windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
             windows_sandbox_private_desktop: false,
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,

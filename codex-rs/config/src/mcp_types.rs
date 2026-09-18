@@ -16,7 +16,6 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::de::Error as SerdeError;
 
-use crate::McpEmaRegistration;
 use crate::RequirementSource;
 
 /// Effective MCP environment id when config omits `environment_id`.
@@ -60,8 +59,6 @@ pub enum McpServerDisabledReason {
     Unknown,
     /// The server was disabled by config requirements from the given source.
     Requirements { source: RequirementSource },
-    /// Enterprise authorization was rejected for this registration, not its name.
-    EmaRegistration,
 }
 
 impl fmt::Display for McpServerDisabledReason {
@@ -70,9 +67,6 @@ impl fmt::Display for McpServerDisabledReason {
             McpServerDisabledReason::Unknown => write!(f, "unknown"),
             McpServerDisabledReason::Requirements { source } => {
                 write!(f, "requirements ({source})")
-            }
-            McpServerDisabledReason::EmaRegistration => {
-                write!(f, "invalid enterprise registration")
             }
         }
     }
@@ -156,8 +150,8 @@ impl AsRef<str> for McpServerEnvVar {
     }
 }
 
-/// Client settings for MCP OAuth login or enterprise token exchange.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+/// OAuth client settings used when Codex launches an MCP OAuth flow.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct McpServerOAuthConfig {
     /// Explicit OAuth client identifier to present during authorization and token exchange.
@@ -171,24 +165,13 @@ pub struct McpServerOAuthConfig {
     /// Fixed callback port that takes precedence over Codex's global OAuth callback port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_port: Option<u16>,
-
-    /// Expected resource authorization server issuer for EMA token exchange.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization_server_issuer: Option<String>,
-
-    /// Host-resolved authorization; never accepted from a server or plugin declaration.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub ema_registration: Option<McpEmaRegistration>,
-
-    /// Host-policy rejection retained until catalog finalization; never deserialized.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub ema_registration_error: Option<&'static str>,
 }
 
-/// Authentication flow for an HTTP MCP server. Explicit credentials take
-/// precedence for OAuth and ChatGPT; EMA rejects alternate credentials and fallback.
+/// Authentication flow Codex attempts after resolving an HTTP MCP server's
+/// configured bearer token and authorization headers, which always take
+/// precedence. ChatGPT authentication falls back to stored OAuth credentials
+/// when its session provider is unavailable; both modes ultimately fall back
+/// to an unauthenticated connection.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpServerAuth {
@@ -202,10 +185,6 @@ pub enum McpServerAuth {
     /// still fall back to stored OAuth credentials.
     #[serde(rename = "chatgpt")]
     ChatGpt,
-    /// Exchange an enterprise IdP refresh token for resource-specific authorization.
-    /// Alternate credentials and ordinary OAuth fallback are not permitted.
-    #[serde(rename = "ema_auth")]
-    EmaAuth,
 }
 
 impl McpServerAuth {
@@ -219,7 +198,7 @@ pub struct McpServerConfig {
     #[serde(flatten)]
     pub transport: McpServerTransportConfig,
 
-    /// Authentication flow, including an explicit no-fallback EMA mode.
+    /// Authentication flow to use when no configured authorization resolves.
     #[serde(default, skip_serializing_if = "McpServerAuth::is_default")]
     pub auth: McpServerAuth,
 
@@ -271,15 +250,15 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
 
-    /// Optional scopes requested during MCP login or EMA token exchange.
+    /// Optional OAuth scopes to request during MCP login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
-    /// Optional client settings for MCP login or EMA token exchange.
+    /// Optional OAuth client settings for MCP login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<McpServerOAuthConfig>,
 
-    /// Optional resource parameter for MCP login or EMA token exchange (RFC 8707).
+    /// Optional OAuth resource parameter to include during MCP login (RFC 8707).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_resource: Option<String>,
 
@@ -511,20 +490,10 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
 
         let environment_id =
             environment_id.unwrap_or_else(|| DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string());
-        let auth = auth.unwrap_or_default();
-        if !matches!(auth, McpServerAuth::EmaAuth)
-            && oauth
-                .as_ref()
-                .is_some_and(|oauth| oauth.authorization_server_issuer.is_some())
-        {
-            return Err(
-                "oauth.authorization_server_issuer requires auth = \"ema_auth\"".to_string(),
-            );
-        }
 
         Ok(Self {
             transport,
-            auth,
+            auth: auth.unwrap_or_default(),
             environment_id,
             startup_timeout_sec,
             tool_timeout_sec,

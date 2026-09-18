@@ -5,15 +5,12 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
-use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
 fn image(url: &str) -> ContentItem {
     ContentItem::InputImage {
-        image: ImageReference::Inline {
-            image_url: url.into(),
-        },
+        image_url: url.into(),
         detail: Some(ImageDetail::High),
     }
 }
@@ -35,9 +32,7 @@ fn image_selection_preserves_source_policy_order_and_both_limits() {
             namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputImage {
-                    image: ImageReference::Inline {
-                        image_url: "tool".into(),
-                    },
+                    image_url: "tool".into(),
                     detail: Some(ImageDetail::High),
                 },
             ]),
@@ -95,72 +90,6 @@ fn image_selection_preserves_source_policy_order_and_both_limits() {
         TranscriptImages {
             images: vec![image("recent")],
             omitted_bytes: oversized.len() + fits_alone.len(),
-        }
-    );
-}
-
-/// File-backed images stay out of Guardian without consuming its inline-image capacity.
-#[test]
-fn file_images_are_omitted_without_displacing_inline_images() {
-    let file_image = ContentItem::InputImage {
-        image: ImageReference::File {
-            file_id: "file_123".to_string(),
-        },
-        detail: Some(ImageDetail::High),
-    };
-    let history = [
-        ResponseItem::Message {
-            id: None,
-            role: "user".into(),
-            content: vec![image("first"), file_image.clone(), image("second")],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: Some("screenshot".into()),
-            name: None,
-            namespace: None,
-            output: FunctionCallOutputPayload::from_content_items(vec![
-                FunctionCallOutputContentItem::InputImage {
-                    image: ImageReference::File {
-                        file_id: "file_tool".to_string(),
-                    },
-                    detail: Some(ImageDetail::High),
-                },
-                FunctionCallOutputContentItem::InputImage {
-                    image: ImageReference::Inline {
-                        image_url: "third".into(),
-                    },
-                    detail: Some(ImageDetail::High),
-                },
-            ]),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let repl = [
-        file_image,
-        image("fourth"),
-        ContentItem::InputImage {
-            image: ImageReference::File {
-                file_id: "file_repl".to_string(),
-            },
-            detail: Some(ImageDetail::High),
-        },
-    ];
-
-    assert_eq!(
-        TranscriptImages::collect(
-            &history,
-            TranscriptImageInput {
-                enabled: true,
-                include_tool_outputs: true,
-                node_repl_images: &repl,
-            }
-        ),
-        TranscriptImages {
-            images: ["first", "second", "third", "fourth"].map(image).to_vec(),
-            omitted_bytes: 0,
         }
     );
 }

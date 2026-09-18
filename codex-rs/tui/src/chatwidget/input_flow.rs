@@ -11,7 +11,6 @@ use crate::bottom_pane::slash_commands::find_slash_command;
 
 impl ChatWidget {
     pub(crate) fn set_parent_owned_thread(&mut self) {
-        self.cancel_image_submission();
         self.blocks_direct_input = true;
         self.bottom_pane.set_parent_owned_thread();
     }
@@ -298,8 +297,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn is_user_turn_pending_or_running(&self) -> bool {
-        self.pending_image_submission.is_some()
-            || self.input_queue.user_turn_pending_start
+        self.input_queue.user_turn_pending_start
             || self.turn_lifecycle.agent_turn_running
             || self.review.is_review_mode
             || (self.bottom_pane.is_task_running() && self.mcp_startup_status.is_none())
@@ -320,13 +318,7 @@ impl ChatWidget {
         if let Some(questions) = &mut self.bottom_pane.questions {
             questions.has_queued_messages = has_queued;
         }
-        let mut preview = self.input_queue.preview();
-        if let Some(pending) = &self.pending_image_submission {
-            preview.queued_messages.insert(
-                /*index*/ 0,
-                format!("Preparing images: {}", pending.message.text),
-            );
-        }
+        let preview = self.input_queue.preview();
         self.bottom_pane.set_pending_input_preview(
             preview.queued_messages,
             preview.pending_steers,

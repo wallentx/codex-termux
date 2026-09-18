@@ -2,9 +2,6 @@
 
 pub mod shell_detect;
 pub mod shell_snapshot;
-mod startup;
-
-pub use startup::shell_startup_script;
 
 pub mod bash;
 pub(crate) mod command_safety;

@@ -3,7 +3,6 @@
 use super::*;
 use crate::budget::section_tokens;
 use crate::composition::user_message;
-use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
@@ -147,9 +146,7 @@ fn budget_reserves_existing_context_and_preserves_required_messages() {
         .unwrap()
         .into_message();
     let image = ContentItem::InputImage {
-        image: ImageReference::Inline {
-            image_url: "data:image/png;base64,AAAA".to_owned(),
-        },
+        image_url: "data:image/png;base64,AAAA".to_owned(),
         detail: None,
     };
     let make_context = || ComposedContext {
@@ -244,9 +241,7 @@ fn image_omission_preserves_text_and_later_eviction_policy() {
             delivery: SectionDelivery::UserContent(vec![
                 Budgeted::optional(
                     ContentItem::InputImage {
-                        image: ImageReference::Inline {
-                            image_url: "rejected-image".to_owned(),
-                        },
+                        image_url: "rejected-image".to_owned(),
                         detail: None,
                     },
                     BudgetPriority::Image,
@@ -312,15 +307,11 @@ fn image_omission_preserves_text_and_later_eviction_policy() {
     );
 
     let older = ContentItem::InputImage {
-        image: ImageReference::Inline {
-            image_url: "older-image".to_owned(),
-        },
+        image_url: "older-image".to_owned(),
         detail: None,
     };
     let newer = ContentItem::InputImage {
-        image: ImageReference::Inline {
-            image_url: "newer-image".to_owned(),
-        },
+        image_url: "newer-image".to_owned(),
         detail: None,
     };
     let image_section = |images: Vec<ContentItem>| SectionOutput {

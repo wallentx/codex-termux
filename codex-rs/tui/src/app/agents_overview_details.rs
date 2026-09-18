@@ -1,6 +1,5 @@
 //! Bounded overview previews from existing reads and already-delivered events.
 //! Observing activity never attaches to a thread or fetches additional history.
-//! Message previews retain Markdown until the details panel's width is known.
 
 use super::App;
 use super::ThreadBufferedEvent;
@@ -15,30 +14,11 @@ use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStatus;
 use codex_protocol::ThreadId;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use std::collections::HashMap;
 
 const PREVIEW_CHARS: usize = 512;
-
-pub(super) fn preview_agent_message(text: &str) -> String {
-    preview_markdown(&crate::markdown::unwrap_markdown_fences(text))
-}
-
-pub(super) fn preview_markdown(text: &str) -> String {
-    text.chars()
-        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
-        .take(PREVIEW_CHARS)
-        .collect()
-}
-
-#[derive(Clone, Default)]
-pub(super) struct AgentsOverviewDetails {
-    pub(super) lines: Vec<Line<'static>>,
-    pub(super) usage_lines: Vec<Line<'static>>,
-    pub(super) last_message: Option<(String, AbsolutePathBuf)>,
-}
 
 pub(super) fn preview_text(text: &str) -> String {
     text.chars()
@@ -107,7 +87,7 @@ impl App {
                 item: ThreadItem::AgentMessage { text, .. },
                 ..
             }) => {
-                activity.last_message = Some(preview_agent_message(text));
+                activity.last_message = Some(preview_text(text));
                 activity.reasoning = None;
                 true
             }
@@ -131,7 +111,7 @@ impl App {
         &self,
         root: &Thread,
         children: &HashMap<String, Vec<&Thread>>,
-    ) -> AgentsOverviewDetails {
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         // Urgency comes first; on ties, prefer available current detail over history.
         let priority = |thread: &Thread| {
@@ -163,7 +143,7 @@ impl App {
             pending.sort_by(|left, right| right.id.cmp(&left.id));
         }
         let Ok(thread_id) = ThreadId::from_string(&source.id) else {
-            return AgentsOverviewDetails::default();
+            return lines;
         };
         let channel = self.thread_event_channels.get(&thread_id);
         let is_child = source.id != root.id;
@@ -210,20 +190,18 @@ impl App {
             }
             lines.extend(["Latest activity".dim().into(), header.clone().into()]);
         }
-        let last_message = activity
+        if let Some(message) = activity
             .and_then(|activity| activity.last_message.as_ref())
             .or_else(|| self.agents_overview.last_messages.get(&thread_id))
             .filter(|message| !message.trim().is_empty())
-            .map(|message| (message.clone(), source.cwd.clone()));
-        AgentsOverviewDetails {
-            lines,
-            usage_lines: ThreadId::from_string(&root.id)
-                .ok()
-                .and_then(|id| self.agents_overview.usage.get(&id))
-                .map(super::agents_overview_usage::usage_lines)
-                .unwrap_or_default(),
-            last_message,
+        {
+            lines.extend([
+                Line::default(),
+                "Last message".dim().into(),
+                message.clone().into(),
+            ]);
         }
+        lines
     }
 
     fn agents_overview_request_preview(&self, thread_id: ThreadId) -> Option<String> {

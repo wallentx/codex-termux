@@ -27,6 +27,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use super::GrpcStream;
+use super::delegate::GrpcDelegate;
 use super::events::EventSender;
 use super::validation;
 use super::waits::ActiveWait;
@@ -212,6 +213,7 @@ impl GrpcSession {
         limits: CodeModeSessionCellExecutionLimits,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak: &Weak<Self>| {
+            let delegate = Arc::new(GrpcDelegate::new(weak.clone()));
             let failure_session = weak.clone();
             let failure_handler = Arc::new(move |reason: String| {
                 if let Some(session) = failure_session.upgrade() {
@@ -221,10 +223,13 @@ impl GrpcSession {
             });
             Self {
                 id,
-                runtime: Arc::new(InProcessCodeModeSession::with_task_failure_handler(
-                    failure_handler,
-                    limits,
-                )),
+                runtime: Arc::new(
+                    InProcessCodeModeSession::with_delegate_and_task_failure_handler(
+                        delegate,
+                        failure_handler,
+                        limits,
+                    ),
+                ),
                 closed,
                 state: Mutex::new(SessionState::default()),
                 events,

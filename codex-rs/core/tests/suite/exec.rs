@@ -55,7 +55,6 @@ where
         &cwd,
         std::slice::from_ref(&cwd),
         &None,
-        /*codex_self_exe*/ &None,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )

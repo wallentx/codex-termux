@@ -13,13 +13,11 @@ use crate::facts::ArtifactOperation;
 use crate::facts::ArtifactOperationInput;
 use crate::facts::CodexGoalEvent;
 use crate::facts::CustomAnalyticsFact;
-use crate::facts::ElicitationType;
 use crate::facts::ExternalAgentConfigImportCompletedInput;
 use crate::facts::ExternalAgentConfigImportFailureInput;
 use crate::facts::HookRunFact;
 use crate::facts::HookRunInput;
 use crate::facts::ImagePreparationFact;
-use crate::facts::McpToolCallElicitation;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequested;
 use crate::facts::PluginInstallRequestedInput;
@@ -446,12 +444,7 @@ impl AnalyticsEventsClient {
         });
     }
 
-    pub fn track_app_used(
-        &self,
-        tracking: TrackEventsContext,
-        app: AppInvocation,
-        elicitation_type: Option<ElicitationType>,
-    ) {
+    pub fn track_app_used(&self, tracking: TrackEventsContext, app: AppInvocation) {
         let Some(queue) = self.queue.as_ref() else {
             return;
         };
@@ -459,18 +452,8 @@ impl AnalyticsEventsClient {
             return;
         }
         self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(
-            AppUsedInput {
-                tracking,
-                app,
-                elicitation_type,
-            },
+            AppUsedInput { tracking, app },
         )));
-    }
-
-    pub fn track_mcp_tool_call_elicitation(&self, input: McpToolCallElicitation) {
-        self.record_fact(AnalyticsFact::Custom(
-            CustomAnalyticsFact::McpToolCallElicitation(input),
-        ));
     }
 
     pub fn track_hook_run(&self, tracking: TrackEventsContext, hook: HookRunFact) {

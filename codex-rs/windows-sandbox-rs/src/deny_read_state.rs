@@ -51,7 +51,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
 
     for path in previous_paths {
         if !desired_keys.contains(&lexical_path_key(&path)) {
-            let _ = revoke_ace(&path, psid);
+            revoke_ace(&path, psid);
         }
     }
 

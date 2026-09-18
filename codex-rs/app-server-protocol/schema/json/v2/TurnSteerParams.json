@@ -105,32 +105,6 @@
           "type": "object"
         },
         {
-          "anyOf": [
-            {
-              "properties": {
-                "url": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "url"
-              ],
-              "title": "UrlUserInput",
-              "type": "object"
-            },
-            {
-              "properties": {
-                "fileId": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "fileId"
-              ],
-              "title": "FileIdUserInput",
-              "type": "object"
-            }
-          ],
           "properties": {
             "detail": {
               "anyOf": [
@@ -149,10 +123,14 @@
               ],
               "title": "ImageUserInputType",
               "type": "string"
+            },
+            "url": {
+              "type": "string"
             }
           },
           "required": [
-            "type"
+            "type",
+            "url"
           ],
           "title": "ImageUserInput",
           "type": "object"

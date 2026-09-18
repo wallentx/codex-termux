@@ -17,7 +17,6 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
-use codex_protocol::models::ImageReference;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelServiceTier;
@@ -37,6 +36,7 @@ use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
+use core_test_support::context_snapshot::ContextSnapshotRenderMode;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::responses::ev_reasoning_item;
@@ -490,7 +490,9 @@ async fn assert_compaction_uses_turn_lifecycle_id(codex: &std::sync::Arc<codex_c
     );
 }
 fn context_snapshot_options() -> ContextSnapshotOptions {
-    ContextSnapshotOptions::default().rewrite_known_segments()
+    ContextSnapshotOptions::default()
+        .strip_capability_instructions()
+        .render_mode(ContextSnapshotRenderMode::KindWithTextPrefix { max_chars: 64 })
 }
 
 fn format_labeled_requests_snapshot(
@@ -501,17 +503,6 @@ fn format_labeled_requests_snapshot(
         scenario,
         sections,
         &context_snapshot_options(),
-    )
-}
-
-fn format_history_snapshot(
-    scenario: &str,
-    requests: &[core_test_support::responses::ResponsesRequest],
-) -> String {
-    context_snapshot::format_request_history_snapshot(
-        scenario,
-        requests,
-        &ContextSnapshotOptions::default().rewrite_known_segments(),
     )
 }
 
@@ -4119,9 +4110,12 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
 
     insta::assert_snapshot!(
         "manual_compact_with_history_shapes",
-        format_history_snapshot(
+        format_labeled_requests_snapshot(
             "Manual /compact with prior user history compacts existing history and the follow-up turn includes the compact summary plus new user message.",
-            &requests
+            &[
+                ("Local Compaction Request", &requests[1]),
+                ("Local Post-Compaction History Layout", &requests[2]),
+            ]
         )
     );
 
@@ -4364,12 +4358,17 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 
     insta::assert_snapshot!(
         "mid_turn_compaction_shapes",
-        format_history_snapshot(
+        format_labeled_requests_snapshot(
             "True mid-turn continuation compaction after tool output: compact request includes tool artifacts, and the continuation request includes the summary in the same turn.",
             &[
-                first_turn_mock.single_request(),
-                auto_compact_mock.single_request(),
-                post_auto_compact_mock.single_request(),
+                (
+                    "Local Compaction Request",
+                    &auto_compact_mock.single_request()
+                ),
+                (
+                    "Local Post-Compaction History Layout",
+                    &post_auto_compact_mock.single_request()
+                ),
             ]
         )
     );
@@ -4834,9 +4833,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![
             UserInput::Image {
-                image: ImageReference::Inline {
-                    image_url: image_url.clone(),
-                },
+                image_url: image_url.clone(),
                 detail: None,
             },
             UserInput::Text {
@@ -4851,17 +4848,14 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     let requests = request_log.requests();
     assert_eq!(requests.len(), 4, "expected user, user, compact, follow-up");
 
-    assert!(requests[3].message_input_texts("user").iter().any(|text| {
-        text.contains(&format!(
-            "<cwd>{}</cwd>",
-            test_path_buf(PRETURN_CONTEXT_DIFF_CWD).display()
-        ))
-    }));
     insta::assert_snapshot!(
         "pre_turn_compaction_including_incoming_shapes",
-        format_history_snapshot(
-            "Pre-turn auto-compaction uses the prior context without the incoming user message; the follow-up carries the cwd override, image, and text.",
-            &requests
+        format_labeled_requests_snapshot(
+            "Pre-turn auto-compaction with a context override emits the context diff in the compact request while the incoming user message is still excluded.",
+            &[
+                ("Local Compaction Request", &requests[2]),
+                ("Local Post-Compaction History Layout", &requests[3]),
+            ]
         )
     );
     let compact_request_user_texts = requests[2].message_input_texts("user");
@@ -5133,7 +5127,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_compaction_refreshes_global_instructions_for_next_turn() -> Result<()> {
+async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Result<()> {
     // Set up an initial turn, a manual compaction response, and a post-compaction turn.
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_sequence(
@@ -5194,25 +5188,25 @@ async fn manual_compaction_refreshes_global_instructions_for_next_turn() -> Resu
     .await;
     test.submit_turn("after compact").await?;
 
-    // Compaction summarizes the existing history; the next turn injects the refreshed instructions.
+    // Assert ordinary and compact turns keep the old rendering even though the reported source
+    // path now contains new text.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
-    let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
-    let new_fragment = expected_instruction_fragment(NEW_GLOBAL_INSTRUCTIONS);
-    assert_single_instruction_fragment(&requests[0], &old_fragment);
-    assert_single_instruction_fragment(&requests[1], &old_fragment);
-    assert_single_instruction_fragment(&requests[2], &new_fragment);
+    let expected_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
+    assert_single_instruction_fragment(&requests[0], &expected_fragment);
+    assert_single_instruction_fragment(&requests[1], &expected_fragment);
+    assert_single_instruction_fragment(&requests[2], &expected_fragment);
     assert_eq!(
         test.codex.instruction_sources().await,
         vec![PathUri::from_abs_path(&source)],
-        "refreshing same-path instructions preserves their source"
+        "thread retains the creation-time global source after compaction"
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mid_turn_compaction_uses_refreshed_global_instructions() -> Result<()> {
+async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Result<()> {
     // Set up a turn that crosses the auto-compaction limit and a post-compaction response.
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_sequence(
@@ -5267,24 +5261,24 @@ async fn mid_turn_compaction_uses_refreshed_global_instructions() -> Result<()> 
     assert_ne!(source, new_source);
     test.submit_turn("trigger mid-turn compaction").await?;
 
-    // The next request boundary selects the override; compaction and continuation retain it.
+    // Assert the initial, compact, and resumed requests all keep the old snapshot and source.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
-    let expected_fragment = expected_instruction_fragment(NEW_GLOBAL_INSTRUCTIONS);
+    let expected_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &expected_fragment);
     assert_single_instruction_fragment(&requests[1], &expected_fragment);
     assert_single_instruction_fragment(&requests[2], &expected_fragment);
     assert_eq!(
         test.codex.instruction_sources().await,
-        vec![PathUri::from_abs_path(&new_source)],
-        "thread reports the refreshed global override after mid-turn compaction"
+        vec![PathUri::from_abs_path(&source)],
+        "thread retains the creation-time global source after mid-turn compaction"
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_resume()
+async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -5336,14 +5330,14 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     test.submit_turn("after remote v2 compaction").await?;
     test.codex.flush_rollout().await?;
 
-    // Compaction summarizes the existing history; the follow-up injects the refreshed instructions.
+    // Assert the compact request, installed replacement history, and follow-up all keep the
+    // creation-time item despite the file-backed source now containing new text.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
     let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
-    let new_fragment = expected_instruction_fragment(NEW_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &old_fragment);
     assert_single_instruction_fragment(&requests[1], &old_fragment);
-    assert_single_instruction_fragment(&requests[2], &new_fragment);
+    assert_single_instruction_fragment(&requests[2], &old_fragment);
     assert_eq!(
         requests[1].input().last(),
         Some(&json!({"type": "compaction_trigger"})),
@@ -5385,10 +5379,17 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
         .submit_turn("after remote v2 compaction cold resume")
         .await?;
 
-    // Cold resume replays the refreshed context without appending unchanged instructions again.
+    // Cold resume replays the persisted old context, then appends the newly loaded instructions as
+    // an explicit replacement.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
-    assert_single_instruction_fragment(&requests[3], &new_fragment);
+    let replacement_fragment = expected_instruction_fragment(&format!(
+        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{NEW_GLOBAL_INSTRUCTIONS}"
+    ));
+    assert_eq!(
+        instruction_fragments(&requests[3]),
+        vec![old_fragment.clone(), replacement_fragment]
+    );
     let resumed_input = requests[3].input();
     assert_eq!(
         resumed_input.get(..replacement_history.len()),

@@ -6,7 +6,6 @@ use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
-use codex_protocol::models::ImageReference;
 use pretty_assertions::assert_eq;
 use serde_json::value::RawValue;
 use std::sync::Arc;
@@ -28,9 +27,7 @@ fn prompt_with_image_outputs(detail: Option<ImageDetail>) -> Prompt {
                         text: "Describe this image.".to_string(),
                     },
                     ContentItem::InputImage {
-                        image: ImageReference::Inline {
-                            image_url: "https://example.com/image.png".to_string(),
-                        },
+                        image_url: "https://example.com/image.png".to_string(),
                         detail,
                     },
                 ],
@@ -44,9 +41,7 @@ fn prompt_with_image_outputs(detail: Option<ImageDetail>) -> Prompt {
                 namespace: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image: ImageReference::Inline {
-                            image_url: "data:image/png;base64,function".to_string(),
-                        },
+                        image_url: "data:image/png;base64,function".to_string(),
                         detail,
                     },
                 ]),
@@ -58,9 +53,7 @@ fn prompt_with_image_outputs(detail: Option<ImageDetail>) -> Prompt {
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image: ImageReference::Inline {
-                            image_url: "data:image/png;base64,custom".to_string(),
-                        },
+                        image_url: "data:image/png;base64,custom".to_string(),
                         detail,
                     },
                 ]),

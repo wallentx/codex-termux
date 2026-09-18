@@ -1,9 +1,7 @@
 use codex_code_mode_protocol::CellId;
-use codex_code_mode_protocol::NoopCodeModeSessionDelegate;
 use codex_code_mode_protocol::grpc;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use pretty_assertions::assert_eq;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use super::CallbackAdmission;
@@ -61,65 +59,32 @@ fn notification(execution_id: &str, notification_id: u128) -> grpc::Notification
 }
 
 #[test]
-fn callbacks_use_their_execution_delegate_before_cell_admission() {
-    let mut state = SessionState::default();
-    let delegates: Vec<Arc<dyn codex_code_mode_protocol::CodeModeSessionDelegate>> = vec![
-        Arc::new(NoopCodeModeSessionDelegate),
-        Arc::new(NoopCodeModeSessionDelegate),
-    ];
-    for (index, delegate) in delegates.iter().enumerate() {
-        state
-            .begin_execution(&request(&index.to_string()), delegate.clone())
-            .unwrap();
-    }
-    for (index, delegate) in delegates.iter().enumerate() {
-        let mut call = tool_call(&index.to_string(), index as u128 + 1);
-        call.cell_id = format!("cell-{index}");
-        let CallbackAdmission::Active(_, actual) = state.admit_invocation(&call).unwrap() else {
-            panic!("callback should be admitted before the execute response");
-        };
-        assert!(Arc::ptr_eq(&actual, delegate));
-        let mut notice = notification(&index.to_string(), index as u128 + 1);
-        notice.cell_id = call.cell_id;
-        let CallbackAdmission::Active(_, actual) = state.admit_notification(&notice).unwrap()
-        else {
-            panic!("notification should be admitted before the execute response");
-        };
-        assert!(Arc::ptr_eq(&actual, delegate));
-    }
-    drop(state.close(/*failure*/ None));
-    for delegate in delegates {
-        assert_eq!(Arc::strong_count(&delegate), 1);
-    }
-}
-
-#[test]
 fn cell_closure_drains_notifications_and_cancels_tool_callbacks() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
     let first = state
         .admit_invocation(&tool_call("execution", /*invocation_id*/ 1))
         .expect("accept early invocation");
-    let CallbackAdmission::Active(first_cancellation, _) = first else {
+    let CallbackAdmission::Active(first_cancellation) = first else {
         panic!("first callback was not admitted");
     };
-    let CallbackAdmission::Active(notification_cancellation, _) = state
+    let CallbackAdmission::Active(notification_cancellation) = state
         .admit_notification(&notification("execution", /*notification_id*/ 1))
         .expect("admit notification")
     else {
         panic!("notification was not admitted");
     };
-    assert!(
+    assert_eq!(
         state
             .close_cell(grpc::CellClosed {
                 execution_id: "execution".to_string(),
                 cell_id: "cell".to_string(),
                 final_tool_call_sequence: 3,
             })
-            .expect("record cell closure")
-            .is_none()
+            .expect("record cell closure"),
+        None
     );
     assert!(first_cancellation.is_cancelled());
     assert!(!notification_cancellation.is_cancelled());
@@ -132,16 +97,14 @@ fn cell_closure_drains_notifications_and_cancels_tool_callbacks() {
             .expect("reject invocation for a closed cell"),
         CallbackAdmission::Closed
     ));
-    assert!(
-        state
-            .mark_execution_ready("execution")
-            .expect("claim started cell")
-            .is_none()
-    );
     assert_eq!(
         state
-            .finish_notification("execution")
-            .map(|(cell_id, _)| cell_id),
+            .mark_execution_ready("execution")
+            .expect("claim started cell"),
+        None
+    );
+    assert_eq!(
+        state.finish_notification("execution"),
         Some(CellId::new("cell".to_string()))
     );
     assert!(notification_cancellation.is_cancelled());
@@ -151,18 +114,18 @@ fn cell_closure_drains_notifications_and_cancels_tool_callbacks() {
 fn cell_closure_waits_until_the_started_cell_is_claimed() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
 
-    assert!(
+    assert_eq!(
         state
             .close_cell(grpc::CellClosed {
                 execution_id: "execution".to_string(),
                 cell_id: "cell".to_string(),
                 final_tool_call_sequence: 0,
             })
-            .expect("record early cell closure")
-            .is_none()
+            .expect("record early cell closure"),
+        None
     );
     state
         .admit_execution("execution", "cell")
@@ -170,7 +133,6 @@ fn cell_closure_waits_until_the_started_cell_is_claimed() {
     assert_eq!(
         state
             .mark_execution_ready("execution")
-            .map(|cell| cell.map(|(cell_id, _)| cell_id))
             .expect("claim started cell"),
         Some(CellId::new("cell".to_string()))
     );
@@ -180,7 +142,7 @@ fn cell_closure_waits_until_the_started_cell_is_claimed() {
 fn oversized_cell_ids_are_rejected_before_admission() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
 
     assert_eq!(
@@ -190,17 +152,17 @@ fn oversized_cell_ids_are_rejected_before_admission() {
             grpc::MAX_IDENTIFIER_BYTES
         ))
     );
-    assert!(state.remove_execution("execution").is_none());
+    assert_eq!(state.remove_execution("execution"), None);
 }
 
 #[test]
 fn callbacks_cannot_claim_another_executions_cell() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("first"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("first"))
         .expect("register first execution");
     state
-        .begin_execution(&request("second"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("second"))
         .expect("register second execution");
     state
         .admit_invocation(&tool_call("first", /*invocation_id*/ 1))
@@ -236,19 +198,19 @@ fn callbacks_cannot_claim_another_executions_cell() {
 fn abandonment_before_start_ignores_later_cell_closure() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
 
-    assert!(state.remove_execution("execution").is_none());
-    assert!(
+    assert_eq!(state.remove_execution("execution"), None);
+    assert_eq!(
         state
             .close_cell(grpc::CellClosed {
                 execution_id: "execution".to_string(),
                 cell_id: "cell".to_string(),
                 final_tool_call_sequence: 0,
             })
-            .expect("ignore closure for abandoned execution")
-            .is_none()
+            .expect("ignore closure for abandoned execution"),
+        None
     );
     assert!(state.close(/*failure*/ None).is_empty());
 }
@@ -257,18 +219,16 @@ fn abandonment_before_start_ignores_later_cell_closure() {
 fn abandonment_revokes_callbacks_and_ignores_late_events() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
-    let CallbackAdmission::Active(invocation, _) = state
+    let CallbackAdmission::Active(invocation) = state
         .admit_invocation(&tool_call("execution", /*invocation_id*/ 1))
         .expect("admit callback before execution starts")
     else {
         panic!("invocation was not admitted");
     };
     assert_eq!(
-        state
-            .remove_execution("execution")
-            .map(|(cell_id, _)| cell_id),
+        state.remove_execution("execution"),
         Some(CellId::new("cell".to_string()))
     );
     assert!(invocation.is_cancelled());
@@ -278,15 +238,15 @@ fn abandonment_revokes_callbacks_and_ignores_late_events() {
             .expect("reject delayed tool invocation"),
         CallbackAdmission::Closed
     ));
-    assert!(
+    assert_eq!(
         state
             .close_cell(grpc::CellClosed {
                 execution_id: "execution".to_string(),
                 cell_id: "cell".to_string(),
                 final_tool_call_sequence: 1,
             })
-            .expect("ignore delayed cell closure")
-            .is_none()
+            .expect("ignore delayed cell closure"),
+        None
     );
     assert!(state.close(/*failure*/ None).is_empty());
 }
@@ -295,7 +255,7 @@ fn abandonment_revokes_callbacks_and_ignores_late_events() {
 fn invocation_cancellation_revokes_delegate_and_late_completion() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
     state
         .admit_execution("execution", "cell")
@@ -304,7 +264,7 @@ fn invocation_cancellation_revokes_delegate_and_late_completion() {
         .mark_execution_ready("execution")
         .expect("claim execution");
     let invocation = tool_call("execution", /*invocation_id*/ 1);
-    let CallbackAdmission::Active(cancellation, _) = state
+    let CallbackAdmission::Active(cancellation) = state
         .admit_invocation(&invocation)
         .expect("accept invocation")
     else {
@@ -324,7 +284,6 @@ fn invocation_cancellation_revokes_delegate_and_late_completion() {
                 cell_id: "cell".to_string(),
                 final_tool_call_sequence: 1,
             })
-            .map(|cell| cell.map(|(cell_id, _)| cell_id))
             .expect("close cell"),
         Some(CellId::new("cell".to_string()))
     );
@@ -334,7 +293,7 @@ fn invocation_cancellation_revokes_delegate_and_late_completion() {
 fn duplicate_invocation_ids_are_rejected() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
     state
         .admit_execution("execution", "cell")
@@ -352,7 +311,7 @@ fn duplicate_invocation_ids_are_rejected() {
 fn tool_callbacks_must_match_the_executions_enabled_tools() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
 
     let mut disabled = tool_call("execution", /*invocation_id*/ 1);
@@ -390,7 +349,7 @@ fn tool_callbacks_must_match_the_executions_enabled_tools() {
     });
     assert!(matches!(
         state.admit_invocation(&explicit_default_namespace),
-        Ok(CallbackAdmission::Active(_, _))
+        Ok(CallbackAdmission::Active(_))
     ));
     assert_eq!(state.require_open(), Ok(()));
 }
@@ -402,20 +361,20 @@ fn execution_call_ids_must_be_bounded() {
     oversized.tool_call_id = "x".repeat(grpc::MAX_IDENTIFIER_BYTES + 1);
 
     assert_eq!(
-        state.begin_execution(&oversized, Arc::new(NoopCodeModeSessionDelegate)),
+        state.begin_execution(&oversized),
         Err(format!(
             "gRPC code-mode host returned tool call ID exceeding {} bytes",
             grpc::MAX_IDENTIFIER_BYTES
         ))
     );
-    assert!(state.remove_execution("execution").is_none());
+    assert_eq!(state.remove_execution("execution"), None);
 }
 
 #[test]
 fn notification_call_ids_must_match_their_execution() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
 
     let mut oversized = notification("execution", /*notification_id*/ 1);
@@ -436,7 +395,7 @@ fn notification_call_ids_must_match_their_execution() {
     );
     assert!(matches!(
         state.admit_notification(&notification("execution", /*notification_id*/ 3)),
-        Ok(CallbackAdmission::Active(_, _))
+        Ok(CallbackAdmission::Active(_))
     ));
 }
 
@@ -444,7 +403,7 @@ fn notification_call_ids_must_match_their_execution() {
 fn malformed_callback_ids_are_rejected_before_retention() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
     let mut invalid_invocation = tool_call("execution", /*invocation_id*/ 1);
     invalid_invocation.invocation_id = "not-a-uuid".to_string();
@@ -483,13 +442,13 @@ fn malformed_callback_ids_are_rejected_before_retention() {
 fn notifications_and_tools_share_the_pending_delegate_limit() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
 
     for index in 0..MAX_PENDING_DELEGATE_CALLS {
         assert!(matches!(
             state.admit_notification(&notification("execution", index as u128 + 1)),
-            Ok(CallbackAdmission::Active(_, _))
+            Ok(CallbackAdmission::Active(_))
         ));
     }
 
@@ -504,10 +463,10 @@ fn notifications_and_tools_share_the_pending_delegate_limit() {
             if error == "code-mode host exceeded its pending delegate callback limit"
     ));
     assert_eq!(state.require_open(), Ok(()));
-    assert!(state.finish_notification("execution").is_none());
+    assert_eq!(state.finish_notification("execution"), None);
     assert!(matches!(
         state.admit_invocation(&tool_call("execution", /*invocation_id*/ 2)),
-        Ok(CallbackAdmission::Active(_, _))
+        Ok(CallbackAdmission::Active(_))
     ));
 }
 
@@ -515,9 +474,9 @@ fn notifications_and_tools_share_the_pending_delegate_limit() {
 fn terminated_cells_cancel_pending_notifications() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
-    let CallbackAdmission::Active(cancellation, _) = state
+    let CallbackAdmission::Active(cancellation) = state
         .admit_notification(&notification("execution", /*notification_id*/ 1))
         .expect("admit notification")
     else {
@@ -527,25 +486,25 @@ fn terminated_cells_cancel_pending_notifications() {
     state.cancel_notifications(&CellId::new("cell".to_string()));
 
     assert!(cancellation.is_cancelled());
-    assert!(state.finish_notification("execution").is_none());
+    assert_eq!(state.finish_notification("execution"), None);
 }
 
 #[test]
 fn disconnect_revokes_callbacks_and_returns_each_live_cell_once() {
     let mut state = SessionState::default();
     state
-        .begin_execution(&request("execution"), Arc::new(NoopCodeModeSessionDelegate))
+        .begin_execution(&request("execution"))
         .expect("register execution");
     state
         .admit_execution("execution", "cell")
         .expect("admit execution");
-    let CallbackAdmission::Active(cancellation, _) = state
+    let CallbackAdmission::Active(cancellation) = state
         .admit_invocation(&tool_call("execution", /*invocation_id*/ 1))
         .expect("accept invocation")
     else {
         panic!("invocation was not admitted");
     };
-    let CallbackAdmission::Active(notification_cancellation, _) = state
+    let CallbackAdmission::Active(notification_cancellation) = state
         .admit_notification(&notification("execution", /*notification_id*/ 1))
         .expect("admit notification")
     else {
@@ -553,11 +512,7 @@ fn disconnect_revokes_callbacks_and_returns_each_live_cell_once() {
     };
 
     assert_eq!(
-        state
-            .close(Some("lease closed".to_string()))
-            .into_iter()
-            .map(|(cell_id, _)| cell_id)
-            .collect::<Vec<_>>(),
+        state.close(Some("lease closed".to_string())),
         vec![CellId::new("cell".to_string())]
     );
     assert!(cancellation.is_cancelled());

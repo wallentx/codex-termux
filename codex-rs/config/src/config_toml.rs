@@ -17,7 +17,6 @@ use crate::types::AuthCredentialsStoreMode;
 use crate::types::FeedbackConfigToml;
 use crate::types::History;
 use crate::types::MarketplaceConfig;
-use crate::types::McpEnterpriseManagedAuthConfig;
 use crate::types::McpServerConfig;
 use crate::types::MemoriesToml;
 use crate::types::Notice;
@@ -277,10 +276,6 @@ pub struct ConfigToml {
     #[schemars(schema_with = "crate::schema::mcp_servers_schema")]
     pub mcp_servers: HashMap<String, McpServerConfig>,
 
-    /// Trusted enterprise IdP shared by EMA-enabled MCP servers and plugins.
-    #[serde(default)]
-    pub mcp_enterprise_managed_auth: Option<McpEnterpriseManagedAuthConfig>,
-
     /// Preferred backend for storing MCP OAuth credentials.
     /// keyring: Use an OS-specific keyring service.
     ///          https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/oauth.rs#L2
@@ -383,7 +378,7 @@ pub struct ConfigToml {
     /// Per-thread `config` overrides are accepted but do not reapply this (no-ops).
     pub model_catalog_json: Option<AbsolutePathBuf>,
 
-    /// Deprecated: `friendly` and `pragmatic` no longer select a style.
+    /// Optionally specify a personality for the model
     pub personality: Option<Personality>,
 
     /// Optional explicit service tier request id for new turns (for example
@@ -553,8 +548,6 @@ pub enum ThreadStoreToml {
 pub struct AutoReviewToml {
     /// Additional policy instructions inserted into the guardian prompt.
     pub policy: Option<String>,
-    /// Experimental full Guardian prompt template containing the tenant policy placeholder.
-    pub experimental_policy_template: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -934,14 +927,10 @@ pub fn validate_model_providers(
 ) -> Result<(), String> {
     validate_reserved_model_provider_ids(model_providers)?;
     for (key, provider) in model_providers {
-        if matches!(
+        if !matches!(
             key.as_str(),
             AMAZON_BEDROCK_PROVIDER_ID | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
         ) {
-            provider
-                .validate_bedrock_override()
-                .map_err(|message| format!("model_providers.{key} {message}"))?;
-        } else {
             if provider.aws.is_some() {
                 return Err(format!(
                     "model_providers.{key}: provider aws is only supported for \

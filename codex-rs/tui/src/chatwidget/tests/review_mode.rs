@@ -1,5 +1,4 @@
 use super::*;
-use codex_app_server_protocol::ImageReference;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 
@@ -647,9 +646,7 @@ async fn item_completed_pops_pending_steer_with_local_image_and_text_elements() 
         "user-1",
         vec![
             UserInput::Image {
-                image: ImageReference::Inline {
-                    url: "data:image/png;base64,placeholder".to_string(),
-                },
+                url: "data:image/png;base64,placeholder".to_string(),
                 detail: None,
             },
             UserInput::Text {

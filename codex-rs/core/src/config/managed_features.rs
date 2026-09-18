@@ -50,9 +50,7 @@ impl ManagedFeatures {
         )
     }
 
-    /// Applies managed feature requirements and dependency normalization to
-    /// configured features, collecting warnings for unsupported requirements.
-    pub fn from_configured_with_warnings(
+    pub(crate) fn from_configured_with_warnings(
         configured_features: Features,
         feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
         startup_warnings: &mut Vec<String>,
@@ -218,9 +216,6 @@ fn parse_feature_requirements(
 ) -> BTreeMap<Feature, bool> {
     let mut pinned_features = BTreeMap::new();
     for (key, enabled) in feature_requirements.entries {
-        if key == Feature::Personality.key() {
-            continue;
-        }
         if key == "auto_review" {
             pinned_features.insert(Feature::GuardianApproval, enabled);
             continue;

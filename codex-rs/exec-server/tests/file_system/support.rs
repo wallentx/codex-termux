@@ -7,7 +7,7 @@ use codex_exec_server::ExecServerRuntimePaths;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LocalFileSystem;
-use codex_exec_server::WindowsSandboxSelection;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -76,10 +76,10 @@ pub(crate) async fn create_file_system_context(
 
 #[cfg(windows)]
 pub(crate) fn is_unsupported_restricted_token_host<T>(result: &std::io::Result<T>) -> bool {
-    result
-        .as_ref()
-        .err()
-        .is_some_and(|err| err.to_string().contains("CreateRestrictedToken failed: 87"))
+    result.as_ref().err().is_some_and(|err| {
+        err.to_string()
+            .contains("windows sandbox failed: CreateRestrictedToken failed: 87")
+    })
 }
 
 pub(crate) fn absolute_path(path: std::path::PathBuf) -> AbsolutePathBuf {
@@ -141,7 +141,7 @@ pub(crate) fn workspace_write_sandbox(
         PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
         PathUri::from_abs_path(&writable_root),
     );
-    sandbox.windows_sandbox_selection = WindowsSandboxSelection::RestrictedToken;
+    sandbox.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
     sandbox
 }
 
@@ -163,7 +163,7 @@ fn sandbox_context(mut entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandbo
         ),
     );
     if cfg!(windows) {
-        sandbox.windows_sandbox_selection = WindowsSandboxSelection::RestrictedToken;
+        sandbox.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
     }
     sandbox
 }

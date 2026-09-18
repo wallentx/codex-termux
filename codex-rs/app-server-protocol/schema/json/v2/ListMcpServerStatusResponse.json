@@ -101,9 +101,6 @@
           ],
           "description": "Current thread-runtime connection state; null when unavailable or the configuration changed."
         },
-        "serverCapabilities": {
-          "description": "Capabilities advertised by the initialized MCP server; null when unavailable."
-        },
         "serverInfo": {
           "anyOf": [
             {

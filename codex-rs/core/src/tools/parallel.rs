@@ -17,7 +17,6 @@ use tracing::trace_span;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
-use crate::tools::call_trace;
 use crate::tools::context::AbortedToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
@@ -29,7 +28,6 @@ use crate::tools::router::ToolCallSource;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
-use codex_protocol::models::ToolResultMetadata;
 
 struct ToolCallTimingGuard {
     started_at: Instant,
@@ -80,51 +78,37 @@ impl ToolCallRuntime {
     ) -> impl std::future::Future<Output = Result<ResponseItemEnvelope, CodexErr>> {
         let error_call = call.clone();
         let source = call.direct_source();
-        let recorder = self.session.services.executed_tool_calls.clone();
-        let recorded_call = recorder.prepare_direct_call(&call, &source, &self.step_context);
-        let step_context = Arc::clone(&self.step_context);
-        let future =
-            self.handle_tool_call_with_source(step_context, call, source, cancellation_token);
+        let future = self.handle_tool_call_with_source(call, source, cancellation_token);
         async move {
-            let result = future.await;
-            let mut recorded_call =
-                recorded_call.filter(|(_, recording)| recording.strong_count() > 0);
-            let mut response = match result {
-                Ok(result) => {
-                    if let Some((call, _)) = recorded_call.as_mut()
-                        && let Some(metadata) = result.result.tool_result_metadata()
-                    {
-                        call.set_tool_result_metadata(ToolResultMetadata::new(metadata));
-                    }
-                    result.into_response()
-                }
-                Err(FunctionCallError::Fatal(message)) => return Err(CodexErr::Fatal(message)),
-                Err(other) => {
-                    ResponseItemEnvelope::new(Self::failure_response(error_call, other).into())
-                }
-            };
-            recorder.attach_direct_call_to_output(&mut response.item, recorded_call);
-            Ok(response)
+            match future.await {
+                Ok(response) => Ok(response.into_response()),
+                Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
+                Err(other) => Ok(ResponseItemEnvelope::new(
+                    Self::failure_response(error_call, other).into(),
+                )),
+            }
         }
+        .in_current_span()
     }
 
     #[instrument(level = "trace", skip_all)]
     pub(crate) fn handle_tool_call_with_source(
         self,
-        step_context: Arc<StepContext>,
         call: ToolCall,
         source: ToolCallSource,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
-        self.session
-            .services
-            .executed_tool_calls
-            .record_tool_call(&call, &source, &step_context);
-        let router = &step_context.tool_router;
+        self.session.services.executed_tool_calls.record_tool_call(
+            &call,
+            &source,
+            &self.step_context,
+        );
+        let router = &self.step_context.tool_router;
         let supports_parallel = router.tool_supports_parallel(&call);
         let tool_runtime = router.tool_runtime(&call.tool_name);
         let router = Arc::clone(router);
         let session = Arc::clone(&self.session);
+        let step_context = Arc::clone(&self.step_context);
         let turn = Arc::clone(&step_context.turn);
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
@@ -141,15 +125,6 @@ impl ToolCallRuntime {
         let terminal_outcome_reached = Arc::new(AtomicBool::new(false));
         let dispatch_terminal_outcome_reached = Arc::clone(&terminal_outcome_reached);
         let dispatch_call = call.clone();
-        let thread_id = session.thread_id;
-        let trace_source = match &source {
-            ToolCallSource::Direct | ToolCallSource::DirectPlaintextMessage => {
-                call_trace::Source::Direct
-            }
-            ToolCallSource::CodeMode { .. } => call_trace::Source::CodeMode,
-        };
-        let dispatch_tool_name = call.tool_name.clone();
-        let dispatch_call_id = call.call_id.clone();
 
         // Code-mode callbacks can resume outside the turn's local span ancestry.
         let dispatch_span = trace_span!(
@@ -162,15 +137,15 @@ impl ToolCallRuntime {
         );
         let abort_dispatch_span = dispatch_span.clone();
 
-        let mut dispatch_handle = AbortOnDropHandle::new(tokio::spawn(
-            async move {
+        let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
+            AbortOnDropHandle::new(tokio::spawn(async move {
                 if let Some(tool_runtime) = tool_runtime
                     && let Some(readiness) = tool_runtime.wait_until_ready(&session)
                 {
                     readiness.await;
                 }
 
-                let guard = if supports_parallel {
+                let _guard = if supports_parallel {
                     Either::Left(lock.read().await)
                 } else {
                     Either::Right(lock.write().await)
@@ -181,7 +156,7 @@ impl ToolCallRuntime {
                     let _ = execution_started_at.set(Instant::now());
                 }
 
-                let result = router
+                router
                     .dispatch_tool_call_with_terminal_outcome(
                         session,
                         step_context,
@@ -192,25 +167,8 @@ impl ToolCallRuntime {
                         dispatch_terminal_outcome_reached,
                     )
                     .instrument(dispatch_span.clone())
-                    .await;
-                drop(guard);
-                // The sampling loop collects results in order only after its stream ends.
-                // Record readiness here, before either caller encodes or collects the result.
-                // A fatal error still propagates to the caller instead of producing a tool
-                // result; unlike a normal tool failure, it has no readiness event.
-                if !matches!(&result, Err(FunctionCallError::Fatal(_))) {
-                    call_trace::result_ready(
-                        thread_id,
-                        &turn.sub_id,
-                        &dispatch_tool_name,
-                        &dispatch_call_id,
-                        trace_source,
-                    );
-                }
-                result
-            }
-            .in_current_span(),
-        ));
+                    .await
+            }));
 
         async move {
             let _tool_call_timing_guard = tool_call_timing_guard;
@@ -229,13 +187,6 @@ impl ToolCallRuntime {
                             Err(err) => return Err(Self::tool_task_join_error(err)),
                         }
                         let response = Self::aborted_response(&call, secs);
-                        call_trace::result_ready(
-                            thread_id,
-                            &abort_turn.sub_id,
-                            &call.tool_name,
-                            &call.call_id,
-                            trace_source,
-                        );
                         notify_tool_aborted(
                             abort_session.as_ref(),
                             abort_turn.as_ref(),

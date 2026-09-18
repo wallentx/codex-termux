@@ -29,7 +29,6 @@ use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
-use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
@@ -459,7 +458,14 @@ async fn request_for_call_args(
             }
             // Pathless images have no stable reference, so this bounded window may include newer
             // unrelated images. This remains best-effort until the harness provides stable refs.
-            recent_images(history, count)?
+            let images = recent_images(history, count);
+            if images.len() != count {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "requested the last {count} conversation images, but only {} were available",
+                    images.len()
+                )));
+            }
+            images
         }
         (false, Some(_)) => {
             return Err(FunctionCallError::RespondToModel(
@@ -481,19 +487,14 @@ async fn request_for_call_args(
     }))
 }
 
-fn recent_images(
-    history: &[ResponseItem],
-    count: usize,
-) -> Result<Vec<ImageUrl>, FunctionCallError> {
+fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
     let mut images = Vec::with_capacity(count);
     'history: for item in history.iter().rev() {
         let mut image_urls = Vec::new();
         match item {
             ResponseItem::Message { content, .. } => {
                 image_urls.extend(content.iter().rev().filter_map(|item| match item {
-                    ContentItem::InputImage { image, .. } => {
-                        Some(inline_image_url(image).map(str::to_owned))
-                    }
+                    ContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
                     ContentItem::InputText { .. }
                     | ContentItem::InputAudio { .. }
                     | ContentItem::OutputText { .. } => None,
@@ -501,12 +502,10 @@ fn recent_images(
             }
             ResponseItem::FunctionCallOutput { output, .. }
             | ResponseItem::CustomToolCallOutput { output, .. } => {
-                image_urls.extend(
-                    output_images(output).map(|image| inline_image_url(image).map(str::to_owned)),
-                );
+                image_urls.extend(output_image_urls(output));
             }
             ResponseItem::ImageGenerationCall { result, .. } if !result.is_empty() => {
-                image_urls.push(Some(format!("data:image/png;base64,{result}")));
+                image_urls.push(format!("data:image/png;base64,{result}"));
             }
             ResponseItem::AdditionalTools { .. }
             | ResponseItem::Reasoning { .. }
@@ -525,53 +524,29 @@ fn recent_images(
             | ResponseItem::Other => {}
         }
         for image_url in image_urls {
-            images.push(image_url.map(|image_url| ImageUrl { image_url }));
+            images.push(ImageUrl { image_url });
             if images.len() == count {
                 break 'history;
             }
         }
     }
-    if images.len() != count {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "requested the last {count} conversation images, but only {} were available",
-            images.len()
-        )));
-    }
-    let mut inline_images = Vec::with_capacity(count);
-    for image in images {
-        let Some(image) = image else {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "requested the last {count} conversation images, but that window includes a \
-                 file-backed image that cannot be used for editing"
-            )));
-        };
-        inline_images.push(image);
-    }
-    inline_images.reverse();
-    Ok(inline_images)
+    images.reverse();
+    images
 }
 
-/// Extracts image references from a tool output in newest-first order.
-fn output_images(output: &FunctionCallOutputPayload) -> impl Iterator<Item = &ImageReference> + '_ {
+/// Extracts image URLs from a tool output in newest-first order.
+fn output_image_urls(output: &FunctionCallOutputPayload) -> impl Iterator<Item = String> + '_ {
     output
         .content_items()
         .into_iter()
         .flatten()
         .rev()
         .filter_map(|item| match item {
-            FunctionCallOutputContentItem::InputImage { image, .. } => Some(image),
+            FunctionCallOutputContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
             FunctionCallOutputContentItem::InputText { .. }
             | FunctionCallOutputContentItem::InputAudio { .. }
             | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })
-}
-
-fn inline_image_url(image: &ImageReference) -> Option<&str> {
-    match image {
-        ImageReference::Inline { image_url } => Some(image_url),
-        // TODO(kc) Image generation and the Images API only accept inline image URLs.
-        ImageReference::File { .. } => None,
-    }
 }
 
 async fn image_url(
@@ -676,9 +651,7 @@ impl ToolOutput for GeneratedImageOutput {
     /// Returns generated bytes and persisted-artifact context for model follow-up.
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         let mut content = vec![FunctionCallOutputContentItem::InputImage {
-            image: ImageReference::Inline {
-                image_url: format!("data:image/png;base64,{}", self.result),
-            },
+            image_url: format!("data:image/png;base64,{}", self.result),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }];
         if let Some(output_hint) = &self.output_hint {

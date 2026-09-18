@@ -254,16 +254,12 @@ pub(crate) fn cancel_when_either(
     first: CancellationToken,
     second: CancellationToken,
 ) -> CancellationToken {
-    let combined = first.child_token();
-    if combined.is_cancelled() || second.is_cancelled() {
-        combined.cancel();
-        return combined;
-    }
+    let combined = CancellationToken::new();
     let cancel = combined.clone();
     tokio::spawn(async move {
         tokio::select! {
+            _ = first.cancelled() => {}
             _ = second.cancelled() => {}
-            _ = cancel.cancelled() => {}
         }
         cancel.cancel();
     });
@@ -304,7 +300,6 @@ pub async fn process_exec_tool_call(
     sandbox_cwd: &AbsolutePathBuf,
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     codex_linux_sandbox_exe: &Option<PathBuf>,
-    codex_self_exe: &Option<PathBuf>,
     use_legacy_landlock: bool,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
@@ -314,7 +309,6 @@ pub async fn process_exec_tool_call(
         sandbox_cwd,
         windows_sandbox_workspace_roots,
         codex_linux_sandbox_exe,
-        codex_self_exe,
         use_legacy_landlock,
     )?;
 
@@ -330,7 +324,6 @@ pub fn build_exec_request(
     sandbox_cwd: &AbsolutePathBuf,
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     codex_linux_sandbox_exe: &Option<PathBuf>,
-    codex_self_exe: &Option<PathBuf>,
     use_legacy_landlock: bool,
 ) -> Result<ExecRequest> {
     let ExecParams {
@@ -397,11 +390,7 @@ pub fn build_exec_request(
             environment_id: network_environment_id.as_deref(),
             network: network.as_ref(),
             sandbox_policy_cwd: &sandbox_policy_cwd_uri,
-            sandbox_exe: if cfg!(windows) {
-                codex_self_exe.as_deref()
-            } else {
-                codex_linux_sandbox_exe.as_deref()
-            },
+            codex_linux_sandbox_exe: codex_linux_sandbox_exe.as_deref(),
             use_legacy_landlock,
             windows_sandbox_level,
             windows_sandbox_private_desktop,

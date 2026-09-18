@@ -5,7 +5,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_code_mode_protocol::CellId;
-use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::DEFAULT_EXEC_YIELD_TIME_MS;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::RuntimeResponse;
@@ -46,11 +45,10 @@ impl Drop for ExecutionOwnership {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove_execution(&self.execution_id);
-        let Some((cell_id, delegate)) = cell else {
+        let Some(cell_id) = cell else {
             return;
         };
-        self.session
-            .report_closed_cell(Some((cell_id.clone(), delegate)));
+        self.session.report_closed_cell(Some(cell_id.clone()));
         if self.session.stopped.is_cancelled() {
             return;
         }
@@ -69,7 +67,6 @@ impl SessionInner {
     pub(super) async fn execute(
         self: &Arc<Self>,
         request: ExecuteRequest,
-        delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> Result<StartedCell, String> {
         self.require_open()?;
         let execution_id = Uuid::new_v4().to_string();
@@ -84,7 +81,7 @@ impl SessionInner {
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .begin_execution(&request, delegate)?;
+            .begin_execution(&request)?;
         let ownership = ExecutionOwnership {
             session: Arc::clone(self),
             execution_id,

@@ -68,7 +68,6 @@ const REFRESHABLE_SERVER_URL: &str = "https://refreshable.example/mcp";
 #[derive(Clone, Copy)]
 enum OAuthStartupScenario {
     DirectAuthorizationMetadata,
-    OidcMetadataAfter503,
     GatewayHeadersHelper,
     SameOriginGatewayHeadersHelper,
     ProtectedResourceMetadata,
@@ -257,18 +256,6 @@ async fn refreshes_expired_persisted_token_before_initialize() -> anyhow::Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn refreshes_expired_persisted_token_after_oidc_fallback() -> anyhow::Result<()> {
-    for refresh_mode in [
-        McpOAuthRefreshMode::Legacy,
-        McpOAuthRefreshMode::Coordinated,
-    ] {
-        assert_expired_token_refresh(OAuthStartupScenario::OidcMetadataAfter503, refresh_mode)
-            .await?;
-    }
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn refreshes_oauth_with_gateway_headers_helper() -> anyhow::Result<()> {
     assert_expired_token_refresh(
         OAuthStartupScenario::GatewayHeadersHelper,
@@ -324,21 +311,7 @@ async fn assert_expired_token_refresh(
             "/mcp/",
             "/.well-known/oauth-authorization-server",
         ),
-        OAuthStartupScenario::OidcMetadataAfter503 => (
-            resource_url.clone(),
-            "/mcp",
-            "/mcp/.well-known/openid-configuration",
-        ),
     };
-
-    if matches!(scenario, OAuthStartupScenario::OidcMetadataAfter503) {
-        Mock::given(method("GET"))
-            .and(path("/.well-known/oauth-authorization-server/mcp"))
-            .respond_with(ResponseTemplate::new(503))
-            .expect(2)
-            .mount(&server)
-            .await;
-    }
 
     if matches!(scenario, OAuthStartupScenario::ProtectedResourceMetadata) {
         let resource_metadata_url = format!("{}/resource-metadata", server.uri());

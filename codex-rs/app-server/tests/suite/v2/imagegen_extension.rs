@@ -9,7 +9,6 @@ use app_test_support::TestAppServer;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::ImageGenerationFailure;
 use codex_app_server_protocol::ImageGenerationItem;
-use codex_app_server_protocol::ImageReference as V2ImageReference;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
@@ -658,9 +657,7 @@ async fn transparent_image_edit_preserves_metadata_and_recent_pathless_image() -
                     text_elements: Vec::new(),
                 },
                 V2UserInput::Image {
-                    image: V2ImageReference::Inline {
-                        url: image_url.to_string(),
-                    },
+                    url: image_url.to_string(),
                     detail: None,
                 },
             ],

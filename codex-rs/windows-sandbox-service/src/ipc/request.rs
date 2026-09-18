@@ -13,21 +13,13 @@ use std::path::PathBuf;
 use super::MAX_REQUEST_BYTES;
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ServiceRequest {
-    RegisterInstallation { codex_home: PathBuf },
-    ProvisionSandbox(ProvisioningRequest),
+pub(super) struct ProvisioningRequest {
+    pub(super) codex_home: PathBuf,
+    pub(super) listeners: WindowsSandboxProxyListeners,
+    pub(super) settings: WindowsSandboxProvisioningSettings,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ProvisioningRequest {
-    pub(crate) codex_home: PathBuf,
-    pub(crate) registered_core: bool,
-    pub(crate) refresh_only: bool,
-    pub(crate) listeners: WindowsSandboxProxyListeners,
-    pub(crate) settings: WindowsSandboxProvisioningSettings,
-}
-
-pub(super) fn validate_request(request: &[u8]) -> Result<ServiceRequest> {
+pub(super) fn validate_request(request: &[u8]) -> Result<ProvisioningRequest> {
     if request.len() > MAX_REQUEST_BYTES {
         bail!("provisioning request exceeds size limit");
     }
@@ -38,26 +30,17 @@ pub(super) fn validate_request(request: &[u8]) -> Result<ServiceRequest> {
     if !reader.is_empty() {
         bail!("provisioning requests must contain exactly one IPC frame");
     }
-
     if frame.version != PROVISIONING_PROTOCOL_VERSION {
         bail!(
             "unsupported provisioning request version: {}",
             frame.version
         );
     }
-    let request = match frame.message {
-        ProvisioningMessage::RegisterInstallationRequest { codex_home } => {
-            validate_home(&codex_home)?;
-            return Ok(ServiceRequest::RegisterInstallation {
-                codex_home: PathBuf::from(codex_home),
-            });
-        }
-        ProvisioningMessage::ProvisionSandboxRequest { payload } => payload,
-        ProvisioningMessage::ProvisionSandboxResponse { .. } => bail!("expected a service request"),
+    let ProvisioningMessage::ProvisionSandboxRequest { payload: request } = frame.message else {
+        bail!("expected a sandbox provisioning request");
     };
-    validate_home(&request.codex_home)?;
-    if request.refresh_only && !request.registered_core {
-        bail!("registration refresh requires registered Core");
+    if request.codex_home.is_empty() || request.codex_home.contains(['\0', '\r', '\n']) {
+        bail!("Codex home is empty or contains an invalid control character");
     }
     let mut settings = request.settings;
     let mut listeners = request.listeners;
@@ -80,18 +63,9 @@ pub(super) fn validate_request(request: &[u8]) -> Result<ServiceRequest> {
     {
         bail!("provisioning listener is absent from the proxy settings");
     }
-    Ok(ServiceRequest::ProvisionSandbox(ProvisioningRequest {
+    Ok(ProvisioningRequest {
         codex_home: PathBuf::from(request.codex_home),
-        registered_core: request.registered_core,
-        refresh_only: request.refresh_only,
         listeners,
         settings,
-    }))
-}
-
-fn validate_home(home: &str) -> Result<()> {
-    if home.is_empty() || home.contains(['\0', '\r', '\n']) {
-        bail!("Codex home is empty or contains an invalid control character");
-    }
-    Ok(())
+    })
 }

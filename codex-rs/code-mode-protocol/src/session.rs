@@ -95,10 +95,7 @@ impl StartedCell {
     }
 }
 
-/// Host callbacks owned by one code-mode execution.
-///
-/// The session retains the supplied delegate while starting and running the cell,
-/// including across yields, and releases it through its existing close/cancel paths.
+/// Host callbacks used by a code-mode session while cells are executing.
 pub trait CodeModeSessionDelegate: Send + Sync {
     fn invoke_tool<'a>(
         &'a self,
@@ -155,7 +152,6 @@ pub trait CodeModeSession: Send + Sync {
     fn execute<'a>(
         &'a self,
         request: ExecuteRequest,
-        delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> CodeModeSessionResultFuture<'a, StartedCell>;
 
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
@@ -175,7 +171,10 @@ pub trait CodeModeSessionProvider: Send + Sync {
         Ok(())
     }
 
-    fn create_session(&self) -> CodeModeSessionProviderFuture<'_>;
+    fn create_session<'a>(
+        &'a self,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
+    ) -> CodeModeSessionProviderFuture<'a>;
 
     /// Creates a session whose cells share the supplied execution limits.
     ///
@@ -183,10 +182,11 @@ pub trait CodeModeSessionProvider: Send + Sync {
     /// explicitly implement this method before accepting non-default limits.
     fn create_session_with_limits<'a>(
         &'a self,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
         limits: CodeModeSessionCellExecutionLimits,
     ) -> CodeModeSessionProviderFuture<'a> {
         if limits == CodeModeSessionCellExecutionLimits::default() {
-            self.create_session()
+            self.create_session(delegate)
         } else {
             Box::pin(async {
                 Err("code-mode session provider does not support resource limits".to_string())

@@ -13,7 +13,6 @@ use ratatui::widgets::Block;
 use std::cell::Cell;
 
 struct ExternalWriterNotice {
-    command_center_available: bool,
     transcript_hint: Option<crate::key_hint::ShortcutHint>,
 }
 
@@ -88,18 +87,19 @@ impl ExternalWriterNotice {
     }
 
     fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut items = vec![("r".to_string(), "retry".to_string())];
-        let escape = crate::key_hint::plain(KeyCode::Esc).display_label();
-        let mut quit_keys = vec![
-            crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
-            crate::key_hint::plain(KeyCode::Char('q')).display_label(),
+        let mut items = vec![
+            ("r".to_string(), "retry".to_string()),
+            (
+                format!(
+                    "{}/{}/{}",
+                    crate::key_hint::plain(KeyCode::Esc).display_label(),
+                    crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
+                    crate::key_hint::plain(KeyCode::Char('q')).display_label(),
+                )
+                .replace(" + ", "+"),
+                "exit".to_string(),
+            ),
         ];
-        if self.command_center_available {
-            items.push((escape, "command center".to_string()));
-        } else {
-            quit_keys.insert(/*index*/ 0, escape);
-        }
-        items.push((quit_keys.join("/").replace(" + ", "+"), "exit".to_string()));
         if let Some(hint) = self.transcript_hint {
             items.push((
                 hint.display_label().replace(" + ", "+"),
@@ -158,12 +158,7 @@ impl ChatWidget {
         };
         let mut flex = FlexRenderable::new();
         flex.push(/*flex*/ 1, active_cell_renderable);
-        for cell in self
-            .realtime_conversation
-            .pending_history_cells
-            .iter()
-            .chain(self.realtime_conversation.live_transcript_cells())
-        {
+        if let Some(cell) = self.realtime_conversation.live_transcript_cell.as_ref() {
             flex.push(
                 /*flex*/ 1,
                 RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
@@ -174,7 +169,17 @@ impl ChatWidget {
                 })),
             );
         }
-
+        if let Some(cell) = self.pending_token_activity_output() {
+            flex.push(
+                /*flex*/ 1,
+                RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
+                    child: cell,
+                    top: 1,
+                    right: active_cell_right_reserve,
+                    persistent_layout: None,
+                })),
+            );
+        }
         if let Some(cell) = self.pending_rate_limit_reset_hint() {
             flex.push(
                 /*flex*/ 1,
@@ -188,7 +193,6 @@ impl ChatWidget {
         }
         let bottom = if self.external_writer_view && !self.bottom_pane.has_active_view() {
             RenderableItem::Owned(Box::new(ExternalWriterNotice {
-                command_center_available: self.remote_connection.is_some(),
                 transcript_hint: self.bottom_pane.transcript_shortcut_hint(),
             }))
         } else {

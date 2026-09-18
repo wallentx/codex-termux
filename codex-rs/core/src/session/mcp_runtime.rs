@@ -28,7 +28,6 @@ pub(super) struct McpDesiredState {
     pub(super) session_source: SessionSource,
     pub(super) environments: TurnEnvironmentSnapshot,
     pub(super) local_process_cwd: PathBuf,
-    pub(super) disabled_plugin_ids: Vec<String>,
 }
 
 impl Session {
@@ -76,12 +75,9 @@ impl Session {
         &self,
         auth: Option<CodexAuth>,
     ) -> McpDesiredState {
-        let (session_configuration, disabled_plugin_ids) = {
+        let session_configuration = {
             let state = self.state.lock().await;
-            (
-                state.session_configuration.clone(),
-                state.active_disabled_plugin_ids.clone(),
-            )
+            state.session_configuration.clone()
         };
         let environments = self.services.turn_environments.snapshot().await;
         let cwd = environments
@@ -102,7 +98,6 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments,
             local_process_cwd,
-            disabled_plugin_ids,
         }
     }
 
@@ -129,7 +124,6 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments: resolved_environments.clone(),
             local_process_cwd,
-            disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
         };
         self.publish_mcp_runtime(
             &desired,

@@ -1,4 +1,4 @@
-//! Exercises both reviewers' evidence delivery through real compaction and resume.
+//! Exercises both reviewers' evidence delivery through real compaction and rollback.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -24,6 +24,8 @@ use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
+use codex_app_server_protocol::ThreadRollbackParams;
+use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
@@ -97,8 +99,7 @@ enum ReviewCheckpoint {
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "incompatible checkpoint")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), None, 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "unknown Luna compatibility")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some(""), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "empty Luna compatibility")]
-#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, None, Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "unknown producer preserves retained evidence")]
-#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some(""), Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "empty producer preserves retained evidence")]
+#[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, None, Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "unknown producer remains unknown after model switch")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 140, EvidenceSize::Normal, ReviewCheckpoint::Valid; "source call evicted")]
 #[test_case(ContextPath::ThreadOwned, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 0, EvidenceSize::OversizedAnswer, ReviewCheckpoint::Valid; "incomplete answers reject fresh low score")]
 #[test_case(ContextPath::Legacy, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "legacy answers remain runtime only")]
@@ -107,7 +108,7 @@ enum ReviewCheckpoint {
 #[test_case(ContextPath::Legacy, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 140, EvidenceSize::Normal, ReviewCheckpoint::Valid; "legacy source call evicted")]
 #[test_case(ContextPath::Legacy, CheckpointReuse::Enabled, Some("matching"), Some("matching"), 0, EvidenceSize::OversizedAnswer, ReviewCheckpoint::Valid; "legacy answer truncation")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardians_retain_evidence_after_compaction_and_resume(
+async fn guardians_retain_evidence_after_compaction_and_discard_it_after_rollback(
     context_path: ContextPath,
     checkpoint_reuse: CheckpointReuse,
     parent_hash: Option<&str>,
@@ -333,6 +334,8 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
         restriction.as_str(),
         "Recheck the repository.",
         "Inspect after resume.",
+        "Inspect after partial rollback.",
+        "Inspect a different repository.",
     ]
     .into_iter()
     .enumerate()
@@ -365,6 +368,15 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                 timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
             assert_eq!(completed.turn.status, TurnStatus::Completed);
             assert_eq!(compact_requests.lock().expect("request log lock").len(), 1);
+        } else if index >= 3 {
+            let id = app_server
+                .send_thread_rollback_request(ThreadRollbackParams {
+                    thread_id: thread_id.clone(),
+                    num_turns: if index == 3 { 1 } else { 3 },
+                })
+                .await?;
+            let _: ThreadRollbackResponse =
+                timeout(TIMEOUT, app_server.read_response(id)).await??;
         }
 
         let id = app_server
@@ -399,7 +411,7 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
             .await?;
             classifier.allow_luna.notify_one();
         }
-        if reject_sync_checkpoint && index > 0 {
+        if reject_sync_checkpoint && (1..=2).contains(&index) {
             let notification = timeout(
                 TIMEOUT,
                 app_server.read_stream_until_matching_notification(
@@ -440,7 +452,7 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
         let completed: TurnCompletedNotification =
             timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
         assert_eq!(completed.turn.status, TurnStatus::Completed);
-        if reject_sync_checkpoint && index > 0 {
+        if reject_sync_checkpoint && (1..=2).contains(&index) {
             // The first review established a cached session before compaction. Neither
             // that session nor a new one may review unusable evidence, including after resume.
             let reviews = review_requests.lock().expect("request log lock");
@@ -480,7 +492,7 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
             }
             continue;
         }
-        if requires_sync && index > 0 {
+        if requires_sync && (1..=3).contains(&index) {
             let reviews = review_requests.lock().expect("request log lock");
             assert_eq!(
                 reviews.len(),
@@ -499,6 +511,12 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                 assert!(
                     text.contains(prompt),
                     "current user input missing from sync review: {text}"
+                );
+            }
+            if index == 3 {
+                assert!(
+                    !text.contains("Inspect after resume."),
+                    "rolled-back user input remains in sync review: {text}"
                 );
             }
             assert!(text.contains(USER_INPUT_RESTRICTION));
@@ -557,8 +575,11 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
             let review = &reviews[index];
             let sync_input = review["input"].as_array().expect("request input array");
             let async_input = request["input"].as_array().expect("request input array");
-            assert_eq!(sync_input.contains(&checkpoint), index > 0);
-            assert_eq!(async_input.contains(&checkpoint), index > 0 && compatible);
+            assert_eq!(sync_input.contains(&checkpoint), (1..=3).contains(&index));
+            assert_eq!(
+                async_input.contains(&checkpoint),
+                (1..=3).contains(&index) && compatible
+            );
             let sync_text = sync_input
                 .iter()
                 .filter(|item| item["role"] == "user")
@@ -570,6 +591,14 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                 sync_text.contains(prompt),
                 "current user input missing from sync review: {sync_text}"
             );
+            if index == 3 {
+                for (consumer, text) in [("sync", sync_text.as_str()), ("async", transcript)] {
+                    assert!(
+                        !text.contains("Inspect after resume."),
+                        "rolled-back user input remains in {consumer} review: {text}"
+                    );
+                }
+            }
             if index == 0 {
                 let input = parent[2]["input"].as_array().expect("request input array");
                 let output = input
@@ -586,12 +615,12 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                     .expect("request input array");
                 let parent_input = serde_json::to_string(parent_items)?;
                 // V2 keeps bounded user history while replacing old tool output with a checkpoint.
-                assert!(parent_input.contains(RESTRICTION));
+                assert_eq!(parent_input.contains(RESTRICTION), index <= 3);
                 assert!(!parent_input.contains(EVIDENCE));
                 assert!(!parent_items.iter().any(|item| {
                     item["type"] == "function_call_output" && item["call_id"] == "inspect-1"
                 }));
-                {
+                if index <= 3 {
                     assert!(sync_text.contains(RESTRICTION));
                     if matches!(context_path, ContextPath::ThreadOwned) {
                         assert!(
@@ -649,10 +678,17 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                             assert!(!transcript.contains("tool request_user_input call:"));
                         }
                     }
+                } else {
+                    assert!(!sync_text.contains(RESTRICTION));
+                    assert!(!sync_text.contains(EVIDENCE));
+                    assert!(!transcript.contains(RESTRICTION));
+                    assert!(!transcript.contains(EVIDENCE));
+                    assert!(!transcript.contains("Recheck the repository."));
+                    assert!(!transcript.contains("\"echoed\":\"current inspection\""));
                 }
             }
             for (consumer, text) in [("async", &content), ("sync", &sync_text)] {
-                if matches!(context_path, ContextPath::ThreadOwned) || index == 0 {
+                if index < 4 && (matches!(context_path, ContextPath::ThreadOwned) || index == 0) {
                     let answers = text
                         .split_once(">>> TRUSTED USER ANSWERS START")
                         .unwrap_or_else(|| {
@@ -679,6 +715,9 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                         },
                     }
                 } else {
+                    if index == 4 {
+                        assert!(!text.contains(USER_INPUT_RESTRICTION));
+                    }
                     assert!(!text.contains(">>> TRUSTED USER ANSWERS START"));
                 }
             }
@@ -779,8 +818,10 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                             .metadata
                             .as_ref()
                             .and_then(|metadata| metadata.compaction_model_hash.as_deref()),
-                        parent_hash,
-                        "every compaction records its producer provenance",
+                        matches!(context_path, ContextPath::ThreadOwned)
+                            .then_some(parent_hash)
+                            .flatten(),
+                        "only the enabled path records checkpoint producer provenance",
                     );
                 }
             }

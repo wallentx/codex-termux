@@ -297,11 +297,7 @@ class Codex:
     # END GENERATED: Codex.flat_methods
 
     def models(self, *, include_hidden: bool = False) -> ModelListResponse:
-        """List available models reported by Codex.
-
-        The deprecated ``Model.supports_personality`` field is always ``False``
-        on the current app-server.
-        """
+        """List available models reported by Codex."""
         return self._client.model_list(include_hidden=include_hidden)
 
 
@@ -561,11 +557,6 @@ class AsyncCodex:
     # END GENERATED: AsyncCodex.flat_methods
 
     async def models(self, *, include_hidden: bool = False) -> ModelListResponse:
-        """List available models reported by Codex.
-
-        The deprecated ``Model.supports_personality`` field is always ``False``
-        on the current app-server.
-        """
         await self._ensure_initialized()
         return await self._client.model_list(include_hidden=include_hidden)
 

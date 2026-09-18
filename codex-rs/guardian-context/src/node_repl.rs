@@ -9,7 +9,6 @@ use crate::SectionInput;
 use crate::SectionScope;
 use codex_context_fragments::ContextualUserFragment;
 use codex_protocol::models::ContentItemKind;
-use codex_protocol::models::ImageReference;
 use codex_protocol::user_input::UserInput;
 use codex_protocol::user_input::UserInput::Image;
 use codex_protocol::user_input::UserInput::Text;
@@ -85,15 +84,10 @@ impl NodeReplContext<'_> {
     pub fn render_inputs(&self) -> Vec<UserInput> {
         if self.mode != NodeReplReviewEvidenceMode::Multimodal
             || !self.responses.iter().any(|response| {
-                response.items.iter().any(|item| {
-                    matches!(
-                        item,
-                        Image {
-                            image: ImageReference::Inline { .. },
-                            ..
-                        }
-                    )
-                })
+                response
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, Image { .. }))
             })
         {
             return vec![text_input(self.render())];
@@ -144,10 +138,9 @@ impl NodeReplContext<'_> {
             for item in response.items {
                 match item {
                     Text { text, .. } => inputs.push(text_input(format!("{text}\n"))),
-                    Image {
-                        image: ImageReference::Inline { image_url },
-                        ..
-                    } if seen_images.insert(image_url) => inputs.push(item.clone()),
+                    Image { image_url, .. } if seen_images.insert(image_url) => {
+                        inputs.push(item.clone())
+                    }
                     _ => {}
                 }
             }

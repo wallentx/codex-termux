@@ -42,7 +42,7 @@ async fn snapshot_failure_omits_credentials_and_stops_descendants(
         manager: &manager,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd_uri),
-        sandbox_exe: None,
+        codex_linux_sandbox_exe: None,
         use_legacy_landlock: false,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,

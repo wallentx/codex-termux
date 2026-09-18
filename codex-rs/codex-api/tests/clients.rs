@@ -12,6 +12,7 @@ use codex_api::Compression;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient;
+use codex_api::ResponsesEndpoint;
 use codex_api::ResponsesOptions;
 use codex_client::HttpTransport;
 use codex_client::Request;
@@ -307,28 +308,22 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 }
 
 #[tokio::test]
-async fn responses_client_sends_extra_headers() -> Result<()> {
+async fn responses_client_uses_guardian_path() -> Result<()> {
     let state = RecordingState::default();
     let transport = RecordingTransport::new(state.clone());
-    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
-    let headers = HeaderMap::from_iter([(
-        http::HeaderName::from_static("x-custom-request"),
-        HeaderValue::from_static("example"),
-    )]);
+    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth))
+        .with_endpoint(ResponsesEndpoint::Guardian);
+
     let _stream = client
         .stream(
             serde_json::json!({ "echo": true }),
-            headers,
+            HeaderMap::new(),
             Compression::None,
             /*turn_state*/ None,
         )
         .await?;
-    let requests = state.take_stream_requests();
-    assert_path_ends_with(&requests, "/responses");
-    assert_eq!(
-        requests[0].headers.get("x-custom-request"),
-        Some(&HeaderValue::from_static("example")),
-    );
+
+    assert_path_ends_with(&state.take_stream_requests(), "/guardian");
     Ok(())
 }
 

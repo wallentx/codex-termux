@@ -1,7 +1,6 @@
 use anyhow::Result;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
-use codex_features::Feature;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageDelivery;
 use codex_protocol::items::AgentMessageItem;
@@ -121,21 +120,15 @@ async fn persistent_async_message_guidance_follows_tool_availability(
     Ok(())
 }
 
-#[test_case(SessionSource::Exec, None, &[], false; "root_without_opt_in")]
-#[test_case(SessionSource::Exec, None, &[Feature::SendAsyncMessage], false; "root_with_retired_feature")]
-#[test_case(SessionSource::Exec, Some("send_user_message_async"), &[], false; "root_with_legacy_question_tool")]
-#[test_case(SessionSource::Exec, Some("request_user_input_async"), &[], false; "root_with_question_tool")]
-#[test_case(SessionSource::Exec, Some("send_message_to_user_async"), &[], true; "root_with_catalog_opt_in")]
-#[test_case(SessionSource::Exec, None, &[Feature::SendMessageToUserAsync], true; "root_with_feature_opt_in")]
-#[test_case(SessionSource::Exec, Some("send_message_to_user_async"), &[Feature::SendMessageToUserAsync], true; "root_with_both_opt_ins")]
-#[test_case(SessionSource::SubAgent(SubAgentSource::Other("test".to_string())), Some("send_message_to_user_async"), &[], false; "subagent_with_catalog_opt_in")]
-#[test_case(SessionSource::SubAgent(SubAgentSource::Other("test".to_string())), None, &[Feature::SendMessageToUserAsync], false; "subagent_with_feature_opt_in")]
-#[test_case(SessionSource::SubAgent(SubAgentSource::Other("test".to_string())), Some("send_message_to_user_async"), &[Feature::SendMessageToUserAsync], false; "subagent_with_both_opt_ins")]
+#[test_case(SessionSource::Exec, None, false; "root_without_opt_in")]
+#[test_case(SessionSource::Exec, Some("send_user_message_async"), false; "root_with_legacy_question_tool")]
+#[test_case(SessionSource::Exec, Some("request_user_input_async"), false; "root_with_question_tool")]
+#[test_case(SessionSource::Exec, Some("send_message_to_user_async"), true; "root_with_freeform_tool")]
+#[test_case(SessionSource::SubAgent(SubAgentSource::Other("test".to_string())), Some("send_message_to_user_async"), false; "subagent_with_freeform_tool")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn freeform_async_message_requires_root_and_catalog_or_feature_opt_in(
+async fn freeform_async_message_requires_root_and_exact_catalog_opt_in(
     session_source: SessionSource,
     catalog_tool: Option<&'static str>,
-    enabled_features: &'static [Feature],
     expected: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -151,14 +144,6 @@ async fn freeform_async_message_requires_root_and_catalog_or_feature_opt_in(
             model.tool_mode = Some(ToolMode::CodeModeOnly);
             model.experimental_supported_tools =
                 catalog_tool.map(str::to_string).into_iter().collect();
-        })
-        .with_config(move |config| {
-            for &feature in enabled_features {
-                config
-                    .features
-                    .enable(feature)
-                    .expect("enable async messaging test feature");
-            }
         })
         .build_with_auto_env(&server)
         .await?;
@@ -183,20 +168,14 @@ async fn freeform_async_message_requires_root_and_catalog_or_feature_opt_in(
     assert_eq!(
         tools
             .iter()
-            .filter(|tool| tool["name"] == "send_message_to_user_async")
-            .count(),
-        usize::from(expected),
+            .any(|tool| tool["name"] == "send_message_to_user_async"),
+        expected,
     );
     Ok(())
 }
 
-#[test_case(Some("send_message_to_user_async"), &[]; "catalog_opt_in")]
-#[test_case(None, &[Feature::SendMessageToUserAsync]; "feature_opt_in")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn freeform_async_message_emits_an_item_without_ending_the_turn(
-    catalog_tool: Option<&'static str>,
-    enabled_features: &'static [Feature],
-) -> Result<()> {
+async fn freeform_async_message_emits_an_item_without_ending_the_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     const CALL_ID: &str = "freeform-message";
@@ -234,12 +213,12 @@ async fn freeform_async_message_emits_an_item_without_ending_the_turn(
     )
     .await;
     let test = test_codex()
-        .with_model_info_override("gpt-5.2", move |model| {
+        .with_model_info_override("gpt-5.2", |model| {
             model.tool_mode = Some(ToolMode::CodeModeOnly);
-            model.experimental_supported_tools = vec!["request_user_input_async".to_string()];
-            model
-                .experimental_supported_tools
-                .extend(catalog_tool.map(str::to_string));
+            model.experimental_supported_tools.extend([
+                "send_message_to_user_async".to_string(),
+                "request_user_input_async".to_string(),
+            ]);
             model
                 .model_messages
                 .as_mut()
@@ -249,14 +228,6 @@ async fn freeform_async_message_emits_an_item_without_ending_the_turn(
                     description: Some("Questions only.".to_string()),
                 }),
             });
-        })
-        .with_config(move |config| {
-            for &feature in enabled_features {
-                config
-                    .features
-                    .enable(feature)
-                    .expect("enable async messaging test feature");
-            }
         })
         .build_with_auto_env(&server)
         .await?;

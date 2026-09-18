@@ -12,7 +12,6 @@ use crate::facts::CompactionReason;
 use crate::facts::CompactionStatus;
 use crate::facts::CompactionStrategy;
 use crate::facts::CompactionTrigger;
-use crate::facts::ElicitationType;
 use crate::facts::GoalEventKind;
 use crate::facts::HookRunFact;
 use crate::facts::ImagePreparationMetadata;
@@ -655,16 +654,6 @@ pub(crate) enum ToolItemFailureKind {
     PolicyForbidden,
 }
 
-/// The immediate initiator of the tool request associated with an analytics event.
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ToolEventType {
-    /// The event item ID matches a tool call emitted in a sampled model response.
-    ModelToolCall,
-    /// The event item ID matches a child call dispatched by an executing tool.
-    InnerToolCall,
-}
-
 #[derive(Serialize)]
 pub(crate) struct CodexToolItemEventBase {
     pub(crate) thread_id: String,
@@ -684,8 +673,6 @@ pub(crate) struct CodexToolItemEventBase {
     pub(crate) subagent_source: Option<String>,
     pub(crate) parent_thread_id: Option<String>,
     pub(crate) tool_name: String,
-    /// Absent when origin evidence is unavailable or conflicting at emission time.
-    pub(crate) tool_event_type: Option<ToolEventType>,
     pub(crate) started_at_ms: u64,
     pub(crate) completed_at_ms: u64,
     // Observed item lifecycle duration. This may undercount end-to-end execution
@@ -791,8 +778,6 @@ pub(crate) enum WebSearchActionKind {
 
 #[derive(Serialize)]
 pub(crate) struct CodexCommandExecutionEventParams {
-    pub(crate) model_slug: Option<String>,
-    pub(crate) reasoning_effort: Option<String>,
     #[serde(flatten)]
     pub(crate) base: CodexToolItemEventBase,
     pub(crate) plugin_id: Option<String>,
@@ -818,8 +803,6 @@ pub(crate) struct CodexPluginMeasurementEventParams {
     pub(crate) turn_id: String,
     pub(crate) item_id: String,
     pub(crate) originator: String,
-    pub(crate) model_slug: Option<String>,
-    pub(crate) reasoning_effort: Option<String>,
     pub(crate) plugin_id: String,
     pub(crate) execution_id: String,
     pub(crate) operation: String,
@@ -860,7 +843,6 @@ pub(crate) struct CodexMcpToolCallEventParams {
     pub(crate) mcp_error_present: bool,
     pub(crate) plugin_id: Option<String>,
     pub(crate) connector_id: Option<String>,
-    pub(crate) elicitation_type: Option<ElicitationType>,
 }
 
 #[derive(Serialize)]
@@ -970,16 +952,9 @@ pub(crate) struct CodexAppMentionedEventRequest {
 }
 
 #[derive(Serialize)]
-pub(crate) struct CodexAppUsedMetadata {
-    #[serde(flatten)]
-    pub(crate) app: CodexAppMetadata,
-    pub(crate) elicitation_type: Option<ElicitationType>,
-}
-
-#[derive(Serialize)]
 pub(crate) struct CodexAppUsedEventRequest {
     pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexAppUsedMetadata,
+    pub(crate) event_params: CodexAppMetadata,
 }
 
 #[derive(Serialize)]

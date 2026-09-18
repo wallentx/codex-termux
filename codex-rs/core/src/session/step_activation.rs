@@ -95,7 +95,7 @@ fn check_legacy_model_safety(
         return Err("the destination model has only fallback metadata".to_string());
     }
     let retained_models = [admitted, current];
-    // The Guardian reviewer extension still selects its circuit-breaker
+    // guardian::review::record_guardian_denial still selects its circuit-breaker
     // policy from the admitted model's Cyber classification.
     let destination_is_cyber =
         destination.model_specialty.as_deref() == Some(MODEL_SPECIALTY_CYBER);
@@ -374,6 +374,7 @@ impl Session {
                 &constraints,
                 self.services.models_manager.as_ref(),
                 &overrides,
+                self.features.enabled(Feature::Personality),
                 self.features.enabled(Feature::FastMode),
             )
             .await

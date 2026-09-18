@@ -103,7 +103,6 @@ pub struct ThreadConfigSnapshot {
     pub parent_thread_id: Option<ThreadId>,
     pub thread_source: Option<ThreadSource>,
     pub originator: String,
-    pub disabled_plugin_ids: Vec<String>,
 }
 
 impl ThreadConfigSnapshot {
@@ -231,11 +230,6 @@ impl CodexThread {
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
     pub fn session_telemetry(&self) -> SessionTelemetry {
         self.session.services.session_telemetry.clone()
-    }
-
-    /// Whether analytics is enabled for this thread after configuration and host overrides.
-    pub fn analytics_enabled(&self) -> bool {
-        self.session.services.analytics_events_client.is_enabled()
     }
 
     /// Returns extension-owned data attached to this thread runtime.
@@ -497,11 +491,6 @@ impl CodexThread {
         self.session.inject_if_running(items).await
     }
 
-    /// Captures a regular turn only after its input is recorded. The caller must flush the rollout.
-    pub async fn interrupted_turn(&self) -> Option<(String, TurnStartOptions)> {
-        self.session.interrupted_turn().await
-    }
-
     /// Returns the trusted root when the expected turn is currently active.
     pub async fn active_turn_root(&self, expected_turn_id: &str) -> Option<String> {
         let active = self.session.active_turn.lock().await;
@@ -697,7 +686,7 @@ impl CodexThread {
 
     pub async fn guardian_trunk_rollout_path(&self) -> Option<PathBuf> {
         self.session
-            .guardian_review_session()?
+            .guardian_review_session()
             .trunk()
             .await?
             .rollout_path()
