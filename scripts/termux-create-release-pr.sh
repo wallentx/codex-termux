@@ -60,312 +60,6 @@ seed_release_branch_workflows() {
   done
 }
 
-apply_seeded_release_code_patches() {
-  local patch_path="${TERMUX_RELEASE_CODE_PATCH:-${seed_dir}/scripts/termux-release-self-update.patch}"
-
-  if git apply --reverse --check "${patch_path}" >/dev/null 2>&1; then
-    echo "Termux release code patch is already applied."
-    return 0
-  fi
-
-  git apply --3way "${patch_path}"
-}
-
-git_add_seeded_release_paths() {
-  git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
-  git add -- "${TERMUX_RELEASE_CODE_PATHS[@]}"
-}
-
-workspace_version_from_ref() {
-  local ref="$1"
-  git show "${ref}:codex-rs/Cargo.toml" | awk '
-    /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
-    /^\[/ { in_workspace_package = 0 }
-    in_workspace_package && /^version = / {
-      gsub(/^version = "/, "")
-      gsub(/"$/, "")
-      print
-      # Drain git show under pipefail; an early exit can give it SIGPIPE when
-      # the workspace manifest grows beyond the pipe buffer.
-      in_workspace_package = 0
-    }
-  '
-}
-
-normalize_workspace_version_to_upstream_tag() {
-  local upstream_version
-
-  upstream_version="$(workspace_version_from_ref "refs/tags/${UPSTREAM_TAG}")"
-  if [[ -z "${upstream_version}" ]]; then
-    echo "Unable to read workspace package version from refs/tags/${UPSTREAM_TAG}" >&2
-    exit 1
-  fi
-  if [[ ! -f codex-rs/Cargo.toml ]]; then
-    echo "codex-rs/Cargo.toml is missing from ${WORK_BRANCH}" >&2
-    exit 1
-  fi
-
-  UPSTREAM_WORKSPACE_VERSION="${upstream_version}" perl -0pi -e '
-    my $version = $ENV{"UPSTREAM_WORKSPACE_VERSION"};
-    s/(\[workspace\.package\]\n(?:(?!^\[).*\n)*?version = ")[^"]+(")/$1$version$2/m
-      or die "workspace.package version not found\n";
-  ' codex-rs/Cargo.toml
-}
-
-restore_release_workspace_manifest() {
-  local release_ref="origin/${RELEASE_BRANCH}"
-  local manifest="codex-rs/Cargo.toml"
-
-  git restore --source="${release_ref}" --staged --worktree -- "${manifest}"
-
-  if git cat-file -e "HEAD:codex-rs/utils/file-lock/Cargo.toml" 2>/dev/null; then
-    if ! grep -q '^[[:space:]]*"utils/file-lock",[[:space:]]*$' "${manifest}"; then
-      perl -0pi -e '
-        s{(^\s*"utils/elapsed",\n)}{$1    "utils/file-lock",\n}m
-          || s{(members = \[\n)}{$1    "utils/file-lock",\n}
-          || die "workspace members array not found\n";
-      ' "${manifest}"
-    fi
-    if ! grep -q '^codex-utils-file-lock[[:space:]]*=' "${manifest}"; then
-      perl -0pi -e '
-        s{(^codex-utils-elapsed = .*\n)}{$1codex-utils-file-lock = { path = "utils/file-lock" }\n}m
-          || s{(\[workspace\.dependencies\]\n)}{$1codex-utils-file-lock = { path = "utils/file-lock" }\n}
-          || die "workspace dependencies section not found\n";
-      ' "${manifest}"
-    fi
-  fi
-
-  git add -- "${manifest}"
-}
-
-resolve_union_merge_paths() {
-  local path
-  local merge_dir
-
-  for path in "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}"; do
-    if [[ -z "$(git ls-files --unmerged -- "${path}")" ]]; then
-      continue
-    fi
-
-    merge_dir="$(mktemp -d "${RUNNER_TEMP}/termux-release-union.XXXXXX")"
-    git show ":2:${path}" > "${merge_dir}/ours"
-    git show ":1:${path}" > "${merge_dir}/base"
-    git show ":3:${path}" > "${merge_dir}/theirs"
-    git merge-file \
-      --union \
-      "${merge_dir}/ours" \
-      "${merge_dir}/base" \
-      "${merge_dir}/theirs"
-    cp "${merge_dir}/ours" "${path}"
-    rm -rf "${merge_dir}"
-    git add -- "${path}"
-  done
-}
-
-restore_release_cargo_overlay() {
-  local release_ref="origin/${RELEASE_BRANCH}"
-  local overlay_dir
-  local overlay_patch
-
-  if [[ -z "${cargo_overlay_source_ref:-}" || -z "${cargo_overlay_base_ref:-}" ]]; then
-    echo "No paired tested Termux tag found; retaining conflict-only Cargo resolution."
-    resolve_union_merge_paths
-    return
-  fi
-
-  overlay_dir="$(mktemp -d "${RUNNER_TEMP}/termux-release-cargo-overlay.XXXXXX")"
-  overlay_patch="${overlay_dir}/cargo.patch"
-  git diff \
-    --binary \
-    "${cargo_overlay_base_ref}" \
-    "${cargo_overlay_source_ref}" \
-    -- "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}" \
-    > "${overlay_patch}"
-
-  git restore \
-    --source="${release_ref}" \
-    --staged \
-    --worktree \
-    -- "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}"
-  if [[ -s "${overlay_patch}" ]]; then
-    if ! git apply --3way --index "${overlay_patch}"; then
-      if [[ -z "$(git ls-files --unmerged -- "${TERMUX_RELEASE_CARGO_OVERLAY_PATHS[@]}")" ]]; then
-        echo "Cargo overlay failed without resolvable conflicts." >&2
-        rm -rf "${overlay_dir}"
-        return 1
-      fi
-      echo "Cargo overlay reported conflicts; retaining both tested Termux and upstream additions."
-      resolve_union_merge_paths
-    fi
-  fi
-  rm -rf "${overlay_dir}"
-}
-
-resolve_unmodified_upstream_conflicts() {
-  local path
-  local release_ref="origin/${RELEASE_BRANCH}"
-
-  [[ -n "${patch_upstream_ref:-}" ]] || return 0
-  # Stable releases can cherry-pick upstream changes without sharing their
-  # ancestry with the next alpha. Resolve only paths that the patch branch has
-  # not changed relative to its paired upstream tag. Real Termux edits remain
-  # conflicts, including renamed files absent from the old tag.
-  while IFS= read -r -d '' path; do
-    if git cat-file -e "${patch_upstream_ref}:${path}" 2>/dev/null \
-      && git diff --quiet "${patch_upstream_ref}" HEAD -- "${path}"; then
-      echo "Taking current upstream for unchanged downstream path: ${path}"
-      if git cat-file -e "${release_ref}:${path}" 2>/dev/null; then
-        git restore --source="${release_ref}" --staged --worktree -- "${path}"
-      else
-        git rm -f -- "${path}"
-      fi
-    fi
-  done < <(git diff --name-only --diff-filter=U -z)
-}
-
-resolve_startup_lock_import_conflict() {
-  local path="codex-rs/app-server-transport/src/transport/unix_socket.rs"
-  [[ -n "$(git ls-files --unmerged -- "${path}")" ]] || return 0
-
-  # 0.154 adds SinkExt at the same location as our lock fallback imports.
-  # Resolve only these exact additive imports, not arbitrary Rust conflicts.
-  # Include the base to prove that neither side replaces existing code.
-  git checkout --conflict=diff3 -- "${path}"
-  python3 - "${path}" <<'PY'
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-ours = (
-    "use codex_utils_file_lock::FileLockOutcome;\n"
-    "use codex_utils_file_lock::LockDirGuard;\n"
-    "use codex_utils_file_lock::acquire_sibling_lock_dir;\n"
-    "use codex_utils_file_lock::lock_exclusive_optional;\n"
-)
-theirs = "use futures::SinkExt;\n"
-pattern = (
-    r"^<<<<<<< [^\n]*\n" + re.escape(ours)
-    + r"\|\|\|\|\|\|\|[^\n]*\n=======\n" + re.escape(theirs)
-    + r">>>>>>> [^\n]*\n"
-)
-resolved, count = re.subn(pattern, ours + theirs, text, flags=re.MULTILINE)
-if count and not re.search(r"^(?:<<<<<<<|=======|>>>>>>>)", resolved, re.MULTILINE):
-    path.write_text(resolved)
-PY
-  if ! grep -qE '^(<<<<<<<|=======|>>>>>>>)' "${path}"; then
-    git add -- "${path}"
-  fi
-}
-
-restore_release_rollout_locks() {
-  local release_ref="origin/${RELEASE_BRANCH}"
-
-  # Only adapt the thread-store -> rollout migration. Older releases and patch
-  # branches that already checkpointed the move keep their own implementation,
-  # including any later fixes, rather than being reset to this seed patch.
-  if ! git cat-file -e "${release_ref}:codex-rs/rollout/src/writer_lock.rs" 2>/dev/null \
-    || ! git cat-file -e "HEAD:codex-rs/thread-store/src/local/writer_lock.rs" 2>/dev/null; then
-    return 0
-  fi
-  if ! git cat-file -e "HEAD:codex-rs/utils/file-lock/Cargo.toml" 2>/dev/null; then
-    echo "Rollout lock fallback requires the Termux file-lock crate." >&2
-    return 1
-  fi
-
-  git restore --source="${release_ref}" --staged --worktree \
-    -- "${TERMUX_RELEASE_ROLLOUT_LOCK_PATHS[@]}"
-  git apply --index "${seed_dir}/scripts/termux-release-rollout-locks.patch"
-}
-
-restore_merge_authoritative_paths() {
-  local release_ref="origin/${RELEASE_BRANCH}"
-  local path
-  local -a patch_remove_paths=()
-  local -a patch_restore_paths=()
-  local -a release_remove_paths=()
-  local -a release_restore_paths=()
-
-  for path in "${TERMUX_RELEASE_CODE_PATHS[@]}"; do
-    if termux_path_in_list "${path}" "${TERMUX_RELEASE_PATCH_AUTHORITATIVE_CODE_PATHS[@]}"; then
-      if git cat-file -e "HEAD:${path}" 2>/dev/null; then
-        patch_restore_paths+=("${path}")
-      elif git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
-        patch_remove_paths+=("${path}")
-      fi
-    elif git cat-file -e "${release_ref}:${path}" 2>/dev/null; then
-      release_restore_paths+=("${path}")
-    elif git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
-      release_remove_paths+=("${path}")
-    fi
-  done
-
-  if (( ${#patch_restore_paths[@]} > 0 )); then
-    git restore \
-      --source=HEAD \
-      --staged \
-      --worktree \
-      -- "${patch_restore_paths[@]}"
-  fi
-  if (( ${#patch_remove_paths[@]} > 0 )); then
-    git rm -f --ignore-unmatch -- "${patch_remove_paths[@]}"
-  fi
-
-  for path in "${TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS[@]}"; do
-    if git cat-file -e "${release_ref}:${path}" 2>/dev/null; then
-      release_restore_paths+=("${path}")
-    elif git ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
-      release_remove_paths+=("${path}")
-    fi
-  done
-
-  if (( ${#release_restore_paths[@]} > 0 )); then
-    git restore \
-      --source="${release_ref}" \
-      --staged \
-      --worktree \
-      -- "${release_restore_paths[@]}"
-  fi
-  if (( ${#release_remove_paths[@]} > 0 )); then
-    git rm -f --ignore-unmatch -- "${release_remove_paths[@]}"
-  fi
-
-  restore_release_cargo_overlay
-}
-
-merge_release_branch_into_work_branch() {
-  local release_ref="origin/${RELEASE_BRANCH}"
-  local unresolved_paths
-
-  if ! git merge --no-ff --no-commit "${release_ref}"; then
-    echo "Release merge reported conflicts; resolving authoritative paths."
-  fi
-
-  restore_merge_authoritative_paths
-  resolve_unmodified_upstream_conflicts
-  resolve_startup_lock_import_conflict
-  restore_release_rollout_locks
-  restore_release_workspace_manifest
-  # Similar dependency lists can make a historical patch apply to the wrong
-  # package. Derive file-lock edges from the actual merged crate manifests.
-  python3 "${seed_dir}/scripts/termux-sync-file-lock.py"
-  git add -- codex-rs/Cargo.lock
-  seed_release_branch_workflows
-  git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
-
-  unresolved_paths="$(git diff --name-only --diff-filter=U)"
-  if [[ -n "${unresolved_paths}" ]]; then
-    echo "Unable to merge ${RELEASE_BRANCH} into ${WORK_BRANCH}; unresolved paths remain:" >&2
-    printf '%s\n' "${unresolved_paths}" >&2
-    exit 1
-  fi
-
-  if [[ -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; then
-    git commit -m "Merge ${RELEASE_BRANCH} into ${WORK_BRANCH}"
-  fi
-}
-
 open_prs_cache_loaded=false
 open_prs_cache="[]"
 open_prs_json() {
@@ -522,8 +216,6 @@ ensure_upstream_tag() {
 patch_source_ref="origin/${PATCH_BRANCH}"
 patch_source_label="${PATCH_BRANCH}"
 patch_source_sha="$(git rev-parse "${patch_source_ref}")"
-cargo_overlay_source_ref=""
-cargo_overlay_base_ref=""
 patch_upstream_ref=""
 
 if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
@@ -536,17 +228,6 @@ if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
       --list 'rust-v*-termux' \
       --sort=-v:refname
   )
-  for candidate_tag in "${target_termux_tags[@]}"; do
-    if [[ "${candidate_tag}" != rust-v${release_line}.*-termux ]]; then
-      continue
-    fi
-    candidate_upstream_tag="${candidate_tag%-termux}"
-    ensure_upstream_tag "${candidate_upstream_tag}"
-    cargo_overlay_source_ref="refs/tags/${candidate_tag}"
-    cargo_overlay_base_ref="refs/tags/${candidate_upstream_tag}"
-    echo "Using ${candidate_tag} Cargo changes as the tested overlay for ${UPSTREAM_TAG}."
-    break
-  done
   if (( ${#target_termux_tags[@]} > 0 )) \
     && [[ "${target_termux_tags[0]}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]] \
     && (( BASH_REMATCH[1] > release_major \
@@ -575,20 +256,24 @@ if [[ "${UPSTREAM_TAG}" =~ ^rust-v([0-9]+)\.([0-9]+)\. ]]; then
   fi
 fi
 
-# The first release in a new minor line has no same-line Termux tag yet. Use
-# the patch source's latest paired upstream/Termux tags to identify untouched
-# upstream files and, if needed, carry only the tested Cargo delta forward.
+# Pair the selected target snapshot with its tested upstream baseline. Only
+# their code delta is portable; the target's full upstream history is not.
 while IFS= read -r candidate_tag; do
   candidate_upstream_tag="${candidate_tag%-termux}"
   ensure_upstream_tag "${candidate_upstream_tag}"
   patch_upstream_ref="refs/tags/${candidate_upstream_tag}"
-  if [[ -z "${cargo_overlay_source_ref}" ]]; then
-    cargo_overlay_source_ref="refs/tags/${candidate_tag}"
-    cargo_overlay_base_ref="${patch_upstream_ref}"
-    echo "Using ${candidate_tag} Cargo changes across release lines for ${UPSTREAM_TAG}."
-  fi
   break
 done < <(git tag --merged "${patch_source_ref}" --list 'rust-v*-termux' --sort=-v:refname)
+if [[ -z "${patch_upstream_ref}" ]]; then
+  echo "No paired upstream baseline for ${patch_source_label}; refusing an unverified release delta." >&2
+  exit 1
+fi
+
+# Preflight BEFORE creating, deleting, or pushing any release branch. The
+# helper uses a private index and rejects conflicts and unrelated source drift.
+release_code_tree="$(python3 "${script_dir}/termux-release-tree.py" \
+  "refs/tags/${UPSTREAM_TAG}" "${patch_source_ref}" "${patch_upstream_ref}" \
+  "${TERMUX_RELEASE_BRANCH_SCRIPT_PATHS[@]}")"
 
 existing_prs="$(title_prs_json)"
 existing_merged_pr="$(
@@ -665,8 +350,7 @@ fi
 if [[ "${release_branch_exists}" == false ]]; then
   git checkout -B "${RELEASE_BRANCH}" "refs/tags/${UPSTREAM_TAG}"
   seed_release_branch_workflows
-  apply_seeded_release_code_patches
-  git_add_seeded_release_paths
+  git add -- "${TERMUX_RELEASE_AUTOMATION_PATHS[@]}"
   if ! git diff --cached --quiet; then
     git commit -m "Seed Termux release automation"
   fi
@@ -678,31 +362,16 @@ if [[ "${release_branch_exists}" == false ]]; then
 fi
 
 git fetch origin "${RELEASE_BRANCH}"
-work_branch_exists=false
 if git ls-remote --exit-code --heads origin "${WORK_BRANCH}" >/dev/null 2>&1; then
-  work_branch_exists=true
   git fetch origin "${WORK_BRANCH}"
 fi
 
-if [[ "${work_branch_exists}" == true \
-  && -n "${existing_open_train_pr_url}" \
-  && "${existing_open_train_pr_matches_upstream}" == "true" \
-  && "${patch_source_ref}" == "origin/${PATCH_BRANCH}" ]]; then
-  git checkout -B "${WORK_BRANCH}" "origin/${WORK_BRANCH}"
-else
-  git checkout -B "${WORK_BRANCH}" "${patch_source_ref}"
-fi
-normalize_workspace_version_to_upstream_tag
-git add -- codex-rs/Cargo.toml
-if ! git diff --cached --quiet; then
-  git commit -m "Normalize workspace version for ${UPSTREAM_TAG}"
-fi
-merge_release_branch_into_work_branch
+# Rebuild from the release base every time, never from a previously merged
+# alpha tree. The recorded patch snapshot still anchors subsequent checkpoints.
+git checkout -B "${WORK_BRANCH}" "origin/${RELEASE_BRANCH}"
+git restore --source="${release_code_tree}" --staged --worktree -- .
 seed_release_branch_workflows
-# The patch branch is the authoritative Termux code source. Reapplying the
-# release code patch here can conflict when that branch contains newer upstream
-# context around the same Termux changes.
-normalize_workspace_version_to_upstream_tag
+python3 "${seed_dir}/scripts/termux-sync-file-lock.py"
 
 mkdir -p .github
 jq -n \
@@ -717,6 +386,7 @@ jq -n \
   --arg work_branch "${WORK_BRANCH}" \
   --arg patch_branch "${PATCH_BRANCH}" \
   --arg patch_source_sha "${patch_source_sha}" \
+  --arg patch_upstream_ref "${patch_upstream_ref}" \
   --arg termux_tag "${TERMUX_TAG}" \
   --argjson upstream_prerelease "${UPSTREAM_PRERELEASE}" \
   '{
@@ -732,10 +402,20 @@ jq -n \
     work_branch: $work_branch,
     patch_branch: $patch_branch,
     patch_source_sha: $patch_source_sha,
+    patch_upstream_ref: $patch_upstream_ref,
     termux_tag: $termux_tag
   }' > .github/termux-release.json
 
 git add -A
+if [[ -n "${existing_open_train_pr_url}" ]] \
+  && git rev-parse --verify --quiet "origin/${WORK_BRANCH}^{commit}" >/dev/null \
+  && git diff --quiet "origin/${WORK_BRANCH}" "$(git write-tree)"; then
+  echo "Existing PR already contains the verified release tree; leaving its commit and CI intact."
+  enable_release_pr_automerge "${existing_open_train_pr_url}"
+  append_pr_summary "verified release tree unchanged" "${existing_open_train_pr_url}"
+  echo "pr_url=${existing_open_train_pr_url}" >> "${GITHUB_OUTPUT}"
+  exit 0
+fi
 if git diff --cached --quiet; then
   echo "No changes to propose for ${UPSTREAM_TAG}."
   append_pr_summary "no changes to propose"
@@ -755,7 +435,7 @@ body_path="${RUNNER_TEMP}/termux-release-pr.md"
   echo "- Release train branch: \`${RELEASE_BRANCH}\`"
   echo "- Patch source: \`${patch_source_label}\`"
   echo
-  echo "This PR is intentionally created from \`${patch_source_label}\` with the Termux release automation files copied from \`dev\`, then targeted at the upstream release branch. If GitHub reports conflicts, resolve them manually by keeping the upstream release code while preserving the Termux compatibility fixes."
+  echo "This PR starts from the exact upstream release and carries only the Termux delta between \`${patch_upstream_ref}\` and \`${patch_source_label}\`. Release automation is copied from \`dev\`. Preflight rejects unresolved compatibility conflicts or unrelated upstream leftovers."
   echo
   echo "Auto-merge is enabled when GitHub reports the PR as mergeable. Required CI, including the Termux artifact smoke test, is the approval gate. After merge, the deployment workflow attaches the tested artifact to \`${TERMUX_TAG}\` and opens the checkpoint PR."
   echo

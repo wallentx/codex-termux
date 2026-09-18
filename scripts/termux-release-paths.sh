@@ -28,59 +28,11 @@ readonly -a TERMUX_RELEASE_BRANCH_SCRIPT_PATHS=(
   scripts/termux-release-self-update.patch
   scripts/termux-release-rollout-locks.patch
   scripts/termux-sync-file-lock.py
+  scripts/termux-release-tree.py
   scripts/termux-release-asset-state.sh
   scripts/termux-release-paths.sh
   scripts/termux-resolve-release-ref.sh
   scripts/termux-validate-gh-env.sh
-)
-
-readonly -a TERMUX_RELEASE_CODE_PATHS=(
-  codex-rs/cli/src/main.rs
-  codex-rs/tui/src/lib.rs
-  codex-rs/tui/src/termux_update.rs
-  codex-rs/tui/src/update_action.rs
-  codex-rs/tui/src/update_prompt.rs
-  codex-rs/tui/src/update_versions.rs
-  codex-rs/tui/src/updates.rs
-)
-
-# This file is implemented entirely by the downstream patch branch and can
-# contain checkpointed improvements that are newer than the seeded patch.
-# Other release code paths mix Termux changes into upstream-owned files, so
-# their post-merge versions must come from the newly patched release branch.
-readonly -a TERMUX_RELEASE_PATCH_AUTHORITATIVE_CODE_PATHS=(
-  codex-rs/tui/src/termux_update.rs
-)
-
-# These generated/manifest files must start from the new upstream release, then
-# receive the Cargo delta from a tested Termux tag (prefer the same release line).
-readonly -a TERMUX_RELEASE_CARGO_OVERLAY_PATHS=(
-  codex-rs/Cargo.lock
-  codex-rs/core/Cargo.toml
-)
-
-# Upstream moved writer ownership from thread-store into rollout in 0.155.
-# Reapply the adapted lock fallback to current upstream source, not the old file.
-readonly -a TERMUX_RELEASE_ROLLOUT_LOCK_PATHS=(
-  codex-rs/app-server-transport/src/transport/unix_socket.rs
-  codex-rs/rollout/Cargo.toml
-  codex-rs/rollout/src/writer_lock.rs
-  codex-rs/rollout/src/writer_lock_tests.rs
-  codex-rs/thread-store/Cargo.toml
-)
-
-# These upstream-owned files have repeatedly retained stale checkpoint-side
-# content when a new release branch was merged into the release work branch.
-readonly -a TERMUX_RELEASE_UPSTREAM_AUTHORITATIVE_PATHS=(
-  .github
-  codex-rs/core/src/compact_remote_v2_image_budget_tests.rs
-  codex-rs/core/src/compact_remote_v2_images.rs
-  codex-rs/core/src/guardian/mod.rs
-  codex-rs/core/tests/suite/compact_remote.rs
-  codex-rs/features/src/lib.rs
-  codex-rs/tui/src/bottom_pane/chat_composer.rs
-  codex-rs/tui/src/bottom_pane/textarea/vim_commands.rs
-  codex-rs/windows-sandbox-rs/BUILD.bazel
 )
 
 readonly -a TERMUX_RELEASE_AUTOMATION_PATHS=(

@@ -1,0 +1,40 @@
+name: termux-release-tests
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - scripts/*termux*
+      - .github/workflows/termux-release-tests.yml
+  pull_request:
+    paths:
+      - scripts/*termux*
+      - .github/workflows/termux-release-tests.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  git-only-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Test release generation and checkpoints without Cargo
+        run: |
+          bash scripts/test-termux-create-release-pr.sh
+          bash scripts/test-termux-create-checkpoint-pr.sh
+          python3 -B scripts/test-termux-sync-file-lock.py
+      - name: Fetch real upstream regression fixtures
+        run: |
+          git remote add upstream https://github.com/openai/codex.git
+          git fetch --no-tags upstream \
+            refs/tags/rust-v0.155.0:refs/tags/rust-v0.155.0 \
+            refs/tags/rust-v0.155.0-alpha.9:refs/tags/rust-v0.155.0-alpha.9 \
+            refs/tags/rust-v0.155.0-alpha.16:refs/tags/rust-v0.155.0-alpha.16 \
+            refs/tags/rust-v0.155.0-alpha.17:refs/tags/rust-v0.155.0-alpha.17
+      - name: Verify stable and alpha trees with the real Termux updater
+        run: bash scripts/test-termux-release-tags.sh

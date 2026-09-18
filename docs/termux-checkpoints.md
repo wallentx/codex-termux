@@ -4,6 +4,9 @@
 and checkpoint automation. A checkpoint returns tested release code to the
 compatibility branch without copying release-only automation into it.
 
+See [release generation](termux-releases.md) for how the upstream tree and
+portable Termux delta are selected before a checkpoint is needed.
+
 ## Merge baseline
 
 Release PRs are squash-merged. The ordinary Git merge base can therefore predate
