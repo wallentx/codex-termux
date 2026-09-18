@@ -455,7 +455,7 @@ pub fn process_responses_event(
                         let delay = try_parse_retry_after(&error);
                         let message = error.message.unwrap_or_default();
                         response_error = match error.code.as_deref() {
-                            Some("rate_limit_exceeded" | "slow_down") => {
+                            Some("rate_limit_exceeded") => {
                                 ApiError::RateLimitExceeded { message, delay }
                             }
                             _ => ApiError::Retryable { message, delay },
@@ -683,10 +683,7 @@ async fn process_sse_with_treatment(
 }
 
 fn try_parse_retry_after(err: &Error) -> Option<Duration> {
-    if !matches!(
-        err.code.as_deref(),
-        Some("rate_limit_exceeded" | "slow_down")
-    ) {
+    if err.code.as_deref() != Some("rate_limit_exceeded") {
         return None;
     }
 
@@ -716,15 +713,7 @@ fn is_context_window_error(error: &Error) -> bool {
 }
 
 fn is_quota_exceeded_error(error: &Error) -> bool {
-    matches!(
-        error.code.as_deref(),
-        Some(
-            "insufficient_quota"
-                | "credit_balance_exhausted"
-                | "organization_spend_limit_exceeded"
-                | "project_spend_limit_exceeded"
-        )
-    )
+    error.code.as_deref() == Some("insufficient_quota")
 }
 
 fn is_usage_not_included(error: &Error) -> bool {
@@ -737,6 +726,7 @@ fn is_cyber_policy_error(error: &Error) -> bool {
 
 fn is_server_overloaded_error(error: &Error) -> bool {
     error.code.as_deref() == Some("server_is_overloaded")
+        || error.code.as_deref() == Some("slow_down")
 }
 
 fn cyber_policy_fallback_message() -> String {
@@ -1128,7 +1118,6 @@ mod tests {
     async fn failed_response_classification_uses_error_code() {
         for (code, message) in [
             ("rate_limit_exceeded", "Temporary limit."),
-            ("slow_down", "Temporary limit."),
             (
                 "unknown_error",
                 "Rate limit reached. Please try again in 1s.",
@@ -1142,7 +1131,7 @@ mod tests {
             let events = collect_events(&[sse.as_bytes()]).await;
             match (code, events.as_slice()) {
                 (
-                    "rate_limit_exceeded" | "slow_down",
+                    "rate_limit_exceeded",
                     [
                         Err(ApiError::RateLimitExceeded {
                             message: actual,

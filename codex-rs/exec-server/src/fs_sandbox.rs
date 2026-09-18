@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
-use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -17,6 +16,7 @@ use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
+use codex_sandboxing::SandboxablePreference;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(not(target_os = "linux"))]
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
@@ -144,10 +144,10 @@ impl FileSystemSandboxRunner {
         let sandbox_manager = sandbox_manager.with_allowed_symlinked_codex_home(
             self.runtime_paths.allowed_symlinked_codex_home.clone(),
         );
-        let (sandbox, windows_sandbox_level) = crate::sandbox_selection::select_sandbox(
-            &sandbox_manager,
+        let sandbox = sandbox_manager.select_initial(
             permission_profile,
-            sandbox_context,
+            SandboxablePreference::Require,
+            sandbox_context.windows_sandbox_level,
             /*has_managed_network_requirements*/ false,
         );
         if sandbox == SandboxType::None {
@@ -176,14 +176,9 @@ impl FileSystemSandboxRunner {
                     environment_id: None,
                     network: None,
                     sandbox_policy_cwd: &cwd.uri,
-                    sandbox_exe: if cfg!(windows) {
-                        Some(self.runtime_paths.codex_self_exe.as_path())
-                    } else {
-                        self.runtime_paths.codex_linux_sandbox_exe.as_deref()
-                    },
+                    codex_linux_sandbox_exe: self.runtime_paths.codex_linux_sandbox_exe.as_deref(),
                     use_legacy_landlock: sandbox_context.use_legacy_landlock,
-                    windows_sandbox_level: windows_sandbox_level
-                        .unwrap_or(WindowsSandboxLevel::Disabled),
+                    windows_sandbox_level: sandbox_context.windows_sandbox_level,
                     windows_sandbox_private_desktop: sandbox_context
                         .windows_sandbox_private_desktop,
                 },
@@ -722,8 +717,8 @@ mod tests {
                 "filesystem sandbox cannot be enforced on this executor"
             );
             crate::FileSystemSandboxContext {
-                windows_sandbox_selection:
-                    codex_file_system::WindowsSandboxSelection::RestrictedToken,
+                windows_sandbox_level:
+                    codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken,
                 ..sandbox_context
             }
         };

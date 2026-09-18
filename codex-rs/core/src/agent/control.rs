@@ -67,18 +67,11 @@ use tokio::sync::watch;
 use tracing::warn;
 use uuid::Uuid;
 
-pub(crate) use self::delivery::AgentMessage;
-pub(crate) use self::delivery::MessageDeliveryError;
-pub(crate) use self::delivery::MessageDeliveryMode;
 pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
-pub(crate) use self::interrupt::AgentInterruptError;
-pub(crate) use self::interrupt::AgentInterruptOutcome;
 use self::residency::V2Residency;
 
-mod delivery;
 mod execution;
-mod interrupt;
 mod legacy;
 mod residency;
 mod service_tier;
@@ -100,8 +93,6 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) parent_turn_id: Option<String>,
-    /// Attribute delegated usage to the turn that initiated it.
-    pub(crate) turn_trigger: Option<String>,
     pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,

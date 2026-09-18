@@ -14,7 +14,6 @@ use super::PUBLIC_TOOL_NAME;
 use super::handle_runtime_response;
 use super::is_exec_tool_name;
 use super::telemetry::CodeModeToolCallGuard;
-use super::telemetry::trace_id;
 
 type CodeModeNestedTool = (Arc<ToolSpec>, Option<Arc<dyn CoreToolRuntime>>);
 
@@ -34,9 +33,9 @@ impl CodeModeExecuteHandler {
     async fn execute(
         &self,
         session: std::sync::Arc<crate::session::session::Session>,
-        step_context: Arc<crate::session::step_context::StepContext>,
+        step_context: std::sync::Arc<crate::session::step_context::StepContext>,
         call_id: String,
-        originating_call: Option<crate::tools::context::ToolCallOrigin>,
+        originating_item_id: Option<codex_protocol::ResponseItemId>,
         code: String,
         telemetry: &mut CodeModeToolCallGuard,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
@@ -71,20 +70,16 @@ impl CodeModeExecuteHandler {
             .session
             .services
             .code_mode_service
-            .execute(
-                codex_code_mode::ExecuteRequest {
-                    tool_call_id: call_id.clone(),
-                    enabled_tools,
-                    source: args.code.clone(),
-                    yield_time_ms: args.yield_time_ms,
-                    max_output_tokens: args.max_output_tokens,
-                },
-                Arc::clone(&step_context),
-            )
+            .execute(codex_code_mode::ExecuteRequest {
+                tool_call_id: call_id.clone(),
+                enabled_tools,
+                source: args.code.clone(),
+                yield_time_ms: args.yield_time_ms,
+                max_output_tokens: args.max_output_tokens,
+            })
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();
-        tracing::Span::current().record("cell.id", trace_id(cell_id.as_str()));
         telemetry.cell_id = Some(cell_id.to_string());
         exec.session
             .services
@@ -113,7 +108,7 @@ impl CodeModeExecuteHandler {
         exec.session
             .services
             .code_mode_service
-            .mark_cell_ready_for_dispatch(&cell_id, originating_call);
+            .mark_cell_ready_for_dispatch(&cell_id, originating_item_id);
         let response = started_cell
             .initial_response()
             .await
@@ -175,26 +170,11 @@ impl ToolExecutor<ToolInvocation> for CodeModeExecuteHandler {
 }
 
 impl CodeModeExecuteHandler {
-    // Default to interrupted if this future is dropped; telemetry::CodeModeToolCallGuard::finish
-    // overwrites this handler's captured span on explicit success or failure.
-    #[tracing::instrument(
-        name = "code_mode.handler.execute",
-        level = "info",
-        skip_all,
-        fields(
-            conversation.id = %invocation.session.thread_id,
-            turn_id = invocation.turn.sub_id.as_str(),
-            call_id = trace_id(&invocation.call_id),
-            cell.id = tracing::field::Empty,
-            outcome = "interrupted",
-        )
-    )]
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let handler_span = tracing::Span::current();
-        let originating_call = invocation.originating_call().await;
+        let originating_item_id = invocation.originating_item_id().await;
         let ToolInvocation {
             session,
             turn,
@@ -212,7 +192,6 @@ impl CodeModeExecuteHandler {
             turn.turn_metadata_state.clone(),
             call_id.clone(),
             PUBLIC_TOOL_NAME,
-            handler_span,
         );
         let result = match payload {
             ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
@@ -220,7 +199,7 @@ impl CodeModeExecuteHandler {
                     session,
                     step_context,
                     call_id,
-                    originating_call,
+                    originating_item_id,
                     input,
                     &mut telemetry,
                 )

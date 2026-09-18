@@ -4,14 +4,15 @@
 use super::authorization::ScoreAuthorization;
 use super::config::GuardianV2Config;
 use super::coverage::GuardianPolicy;
+use super::extension::GuardianV2ScoreProgress;
 use super::metrics::TOOL_CALL_LAG_METRIC;
 use super::metrics::record_fast_decision;
 use super::parent_compaction::select_parent_compaction;
 use super::sampler::LunaSampler;
-use super::score::GuardianV2ScoreProgress;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::context::GuardianContextMode;
+use codex_core::context::GuardianReviewEvidence;
 use codex_extension_api::ApprovalDecision;
 use codex_extension_api::ApprovalDecisionInput;
 use codex_extension_api::ApprovalReviewContributor;
@@ -36,7 +37,7 @@ impl ApprovalReviewContributor for GuardianApprovalReviewer {
         input: &'a ApprovalDecisionInput<'_>,
     ) -> ExtensionFuture<'a, Option<ApprovalDecision>> {
         Box::pin(async move {
-            // If the scorer is unavailable, the reviewer extension runs its synchronous fallback.
+            // If the extension is unavailable, core keeps its existing synchronous fallback.
             let manager = self.thread_manager.upgrade()?;
             let Ok(thread) = manager.get_thread(input.thread_id).await else {
                 record_fast_decision(input.metrics.as_deref(), "deferred", "scoring_failure");
@@ -159,12 +160,14 @@ async fn cached_evidence(
         record_fast_decision(metrics, "deferred", "scoring_failure");
         return Err(GuardianReviewReason::ScoringFailure);
     }
-    let history = thread.conversation_history_snapshot().await;
-    let context_mode = GuardianContextMode::from_history(history.as_ref());
+    let context_mode = store
+        .get_or_init(GuardianReviewEvidence::default)
+        .context_mode();
     if context_mode == GuardianContextMode::ThreadOwned {
         let sampler = store
             .get::<LunaSampler>()
             .ok_or(GuardianReviewReason::MissingScore)?;
+        let history = thread.conversation_history_snapshot().await;
         if select_parent_compaction(
             context_mode,
             config,

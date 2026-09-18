@@ -864,7 +864,6 @@ fn remote_installed_plugin_in_marketplace(
     marketplace_name: &str,
 ) -> RemoteInstalledPlugin {
     RemoteInstalledPlugin {
-        canonical_app_id: None,
         marketplace_name: marketplace_name.to_string(),
         id: format!("plugins~Plugin_{name}"),
         version: None,
@@ -1000,7 +999,6 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
                         client_id: Some("client-id".to_string()),
                         callback_url: None,
                         callback_port: Some(3118),
-                        ..Default::default()
                     }),
                     oauth_resource: None,
                     tools: HashMap::new(),
@@ -3101,55 +3099,6 @@ enabled = true
             )],
         );
     }
-}
-
-#[tokio::test]
-async fn connector_snapshot_combines_plugin_exclusions_with_current_account_ownership() {
-    let codex_home = TempDir::new().unwrap();
-    let auth_manager = test_auth_manager(Some(AuthMode::Chatgpt));
-    let manager = test_plugins_manager_with_auth_manager(
-        codex_home.path().to_path_buf(),
-        Some(Product::Codex),
-        Arc::clone(&auth_manager),
-    );
-    let sources = [PluginConnectorSource::from_connector_ids(
-        "local@test",
-        "Local",
-        [AppConnectorId("local-connector".to_string())],
-    )];
-    let disabled = vec![
-        "linear@openai-curated-remote".to_string(),
-        "local@test".to_string(),
-    ];
-    let local_exclusion = HashSet::from(["local-connector".to_string()]);
-    assert_eq!(
-        manager
-            .connector_snapshot(sources.clone(), &disabled)
-            .disabled_connector_ids(),
-        &local_exclusion,
-    );
-    let mut plugin = remote_installed_linear_plugin();
-    plugin.canonical_app_id = Some("linear".to_string());
-    manager.write_remote_installed_plugins_cache(vec![plugin]);
-    assert_eq!(
-        manager
-            .connector_snapshot(sources.clone(), &disabled)
-            .disabled_connector_ids(),
-        &HashSet::from(["linear".to_string(), "local-connector".to_string()]),
-    );
-    assert!(
-        manager
-            .connector_snapshot(sources.clone(), &["linear@another-marketplace".to_string()])
-            .disabled_connector_ids()
-            .is_empty()
-    );
-    set_test_auth_mode(&auth_manager, Some(AuthMode::ApiKey)).await;
-    assert_eq!(
-        manager
-            .connector_snapshot(sources, &disabled)
-            .disabled_connector_ids(),
-        &local_exclusion,
-    );
 }
 
 #[test]

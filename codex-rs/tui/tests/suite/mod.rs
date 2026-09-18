@@ -1,7 +1,5 @@
 // Aggregates all former standalone integration tests as modules.
 #[cfg(unix)]
-mod directory_trust;
-#[cfg(unix)]
 mod focus_palette;
 #[cfg(unix)]
 mod reconnect;

@@ -317,11 +317,8 @@ impl App {
             };
             let handle = app_server.request_handle();
             let result = handle.request_typed::<ListResponse>(request).await;
-            if let Some(message) = super::managed_worktree_creation::background_terminals_blocker(
-                result,
-                &self.app_server_target,
-            ) {
-                return self.working_directory_error(message);
+            if !matches!(result, Ok(response) if response.data.is_empty()) {
+                return self.working_directory_error("Active background terminals block /cd.");
             }
         }
         if is_new_worktree {

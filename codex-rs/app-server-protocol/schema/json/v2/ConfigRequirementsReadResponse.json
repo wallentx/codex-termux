@@ -414,16 +414,6 @@
             "null"
           ]
         },
-        "allowedLoginMethods": {
-          "description": "Effective login methods after managed, forced-login, and workspace restrictions. An empty list permits no login method. Older servers may omit this field.",
-          "items": {
-            "$ref": "#/definitions/ForcedLoginMethod"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
         "allowedPermissionProfiles": {
           "additionalProperties": {
             "type": "boolean"
@@ -453,7 +443,7 @@
         },
         "allowedWindowsSandboxImplementations": {
           "items": {
-            "$ref": "#/definitions/WindowsSandboxImplementation"
+            "$ref": "#/definitions/WindowsSandboxSetupMode"
           },
           "type": [
             "array",
@@ -566,21 +556,6 @@
         "modelCatalogJson": {
           "type": [
             "string",
-            "null"
-          ]
-        },
-        "modelProvider": {
-          "description": "Exact provider selection required by managed policy.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "modelProviders": {
-          "additionalProperties": true,
-          "description": "Complete required provider definitions, using config.toml field names.",
-          "type": [
-            "object",
             "null"
           ]
         },
@@ -771,13 +746,6 @@
         }
       },
       "type": "object"
-    },
-    "ForcedLoginMethod": {
-      "enum": [
-        "chatgpt",
-        "api"
-      ],
-      "type": "string"
     },
     "InAppBrowserRequirements": {
       "properties": {
@@ -1085,11 +1053,10 @@
       ],
       "type": "string"
     },
-    "WindowsSandboxImplementation": {
+    "WindowsSandboxSetupMode": {
       "enum": [
         "elevated",
-        "unelevated",
-        "mxc"
+        "unelevated"
       ],
       "type": "string"
     }

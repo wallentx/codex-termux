@@ -21,9 +21,12 @@ use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::ACL_SIZE_INFORMATION;
 use windows_sys::Win32::Security::AclSizeInformation;
+use windows_sys::Win32::Security::Authorization::ACCESS_MODE;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
+use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+use windows_sys::Win32::Security::Authorization::SET_ACCESS;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
 use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
@@ -68,6 +71,8 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 const GENERIC_READ_MASK: u32 = 0x8000_0000;
 const GENERIC_WRITE_MASK: u32 = 0x4000_0000;
+const GENERIC_EXECUTE_MASK: u32 = 0x2000_0000;
+const GENERIC_ALL_MASK: u32 = 0x1000_0000;
 const DENY_ACCESS: i32 = 3;
 // TrustedInstaller is a deterministic service SID, not a machine-local account SID.
 const TRUSTED_INSTALLER_SID: &str =
@@ -444,6 +449,10 @@ pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -
 }
 
 pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+    dacl_has_deny_mask_for_sid(p_dacl, psid, FILE_GENERIC_READ | GENERIC_READ_MASK)
+}
+
+unsafe fn dacl_has_deny_mask_for_sid(p_dacl: *mut ACL, psid: *mut c_void, deny_mask: u32) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -457,7 +466,6 @@ pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) ->
     if ok == 0 {
         return false;
     }
-    let deny_read_mask = FILE_GENERIC_READ | GENERIC_READ_MASK;
     for i in 0..info.AceCount {
         let mut p_ace: *mut c_void = std::ptr::null_mut();
         if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
@@ -474,7 +482,7 @@ pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) ->
         let base = p_ace as usize;
         let sid_ptr =
             (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
-        if EqualSid(sid_ptr, psid) != 0 && (ace.Mask & deny_read_mask) != 0 {
+        if EqualSid(sid_ptr, psid) != 0 && (ace.Mask & deny_mask) != 0 {
             return true;
         }
     }
@@ -522,17 +530,33 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     sids: &[*mut c_void],
     allow_mask: u32,
     disallow_mask: u32,
+    access_mode: ACCESS_MODE,
     inheritance: u32,
 ) -> Result<bool> {
     let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     for sid in sids {
+        // An explicit allow can outrank an inherited deny. All file generic rights
+        // overlap read/execute through READ_CONTROL or SYNCHRONIZE.
+        if access_mode == GRANT_ACCESS
+            && dacl_has_deny_mask_for_sid(
+                p_dacl,
+                *sid,
+                allow_mask
+                    | GENERIC_READ_MASK
+                    | GENERIC_WRITE_MASK
+                    | GENERIC_EXECUTE_MASK
+                    | GENERIC_ALL_MASK,
+            )
+        {
+            continue;
+        }
         if !dacl_allow_mask_needs_refresh(p_dacl, *sid, allow_mask, disallow_mask) {
             continue;
         }
         entries.push(EXPLICIT_ACCESS_W {
             grfAccessPermissions: allow_mask,
-            grfAccessMode: 2, // SET_ACCESS
+            grfAccessMode: access_mode,
             grfInheritance: inheritance,
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
@@ -605,6 +629,27 @@ pub unsafe fn ensure_allow_mask_aces_with_inheritance(
         sids,
         allow_mask,
         /*disallow_mask*/ 0,
+        SET_ACCESS,
+        inheritance,
+    )
+}
+
+/// Ensure read/execute grants without replacing existing entries or overriding denies.
+/// Returns true if any ACE was added.
+///
+/// # Safety
+/// Caller must pass valid SID pointers and an existing path.
+pub unsafe fn grant_read_execute_aces(
+    path: &Path,
+    sids: &[*mut c_void],
+    inheritance: u32,
+) -> Result<bool> {
+    ensure_allow_mask_aces_with_inheritance_impl(
+        path,
+        sids,
+        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        /*disallow_mask*/ 0,
+        GRANT_ACCESS,
         inheritance,
     )
 }
@@ -638,6 +683,7 @@ pub unsafe fn ensure_allow_write_aces(path: &Path, sids: &[*mut c_void]) -> Resu
         sids,
         WRITE_ALLOW_MASK,
         FILE_DELETE_CHILD,
+        SET_ACCESS,
         CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
     )
 }
@@ -899,11 +945,7 @@ pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> 
 #[path = "acl_tests.rs"]
 mod tests;
 
-/// Removes explicit ACEs for one SID and propagates the updated inherited ACL.
-///
-/// # Safety
-/// Caller must pass a valid SID pointer and have authority to edit the target DACL.
-pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<()> {
+pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -920,14 +962,7 @@ pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<()> {
         if !p_sd.is_null() {
             LocalFree(p_sd as HLOCAL);
         }
-        return acl_api_result(path, "GetNamedSecurityInfoW", code);
-    }
-    if p_dacl.is_null() {
-        // A null DACL has no ACE to revoke; replacing it with an empty ACL would deny access.
-        if !p_sd.is_null() {
-            LocalFree(p_sd as HLOCAL);
-        }
-        return Ok(());
+        return;
     }
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
@@ -942,17 +977,9 @@ pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<()> {
     explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
     explicit.Trustee = trustee;
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-    let result = acl_api_result(
-        path,
-        "SetEntriesInAclW",
-        SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl),
-    )
-    .and_then(|()| {
-        // REVOKE_ACCESS only removes ACEs. An unchanged ACL must not propagate inheritance.
-        if (*p_new_dacl).AceCount == (*p_dacl).AceCount {
-            return Ok(());
-        }
-        let code = SetNamedSecurityInfoW(
+    let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
+    if code2 == ERROR_SUCCESS {
+        let _ = SetNamedSecurityInfoW(
             to_wide(path).as_ptr() as *mut u16,
             1,
             DACL_SECURITY_INFORMATION,
@@ -961,15 +988,13 @@ pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<()> {
             p_new_dacl,
             std::ptr::null_mut(),
         );
-        acl_api_result(path, "SetNamedSecurityInfoW", code)
-    });
-    if !p_new_dacl.is_null() {
-        LocalFree(p_new_dacl as HLOCAL);
+        if !p_new_dacl.is_null() {
+            LocalFree(p_new_dacl as HLOCAL);
+        }
     }
     if !p_sd.is_null() {
         LocalFree(p_sd as HLOCAL);
     }
-    result
 }
 
 /// Grants RX to the null device for the given SID to support stdout/stderr redirection.

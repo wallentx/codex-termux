@@ -858,9 +858,6 @@ async fn steer_only_requires_active_turn() {
 #[tokio::test]
 async fn steer_only_enforces_expected_turn_id() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
-    turn_context
-        .turn_metadata_state
-        .set_turn_trigger("composer".to_string());
     session
         .spawn_task(
             Arc::clone(&turn_context),
@@ -907,12 +904,7 @@ async fn steer_only_enforces_expected_turn_id() {
 
     let submission = handle(
         &session,
-        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(output)).on_start(
-            TurnStartOptions {
-                turn_trigger: Some("automation_cron_scheduled".to_string()),
-                ..Default::default()
-            },
-        ),
+        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(output)),
         TurnInputMode::StartOrSteer,
         "test-submission".to_string(),
     )
@@ -924,13 +916,6 @@ async fn steer_only_enforces_expected_turn_id() {
         TurnInputSubmission::Steered {
             turn_id: turn_context.sub_id.clone()
         }
-    );
-    assert_eq!(
-        turn_context
-            .turn_metadata_state
-            .current_turn_trigger()
-            .as_deref(),
-        Some("composer")
     );
     let turn_state = session
         .input_queue

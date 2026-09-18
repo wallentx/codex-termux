@@ -431,7 +431,6 @@ fn mcp_dependency_to_server_config(
                     client_id: None,
                     callback_url: None,
                     callback_port: Some(callback_port),
-                    ..Default::default()
                 }),
             oauth_resource: None,
             tools: HashMap::new(),

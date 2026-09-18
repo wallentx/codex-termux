@@ -70,28 +70,18 @@ pub struct ToolInvocation {
     pub payload: ToolPayload,
 }
 
-/// Identity of the model call that started a tool invocation, retained across code-mode waits.
-#[derive(Clone)]
-pub(crate) struct ToolCallOrigin {
-    /// Best-effort lookup: invocations without a matching history item still
-    /// retain their known window ID.
-    pub(crate) item_id: Option<ResponseItemId>,
-    pub(crate) window_id: String,
-}
-
 impl ToolInvocation {
-    /// Returns the item and window that requested this call or started its code-mode cell.
-    pub(crate) async fn originating_call(&self) -> Option<ToolCallOrigin> {
+    /// Returns the Responses item that requested this call or started its code-mode cell.
+    pub(crate) async fn originating_item_id(&self) -> Option<ResponseItemId> {
         if let ToolCallSource::CodeMode { cell_id, .. } = &self.source {
             return self
                 .session
                 .services
                 .code_mode_service
-                .cell_originating_call(&codex_code_mode::CellId::new(cell_id.clone()));
+                .cell_originating_item_id(&codex_code_mode::CellId::new(cell_id.clone()));
         }
 
-        let item_id = self
-            .session
+        self.session
             .clone_history()
             .await
             .raw_items()
@@ -104,11 +94,7 @@ impl ToolInvocation {
                     id.clone()
                 }
                 _ => None,
-            });
-        Some(ToolCallOrigin {
-            item_id,
-            window_id: self.session.current_window_id().await,
-        })
+            })
     }
 }
 

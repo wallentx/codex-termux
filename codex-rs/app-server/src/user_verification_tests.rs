@@ -87,11 +87,7 @@ async fn local_enrollment_reuses_key_and_status_and_delete_have_no_signing_effec
         .unwrap();
         assert_eq!(
             serde_json::to_value(response.payload).unwrap(),
-            json!({
-                "credentialId": "credential",
-                "algorithm": "ecdsaP256Sha256X962",
-                "publicKey": "public-key"
-            })
+            json!({"credentialId": "credential"})
         );
     }
     let response = run(

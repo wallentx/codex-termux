@@ -6,6 +6,7 @@ use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact_remote_history::trim_function_call_history_to_fit_context_window;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -71,9 +72,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         .into_iter()
         .map(|envelope| (envelope.item, envelope.metadata))
         .unzip();
-    sess.services
-        .executed_tool_calls
-        .strip_disabled_direct_metadata(&mut input);
     let tool_router = &step_context.tool_router;
     input.push(ResponseItem::CompactionTrigger {});
     let prompt = Prompt {
@@ -86,10 +84,12 @@ pub(super) async fn run_remote_compact_v2_attempt(
         cyber_access_program: turn_context.cyber_access_program,
     };
 
-    let mut responses_metadata = sess
-        .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
+    let responses_metadata = sess
+        .responses_metadata(
+            turn_context.as_ref(),
+            CodexResponsesRequestKind::Compaction(compaction_metadata),
+        )
         .await;
-    responses_metadata.tool_namespaces_info = tool_router.tool_namespaces_info().cloned();
     let trace_attempt = compaction_trace.start_attempt(&serde_json::json!({
         "model": turn_context.model_info().slug.as_str(),
         "instructions": prompt.base_instructions.text.as_str(),

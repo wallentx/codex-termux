@@ -2,7 +2,6 @@ use anyhow::Result;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::TurnInputRequest;
-use codex_core::TurnStartOptions;
 use codex_core::config::AgentRoleConfig;
 use codex_core::config::CurrentTimeReminderConfig;
 use codex_features::Feature;
@@ -72,8 +71,6 @@ use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
-
-use super::direct_tool_metadata::tool_call_metadata;
 
 const SPAWN_CALL_ID: &str = "spawn-call-1";
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
@@ -1061,7 +1058,7 @@ async fn spawned_child_receives_forked_parent_context(
     test.submit_turn(TURN_0_FORK_PROMPT).await?;
     let _ = seed_turn.single_request();
 
-    submit_turn_with_trigger(&test, TURN_1_PROMPT, "composer").await?;
+    test.submit_turn(TURN_1_PROMPT).await?;
     let parent_body = spawn_turn.single_request().body_json();
 
     let child_request = wait_for_request_with_model(&child_request_log, REQUESTED_MODEL).await?;
@@ -1072,13 +1069,7 @@ async fn spawned_child_receives_forked_parent_context(
             .as_str()
             .expect("child turn metadata"),
     )?;
-    assert_eq!(
-        (
-            &child_metadata["thread_source"],
-            &child_metadata["turn_trigger"]
-        ),
-        (&json!("subagent"), &json!("composer")),
-    );
+    assert_eq!(child_metadata["thread_source"], "subagent");
     let original_parent_turn_id = parent_body["client_metadata"]["turn_id"]
         .as_str()
         .expect("legacy spawn parent turn id");
@@ -1136,7 +1127,7 @@ async fn spawned_child_receives_forked_parent_context(
     )
     .await;
 
-    submit_turn_with_trigger(&test, "reuse the legacy child", "automation_cron_scheduled").await?;
+    test.submit_turn("reuse the legacy child").await?;
     let followup_parent_body = parent.single_request().body_json();
     let reused_child_body = wait_for_request_with_model(&followup, REQUESTED_MODEL)
         .await?
@@ -1151,32 +1142,6 @@ async fn spawned_child_receives_forked_parent_context(
     assert_parent_turn(&reused_child_body, Some(followup_parent_turn_id))?;
     assert_root_turn(&followup_parent_body, Some(followup_parent_turn_id))?;
     assert_root_turn(&reused_child_body, Some(followup_parent_turn_id))?;
-    let reused_metadata: Value = serde_json::from_str(
-        reused_child_body["client_metadata"]["x-codex-turn-metadata"]
-            .as_str()
-            .expect("reused child turn metadata"),
-    )?;
-    assert_eq!(reused_metadata["turn_trigger"], "automation_cron_scheduled");
-    Ok(())
-}
-
-async fn submit_turn_with_trigger(test: &TestCodex, prompt: &str, trigger: &str) -> Result<()> {
-    test.codex
-        .start_or_steer_turn(
-            TurnInputRequest::user_input(vec![UserInput::Text {
-                text: prompt.to_string(),
-                text_elements: Vec::new(),
-            }])
-            .on_start(TurnStartOptions {
-                turn_trigger: Some(trigger.to_string()),
-                ..Default::default()
-            }),
-        )
-        .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
     Ok(())
 }
 
@@ -1357,7 +1322,7 @@ async fn grandchild_full_fork_preserves_context_baseline(
         .build_with_auto_env(&server)
         .await?;
 
-    submit_turn_with_trigger(&test, ROOT_PROMPT, "automation_heartbeat_scheduled").await?;
+    test.submit_turn(ROOT_PROMPT).await?;
     let root_request = root_log.single_request();
     let mut descendant_requests = Vec::new();
     for (mock, agent_name) in [
@@ -1398,15 +1363,6 @@ async fn grandchild_full_fork_preserves_context_baseline(
                 AgentStatus::Completed(Some("done".to_string()))
             );
         }
-        let metadata: Value = serde_json::from_str(
-            request.body_json()["client_metadata"]["x-codex-turn-metadata"]
-                .as_str()
-                .expect("descendant turn metadata"),
-        )?;
-        assert_eq!(
-            (&metadata["thread_source"], &metadata["turn_trigger"]),
-            (&json!("subagent"), &json!("automation_heartbeat_scheduled")),
-        );
         descendant_requests.push(request);
     }
     let context_counts = [
@@ -2237,24 +2193,16 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     } else {
         "koffing"
     };
-    let mut builder = test_codex()
-        .with_model(parent_model)
-        .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::Collab)
-                .expect("test config should allow feature update");
-            config
-                .features
-                .enable(Feature::MultiAgentV2)
-                .expect("test config should allow feature update");
-            if plaintext {
-                config
-                    .features
-                    .enable(Feature::ExecutedToolCallMetadata)
-                    .expect("enable tool-call metadata");
-            }
-        });
+    let mut builder = test_codex().with_model(parent_model).with_config(|config| {
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build(&server).await?;
     let root_thread_id = test.session_configured.thread_id;
 
@@ -2317,32 +2265,14 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
         );
     }
     if plaintext {
-        let parent_request = parent_request_log
-            .requests()
-            .into_iter()
-            .find(|request| {
-                request
-                    .inputs_of_type("function_call_output")
-                    .iter()
-                    .any(|item| item["call_id"] == SPAWN_CALL_ID)
-            })
-            .expect("parent request with spawn result");
         assert!(
-            parent_request.input().iter().any(|item| {
-                item["call_id"].as_str() == Some(SPAWN_CALL_ID)
-                    && item["encrypted_function_args"] == json!([])
+            parent_request_log.requests().into_iter().any(|request| {
+                request.input().iter().any(|item| {
+                    item["call_id"].as_str() == Some(SPAWN_CALL_ID)
+                        && item["encrypted_function_args"] == json!([])
+                })
             }),
             "plaintext function-call metadata should survive replay"
-        );
-        assert_eq!(
-            tool_call_metadata(parent_request.function_call_output(SPAWN_CALL_ID)),
-            json!({
-                "executed_tool_calls": [{
-                    "name": "collaboration__spawn_agent",
-                    "arguments": serde_json::from_str::<Value>(&spawn_args)?,
-                }],
-                "tool_calls_complete": true,
-            }),
         );
     }
 
@@ -2816,7 +2746,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
     )
     .await;
 
-    submit_turn_with_trigger(&test, SPAWN_WORKER_PROMPT, "automation_cron_scheduled").await?;
+    test.submit_turn(SPAWN_WORKER_PROMPT).await?;
     let worker_thread_id = created_threads.recv().await?;
     let worker_thread = test.thread_manager.get_thread(worker_thread_id).await?;
     wait_for_event(worker_thread.as_ref(), |event| {
@@ -2915,7 +2845,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
         );
     }
 
-    submit_turn_with_trigger(&test, SPAWN_REQUESTER_PROMPT, "composer").await?;
+    test.submit_turn(SPAWN_REQUESTER_PROMPT).await?;
     let requester_thread_id = created_threads.recv().await?;
     let requester_thread = test.thread_manager.get_thread(requester_thread_id).await?;
     let requester_turn_id = wait_for_event_match(requester_thread.as_ref(), |event| match event {
@@ -2944,13 +2874,6 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
             (body["client_metadata"]["thread_id"] == json!(worker_thread_id)
                 && request.body_contains_text(WORKER_FOLLOWUP_TASK))
             .then(|| {
-                let metadata: Value = serde_json::from_str(
-                    body["client_metadata"]["x-codex-turn-metadata"]
-                        .as_str()
-                        .expect("worker turn metadata"),
-                )
-                .expect("worker turn metadata JSON");
-                assert_eq!(metadata["turn_trigger"], "composer");
                 body["client_metadata"]["turn_id"]
                     .as_str()
                     .expect("worker follow-up turn ID")

@@ -437,10 +437,8 @@ pub struct TuiAgentsKeymap {
     pub resume: Option<KeybindingsSpec>,
     /// Search the available agent tasks.
     pub search: Option<KeybindingsSpec>,
-    /// Open a new session in the selected checkout.
+    /// Start composing a new agent task.
     pub new_task: Option<KeybindingsSpec>,
-    /// Open a new session in a worktree from the project default branch.
-    pub new_worktree: Option<KeybindingsSpec>,
     /// Rename the selected task.
     pub rename: Option<KeybindingsSpec>,
     /// Stop the selected running task.

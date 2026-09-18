@@ -41,7 +41,7 @@ fn arrival_and_rtp_bytes_survive_the_adapter_without_an_upstream_copy() {
 }
 
 #[test]
-fn exhausted_packet_or_byte_budget_drops_audio_then_accepts_fresh_packets() {
+fn consumed_packets_keep_their_budget_until_the_last_owner_drops_them() {
     for size in [32, PACKET_BYTES] {
         let (mut incoming, mut ingress) = pair();
         let count = PACKETS.min(BYTES / size);
@@ -54,11 +54,8 @@ fn exhausted_packet_or_byte_budget_drops_audio_then_accepts_fresh_packets() {
         ingress.handle_read(packet(size, Instant::now())).unwrap();
         held.push(incoming.take().unwrap().unwrap());
         ingress.handle_read(packet(size, Instant::now())).unwrap();
-        assert!(incoming.take().unwrap().is_none());
-        assert!(!incoming.state.failed.load(Ordering::Acquire));
+        assert_eq!(incoming.take().err(), Some("incoming audio failed"));
         drop(held);
-        ingress.handle_read(packet(size, Instant::now())).unwrap();
-        assert!(incoming.take().unwrap().is_some());
         assert_eq!(
             (
                 incoming.state.packets.available_permits(),
@@ -67,22 +64,6 @@ fn exhausted_packet_or_byte_budget_drops_audio_then_accepts_fresh_packets() {
             (PACKETS, BYTES)
         );
     }
-}
-
-#[test]
-fn old_speaker_packets_are_discarded_without_poisoning_fresh_audio() {
-    let (mut incoming, mut ingress) = pair();
-    ingress
-        .handle_read(packet(/*size*/ 32, Instant::now()))
-        .unwrap();
-    let mut queued = incoming.receiver.try_recv().unwrap();
-    queued.at -= Duration::from_secs(/*secs*/ 2);
-    ingress.sender.try_send(queued).unwrap();
-    assert!(incoming.take().unwrap().is_none());
-    ingress
-        .handle_read(packet(/*size*/ 32, Instant::now()))
-        .unwrap();
-    assert!(incoming.take().unwrap().is_some());
 }
 
 #[test]

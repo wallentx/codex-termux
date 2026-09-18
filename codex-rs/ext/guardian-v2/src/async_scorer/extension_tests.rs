@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::Result;
 use codex_core::config::Config;
@@ -38,7 +39,6 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
-use codex_protocol::models::ImageReference;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
@@ -67,7 +67,9 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-use crate::async_scorer::authorization::ScoreAuthorization;
+use super::GuardianV2Extension;
+use super::GuardianV2ScoreProgress;
+
 use crate::async_scorer::config::CLASSIFICATION_OUTPUT_INSTRUCTIONS;
 use crate::async_scorer::config::DEFAULT_PARENT_COMPACTION_TOKENS;
 use crate::async_scorer::config::GuardianV2Config;
@@ -84,7 +86,6 @@ use crate::async_scorer::sampler::LunaSampler;
 use crate::async_scorer::sampler::MODEL;
 use crate::async_scorer::sampler::tests::ProxyPrewarmLimit;
 use crate::async_scorer::sampler::tests::proxy_websocket_servers_with_http;
-use crate::async_scorer::score::GuardianV2ScoreProgress;
 use crate::async_scorer::transcript::MAX_MESSAGE_ENTRY_TOKENS;
 use crate::async_scorer::transcript::MAX_TOOL_ENTRY_TOKENS;
 use crate::async_scorer::transcript::truncate_entry;
@@ -411,14 +412,9 @@ struct TestRetainedHistory {
     current: TestConversationHistory,
     retained: Vec<ResponseItem>,
     compaction_model_hash: Option<String>,
-    retained_context: Option<codex_history::RetainedContext>,
 }
 
 impl ConversationHistorySnapshot for TestRetainedHistory {
-    fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
-        self.retained_context.as_ref()
-    }
-
     fn latest_compaction_model_hash(&self) -> Option<&str> {
         self.compaction_model_hash.as_deref()
     }
@@ -453,13 +449,48 @@ impl ConversationHistorySnapshot for TestConversationHistory {
     }
 }
 
+#[test]
+fn fail_closed_score_preserves_classification_order() {
+    let thread_store = ExtensionData::new("thread-1");
+    let newer_sampled_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    let newest_sampled_at = newer_sampled_at + Duration::from_secs(1);
+    let newer_score = SecurityRiskScore {
+        scores: BTreeMap::from([("action_risk".to_owned(), 0.25)]),
+        call_id: None,
+        action: None,
+        sampled_at: Some(newer_sampled_at.into()),
+    };
+    thread_store.insert(newer_score.clone());
+
+    GuardianV2Extension::record_fail_closed_score(&thread_store, SystemTime::UNIX_EPOCH);
+    assert_eq!(
+        thread_store.get::<SecurityRiskScore>().as_deref(),
+        Some(&newer_score)
+    );
+
+    GuardianV2Extension::record_fail_closed_score(&thread_store, newest_sampled_at);
+    let fail_closed_score = SecurityRiskScore {
+        scores: BTreeMap::from([("action_risk".to_owned(), 1.0)]),
+        call_id: None,
+        action: None,
+        sampled_at: Some(newest_sampled_at.into()),
+    };
+    assert!(!thread_store.insert_if(newer_score.clone(), |previous| {
+        previous.is_none_or(|previous| previous.sampled_at < newer_score.sampled_at)
+    }));
+    assert_eq!(
+        thread_store.get::<SecurityRiskScore>().as_deref(),
+        Some(&fail_closed_score)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
     let sandboxed = ToolPayload::Function {
         arguments: r#"{"cmd":"pwd"}"#.to_owned(),
     };
     let additional_permissions = ToolPayload::Function {
-        arguments: r#"{"cmd":"pwd","sandbox_permissions":"with_additional_permissions","additional_permissions":{"network":{"enabled":true}}}"#
+        arguments: r#"{"cmd":"pwd","sandbox_permissions":"with_additional_permissions"}"#
             .to_owned(),
     };
     let unsandboxed = ToolPayload::Function {
@@ -508,13 +539,6 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
 
     let fixture = GuardianFailureFixture::new().await?;
     let thread_store = fixture.test.codex.thread_extension_data();
-    let mut score = thread_store
-        .get::<SecurityRiskScore>()
-        .expect("fixture should publish a score")
-        .as_ref()
-        .clone();
-    score.scores.insert("action_risk".to_owned(), 0.0);
-    thread_store.insert(score);
     let score_progress = thread_store
         .get::<GuardianV2ScoreProgress>()
         .expect("Guardian v2 should track score progress per thread");
@@ -523,42 +547,30 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
         .load(Ordering::Acquire);
     let turn_store = ExtensionData::new("turn-1");
     let tool_name = ToolName::plain("exec_command");
-    for (call_id, payload, expected_decision) in [
-        ("call-2", sandboxed, Some(ReviewDecision::Approved)),
-        ("call-3", additional_permissions, None),
-    ] {
-        fixture.registry.tool_lifecycle_contributors()[0]
-            .on_tool_start(ToolStartInput {
-                session_store: &fixture.session_store,
-                thread_store,
-                turn_store: &turn_store,
-                turn_id: "turn-1",
-                root_turn_id: None,
-                call_id,
-                originating_item_id: None,
-                tool_name: &tool_name,
-                mcp_tool: None,
-                payload: &payload,
-                conversation_history: Arc::new(TestConversationHistory(Vec::new())),
-                source: ToolCallSource::Direct,
-            })
-            .await;
+    let payload = ToolPayload::Function {
+        arguments: r#"{"cmd":"pwd"}"#.to_owned(),
+    };
 
-        assert_eq!(
-            cached_approval(
-                &fixture.registry,
-                thread_store,
-                r#"{"tool":"exec_command","cmd":"pwd"}"#,
-                /*metrics*/ None,
-            )
-            .await,
-            expected_decision,
-        );
-    }
+    fixture.registry.tool_lifecycle_contributors()[0]
+        .on_tool_start(ToolStartInput {
+            session_store: &fixture.session_store,
+            thread_store,
+            turn_store: &turn_store,
+            turn_id: "turn-1",
+            root_turn_id: None,
+            call_id: "call-2",
+            originating_item_id: None,
+            tool_name: &tool_name,
+            mcp_tool: None,
+            payload: &payload,
+            conversation_history: Arc::new(TestConversationHistory(Vec::new())),
+            source: ToolCallSource::Direct,
+        })
+        .await;
 
     assert_eq!(
         score_progress.latest_tool_call.load(Ordering::Acquire),
-        latest_scored_tool_call + 2
+        latest_scored_tool_call + 1
     );
     assert_eq!(
         score_progress
@@ -566,7 +578,6 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
             .load(Ordering::Acquire),
         latest_scored_tool_call
     );
-    fixture.assert_fails_closed("scoring_failure").await?;
     Ok(())
 }
 
@@ -1647,9 +1658,7 @@ async fn contributor_includes_transcript_images_by_default() -> Result<()> {
                     text: "Review what is shown on screen.".to_owned(),
                 },
                 ContentItem::InputImage {
-                    image: ImageReference::Inline {
-                        image_url: user_image.to_owned(),
-                    },
+                    image_url: user_image.to_owned(),
                     detail: Some(ImageDetail::High),
                 },
             ],
@@ -1675,9 +1684,7 @@ async fn contributor_includes_transcript_images_by_default() -> Result<()> {
                     text: "Screenshot captured.".to_owned(),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image: ImageReference::Inline {
-                        image_url: tool_image.to_owned(),
-                    },
+                    image_url: tool_image.to_owned(),
                     detail: Some(ImageDetail::High),
                 },
             ]),
@@ -2213,9 +2220,7 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
         .await;
     model_info.slug = "protected-model".to_owned();
     thread_store.insert(model_info);
-    // A late prewarm preview must leave the active model's review requirements intact.
-    let _ = codex_core::guardian_review::prepare_review_prewarm(&test.codex).await?;
-    let authorization = ScoreAuthorization::current(&test.codex).await;
+    let authorization = super::ScoreAuthorization::current(&test.codex).await;
     let progress = thread_store
         .get::<GuardianV2ScoreProgress>()
         .expect("Guardian v2 should track score progress per thread");
@@ -2410,7 +2415,7 @@ async fn assert_compaction_approval_policy(thread_context_enabled: bool) -> Resu
         fixture.test.codex.guardian_authorization_version().await,
         authorization
     );
-    let score_authorization = ScoreAuthorization::current(&fixture.test.codex).await;
+    let score_authorization = super::ScoreAuthorization::current(&fixture.test.codex).await;
     *thread_store
         .get::<GuardianV2ScoreProgress>()
         .expect("score progress")
@@ -3002,7 +3007,6 @@ async fn assert_parent_compaction_reuse(thread_context_enabled: bool) -> Result<
         retained,
         current: conversation_history,
         compaction_model_hash: parent_model.comp_hash.clone(),
-        retained_context: thread_context_enabled.then(codex_history::RetainedContext::default),
     };
     thread_store.insert(parent_model);
 
@@ -3097,8 +3101,6 @@ async fn assert_parent_compaction_reuse(thread_context_enabled: bool) -> Result<
             conversation_history: Arc::new(TestRetainedHistory {
                 current: TestConversationHistory(vec![latest_compaction, oversized_compaction]),
                 retained: Vec::new(),
-                retained_context: thread_context_enabled
-                    .then(codex_history::RetainedContext::default),
                 compaction_model_hash: thread_store
                     .get::<ModelInfo>()
                     .and_then(|model| model.comp_hash.clone()),

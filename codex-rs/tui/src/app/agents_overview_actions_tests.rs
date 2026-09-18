@@ -12,48 +12,6 @@ use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-async fn archive_confirmation_number_keys_act_immediately() {
-    for key in ['1', '2'] {
-        let (mut app, mut rx, _op_rx) = crate::app::tests::make_test_app_with_channels().await;
-        let id = ThreadId::new();
-        app.agents_overview.threads.insert(
-            id,
-            Some(overview_thread(
-                id,
-                /*parent_thread_id*/ None,
-                "Current task",
-                ThreadStatus::Idle,
-            )),
-        );
-        app.confirm_agents_overview_action(id, AgentsOverviewAction::Archive);
-        insta::assert_snapshot!(
-            "archive_task_confirmation",
-            render_bottom_popup(&app.chat_widget, /*width*/ 72)
-        );
-
-        app.chat_widget.handle_key_event(KeyCode::Char(key).into());
-
-        assert!(!app.chat_widget.has_active_view());
-        let actions = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter_map(|event| match event {
-                AppEvent::RunAgentsOverviewAction { thread_id, action } => {
-                    Some((thread_id, action))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            actions,
-            if key == '2' {
-                vec![(id, AgentsOverviewAction::Archive)]
-            } else {
-                Vec::new()
-            }
-        );
-    }
-}
-
-#[tokio::test]
 async fn lifecycle_shortcuts_target_filtered_task_in_any_state() {
     let mut app = make_test_app().await;
     let mut keymap = TuiKeymap::default();
@@ -70,6 +28,11 @@ async fn lifecycle_shortcuts_target_filtered_task_in_any_state() {
             active_flags: Vec::new(),
         },
     ] {
+        app.agents_overview
+            .view_state
+            .lock()
+            .unwrap()
+            .focus_composer();
         let target = ThreadId::new();
         let mut view = app.agents_overview_view(
             vec![
@@ -84,7 +47,7 @@ async fn lifecycle_shortcuts_target_filtered_task_in_any_state() {
             Some(target),
         );
         view.handle_key_event(KeyCode::Esc.into());
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         for character in "Target".chars() {
             view.handle_key_event(KeyCode::Char(character).into());
         }
@@ -128,7 +91,7 @@ async fn hidden_task_stays_hidden_through_activity_and_seed_until_explicit_resum
     app.chat_widget.show_bottom_pane_view(Box::new(view));
     app.chat_widget.handle_key_event(KeyCode::Esc.into());
     app.chat_widget
-        .handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        .handle_key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
     let hide = std::iter::from_fn(|| rx.try_recv().ok())
         .find(|event| matches!(event, AppEvent::HideAgentsOverviewThread { .. }))
         .expect("shortcut requests hiding the task");
@@ -231,7 +194,9 @@ async fn lifecycle_removes_background_and_current_tasks_without_losing_the_dashb
         (AgentsOverviewAction::Delete, "delete_task", true),
     ] {
         let key = match action {
-            AgentsOverviewAction::Archive => KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            AgentsOverviewAction::Archive => {
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)
+            }
             AgentsOverviewAction::Delete => KeyCode::Delete.into(),
         };
         let (mut app, mut rx, _op_rx) =
@@ -469,6 +434,7 @@ async fn lifecycle_removes_background_and_current_tasks_without_losing_the_dashb
             render_bottom_popup(&app.chat_widget, /*width*/ 80)
         );
         app.chat_widget.handle_key_event(KeyCode::Enter.into());
+        app.chat_widget.handle_key_event(KeyCode::Esc.into());
         app_server
             .request_handle()
             .request_typed::<TurnStartResponse>(ClientRequest::TurnStart {
@@ -579,28 +545,20 @@ async fn disabled_footer_shortcuts_stay_bold_when_wrapped() {
     let mut buffer = ratatui::buffer::Buffer::empty(area);
     view.render(area, &mut buffer);
     let delete_key = crate::key_hint::plain(KeyCode::Delete).display_label();
-    for (key, label) in [
-        ("x", "x stop"),
-        ("h", "h hide"),
-        ("a", "a archive"),
-        (delete_key.as_str(), delete_key.as_str()),
-    ] {
+    for key in ["ctrl+x", "ctrl+w", "ctrl+e", delete_key.as_str()] {
         let cells = buffer
             .content()
-            .windows(label.len())
+            .windows(key.len())
             .find(|cells| {
                 cells
                     .iter()
                     .map(ratatui::buffer::Cell::symbol)
                     .collect::<String>()
-                    == label
+                    == key
             })
             .expect("footer shortcut");
         assert_eq!(
-            cells[..key.len()]
-                .iter()
-                .map(|cell| cell.modifier)
-                .collect::<Vec<_>>(),
+            cells.iter().map(|cell| cell.modifier).collect::<Vec<_>>(),
             vec![ratatui::style::Modifier::BOLD | ratatui::style::Modifier::DIM; key.len()]
         );
     }

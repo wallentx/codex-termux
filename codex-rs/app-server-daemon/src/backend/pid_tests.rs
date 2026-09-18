@@ -197,13 +197,11 @@ async fn stale_record_cleanup_preserves_replacement_record() {
     let stale = PidRecord {
         pid: 1,
         process_start_time: "old".to_string(),
-        process_identity: None,
         executable_identity: None,
     };
     let replacement = PidRecord {
         pid: 2,
         process_start_time: "new".to_string(),
-        process_identity: None,
         executable_identity: None,
     };
     tokio::fs::write(
@@ -280,38 +278,6 @@ async fn pid_record_captures_the_resolved_launch_binary() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn legacy_start_time_mismatch_preserves_record_and_process() {
-    let temp = TempDir::new().unwrap();
-    let backend = PidBackend::new(
-        temp.path().join("codex"),
-        temp.path().join("app-server.pid"),
-        /*remote_control_enabled*/ false,
-    );
-    let contents = serde_json::to_vec(&serde_json::json!({
-        "pid": std::process::id(),
-        "processStartTime": "historical wall-clock start time",
-    }))
-    .unwrap();
-    std::fs::write(&backend.pid_file, &contents).unwrap();
-    for result in [
-        backend.is_starting_or_running().await.map(|_| ()),
-        backend.start().await.map(|_| ()),
-        backend.stop().await,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        backend.promote_legacy_identity().await,
-    ] {
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("PID record retained")
-        );
-    }
-    assert_eq!(std::fs::read(&backend.pid_file).unwrap(), contents);
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn stop_reaps_untracked_app_server_child() {
     let temp_dir = TempDir::new().expect("temp dir");
     let pid_file = temp_dir.path().join("app-server.pid");
@@ -326,7 +292,6 @@ async fn stop_reaps_untracked_app_server_child() {
     let record = PidRecord {
         pid,
         process_start_time: read_process_start_time(pid).await.expect("start time"),
-        process_identity: None,
         executable_identity: None,
     };
     tokio::fs::write(
@@ -418,7 +383,6 @@ async fn shutdown_grace_handles_process_exit() {
             process_start_time: super::read_process_start_time(pid)
                 .await
                 .expect("start time"),
-            process_identity: None,
             executable_identity: None,
         };
         tokio::fs::write(
@@ -434,11 +398,7 @@ async fn shutdown_grace_handles_process_exit() {
             /*remote_control_enabled*/ false,
         );
         #[cfg(windows)]
-        let backend = PidBackend::new_update_loop(
-            temp.path().join("codex"),
-            pid_file,
-            /*restore_release*/ None,
-        );
+        let backend = PidBackend::new_update_loop(temp.path().join("codex"), pid_file);
         let result = tokio::time::timeout(
             Duration::from_secs(3),
             backend.stop_with_grace(grace_seconds),
@@ -500,18 +460,13 @@ async fn stopping_updater_signals_its_installer_process_group() {
         serde_json::to_vec(&PidRecord {
             pid,
             process_start_time: read_process_start_time(pid).await.expect("start time"),
-            process_identity: None,
             executable_identity: None,
         })
         .expect("serialize pid"),
     )
     .await
     .expect("write pid file");
-    let backend = PidBackend::new_update_loop(
-        temp.path().join("codex"),
-        pid_file,
-        /*restore_release*/ None,
-    );
+    let backend = PidBackend::new_update_loop(temp.path().join("codex"), pid_file);
     backend.stop().await.expect("stop updater");
     // The backend normally reaps the shim, so a second wait may return ECHILD.
     let _ = child.wait();
@@ -533,28 +488,15 @@ async fn exited_unreaped_updater_is_reaped() {
         .arg("60")
         .spawn()
         .expect("spawn updater shim");
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let process_identity = Some(
-        super::identity::read_process_details(child.id())
-            .await
-            .unwrap()
-            .1,
-    );
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let process_identity = None;
     let record = PidRecord {
         pid: child.id(),
         process_start_time: read_process_start_time(child.id())
             .await
             .expect("start time"),
-        process_identity,
         executable_identity: None,
     };
-    let backend = PidBackend::new_update_loop(
-        temp.path().join("codex"),
-        temp.path().join("updater.pid"),
-        /*restore_release*/ None,
-    );
+    let backend =
+        PidBackend::new_update_loop(temp.path().join("codex"), temp.path().join("updater.pid"));
     child.kill().expect("terminate updater shim");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let result = loop {
@@ -580,9 +522,7 @@ fn update_loop_uses_hidden_app_server_subcommand() {
         codex_bin: "codex".into(),
         pid_file: "updater.pid".into(),
         lock_file: "updater.pid.lock".into(),
-        command_kind: PidCommandKind::UpdateLoop {
-            restore_release: None,
-        },
+        command_kind: PidCommandKind::UpdateLoop,
     };
 
     assert_eq!(
@@ -644,6 +584,7 @@ async fn read_stderr_log_tail_returns_recent_complete_lines() {
     );
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn stale_creation_time_never_stops_reused_pid() {
     let temp = TempDir::new().expect("temp");
@@ -652,45 +593,17 @@ async fn stale_creation_time_never_stops_reused_pid() {
         temp.path().join("server.pid"),
         /*remote_control_enabled*/ false,
     );
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let identities = {
-        use super::identity::ProcessIdentity;
-        let (_, identity) = super::identity::read_process_details(std::process::id())
-            .await
-            .unwrap();
-        let mut stale_time = identity.clone();
-        let mut stale_epoch = identity;
-        match &mut stale_time {
-            ProcessIdentity::Linux { start_ticks, .. } => *start_ticks += 1,
-            ProcessIdentity::MacOs {
-                start_microseconds, ..
-            }
-            | ProcessIdentity::MacOsUnique {
-                start_microseconds, ..
-            } => *start_microseconds += 1,
-        }
-        match &mut stale_epoch {
-            ProcessIdentity::Linux { boot_id, .. } => boot_id.push_str("-previous"),
-            ProcessIdentity::MacOs { start_seconds, .. } => *start_seconds += 1,
-            ProcessIdentity::MacOsUnique { unique_id, .. } => *unique_id += 1,
-        }
-        [Some(stale_time), Some(stale_epoch)]
+    let record = PidRecord {
+        pid: std::process::id(),
+        process_start_time: "stale".into(),
+        executable_identity: None,
     };
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let identities = [None];
-    for process_identity in identities {
-        let record = PidRecord {
-            pid: std::process::id(),
-            process_start_time: "stale".into(),
-            process_identity,
-            executable_identity: None,
-        };
-        let contents = serde_json::to_vec(&record).unwrap();
-        std::fs::write(&backend.pid_file, &contents).unwrap();
-        backend.stop().await.expect("stale record cleanup");
-        assert!(!backend.pid_file.exists());
-        assert!(!backend.pid_file.with_extension("shutdown").exists());
-    }
+    tokio::fs::write(&backend.pid_file, serde_json::to_vec(&record).unwrap())
+        .await
+        .unwrap();
+    backend.stop().await.expect("stale record cleanup");
+    assert!(!backend.pid_file.exists());
+    assert!(!backend.pid_file.with_extension("shutdown").exists());
 }
 
 #[cfg(windows)]
@@ -705,14 +618,12 @@ async fn failed_updater_handoff_preserves_predecessor_record() {
     let backend = PidBackend::new_update_loop(
         temp.path().join("missing-codex.exe"),
         state_dir.join("updater.pid"),
-        /*restore_release*/ None,
     );
     let record = PidRecord {
         pid: std::process::id(),
         process_start_time: super::read_process_start_time(std::process::id())
             .await
             .unwrap(),
-        process_identity: None,
         executable_identity: None,
     };
     for record in [
@@ -752,7 +663,6 @@ async fn updater_readiness_and_post_publication_failure_preserve_ownership() {
     let backend = PidBackend::new_update_loop(
         temp.path().join("codex.exe"),
         temp.path().join("updater.pid"),
-        /*restore_release*/ None,
     );
     let _lock = backend
         .acquire_reservation_lock()
@@ -775,7 +685,6 @@ async fn updater_readiness_and_post_publication_failure_preserve_ownership() {
         process_start_time: super::read_process_start_time(pid)
             .await
             .expect("creation time"),
-        process_identity: None,
         executable_identity: None,
     };
     let predecessor = PidRecord {
@@ -783,7 +692,6 @@ async fn updater_readiness_and_post_publication_failure_preserve_ownership() {
         process_start_time: super::read_process_start_time(std::process::id())
             .await
             .expect("creation time"),
-        process_identity: None,
         executable_identity: None,
     };
     tokio::fs::write(&backend.pid_file, serde_json::to_vec(&successor).unwrap())
@@ -871,7 +779,7 @@ async fn updater_readiness_and_post_publication_failure_preserve_ownership() {
 
 #[cfg(windows)]
 #[test]
-fn inaccessible_pid_preserves_identity_check_error() {
+fn inaccessible_reused_pid_is_stale_without_hiding_process_open_errors() {
     use futures::FutureExt;
     use windows_sys::Win32::Security::ImpersonateAnonymousToken;
     use windows_sys::Win32::Security::RevertToSelf;
@@ -883,7 +791,6 @@ fn inaccessible_pid_preserves_identity_check_error() {
         let record = PidRecord {
             pid: std::process::id(),
             process_start_time: "stale".into(),
-            process_identity: None,
             executable_identity: None,
         };
         assert!(
@@ -909,15 +816,7 @@ fn inaccessible_pid_preserves_identity_check_error() {
                 .raw_os_error(),
             Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32),
         );
-        assert_eq!(
-            matches
-                .expect("identity check must not suspend")
-                .unwrap_err()
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .raw_os_error(),
-            Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32),
-        );
+        assert!(!matches.expect("identity check must not suspend").unwrap());
     })
     .join()
     .expect("anonymous identity check");

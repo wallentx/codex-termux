@@ -10,9 +10,7 @@ impl ChatWidget {
             crate::clipboard_copy::CopyFormat::PlainText,
         ) {
             Ok(lease) => {
-                if let Some(lease) = lease {
-                    self.clipboard_lease = Some(lease);
-                }
+                self.clipboard_lease = lease;
                 self.add_info_message(
                     "Copied conversation to clipboard".to_string(),
                     /*hint*/ None,

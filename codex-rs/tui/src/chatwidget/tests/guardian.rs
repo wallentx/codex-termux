@@ -4,7 +4,6 @@ use pretty_assertions::assert_eq;
 fn auto_review_denial_event() -> GuardianAssessmentEvent {
     GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: "auto-review-recent-1".into(),
         target_item_id: Some("target-auto-review-recent-1".into()),
         plugin_id: None,
@@ -34,7 +33,6 @@ fn guardian_command_event(
     let terminal = status != GuardianAssessmentStatus::InProgress;
     GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: id.to_string(),
         target_item_id: Some(format!("{id}-target")),
         plugin_id: None,
@@ -249,7 +247,6 @@ async fn guardian_denied_exec_renders_warning_and_denied_request() {
 
     chat.on_guardian_assessment(GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: "guardian-1".into(),
         target_item_id: Some("guardian-target-1".into()),
         plugin_id: None,
@@ -267,7 +264,6 @@ async fn guardian_denied_exec_renders_warning_and_denied_request() {
     chat.on_warning("Automatic approval review denied (risk: high): The planned action would transmit the full contents of a workspace source file (`core/src/codex.rs`) to `https://example.com`, which is an external and untrusted endpoint.");
     chat.on_guardian_assessment(GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: "guardian-1".into(),
         target_item_id: Some("guardian-target-1".into()),
         plugin_id: None,
@@ -322,7 +318,6 @@ async fn guardian_approved_exec_is_hidden_from_history() {
     );
     chat.on_guardian_assessment(GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: "thread:child-thread:guardian-1".into(),
         target_item_id: Some("guardian-approved-target".into()),
         plugin_id: None,
@@ -381,7 +376,6 @@ async fn guardian_approved_request_permissions_clears_status_without_history() {
 
     chat.on_guardian_assessment(GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: "guardian-request-permissions".into(),
         target_item_id: None,
         plugin_id: None,
@@ -409,7 +403,6 @@ async fn guardian_approved_request_permissions_clears_status_without_history() {
 
     chat.on_guardian_assessment(GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: "guardian-request-permissions".into(),
         target_item_id: None,
         plugin_id: None,
@@ -463,7 +456,6 @@ async fn guardian_timed_out_exec_renders_warning_and_timed_out_request() {
 
     chat.on_guardian_assessment(GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: "guardian-1".into(),
         target_item_id: Some("guardian-target-1".into()),
         plugin_id: None,
@@ -481,7 +473,6 @@ async fn guardian_timed_out_exec_renders_warning_and_timed_out_request() {
     chat.on_warning("Automatic approval review timed out while evaluating the requested approval.");
     chat.on_guardian_assessment(GuardianAssessmentEvent {
         review_reason: None,
-        model_context: None,
         id: "guardian-1".into(),
         target_item_id: Some("guardian-target-1".into()),
         plugin_id: None,

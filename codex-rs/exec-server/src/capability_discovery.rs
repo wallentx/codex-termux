@@ -78,7 +78,9 @@ async fn discover_root(
 
     #[cfg(target_os = "windows")]
     if sandbox.is_some_and(|context| {
-        context.should_run_in_sandbox() && !context.windows_sandbox_is_requested()
+        context.should_run_in_sandbox()
+            && context.windows_sandbox_level
+                == codex_protocol::config_types::WindowsSandboxLevel::Disabled
     }) {
         discovery.error = Some("filesystem sandbox is unavailable on this executor".to_string());
         return discovery;

@@ -1344,9 +1344,7 @@ async fn managed_auth_policy_survives_unusable_requirements_file_changes() -> Re
     )?;
     for refreshed in [
         service.load_latest_config(/*fallback_cwd*/ None).await?,
-        service
-            .load_latest_config_with_session_layers(&startup.config_layer_stack, &startup.cwd)
-            .await?,
+        service.load_latest_config_for_thread(&startup).await?,
     ] {
         assert_eq!(refreshed.forced_login_method, None);
         assert_eq!(refreshed.forced_chatgpt_workspace_id, None);
@@ -1537,7 +1535,7 @@ async fn write_value_rejects_feature_requirement_conflict() {
         CloudConfigBundleFixture::loader_with_enterprise_requirement(
             r#"
 [features]
-fast_mode = true
+personality = true
 "#,
         ),
     );
@@ -1545,7 +1543,7 @@ fast_mode = true
     let error = service
         .write_value(ConfigValueWriteParams {
             file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-            key_path: "features.fast_mode".to_string(),
+            key_path: "features.personality".to_string(),
             value: serde_json::json!(false),
             merge_strategy: MergeStrategy::Replace,
             expected_version: None,
@@ -1560,7 +1558,7 @@ fast_mode = true
     assert!(
         error
             .to_string()
-            .contains("invalid value for `features`: `features.fast_mode=false`"),
+            .contains("invalid value for `features`: `features.personality=false`"),
         "{error}"
     );
     assert_eq!(
@@ -2630,47 +2628,5 @@ exclude = ["AWS_*"]
             .await?;
     }
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn allowed_login_methods_follow_current_forced_workspaces() -> Result<()> {
-    use codex_protocol::config_types::ForcedLoginMethod;
-
-    let tmp = tempdir()?;
-    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
-    std::fs::write(
-        tmp.path().join("requirements.toml"),
-        "allowed_chatgpt_workspaces = ['managed']",
-    )?;
-    let service = ConfigManager::new_for_tests(
-        tmp.path().to_path_buf(),
-        Vec::new(),
-        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml")),
-        CloudConfigBundleLoader::default(),
-    );
-    let config = service.load_latest_config(/*fallback_cwd*/ None).await?;
-    let auth = codex_login::AuthManager::shared_from_config(
-        &config, /*enable_codex_api_key_env*/ false,
-    )
-    .await?;
-    for (workspaces, expected) in [
-        (
-            Some(vec!["managed".to_string()]),
-            vec![ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt],
-        ),
-        (
-            Some(vec!["other".to_string()]),
-            vec![ForcedLoginMethod::Api],
-        ),
-        (Some(Vec::new()), vec![ForcedLoginMethod::Api]),
-        (
-            None,
-            vec![ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt],
-        ),
-    ] {
-        auth.set_forced_chatgpt_workspace_id(workspaces);
-        assert_eq!(auth.allowed_login_methods(), expected);
-    }
     Ok(())
 }

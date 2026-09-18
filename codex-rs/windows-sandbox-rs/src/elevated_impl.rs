@@ -292,7 +292,6 @@ mod windows_impl {
                 let _ = cancel_handle.join();
             }
             drop(pipe_write);
-            crate::elevated::runner_metrics::record_command(result.as_ref().ok().copied());
             let (exit_code, timed_out) = result?;
 
             if exit_code == 0 {

@@ -29,18 +29,25 @@ impl ConnectionDriver {
         match command {
             DriverCommand::OpenSession {
                 session,
+                delegate,
                 limits,
                 cleanup,
                 caller_cancellation,
                 response_tx,
-            } => self.open_session(session, limits, cleanup, caller_cancellation, response_tx),
+            } => self.open_session(
+                session,
+                delegate,
+                limits,
+                cleanup,
+                caller_cancellation,
+                response_tx,
+            ),
             DriverCommand::Execute {
                 session,
                 request,
-                delegate,
                 caller_cancellation,
                 response_tx,
-            } => self.execute(session, request, delegate, caller_cancellation, response_tx),
+            } => self.execute(session, request, caller_cancellation, response_tx),
             DriverCommand::Wait {
                 session,
                 request,
@@ -62,6 +69,7 @@ impl ConnectionDriver {
     fn open_session(
         &mut self,
         session: RemoteSession,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
         limits: CodeModeSessionCellExecutionLimits,
         cleanup: super::cleanup::SessionCleanup,
         caller_cancellation: CancellationToken,
@@ -112,6 +120,7 @@ impl ConnectionDriver {
             request_id,
             PendingRequest::OpenSession {
                 session,
+                delegate,
                 cleanup,
                 cancellation,
                 response_tx,
@@ -125,7 +134,6 @@ impl ConnectionDriver {
         &mut self,
         session: RemoteSession,
         request: ExecuteRequest,
-        delegate: Arc<dyn CodeModeSessionDelegate>,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
     ) -> bool {
@@ -171,7 +179,6 @@ impl ConnectionDriver {
             request_id,
             PendingRequest::Execute {
                 session,
-                delegate,
                 response_tx,
                 initial_response_tx,
                 initial_response_rx,

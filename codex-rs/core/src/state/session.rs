@@ -28,11 +28,11 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnContextItem;
 use codex_utils_output_truncation::TruncationPolicy;
-use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 /// Runtime request effort, initially unset and established by prewarm or sampling.
-/// Successful compaction allows a fresh baseline without an override.
+/// Rollback clears it after startup prewarm is consumed; successful compaction allows
+/// a fresh baseline without an override.
 pub(crate) enum ReasoningEffortPin {
     Unset,
     Compacted,
@@ -68,13 +68,9 @@ impl ReasoningEffortPin {
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
-    /// Plugin selection of the last admitted task; settings updates take effect on the next task.
-    pub(crate) active_disabled_plugin_ids: Vec<String>,
     /// Persisted origin of the session base instructions, when known.
     pub(crate) base_instructions_provenance: Option<BaseInstructionsProvenance>,
     pub(crate) history: ContextManager,
-    /// Cancels work bound to discarded history or a superseded Guardian evidence policy.
-    pub(crate) history_reset: CancellationToken,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) latest_token_usage_record: Option<TokenUsageRecord>,
     pub(crate) server_reasoning_included: bool,
@@ -116,11 +112,9 @@ impl SessionState {
         history: ContextManager,
     ) -> Self {
         Self {
-            active_disabled_plugin_ids: Vec::new(),
             session_configuration,
             base_instructions_provenance: None,
             history,
-            history_reset: CancellationToken::new(),
             latest_rate_limits: None,
             latest_token_usage_record: None,
             server_reasoning_included: false,
@@ -178,11 +172,10 @@ impl SessionState {
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
     ) {
-        self.replace_annotated_history(
-            items.into_iter().map(ResponseItemEnvelope::new).collect(),
-            reference_context_item,
-            HistoryReplacement::Reset,
-        );
+        self.history.replace(items);
+        self.history
+            .set_reference_context_item(reference_context_item);
+        self.auto_compact_window.clear_prefill();
     }
 
     pub(crate) fn replace_annotated_history(
@@ -191,19 +184,9 @@ impl SessionState {
         reference_context_item: Option<TurnContextItem>,
         replacement: HistoryReplacement,
     ) {
-        let invalidate_reviews = match replacement {
-            HistoryReplacement::Compaction {
-                reviewer_compaction_hash,
-            } => self
-                .history
-                .replace_compacted(items, reviewer_compaction_hash.as_deref()),
-            HistoryReplacement::Reset => {
-                self.history.replace_annotated(items);
-                true
-            }
-        };
-        if invalidate_reviews {
-            std::mem::take(&mut self.history_reset).cancel();
+        match replacement {
+            HistoryReplacement::Compaction => self.history.replace_compacted(items),
+            HistoryReplacement::Reset => self.history.replace_annotated(items),
         }
         self.history
             .set_reference_context_item(reference_context_item);

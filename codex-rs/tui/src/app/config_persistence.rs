@@ -6,6 +6,14 @@
 
 use super::*;
 use codex_config::ConfigLayerSource;
+#[cfg(target_os = "windows")]
+use codex_utils_approval_presets::ApprovalPreset;
+
+#[cfg(target_os = "windows")]
+pub(super) struct WindowsSetupPermissions {
+    pub(super) permission_profile: PermissionProfile,
+    pub(super) workspace_roots: Vec<AbsolutePathBuf>,
+}
 
 async fn build_config_on_runtime_worker(
     builder: ConfigBuilder,
@@ -119,6 +127,29 @@ impl App {
         .await
     }
 
+    #[cfg(target_os = "windows")]
+    pub(super) async fn windows_setup_permissions(
+        &self,
+        preset: &ApprovalPreset,
+        profile_selection: Option<&PermissionProfileSelection>,
+    ) -> Result<WindowsSetupPermissions> {
+        match profile_selection {
+            Some(selection) => {
+                let selected_config = self
+                    .rebuild_config_for_permission_profile(selection.profile_id.as_str())
+                    .await?;
+                Ok(WindowsSetupPermissions {
+                    permission_profile: selected_config.permissions.permission_profile().clone(),
+                    workspace_roots: selected_config.effective_workspace_roots(),
+                })
+            }
+            None => Ok(WindowsSetupPermissions {
+                permission_profile: preset.permission_profile.clone(),
+                workspace_roots: self.config.effective_workspace_roots(),
+            }),
+        }
+    }
+
     pub(super) async fn apply_permission_profile_selection(
         &mut self,
         selection: PermissionProfileSelection,
@@ -212,11 +243,6 @@ impl App {
             self.chat_widget.set_approvals_reviewer(reviewer);
         }
         self.chat_widget.set_permission_network(network);
-        if let Some(thread_id) = self.chat_widget.thread_id() {
-            self.agents_overview
-                .selected_permission_profiles
-                .insert(thread_id, profile_id.clone());
-        }
         self.runtime_permission_profile_override =
             Some(RuntimePermissionProfileOverride::from_config(&self.config));
         self.sync_active_thread_permission_settings_to_cached_session()
@@ -295,9 +321,6 @@ impl App {
                 .approvals_reviewer
                 .is_none_or(|reviewer| config.approvals_reviewer == reviewer)
         {
-            self.agents_overview
-                .selected_permission_profiles
-                .insert(thread_id, selection.profile_id);
             return;
         }
         let params = ThreadSettingsUpdateParams {
@@ -309,9 +332,6 @@ impl App {
         };
         match app_server.thread_settings_update(params).await {
             Ok(true) => {
-                self.agents_overview
-                    .selected_permission_profiles
-                    .insert(thread_id, selection.profile_id.clone());
                 self.pending_server_profiles
                     .insert(thread_id, selection.clone());
                 self.chat_widget.add_info_message(
@@ -1055,12 +1075,17 @@ impl App {
                         profile.turn_override == RuntimePermissionProfileTurnOverride::LegacySandbox
                     });
         if explicitly_selected {
-            self.add_agents_overview_error(
+            self.chat_widget.add_error_message(
                 "Permission overrides are not supported when resuming a remote task.".into(),
             );
             return true;
         }
         false
+    }
+
+    pub(super) fn on_update_personality(&mut self, personality: Personality) {
+        self.config.personality = Some(personality);
+        self.chat_widget.set_personality(personality);
     }
 
     pub(super) fn sync_tui_theme_selection(&mut self, name: String) {
@@ -1097,6 +1122,14 @@ impl App {
             Some(&self.local_settings.codex_home),
         ) {
             crate::render::highlight::set_syntax_theme(theme);
+        }
+    }
+
+    pub(super) fn personality_label(personality: Personality) -> &'static str {
+        match personality {
+            Personality::None => "None",
+            Personality::Friendly => "Friendly",
+            Personality::Pragmatic => "Pragmatic",
         }
     }
 
@@ -1246,34 +1279,31 @@ impl App {
     }
 
     #[cfg(target_os = "windows")]
-    pub(super) async fn verify_windows_sandbox_mode_after_setup(
+    pub(super) async fn sync_windows_sandbox_after_overridden_write(
         &mut self,
         app_server: &mut AppServerSession,
-        requested_mode: codex_config::types::WindowsSandboxModeToml,
-    ) -> bool {
-        let cwd = self.chat_widget.config_ref().cwd.display().to_string();
-        let mode = crate::config_update::read_effective_config(app_server.request_handle(), cwd)
+        write_response: &ConfigWriteResponse,
+    ) {
+        let message = overridden_write_message(write_response);
+        tracing::warn!(
+            message,
+            "Windows sandbox config write was overridden by effective config"
+        );
+        self.chat_widget.add_error_message(format!(
+            "Windows sandbox changes were saved but not applied: {message}"
+        ));
+        let Some(effective_config) = self
+            .read_effective_config_after_overridden_write(app_server, "Windows sandbox changes")
             .await
-            .ok()
-            .and_then(|config| windows_sandbox_mode_from_effective_config(&config));
-        let Some(mode) = mode else {
-            self.chat_widget.add_error_message(
-                "Windows sandbox setup completed, but Codex could not verify the effective sandbox mode."
-                    .to_string(),
-            );
-            return false;
+        else {
+            return;
+        };
+        let Some(mode) = windows_sandbox_mode_from_effective_config(&effective_config) else {
+            return;
         };
         self.config.permissions.windows_sandbox_mode = Some(mode);
-        if mode == requested_mode {
-            return true;
-        }
         self.chat_widget.set_windows_sandbox_mode(Some(mode));
         self.propagate_windows_sandbox_turn_context();
-        self.chat_widget.add_error_message(
-            "Windows sandbox setup completed, but its mode was overridden by the effective configuration."
-                .to_string(),
-        );
-        false
     }
 
     fn propagate_windows_sandbox_turn_context(&self) {
@@ -1775,7 +1805,6 @@ enabled = false
 
         app.chat_widget
             .handle_thread_session(crate::session_state::ThreadSessionState {
-                windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
                 thread_id: ThreadId::new(),
                 forked_from_id: None,
                 fork_parent_title: None,

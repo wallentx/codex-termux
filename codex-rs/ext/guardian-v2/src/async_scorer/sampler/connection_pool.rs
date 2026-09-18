@@ -13,6 +13,7 @@ use codex_api::ReqwestTransport;
 use codex_api::ResponseStream;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient;
+use codex_api::ResponsesEndpoint;
 use codex_api::ResponsesOptions;
 use codex_api::ResponsesWebsocketClient;
 use codex_api::ResponsesWebsocketConnection;
@@ -43,12 +44,6 @@ const CONNECT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const MAX_WEBSOCKET_AGE: Duration = Duration::from_secs(55 * 60);
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum RequestMode {
-    Regular,
-    GuardianClassifier,
-}
-
 pub(super) struct ConnectionPool {
     config: Arc<LunaSamplerConfig>,
     pub(super) idle_connections: Mutex<Vec<PooledConnection>>,
@@ -62,7 +57,7 @@ pub(super) struct ConnectionPool {
 
 pub(super) struct PooledConnection {
     connection: ResponsesWebsocketConnection,
-    request_kind: RequestMode,
+    endpoint: ResponsesEndpoint,
     // The bridge routes by thread ID, so each socket needs its own identity.
     thread_id: String,
     pub(super) expires_at: Instant,
@@ -77,7 +72,7 @@ enum Connection {
 
 pub(super) struct ConnectionLease {
     pub(super) thread_id: String,
-    pub(super) request_kind: RequestMode,
+    pub(super) endpoint: ResponsesEndpoint,
     connection: Connection,
     pool: Arc<ConnectionPool>,
     _permit: OwnedSemaphorePermit,
@@ -182,19 +177,19 @@ impl ConnectionPool {
                 None => break None,
             }
         };
-        let (connection, thread_id, request_kind) = match connection {
+        let (connection, thread_id, endpoint) = match connection {
             Some(connection) => {
                 let thread_id = connection.thread_id.clone();
-                let request_kind = connection.request_kind;
-                (Connection::Websocket(connection), thread_id, request_kind)
+                let endpoint = connection.endpoint;
+                (Connection::Websocket(connection), thread_id, endpoint)
             }
             None => {
                 self.replenish();
                 let (mut provider, auth) = self.client_setup().await?;
                 // Sampling owns the retry budget across both transports.
                 provider.retry.max_attempts = 0;
-                let request_kind = self.responses_request_kind().await;
-                let url = provider.url_for_path("/responses");
+                let endpoint = self.responses_endpoint().await;
+                let url = provider.url_for_path(endpoint.path());
                 let transport = {
                     let mut cached = self
                         .http_transport
@@ -227,17 +222,18 @@ impl ConnectionPool {
                     })
                     .await?
                     .clone();
-                let client = ResponsesClient::new(transport, provider, auth);
+                let client =
+                    ResponsesClient::new(transport, provider, auth).with_endpoint(endpoint);
                 (
                     Connection::Http(client),
                     ThreadId::new().to_string(),
-                    request_kind,
+                    endpoint,
                 )
             }
         };
         Ok(ConnectionLease {
             thread_id,
-            request_kind,
+            endpoint,
             connection,
             pool: Arc::clone(self),
             _permit: permit,
@@ -265,18 +261,11 @@ impl ConnectionPool {
         Ok((provider, auth))
     }
 
-    fn headers(
-        &self,
-        thread_id: &str,
-        request_kind: RequestMode,
-    ) -> Result<HeaderMap, LunaSamplerError> {
+    fn headers(&self, thread_id: &str) -> Result<HeaderMap, LunaSamplerError> {
         let mut headers = build_session_headers(
             Some(self.config.session_id.clone()),
             Some(thread_id.to_owned()),
         );
-        if request_kind == RequestMode::GuardianClassifier {
-            headers.insert("x-codex-guardian", HeaderValue::from_static("classifier"));
-        }
         headers.insert("x-openai-subagent", HeaderValue::from_static("guardian"));
         headers.insert(
             "x-codex-window-id",
@@ -298,15 +287,16 @@ impl ConnectionPool {
         }
         Ok(headers)
     }
-    async fn responses_request_kind(&self) -> RequestMode {
+    async fn responses_endpoint(&self) -> ResponsesEndpoint {
         let provider = self.config.provider.info();
-        if self
-            .config
-            .provider
-            .auth()
-            .await
-            .as_ref()
-            .is_some_and(CodexAuth::uses_codex_backend)
+        if self.config.free_guardian
+            && self
+                .config
+                .provider
+                .auth()
+                .await
+                .as_ref()
+                .is_some_and(CodexAuth::uses_codex_backend)
             && provider.supports_codex_backend_routes()
             && provider.requires_openai_auth
             && provider.env_key.is_none()
@@ -314,9 +304,9 @@ impl ConnectionPool {
             && provider.auth.is_none()
             && provider.aws.is_none()
         {
-            RequestMode::GuardianClassifier
+            ResponsesEndpoint::GuardianClassifier
         } else {
-            RequestMode::Regular
+            ResponsesEndpoint::Responses
         }
     }
 
@@ -328,15 +318,15 @@ impl ConnectionPool {
         let auth_changes = auth_manager.map(|manager| manager.auth_change_receiver());
         let (provider, auth) = self.client_setup().await?;
         let thread_id = ThreadId::new().to_string();
-        let request_kind = self.responses_request_kind().await;
-        let mut headers = self.headers(&thread_id, request_kind)?;
+        let mut headers = self.headers(&thread_id)?;
         headers.insert(
             "openai-beta",
             HeaderValue::from_static(RESPONSES_WEBSOCKETS_BETA),
         );
 
         let provider_info = self.config.provider.info();
-        let client = ResponsesWebsocketClient::new(provider, auth);
+        let endpoint = self.responses_endpoint().await;
+        let client = ResponsesWebsocketClient::new(provider, auth).with_endpoint(endpoint);
         let connect = client.connect(
             &self.config.http_client_factory,
             headers,
@@ -351,7 +341,7 @@ impl ConnectionPool {
             .and_then(|result| result.map_err(LunaSamplerError::Api));
         if let Some(metrics) = self.config.metrics.as_deref() {
             let outcome = if result.is_ok() { "success" } else { "failure" };
-            let mut tags = vec![("endpoint", "/responses"), ("outcome", outcome)];
+            let mut tags = vec![("endpoint", endpoint.path()), ("outcome", outcome)];
             if let Err(error) = &result {
                 tags.push(("failure_reason", sampler_failure_reason(error)));
             }
@@ -373,7 +363,7 @@ impl ConnectionPool {
 
         Ok(PooledConnection {
             connection,
-            request_kind,
+            endpoint,
             thread_id,
             expires_at: Instant::now() + MAX_WEBSOCKET_AGE,
             auth_changes,
@@ -409,7 +399,7 @@ impl ConnectionLease {
                             thread_id: Some(self.thread_id.clone()),
                             extra_headers: self
                                 .pool
-                                .headers(&self.thread_id, self.request_kind)
+                                .headers(&self.thread_id)
                                 .map_err(|error| ApiError::Stream(error.to_string()))?,
                             ..Default::default()
                         },

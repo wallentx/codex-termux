@@ -22,7 +22,6 @@ use std::path::Path;
 /// re-rendered as committed source arrives.
 pub(super) struct StreamingRender {
     pub(super) lines: Vec<HyperlinkLine>,
-    pub(super) pending_math_start: Option<usize>,
     /// Source prefix containing only completed top-level markdown blocks.
     stable_source_len: usize,
     /// Rendered-line boundary corresponding to `stable_source_len`.
@@ -39,7 +38,6 @@ impl StreamingRender {
     pub(super) fn new() -> Self {
         Self {
             lines: Vec::with_capacity(64),
-            pending_math_start: None,
             stable_source_len: 0,
             stable_rendered_len: 0,
             has_reference_link_definition: false,
@@ -50,7 +48,6 @@ impl StreamingRender {
 
     pub(super) fn clear(&mut self) {
         self.lines.clear();
-        self.pending_math_start = None;
         self.stable_source_len = 0;
         self.stable_rendered_len = 0;
         self.has_reference_link_definition = false;
@@ -71,26 +68,16 @@ impl StreamingRender {
         inline_visualization_context: Option<&InlineVisualizationContext>,
     ) {
         self.open_code_fence = None;
-        self.pending_math_start = None;
         self.has_inline_visualization_directive = contains_inline_visualization(source);
         self.lines = match (render_mode, inline_visualization_context) {
             (HistoryRenderMode::Rich, None) if !self.has_inline_visualization_directive => {
                 let rendered =
                     render_streaming_markdown_agent_with_links_and_cwd(source, width, Some(cwd));
                 self.has_reference_link_definition = rendered.has_reference_link_definition;
-                self.pending_math_start = rendered.pending_math_start;
                 rendered.lines
             }
             _ => {
                 self.has_reference_link_definition = false;
-                if render_mode == HistoryRenderMode::Rich {
-                    self.pending_math_start = render_streaming_markdown_agent_with_links_and_cwd(
-                        source,
-                        width,
-                        Some(cwd),
-                    )
-                    .pending_math_start;
-                }
                 render_source(
                     source,
                     width,
@@ -162,9 +149,6 @@ impl StreamingRender {
         let theme_revision = syntax_theme_revision();
         let pending =
             render_streaming_markdown_agent_with_links_and_cwd(pending_source, width, Some(cwd));
-        self.pending_math_start = pending
-            .pending_math_start
-            .map(|start| self.stable_source_len + start);
         if pending.has_reference_link_definition {
             self.has_reference_link_definition = true;
             self.recompute(
@@ -234,7 +218,3 @@ pub(super) fn render_source(
 #[cfg(test)]
 #[path = "render_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "inline_math_tests.rs"]
-mod inline_math_tests;

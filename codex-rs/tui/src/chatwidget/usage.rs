@@ -45,7 +45,6 @@ impl ChatWidget {
                     (false, "No usage limit resets available.".to_string())
                 }
             };
-
         SelectionViewParams {
             view_id: Some(USAGE_MENU_VIEW_ID),
             title: Some("Usage".to_string()),
@@ -53,10 +52,10 @@ impl ChatWidget {
             footer_hint: Some(standard_popup_hint_line()),
             items: vec![
                 SelectionItem {
-                    name: "View analytics".to_string(),
-                    description: Some("Browse account usage and activity.".to_string()),
+                    name: "Show usage".to_string(),
+                    description: Some("View recent account token usage.".to_string()),
                     actions: vec![Box::new(|tx| {
-                        tx.send(AppEvent::OpenAnalytics { view: None });
+                        tx.send(AppEvent::OpenTokenActivity);
                     })],
                     dismiss_on_select: true,
                     ..Default::default()

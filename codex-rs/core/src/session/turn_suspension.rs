@@ -107,8 +107,9 @@ pub(super) async fn suspend_turn_and_shutdown(
     live_thread.shutdown().await.map_err(|error| {
         CodexErr::Fatal(format!("close suspended root turn writer failed: {error}"))
     })?;
-    // Announce completion only after extension cleanup and writer closure so a
-    // replacement worker cannot write the same thread concurrently.
+    // Announce thread shutdown only after its writer closes so a replacement worker
+    // cannot write the same thread concurrently.
+    handlers::emit_thread_stop_lifecycle(session.as_ref()).await;
     session
         .deliver_event_raw(Event {
             id: submission_id,

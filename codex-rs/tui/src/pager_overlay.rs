@@ -58,7 +58,6 @@ use scrolling::render_offset_content;
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
-    Analytics(Box<crate::analytics::AnalyticsView>),
 }
 
 impl Overlay {
@@ -86,7 +85,6 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
-            Overlay::Analytics(o) => o.handle_event(tui, event),
         }
     }
 
@@ -94,7 +92,6 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
-            Overlay::Analytics(o) => o.is_done,
         }
     }
 }
@@ -698,7 +695,7 @@ impl TranscriptOverlay {
     /// Replace committed transcript cells while keeping any cached in-progress output that is
     /// currently shown at the end of the overlay.
     ///
-    /// This is used when existing history is replaced or trimmed so the
+    /// This is used when existing history is trimmed (for example after rollback) so the
     /// transcript overlay immediately reflects the same committed cells as the main transcript.
     pub(crate) fn replace_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>) {
         let follow_bottom = self.view.is_scrolled_to_bottom();

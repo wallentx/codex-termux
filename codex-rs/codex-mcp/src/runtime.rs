@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -140,8 +139,7 @@ fn ensure_host_owned_apps_registration(
 
 struct CachedMcpBinding {
     catalog_revisions: HashMap<String, BindingCatalogRevision>,
-    // Reuse a frozen binding while a model step or caller still needs it.
-    binding: Weak<McpBinding>,
+    binding: Arc<McpBinding>,
 }
 
 struct McpReconnectGuard<'a> {
@@ -395,9 +393,8 @@ impl McpRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = cached.as_ref()
                 && &cached.catalog_revisions == catalog_revisions
-                && let Some(binding) = cached.binding.upgrade()
             {
-                return Some(binding);
+                return Some(Arc::clone(&cached.binding));
             }
         }
 
@@ -426,13 +423,12 @@ impl McpRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = cached.as_ref()
                 && cached.catalog_revisions == catalog_revisions
-                && let Some(binding) = cached.binding.upgrade()
             {
-                return Some(binding);
+                return Some(Arc::clone(&cached.binding));
             }
             *cached = Some(CachedMcpBinding {
                 catalog_revisions,
-                binding: Arc::downgrade(&binding),
+                binding: Arc::clone(&binding),
             });
         }
         Some(binding)
@@ -999,20 +995,13 @@ mod tests {
                 .contains("reached refreshed call preparation")
         );
         let repeated = McpRuntime::binding_from_published_runtime(
-            Arc::clone(&published),
+            published,
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
         )
         .await
         .expect("cached refreshed binding");
         assert!(Arc::ptr_eq(&refreshed, &repeated));
-        let released = Arc::downgrade(&refreshed);
-        drop(refreshed);
-        drop(repeated);
-        assert!(
-            released.upgrade().is_none(),
-            "the runtime cache must not pin an unused binding"
-        );
         Ok(())
     }
 

@@ -118,7 +118,7 @@ async fn test_step(
         Arc::clone(&connections),
         managed_client,
         Arc::clone(&config),
-        tool_catalog.read(Arc::new).await,
+        /*catalog_revision*/ 0,
         tool.clone(),
         McpServerMetadata {
             environment_id: format!("{label}-environment"),

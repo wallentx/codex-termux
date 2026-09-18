@@ -33,7 +33,7 @@ fn legacy_landlock_flag_is_included_when_requested() {
 }
 
 #[test]
-fn managed_context_takes_precedence_over_legacy_landlock() {
+fn proxy_flag_takes_precedence_over_legacy_landlock() {
     let command = vec!["/bin/true".to_string()];
     let command_cwd = Path::new("/tmp/link");
     let cwd = Path::new("/tmp");
@@ -45,9 +45,12 @@ fn managed_context_takes_precedence_over_legacy_landlock() {
         &permission_profile,
         cwd,
         /*use_legacy_landlock*/ true,
-        Some(&ManagedNetworkSandboxContext::default()),
+        /*allow_network_for_proxy*/ true,
     );
-    assert_eq!(args.contains(&"--managed-network".to_string()), true);
+    assert_eq!(
+        args.contains(&"--allow-network-for-proxy".to_string()),
+        true
+    );
     assert_eq!(args.contains(&"--use-legacy-landlock".to_string()), false);
 }
 
@@ -64,7 +67,7 @@ fn permission_profile_flag_is_included() {
         &permission_profile,
         cwd,
         /*use_legacy_landlock*/ true,
-        /*managed_network*/ None,
+        /*allow_network_for_proxy*/ false,
     );
 
     assert_eq!(

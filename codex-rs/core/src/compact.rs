@@ -13,6 +13,7 @@ use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::RequestEffortUsage;
 use crate::session::session::Session;
@@ -46,6 +47,7 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
@@ -86,7 +88,6 @@ pub(crate) struct CompactedHistoryMetadata {
     pub(crate) window_ids: AutoCompactWindowIds,
     pub(crate) compaction_response_id: Option<String>,
     pub(crate) compaction_model_hash: Option<String>,
-    pub(crate) reviewer_compaction_hash: Option<String>,
 }
 
 pub(crate) async fn build_compaction_initial_context(
@@ -148,7 +149,14 @@ pub(crate) async fn run_compact_task(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
 ) -> CodexResult<()> {
-    sess.emit_turn_started(&turn_context).await;
+    let start_event = EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: turn_context.sub_id.clone(),
+        trace_id: turn_context.trace_id.clone(),
+        started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
+        model_context_window: turn_context.model_context_window(),
+        collaboration_mode_kind: turn_context.mode(),
+    });
+    sess.send_event(&turn_context, start_event).await;
     run_compact_task_inner(
         sess.clone(),
         turn_context,
@@ -258,17 +266,17 @@ async fn run_compact_task_inner_impl(
     // request tracking)
     // survives retries within this compact turn.
     let responses_metadata = sess
-        .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
+        .responses_metadata(
+            turn_context.as_ref(),
+            CodexResponsesRequestKind::Compaction(compaction_metadata),
+        )
         .await;
 
     let compaction_response_id = loop {
         // Clone is required because of the loop
-        let mut turn_input = history
+        let turn_input = history
             .clone()
             .for_prompt(&turn_context.model_info().input_modalities);
-        sess.services
-            .executed_tool_calls
-            .strip_disabled_direct_metadata(&mut turn_input);
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
@@ -389,7 +397,6 @@ async fn run_compact_task_inner_impl(
             window_ids,
             compaction_response_id: Some(compaction_response_id),
             compaction_model_hash: turn_context.model_info().comp_hash.clone(),
-            reviewer_compaction_hash: None,
         },
     )
     .await;

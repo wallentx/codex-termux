@@ -1173,18 +1173,6 @@ impl FileSystemSandboxPolicy {
                     },
                     None => (context.cwd, pattern.as_str()),
                 };
-                let convention = if is_windows {
-                    PathConvention::Windows
-                } else {
-                    PathConvention::Posix
-                };
-                if LegacyAppPathString::from_string(pattern)
-                    .to_path_uri(convention)
-                    .is_err()
-                    && let Err(error) = root.validate_glob_directory(convention)
-                {
-                    return Some(Err(error.to_string()));
-                }
                 Some(
                     root
                         .join(pattern)
@@ -1200,27 +1188,73 @@ impl FileSystemSandboxPolicy {
     /// Replaces symbolic `:workspace_roots` entries with concrete entries for
     /// each workspace root.
     pub fn materialize_project_roots_with_workspace_roots(
-        self,
+        mut self,
         workspace_roots: &[AbsolutePathBuf],
     ) -> Self {
-        let roots = workspace_roots
-            .iter()
-            .map(PathUri::from_abs_path)
-            .collect::<Vec<_>>();
-        self.materialize_project_roots_with_path_uris(&roots)
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for entry in self.entries {
+            match entry.path {
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots { subpath },
+                } => {
+                    entries.extend(workspace_roots.iter().map(|root| FileSystemSandboxEntry {
+                        path: FileSystemPath::from(match subpath.as_ref() {
+                            Some(subpath) => {
+                                AbsolutePathBuf::resolve_path_against_base(subpath, root.as_path())
+                            }
+                            None => root.clone(),
+                        }),
+                        access: entry.access,
+                        missing_path_behavior: entry.missing_path_behavior,
+                    }));
+                }
+                FileSystemPath::GlobPattern { pattern } => {
+                    if let Some(subpath) = parse_project_roots_glob_pattern(&pattern) {
+                        entries.extend(workspace_roots.iter().map(|root| FileSystemSandboxEntry {
+                            path: FileSystemPath::GlobPattern {
+                                pattern: resolve_project_roots_glob_pattern(subpath, root),
+                            },
+                            access: entry.access,
+                            missing_path_behavior: entry.missing_path_behavior,
+                        }));
+                    } else {
+                        entries.push(FileSystemSandboxEntry {
+                            path: FileSystemPath::GlobPattern { pattern },
+                            access: entry.access,
+                            missing_path_behavior: entry.missing_path_behavior,
+                        });
+                    }
+                }
+                FileSystemPath::Path { path } => {
+                    entries.push(FileSystemSandboxEntry {
+                        path: path.into(),
+                        access: entry.access,
+                        missing_path_behavior: entry.missing_path_behavior,
+                    });
+                }
+                FileSystemPath::Special { value } => {
+                    entries.push(FileSystemSandboxEntry {
+                        path: FileSystemPath::Special { value },
+                        access: entry.access,
+                        missing_path_behavior: entry.missing_path_behavior,
+                    });
+                }
+            }
+        }
+        self.entries = entries;
+        self
     }
 
     /// Materializes workspace-root entries without projecting executor paths onto the host.
-    /// Legacy home-relative workspace denials clear all grants when their target is unknown.
-    pub fn materialize_project_roots_with_path_uris(self, workspace_roots: &[PathUri]) -> Self {
-        self.try_materialize_project_roots_with_path_uris(workspace_roots)
-            .unwrap_or_else(|| Self::restricted(Vec::new()))
-    }
+    pub fn materialize_project_roots_with_path_uris(mut self, workspace_roots: &[PathUri]) -> Self {
+        if let Ok(native_workspace_roots) = workspace_roots
+            .iter()
+            .map(PathUri::to_abs_path)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            return self.materialize_project_roots_with_workspace_roots(&native_workspace_roots);
+        }
 
-    fn try_materialize_project_roots_with_path_uris(
-        mut self,
-        workspace_roots: &[PathUri],
-    ) -> Option<Self> {
         let mut entries = Vec::with_capacity(self.entries.len());
         for entry in self.entries {
             let (subpath, is_glob) = match &entry.path {
@@ -1240,34 +1274,11 @@ impl FileSystemSandboxPolicy {
                     continue;
                 }
             };
-            if entry.access == FileSystemAccessMode::Deny
-                && subpath.is_some_and(|subpath| {
-                    workspace_roots.iter().any(|root| {
-                        root.infer_path_convention().is_some_and(|convention| {
-                            convention.home_relative_suffix(subpath).is_some()
-                        })
-                    })
-                })
-            {
-                // Older policies could expand these rules outside the workspace.
-                // Without a home fact, denying only the workspace would weaken them.
-                return None;
-            }
             entries.extend(workspace_roots.iter().filter_map(|root| {
-                let path = if is_glob
-                    && root
-                        .infer_path_convention()
-                        .is_none_or(|convention| root.validate_glob_directory(convention).is_err())
-                {
-                    // An infallible materializer cannot return an unsafe glob.
-                    // Use the existing deny-root fallback for unresolvable rules.
-                    None
-                } else {
-                    subpath.map_or_else(
-                        || Some(root.clone()),
-                        |subpath| resolve_scoped_workspace_path(root, subpath),
-                    )
-                };
+                let path = subpath.map_or_else(
+                    || Some(root.clone()),
+                    |subpath| resolve_scoped_workspace_path(root, subpath),
+                );
                 let (path, access) = match path {
                     Some(path) if is_glob => (
                         FileSystemPath::GlobPattern {
@@ -1290,20 +1301,24 @@ impl FileSystemSandboxPolicy {
             }));
         }
         self.entries = entries;
-        Some(self)
+        self
     }
 
     /// Preserves symbolic `:workspace_roots` entries while also adding concrete
     /// entries for each provided workspace root.
     pub fn with_materialized_project_roots_for_workspace_roots(
-        self,
+        mut self,
         workspace_roots: &[AbsolutePathBuf],
     ) -> Self {
-        let roots = workspace_roots
-            .iter()
-            .map(PathUri::from_abs_path)
-            .collect::<Vec<_>>();
-        self.with_materialized_project_roots_for_path_uris(&roots)
+        let materialized = self
+            .clone()
+            .materialize_project_roots_with_workspace_roots(workspace_roots);
+        for entry in materialized.entries {
+            if !self.entries.contains(&entry) {
+                self.entries.push(entry);
+            }
+        }
+        self
     }
 
     pub fn with_additional_readable_roots(
@@ -1922,6 +1937,18 @@ fn resolve_entry_path(
         } => cwd.map(absolute_root_path_for_cwd),
         _ => resolve_file_system_path(path, cwd),
     }
+}
+
+fn parse_project_roots_glob_pattern(pattern: &str) -> Option<&Path> {
+    pattern
+        .strip_prefix(PROJECT_ROOTS_GLOB_PATTERN_PREFIX)
+        .map(Path::new)
+}
+
+fn resolve_project_roots_glob_pattern(subpath: &Path, root: &AbsolutePathBuf) -> String {
+    AbsolutePathBuf::resolve_path_against_base(subpath, root.as_path())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn resolve_candidate_path(path: &Path, cwd: &Path) -> Option<AbsolutePathBuf> {

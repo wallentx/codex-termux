@@ -32,11 +32,7 @@ pub(crate) fn pid_backend(paths: BackendPaths) -> PidBackend {
 }
 
 pub(crate) fn pid_update_loop_backend(paths: BackendPaths) -> PidBackend {
-    PidBackend::new_update_loop(
-        paths.codex_bin,
-        paths.update_pid_file,
-        /*restore_release*/ None,
-    )
+    PidBackend::new_update_loop(paths.codex_bin, paths.update_pid_file)
 }
 
 pub(crate) async fn append_stderr_log_tail_context(pid_file: &Path, context: &mut String) {

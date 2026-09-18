@@ -40,7 +40,6 @@ use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
-use codex_protocol::models::ImageReference;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
@@ -1079,9 +1078,7 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputImage {
-                    image: ImageReference::Inline {
-                        image_url: legacy_image_url.to_string(),
-                    },
+                    image_url: legacy_image_url.to_string(),
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 }],
                 phase: None,
@@ -1221,9 +1218,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                 namespace: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image: ImageReference::Inline {
-                            image_url: image_url.to_string(),
-                        },
+                        image_url: image_url.to_string(),
                         detail: Some(ImageDetail::Original),
                     },
                 ]),
@@ -1252,9 +1247,7 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image: ImageReference::Inline {
-                            image_url: image_url.to_string(),
-                        },
+                        image_url: image_url.to_string(),
                         detail: Some(ImageDetail::Original),
                     },
                 ]),
@@ -1579,7 +1572,6 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
             .enabled(Feature::ConcurrentReasoningSummaries),
         /*attestation_provider*/ None,
         config.http_client_factory(),
-        config.workspace_routing_context(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();
@@ -1849,11 +1841,11 @@ async fn includes_user_instructions_message_in_request() {
         .with_pre_build_hook(|home| {
             std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
         });
-    let test = builder
+    let codex = builder
         .build(&server)
         .await
-        .expect("create new conversation");
-    let codex = test.codex.clone();
+        .expect("create new conversation")
+        .codex;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2886,11 +2878,11 @@ async fn includes_developer_instructions_message_in_request() {
         .with_config(|config| {
             config.developer_instructions = Some("be useful".to_string());
         });
-    let test = builder
+    let codex = builder
         .build(&server)
         .await
-        .expect("create new conversation");
-    let codex = test.codex.clone();
+        .expect("create new conversation")
+        .codex;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -3071,7 +3063,6 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
-        config.workspace_routing_context(),
     );
     let responses_metadata = test_turn_responses_metadata(&client, thread_id);
     let mut client_session = client.new_session();

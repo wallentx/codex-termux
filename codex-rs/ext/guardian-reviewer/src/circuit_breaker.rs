@@ -4,10 +4,10 @@ const MAX_CONSECUTIVE_CYBER_GUARDIAN_DENIALS_PER_TURN: u32 = 1;
 const MAX_CONSECUTIVE_GUARDIAN_DENIALS_PER_TURN: u32 = 3;
 const MAX_RECENT_CYBER_AUTO_REVIEW_DENIALS_PER_TURN: u32 = 1;
 const MAX_RECENT_AUTO_REVIEW_DENIALS_PER_TURN: u32 = 10;
-pub(crate) const AUTO_REVIEW_DENIAL_WINDOW_SIZE: usize = 50;
+pub const AUTO_REVIEW_DENIAL_WINDOW_SIZE: usize = 50;
 
 #[derive(Debug, Default)]
-pub(crate) struct GuardianRejectionCircuitBreaker {
+pub struct GuardianRejectionCircuitBreaker {
     turns: std::collections::HashMap<String, GuardianRejectionCircuitBreakerTurn>,
 }
 
@@ -19,7 +19,7 @@ struct GuardianRejectionCircuitBreakerTurn {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GuardianRejectionCircuitBreakerPolicy {
+pub enum GuardianRejectionCircuitBreakerPolicy {
     Standard,
     CyberModel,
 }
@@ -37,7 +37,7 @@ impl From<&codex_protocol::openai_models::ModelInfo> for GuardianRejectionCircui
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GuardianRejectionCircuitBreakerAction {
+pub enum GuardianRejectionCircuitBreakerAction {
     Continue,
     InterruptTurn {
         consecutive_denials: u32,
@@ -46,11 +46,11 @@ pub(crate) enum GuardianRejectionCircuitBreakerAction {
 }
 
 impl GuardianRejectionCircuitBreaker {
-    pub(crate) fn clear_turn(&mut self, turn_id: &str) {
+    pub fn clear_turn(&mut self, turn_id: &str) {
         self.turns.remove(turn_id);
     }
 
-    pub(crate) fn record_denial(
+    pub fn record_denial(
         &mut self,
         turn_id: &str,
         policy: GuardianRejectionCircuitBreakerPolicy,
@@ -83,7 +83,7 @@ impl GuardianRejectionCircuitBreaker {
         }
     }
 
-    pub(crate) fn record_non_denial(&mut self, turn_id: &str) {
+    pub fn record_non_denial(&mut self, turn_id: &str) {
         let turn = self.turns.entry(turn_id.to_string()).or_default();
         turn.consecutive_denials = 0;
         Self::record_recent_review(turn, /*denied*/ false);

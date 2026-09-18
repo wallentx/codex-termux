@@ -32,7 +32,6 @@ use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
-use core_test_support::context_snapshot::SnapshotEntry;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
@@ -751,14 +750,22 @@ async fn any_new_input_interrupts_sleep() {
 
 fn assert_two_responses_input_snapshot(snapshot_name: &str, requests: &[Vec<u8>]) {
     assert_eq!(requests.len(), 2);
-    let options = ContextSnapshotOptions::default().rewrite_known_segments();
+    let options = ContextSnapshotOptions::default().strip_capability_instructions();
     let first: Value = from_slice(&requests[0]).expect("parse first request");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
-    let snapshot = context_snapshot::format_context_snapshot(
-        "/responses POST bodies with pending input",
+    let first_items = first["input"]
+        .as_array()
+        .expect("first request input")
+        .clone();
+    let second_items = second["input"]
+        .as_array()
+        .expect("second request input")
+        .clone();
+    let snapshot = context_snapshot::format_labeled_items_snapshot(
+        "/responses POST bodies (input only, redacted like other suite snapshots)",
         &[
-            SnapshotEntry::body(&first).labeled("First request"),
-            SnapshotEntry::body(&second).labeled("Second request"),
+            ("First request", first_items.as_slice()),
+            ("Second request", second_items.as_slice()),
         ],
         &options,
     );

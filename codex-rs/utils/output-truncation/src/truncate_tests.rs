@@ -7,7 +7,6 @@ use crate::truncate_function_output_items_with_policy;
 use crate::truncate_text;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::ImageReference;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -115,9 +114,7 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
         FunctionCallOutputContentItem::InputText { text: t1.clone() },
         FunctionCallOutputContentItem::InputText { text: t2.clone() },
         FunctionCallOutputContentItem::InputImage {
-            image: ImageReference::Inline {
-                image_url: "img:mid".to_string(),
-            },
+            image_url: "img:mid".to_string(),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         },
         FunctionCallOutputContentItem::InputText { text: t3 },
@@ -145,9 +142,7 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
     assert_eq!(
         output[2],
         FunctionCallOutputContentItem::InputImage {
-            image: ImageReference::Inline {
-                image_url: "img:mid".to_string()
-            },
+            image_url: "img:mid".to_string(),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }
     );
@@ -188,15 +183,7 @@ fn truncate_function_output_items_with_policy_discards_empty_text() {
             text: "caption".to_string(),
         },
         FunctionCallOutputContentItem::InputImage {
-            image: ImageReference::Inline {
-                image_url: "img:one".to_string(),
-            },
-            detail: Some(DEFAULT_IMAGE_DETAIL),
-        },
-        FunctionCallOutputContentItem::InputImage {
-            image: ImageReference::File {
-                file_id: "file_123".to_string(),
-            },
+            image_url: "img:one".to_string(),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         },
         FunctionCallOutputContentItem::InputAudio {
@@ -266,9 +253,7 @@ fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_med
             text: "abcd".to_string(),
         },
         FunctionCallOutputContentItem::InputImage {
-            image: ImageReference::Inline {
-                image_url: "img:one".to_string(),
-            },
+            image_url: "img:one".to_string(),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         },
         FunctionCallOutputContentItem::InputText {
@@ -277,19 +262,11 @@ fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_med
         FunctionCallOutputContentItem::InputAudio {
             audio_url: "audio:one".to_string(),
         },
-        FunctionCallOutputContentItem::InputImage {
-            image: ImageReference::File {
-                file_id: "file_123".to_string(),
-            },
-            detail: Some(DEFAULT_IMAGE_DETAIL),
-        },
         FunctionCallOutputContentItem::InputText {
             text: "ijkl".to_string(),
         },
         FunctionCallOutputContentItem::InputImage {
-            image: ImageReference::Inline {
-                image_url: "img:two".to_string(),
-            },
+            image_url: "img:two".to_string(),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         },
     ];
@@ -304,20 +281,14 @@ fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_med
                 text: "Warning: truncated output (original token count: 4)\nTotal output lines: 3\n\nabcd…6 chars truncated…ijkl".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image: ImageReference::Inline { image_url: "img:one".to_string() },
+                image_url: "img:one".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             FunctionCallOutputContentItem::InputAudio {
                 audio_url: "audio:one".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image: ImageReference::File {
-                    file_id: "file_123".to_string(),
-                },
-                detail: Some(DEFAULT_IMAGE_DETAIL),
-            },
-            FunctionCallOutputContentItem::InputImage {
-                image: ImageReference::Inline { image_url: "img:two".to_string() },
+                image_url: "img:two".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]

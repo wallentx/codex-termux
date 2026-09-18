@@ -88,7 +88,7 @@ impl ToolOrchestrator {
             manager: attempt.manager,
             sandbox_cwd: attempt.sandbox_cwd,
             workspace_roots: attempt.workspace_roots,
-            sandbox_exe: attempt.sandbox_exe,
+            codex_linux_sandbox_exe: attempt.codex_linux_sandbox_exe,
             use_legacy_landlock: attempt.use_legacy_landlock,
             windows_sandbox_level: attempt.windows_sandbox_level,
             windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
@@ -290,11 +290,6 @@ impl ToolOrchestrator {
             .sandbox_cwd(req)
             .cloned()
             .unwrap_or_else(|| environment.cwd().clone());
-        let codex_sandbox_exe = if cfg!(windows) {
-            turn_ctx.config.codex_self_exe.as_ref()
-        } else {
-            turn_ctx.config.codex_linux_sandbox_exe.as_ref()
-        };
         let initial_attempt = SandboxAttempt {
             sandbox: initial_sandbox,
             sandbox_requested,
@@ -304,7 +299,7 @@ impl ToolOrchestrator {
             manager: &sandbox_manager,
             sandbox_cwd: &sandbox_policy_cwd,
             workspace_roots,
-            sandbox_exe: codex_sandbox_exe,
+            codex_linux_sandbox_exe: turn_ctx.config.codex_linux_sandbox_exe.as_ref(),
             use_legacy_landlock: sandbox_config.use_legacy_landlock,
             windows_sandbox_level: sandbox_config.windows_sandbox_level,
             windows_sandbox_private_desktop: sandbox_config.windows_sandbox_private_desktop,
@@ -464,10 +459,10 @@ impl ToolOrchestrator {
                 } else {
                     SandboxType::None
                 };
-                let retry_sandbox_exe = if unsandboxed_allowed {
+                let retry_codex_linux_sandbox_exe = if unsandboxed_allowed {
                     None
                 } else {
-                    codex_sandbox_exe
+                    turn_ctx.config.codex_linux_sandbox_exe.as_ref()
                 };
                 let retry_attempt = SandboxAttempt {
                     sandbox: retry_sandbox,
@@ -478,7 +473,7 @@ impl ToolOrchestrator {
                     manager: &sandbox_manager,
                     sandbox_cwd: &sandbox_policy_cwd,
                     workspace_roots,
-                    sandbox_exe: retry_sandbox_exe,
+                    codex_linux_sandbox_exe: retry_codex_linux_sandbox_exe,
                     use_legacy_landlock: sandbox_config.use_legacy_landlock,
                     windows_sandbox_level: sandbox_config.windows_sandbox_level,
                     windows_sandbox_private_desktop: sandbox_config.windows_sandbox_private_desktop,

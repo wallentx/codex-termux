@@ -1,15 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
-    "CyberAccessProgram": {
-      "description": "Requested cyber treatment for a ChatGPT-authenticated Codex turn. Authorization and model-tier restrictions remain server-owned.",
-      "enum": [
-        "standard",
-        "daybreakBlue",
-        "daybreakRed"
-      ],
-      "type": "string"
-    },
     "InputModality": {
       "description": "Canonical user-input modality tags advertised by a model.",
       "oneOf": [
@@ -55,18 +46,6 @@
               "type": "null"
             }
           ]
-        },
-        "availableAccessPrograms": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ModelAccessPrograms"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Null when the catalog does not provide access-program metadata."
         },
         "defaultReasoningEffort": {
           "$ref": "#/definitions/ReasoningEffort"
@@ -140,7 +119,6 @@
         },
         "supportsPersonality": {
           "default": false,
-          "description": "@deprecated Always false; models no longer support personality selection.",
           "type": "boolean"
         },
         "upgrade": {
@@ -169,22 +147,6 @@
         "isDefault",
         "model",
         "supportedReasoningEfforts"
-      ],
-      "type": "object"
-    },
-    "ModelAccessPrograms": {
-      "description": "Caller-specific explicit access programs advertised by model discovery.",
-      "properties": {
-        "cyber": {
-          "description": "Accepted explicit selections.",
-          "items": {
-            "$ref": "#/definitions/CyberAccessProgram"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "cyber"
       ],
       "type": "object"
     },

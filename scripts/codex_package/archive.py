@@ -59,8 +59,7 @@ def archive_format_for_path(path: Path) -> str:
 
 
 def write_tar_archive(package_dir: Path, archive_path: Path, *, mode: str) -> None:
-    options = {"compresslevel": 6} if mode == "w:gz" else {}
-    with tarfile.open(archive_path, mode, **options) as archive:
+    with tarfile.open(archive_path, mode) as archive:
         for path in package_entries(package_dir):
             archive.add(
                 path,

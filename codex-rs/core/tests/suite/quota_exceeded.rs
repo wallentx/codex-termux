@@ -1,6 +1,5 @@
 use anyhow::Result;
 use codex_core::TurnInputRequest;
-use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_response_created;
@@ -13,12 +12,8 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-#[test_case::test_case("insufficient_quota"; "quota")]
-#[test_case::test_case("credit_balance_exhausted"; "credit_balance")]
-#[test_case::test_case("organization_spend_limit_exceeded"; "organization_spend_limit")]
-#[test_case::test_case("project_spend_limit_exceeded"; "project_spend_limit")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn quota_exceeded_emits_single_error_event(code: &str) -> Result<()> {
+async fn quota_exceeded_emits_single_error_event() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -33,7 +28,7 @@ async fn quota_exceeded_emits_single_error_event(code: &str) -> Result<()> {
                 "response": {
                     "id": "resp-1",
                     "error": {
-                        "code": code,
+                        "code": "insufficient_quota",
                         "message": "You exceeded your current quota, please check your plan and billing details."
                     }
                 }
@@ -42,14 +37,15 @@ async fn quota_exceeded_emits_single_error_event(code: &str) -> Result<()> {
     )
     .await;
 
-    let test = builder.build_with_auto_env(&server).await?;
+    let test = builder.build(&server).await?;
 
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: "quota?".into(),
             text_elements: Vec::new(),
         }]))
-        .await?;
+        .await
+        .unwrap();
 
     let mut error_events = 0;
 
@@ -63,10 +59,6 @@ async fn quota_exceeded_emits_single_error_event(code: &str) -> Result<()> {
                     err.message,
                     "Quota exceeded. Check your plan and billing details."
                 );
-                assert_eq!(
-                    err.codex_error_info,
-                    Some(CodexErrorInfo::UsageLimitExceeded)
-                );
             }
             EventMsg::TurnComplete(_) => break,
             _ => {}
@@ -74,14 +66,6 @@ async fn quota_exceeded_emits_single_error_event(code: &str) -> Result<()> {
     }
 
     assert_eq!(error_events, 1, "expected exactly one Codex:Error event");
-    let requests = server.received_requests().await.expect("recorded requests");
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.url.path().ends_with("/responses"))
-            .count(),
-        1
-    );
 
     Ok(())
 }

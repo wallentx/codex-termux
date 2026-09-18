@@ -126,9 +126,9 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
                     text_elements: Vec::new(),
                 });
             }
-            ContentItem::InputImage { image, detail } => {
+            ContentItem::InputImage { image_url, detail } => {
                 content.push(UserInput::Image {
-                    image: image.clone(),
+                    image_url: image_url.clone(),
                     detail: *detail,
                 });
             }

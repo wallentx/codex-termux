@@ -16,7 +16,6 @@ use futures::future::Abortable;
 use tokio::sync::mpsc;
 
 use crate::AudioControls;
-use crate::ConnectionError;
 use crate::SessionDescription;
 use crate::VoiceHost;
 
@@ -134,38 +133,28 @@ impl RealtimeWebrtcSession {
             .name("voice-session".into())
             .spawn(move || {
                 let task = async {
-                    let host = report_failure(
-                        ConnectionError::HelperStartup,
-                        VoiceHost::connect(&package, &build_commit).await,
-                    )?;
-                    let host = report_failure(
-                        ConnectionError::RuntimeInitialization,
-                        host.initialize_runtime().await,
-                    )?;
-                    let (host, sdp) =
-                        report_failure(ConnectionError::Transport, host.start_transport().await)?;
+                    let host = VoiceHost::connect(&package, &build_commit)
+                        .await?
+                        .initialize_runtime()
+                        .await?;
+                    let (host, sdp) = host.start_transport().await?;
                     offer
-                        .send(Ok(sdp.into_sdp()))
+                        .send(sdp.into_sdp())
                         .map_err(|_| anyhow::anyhow!("voice startup cancelled"))?;
                     run(host, receiver, &state, &controls).await
                 };
                 let result = runtime.block_on(Abortable::new(Abortable::new(task, abort), stopped));
-                if let Ok(Ok(Err(error))) = result {
-                    let failure = error
-                        .downcast_ref::<ConnectionError>()
-                        .copied()
-                        .unwrap_or(ConnectionError::Failed);
-                    let _ = offer.try_send(Err(failure));
+                if !matches!(result, Err(_) | Ok(Err(_)) | Ok(Ok(Ok(())))) {
                     *state
                         .error
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(failure.to_string());
+                        Some("Voice helper stopped unexpectedly.".into());
                 }
             })?;
         let offer_sdp = result
             .recv_timeout(STARTUP_WAIT)
-            .map_err(|_| anyhow::anyhow!("voice startup failed"))??;
+            .map_err(|_| anyhow::anyhow!("voice startup failed"))?;
         Ok(StartedRealtimeWebrtcSession { offer_sdp, handle })
     }
 }
@@ -275,70 +264,39 @@ async fn run(
             biased;
             command = commands.recv() => match command {
                 Some(Command::Answer(sdp, complete)) if !connected => {
-                    let startup = async {
-                        let mut host = report_failure(ConnectionError::Transport, host.apply_answer(sdp).await)?;
-                        host = report_failure(ConnectionError::AudioDevices, host.open_devices().await)?;
-                        let applied = startup_controls(&mut commands, controls, |initial| {
-                            host.begin_audio_controls(initial)
-                        });
-                        let applied = report_failure(ConnectionError::AudioControls, applied)?;
-                        report_failure(ConnectionError::AudioControls, applied.await)?;
-                        Ok::<_, anyhow::Error>(host)
-                    }.await;
-                    host = match startup {
+                    host = match host.apply_answer(sdp).await {
                         Ok(host) => host,
                         Err(error) => {
-                            let failure = error.downcast_ref::<ConnectionError>()
-                                .copied().unwrap_or(ConnectionError::Failed);
+                            let failure = error.downcast_ref::<crate::ConnectionError>()
+                                .copied().unwrap_or(crate::ConnectionError::Failed);
                             let _ = complete.send(Err(failure));
                             // This failure is delivered by the startup completion only.
                             return Ok(());
                         }
                     };
+                    host = host.open_devices().await?;
+                    let applied = startup_controls(&mut commands, controls, |initial| {
+                        host.begin_audio_controls(initial)
+                    })?;
+                    applied.await?;
                     connected = true;
                     let _ = complete.send(Ok(()));
                 }
                 Some(Command::Controls(next)) => {
                     if connected {
-                        report_failure(ConnectionError::AudioControls, host.set_audio_controls(next).await)?;
+                        host.set_audio_controls(next).await?;
                     }
                 }
                 Some(Command::Answer(..)) => anyhow::bail!("voice answer already applied"),
-                None => return report_failure(ConnectionError::Shutdown, host.close().await),
+                None => return host.close().await,
             },
             _ = poll.tick() => {
-                let audio = report_failure(ConnectionError::AudioSession, host.inspect_audio().await)?;
+                let audio = host.inspect_audio().await?;
                 state.microphone.fetch_max(audio.microphone_peak, Ordering::Release);
                 state.speaker.fetch_max(audio.speaker_peak, Ordering::Release);
             }
         }
     }
-}
-
-// Keep diagnostics bounded and independent of untyped native, SDP, or device error text.
-fn report_failure<T>(stage: ConnectionError, result: Result<T>) -> Result<T> {
-    result.map_err(|error| {
-        let kind = if error.is::<tokio::time::error::Elapsed>() {
-            "timeout"
-        } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
-            match error.kind() {
-                std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset => "closed",
-                std::io::ErrorKind::InvalidData => "protocol",
-                _ => "io",
-            }
-        } else {
-            "other"
-        };
-        tracing::warn!(?stage, kind, "voice session operation failed");
-        let failure = error
-            .downcast_ref::<ConnectionError>()
-            .copied()
-            .unwrap_or(stage);
-        // Replace the original error instead of retaining a potentially sensitive source chain.
-        anyhow::Error::new(failure)
-    })
 }
 
 // Devices are still disabled. The snapshot and request enqueue share the setters' lock;

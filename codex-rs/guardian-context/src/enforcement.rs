@@ -7,7 +7,6 @@ use std::collections::HashSet;
 
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ImageDetail;
-use codex_protocol::models::ImageReference;
 use codex_protocol::protocol::TruncationPolicy;
 
 use crate::ComposedContext;
@@ -91,14 +90,7 @@ impl ComposedContext {
     pub fn retain_images(&mut self, mut admit: impl FnMut(&str, &mut Option<ImageDetail>) -> bool) {
         for section in &mut self.sections {
             retain_content(section, &mut self.truncations, |_, item| match item {
-                ContentItem::InputImage {
-                    image: ImageReference::Inline { image_url },
-                    detail,
-                } => admit(image_url, detail),
-                ContentItem::InputImage {
-                    image: ImageReference::File { .. },
-                    ..
-                } => false,
+                ContentItem::InputImage { image_url, detail } => admit(image_url, detail),
                 _ => true,
             });
         }
@@ -281,14 +273,7 @@ fn retain_content(
         if !keep {
             let original_bytes = match &item.content {
                 ContentItem::InputText { text } | ContentItem::OutputText { text } => text.len(),
-                ContentItem::InputImage {
-                    image: ImageReference::Inline { image_url },
-                    ..
-                } => image_url.len(),
-                ContentItem::InputImage {
-                    image: ImageReference::File { .. },
-                    ..
-                } => 0,
+                ContentItem::InputImage { image_url, .. } => image_url.len(),
                 ContentItem::InputAudio { audio_url } => audio_url.len(),
             };
             truncations.push(TruncationObservation {

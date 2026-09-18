@@ -76,15 +76,10 @@ fn confirmation_requires_an_accept_key() {
     for key in [
         KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
     ] {
         assert_eq!(screen.handle_key(key), Some(UnarchiveChoice::Cancel));
-    }
-    for key in ['c', 'd'] {
-        assert_eq!(
-            screen.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL)),
-            Some(UnarchiveChoice::Quit),
-        );
     }
     assert_eq!(
         screen.handle_key(KeyEvent::new_with_kind(

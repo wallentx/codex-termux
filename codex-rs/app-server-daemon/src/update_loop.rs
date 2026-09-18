@@ -32,33 +32,13 @@ use crate::RestartMode;
 use crate::managed_install::ExecutableIdentity;
 use crate::managed_install::executable_identity;
 use crate::managed_install::resolved_managed_codex_bin;
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(windows)]
 use crate::settings::DaemonSettings;
 use crate::settings::UpdaterSettings;
 
 #[path = "manual_update.rs"]
 mod manual_update;
-#[path = "migration.rs"]
-mod migration;
-
-pub(crate) async fn request_manual_update(
-    daemon: &Daemon,
-    http_client_factory: HttpClientFactory,
-) -> Result<crate::UpdateOutput> {
-    if daemon
-        .pid_file
-        .file_name()
-        .is_some_and(|name| name == crate::LEGACY_PID_FILE_NAME)
-        && manual_update::supported(daemon)?
-    {
-        let http = RouteAwareClientPool::new_without_request_logging(
-            http_client_factory,
-            ClientRouteClass::Other,
-        );
-        return migration::run(&http, daemon).await;
-    }
-    manual_update::request(daemon).await
-}
+pub(crate) use manual_update::request as request_manual_update;
 
 const INITIAL_UPDATE_DELAY: Duration = Duration::from_secs(5 * 60);
 const RESTART_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -67,10 +47,7 @@ const INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
 #[cfg(windows)]
 const INSTALL_URL: &str = "https://chatgpt.com/codex/install.ps1";
 
-pub(crate) async fn run(
-    http_client_factory: HttpClientFactory,
-    restore_release: Option<String>,
-) -> Result<()> {
+pub(crate) async fn run(http_client_factory: HttpClientFactory) -> Result<()> {
     let http = RouteAwareClientPool::new_without_request_logging(
         http_client_factory,
         ClientRouteClass::Other,
@@ -79,7 +56,6 @@ pub(crate) async fn run(
         &http,
         &Daemon::from_environment()?,
         &current_updater_identity().await?,
-        restore_release,
     )
     .await
 }
@@ -88,22 +64,10 @@ async fn run_with_http(
     http: &impl InstallerHttp,
     daemon: &Daemon,
     running_updater_identity: &ExecutableIdentity,
-    mut restore_release: Option<String>,
 ) -> Result<()> {
     #[cfg(unix)]
     let mut terminate =
         signal(SignalKind::terminate()).context("failed to install updater shutdown handler")?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let paths = daemon.backend_paths(&DaemonSettings::default());
-        for backend in [
-            crate::backend::pid_backend(paths.clone()),
-            crate::backend::pid_update_loop_backend(paths),
-        ] {
-            // Inspection failures must preserve legacy records without blocking updates.
-            let _ = backend.promote_legacy_identity().await;
-        }
-    }
     #[cfg(windows)]
     let updater = {
         // Updater ownership needs only paths, not settings that may be mid-edit.
@@ -141,7 +105,7 @@ async fn run_with_http(
         .map(|settings| settings.auto_update_enabled)
         .unwrap_or(true);
     let mut next_check = Instant::now()
-        + if restore_release.is_some() || needs_managed_handoff || !auto_update_enabled {
+        + if needs_managed_handoff || !auto_update_enabled {
             Duration::from_secs(15)
         } else {
             INITIAL_UPDATE_DELAY
@@ -153,11 +117,7 @@ async fn run_with_http(
             _ = terminate.recv() => return Ok(()),
             connection = listener.as_mut().context("updater listener closed")?.accept() => {
                 let connection = connection.context("failed to accept updater request")?;
-                // Only a manual CLI launch under the operation lock supplies this
-                // single-use authority. Ordinary socket requests cannot undo a pin.
-                let restoration = restore_release.take();
-                let trigger = restoration.as_deref().map_or(UpdateTrigger::Manual, UpdateTrigger::RestoreProduction);
-                let disposition = match manual_update::handle_request(connection, http, daemon, running_updater_identity, &mut terminate, trigger).await {
+                let disposition = match manual_update::handle_request(connection, http, daemon, running_updater_identity, &mut terminate).await {
                     Ok(manual_update::RequestDisposition::Stop) => return Ok(()),
                     Ok(disposition) => disposition,
                     Err(_) => manual_update::RequestDisposition::Continue,
@@ -177,10 +137,6 @@ async fn run_with_http(
                 next_check = Instant::now();
             }
             _ = sleep_until(next_check) => {
-                // The authorizing CLI may have exited before sending its request.
-                if restore_release.is_some() {
-                    return Ok(());
-                }
                 match UpdaterSettings::load(&daemon.settings_file).await {
                     Ok(settings) if !settings.auto_update_enabled => return Ok(()),
                     Err(_) => {
@@ -297,10 +253,9 @@ enum UpdateLoopControl {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum UpdateTrigger<'a> {
+enum UpdateTrigger {
     Scheduled,
     Manual,
-    RestoreProduction(&'a str),
 }
 
 async fn update_once(
@@ -308,7 +263,7 @@ async fn update_once(
     daemon: &Daemon,
     running_updater_identity: &ExecutableIdentity,
     terminate: &mut Signal,
-    trigger: UpdateTrigger<'_>,
+    trigger: UpdateTrigger,
 ) -> Result<(UpdateLoopControl, Option<RestartIfRunningOutcome>)> {
     if trigger == UpdateTrigger::Scheduled
         && !UpdaterSettings::load(&daemon.settings_file)
@@ -322,45 +277,17 @@ async fn update_once(
         // latest-channel marker. Retry after the interval instead of exiting.
         return Ok((UpdateLoopControl::Continue, None));
     }
-    let (package_root, previous_selection, previous_release) = selected_release(daemon)?;
-    let codex_home = package_root
-        .parent()
-        .and_then(Path::parent)
-        .context("daemon package root has no Codex home")?;
-    let (installer_mode, installer_guard) =
-        if let UpdateTrigger::RestoreProduction(expected) = trigger {
-            anyhow::ensure!(
-                previous_release == expected,
-                "daemon selection changed; retry the update"
-            );
-            (
-                InstallerMode::RestoreProduction(&previous_release),
-                "CODEX_INSTALL_IF_CURRENT",
-            )
-        } else {
-            (
-                InstallerMode::Update(&previous_release),
-                "CODEX_INSTALL_IF_LATEST",
-            )
-        };
+    let (_codex_home, _, previous_release) = selected_release(daemon)?;
     let script = tokio::select! {
         result = fetch_installer_script(http) => result?,
         _ = terminate.recv() => return Ok((UpdateLoopControl::Stop, None)),
     };
     anyhow::ensure!(
         script
-            .windows(installer_guard.len())
-            .any(|window| window == installer_guard.as_bytes()),
-        "standalone installer does not support {installer_guard} guarded updates"
+            .windows(b"CODEX_INSTALL_IF_LATEST".len())
+            .any(|window| window == b"CODEX_INSTALL_IF_LATEST"),
+        "standalone installer does not support guarded updates"
     );
-    if package_root.ends_with("app-server-daemon") {
-        anyhow::ensure!(
-            script
-                .windows(b"CODEX_INSTALL_DAEMON_ONLY".len())
-                .any(|window| window == b"CODEX_INSTALL_DAEMON_ONLY"),
-            "installer does not support daemon-owned packages"
-        );
-    }
     if trigger == UpdateTrigger::Scheduled
         && !UpdaterSettings::load(&daemon.settings_file)
             .await?
@@ -371,26 +298,18 @@ async fn update_once(
     if release_selection_unstable(daemon, trigger)? {
         return Ok((UpdateLoopControl::Continue, None));
     }
-    anyhow::ensure!(
-        crate::managed_install::package_root(codex_home) == package_root,
-        "daemon package root changed during the update; retry the command"
-    );
     #[cfg(unix)]
     if matches!(
-        run_installer_script(&script, installer_mode, &package_root, terminate.recv()).await?,
+        run_installer_script(&script, &previous_release, _codex_home, terminate.recv()).await?,
         UpdateLoopControl::Stop
     ) {
         return Ok((UpdateLoopControl::Stop, None));
     }
     #[cfg(windows)]
     tokio::select! {
-        result = run_installer_script(&script, installer_mode, &package_root) => { result?; },
+        result = run_installer_script(&script, &previous_release) => { result?; },
         _ = terminate.recv() => return Ok((UpdateLoopControl::Stop, None)),
     }
-    anyhow::ensure!(
-        trigger == UpdateTrigger::Scheduled || daemon.is_stable_standalone_release()?,
-        "installer did not select a stable latest release; retry the update"
-    );
     if release_selection_unstable(daemon, trigger)? {
         return Ok((UpdateLoopControl::Continue, None));
     }
@@ -398,16 +317,7 @@ async fn update_once(
     let managed_codex_bin =
         resolved_managed_codex_bin(&daemon.current_managed_codex_bin()?).await?;
     let restart_mode = match trigger {
-        // The package can contain different resources even when its CLI binary
-        // is identical. A release change must also replace the running process.
-        UpdateTrigger::Manual | UpdateTrigger::RestoreProduction(_)
-            if selected_release(daemon)?.1 != previous_selection =>
-        {
-            RestartMode::Always
-        }
-        UpdateTrigger::Manual | UpdateTrigger::RestoreProduction(_) => {
-            RestartMode::IfBinaryOrVersionChanged
-        }
+        UpdateTrigger::Manual => RestartMode::IfBinaryOrVersionChanged,
         UpdateTrigger::Scheduled
             if executable_identity(&managed_codex_bin).await? != *running_updater_identity =>
         {
@@ -442,7 +352,7 @@ async fn update_once(
                 ));
             }
             RestartIfRunningOutcome::AlreadyCurrent
-                if trigger != UpdateTrigger::Scheduled
+                if trigger == UpdateTrigger::Manual
                     && restart_mode == RestartMode::IfBinaryOrVersionChanged =>
             {
                 anyhow::ensure!(
@@ -458,7 +368,7 @@ async fn update_once(
             }
             RestartIfRunningOutcome::NotReady | RestartIfRunningOutcome::AlreadyCurrent => {
                 anyhow::ensure!(
-                    trigger == UpdateTrigger::Scheduled,
+                    trigger != UpdateTrigger::Manual,
                     "managed daemon could not restart; retry when it is ready"
                 );
                 return Ok((
@@ -474,34 +384,30 @@ async fn update_once(
     }
 }
 
-fn release_selection_unstable(daemon: &Daemon, trigger: UpdateTrigger<'_>) -> Result<bool> {
-    if daemon.is_stable_standalone_release()?
-        || matches!(trigger, UpdateTrigger::RestoreProduction(_))
-            && manual_update::supported(daemon)?
-    {
+fn release_selection_unstable(daemon: &Daemon, trigger: UpdateTrigger) -> Result<bool> {
+    if daemon.is_stable_standalone_release()? {
         return Ok(false);
     }
     anyhow::ensure!(
-        trigger == UpdateTrigger::Scheduled,
+        trigger != UpdateTrigger::Manual,
         "standalone install selection changed during the update"
     );
     Ok(true)
 }
 
-fn selected_release(daemon: &Daemon) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+fn selected_release(daemon: &Daemon) -> Result<(&Path, std::path::PathBuf, String)> {
     let home = daemon
         .settings_file
         .parent()
         .and_then(Path::parent)
         .context("daemon settings path has no Codex home")?;
-    let root = crate::managed_install::package_root(home);
-    let release = std::fs::canonicalize(root.join("current"))?;
+    let release = std::fs::canonicalize(home.join("packages/standalone/current"))?;
     let name = release
         .file_name()
         .context("managed release has no name")?
         .to_string_lossy()
         .into_owned();
-    Ok((root, release, name))
+    Ok((home, release, name))
 }
 
 async fn current_updater_identity() -> Result<ExecutableIdentity> {
@@ -523,16 +429,10 @@ pub(crate) fn reexec_managed_updater(managed_codex_bin: &std::path::Path) -> Res
     })
 }
 
-enum InstallerMode<'a> {
-    Update(&'a str),
-    RestoreProduction(&'a str),
-    Migration,
-}
-
 async fn run_installer_script(
     script: &[u8],
-    mode: InstallerMode<'_>,
-    package_root: &Path,
+    previous_release: &str,
+    #[cfg(unix)] codex_home: &Path,
     #[cfg(unix)] terminate: impl std::future::Future<Output = Option<()>>,
 ) -> Result<UpdateLoopControl> {
     #[cfg(unix)]
@@ -550,32 +450,10 @@ async fn run_installer_script(
             .kill_on_drop(true);
         command
     };
-    let (latest_guard, current_guard, previous_release, defer_selection) = match mode {
-        InstallerMode::Update(release) => ("1", "0", release, "0"),
-        InstallerMode::RestoreProduction(release) => ("0", "1", release, "0"),
-        InstallerMode::Migration => ("0", "0", "", "1"),
-    };
     let mut child = command
-        .env(
-            "CODEX_HOME",
-            package_root
-                .parent()
-                .and_then(Path::parent)
-                .context("package root has no Codex home")?,
-        )
-        .env("CODEX_INSTALL_DEFER_SELECTION", defer_selection)
-        .env(
-            "CODEX_INSTALL_DAEMON_ONLY",
-            if package_root.ends_with("app-server-daemon") {
-                "1"
-            } else {
-                "0"
-            },
-        )
         .env("CODEX_RELEASE", "latest")
         .env("CODEX_NON_INTERACTIVE", "1")
-        .env("CODEX_INSTALL_IF_LATEST", latest_guard)
-        .env("CODEX_INSTALL_IF_CURRENT", current_guard)
+        .env("CODEX_INSTALL_IF_LATEST", "1")
         .env("CODEX_UPDATE_FROM_RELEASE", previous_release)
         .kill_on_drop(true)
         .stdin(Stdio::piped())
@@ -583,8 +461,6 @@ async fn run_installer_script(
         .stderr(Stdio::null())
         .spawn()
         .context("failed to invoke standalone Codex updater")?;
-    #[cfg(windows)]
-    let _installer_job = crate::backend::windows::installer_job(&child)?;
     let mut stdin = child
         .stdin
         .take()
@@ -601,7 +477,7 @@ async fn run_installer_script(
     drop(stdin);
     #[cfg(unix)]
     if write_result.is_none() {
-        cancel_installer(&mut child, package_root).await;
+        cancel_installer(&mut child, codex_home).await;
         return Ok(UpdateLoopControl::Stop);
     }
     write_result
@@ -611,7 +487,7 @@ async fn run_installer_script(
     let status = tokio::select! {
         result = child.wait() => result,
         _ = &mut terminate => {
-            cancel_installer(&mut child, package_root).await;
+            cancel_installer(&mut child, codex_home).await;
             return Ok(UpdateLoopControl::Stop);
         }
     };
@@ -627,7 +503,7 @@ async fn run_installer_script(
 }
 
 #[cfg(unix)]
-async fn cancel_installer(child: &mut tokio::process::Child, package_root: &Path) {
+async fn cancel_installer(child: &mut tokio::process::Child, codex_home: &Path) {
     let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
         return;
     };
@@ -639,7 +515,7 @@ async fn cancel_installer(child: &mut tokio::process::Child, package_root: &Path
     unsafe { libc::kill(-pid, libc::SIGKILL) };
     // A forced kill can bypass the shell trap on hosts using the mkdir lock.
     // The lock is ours only if its recorded owner is this still-unreaped shell.
-    let lock = package_root.join("install.lock.d");
+    let lock = codex_home.join("packages/standalone/install.lock.d");
     if std::fs::read_to_string(lock.join("pid")).is_ok_and(|owner| owner.trim() == pid.to_string())
     {
         let _ = std::fs::remove_dir_all(lock);

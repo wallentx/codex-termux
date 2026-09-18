@@ -11,11 +11,7 @@ import type { SandboxPolicy } from "./SandboxPolicy";
 import type { TurnToolOutput } from "./TurnToolOutput";
 import type { UserInput } from "./UserInput";
 
-export type TurnStartParams = {threadId: string, /**
- * Replace this thread's disabled plugin IDs.
- * Omitted/null preserves the list; [] clears it.
- */
-disabledPluginIds?: Array<string> | null, clientUserMessageId?: string | null, input: Array<UserInput>, /**
+export type TurnStartParams = {threadId: string, clientUserMessageId?: string | null, input: Array<UserInput>, /**
  * Optional source classification for the caller that starts this turn.
  * Ignored when this request steers an already-active turn.
  */
@@ -50,8 +46,7 @@ effort?: ReasoningEffort | null, /**
  * Override the reasoning summary for this turn and subsequent turns.
  */
 summary?: ReasoningSummary | null, /**
- * @deprecated `friendly` and `pragmatic` no longer select a style.
- * Changing this does not rewrite the thread's existing instructions.
+ * Override the personality for this turn and subsequent turns.
  */
 personality?: Personality | null, /**
  * Optional JSON Schema used to constrain the final assistant message for

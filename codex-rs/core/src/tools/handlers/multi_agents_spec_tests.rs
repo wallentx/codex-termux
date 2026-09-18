@@ -28,7 +28,6 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
             description: "1.5x speed, increased usage".to_string(),
         }],
         default_service_tier: None,
-        available_access_programs: None,
         is_default: false,
         upgrade: None,
         show_in_picker,
@@ -122,7 +121,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         Some(&vec!["task_name".to_string(), "message".to_string()])
     );
     assert_eq!(
-        output_schema.expect("spawn_agent output schema").to_value()["required"],
+        output_schema.expect("spawn_agent output schema")["required"],
         json!(["task_name", "nickname"])
     );
 }
@@ -416,7 +415,7 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     );
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
-        output_schema.expect("wait output schema").to_value()["properties"]["message"]["description"],
+        output_schema.expect("wait output schema")["properties"]["message"]["description"],
         json!(
             "Brief wait summary without the agent's final content, including any timeout adjustment."
         )
@@ -449,8 +448,7 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
         Some("Task-path prefix filter without a trailing slash. Omit to list all live agents.")
     );
     assert_eq!(
-        output_schema.expect("list_agents output schema").to_value()["properties"]["agents"]["items"]
-            ["required"],
+        output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],
         json!(["agent_name", "agent_status"])
     );
 }
@@ -463,8 +461,8 @@ fn list_agents_tool_status_schema_includes_interrupted() {
     };
 
     assert_eq!(
-        output_schema.expect("list_agents output schema").to_value()["properties"]["agents"]["items"]
-            ["properties"]["agent_status"]["allOf"][0]["oneOf"][0]["enum"],
+        output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["properties"]
+            ["agent_status"]["allOf"][0]["oneOf"][0]["enum"],
         json!([
             "pending_init",
             "running",

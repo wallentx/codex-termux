@@ -286,11 +286,8 @@ fn candidate_filenames(config: &Config) -> Vec<&str> {
 /// guidance.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedAgentsMd {
-    /// Account- or home-scoped instructions supplied by the host.
+    /// Host-provided user instructions.
     user_instructions: Option<Instructions>,
-
-    /// Thread-scoped instructions supplied by the host.
-    thread_instructions: Option<Instructions>,
 
     /// Ordered instructions and their provenance.
     entries: Vec<InstructionEntry>,
@@ -305,9 +302,8 @@ impl LoadedAgentsMd {
         Self {
             user_instructions: Some(Instructions {
                 text: contents,
-                source: Some(path),
+                source: path,
             }),
-            thread_instructions: None,
             entries: Vec::new(),
         }
     }
@@ -316,21 +312,8 @@ impl LoadedAgentsMd {
         Self {
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),
-            thread_instructions: None,
             entries: Vec::new(),
         }
-    }
-
-    pub(crate) fn with_instructions(
-        mut self,
-        user_instructions: Option<Instructions>,
-        thread_instructions: Option<Instructions>,
-    ) -> Option<Self> {
-        self.user_instructions =
-            user_instructions.filter(|instructions| !instructions.text.trim().is_empty());
-        self.thread_instructions =
-            thread_instructions.filter(|instructions| !instructions.text.trim().is_empty());
-        (!self.is_empty()).then_some(self)
     }
 
     /// Creates source-less user instructions for tests.
@@ -344,7 +327,6 @@ impl LoadedAgentsMd {
         }
         Self {
             user_instructions: None,
-            thread_instructions: None,
             entries: vec![InstructionEntry {
                 contents,
                 provenance: InstructionProvenance::Internal,
@@ -354,7 +336,6 @@ impl LoadedAgentsMd {
 
     fn is_empty(&self) -> bool {
         self.user_instructions.is_none()
-            && self.thread_instructions.is_none()
             && self
                 .entries
                 .iter()
@@ -374,14 +355,7 @@ impl LoadedAgentsMd {
         let mut output = String::new();
         let mut has_previous = false;
         let mut previous_was_project = false;
-        for instructions in self
-            .user_instructions
-            .iter()
-            .chain(self.thread_instructions.iter())
-        {
-            if has_previous {
-                output.push_str("\n\n");
-            }
+        if let Some(instructions) = &self.user_instructions {
             output.push_str(&instructions.text);
             has_previous = true;
         }
@@ -409,14 +383,7 @@ impl LoadedAgentsMd {
         let mut output = String::new();
         let mut has_previous = false;
         let mut previous_environment: Option<(&str, &PathUri)> = None;
-        for instructions in self
-            .user_instructions
-            .iter()
-            .chain(self.thread_instructions.iter())
-        {
-            if has_previous {
-                output.push_str("\n\n");
-            }
+        if let Some(instructions) = &self.user_instructions {
             output.push_str(&instructions.text);
             has_previous = true;
         }
@@ -476,8 +443,7 @@ impl LoadedAgentsMd {
     pub fn sources(&self) -> impl Iterator<Item = PathUri> + '_ {
         self.user_instructions
             .iter()
-            .chain(self.thread_instructions.iter())
-            .filter_map(|instructions| instructions.source.as_ref().map(PathUri::from_abs_path))
+            .map(|instructions| PathUri::from_abs_path(&instructions.source))
             .chain(
                 self.entries
                     .iter()

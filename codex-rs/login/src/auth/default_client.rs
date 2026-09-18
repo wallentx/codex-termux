@@ -253,32 +253,24 @@ pub fn create_client_for_route(
     http_client_factory: &HttpClientFactory,
     request_url: &str,
     route_class: ClientRouteClass,
-    redirect_policy: ClientRedirectPolicy,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
-    let builder = match redirect_policy {
-        ClientRedirectPolicy::Default => default_http_client_builder(),
-        ClientRedirectPolicy::Reject => default_http_client_builder().without_redirects(),
-    };
     if matches!(
         http_client_factory.outbound_proxy_policy(),
         OutboundProxyPolicy::ReqwestDefault
     ) {
-        return Ok(build_default_client(builder));
+        return Ok(create_client());
     }
     if is_sandboxed() {
         // Preserve the sandbox's existing no-proxy policy; sandboxed command egress is routed
         // separately through network-proxy.
-        return Ok(build_default_client(builder));
+        return Ok(create_client());
     }
 
-    builder.build_respecting_outbound_proxy_policy(http_client_factory, request_url, route_class)
-}
-
-/// Redirect handling for the shared HTTP client builders.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClientRedirectPolicy {
-    Default,
-    Reject,
+    default_http_client_builder().build_respecting_outbound_proxy_policy(
+        http_client_factory,
+        request_url,
+        route_class,
+    )
 }
 
 /// Builds the default Codex HTTP client for a concrete outbound route without blocking the
@@ -294,13 +286,8 @@ pub async fn create_client_for_route_async(
         .map_err(std::io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        create_client_for_route(
-            &http_client_factory,
-            &request_url,
-            route_class,
-            ClientRedirectPolicy::Default,
-        )
-        .map_err(std::io::Error::from)
+        create_client_for_route(&http_client_factory, &request_url, route_class)
+            .map_err(std::io::Error::from)
     })
     .await
     .map_err(std::io::Error::other)?
@@ -342,7 +329,6 @@ pub(crate) fn create_default_auth_client(
         auth_route_config.http_client_factory(),
         endpoint,
         ClientRouteClass::Auth,
-        ClientRedirectPolicy::Default,
     )
 }
 

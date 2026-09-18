@@ -1,6 +1,5 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
-use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::role::apply_role_to_config;
 use crate::codex_thread::CodexThread;
 use crate::config::PermissionProfileSnapshot;
@@ -13,6 +12,7 @@ use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::world_state::PersistentModeState;
 use crate::session::multi_agents::resolve_usage_hints;
+use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
@@ -557,17 +557,7 @@ impl AgentControl {
                 None,
             )
         };
-        let inherited_instructions = if let Some((parent, _)) = parent.as_ref() {
-            Some(parent.session.inherited_instructions().await)
-        } else if let Some(parent_thread_id) = parent_thread_id
-            && let Ok(parent) = state.get_thread(parent_thread_id).await
-        {
-            Some(parent.session.inherited_instructions().await)
-        } else {
-            None
-        };
-        // Reserving a slot can evict an idle nested parent. Capture its instructions
-        // alongside its authority so the child does not depend on a later live lookup.
+        // Reserving a slot can evict an idle nested parent. Keep its authority captured above.
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, Some(thread_id))
             .await?;
@@ -581,7 +571,6 @@ impl AgentControl {
                 parent_thread_id,
                 environment_selections,
                 inherited_environments,
-                inherited_instructions,
                 inherited_exec_policy,
                 client_mcp_extensions,
             })
@@ -776,7 +765,6 @@ impl AgentControl {
 
         let start_options = TurnStartOptions {
             parent_turn_id: options.parent_turn_id,
-            turn_trigger: options.turn_trigger,
             root_turn_id: options.root_turn_id,
             cyber_access_program: options.cyber_access_program,
             ..Default::default()
@@ -1288,7 +1276,6 @@ impl AgentControl {
                 parent_thread_id,
                 environment_selections: None,
                 inherited_environments,
-                inherited_instructions: None,
                 inherited_exec_policy,
                 client_mcp_extensions: None,
             })

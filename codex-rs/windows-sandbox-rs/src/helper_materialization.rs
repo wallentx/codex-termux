@@ -1,62 +1,75 @@
-//! Resolve sandbox helpers and materialize legacy executables with inherited sandbox ACLs.
-//! An explicit registered-runtime request never falls through to copying or PATH lookup;
-//! the service and startup handshake independently verify the installed image.
-
-mod copy;
-use copy::CopyOutcome;
-use copy::copy_from_source_if_needed;
-
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
+use tempfile::NamedTempFile;
 
-use crate::app_package::registered_core_requested;
 use crate::logging::log_note;
 use crate::sandbox_bin_dir;
-use crate::setup::SetupRuntime;
 
 const DEV_BUILD_VERSION_SENTINEL: &str = "0.0.0";
-const COMMAND_RUNNER_EXE: &str = "codex-command-runner.exe";
 pub(crate) const BIN_DIRNAME: &str = "bin";
 pub(crate) const RESOURCES_DIRNAME: &str = "codex-resources";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum HelperExecutable {
+    CommandRunner,
+}
+
+impl HelperExecutable {
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::CommandRunner => "codex-command-runner.exe",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CommandRunner => "command-runner",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyOutcome {
+    Reused,
+    ReCopied,
+}
+
+static HELPER_PATH_CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
 pub(crate) fn helper_bin_dir(codex_home: &Path) -> PathBuf {
     sandbox_bin_dir(codex_home)
 }
 
-fn legacy_lookup() -> PathBuf {
+pub(crate) fn legacy_lookup(kind: HelperExecutable) -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
-        && let Some(candidate) = bundled_executable_path_for_exe(&exe, COMMAND_RUNNER_EXE)
+        && let Some(candidate) = bundled_executable_path_for_exe(&exe, kind.file_name())
     {
         return candidate;
     }
-    PathBuf::from(COMMAND_RUNNER_EXE)
+    PathBuf::from(kind.file_name())
 }
 
-pub(crate) fn resolve_command_runner(codex_home: &Path, log_dir: Option<&Path>) -> Result<PathBuf> {
-    if registered_core_requested() {
-        let exe = std::env::current_exe().context("resolve registered Core helper source")?;
-        let direct_path = exe.with_file_name(COMMAND_RUNNER_EXE);
-        log_note(
-            &format!(
-                "helper launch resolution: using app-contained command-runner path {}",
-                direct_path.display()
-            ),
-            log_dir,
-        );
-        // Missing packaged helpers must fail rather than search PATH or create a copy.
-        return Ok(direct_path);
-    }
-    Ok(match copy_runner_if_needed(codex_home, log_dir) {
+pub(crate) fn resolve_helper_for_launch(
+    kind: HelperExecutable,
+    codex_home: &Path,
+    log_dir: Option<&Path>,
+) -> PathBuf {
+    match copy_helper_if_needed(kind, codex_home, log_dir) {
         Ok(path) => {
             log_note(
                 &format!(
-                    "helper launch resolution: using copied command-runner path {}",
+                    "helper launch resolution: using copied {} path {}",
+                    kind.label(),
                     path.display()
                 ),
                 log_dir,
@@ -64,54 +77,37 @@ pub(crate) fn resolve_command_runner(codex_home: &Path, log_dir: Option<&Path>) 
             path
         }
         Err(err) => {
-            let fallback = legacy_lookup();
+            let fallback = legacy_lookup(kind);
             log_note(
                 &format!(
-                    "helper copy failed for command-runner: {err:#}; falling back to legacy path {}",
+                    "helper copy failed for {}: {err:#}; falling back to legacy path {}",
+                    kind.label(),
                     fallback.display()
                 ),
                 log_dir,
             );
             fallback
         }
-    })
+    }
+}
+
+pub fn resolve_current_exe_for_launch(codex_home: &Path, fallback_executable: &str) -> PathBuf {
+    let source = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return PathBuf::from(fallback_executable),
+    };
+    resolve_exe_for_launch(&source, codex_home)
 }
 
 pub fn resolve_exe_for_launch(source: &Path, codex_home: &Path) -> PathBuf {
-    let runtime = crate::setup::current_setup_runtime();
-    resolve_exe_for_runtime(source, codex_home, runtime)
-}
-
-fn resolve_exe_for_runtime(source: &Path, codex_home: &Path, runtime: SetupRuntime) -> PathBuf {
-    let sandbox_log_dir = crate::sandbox_dir(codex_home);
-    if runtime == SetupRuntime::Registered {
-        log_note(
-            &format!(
-                "helper executable resolution: route=direct source={} selected={}",
-                source.display(),
-                source.display()
-            ),
-            Some(&sandbox_log_dir),
-        );
-        return source.to_path_buf();
-    }
     let Some(file_name) = source.file_name() else {
         return source.to_path_buf();
     };
     let destination = helper_bin_dir(codex_home).join(file_name);
     match copy_from_source_if_needed(source, &destination) {
-        Ok(_) => {
-            log_note(
-                &format!(
-                    "helper executable resolution: route=materialized source={} selected={}",
-                    source.display(),
-                    destination.display()
-                ),
-                Some(&sandbox_log_dir),
-            );
-            destination
-        }
+        Ok(_) => destination,
         Err(err) => {
+            let sandbox_log_dir = crate::sandbox_dir(codex_home);
             log_note(
                 &format!(
                     "helper copy failed for executable: {err:#}; falling back to legacy path {}",
@@ -124,13 +120,30 @@ fn resolve_exe_for_runtime(source: &Path, codex_home: &Path, runtime: SetupRunti
     }
 }
 
-fn copy_runner_if_needed(codex_home: &Path, log_dir: Option<&Path>) -> Result<PathBuf> {
-    let source = sibling_source_path()?;
-    let suffix = helper_version_suffix(&source)?;
-    let destination = helper_bin_dir(codex_home).join(materialized_file_name(&suffix));
+pub(crate) fn copy_helper_if_needed(
+    kind: HelperExecutable,
+    codex_home: &Path,
+    log_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let cache_key = format!("{}|{}", kind.file_name(), codex_home.display());
+    if let Some(path) = cached_helper_path(&cache_key) {
+        log_note(
+            &format!(
+                "helper copy: using in-memory cache for {} -> {}",
+                kind.label(),
+                path.display()
+            ),
+            log_dir,
+        );
+        return Ok(path);
+    }
+
+    let source = sibling_source_path(kind)?;
+    let destination = helper_destination_for_source(kind, codex_home, &source)?;
     log_note(
         &format!(
-            "helper copy: validating command-runner source={} destination={}",
+            "helper copy: validating {} source={} destination={}",
+            kind.label(),
             source.display(),
             destination.display()
         ),
@@ -143,19 +156,34 @@ fn copy_runner_if_needed(codex_home: &Path, log_dir: Option<&Path>) -> Result<Pa
     };
     log_note(
         &format!(
-            "helper copy: {} command-runner source={} destination={}",
+            "helper copy: {} {} source={} destination={}",
             action,
+            kind.label(),
             source.display(),
             destination.display()
         ),
         log_dir,
     );
+    store_helper_path(cache_key, destination.clone());
     Ok(destination)
 }
 
-fn sibling_source_path() -> Result<PathBuf> {
+fn cached_helper_path(cache_key: &str) -> Option<PathBuf> {
+    let cache = HELPER_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = cache.lock().ok()?;
+    guard.get(cache_key).cloned()
+}
+
+fn store_helper_path(cache_key: String, path: PathBuf) {
+    let cache = HELPER_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(cache_key, path);
+    }
+}
+
+fn sibling_source_path(kind: HelperExecutable) -> Result<PathBuf> {
     let exe = std::env::current_exe().context("resolve current executable for helper lookup")?;
-    bundled_executable_path_for_exe(&exe, COMMAND_RUNNER_EXE).ok_or_else(|| {
+    bundled_executable_path_for_exe(&exe, kind.file_name()).ok_or_else(|| {
         anyhow!(
             "helper not found next to current executable or under {RESOURCES_DIRNAME}: {}",
             exe.display()
@@ -188,8 +216,29 @@ pub(crate) fn bundled_executable_path_for_exe(exe: &Path, file_name: &str) -> Op
     find(exe).or_else(|| find(&dunce::canonicalize(exe).ok()?))
 }
 
-fn materialized_file_name(suffix: &str) -> String {
-    format!("codex-command-runner-{suffix}.exe")
+fn helper_destination_for_source(
+    kind: HelperExecutable,
+    codex_home: &Path,
+    source: &Path,
+) -> Result<PathBuf> {
+    let suffix = helper_version_suffix(source)?;
+    let file_name = materialized_file_name(kind, &suffix);
+    Ok(helper_bin_dir(codex_home).join(file_name))
+}
+
+fn materialized_file_name(kind: HelperExecutable, suffix: &str) -> String {
+    let source_name = kind.file_name();
+    let path = Path::new(source_name);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(source_name);
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{ext}"))
+        .unwrap_or_default();
+    format!("{stem}-{suffix}{extension}")
 }
 
 fn helper_version_suffix(source: &Path) -> Result<String> {
@@ -213,25 +262,176 @@ fn dev_build_suffix(source: &Path) -> Result<String> {
     Ok(format!("{}-{:x}", metadata.len(), duration.as_secs(),))
 }
 
+fn copy_from_source_if_needed(source: &Path, destination: &Path) -> Result<CopyOutcome> {
+    if destination_is_fresh(source, destination)? {
+        return Ok(CopyOutcome::Reused);
+    }
+
+    let destination_dir = destination.parent().ok_or_else(|| {
+        anyhow!(
+            "helper destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    fs::create_dir_all(destination_dir).with_context(|| {
+        format!(
+            "create helper destination directory {}",
+            destination_dir.display()
+        )
+    })?;
+
+    let temp_path = NamedTempFile::new_in(destination_dir)
+        .with_context(|| {
+            format!(
+                "create temporary helper file in {}",
+                destination_dir.display()
+            )
+        })?
+        .into_temp_path();
+    let temp_path_buf = temp_path.to_path_buf();
+
+    let mut source_file = fs::File::open(source)
+        .with_context(|| format!("open helper source for read {}", source.display()))?;
+    let mut temp_file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&temp_path_buf)
+        .with_context(|| format!("open temporary helper file {}", temp_path_buf.display()))?;
+
+    // Write into a temp file created inside `.sandbox-bin` so the copied helper keeps the
+    // destination directory's inherited ACLs instead of reusing the source file's descriptor.
+    std::io::copy(&mut source_file, &mut temp_file).with_context(|| {
+        format!(
+            "copy helper from {} to {}",
+            source.display(),
+            temp_path_buf.display()
+        )
+    })?;
+    temp_file
+        .flush()
+        .with_context(|| format!("flush temporary helper file {}", temp_path_buf.display()))?;
+    drop(temp_file);
+
+    if destination.exists() {
+        fs::remove_file(destination).with_context(|| {
+            format!("remove stale helper destination {}", destination.display())
+        })?;
+    }
+
+    match fs::rename(&temp_path_buf, destination) {
+        Ok(()) => Ok(CopyOutcome::ReCopied),
+        Err(rename_err) => {
+            if destination_is_fresh(source, destination)? {
+                Ok(CopyOutcome::Reused)
+            } else {
+                Err(rename_err).with_context(|| {
+                    format!(
+                        "rename helper temp file {} to {}",
+                        temp_path_buf.display(),
+                        destination.display()
+                    )
+                })
+            }
+        }
+    }
+}
+
+fn destination_is_fresh(source: &Path, destination: &Path) -> Result<bool> {
+    let source_meta = fs::metadata(source)
+        .with_context(|| format!("read helper source metadata {}", source.display()))?;
+    let destination_meta = match fs::metadata(destination) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("read helper destination metadata {}", destination.display())
+            });
+        }
+    };
+
+    if source_meta.len() != destination_meta.len() {
+        return Ok(false);
+    }
+
+    let source_modified = source_meta
+        .modified()
+        .with_context(|| format!("read helper source mtime {}", source.display()))?;
+    let destination_modified = destination_meta
+        .modified()
+        .with_context(|| format!("read helper destination mtime {}", destination.display()))?;
+
+    Ok(destination_modified >= source_modified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::BIN_DIRNAME;
     use super::CopyOutcome;
     use super::DEV_BUILD_VERSION_SENTINEL;
+    use super::HelperExecutable;
     use super::RESOURCES_DIRNAME;
     use super::bundled_executable_path_for_exe;
     use super::copy_from_source_if_needed;
+    use super::destination_is_fresh;
     use super::dev_build_suffix;
     use super::helper_bin_dir;
     use super::helper_version_suffix;
     use super::materialized_file_name;
-    use super::resolve_exe_for_runtime;
-    use crate::setup::SetupRuntime;
     use pretty_assertions::assert_eq;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn copy_from_source_if_needed_copies_missing_destination() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        let destination = tmp.path().join("bin").join("helper.exe");
+
+        fs::write(&source, b"runner-v1").expect("write source");
+
+        let outcome = copy_from_source_if_needed(&source, &destination).expect("copy helper");
+
+        assert_eq!(CopyOutcome::ReCopied, outcome);
+        assert_eq!(
+            b"runner-v1".as_slice(),
+            fs::read(&destination).expect("read destination")
+        );
+    }
+
+    #[test]
+    fn destination_is_fresh_uses_size_and_mtime() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        let destination = tmp.path().join("destination.exe");
+
+        fs::write(&destination, b"same-size").expect("write destination");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(&source, b"same-size").expect("write source");
+        assert!(!destination_is_fresh(&source, &destination).expect("stale metadata"));
+
+        fs::write(&destination, b"same-size").expect("rewrite destination");
+        assert!(destination_is_fresh(&source, &destination).expect("fresh metadata"));
+    }
+
+    #[test]
+    fn copy_from_source_if_needed_reuses_fresh_destination() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source.exe");
+        let destination = tmp.path().join("bin").join("helper.exe");
+
+        fs::write(&source, b"runner-v1").expect("write source");
+        copy_from_source_if_needed(&source, &destination).expect("initial copy");
+
+        let outcome = copy_from_source_if_needed(&source, &destination).expect("revalidate helper");
+
+        assert_eq!(CopyOutcome::Reused, outcome);
+        assert_eq!(
+            b"runner-v1".as_slice(),
+            fs::read(&destination).expect("read destination")
+        );
+    }
 
     #[test]
     fn helper_bin_dir_is_under_sandbox_bin() {
@@ -244,37 +444,6 @@ mod tests {
     }
 
     #[test]
-    fn registered_request_does_not_materialize_or_replace_a_missing_source() {
-        let tmp = TempDir::new().expect("tempdir");
-        let executable = tmp.path().join("codex.exe");
-        let home = tmp.path().join("home");
-        for content in [None, Some(b"fixture".as_slice())] {
-            if let Some(content) = content {
-                fs::write(&executable, content).expect("write source");
-            }
-            assert_eq!(
-                resolve_exe_for_runtime(&executable, &home, SetupRuntime::Registered),
-                executable
-            );
-            assert!(!helper_bin_dir(&home).exists());
-        }
-    }
-
-    #[test]
-    fn legacy_request_materializes_the_same_source() {
-        let tmp = TempDir::new().expect("tempdir");
-        let executable = tmp.path().join("codex.exe");
-        let home = tmp.path().join("home");
-        fs::write(&executable, b"fixture").expect("write source");
-        let destination = helper_bin_dir(&home).join("codex.exe");
-        assert_eq!(
-            resolve_exe_for_runtime(&executable, &home, SetupRuntime::Legacy),
-            destination
-        );
-        assert_eq!(fs::read(destination).expect("read copy"), b"fixture");
-    }
-
-    #[test]
     fn copy_runner_into_shared_bin_dir() {
         let tmp = TempDir::new().expect("tempdir");
         let codex_home = tmp.path().join("codex-home");
@@ -283,8 +452,10 @@ mod tests {
         let runner_source = source_dir.join("codex-command-runner.exe");
         fs::write(&runner_source, b"runner").expect("runner");
         let runner_suffix = helper_version_suffix(&runner_source).expect("runner suffix");
-        let runner_destination =
-            helper_bin_dir(&codex_home).join(materialized_file_name(&runner_suffix));
+        let runner_destination = helper_bin_dir(&codex_home).join(materialized_file_name(
+            HelperExecutable::CommandRunner,
+            &runner_suffix,
+        ));
 
         let runner_outcome =
             copy_from_source_if_needed(&runner_source, &runner_destination).expect("runner copy");
@@ -425,7 +596,7 @@ mod tests {
 
     #[test]
     fn materialized_file_name_adds_suffix_before_extension() {
-        let file_name = materialized_file_name("test-suffix");
+        let file_name = materialized_file_name(HelperExecutable::CommandRunner, "test-suffix");
 
         assert_eq!(file_name, "codex-command-runner-test-suffix.exe");
     }

@@ -57,18 +57,9 @@ impl native::UserVerificationProvider for BlockingProvider {
     }
     fn ensure_key(
         &self,
-        guard: &native::UserVerificationRequestGuard,
+        _guard: &native::UserVerificationRequestGuard,
     ) -> Result<native::UserVerificationKeyCreation, native::UserVerificationError> {
-        guard.check()?;
-        self.calls.fetch_add(/*val*/ 1, Ordering::SeqCst);
-        Ok(native::UserVerificationKeyCreation {
-            created: false,
-            credential: native::UserVerificationKeyInfo {
-                credential_id: "credential".into(),
-                algorithm: "ecdsaP256Sha256X962".into(),
-                public_key: "public-key".into(),
-            },
-        })
+        unreachable!("this test must not create keys")
     }
     fn delete(
         &self,

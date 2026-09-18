@@ -1,6 +1,4 @@
 mod common;
-#[path = "exec_process/windows_sandbox.rs"]
-mod windows_sandbox;
 
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -27,8 +25,6 @@ use codex_exec_server::ShellInfo;
 #[cfg(unix)]
 use codex_exec_server::ShellSnapshotRequest;
 use codex_exec_server::StartedExecProcess;
-#[cfg(any(unix, windows))]
-use codex_exec_server::WindowsSandboxSelection;
 use codex_exec_server::WriteStatus;
 #[cfg(unix)]
 use codex_network_proxy::NetworkProxyConfig;
@@ -38,6 +34,7 @@ use codex_network_proxy::RemoteNetworkProxyConfig;
 use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
 #[cfg(unix)]
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+use codex_protocol::config_types::WindowsSandboxLevel;
 #[cfg(unix)]
 use codex_protocol::models::PermissionProfile;
 #[cfg(unix)]
@@ -918,19 +915,12 @@ async fn collect_process_output_from_reads(
 async fn collect_process_output_from_events(
     session: Arc<dyn ExecProcess>,
 ) -> Result<(String, String, Option<i32>, bool)> {
-    collect_process_output_from_events_with_timeout(session, Duration::from_secs(2)).await
-}
-
-async fn collect_process_output_from_events_with_timeout(
-    session: Arc<dyn ExecProcess>,
-    event_timeout: Duration,
-) -> Result<(String, String, Option<i32>, bool)> {
     let mut events = session.subscribe_events();
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut exit_code = None;
     loop {
-        match timeout(event_timeout, events.recv()).await?? {
+        match timeout(Duration::from_secs(2), events.recv()).await?? {
             ExecProcessEvent::Output(chunk) => match chunk.stream {
                 ExecOutputStream::Stdout | ExecOutputStream::Pty => {
                     stdout.push_str(&String::from_utf8_lossy(&chunk.chunk.into_inner()));
@@ -1291,13 +1281,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
     Ok(())
 }
 
-async fn assert_remote_windows_sandbox_process_write(
-    expected_sandbox_type: codex_sandboxing::SandboxType,
-    tty: bool,
-) -> Result<()> {
-    if expected_sandbox_type == codex_sandboxing::SandboxType::WindowsMxc {
-        crate::skip_if_mxc_unavailable!(Ok(()));
-    }
+async fn assert_remote_windows_sandbox_process_write() -> Result<()> {
     let context = create_process_context(/*use_remote*/ true).await?;
     let workspace = TempDir::new()?;
     let blocked_file = workspace.path().join("blocked.txt");
@@ -1306,19 +1290,7 @@ async fn assert_remote_windows_sandbox_process_write(
         SandboxPolicy::new_read_only_policy(),
         cwd.clone(),
     )?;
-    match expected_sandbox_type {
-        codex_sandboxing::SandboxType::WindowsRestrictedToken => {
-            sandbox.windows_sandbox_selection = WindowsSandboxSelection::RestrictedToken;
-        }
-        codex_sandboxing::SandboxType::WindowsMxc => {
-            sandbox.windows_sandbox_selection = WindowsSandboxSelection::Mxc;
-        }
-        codex_sandboxing::SandboxType::None
-        | codex_sandboxing::SandboxType::MacosSeatbelt
-        | codex_sandboxing::SandboxType::LinuxSeccomp => {
-            anyhow::bail!("expected a Windows sandbox type")
-        }
-    }
+    sandbox.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
 
     let session = match context
         .backend
@@ -1340,8 +1312,8 @@ async fn assert_remote_windows_sandbox_process_write(
             shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
-            tty,
-            pipe_stdin: !tty,
+            tty: false,
+            pipe_stdin: true,
             arg0: None,
             sandbox: Some(sandbox),
             enforce_managed_network: false,
@@ -1353,10 +1325,8 @@ async fn assert_remote_windows_sandbox_process_write(
         Ok(session) => session,
         Err(err) => return Err(err.into()),
     };
-    assert_eq!(session.sandbox_type, Some(expected_sandbox_type));
 
-    let input = if tty { b"hello\r" } else { b"hello\n" };
-    let write_response = session.process.write(input.to_vec()).await?;
+    let write_response = session.process.write(b"hello\n".to_vec()).await?;
     assert_eq!(write_response.status, WriteStatus::Accepted);
     let StartedExecProcess { process, .. } = session;
     let wake_rx = process.subscribe_wake();
@@ -1773,29 +1743,11 @@ async fn exec_process_write_then_read_without_tty(use_remote: bool) -> Result<()
     assert_exec_process_write_then_read_without_tty(use_remote).await
 }
 
-#[test_case(
-    codex_sandboxing::SandboxType::WindowsRestrictedToken,
-    false;
-    "restricted_token"
-)]
-#[test_case(
-    codex_sandboxing::SandboxType::WindowsMxc,
-    false;
-    "mxc_pipe"
-)]
-#[test_case(
-    codex_sandboxing::SandboxType::WindowsMxc,
-    true;
-    "mxc_conpty"
-)]
-#[cfg_attr(not(windows), ignore = "Windows-only exec-server sandbox process test")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(windows), ignore = "Windows-only exec-server sandbox process test")]
 #[serial_test::serial(remote_exec_server)]
-async fn remote_windows_sandbox_process_accepts_process_write(
-    expected_sandbox_type: codex_sandboxing::SandboxType,
-    tty: bool,
-) -> Result<()> {
-    assert_remote_windows_sandbox_process_write(expected_sandbox_type, tty).await
+async fn remote_windows_sandbox_process_accepts_process_write() -> Result<()> {
+    assert_remote_windows_sandbox_process_write().await
 }
 
 #[test_case(false ; "local")]
