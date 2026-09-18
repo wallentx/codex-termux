@@ -91,8 +91,6 @@ impl Stage {
 /// Unique features toggled via configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
-    /// Preview consumer five-hour and weekly allowance history.
-    AnalyticsPlanHistory,
     /// Discover model catalogs for OpenAI API-key authentication.
     ApiKeyModelDiscovery,
     /// Enable the interactive transcript composer and turn-selection UI.
@@ -217,8 +215,6 @@ pub enum Feature {
     CodexAppsMcp20260728,
     /// Let RMCP coordinate OAuth refresh through the configured credential store.
     McpOAuthRefreshCoordination,
-    /// Enable enterprise refresh-token authorization for configured MCP resources.
-    UseXaa,
     /// Removed compatibility flag for the legacy Apps MCP path override.
     AppsMcpPathOverride,
     /// Removed compatibility flag retained as a no-op now that tool_search is always enabled.
@@ -309,8 +305,6 @@ pub enum Feature {
     DefaultModeRequestUserInput,
     /// Removed compatibility flag for model-enabled async user messaging.
     SendAsyncMessage,
-    /// Allow root agents to send async user messages without model catalog support.
-    SendMessageToUserAsync,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
     /// Select thread-owned context for both Guardian reviewers.
@@ -324,7 +318,7 @@ pub enum Feature {
     GuardianNodeReplTranscriptImages,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
-    /// Removed compatibility flag for the unused Guardian extension prototype.
+    /// Enable the extension-owned synchronous Guardian reviewer.
     GuardianExt,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
@@ -344,7 +338,7 @@ pub enum Feature {
     AuthElicitation,
     /// Offer Amazon Bedrock setup during TUI sign-in onboarding.
     BedrockSetupWizard,
-    /// Removed compatibility flag retained as a no-op.
+    /// Enable personality selection in the TUI.
     Personality,
     /// Enable native artifact tools.
     Artifact,
@@ -352,7 +346,7 @@ pub enum Feature {
     FastMode,
     /// Enable explicitly requested model changes for later step captures.
     StepModelSwitching,
-    /// Enable voice conversations in the TUI.
+    /// Removed compatibility flag. Realtime sessions no longer require a per-thread opt-in.
     RealtimeConversation,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
@@ -610,7 +604,7 @@ impl Features {
                 "image_detail_original" | "resize_all_images" | "item_ids" => {
                     continue;
                 }
-                "personality" | "plugin_hooks" => {
+                "plugin_hooks" => {
                     continue;
                 }
                 "skill_env_var_dependency_prompt" => {
@@ -908,16 +902,6 @@ pub struct FeatureSpec {
 }
 
 pub const FEATURES: &[FeatureSpec] = &[
-    FeatureSpec {
-        id: Feature::AnalyticsPlanHistory,
-        key: "analytics_plan_history",
-        stage: Stage::Experimental {
-            name: "Analytics plan history",
-            menu_description: "Preview five-hour and weekly allowance history for consumer accounts in /analytics.",
-            announcement: "",
-        },
-        default_enabled: false,
-    },
     FeatureSpec {
         id: Feature::TranscriptV2,
         key: "transcript_v2",
@@ -1268,8 +1252,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Worktrees,
         key: "worktrees",
-        stage: Stage::Stable,
-        default_enabled: true,
+        stage: Stage::Experimental {
+            name: "Worktrees",
+            menu_description: "Create isolated Git worktrees and group sessions by repository.",
+            announcement: "NEW: Worktrees can now be enabled from /experimental. Restart Codex after enabling it.",
+        },
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::RespectSystemProxy,
@@ -1334,12 +1322,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::McpOAuthRefreshCoordination,
         key: "mcp_oauth_refresh_coordination",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::UseXaa,
-        key: "use_xaa",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1572,12 +1554,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::SendMessageToUserAsync,
-        key: "send_message_to_user_async",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::TerminalVisualizationInstructions,
         key: "terminal_visualization_instructions",
         stage: Stage::UnderDevelopment,
@@ -1622,7 +1598,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianExt,
         key: "guardian_ext",
-        stage: Stage::Removed,
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1688,8 +1664,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Personality,
         key: "personality",
-        stage: Stage::Removed,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::Artifact,
@@ -1712,8 +1688,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RealtimeConversation,
         key: "realtime_conversation",
-        stage: Stage::Stable,
-        default_enabled: true,
+        stage: Stage::Experimental {
+            name: "Voice conversations",
+            menu_description: "Talk with Codex using /voice.",
+            announcement: "NEW: Voice conversations can now be enabled from /experimental. Restart Codex after enabling, then use /voice.",
+        },
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::RemoteControl,

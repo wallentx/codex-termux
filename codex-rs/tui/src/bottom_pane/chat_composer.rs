@@ -4,7 +4,7 @@
 //! completed slash commands to atomic elements, and handles Enter submission/newlines.
 //! It also shows Luna Reserve's yellow prompt arrow and detects unbracketed paste bursts
 //! from raw key streams, particularly on Windows.
-//! The live voice strip renders after effort ignition.
+//! The live voice strip renders after effort ignition and before stars, which skip its text.
 //!
 //! The plain-text preset keeps command prefixes literal, including `!`, so Enter and Tab
 //! submit ordinary text without enabling shell mode.
@@ -18,6 +18,7 @@
 //! # Key Event Routing
 //!
 //! Plain Left opens agents when the local-daemon composer is empty and available for input.
+//! The agents dashboard uses the matching empty-editor guards for Right to open a task.
 //! Explicit editor remaps take precedence.
 //! Most key handling goes through [`ChatComposer::handle_key_event`], which dispatches to a
 //! popup-specific handler if a popup is visible and otherwise to
@@ -60,7 +61,6 @@
 //! Recall moves the cursor to the end. Question editors copy primary history on recall/search;
 //! draft capture cancels previews, and restoration resets traversal.
 //! Ctrl+R searches history in the footer and previews matches in the composer.
-//! Typing and pasting edit the active search query, including large pastes and image paths.
 //! Enter accepts the preview; Esc restores the original draft.
 //! Vim undo/redo snapshots complete drafts and groups direct edits with active Vim transactions.
 //! An active edit keeps one separately capped snapshot; canceling does not evict committed history.
@@ -104,8 +104,7 @@
 //! When these paths clear the visible textarea after a successful submit or slash-command
 //! dispatch, they intentionally preserve the textarea kill buffer. That lets users `Ctrl+K` part
 //! of a draft, perform a composer action such as changing reasoning level, and then `Ctrl+Y` the
-//! killed text back into the now-empty draft. Replacing the chat widget carries that buffer into
-//! the fresh composer so Vim yanks survive `/new` and thread switches.
+//! killed text back into the now-empty draft.
 //!
 //! The numeric auto-submit path used by the slash popup performs the same pending-paste expansion
 //! and attachment pruning, and clears pending paste state on success.
@@ -167,7 +166,7 @@
 //! # Non-bracketed Paste Bursts
 //!
 //! On some terminals (especially on Windows), pastes arrive as a rapid sequence of
-//! `KeyCode::Char`, `KeyCode::Enter`, and `KeyCode::Tab` key events instead of a single paste event.
+//! `KeyCode::Char` and `KeyCode::Enter` key events instead of a single paste event.
 //!
 //! To avoid misinterpreting these bursts as real typing (and to prevent transient UI effects like
 //! shortcut overlays toggling on a pasted `?`), we feed text-producing character events (plain,
@@ -198,8 +197,6 @@
 //!   input to either buffer it or insert normally.
 //! - [`ChatComposer::handle_non_ascii_char`]: handles the non-ASCII/IME path without holding the
 //!   first char, while still allowing paste detection via retro-capture.
-//! - Unmodified Tab joins detected bursts, including short Unicode prefixes, before popup dispatch.
-//!   Expired bursts are flushed first so manual Tab keeps its normal shortcut behavior.
 //! - [`ChatComposer::flush_paste_burst_if_due`]/[`ChatComposer::handle_paste_burst_flush`]: called
 //!   from UI ticks to turn a pending burst into either an explicit paste (`handle_paste`) or a
 //!   normal typed character.
@@ -315,10 +312,10 @@ mod draft_state;
 mod footer_state;
 mod history_search;
 mod inline_input;
-mod paste_input;
 mod popup_state;
 mod reconnect;
 mod slash_input;
+mod sparkle;
 mod vim_history;
 mod vim_search;
 
@@ -339,7 +336,6 @@ use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
-use crate::bottom_pane::textarea::KillBufferSnapshot;
 use crate::bottom_pane::textarea::TextArea;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
@@ -534,6 +530,7 @@ pub(crate) struct ChatComposer {
     effort_animation_style: Option<IgnitionStyle>,
     effort_ignition: Option<EffortIgnition>,
     voice_strip: Option<VoiceStrip>,
+    astra_sparkle: Option<sparkle::Sparkle>,
     effort_status_line_transition: Option<EffortStatusLineTransition>,
     effort_observed: bool,
     luna_reserve_active: bool,
@@ -560,6 +557,7 @@ pub(crate) struct ChatComposer {
     service_tier_commands: Vec<ServiceTierCommand>,
     mentions_v2_enabled: bool,
     goal_command_enabled: bool,
+    personality_command_enabled: bool,
     voice_command_enabled: bool,
     worktrees_enabled: bool,
     windows_degraded_sandbox_active: bool,
@@ -702,6 +700,7 @@ impl ChatComposer {
             effort_animation_style: None,
             effort_ignition: None,
             voice_strip: None,
+            astra_sparkle: None,
             effort_status_line_transition: None,
             effort_observed: false,
             luna_reserve_active: false,
@@ -724,6 +723,7 @@ impl ChatComposer {
             service_tier_commands: Vec::new(),
             mentions_v2_enabled: false,
             goal_command_enabled: false,
+            personality_command_enabled: false,
             voice_command_enabled: false,
             worktrees_enabled: false,
             windows_degraded_sandbox_active: false,
@@ -1004,6 +1004,10 @@ impl ChatComposer {
         self.footer.ide_context_active = active;
     }
 
+    pub fn set_personality_command_enabled(&mut self, enabled: bool) {
+        self.personality_command_enabled = enabled;
+    }
+
     pub fn set_side_conversation_active(&mut self, active: bool) {
         self.side_conversation_active = active;
     }
@@ -1212,25 +1216,17 @@ impl ChatComposer {
     ///
     /// Behavior:
     ///
-    /// - If history search is active, inserts nonempty text into its query and ignores empty pastes.
-    /// - If Vim search is active, inserts text into its query.
-    /// - Otherwise, if the paste is larger than `LARGE_PASTE_CHAR_THRESHOLD` chars, inserts a
-    ///   placeholder element (expanded on submit) and stores the full text in `pending_pastes`.
+    /// - If the paste is larger than `LARGE_PASTE_CHAR_THRESHOLD` chars, inserts a placeholder
+    ///   element (expanded on submit) and stores the full text in `pending_pastes`.
     /// - Otherwise, if the paste looks like an image path, attaches the image and inserts a
     ///   trailing space so the user can keep typing naturally.
     /// - Otherwise, inserts the pasted text directly into the textarea.
     ///
-    /// For composer edits, clears any paste-burst Enter suppression state so a real paste cannot
-    /// affect the next user Enter key, then syncs popup state.
+    /// In all cases, clears any paste-burst Enter suppression state so a real paste cannot affect
+    /// the next user Enter key, then syncs popup state.
     pub fn handle_paste(&mut self, pasted: String) -> bool {
         let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
         let pasted = sanitize_user_text(pasted.into());
-        if self.history_search.is_some() {
-            if !pasted.is_empty() {
-                self.update_history_search_query(|query| query.push_str(&pasted));
-            }
-            return true;
-        }
         if let Some(query) = self.draft.textarea.vim_query_mut() {
             query.editor.insert_str(&pasted);
             return true;
@@ -1421,14 +1417,6 @@ impl ChatComposer {
     /// Resume text entry after a parent view takes focus, preserving Vim undo history.
     pub(crate) fn resume_text_entry(&mut self) {
         self.draft.textarea.enter_vim_insert_mode();
-    }
-
-    pub(crate) fn take_kill_buffer_snapshot(&mut self) -> KillBufferSnapshot {
-        self.draft.textarea.take_kill_buffer_snapshot()
-    }
-
-    pub(crate) fn restore_kill_buffer_snapshot(&mut self, snapshot: KillBufferSnapshot) {
-        self.draft.textarea.restore_kill_buffer_snapshot(snapshot);
     }
 
     /// Restore draft history transferred from the startup composer.
@@ -2047,10 +2035,6 @@ impl ChatComposer {
 
         if Self::is_history_search_key(&key_event, &self.history_search_previous_keys) {
             return self.begin_history_search();
-        }
-
-        if self.handle_paste_tab(key_event, Instant::now()) {
-            return (InputResult::None, true);
         }
 
         let result = match &mut self.popups.active {
@@ -3708,10 +3692,7 @@ impl ChatComposer {
         if matches!(input.code, KeyCode::Enter)
             && !self.draft.disable_paste_burst
             && self.draft.paste_burst.is_active()
-            && self
-                .draft
-                .paste_burst
-                .append_control_char_if_active('\n', now)
+            && self.draft.paste_burst.append_newline_if_active(now)
         {
             return (InputResult::None, true);
         }
@@ -5074,6 +5055,13 @@ impl ChatComposer {
         }
         drop(state);
         self.render_voice_strip(composer_rect, buf);
+        if self.astra_sparkle.is_some() {
+            self.render_sparkle(
+                composer_rect,
+                self.cursor_pos_with_textarea_right_reserve(area, textarea_right_reserve),
+                buf,
+            );
+        }
     }
 }
 
@@ -5088,14 +5076,6 @@ mod effort_tests;
 #[cfg(test)]
 #[path = "chat_composer/embedded_input_tests.rs"]
 mod embedded_input_tests;
-
-#[cfg(test)]
-#[path = "chat_composer/paste_tests.rs"]
-mod paste_tests;
-
-#[cfg(test)]
-#[path = "chat_composer/snapshot_tests.rs"]
-mod snapshot_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5177,6 +5157,39 @@ mod tests {
                 composer.footer.mode = FooterMode::ShortcutOverlay;
             },
         );
+    }
+
+    #[test]
+    fn parent_owned_thread_allows_bare_navigation_commands() {
+        for (command, expected) in [
+            ("/agents", SlashCommand::Agents),
+            ("/subagents", SlashCommand::MultiAgents),
+            ("/side", SlashCommand::Side),
+            ("/btw", SlashCommand::Btw),
+            ("/diff ", SlashCommand::Diff),
+        ] {
+            let (mut composer, _rx) = new_test_composer();
+            composer.set_parent_owned_thread();
+            composer.set_text_content(command.to_string(), Vec::new(), Vec::new());
+
+            assert_eq!(
+                composer.handle_submission(/*should_queue*/ false).0,
+                InputResult::Command(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn parent_owned_thread_allows_safe_command_selected_from_prefix() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_parent_owned_thread();
+        type_chars_humanlike(&mut composer, &['/', 'a', 'g']);
+
+        let result = composer
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .0;
+
+        assert_eq!(result, InputResult::Command(SlashCommand::Agents));
     }
 
     #[test]
