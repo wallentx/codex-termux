@@ -32,6 +32,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::WarningEvent;
 use codex_sandboxing::record_network_sandbox_violation;
 use codex_tools::ToolName;
+use codex_utils_path_uri::Platform;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1151,9 +1152,16 @@ pub(crate) async fn begin_network_approval(
                 })?
         } else {
             // This carrier never listens: the executor starts the real per-command proxy.
+            let executor_os = Platform::from_platform_os(
+                environments
+                    .turn_environments()
+                    .find(|environment| environment.selection.environment_id == environment_id)
+                    .and_then(|environment| environment.executor_platform_os.as_deref()),
+            );
             let state = owner_spec
                 .build_state_with_audit_metadata(
                     session.services.network_proxy_audit_metadata.clone(),
+                    executor_os,
                 )
                 .map_err(|error| {
                     ToolError::Rejected(format!(

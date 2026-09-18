@@ -168,6 +168,8 @@ fn blocked_request_violation_log_line(entry: &BlockedRequest) -> String {
 
 #[derive(Clone)]
 pub struct ConfigState {
+    /// Preserve the target when policy edits rebuild state on a controller.
+    pub(crate) executor_os: crate::Platform,
     pub config: NetworkProxyConfig,
     pub(crate) brokerage_created_default_allowlist: bool,
     pub allow_set: GlobSet,
@@ -285,8 +287,10 @@ impl Clone for NetworkProxyState {
 
 impl NetworkProxyState {
     /// Builds runtime state for one executor-local proxy launch.
+    /// The launching executor supplies its own OS; the wire policy cannot override it.
     pub fn from_remote_launch_config(
         launch: crate::RemoteNetworkProxyLaunchConfig,
+        executor_os: crate::Platform,
     ) -> Result<Self> {
         let crate::RemoteNetworkProxyLaunchConfig {
             proxy,
@@ -300,7 +304,7 @@ impl NetworkProxyState {
             "executor-local network proxy launch requires an enabled proxy"
         );
         let config = proxy.into_network_proxy_config();
-        let state = build_config_state(config, NetworkProxyConstraints::default())?;
+        let state = build_config_state(config, NetworkProxyConstraints::default(), executor_os)?;
         Ok(Self {
             environment_id: environment_id.map(Into::into),
             execution_id: execution_id.map(Into::into),
@@ -571,7 +575,7 @@ impl NetworkProxyState {
     pub async fn current_cfg(&self) -> Result<NetworkProxyConfig> {
         self.current_cfg_with_brokerage_provenance()
             .await
-            .map(|(config, _)| config)
+            .map(|(config, _, _)| config)
     }
 
     pub(crate) fn credential_broker_config_revision(&self) -> u64 {
@@ -580,7 +584,7 @@ impl NetworkProxyState {
 
     pub(crate) async fn current_cfg_with_brokerage_provenance(
         &self,
-    ) -> Result<(NetworkProxyConfig, bool)> {
+    ) -> Result<(NetworkProxyConfig, bool, crate::Platform)> {
         // Callers treat `NetworkProxyState` as a live view of policy. We reload-on-demand so edits to
         // `config.toml` (including Codex-managed writes) take effect without a restart.
         self.reload_if_needed().await?;
@@ -588,6 +592,7 @@ impl NetworkProxyState {
         Ok((
             guard.config.clone(),
             guard.brokerage_created_default_allowlist,
+            guard.executor_os,
         ))
     }
 
@@ -786,7 +791,11 @@ impl NetworkProxyState {
         }
 
         let guard = self.state.read().await;
-        if guard.config.dangerously_allow_all_unix_sockets {
+        if guard
+            .config
+            .dangerously_allow_all_unix_sockets
+            .unwrap_or(false)
+        {
             return Ok(true);
         }
 
@@ -930,13 +939,14 @@ impl NetworkProxyState {
 
         loop {
             self.reload_if_needed().await?;
-            let (previous_cfg, constraints, blocked, blocked_total) = {
+            let (previous_cfg, constraints, blocked, blocked_total, executor_os) = {
                 let guard = self.state.read().await;
                 (
                     guard.config.clone(),
                     guard.constraints.clone(),
                     guard.blocked.clone(),
                     guard.blocked_total,
+                    guard.executor_os,
                 )
             };
 
@@ -963,13 +973,17 @@ impl NetworkProxyState {
                 .map_err(NetworkProxyConstraintError::into_anyhow)
                 .with_context(|| format!("{constraint_field} constrained by managed config"))?;
 
-            let mut new_state = build_config_state(candidate.clone(), constraints.clone())
-                .with_context(|| format!("failed to compile updated network {list_name}"))?;
+            let mut new_state =
+                build_config_state(candidate.clone(), constraints.clone(), executor_os)
+                    .with_context(|| format!("failed to compile updated network {list_name}"))?;
             new_state.blocked = blocked;
             new_state.blocked_total = blocked_total;
 
             let mut guard = self.state.write().await;
-            if guard.constraints != constraints || guard.config != previous_cfg {
+            if guard.constraints != constraints
+                || guard.config != previous_cfg
+                || guard.executor_os != executor_os
+            {
                 drop(guard);
                 continue;
             }
@@ -1174,6 +1188,7 @@ pub(crate) fn network_proxy_state_for_policy(
         config.set_allowed_domains(vec!["*".to_string()]);
     }
     let state = ConfigState {
+        executor_os: crate::Platform::native(),
         allow_set: crate::policy::compile_allowlist_globset(
             &config.allowed_domains().unwrap_or_default(),
         )
@@ -1278,12 +1293,20 @@ mod tests {
             enabled: true,
             ..NetworkProxyConfig::default()
         };
-        let initial_state =
-            build_config_state(config.clone(), NetworkProxyConstraints::default()).unwrap();
+        let initial_state = build_config_state(
+            config.clone(),
+            NetworkProxyConstraints::default(),
+            crate::Platform::native(),
+        )
+        .unwrap();
         let mut reloaded_config = config;
         reloaded_config.set_credential_broker_enabled(/*enabled*/ true);
-        let reloaded_state =
-            build_config_state(reloaded_config, NetworkProxyConstraints::default()).unwrap();
+        let reloaded_state = build_config_state(
+            reloaded_config,
+            NetworkProxyConstraints::default(),
+            crate::Platform::native(),
+        )
+        .unwrap();
         let state = NetworkProxyState::with_reloader(
             initial_state,
             Arc::new(StaticReloader {
@@ -1310,6 +1333,7 @@ mod tests {
                 enabled: Some(false),
                 ..NetworkProxyConstraints::default()
             },
+            crate::Platform::native(),
         )
         .expect("managed-disabled credential broker should fail open");
         let state = NetworkProxyState::with_reloader(config_state, Arc::new(NoopReloader));
@@ -1357,8 +1381,12 @@ mod tests {
                 ..NetworkProxyConfig::default()
             };
             config.set_credential_broker_enabled(/*enabled*/ true);
-            let config_state = build_config_state(config, NetworkProxyConstraints::default())
-                .expect("valid credential-broker configuration");
+            let config_state = build_config_state(
+                config,
+                NetworkProxyConstraints::default(),
+                crate::Platform::native(),
+            )
+            .expect("valid credential-broker configuration");
             assert_eq!(config_state.brokerage_created_default_allowlist, !enabled);
             let state = NetworkProxyState::with_reloader(config_state, Arc::new(NoopReloader));
 
@@ -1444,7 +1472,7 @@ mod tests {
             ..NetworkProxyConstraints::default()
         };
         let state = NetworkProxyState::with_reloader(
-            build_config_state(config, constraints).unwrap(),
+            build_config_state(config, constraints, crate::Platform::native()).unwrap(),
             Arc::new(NoopReloader),
         );
 
@@ -1471,7 +1499,7 @@ mod tests {
             ..NetworkProxyConstraints::default()
         };
         let state = NetworkProxyState::with_reloader(
-            build_config_state(config, constraints).unwrap(),
+            build_config_state(config, constraints, crate::Platform::native()).unwrap(),
             Arc::new(NoopReloader),
         );
 
@@ -1496,7 +1524,7 @@ mod tests {
             ..NetworkProxyConstraints::default()
         };
         let state = NetworkProxyState::with_reloader(
-            build_config_state(config, constraints).unwrap(),
+            build_config_state(config, constraints, crate::Platform::native()).unwrap(),
             Arc::new(NoopReloader),
         );
 
@@ -2038,7 +2066,7 @@ mod tests {
 
         let config = NetworkProxyConfig {
             enabled: true,
-            dangerously_allow_all_unix_sockets: true,
+            dangerously_allow_all_unix_sockets: Some(true),
             ..NetworkProxyConfig::default()
         };
 
@@ -2055,7 +2083,7 @@ mod tests {
 
         let config = NetworkProxyConfig {
             enabled: true,
-            dangerously_allow_all_unix_sockets: true,
+            dangerously_allow_all_unix_sockets: Some(true),
             ..NetworkProxyConfig::default()
         };
 
@@ -2071,7 +2099,7 @@ mod tests {
 
         let config = NetworkProxyConfig {
             enabled: true,
-            dangerously_allow_all_unix_sockets: true,
+            dangerously_allow_all_unix_sockets: Some(true),
             ..NetworkProxyConfig::default()
         };
 
@@ -2084,7 +2112,7 @@ mod tests {
 
         let config = NetworkProxyConfig {
             enabled: true,
-            dangerously_allow_all_unix_sockets: true,
+            dangerously_allow_all_unix_sockets: Some(true),
             ..NetworkProxyConfig::default()
         };
 
@@ -2164,7 +2192,14 @@ mod tests {
         let mut config = network_settings(&["*"], &[]);
         config.enabled = true;
 
-        assert!(build_config_state(config, NetworkProxyConstraints::default()).is_ok());
+        assert!(
+            build_config_state(
+                config,
+                NetworkProxyConstraints::default(),
+                crate::Platform::native()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2172,7 +2207,14 @@ mod tests {
         let mut config = network_settings(&["[*]"], &[]);
         config.enabled = true;
 
-        assert!(build_config_state(config, NetworkProxyConstraints::default()).is_ok());
+        assert!(
+            build_config_state(
+                config,
+                NetworkProxyConstraints::default(),
+                crate::Platform::native()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2180,7 +2222,14 @@ mod tests {
         let mut config = network_settings(&["example.com"], &["*"]);
         config.enabled = true;
 
-        assert!(build_config_state(config, NetworkProxyConstraints::default()).is_err());
+        assert!(
+            build_config_state(
+                config,
+                NetworkProxyConstraints::default(),
+                crate::Platform::native()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2188,7 +2237,14 @@ mod tests {
         let mut config = network_settings(&["example.com"], &["[*]"]);
         config.enabled = true;
 
-        assert!(build_config_state(config, NetworkProxyConstraints::default()).is_err());
+        assert!(
+            build_config_state(
+                config,
+                NetworkProxyConstraints::default(),
+                crate::Platform::native()
+            )
+            .is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2244,7 +2300,7 @@ mod tests {
     async fn unix_socket_allow_all_flag_bypasses_allowlist() {
         let state = network_proxy_state_for_policy({
             let mut network = network_settings(&["example.com"], &[]);
-            network.dangerously_allow_all_unix_sockets = true;
+            network.dangerously_allow_all_unix_sockets = Some(true);
             network
         });
 
@@ -2262,7 +2318,7 @@ mod tests {
                 &[],
                 std::slice::from_ref(&socket_path),
             );
-            network.dangerously_allow_all_unix_sockets = true;
+            network.dangerously_allow_all_unix_sockets = Some(true);
             network
         });
 

@@ -134,15 +134,19 @@ impl ChatWidget {
             initial_user_message,
             status_account_display,
             remote_connection: None,
+            snapshot_local_images: false,
+            pending_image_submission: None,
             local_worktree_operations: true,
+            windows_sandbox_local_server: false,
+            windows_sandbox_config: Default::default(),
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Unknown,
+            #[cfg(any(target_os = "windows", test))]
+            windows_sandbox_elevated_setup_complete: false,
             token_info: None,
             token_usage_pending: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             refreshing_status_outputs: Vec::new(),
             next_status_refresh_request_id: 0,
-            refreshing_token_activity_output: None,
-            completed_token_activity_output: None,
-            next_token_activity_request_id: 0,
             pending_rate_limit_reset_request_id: None,
             pending_rate_limit_reset_idempotency_key: None,
             rate_limit_reset_picker_request_id: None,
@@ -271,6 +275,7 @@ impl ChatWidget {
             current_goal_status: None,
             external_editor_state: ExternalEditorState::Closed,
             last_rendered_user_message_display: None,
+            last_rendered_user_message_client_id: None,
             last_non_retry_error: None,
         };
 
@@ -290,7 +295,6 @@ impl ChatWidget {
             .bottom_pane
             .set_collaboration_modes_enabled(/*enabled*/ true);
         widget.sync_service_tier_commands();
-        widget.sync_personality_command_enabled();
         widget.sync_worktrees_enabled();
         widget.sync_plugins_command_enabled();
         widget.sync_goal_command_enabled();
@@ -301,13 +305,6 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_queued_message_edit_binding(widget.queued_message_edit_hint_binding);
-        #[cfg(target_os = "windows")]
-        widget
-            .bottom_pane
-            .set_windows_degraded_sandbox_active(matches!(
-                crate::windows_sandbox::level_from_config(&widget.config),
-                WindowsSandboxLevel::RestrictedToken
-            ));
         widget.update_collaboration_mode_indicator();
 
         widget
@@ -317,10 +314,6 @@ impl ChatWidget {
             .bottom_pane
             .set_token_activity_command_enabled(widget.has_codex_backend_auth);
         widget.refresh_status_surfaces();
-        widget.bottom_pane.set_astra_sparkle(
-            widget.effective_collaboration_mode().model(),
-            &widget.local_settings.tui,
-        );
 
         widget
     }

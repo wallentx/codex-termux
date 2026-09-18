@@ -6,6 +6,46 @@ use codex_config::types::SessionPickerViewMode;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn system_motion_suppresses_animations_without_changing_saved_preferences()
+-> anyhow::Result<()> {
+    use crate::motion::MotionMode;
+
+    for configured in [true, false] {
+        let home = tempfile::tempdir()?;
+        let config_text = format!("[tui]\nanimations = {configured}\nwhimsy = true\n");
+        std::fs::write(home.path().join("config.toml"), &config_text)?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_project_config: true,
+                ..LoaderOverrides::without_managed_config_for_tests()
+            })
+            .build()
+            .await?;
+        let animated = LocalSettings::with_accessibility_preferences(
+            &config,
+            MotionMode::Animated,
+            MotionMode::Animated,
+        );
+        let reduced = LocalSettings::with_accessibility_preferences(
+            &config,
+            MotionMode::Reduced,
+            MotionMode::Animated,
+        );
+        let mut expected = animated.clone();
+        expected.tui.animations = false;
+        assert_eq!(reduced, expected);
+        assert_eq!(animated.tui.animations, configured);
+        assert_eq!(config.animations, configured);
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.toml"))?,
+            config_text
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_load_preserves_defaults_and_resolved_overrides() -> anyhow::Result<()> {
     for config_text in [
         "",
@@ -106,5 +146,34 @@ async fn local_writes_preserve_selected_user_file_and_home_destinations() -> any
         Some("comfortable")
     );
     assert_eq!(home_config["tui"].get("theme"), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn screen_reader_default_yields_to_preferences_on_reload() -> anyhow::Result<()> {
+    use crate::motion::MotionMode;
+
+    let home = tempfile::tempdir()?;
+    for (config_text, expected) in [
+        ("", false),
+        ("[tui]\nanimations = true\n", true),
+        ("[tui]\nanimations = false\n", false),
+    ] {
+        std::fs::write(home.path().join("config.toml"), config_text)?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_project_config: true,
+                ..LoaderOverrides::without_managed_config_for_tests()
+            })
+            .build()
+            .await?;
+        let local = LocalSettings::with_accessibility_preferences(
+            &config,
+            MotionMode::Animated,
+            MotionMode::Reduced,
+        );
+        assert_eq!(local.tui.animations, expected);
+    }
     Ok(())
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::HistoryLookupResponse;
+use codex_app_server_protocol::ImageReference;
 use codex_app_server_protocol::NetworkAccess;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -18,6 +19,7 @@ async fn resumed_initial_messages_render_history() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -132,6 +134,7 @@ async fn restored_conversation_ultra_remains_selected_after_switching_to_plan() 
     chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
 
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -419,6 +422,7 @@ async fn replayed_user_message_preserves_text_elements_and_local_images() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -491,6 +495,7 @@ async fn replayed_user_message_preserves_remote_image_urls() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -523,7 +528,9 @@ async fn replayed_user_message_preserves_remote_image_urls() {
                 text_elements: Vec::new(),
             },
             AppServerUserInput::Image {
-                url: remote_image_urls[0].clone(),
+                image: ImageReference::Inline {
+                    url: remote_image_urls[0].clone(),
+                },
                 detail: None,
             },
         ],
@@ -595,6 +602,7 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
         .expect("permission profile should project to legacy sandbox policy");
     let expected_sandbox = SandboxPolicy::from(expected_core_sandbox);
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -668,6 +676,7 @@ async fn session_configured_preserves_profile_workspace_roots() {
     let session_permission_profile = PermissionProfile::workspace_write()
         .materialize_project_roots_with_workspace_roots(&session_effective_workspace_roots);
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -715,6 +724,7 @@ async fn session_configured_external_sandbox_keeps_external_runtime_policy() {
         network_access: NetworkAccess::Restricted,
     };
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -756,6 +766,7 @@ async fn replayed_user_message_with_only_remote_images_renders_history_cell() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -783,7 +794,9 @@ async fn replayed_user_message_with_only_remote_images_renders_history_cell() {
         &mut chat,
         "user-1",
         vec![AppServerUserInput::Image {
-            url: remote_image_urls[0].clone(),
+            image: ImageReference::Inline {
+                url: remote_image_urls[0].clone(),
+            },
             detail: None,
         }],
         ReplayKind::ResumeInitialMessages,
@@ -814,6 +827,7 @@ async fn replayed_user_message_with_only_local_images_renders_history_cell() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -920,6 +934,63 @@ async fn forked_thread_history_line_without_name_shows_id_once_snapshot() {
     let combined = lines_to_single_string(&history_cell.display_lines(/*width*/ 80));
 
     assert_chatwidget_snapshot!("forked_thread_history_line_without_name", combined);
+}
+
+#[tokio::test]
+async fn prompt_edit_stops_streaming_without_submitting_queued_input() {
+    let (mut chat, _events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+    chat.on_agent_message_delta("removed response".into());
+    chat.queue_user_message("queued follow-up".into());
+    chat.enter_review_mode_with_hint("review".into(), /*from_replay*/ false);
+
+    let retained_turn = AppServerTurn {
+        items: vec![
+            AppServerThreadItem::AgentMessage {
+                id: "retained-response".to_string(),
+                text: "retained response".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+            AppServerThreadItem::UserMessage {
+                id: "voice-steer".to_string(),
+                client_id: None,
+                content: vec![UserInput::Text {
+                    text: "<realtime_delegation><input>voice input</input></realtime_delegation>"
+                        .to_string(),
+                    text_elements: Vec::new(),
+                }],
+            },
+            AppServerThreadItem::AgentMessage {
+                id: "private-commentary".to_string(),
+                text: "hidden voice commentary".to_string(),
+                phase: Some(MessagePhase::Commentary),
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+        ],
+        ..app_server_turn(
+            "retained-turn",
+            AppServerTurnStatus::Completed,
+            /*duration_ms*/ None,
+            /*error*/ None,
+        )
+    };
+    chat.reset_after_prompt_revert(/*rollout_path*/ None, &[retained_turn]);
+    chat.pre_draw_tick();
+
+    assert_eq!(
+        (
+            chat.is_user_turn_pending_or_running(),
+            chat.has_active_stream_tail(),
+            chat.maybe_send_next_queued_input(),
+            chat.last_agent_markdown_text(),
+        ),
+        (false, false, false, Some("retained response")),
+    );
 }
 
 #[tokio::test]
@@ -1111,6 +1182,7 @@ async fn replayed_reasoning_item_preserves_summary_parts_and_hides_raw_reasoning
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.show_raw_agent_reasoning = false;
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -1162,6 +1234,7 @@ async fn replayed_reasoning_item_shows_raw_reasoning_when_enabled() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.show_raw_agent_reasoning = true;
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -1218,6 +1291,7 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
             arguments: json!({"action": "wait"}),
             app_context: None,
             mcp_app_resource_uri: None,
+            mcp_app_ui: None,
             plugin_id: None,
             read_only_hint: None,
             result: None,
@@ -1253,6 +1327,7 @@ async fn failed_repl_mcp_tool_call_preserves_status_and_result() {
                     arguments: json!({"title": "Inspect workspace"}),
                     app_context: None,
                     mcp_app_resource_uri: None,
+                    mcp_app_ui: None,
                     plugin_id: None,
                     read_only_hint: None,
                     result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
@@ -1282,7 +1357,7 @@ async fn failed_repl_mcp_tool_call_preserves_status_and_result() {
         }
         insta::allow_duplicates! {
             insta::assert_snapshot!(lines_to_single_string(lines), @r#"
-            • Called Inspect workspace
+            • Inspect workspace
               └ Script failed
                 {"exit_code": 0, "output": "ready", "chunk_id": "chunk-1"}
                 Script error:
@@ -1293,8 +1368,6 @@ async fn failed_repl_mcp_tool_call_preserves_status_and_result() {
             lines.first(),
             Some(&Line::from(vec![
                 "•".red().bold(),
-                " ".into(),
-                "Called".bold(),
                 " ".into(),
                 "Inspect workspace".cyan(),
             ])),
@@ -1321,6 +1394,7 @@ async fn deferred_mcp_lifecycle_events_keep_fifo_after_stream_finishes() {
         arguments: json!({"action": "wait"}),
         app_context: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         plugin_id: None,
         read_only_hint: None,
         result: None,
@@ -1338,6 +1412,7 @@ async fn deferred_mcp_lifecycle_events_keep_fifo_after_stream_finishes() {
         arguments: json!({"action": "wait"}),
         app_context: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         plugin_id: None,
         read_only_hint: None,
         result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
@@ -1603,13 +1678,11 @@ async fn thread_snapshot_replayed_stream_recovery_restores_previous_status_heade
 
     replay_agent_message_delta(&mut chat, "hello", ReplayKind::ThreadSnapshot);
 
-    let status = chat
-        .bottom_pane
-        .status_widget()
-        .expect("status indicator should be visible");
-    assert_eq!(status.header(), "Working");
-    assert_eq!(status.details(), None);
+    assert_eq!(chat.status_state.current_status.header, "Working");
+    assert_eq!(chat.status_state.current_status.details, None);
     assert!(chat.status_state.retry_status_header.is_none());
+    assert!(chat.bottom_pane.status_widget().is_none());
+    assert!(chat.active_cell_is_stream_tail());
 }
 
 #[tokio::test]
@@ -1625,11 +1698,9 @@ async fn stream_recovery_restores_previous_status_header() {
     drain_insert_history(&mut rx);
     handle_agent_message_delta(&mut chat, "hello");
 
-    let status = chat
-        .bottom_pane
-        .status_widget()
-        .expect("status indicator should be visible");
-    assert_eq!(status.header(), "Working");
-    assert_eq!(status.details(), None);
+    assert_eq!(chat.status_state.current_status.header, "Working");
+    assert_eq!(chat.status_state.current_status.details, None);
     assert!(chat.status_state.retry_status_header.is_none());
+    assert!(chat.bottom_pane.status_widget().is_none());
+    assert!(chat.active_cell_is_stream_tail());
 }

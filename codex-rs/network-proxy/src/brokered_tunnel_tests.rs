@@ -172,7 +172,12 @@ impl TestProxy {
             ..NetworkProxyConfig::default()
         };
         config.set_allowed_domains(vec!["127.0.0.1".to_string()]);
-        let config_state = build_config_state(config, NetworkProxyConstraints::default()).unwrap();
+        let config_state = build_config_state(
+            config,
+            NetworkProxyConstraints::default(),
+            crate::Platform::native(),
+        )
+        .unwrap();
         let state = Arc::new(NetworkProxyState::with_reloader(
             config_state.clone(),
             Arc::new(StaticReloader(config_state)),

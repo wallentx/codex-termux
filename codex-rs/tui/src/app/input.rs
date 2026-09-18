@@ -56,6 +56,18 @@ impl App {
     ) -> Option<KeyEvent> {
         let contexts = self.active_keymap_contexts();
         let was_pending = self.key_chord_matcher.is_pending();
+        if !was_pending
+            && contexts.contains(crate::keymap::KeymapContext::Agents)
+            && self
+                .agents_overview
+                .view_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .editing_metadata()
+            && crate::key_hint::is_plain_text_key_event(key_event)
+        {
+            return Some(key_event);
+        }
         match self.key_chord_matcher.advance(
             key_event,
             &self.keymap.chords,
@@ -251,6 +263,13 @@ impl App {
             && key_event.kind == KeyEventKind::Press
         {
             let modifiers = key_event.modifiers;
+            if key_event.code == KeyCode::Esc
+                && modifiers == KeyModifiers::NONE
+                && !matches!(self.app_server_target, AppServerTarget::Embedded)
+            {
+                self.open_agents_overview(app_server);
+                return;
+            }
             let quit = match key_event.code {
                 KeyCode::Esc => modifiers == KeyModifiers::NONE,
                 KeyCode::Char('q' | 'Q') => {
@@ -279,7 +298,11 @@ impl App {
                     cwd: None,
                     history_mode: None,
                 };
-                let _ = self.resume_target_session(tui, app_server, target).await;
+                if let Ok(AppRunControl::Exit(_)) =
+                    self.resume_target_session(tui, app_server, target).await
+                {
+                    self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+                }
                 return;
             }
         }
@@ -446,6 +469,7 @@ impl App {
             // Esc so the active UI (e.g. status indicator, modals, popups)
             // handles it.
             if self.should_handle_backtrack_esc(key_event) {
+                self.chat_widget.prepare_composer_sparkle_key(key_event);
                 self.handle_backtrack_esc_key(tui);
             } else if self.should_reject_side_backtrack_esc(key_event) {
                 self.reject_side_backtrack_esc();

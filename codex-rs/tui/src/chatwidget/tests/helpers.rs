@@ -212,6 +212,8 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         session_telemetry,
     };
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
+    widget.windows_sandbox_host = crate::app::WindowsSandboxHost::Local;
+    widget.windows_sandbox_config.requirements = Some(None);
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
     widget.set_model(&resolved_model);
@@ -343,13 +345,29 @@ pub(super) fn drain_insert_history(
     drain_insert_history_with(rx, |cell| cell.display_lines(/*width*/ 80))
 }
 
+pub(super) fn drain_insert_history_normalized(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| {
+        cell.display_lines(/*width*/ 80)
+            .into_iter()
+            .map(|mut line| {
+                if cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+                    line.spans = vec![normalize_completion_timestamps(cell, &line).into()];
+                }
+                line
+            })
+            .collect()
+    })
+}
+
 pub(super) fn drain_insert_history_transcript(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
     drain_insert_history_with(rx, |cell| cell.transcript_lines(/*width*/ 80))
 }
 
-fn drain_insert_history_with(
+pub(super) fn drain_insert_history_with(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     render: impl Fn(&dyn HistoryCell) -> Vec<ratatui::text::Line<'static>>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
@@ -883,6 +901,7 @@ pub(super) fn begin_exec_with_source(
         .map(|parsed| AppServerCommandAction::from_core_with_cwd(parsed, &chat.config.cwd))
         .collect();
     let item = AppServerThreadItem::CommandExecution {
+        model_context: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -908,6 +927,7 @@ pub(super) fn begin_unified_exec_startup(
 ) -> AppServerThreadItem {
     let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
     let item = AppServerThreadItem::CommandExecution {
+        model_context: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -1142,6 +1162,7 @@ pub(super) fn end_exec(
     handle_exec_end(
         chat,
         AppServerThreadItem::CommandExecution {
+            model_context: None,
             id,
             command,
             cwd,
@@ -1763,11 +1784,17 @@ pub(super) async fn assert_hook_events_snapshot(
     assert_chatwidget_snapshot!(snapshot_name, combined);
 }
 
-/// Normalize complete footer lines only, in snapshots that opt into clock normalization.
-pub(crate) fn normalize_completion_timestamps(value: impl std::fmt::Display) -> String {
+/// Normalize timestamps only in structurally identified completion footer cells.
+pub(crate) fn normalize_completion_timestamps(
+    cell: &dyn HistoryCell,
+    value: impl std::fmt::Display,
+) -> String {
+    if !cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+        return value.to_string();
+    }
     static COMPLETION_FOOTER: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(
         || {
-            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s · )?done (?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)(?P<padding>[ \t]*)$")
+            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s · )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)(?P<padding>[ \t]*)$")
                 .expect("valid completion footer pattern")
         },
     );
@@ -1780,7 +1807,7 @@ pub(crate) fn normalize_completion_timestamps(value: impl std::fmt::Display) -> 
             } else {
                 ""
             };
-            format!("{indent}{duration}done [completion time]{padding}")
+            format!("{indent}{duration}[completion time]{padding}")
         })
         .into_owned()
 }

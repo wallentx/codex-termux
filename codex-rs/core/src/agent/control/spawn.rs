@@ -1,10 +1,12 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
+use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::role::apply_role_to_config;
 use crate::codex_thread::CodexThread;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
+use crate::context::CurrentTimeUnavailable;
 use crate::context::DeveloperInstructions;
 use crate::context::GuardianContextMode;
 use crate::context::ManagedDeveloperInstructions;
@@ -12,11 +14,11 @@ use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::world_state::PersistentModeState;
 use crate::session::multi_agents::resolve_usage_hints;
-use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
 use codex_history::ResponseItemEnvelope;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
@@ -135,6 +137,7 @@ fn retain_forked_developer_message(
                 ))
             || MultiAgentModeInstructions::matches_text(text)
             || CurrentTimeReminder::matches_text(text)
+            || CurrentTimeUnavailable::matches_text(text)
             || usage_hint_texts
                 .iter()
                 .any(|usage_hint_text| usage_hint_text == text))
@@ -319,18 +322,13 @@ impl AgentControl {
         parent: Option<Arc<CodexThread>>,
     ) -> CodexResult<()> {
         let state = self.upgrade()?;
-        let parent = if let Some(parent) = parent {
+        let owner_thread_id = parent.as_ref().map(|parent| parent.session.thread_id);
+        if let Some(parent) = &parent {
             let parent_thread_id = parent.session.thread_id;
-            let turn = parent.session.new_default_turn().await;
-            config = build_agent_resume_config(&turn).map_err(|_| {
-                CodexErr::InvalidRequest(format!(
-                    "cannot resume multi-agent v2 child {thread_id} with the current parent settings"
-                ))
-            })?;
             let registered_parent = state.get_thread(parent_thread_id).await.ok();
             if !registered_parent
                 .as_ref()
-                .is_some_and(|registered| Arc::ptr_eq(registered, &parent))
+                .is_some_and(|registered| Arc::ptr_eq(registered, parent))
                 || !parent.is_running()
                 || parent.multi_agent_version() != Some(MultiAgentVersion::V2)
                 || !Arc::ptr_eq(&self.state, &parent.session.services.agent_control.state)
@@ -339,11 +337,7 @@ impl AgentControl {
                     "cannot resume multi-agent v2 child {thread_id}: parent ownership is unavailable; resume the parent first"
                 )));
             }
-            Some((parent, turn.environments.clone()))
-        } else {
-            None
-        };
-        let owner_thread_id = parent.as_ref().map(|(parent, _)| parent.session.thread_id);
+        }
         if owner_thread_id.is_none() && state.get_thread(thread_id).await.is_ok() {
             self.touch_loaded_v2_residency(&state, thread_id).await;
             return Ok(());
@@ -397,6 +391,20 @@ impl AgentControl {
                 return Ok(());
             }
         }
+        let parent = if let Some(parent) = parent {
+            let turn = parent
+                .session
+                .new_turn_with_default_settings(Uuid::now_v7().to_string(), Default::default())
+                .await;
+            config = build_agent_resume_config(&turn).map_err(|_| {
+                CodexErr::InvalidRequest(format!(
+                    "cannot resume multi-agent v2 child {thread_id} with the current parent settings"
+                ))
+            })?;
+            Some((parent, turn.environments.clone()))
+        } else {
+            None
+        };
         config.model_reasoning_effort = stored_reasoning_effort;
         if let Some(role_name) = session_source.get_agent_role() {
             let runtime_approval_policy = config.permissions.approval_policy.value();
@@ -557,7 +565,17 @@ impl AgentControl {
                 None,
             )
         };
-        // Reserving a slot can evict an idle nested parent. Keep its authority captured above.
+        let inherited_instructions = if let Some((parent, _)) = parent.as_ref() {
+            Some(parent.session.inherited_instructions().await)
+        } else if let Some(parent_thread_id) = parent_thread_id
+            && let Ok(parent) = state.get_thread(parent_thread_id).await
+        {
+            Some(parent.session.inherited_instructions().await)
+        } else {
+            None
+        };
+        // Reserving a slot can evict an idle nested parent. Capture its instructions
+        // alongside its authority so the child does not depend on a later live lookup.
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, Some(thread_id))
             .await?;
@@ -571,6 +589,7 @@ impl AgentControl {
                 parent_thread_id,
                 environment_selections,
                 inherited_environments,
+                inherited_instructions,
                 inherited_exec_policy,
                 client_mcp_extensions,
             })
@@ -765,6 +784,7 @@ impl AgentControl {
 
         let start_options = TurnStartOptions {
             parent_turn_id: options.parent_turn_id,
+            turn_trigger: options.turn_trigger,
             root_turn_id: options.root_turn_id,
             cyber_access_program: options.cyber_access_program,
             ..Default::default()
@@ -903,7 +923,7 @@ impl AgentControl {
                 let parent_config = parent_thread.session.get_config().await;
                 let parent_usage_hints = resolve_usage_hints(
                     &parent_config.multi_agent_v2,
-                    /*catalog*/ None,
+                    ResolvedModelMessages::bundled().multi_agent(),
                     !parent_config.update_plan_enabled,
                 );
                 [parent_usage_hints.root, parent_usage_hints.subagent]
@@ -945,6 +965,11 @@ impl AgentControl {
                     .metadata
                     .get_or_insert_default()
                     .inherited_user_message = true;
+            }
+            if let Some(metadata) = &mut envelope.metadata
+                && metadata.sender_user_messages.take().is_some()
+            {
+                metadata.user_input_order = None;
             }
             let response_item = &mut envelope.item;
             if matches!(response_item, ResponseItem::AgentMessage { .. }) {
@@ -1091,7 +1116,7 @@ impl AgentControl {
                 .unwrap_or_else(|| {
                     resolve_usage_hints(
                         &config.multi_agent_v2,
-                        /*catalog*/ None,
+                        ResolvedModelMessages::bundled().multi_agent(),
                         !config.update_plan_enabled,
                     )
                     .subagent
@@ -1276,6 +1301,7 @@ impl AgentControl {
                 parent_thread_id,
                 environment_selections: None,
                 inherited_environments,
+                inherited_instructions: None,
                 inherited_exec_policy,
                 client_mcp_extensions: None,
             })

@@ -155,6 +155,13 @@
           ],
           "description": "Per-account approval settings keyed by link ID."
         },
+        "omit_tools_from": {
+          "description": "Model-facing surfaces from which this connector's tools must be omitted, in addition to any server-level omissions. `None` leaves lower-priority configuration unchanged; an empty list clears connector-level omissions.",
+          "items": {
+            "$ref": "#/definitions/ToolExposureSurface"
+          },
+          "type": "array"
+        },
         "open_world_enabled": {
           "description": "Whether tools with `open_world_hint = true` are allowed for this app.",
           "type": "boolean"
@@ -383,6 +390,10 @@
     },
     "AutoReviewToml": {
       "properties": {
+        "experimental_policy_template": {
+          "description": "Experimental full Guardian prompt template containing the tenant policy placeholder.",
+          "type": "string"
+        },
         "policy": {
           "description": "Additional policy instructions inserted into the guardian prompt.",
           "type": "string"
@@ -519,6 +530,10 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "experimental_show_cell_overhead": {
+          "description": "Show handler duration, code-mode host duration, and harness overhead in each code-mode cell response. Experimental: this option and the response format may change or be removed.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -631,6 +646,9 @@
           "default": null,
           "description": "Optional feature toggles scoped to this profile.",
           "properties": {
+            "analytics_plan_history": {
+              "type": "boolean"
+            },
             "api_key_model_discovery": {
               "type": "boolean"
             },
@@ -741,6 +759,9 @@
               "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
             },
             "cwd_relative_turn_diffs": {
+              "type": "boolean"
+            },
+            "daemon_auto_start": {
               "type": "boolean"
             },
             "default_mode_request_user_input": {
@@ -887,6 +908,9 @@
             "non_prefixed_mcp_tool_names": {
               "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
             },
+            "nonfatal_clock_read_errors": {
+              "type": "boolean"
+            },
             "omit_app_server_notification_media": {
               "type": "boolean"
             },
@@ -969,6 +993,9 @@
               "type": "boolean"
             },
             "send_async_message": {
+              "type": "boolean"
+            },
+            "send_message_to_user_async": {
               "type": "boolean"
             },
             "shell_snapshot": {
@@ -1073,6 +1100,9 @@
             "use_linux_sandbox_bwrap": {
               "type": "boolean"
             },
+            "use_xaa": {
+              "type": "boolean"
+            },
             "view_image": {
               "type": "boolean"
             },
@@ -1151,7 +1181,12 @@
           "type": "string"
         },
         "personality": {
-          "$ref": "#/definitions/Personality"
+          "allOf": [
+            {
+              "$ref": "#/definitions/Personality"
+            }
+          ],
+          "description": "Deprecated: `friendly` and `pragmatic` no longer select a style."
         },
         "plan_mode_reasoning_effort": {
           "$ref": "#/definitions/ReasoningEffort"
@@ -1607,7 +1642,7 @@
           "type": "boolean"
         },
         "free_guardian": {
-          "description": "Route Guardian review and classification through the unmetered Codex endpoints.",
+          "description": "Legacy setting retained for config compatibility; the backend now controls Guardian billing.",
           "type": "boolean"
         },
         "max_action_tokens": {
@@ -2073,8 +2108,25 @@
       },
       "type": "object"
     },
+    "McpEnterpriseManagedAuthConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "idp": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpServerIdpOAuthConfig"
+            }
+          ],
+          "description": "Shared enterprise authorization, independent of Codex account credentials."
+        }
+      },
+      "required": [
+        "idp"
+      ],
+      "type": "object"
+    },
     "McpServerAuth": {
-      "description": "Authentication flow Codex attempts after resolving an HTTP MCP server's configured bearer token and authorization headers, which always take precedence. ChatGPT authentication falls back to stored OAuth credentials when its session provider is unavailable; both modes ultimately fall back to an unauthenticated connection.",
+      "description": "Authentication flow for an HTTP MCP server. Explicit credentials take precedence for OAuth and ChatGPT; EMA rejects alternate credentials and fallback.",
       "oneOf": [
         {
           "description": "Use stored MCP OAuth credentials when available. Starting an OAuth login is a separate operation.",
@@ -2087,6 +2139,13 @@
           "description": "Use the current ChatGPT session for servers on the trusted first-party ChatGPT origin. If no ChatGPT session provider is available, startup can still fall back to stored OAuth credentials.",
           "enum": [
             "chatgpt"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Exchange an enterprise IdP refresh token for resource-specific authorization. Alternate credentials and ordinary OAuth fallback are not permitted.",
+          "enum": [
+            "ema_auth"
           ],
           "type": "string"
         }
@@ -2114,10 +2173,32 @@
         }
       ]
     },
+    "McpServerIdpOAuthConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "client_id": {
+          "description": "Public OAuth client registered with that enterprise IdP.",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "Issuer used for enterprise OAuth discovery and identity validation.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_id",
+        "issuer"
+      ],
+      "type": "object"
+    },
     "McpServerOAuthConfig": {
       "additionalProperties": false,
-      "description": "OAuth client settings used when Codex launches an MCP OAuth flow.",
+      "description": "Client settings for MCP OAuth login or enterprise token exchange.",
       "properties": {
+        "authorization_server_issuer": {
+          "description": "Expected resource authorization server issuer for EMA token exchange.",
+          "type": "string"
+        },
         "callback_port": {
           "description": "Fixed callback port that takes precedence over Codex's global OAuth callback port.",
           "format": "uint16",
@@ -3141,6 +3222,7 @@
       "type": "object"
     },
     "Personality": {
+      "description": "Deprecated: `friendly` and `pragmatic` no longer select a style.",
       "enum": [
         "none",
         "friendly",
@@ -3167,7 +3249,7 @@
     },
     "PluginMcpServerConfig": {
       "additionalProperties": false,
-      "description": "Policy settings for a plugin-provided MCP server.\n\nThis intentionally excludes transport settings: plugin manifests own how the MCP server is launched, while user config owns enablement and tool policy.",
+      "description": "Policy settings for a plugin-provided MCP server.\n\nThis intentionally excludes transport settings: plugin manifests own how the MCP server is launched, while host config owns enablement, auth, and tool policy.",
       "properties": {
         "default_tools_approval_mode": {
           "allOf": [
@@ -3183,6 +3265,14 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "ema_auth": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PluginMcpServerEmaAuthConfig"
+            }
+          ],
+          "description": "Host-configured EMA registration; the plugin still owns its endpoint."
         },
         "enabled": {
           "default": true,
@@ -3204,6 +3294,39 @@
           "type": "object"
         }
       },
+      "type": "object"
+    },
+    "PluginMcpServerEmaAuthConfig": {
+      "additionalProperties": false,
+      "description": "Resource registration applied through an existing per-plugin policy overlay. The enterprise IdP is selected separately by trusted host configuration.",
+      "properties": {
+        "authorization_server_issuer": {
+          "type": "string"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "resource": {
+          "type": "string"
+        },
+        "scopes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "url": {
+          "description": "Exact plugin endpoint approved by the host; never overrides the declaration.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authorization_server_issuer",
+        "client_id",
+        "resource",
+        "url"
+      ],
       "type": "object"
     },
     "ProfileTui": {
@@ -3997,6 +4120,7 @@
               "delete": null,
               "hide": null,
               "new_task": null,
+              "new_worktree": null,
               "rename": null,
               "resume": null,
               "search": null,
@@ -4022,6 +4146,7 @@
               "previous_permission_mode": null,
               "prompt_stack_back": null,
               "skip_question": null,
+              "toggle_voice": null,
               "toggle_voice_mute": null
             },
             "composer": {
@@ -4237,6 +4362,10 @@
           "default": null,
           "description": "Working directory to use when resuming or forking a session. When unset, prompt if the current and session directories differ."
         },
+        "screen_reader_detection_done": {
+          "description": "Records the one-time screen-reader detection attempt. Either value skips detection.",
+          "type": "boolean"
+        },
         "session_picker_view": {
           "allOf": [
             {
@@ -4336,7 +4465,15 @@
               "$ref": "#/definitions/KeybindingsSpec"
             }
           ],
-          "description": "Start composing a new agent task."
+          "description": "Open a new session in the selected checkout."
+        },
+        "new_worktree": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Open a new session in a worktree from the project default branch."
         },
         "rename": {
           "allOf": [
@@ -4519,6 +4656,14 @@
             }
           ],
           "description": "Skip the focused question."
+        },
+        "toggle_voice": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Start or stop a voice conversation."
         },
         "toggle_voice_mute": {
           "allOf": [
@@ -4839,6 +4984,7 @@
             "delete": null,
             "hide": null,
             "new_task": null,
+            "new_worktree": null,
             "rename": null,
             "resume": null,
             "search": null,
@@ -4878,6 +5024,7 @@
             "previous_permission_mode": null,
             "prompt_stack_back": null,
             "skip_question": null,
+            "toggle_voice": null,
             "toggle_voice_mute": null
           }
         },
@@ -5955,7 +6102,8 @@
     "WindowsSandboxModeToml": {
       "enum": [
         "elevated",
-        "unelevated"
+        "unelevated",
+        "mxc"
       ],
       "type": "string"
     },
@@ -5966,7 +6114,7 @@
           "$ref": "#/definitions/WindowsSandboxModeToml"
         },
         "sandbox_private_desktop": {
-          "description": "Defaults to `true`. Set to `false` to launch the final sandboxed child process on `Winsta0\\\\Default` instead of a private desktop.",
+          "description": "Defaults to `true` for legacy sandboxes and `false` for MXC. Set to `false` to launch the final sandboxed child process on `Winsta0\\\\Default`.",
           "type": "boolean"
         }
       },
@@ -6156,6 +6304,9 @@
       "default": null,
       "description": "Centralized feature flags (new). Prefer this over individual toggles.",
       "properties": {
+        "analytics_plan_history": {
+          "type": "boolean"
+        },
         "api_key_model_discovery": {
           "type": "boolean"
         },
@@ -6266,6 +6417,9 @@
           "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
         },
         "cwd_relative_turn_diffs": {
+          "type": "boolean"
+        },
+        "daemon_auto_start": {
           "type": "boolean"
         },
         "default_mode_request_user_input": {
@@ -6412,6 +6566,9 @@
         "non_prefixed_mcp_tool_names": {
           "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
         },
+        "nonfatal_clock_read_errors": {
+          "type": "boolean"
+        },
         "omit_app_server_notification_media": {
           "type": "boolean"
         },
@@ -6494,6 +6651,9 @@
           "type": "boolean"
         },
         "send_async_message": {
+          "type": "boolean"
+        },
+        "send_message_to_user_async": {
           "type": "boolean"
         },
         "shell_snapshot": {
@@ -6596,6 +6756,9 @@
           "type": "boolean"
         },
         "use_linux_sandbox_bwrap": {
+          "type": "boolean"
+        },
+        "use_xaa": {
           "type": "boolean"
         },
         "view_image": {
@@ -6739,6 +6902,15 @@
       "default": {},
       "description": "User-level marketplace entries keyed by marketplace name.",
       "type": "object"
+    },
+    "mcp_enterprise_managed_auth": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpEnterpriseManagedAuthConfig"
+        }
+      ],
+      "default": null,
+      "description": "Trusted enterprise IdP shared by EMA-enabled MCP servers and plugins."
     },
     "mcp_oauth_callback_port": {
       "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS.",
@@ -6900,7 +7072,7 @@
           "$ref": "#/definitions/Personality"
         }
       ],
-      "description": "Optionally specify a personality for the model"
+      "description": "Deprecated: `friendly` and `pragmatic` no longer select a style."
     },
     "plan_mode_reasoning_effort": {
       "$ref": "#/definitions/ReasoningEffort"

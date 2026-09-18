@@ -3038,8 +3038,6 @@ async fn apps_popup_for_not_installed_app_uses_install_only_selected_description
 async fn experimental_features_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    let worktrees = Feature::Worktrees.stage();
-    let voice = Feature::RealtimeConversation.stage();
     let features = vec![
         ExperimentalFeatureItem {
             key: Feature::JsRepl.key().to_string(),
@@ -3056,17 +3054,10 @@ async fn experimental_features_popup_snapshot() {
             enabled: true,
         },
         ExperimentalFeatureItem {
-            key: Feature::Worktrees.key().to_string(),
-            writable: true,
-            name: worktrees.experimental_menu_name().unwrap().to_string(),
-            description: worktrees.experimental_menu_description().unwrap().to_string(),
-            enabled: false,
-        },
-        ExperimentalFeatureItem {
             key: Feature::RealtimeConversation.key().to_string(),
             writable: true,
-            name: voice.experimental_menu_name().unwrap().to_string(),
-            description: voice.experimental_menu_description().unwrap().to_string(),
+            name: "Voice conversations".to_string(),
+            description: "Talk with Codex using /voice.".to_string(),
             enabled: false,
         },
     ];
@@ -3599,16 +3590,6 @@ async fn model_picker_refresh_dismisses_empty_choices() {
 }
 
 #[tokio::test]
-async fn personality_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
-    chat.thread_id = Some(ThreadId::new());
-    chat.open_personality_popup();
-
-    let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert_chatwidget_snapshot!("personality_selection_popup", popup);
-}
-
-#[tokio::test]
 async fn skills_menu_default_mentions_shortcut_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.open_skills_menu();
@@ -3636,6 +3617,7 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         is_default: false,
         upgrade: None,
         show_in_picker,
@@ -4120,6 +4102,7 @@ async fn single_reasoning_option_skips_selection() {
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         is_default: false,
         upgrade: None,
         show_in_picker: true,

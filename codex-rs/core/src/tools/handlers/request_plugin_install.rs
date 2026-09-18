@@ -114,6 +114,12 @@ impl RequestPluginInstallHandler {
             }
         };
 
+        if turn.session_source.is_non_root_agent() {
+            return Err(FunctionCallError::RespondToModel(
+                "request_plugin_install can only be used by the root thread".to_string(),
+            ));
+        }
+
         let (requested_tool_id, requested_tool_type, suggest_reason) = match self.presentation {
             ToolSuggestPresentation::ListTool => {
                 let args: RequestPluginInstallArgs = parse_arguments(&arguments)?;
@@ -248,7 +254,8 @@ impl RequestPluginInstallHandler {
                 request_id,
                 request,
             )
-            .await;
+            .await
+            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
         let response = elicitation.response;
         if let Some(response) = response.as_ref() {
             maybe_persist_disabled_install_request(&session, &turn, &tool, response).await;

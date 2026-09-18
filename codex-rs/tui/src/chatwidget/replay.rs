@@ -102,6 +102,9 @@ impl ChatWidget {
     /// avoid triggering side effects. Event ids are passed as `None` to
     /// distinguish replayed events from live ones.
     pub(crate) fn replay_thread_turns(&mut self, turns: Vec<Turn>, replay_kind: ReplayKind) {
+        if !turns.is_empty() || matches!(replay_kind, ReplayKind::ThreadSnapshot) {
+            self.bottom_pane.dismiss_composer_sparkle();
+        }
         if matches!(replay_kind, ReplayKind::ThreadSnapshot) && !turns.is_empty() {
             self.warning_display_state.startup_complete = true;
         }
@@ -112,6 +115,7 @@ impl ChatWidget {
             }))
             .collect::<Vec<_>>();
         for (turn, hidden_nested_review_turn) in turns.into_iter().zip(hidden_nested_review_turns) {
+            self.restore_realtime_transcripts_before_turn(&turn.id);
             // Defer completed metadata-only turns until their page loads. Active
             // turns must restore their lifecycle even before any items are available.
             if turn.status == TurnStatus::Completed

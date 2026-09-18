@@ -84,6 +84,7 @@ async fn check_for_update(
     .with_legacy_custom_ca_fallback();
     let latest_version = match action {
         Some(UpdateAction::TermuxSelfUpdate) => termux_update::latest_release_version().await?,
+        Some(UpdateAction::Daemon(_)) => return Ok(()),
         Some(UpdateAction::BrewUpgrade) => {
             let HomebrewCaskInfo { version } = client_pool
                 .get(HOMEBREW_CASK_API_URL)

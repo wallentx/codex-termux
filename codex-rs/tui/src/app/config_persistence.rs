@@ -6,14 +6,6 @@
 
 use super::*;
 use codex_config::ConfigLayerSource;
-#[cfg(target_os = "windows")]
-use codex_utils_approval_presets::ApprovalPreset;
-
-#[cfg(target_os = "windows")]
-pub(super) struct WindowsSetupPermissions {
-    pub(super) permission_profile: PermissionProfile,
-    pub(super) workspace_roots: Vec<AbsolutePathBuf>,
-}
 
 async fn build_config_on_runtime_worker(
     builder: ConfigBuilder,
@@ -127,29 +119,6 @@ impl App {
         .await
     }
 
-    #[cfg(target_os = "windows")]
-    pub(super) async fn windows_setup_permissions(
-        &self,
-        preset: &ApprovalPreset,
-        profile_selection: Option<&PermissionProfileSelection>,
-    ) -> Result<WindowsSetupPermissions> {
-        match profile_selection {
-            Some(selection) => {
-                let selected_config = self
-                    .rebuild_config_for_permission_profile(selection.profile_id.as_str())
-                    .await?;
-                Ok(WindowsSetupPermissions {
-                    permission_profile: selected_config.permissions.permission_profile().clone(),
-                    workspace_roots: selected_config.effective_workspace_roots(),
-                })
-            }
-            None => Ok(WindowsSetupPermissions {
-                permission_profile: preset.permission_profile.clone(),
-                workspace_roots: self.config.effective_workspace_roots(),
-            }),
-        }
-    }
-
     pub(super) async fn apply_permission_profile_selection(
         &mut self,
         selection: PermissionProfileSelection,
@@ -243,6 +212,11 @@ impl App {
             self.chat_widget.set_approvals_reviewer(reviewer);
         }
         self.chat_widget.set_permission_network(network);
+        if let Some(thread_id) = self.chat_widget.thread_id() {
+            self.agents_overview
+                .selected_permission_profiles
+                .insert(thread_id, profile_id.clone());
+        }
         self.runtime_permission_profile_override =
             Some(RuntimePermissionProfileOverride::from_config(&self.config));
         self.sync_active_thread_permission_settings_to_cached_session()
@@ -254,7 +228,6 @@ impl App {
                 approvals_reviewer,
                 Some(permission_profile.clone()),
                 active_permission_profile,
-                /*windows_sandbox_level*/ None,
                 /*model*/ None,
                 /*effort*/ None,
                 /*summary*/ None,
@@ -279,7 +252,7 @@ impl App {
         if self.reject_pending_permission_change() {
             return;
         }
-        if selection.profile_id.starts_with(':')
+        if (self.chat_widget.thread_id().is_none() && selection.profile_id.starts_with(':'))
             || (app_server.thread_params_mode()
                 == crate::app_server_session::ThreadParamsMode::Embedded
                 && self
@@ -301,7 +274,9 @@ impl App {
             );
             return;
         };
-        if self.chat_widget.is_user_turn_pending_or_running() {
+        if !selection.profile_id.starts_with(':')
+            && self.chat_widget.is_user_turn_pending_or_running()
+        {
             self.chat_widget
                 .retain_input_after_failed_permission_selection();
             self.chat_widget.add_error_message(
@@ -321,6 +296,10 @@ impl App {
                 .approvals_reviewer
                 .is_none_or(|reviewer| config.approvals_reviewer == reviewer)
         {
+            self.agents_overview
+                .selected_permission_profiles
+                .insert(thread_id, selection.profile_id);
+            self.chat_widget.submit_initial_user_message_if_pending();
             return;
         }
         let params = ThreadSettingsUpdateParams {
@@ -332,6 +311,9 @@ impl App {
         };
         match app_server.thread_settings_update(params).await {
             Ok(true) => {
+                self.agents_overview
+                    .selected_permission_profiles
+                    .insert(thread_id, selection.profile_id.clone());
                 self.pending_server_profiles
                     .insert(thread_id, selection.clone());
                 self.chat_widget.add_info_message(
@@ -347,13 +329,13 @@ impl App {
                 self.chat_widget
                     .retain_input_after_failed_permission_selection();
                 self.chat_widget
-                    .add_error_message("Named profiles require a newer app server.".into());
+                    .add_error_message("Permission selection requires a newer app server.".into());
             }
             Err(error) => {
                 self.chat_widget
                     .retain_input_after_failed_permission_selection();
                 self.chat_widget
-                    .add_error_message(format!("Failed to select permissions: {error}"));
+                    .add_error_message(format!("Failed to select permissions: {error:#}"));
             }
         }
     }
@@ -370,6 +352,19 @@ impl App {
             return true;
         }
         false
+    }
+
+    pub(super) fn reject_pending_permission_root_switch(&mut self) -> bool {
+        if !self
+            .pending_server_profiles
+            .keys()
+            .any(|thread_id| !self.thread_unavailable(*thread_id))
+        {
+            return false;
+        }
+        self.chat_widget
+            .add_error_message("Wait for permissions to update before switching tasks.".into());
+        true
     }
 
     pub(super) fn confirmed_server_profile(
@@ -608,12 +603,6 @@ impl App {
 
         let auto_review_preset = auto_review_mode();
         let mut next_config = self.config.clone();
-        let windows_sandbox_changed = updates.iter().any(|(feature, _)| {
-            matches!(
-                feature,
-                Feature::WindowsSandbox | Feature::WindowsSandboxElevated
-            )
-        });
         let mut approval_policy_override = None;
         let mut approvals_reviewer_override = None;
         let mut permission_profile_override = None;
@@ -753,9 +742,6 @@ impl App {
                     &feature_updates_to_apply,
                 )
                 .await;
-                if windows_sandbox_changed {
-                    self.propagate_windows_sandbox_turn_context();
-                }
             }
             return;
         }
@@ -823,7 +809,6 @@ impl App {
                 approvals_reviewer_override,
                 permission_profile_override,
                 active_permission_profile_override,
-                /*windows_sandbox_level*/ None,
                 /*model*/ None,
                 /*effort*/ None,
                 /*summary*/ None,
@@ -838,10 +823,6 @@ impl App {
                 self.note_active_thread_outbound_op(op).await;
                 self.refresh_pending_thread_approvals().await;
             }
-        }
-
-        if windows_sandbox_changed {
-            self.propagate_windows_sandbox_turn_context();
         }
 
         if let Some(label) = permissions_history_label {
@@ -1075,17 +1056,12 @@ impl App {
                         profile.turn_override == RuntimePermissionProfileTurnOverride::LegacySandbox
                     });
         if explicitly_selected {
-            self.chat_widget.add_error_message(
+            self.add_agents_overview_error(
                 "Permission overrides are not supported when resuming a remote task.".into(),
             );
             return true;
         }
         false
-    }
-
-    pub(super) fn on_update_personality(&mut self, personality: Personality) {
-        self.config.personality = Some(personality);
-        self.chat_widget.set_personality(personality);
     }
 
     pub(super) fn sync_tui_theme_selection(&mut self, name: String) {
@@ -1122,14 +1098,6 @@ impl App {
             Some(&self.local_settings.codex_home),
         ) {
             crate::render::highlight::set_syntax_theme(theme);
-        }
-    }
-
-    pub(super) fn personality_label(personality: Personality) -> &'static str {
-        match personality {
-            Personality::None => "None",
-            Personality::Friendly => "Friendly",
-            Personality::Pragmatic => "Pragmatic",
         }
     }
 
@@ -1238,7 +1206,6 @@ impl App {
             Some(self.config.approvals_reviewer),
             /*permission_profile*/ None,
             Some(auto_review_preset.active_permission_profile),
-            /*windows_sandbox_level*/ None,
             /*model*/ None,
             /*effort*/ None,
             /*summary*/ None,
@@ -1279,53 +1246,24 @@ impl App {
     }
 
     #[cfg(target_os = "windows")]
-    pub(super) async fn sync_windows_sandbox_after_overridden_write(
+    pub(super) async fn verify_windows_sandbox_mode_after_setup(
         &mut self,
         app_server: &mut AppServerSession,
-        write_response: &ConfigWriteResponse,
-    ) {
-        let message = overridden_write_message(write_response);
-        tracing::warn!(
-            message,
-            "Windows sandbox config write was overridden by effective config"
-        );
-        self.chat_widget.add_error_message(format!(
-            "Windows sandbox changes were saved but not applied: {message}"
-        ));
-        let Some(effective_config) = self
-            .read_effective_config_after_overridden_write(app_server, "Windows sandbox changes")
-            .await
-        else {
-            return;
-        };
-        let Some(mode) = windows_sandbox_mode_from_effective_config(&effective_config) else {
-            return;
-        };
-        self.config.permissions.windows_sandbox_mode = Some(mode);
-        self.chat_widget.set_windows_sandbox_mode(Some(mode));
-        self.propagate_windows_sandbox_turn_context();
-    }
-
-    fn propagate_windows_sandbox_turn_context(&self) {
-        #[cfg(target_os = "windows")]
-        {
-            let windows_sandbox_level = crate::windows_sandbox::level_from_config(&self.config);
-            self.app_event_tx
-                .send(AppEvent::CodexOp(AppCommand::override_turn_context(
-                    /*cwd*/ None,
-                    /*approval_policy*/ None,
-                    /*approvals_reviewer*/ None,
-                    /*permission_profile*/ None,
-                    /*active_permission_profile*/ None,
-                    Some(windows_sandbox_level),
-                    /*model*/ None,
-                    /*effort*/ None,
-                    /*summary*/ None,
-                    /*service_tier*/ None,
-                    /*collaboration_mode*/ None,
-                    /*personality*/ None,
-                )));
+        requested_mode: codex_app_server_protocol::WindowsSandboxSetupMode,
+    ) -> bool {
+        if !self.refresh_windows_sandbox_config(app_server).await {
+            return false;
         }
+        if self.chat_widget.windows_sandbox_config.mode == Some(requested_mode)
+            && self
+                .chat_widget
+                .windows_sandbox_config
+                .allows(requested_mode)
+        {
+            return true;
+        }
+        self.chat_widget.add_error_message("Windows sandbox setup completed, but its mode was overridden by the effective configuration.".to_string());
+        false
     }
 }
 
@@ -1385,23 +1323,6 @@ fn features_toml_from_json(value: &serde_json::Value) -> Option<FeaturesToml> {
     serde_json::from_value(value.clone()).ok()
 }
 
-#[cfg(target_os = "windows")]
-fn windows_sandbox_mode_from_effective_config(
-    effective_config: &ConfigReadResponse,
-) -> Option<codex_config::types::WindowsSandboxModeToml> {
-    let root_windows = effective_config
-        .config
-        .additional
-        .get("windows")
-        .and_then(windows_toml_from_json);
-    root_windows.and_then(|windows| windows.sandbox)
-}
-
-#[cfg(target_os = "windows")]
-fn windows_toml_from_json(value: &serde_json::Value) -> Option<WindowsToml> {
-    serde_json::from_value(value.clone()).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1456,7 +1377,7 @@ mod tests {
 
             let default_effort =
                 app.on_apply_advanced_reasoning("gpt-5.5", ReasoningEffortConfig::Ultra);
-            let new_thread_config = app.fresh_session_config();
+            let new_thread_config = &app.config;
 
             assert_eq!(default_effort, Some(expected_default_effort.clone()));
             assert_eq!(app.chat_widget.current_model(), "gpt-5.5");
@@ -1467,7 +1388,7 @@ mod tests {
             assert_eq!(
                 (
                     new_thread_config.model.as_deref(),
-                    new_thread_config.model_reasoning_effort,
+                    new_thread_config.model_reasoning_effort.clone(),
                 ),
                 (Some("gpt-5.5"), Some(expected_default_effort))
             );
@@ -1496,7 +1417,7 @@ mod tests {
 
         let default_effort =
             app.on_apply_advanced_reasoning("ultra-only", ReasoningEffortConfig::Ultra);
-        let new_thread_config = app.fresh_session_config();
+        let new_thread_config = &app.config;
 
         assert_eq!(default_effort, None);
         assert_eq!(app.chat_widget.current_model(), "ultra-only");
@@ -1507,7 +1428,7 @@ mod tests {
         assert_eq!(
             (
                 new_thread_config.model.as_deref(),
-                new_thread_config.model_reasoning_effort,
+                new_thread_config.model_reasoning_effort.clone(),
             ),
             (Some("gpt-5.5"), Some(ReasoningEffortConfig::Low))
         );
@@ -1753,7 +1674,7 @@ enabled = false
         )?;
 
         let assert_cloud_requirements = |app: &App| {
-            let config = app.fresh_session_config();
+            let config = &app.config;
             assert_eq!(
                 config
                     .config_layer_stack
@@ -1805,6 +1726,7 @@ enabled = false
 
         app.chat_widget
             .handle_thread_session(crate::session_state::ThreadSessionState {
+                windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
                 thread_id: ThreadId::new(),
                 forked_from_id: None,
                 fork_parent_title: None,
