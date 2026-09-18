@@ -27,6 +27,7 @@ use crate::tools::router::tool_log_payload;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::util::error_or_panic;
 use codex_analytics::ControlToolCallStatus;
+use codex_extension_api::AllowedTools;
 use codex_extension_api::ToolCallOutcome;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -231,6 +232,10 @@ impl ToolOutput for PostToolUseFeedbackOutput {
         self.original.success_for_logging()
     }
 
+    fn set_handler_duration_ms(&mut self, handler_duration_ms: u64) {
+        self.original.set_handler_duration_ms(handler_duration_ms);
+    }
+
     fn fallback_token_limit_override(&self) -> Option<usize> {
         self.original.fallback_token_limit_override()
     }
@@ -287,9 +292,17 @@ pub(crate) struct RegisteredTool {
 pub struct ToolRegistry {
     tools: IndexMap<ToolName, RegisteredTool>,
     first_collision: Option<ToolName>,
+    pub(crate) allowed_tools: Option<Arc<AllowedTools>>,
 }
 
 impl ToolRegistry {
+    pub(crate) fn with_allowed_tools(allowed_tools: Option<Arc<AllowedTools>>) -> Self {
+        Self {
+            allowed_tools,
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_tools(tools: impl IntoIterator<Item = Arc<dyn CoreToolRuntime>>) -> Self {
         let mut registry = Self::default();
@@ -326,6 +339,13 @@ impl ToolRegistry {
         exposure: ToolExposure,
     ) {
         let tool_name = runtime.tool_name().with_default_namespace();
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&tool_name))
+        {
+            return;
+        }
         match self.tools.entry(tool_name) {
             Entry::Vacant(entry) => {
                 entry.insert(RegisteredTool { runtime, exposure });
@@ -339,6 +359,13 @@ impl ToolRegistry {
 
     pub(crate) fn prepend_trusted(&mut self, runtime: Arc<dyn CoreToolRuntime>) {
         let tool_name = runtime.tool_name().with_default_namespace();
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&tool_name))
+        {
+            return;
+        }
         if self.tools.contains_key(&tool_name) {
             error_or_panic(format!("tool {tool_name} already registered"));
             return;
@@ -360,6 +387,13 @@ impl ToolRegistry {
         exposure: ToolExposure,
     ) -> bool {
         let tool_name = runtime.tool_name().with_default_namespace();
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&tool_name))
+        {
+            return false;
+        }
         if tool_name.is_default_namespace()
             && matches!(tool_name.name.as_str(), "exec_command" | "shell_command")
         {
@@ -567,7 +601,7 @@ impl ToolRegistry {
         if let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation) {
             match run_pre_tool_use_hooks(
                 &invocation.session,
-                &invocation.turn,
+                invocation.step_context.as_ref(),
                 invocation.call_id.clone(),
                 &pre_tool_use_payload.tool_name,
                 &pre_tool_use_payload.tool_input,
@@ -683,7 +717,7 @@ impl ToolRegistry {
             Some(
                 run_post_tool_use_hooks(
                     &invocation.session,
-                    &invocation.turn,
+                    invocation.step_context.as_ref(),
                     post_tool_use_payload.tool_use_id,
                     post_tool_use_payload.tool_name.name().to_string(),
                     post_tool_use_payload.tool_name.matcher_aliases().to_vec(),

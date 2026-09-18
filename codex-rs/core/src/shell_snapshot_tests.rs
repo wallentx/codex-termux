@@ -238,6 +238,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
     let started_proxy = network_spec
         .start_proxy(
             &permission_profile,
+            codex_network_proxy::ManagedProxyRouting::SharedIngress,
             /*policy_decider*/ None,
             /*blocked_request_observer*/ None,
             /*enable_network_approval_flow*/ false,
@@ -298,6 +299,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
         allow_login_shell: false,
         workspace_roots: Vec::new(),
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_type: SandboxType::None,
         windows_sandbox_private_desktop: true,
         use_legacy_landlock: false,
         permission_profile: PermissionProfileSnapshot::legacy(permission_profile),
@@ -416,8 +418,9 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
         manager: &manager,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd_uri),
-        codex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: Some(cancellation.clone()),
@@ -518,6 +521,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
             .replace_config_state(codex_network_proxy::build_config_state(
                 config,
                 codex_network_proxy::NetworkProxyConstraints::default(),
+                codex_utils_path_uri::Platform::native(),
             )?)
             .await?;
         assert_eq!(
@@ -566,6 +570,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
             .replace_config_state(codex_network_proxy::build_config_state(
                 config,
                 codex_network_proxy::NetworkProxyConstraints::default(),
+                codex_utils_path_uri::Platform::native(),
             )?)
             .await?;
         fs::write(dir.path().join("finish-startup"), "").await?;
@@ -664,6 +669,7 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
     let started_proxy = network_spec
         .start_proxy(
             &permission_profile,
+            codex_network_proxy::ManagedProxyRouting::SharedIngress,
             /*policy_decider*/ None,
             /*blocked_request_observer*/ None,
             /*enable_network_approval_flow*/ false,

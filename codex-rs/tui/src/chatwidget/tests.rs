@@ -114,13 +114,13 @@ pub(super) use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 pub(super) use codex_app_server_protocol::UserInput;
 pub(super) use codex_app_server_protocol::UserInput as AppServerUserInput;
 pub(super) use codex_app_server_protocol::WarningNotification;
+pub(super) use codex_app_server_protocol::WindowsSandboxSetupMode;
 pub(super) use codex_config::ConfigLayerStack;
 pub(super) use codex_config::Constrained;
 pub(super) use codex_config::ConstraintError;
 pub(super) use codex_config::RequirementSource;
 pub(super) use codex_config::types::ApprovalsReviewer;
 pub(super) use codex_config::types::Notifications;
-pub(super) use codex_config::types::WindowsSandboxModeToml;
 pub(super) use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 pub(super) use codex_features::Feature;
 pub(super) use codex_git_utils::CommitLogEntry;
@@ -272,12 +272,18 @@ mod reasoning_status_tests;
 #[path = "tests/replay_render_tests.rs"]
 mod replay_render_tests;
 mod review_mode;
+#[path = "tests/session_model_selection_tests.rs"]
+mod session_model_selection_tests;
 mod side;
 mod slash_commands;
+#[path = "tests/sparkle_submission_tests.rs"]
+mod sparkle_submission_tests;
 mod status_and_layout;
 mod status_command_tests;
 mod status_surface_previews;
 mod terminal_title;
+#[path = "tests/tool_activity_tests.rs"]
+mod tool_activity_tests;
 mod usage;
 #[path = "tests/worktree_picker_tests.rs"]
 mod worktree_picker;

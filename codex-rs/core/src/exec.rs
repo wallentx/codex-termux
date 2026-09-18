@@ -125,13 +125,13 @@ pub enum ExecCapturePolicy {
 
 fn select_process_exec_tool_sandbox_type(
     permission_profile: &PermissionProfile,
-    windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
+    windows_sandbox_type: SandboxType,
     enforce_managed_network: bool,
 ) -> SandboxType {
     SandboxManager::new().select_initial(
         permission_profile,
         SandboxablePreference::Auto,
-        windows_sandbox_level,
+        windows_sandbox_type,
         enforce_managed_network,
     )
 }
@@ -254,12 +254,16 @@ pub(crate) fn cancel_when_either(
     first: CancellationToken,
     second: CancellationToken,
 ) -> CancellationToken {
-    let combined = CancellationToken::new();
+    let combined = first.child_token();
+    if combined.is_cancelled() || second.is_cancelled() {
+        combined.cancel();
+        return combined;
+    }
     let cancel = combined.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = first.cancelled() => {}
             _ = second.cancelled() => {}
+            _ = cancel.cancelled() => {}
         }
         cancel.cancel();
     });
@@ -300,15 +304,29 @@ pub async fn process_exec_tool_call(
     sandbox_cwd: &AbsolutePathBuf,
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     codex_linux_sandbox_exe: &Option<PathBuf>,
+    codex_self_exe: &Option<PathBuf>,
     use_legacy_landlock: bool,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
+    let windows_sandbox_type = if params.windows_sandbox_level
+        == codex_protocol::config_types::WindowsSandboxLevel::Disabled
+    {
+        SandboxType::None
+    } else {
+        SandboxType::WindowsRestrictedToken
+    };
+    let windows_sandbox_workspace_roots = windows_sandbox_workspace_roots
+        .iter()
+        .map(PathUri::from_abs_path)
+        .collect::<Vec<_>>();
     let exec_req = build_exec_request(
         params,
         permission_profile,
         sandbox_cwd,
-        windows_sandbox_workspace_roots,
+        &windows_sandbox_workspace_roots,
         codex_linux_sandbox_exe,
+        codex_self_exe,
+        windows_sandbox_type,
         use_legacy_landlock,
     )?;
 
@@ -318,12 +336,15 @@ pub async fn process_exec_tool_call(
 
 /// Transform a portable exec request into the concrete argv/env that should be
 /// spawned under the requested sandbox policy.
+#[allow(clippy::too_many_arguments)]
 pub fn build_exec_request(
     params: ExecParams,
     permission_profile: &PermissionProfile,
     sandbox_cwd: &AbsolutePathBuf,
-    windows_sandbox_workspace_roots: &[AbsolutePathBuf],
+    windows_sandbox_workspace_roots: &[PathUri],
     codex_linux_sandbox_exe: &Option<PathBuf>,
+    codex_self_exe: &Option<PathBuf>,
+    windows_sandbox_type: SandboxType,
     use_legacy_landlock: bool,
 ) -> Result<ExecRequest> {
     let ExecParams {
@@ -347,7 +368,7 @@ pub fn build_exec_request(
     let enforce_managed_network = network.is_some();
     let sandbox_type = select_process_exec_tool_sandbox_type(
         permission_profile,
-        windows_sandbox_level,
+        windows_sandbox_type,
         enforce_managed_network,
     );
     tracing::debug!("Sandbox type: {sandbox_type:?}");
@@ -390,16 +411,34 @@ pub fn build_exec_request(
             environment_id: network_environment_id.as_deref(),
             network: network.as_ref(),
             sandbox_policy_cwd: &sandbox_policy_cwd_uri,
-            codex_linux_sandbox_exe: codex_linux_sandbox_exe.as_deref(),
+            sandbox_exe: if cfg!(windows) {
+                codex_self_exe.as_deref()
+            } else {
+                codex_linux_sandbox_exe.as_deref()
+            },
             use_legacy_landlock,
             windows_sandbox_level,
             windows_sandbox_private_desktop,
         })
         .map_err(CodexErr::from)?;
-    let windows_sandbox_workspace_roots = if windows_sandbox_workspace_roots.is_empty() {
-        vec![sandbox_cwd.clone()]
+    // These hints belong to the native Windows backend. Other backends use
+    // the materialized profile and must not project executor paths onto this host.
+    let windows_sandbox_workspace_roots = if sandbox_type == SandboxType::WindowsRestrictedToken {
+        if windows_sandbox_workspace_roots.is_empty() {
+            vec![sandbox_cwd.clone()]
+        } else {
+            windows_sandbox_workspace_roots
+                .iter()
+                .map(PathUri::to_abs_path)
+                .collect::<io::Result<Vec<_>>>()
+                .map_err(|err| {
+                    CodexErr::InvalidRequest(format!(
+                        "invalid Windows sandbox workspace roots: {err}"
+                    ))
+                })?
+        }
     } else {
-        windows_sandbox_workspace_roots.to_vec()
+        Vec::new()
     };
     ExecRequest::from_sandbox_exec_request(request, options, windows_sandbox_workspace_roots)
 }

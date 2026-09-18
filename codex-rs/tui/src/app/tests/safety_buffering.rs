@@ -275,6 +275,14 @@ stream_max_retries = 0
             crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
         )
         .await?;
+    for cwd in [&app.config.cwd, &other.session.cwd] {
+        crate::legacy_core::config::set_project_trust_level(
+            app.config.codex_home.as_path(),
+            cwd.as_path(),
+            codex_protocol::config_types::TrustLevel::Trusted,
+        )
+        .map_err(std::io::Error::other)?;
+    }
     app.thread_event_channels.insert(
         other_id,
         ThreadEventChannel::new_with_session(
@@ -915,7 +923,8 @@ goals = true
                 .as_any()
                 .is::<crate::history_cell::FinalMessageSeparator>()
             {
-                replayed_history.push_str(&normalize_completion_timestamps(rendered));
+                replayed_history
+                    .push_str(&normalize_completion_timestamps(cell.as_ref(), rendered));
             } else {
                 replayed_history.push_str(&rendered);
             }

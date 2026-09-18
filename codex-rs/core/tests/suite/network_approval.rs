@@ -15,6 +15,7 @@ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_exec_server::RemoveOptions;
 use codex_features::Feature;
+use codex_history::RolloutItem;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::approvals::NetworkApprovalProtocol;
@@ -45,6 +46,7 @@ use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::LoadThreadHistoryParams;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
@@ -396,7 +398,7 @@ async fn cancelled_guardian_network_review_fails_closed_without_rewriting_turn_s
         AskForApproval::OnRequest,
     )
     .await?;
-    wait_for_response_request(&pending_guardian).await;
+    wait_for_guardian_request(&pending_guardian).await;
     test.codex.submit(Op::Interrupt).await?;
     let mut saw_turn_aborted = false;
     let mut saw_guardian_aborted = false;
@@ -531,7 +533,7 @@ PY"#
         AskForApproval::OnRequest,
     )
     .await?;
-    wait_for_response_request(&pending_guardian).await;
+    wait_for_guardian_request(&pending_guardian).await;
     wait_for_response_request(&parent_poll).await;
     fs::write(test.config.cwd.join("disconnect-now"), "close")?;
     wait_for_completion_without_network_prompt(&test).await;
@@ -641,7 +643,7 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
         AskForApproval::OnRequest,
     )
     .await?;
-    wait_for_response_request(&pending_guardian).await;
+    wait_for_guardian_request(&pending_guardian).await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(91)).await;
     tokio::time::resume();
@@ -1582,12 +1584,16 @@ async fn failed_network_policy_amendment_denies_request_and_does_not_approve_hos
     Ok(())
 }
 
+#[test_case(ApprovalsReviewer::User; "user_approval")]
+#[test_case(ApprovalsReviewer::AutoReview; "shutdown_during_guardian_retry")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "requires the trusted Linux proxy bridge"
 )]
-async fn unattributed_network_request_uses_active_turn_environment_fallback() -> Result<()> {
+async fn unattributed_network_request_uses_active_turn_environment_fallback(
+    approvals_reviewer: ApprovalsReviewer,
+) -> Result<()> {
     skip_if_target_windows!(Ok(()), "uses a raw TCP proxy fixture");
     skip_if_host_windows!(Ok(()));
     skip_if_no_network!(Ok(()));
@@ -1610,7 +1616,7 @@ async fn unattributed_network_request_uses_active_turn_environment_fallback() ->
         &test,
         "hold the active turn",
         vec![local(test.config.cwd.clone())],
-        ApprovalsReviewer::User,
+        approvals_reviewer,
         AskForApproval::OnRequest,
     )
     .await?;
@@ -1623,6 +1629,64 @@ async fn unattributed_network_request_uses_active_turn_environment_fallback() ->
         .context("expected managed network proxy")?
         .http_addr
         .clone();
+    if approvals_reviewer == ApprovalsReviewer::AutoReview {
+        mount_sse_once_match(
+            &server,
+            is_guardian_request,
+            core_test_support::responses::sse_failed(
+                "guardian-first-failure",
+                "rate_limit_exceeded",
+                "Rate limit exceeded. Please try again in 0s.",
+            ),
+        )
+        .await;
+        let retrying = mount_sse_once_match(
+            &server,
+            is_guardian_request,
+            core_test_support::responses::sse_failed(
+                "guardian-rate-limited",
+                "rate_limit_exceeded",
+                "Rate limit exceeded. Please try again in 60s.",
+            ),
+        )
+        .await;
+        let proxy_request = tokio::spawn(raw_http_proxy_request(proxy_addr, NETWORK_TEST_HOST));
+        wait_for_response_request(&retrying).await;
+        let request = retrying.single_request().body_json();
+        let thread_id = request["client_metadata"]["thread_id"]
+            .as_str()
+            .context("Guardian thread id")?;
+        let thread_id = codex_protocol::ThreadId::from_string(thread_id)?;
+        // Internal reviewers are hidden from get_thread. Their persisted terminal event
+        // confirms the reviewer's own retries finished before testing Guardian's retry wait.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                test.thread_store.flush_thread(thread_id).await?;
+                let history = test
+                    .thread_store
+                    .load_latest_model_context(LoadThreadHistoryParams {
+                        thread_id,
+                        include_archived: false,
+                    })
+                    .await?;
+                if history.items.iter().any(|item| {
+                    matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.error.is_some())
+                }) {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("Guardian reviewer did not finish its rate-limited turn")??;
+        tokio::time::timeout(Duration::from_secs(5), test.codex.shutdown_and_wait())
+            .await
+            .context("parent shutdown waited for Guardian's 60-second retry")??;
+        let response = tokio::time::timeout(Duration::from_secs(5), proxy_request).await???;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(retrying.requests().len(), 1);
+        return Ok(());
+    }
     let proxy_request = tokio::spawn(raw_http_proxy_request(proxy_addr, NETWORK_TEST_HOST));
     let approval = expect_network_approval(&test, LOCAL_ENVIRONMENT_ID).await?;
     assert_eq!(approval.command, ["network-access", NETWORK_TEST_TARGET]);
@@ -2365,6 +2429,7 @@ async fn owner_network_policy_follows_the_selected_remote_command() -> Result<()
                 }),
                 shell_environment_policy: test.config.permissions.shell_environment_policy.clone(),
                 windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+                windows_sandbox_type: test.config.permissions.windows_sandbox_type,
                 windows_sandbox_private_desktop: test
                     .config
                     .permissions
@@ -2968,6 +3033,21 @@ async fn wait_for_completion_without_network_prompt(test: &TestCodex) {
         }
         other => panic!("unexpected event: {other:?}"),
     }
+}
+
+async fn wait_for_guardian_request(responses: &ResponseMock) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if responses.requests().iter().any(|request| {
+                request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian"
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for Guardian request");
 }
 
 async fn wait_for_response_request(responses: &ResponseMock) {

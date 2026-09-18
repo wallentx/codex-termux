@@ -52,21 +52,29 @@ fn map_api_error_preserves_retry_delay() {
 }
 
 #[test]
-fn map_api_error_maps_server_overloaded_from_503_body() {
-    let body = serde_json::json!({
-        "error": {
-            "code": "server_is_overloaded"
-        }
-    })
-    .to_string();
-    let err = map_api_error(ApiError::Transport(TransportError::Http {
-        status: http::StatusCode::SERVICE_UNAVAILABLE,
-        url: Some("http://example.com/v1/responses".to_string()),
-        headers: None,
-        body: Some(body),
-    }));
-
-    assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+fn map_api_error_distinguishes_capacity_from_slow_down() {
+    for (code, expected, retryable) in [
+        (
+            "server_is_overloaded",
+            CodexErrorInfo::ServerOverloaded,
+            false,
+        ),
+        ("slow_down", CodexErrorInfo::RateLimitExceeded, true),
+        ("unknown_error", CodexErrorInfo::Other, true),
+    ] {
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::SERVICE_UNAVAILABLE,
+            url: None,
+            headers: None,
+            body: Some(
+                serde_json::json!({"error": {"code": code, "message": "retry later"}}).to_string(),
+            ),
+        }));
+        assert_eq!(
+            (err.to_codex_protocol_error(), err.is_retryable()),
+            (expected, retryable)
+        );
+    }
 }
 
 #[test]
@@ -171,6 +179,53 @@ fn map_api_error_uses_cyber_policy_fallback_for_missing_message() {
         message,
         "This request has been flagged for possible cybersecurity risk."
     );
+}
+
+#[test]
+fn map_api_error_preserves_bio_policy() {
+    let err = map_api_error(ApiError::BioPolicy {
+        message: "This request was blocked by bio policy.".to_string(),
+    });
+    assert_eq!(err.to_codex_protocol_error(), CodexErrorInfo::BioPolicy);
+    assert_eq!(err.to_string(), "This request was blocked by bio policy.");
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn map_api_error_maps_http_and_wrapped_websocket_bio_policy() {
+    for wrapped in [false, true] {
+        for message in [
+            Some("This request was blocked by bio policy."),
+            None,
+            Some(""),
+            Some("  "),
+        ] {
+            let mut body = serde_json::json!({"error": {"code": "bio_policy"}});
+            if let Some(message) = message {
+                body["error"]["message"] = serde_json::json!(message);
+            }
+            if wrapped {
+                body["type"] = serde_json::json!("error");
+                body["status"] = serde_json::json!(400);
+            }
+            let err = map_api_error(ApiError::Transport(TransportError::Http {
+                status: http::StatusCode::BAD_REQUEST,
+                url: None,
+                headers: None,
+                body: Some(body.to_string()),
+            }));
+
+            let expected = message
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("This content was flagged for possible biological risk.");
+            let CodexErrorDetails::BioPolicy { message } = err.details() else {
+                panic!("expected CodexErrorDetails::BioPolicy, got {err:?}");
+            };
+            assert_eq!(message, expected);
+            assert_eq!(err.to_codex_protocol_error(), CodexErrorInfo::BioPolicy);
+            assert!(!err.is_retryable());
+        }
+    }
 }
 
 #[test]

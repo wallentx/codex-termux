@@ -19,6 +19,7 @@ clap = { workspace = true, features = ["derive"] }
 chrono = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-home-dir = { workspace = true }
+codex-utils-path-uri = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 globset = { workspace = true }
 opentelemetry = { workspace = true }
@@ -53,6 +54,7 @@ tempfile = { workspace = true }
 rama-unix = { version = "=0.3.0-alpha.4" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+rama-dns = { version = "=0.3.0-alpha.4" }
 security-framework = "3"
 
 [target.'cfg(windows)'.dependencies]
