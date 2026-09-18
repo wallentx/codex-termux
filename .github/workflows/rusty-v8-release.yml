@@ -84,6 +84,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    env:
+      # rusty_v8 152.2.0 requires libclang 21.1+ for its bundled libc++ headers.
+      BINDGEN_LLVM_VERSION: "21"
 
     steps:
       - name: Check out source ref
@@ -133,17 +136,17 @@ jobs:
             wget \
             xz-utils
 
-          if ! command -v clang-19 >/dev/null 2>&1; then
-            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-            chmod +x /tmp/llvm.sh
-            sudo /tmp/llvm.sh 19
+          if ! command -v "clang-${BINDGEN_LLVM_VERSION}" >/dev/null 2>&1; then
+            wget -qO "${RUNNER_TEMP}/llvm.sh" https://apt.llvm.org/llvm.sh
+            chmod +x "${RUNNER_TEMP}/llvm.sh"
+            sudo "${RUNNER_TEMP}/llvm.sh" "${BINDGEN_LLVM_VERSION}"
           fi
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            clang-19 \
-            libclang-19-dev \
-            lld-19
+            "clang-${BINDGEN_LLVM_VERSION}" \
+            "libclang-${BINDGEN_LLVM_VERSION}-dev" \
+            "lld-${BINDGEN_LLVM_VERSION}"
 
-          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-${BINDGEN_LLVM_VERSION}/lib" >> "$GITHUB_ENV"
 
       - name: Stage Android release pair
         shell: bash

@@ -6,10 +6,14 @@ on:
     paths:
       - scripts/*termux*
       - .github/workflows/termux-release-tests.yml
+      - .github/workflows/rusty-v8-release.yml
+      - .github/scripts/rusty_v8_android_release.py
   pull_request:
     paths:
       - scripts/*termux*
       - .github/workflows/termux-release-tests.yml
+      - .github/workflows/rusty-v8-release.yml
+      - .github/scripts/rusty_v8_android_release.py
   workflow_dispatch:
 
 permissions:
@@ -28,6 +32,7 @@ jobs:
           bash scripts/test-termux-create-release-pr.sh
           bash scripts/test-termux-create-checkpoint-pr.sh
           python3 -B scripts/test-termux-sync-file-lock.py
+          python3 -B scripts/test-termux-v8-toolchain.py
       - name: Fetch real upstream regression fixtures
         run: |
           git remote add upstream https://github.com/openai/codex.git

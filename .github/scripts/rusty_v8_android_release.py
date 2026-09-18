@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gzip
 import hashlib
 import os
@@ -11,9 +12,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
+import tomllib
 
 ANDROID_GN_PYDEPS_FILES = [
     "build/android/pylib/results/presentation/test_results_presentation.pydeps",
@@ -27,6 +28,46 @@ ANDROID_GN_PYDEPS_FILES = [
 ANDROID_EXTRA_GN_ARGS = [
     'android_ndk_root="//third_party/android_ndk"',
 ]
+
+
+def validate_android_bindgen_toolchain(env: dict[str, str]) -> None:
+    """Check the library bindgen will load, not an unrelated clang on PATH."""
+    configured_path = env.get("LIBCLANG_PATH")
+    if not configured_path:
+        raise SystemExit("Android V8 staging requires LIBCLANG_PATH for libclang 21.1+")
+    library_path = Path(configured_path)
+    if library_path.is_dir():
+        library_path /= "libclang.so"
+
+    class CXString(ctypes.Structure):
+        _fields_ = [("data", ctypes.c_void_p), ("private_flags", ctypes.c_uint)]
+
+    try:
+        library = ctypes.CDLL(str(library_path))
+        library.clang_getClangVersion.argtypes = []
+        library.clang_getClangVersion.restype = CXString
+        library.clang_getCString.argtypes = [CXString]
+        library.clang_getCString.restype = ctypes.c_char_p
+        library.clang_disposeString.argtypes = [CXString]
+        library.clang_disposeString.restype = None
+        version_string = library.clang_getClangVersion()
+        try:
+            version = (library.clang_getCString(version_string) or b"").decode()
+        finally:
+            library.clang_disposeString(version_string)
+    except (OSError, AttributeError) as error:
+        raise SystemExit(
+            f"cannot load bindgen libclang at {library_path}: {error}"
+        ) from error
+
+    # Upstream v8 152.2.0 build.rs explicitly requires Clang 21.1+ libclang.
+    match = re.search(r"clang version (\d+)\.(\d+)", version)
+    if not match or tuple(map(int, match.groups())) < (21, 1):
+        raise SystemExit(
+            f"Android V8 bindings require libclang 21.1+; {library_path} reports {version!r}. "
+            "Update LIBCLANG_PATH before starting the source build."
+        )
+    print(f"Verified bindgen libclang: {library_path} ({version})", flush=True)
 
 
 def resolved_v8_crate_version(repo_root: Path) -> str:
@@ -83,7 +124,9 @@ def write_checksums(paths: list[Path], checksums_path: Path) -> None:
             checksums.write(f"{digest.hexdigest()}  {path.name}\n")
 
 
-def copy_chromium_rust_vendor(vendored_source: Path, rusty_v8_source_root: Path) -> None:
+def copy_chromium_rust_vendor(
+    vendored_source: Path, rusty_v8_source_root: Path
+) -> None:
     source_vendor_dir = (
         rusty_v8_source_root / "third_party" / "rust" / "chromium_crates_io" / "vendor"
     )
@@ -132,7 +175,9 @@ def patch_android_v8_source(vendored_source: Path) -> None:
 
 def add_android_extra_gn_args(env: dict[str, str], args: list[str]) -> None:
     existing = " ".join(
-        value for value in (env.get("GN_ARGS", ""), env.get("EXTRA_GN_ARGS", "")) if value
+        value
+        for value in (env.get("GN_ARGS", ""), env.get("EXTRA_GN_ARGS", ""))
+        if value
     )
     extra_args = [env["EXTRA_GN_ARGS"]] if env.get("EXTRA_GN_ARGS") else []
     for arg in args:
@@ -236,6 +281,9 @@ def stage_android_release_pair(
     if target != "aarch64-linux-android":
         raise SystemExit(f"unsupported Android rusty_v8 target: {target}")
 
+    # Bindgen runs after the expensive V8 compile. Reject an incompatible host
+    # library before Cargo fetches dependencies or starts any build.
+    validate_android_bindgen_toolchain(dict(os.environ))
     version = resolved_v8_crate_version(repo_root)
     temp_dir = Path(tempfile.mkdtemp(prefix="rusty-v8-android-stage-"))
     target_dir = temp_dir / "target"
