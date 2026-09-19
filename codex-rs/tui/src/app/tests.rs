@@ -27,6 +27,8 @@ mod buffered_replay;
 mod connector_policy;
 #[path = "tests/disconnect_tests.rs"]
 mod disconnect;
+#[path = "tests/fork_workspace_roots_tests.rs"]
+mod fork_workspace_roots_tests;
 #[path = "tests/fresh_sparkle_tests.rs"]
 mod fresh_sparkle_tests;
 #[path = "tests/key_chords.rs"]
@@ -5778,6 +5780,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
             app.chat_widget.config_ref(),
             &app.local_settings,
             app.chat_widget.current_model(),
+            &session.model,
             &session,
             is_first,
             /*tooltip_override*/ None,
@@ -7344,6 +7347,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             app.chat_widget.config_ref(),
             &app.local_settings,
             app.chat_widget.current_model(),
+            &session.model,
             &session,
             is_first,
             /*tooltip_override*/ None,
