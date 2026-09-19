@@ -3373,6 +3373,7 @@ dependencies = [
  "codex-config",
  "codex-context-fragments",
  "codex-exec-server-protocol",
+ "codex-file-system",
  "codex-history",
  "codex-mcp",
  "codex-protocol",

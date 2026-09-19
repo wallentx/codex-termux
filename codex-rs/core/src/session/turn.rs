@@ -32,7 +32,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
-use crate::responses_retry::handle_retryable_response_stream_error;
+use crate::responses_retry::handle_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
@@ -700,6 +700,38 @@ pub(crate) async fn run_turn(
                     .await
                     {
                         return Ok(None);
+                    }
+                    // Token-budget resets do not summarize, so preserve their existing rollover
+                    // policy. Keep summarizing compaction in this task to serialize history updates.
+                    let config = &turn_context.config;
+                    if config.model_post_turn_compact_threshold_percent > 0
+                        && !config.features.enabled(Feature::TokenBudget)
+                        && super::context_window::context_window_token_status(
+                            sess.as_ref(),
+                            turn_context.as_ref(),
+                        )
+                        .await
+                        .turn_end_compaction_threshold_reached
+                        && !sess.input_queue.has_pending_input(&sess.active_turn).await
+                        && !cancellation_token.is_cancelled()
+                        && let Err(err) = run_auto_compact(
+                            &sess,
+                            Arc::clone(&step_context),
+                            /*fallback_step_context*/ None,
+                            &mut client_session,
+                            InitialContextInjection::DoNotInject,
+                            CompactionReason::ContextLimit,
+                            CompactionPhase::PostTurn,
+                        )
+                        .await
+                    {
+                        if matches!(
+                            err.details(),
+                            CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+                        ) {
+                            return Err(err);
+                        }
+                        warn!(error = %err, "Post-turn compaction failed; preserving the completed turn");
                     }
                     break;
                 }
@@ -1644,11 +1676,7 @@ async fn run_sampling_request(
             original_input = Some(prompt.input);
         }
 
-        if !err.is_retryable() {
-            return Err(err);
-        }
-
-        handle_retryable_response_stream_error(
+        handle_response_stream_error(
             &mut retry_state,
             max_retries,
             err,

@@ -5215,6 +5215,18 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
         primary.read_stream_until_notification_message("turn/started"),
     )
     .await??;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let started: ItemStartedNotification =
+                primary.read_notification("item/started").await?;
+            if started.turn_id == running_turn.id
+                && matches!(started.item, ThreadItem::UserMessage { .. })
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
 
     let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
@@ -5267,6 +5279,13 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
         primary.read_response(metadata_resume_id),
     )
     .await??;
+    assert_eq!(metadata_resume.thread.id, thread.id);
+    assert_eq!(
+        metadata_resume.thread.status,
+        ThreadStatus::Active {
+            active_flags: Vec::new()
+        }
+    );
     assert!(metadata_resume.thread.turns.is_empty());
     assert!(metadata_resume.initial_turns_page.is_none());
     assert!(
@@ -5278,6 +5297,42 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
         .is_err(),
         "hot paginated resume should wait for a real token usage update"
     );
+
+    for (exclude_turns, items_view) in [
+        (true, None),
+        (true, Some(TurnItemsView::Full)),
+        (false, Some(TurnItemsView::Summary)),
+    ] {
+        let resume_id = primary
+            .send_thread_resume_request(ThreadResumeParams {
+                thread_id: thread.id.clone(),
+                exclude_turns,
+                initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                    limit: Some(1),
+                    sort_direction: Some(SortDirection::Desc),
+                    items_view,
+                }),
+                ..Default::default()
+            })
+            .await?;
+        let resumed: ThreadResumeResponse =
+            timeout(DEFAULT_READ_TIMEOUT, primary.read_response(resume_id)).await??;
+        let page = resumed.initial_turns_page.expect("initial turns page");
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].id, running_turn.id);
+        assert_eq!(page.data[0].status, TurnStatus::InProgress);
+        assert_eq!(
+            page.data[0].items_view,
+            items_view.unwrap_or(TurnItemsView::Summary)
+        );
+        assert!(!page.data[0].items.is_empty());
+        if !exclude_turns {
+            let full_turn = resumed.thread.turns.last().expect("full active turn");
+            assert_eq!(full_turn.id, running_turn.id);
+            assert_eq!(full_turn.items_view, TurnItemsView::Full);
+            assert!(!full_turn.items.is_empty());
+        }
+    }
 
     let asc_resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {

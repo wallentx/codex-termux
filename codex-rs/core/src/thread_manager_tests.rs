@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::control::SpawnAgentOptions;
+use crate::agent::types::SpawnAgentOptions;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -281,7 +281,7 @@ async fn thread_analytics_opt_out_overrides_shared_client() {
 /// Controls without a custom allocation policy still produce distinct thread identifiers.
 #[test]
 fn thread_id_generator_defaults_to_standard_ids() {
-    let agent_control = AgentControl::default();
+    let agent_control = LocalAgentControl::default();
 
     assert_ne!(
         agent_control.generate_thread_id(),
