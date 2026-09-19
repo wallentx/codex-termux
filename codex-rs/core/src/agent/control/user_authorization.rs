@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use super::AgentControl;
+use super::LocalAgentControl;
 use crate::codex_thread::GuardianRootMessage;
 use crate::codex_thread::GuardianRootSnapshot;
 use crate::compact::is_summary_message;
@@ -29,7 +29,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 
 const MAX_ROOT_MESSAGES: usize = 8;
 
-impl AgentControl {
+impl LocalAgentControl {
     /// Returns bounded root conversation and authorization state for a MultiAgent V2 worker.
     pub(crate) async fn root_user_authorization(
         &self,
@@ -223,6 +223,7 @@ impl AgentControl {
             .map(|turn_id| root_evidence.trusted_skill_paths(turn_id))
             .unwrap_or_default();
         Some(GuardianRootSnapshot {
+            root_thread_id,
             authorization_version,
             messages,
             trusted_skill_paths,

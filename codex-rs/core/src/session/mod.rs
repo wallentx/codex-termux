@@ -10,8 +10,8 @@ use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
+use crate::agent::LocalAgentControl;
 use crate::agent::agent_status_from_event;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
@@ -235,6 +235,7 @@ mod daemon_recovery;
 mod environment;
 mod extension_interruption;
 pub(crate) mod extension_metrics;
+mod guardian_checkpoint;
 mod handlers;
 mod inject;
 mod reasoning_effort;
@@ -334,6 +335,7 @@ use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttfm_metric;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
+use crate::windows_sandbox::local_binding_policy_for_sandbox;
 use crate::windows_sandbox::managed_proxy_routing_for_windows_sandbox;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_core_plugins::PluginsManager;
@@ -459,7 +461,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) thread_source: Option<ThreadSource>,
     pub(crate) originator: String,
-    pub(crate) agent_control: AgentControl,
+    pub(crate) agent_control: LocalAgentControl,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
@@ -1220,6 +1222,7 @@ impl Session {
             .start_proxy(
                 permission_profile,
                 managed_proxy_routing_for_windows_sandbox(windows_sandbox_type),
+                local_binding_policy_for_sandbox(windows_sandbox_type, Some(std::env::consts::OS)),
                 network_policy_decider,
                 blocked_request_observer,
                 managed_network_requirements_enabled,
@@ -2291,6 +2294,14 @@ impl Session {
             .get::<GuardianReviewSessionManager>()
     }
 
+    pub(crate) async fn is_private_guardian_reviewer(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .session_configuration
+            .trusted_guardian_reviewer
+    }
+
     pub(crate) async fn emit_turn_started(&self, turn_context: &TurnContext) {
         let event = TurnStartedEvent {
             turn_id: turn_context.sub_id.clone(),
@@ -2609,6 +2620,9 @@ impl Session {
     }
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+        let flush_guardian_completion = persist
+            && matches!(event.msg, EventMsg::TurnComplete(_))
+            && self.is_private_guardian_reviewer().await;
         // Keep realtime reduction, canonical append, and delivery in the same order.
         // This lock must not acquire SessionState or ActiveTurn: event producers can
         // already hold those locks. Host presentation policies are synchronous.
@@ -2647,6 +2661,11 @@ impl Session {
             && let Err(error) = self.send_realtime_history_effects(&event.id, effects).await
         {
             warn!("failed to persist realtime history: {error}");
+        }
+        // Save the completed review and its terminal event together before the parent sees
+        // the decision. Turn completion skips its separate before/after barriers for this case.
+        if flush_guardian_completion && let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush completed Guardian review: {err}");
         }
         self.deliver_event_raw(event).await;
     }
