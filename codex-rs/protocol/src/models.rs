@@ -10,8 +10,10 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::ser::Serializer;
+use serde_with::serde_as;
 use ts_rs::TS;
 
+use crate::local_media::audio_mime_for_path;
 use crate::permissions::FileSystemAccessMode;
 use crate::permissions::FileSystemPath;
 use crate::permissions::FileSystemSandboxEntry;
@@ -19,6 +21,7 @@ use crate::permissions::FileSystemSandboxKind;
 use crate::permissions::FileSystemSandboxPolicy;
 use crate::permissions::FileSystemSpecialPath;
 use crate::permissions::NetworkSandboxPolicy;
+use crate::permissions::RawFileSystemSandboxEntry;
 use crate::protocol::SandboxPolicy;
 use crate::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -27,6 +30,28 @@ use schemars::JsonSchema;
 
 use crate::ResponseItemId;
 use crate::mcp::CallToolResult;
+use codex_utils_path_uri::PathUri;
+
+mod configuration_update;
+mod executed_tool_calls;
+mod item_metadata;
+
+pub use crate::local_media::MAX_PROMPT_AUDIO_INPUT_BYTES;
+pub use crate::local_media::snapshot_local_user_input;
+pub use crate::permission_profile_snapshot::PermissionProfileSnapshot;
+pub use crate::permission_profile_snapshot::ProfileWorkspaceRoot;
+pub use configuration_update::ConfigurationReasoning;
+pub use executed_tool_calls::ExecutedToolCall;
+pub use executed_tool_calls::ExecutedToolCallArguments;
+pub use executed_tool_calls::ExecutedToolCallTruncation;
+pub use executed_tool_calls::MAX_TOOL_RESULT_SOURCE_FIELD_BYTES;
+pub use executed_tool_calls::ToolResultMetadata;
+pub use executed_tool_calls::ToolResultSource;
+pub use executed_tool_calls::ToolResultSources;
+pub use executed_tool_calls::bound_executed_tool_calls_for_prompt;
+pub use executed_tool_calls::bound_executed_tool_calls_for_prompt_prioritizing_recent;
+pub use executed_tool_calls::executed_tool_call_metadata_bytes;
+pub use item_metadata::ContentItemKind;
 
 /// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
@@ -65,6 +90,8 @@ impl SandboxPermissions {
 
 #[derive(Debug, Clone, Default, Eq, Hash, PartialEq, JsonSchema, TS)]
 pub struct FileSystemPermissions {
+    #[schemars(with = "Vec<RawFileSystemSandboxEntry>")]
+    #[ts(as = "Vec<RawFileSystemSandboxEntry>")]
     pub entries: Vec<FileSystemSandboxEntry>,
     pub glob_scan_max_depth: Option<NonZeroUsize>,
 }
@@ -87,32 +114,39 @@ impl FileSystemPermissions {
         read: Option<Vec<AbsolutePathBuf>>,
         write: Option<Vec<AbsolutePathBuf>>,
     ) -> Self {
+        Self::from_paths(read, write)
+    }
+
+    pub fn from_read_write_path_uris(
+        read: Option<Vec<PathUri>>,
+        write: Option<Vec<PathUri>>,
+    ) -> Self {
+        Self::from_paths(read, write)
+    }
+
+    fn from_paths<P>(read: Option<Vec<P>>, write: Option<Vec<P>>) -> Self
+    where
+        P: Into<FileSystemPath>,
+    {
         let mut entries = Vec::new();
         if let Some(read) = read {
-            entries.extend(read.into_iter().map(|path| FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
-                access: FileSystemAccessMode::Read,
-            }));
+            entries.extend(
+                read.into_iter().map(|path| {
+                    FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Read)
+                }),
+            );
         }
         if let Some(write) = write {
-            entries.extend(write.into_iter().map(|path| FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
-                access: FileSystemAccessMode::Write,
-            }));
+            entries.extend(
+                write.into_iter().map(|path| {
+                    FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Write)
+                }),
+            );
         }
         Self {
             entries,
             glob_scan_max_depth: None,
         }
-    }
-
-    pub fn explicit_path_entries(
-        &self,
-    ) -> impl Iterator<Item = (&AbsolutePathBuf, FileSystemAccessMode)> {
-        self.entries.iter().filter_map(|entry| match &entry.path {
-            FileSystemPath::Path { path } => Some((path, entry.access)),
-            FileSystemPath::GlobPattern { .. } | FileSystemPath::Special { .. } => None,
-        })
     }
 
     pub fn legacy_read_write_roots(&self) -> Option<LegacyReadWriteRoots> {
@@ -131,9 +165,10 @@ impl FileSystemPermissions {
             let FileSystemPath::Path { path } = &entry.path else {
                 return None;
             };
+            let path = path.to_abs_path().ok()?;
             match entry.access {
-                FileSystemAccessMode::Read => read.push(path.clone()),
-                FileSystemAccessMode::Write => write.push(path.clone()),
+                FileSystemAccessMode::Read => read.push(path),
+                FileSystemAccessMode::Write => write.push(path),
                 FileSystemAccessMode::Deny => return None,
             }
         }
@@ -149,7 +184,7 @@ impl FileSystemPermissions {
 #[serde(deny_unknown_fields)]
 struct CanonicalFileSystemPermissions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    entries: Vec<FileSystemSandboxEntry>,
+    entries: Vec<RawFileSystemSandboxEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     glob_scan_max_depth: Option<NonZeroUsize>,
 }
@@ -170,7 +205,13 @@ impl Serialize for FileSystemPermissions {
             legacy.serialize(serializer)
         } else {
             CanonicalFileSystemPermissions {
-                entries: self.entries.clone(),
+                entries: self
+                    .entries
+                    .clone()
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::ser::Error::custom)?,
                 glob_scan_max_depth: self.glob_scan_max_depth,
             }
             .serialize(serializer)
@@ -188,7 +229,11 @@ impl<'de> Deserialize<'de> for FileSystemPermissions {
                 entries,
                 glob_scan_max_depth,
             }) => Ok(Self {
-                entries,
+                entries: entries
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::de::Error::custom)?,
                 glob_scan_max_depth,
             }),
             FileSystemPermissionsDe::Legacy(LegacyReadWriteRoots { read, write }) => {
@@ -248,7 +293,7 @@ impl SandboxEnforcement {
 }
 
 /// Filesystem permissions for profiles where Codex owns sandbox construction.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Eq, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(tag = "type")]
 pub enum ManagedFileSystemPermissions {
@@ -256,6 +301,8 @@ pub enum ManagedFileSystemPermissions {
     #[serde(rename_all = "snake_case")]
     #[ts(rename_all = "snake_case")]
     Restricted {
+        #[schemars(with = "Vec<RawFileSystemSandboxEntry>")]
+        #[ts(as = "Vec<RawFileSystemSandboxEntry>")]
         entries: Vec<FileSystemSandboxEntry>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -263,6 +310,68 @@ pub enum ManagedFileSystemPermissions {
     },
     /// Apply a managed sandbox that allows all filesystem access.
     Unrestricted,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SerializedManagedFileSystemPermissions {
+    #[serde(rename_all = "snake_case")]
+    Restricted {
+        entries: Vec<RawFileSystemSandboxEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        glob_scan_max_depth: Option<NonZeroUsize>,
+    },
+    Unrestricted,
+}
+
+impl Serialize for ManagedFileSystemPermissions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Restricted {
+                entries,
+                glob_scan_max_depth,
+            } => SerializedManagedFileSystemPermissions::Restricted {
+                entries: entries
+                    .clone()
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::ser::Error::custom)?,
+                glob_scan_max_depth: *glob_scan_max_depth,
+            }
+            .serialize(serializer),
+            Self::Unrestricted => {
+                SerializedManagedFileSystemPermissions::Unrestricted.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedFileSystemPermissions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            match SerializedManagedFileSystemPermissions::deserialize(deserializer)? {
+                SerializedManagedFileSystemPermissions::Restricted {
+                    entries,
+                    glob_scan_max_depth,
+                } => Self::Restricted {
+                    entries: entries
+                        .into_iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<_, _>>()
+                        .map_err(serde::de::Error::custom)?,
+                    glob_scan_max_depth,
+                },
+                SerializedManagedFileSystemPermissions::Unrestricted => Self::Unrestricted,
+            },
+        )
+    }
 }
 
 impl ManagedFileSystemPermissions {
@@ -380,6 +489,33 @@ impl PermissionProfile {
         }
     }
 
+    /// Intersects managed filesystem permissions with read-only access and restricts network.
+    ///
+    /// Returns `None` when filesystem enforcement belongs to an external caller.
+    pub fn intersect_with_read_only(&self) -> Option<Self> {
+        let mut file_system = self.file_system_sandbox_policy();
+        match file_system.kind {
+            FileSystemSandboxKind::Restricted => {
+                for entry in &mut file_system.entries {
+                    entry.access = match entry.access {
+                        FileSystemAccessMode::Read | FileSystemAccessMode::Write => {
+                            FileSystemAccessMode::Read
+                        }
+                        FileSystemAccessMode::Deny => FileSystemAccessMode::Deny,
+                    };
+                }
+            }
+            FileSystemSandboxKind::Unrestricted => {
+                file_system = FileSystemSandboxPolicy::read_only();
+            }
+            FileSystemSandboxKind::ExternalSandbox => return None,
+        }
+        Some(Self::from_runtime_permissions(
+            &file_system,
+            NetworkSandboxPolicy::Restricted,
+        ))
+    }
+
     /// Managed workspace-write filesystem access with restricted network
     /// access.
     ///
@@ -416,18 +552,49 @@ impl PermissionProfile {
         }
     }
 
+    /// Legacy workspace-write settings interpreted for executor-owned paths.
+    pub fn workspace_write_with_path_uris(
+        writable_roots: &[PathUri],
+        network: NetworkSandboxPolicy,
+        exclude_tmpdir_env_var: bool,
+        exclude_slash_tmp: bool,
+    ) -> Self {
+        let file_system = FileSystemSandboxPolicy::workspace_write_with_path_uris(
+            writable_roots,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+        );
+        Self::Managed {
+            file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
+            network,
+        }
+    }
+
     pub fn materialize_project_roots_with_workspace_roots(
         self,
         workspace_roots: &[AbsolutePathBuf],
+    ) -> Self {
+        self.materialize_project_roots_with(|policy| {
+            policy.materialize_project_roots_with_workspace_roots(workspace_roots)
+        })
+    }
+
+    pub fn materialize_project_roots_with_path_uris(self, workspace_roots: &[PathUri]) -> Self {
+        self.materialize_project_roots_with(|policy| {
+            policy.materialize_project_roots_with_path_uris(workspace_roots)
+        })
+    }
+
+    fn materialize_project_roots_with(
+        self,
+        materialize: impl FnOnce(FileSystemSandboxPolicy) -> FileSystemSandboxPolicy,
     ) -> Self {
         match self {
             Self::Managed {
                 file_system,
                 network,
             } => {
-                let file_system = file_system
-                    .to_sandbox_policy()
-                    .materialize_project_roots_with_workspace_roots(workspace_roots);
+                let file_system = materialize(file_system.to_sandbox_policy());
                 Self::Managed {
                     file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
                     network,
@@ -645,12 +812,12 @@ impl From<&FileSystemSandboxPolicy> for FileSystemPermissions {
         let entries = match value.kind {
             FileSystemSandboxKind::Restricted => value.entries.clone(),
             FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => {
-                vec![FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
+                vec![FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
                         value: FileSystemSpecialPath::Root,
                     },
-                    access: FileSystemAccessMode::Write,
-                }]
+                    FileSystemAccessMode::Write,
+                )]
             }
         };
         Self {
@@ -713,7 +880,8 @@ pub enum ContentItem {
         text: String,
     },
     InputImage {
-        image_url: String,
+        #[serde(flatten)]
+        image: ImageReference,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         detail: Option<ImageDetail>,
@@ -724,6 +892,14 @@ pub enum ContentItem {
     OutputText {
         text: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
+#[serde(untagged)]
+#[ts(untagged)]
+pub enum ImageReference {
+    Inline { image_url: String },
+    File { file_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
@@ -778,11 +954,42 @@ pub enum MessagePhase {
 ///
 /// Responses API strongly types this payload. Do not modify it without first getting API
 /// approval and making the corresponding Responses API change.
+#[serde_as]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct InternalChatMessageMetadataPassthrough {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub turn_id: Option<String>,
+    /// Message creation time in fractional Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub create_time: Option<serde_json::Number>,
+    /// Harness-owned classifications aligned with the item's content entries.
+    #[serde_as(deserialize_as = "serde_with::DefaultOnError")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub content_item_kinds: Option<Vec<ContentItemKind>>,
+    // Ignore input values so requests and rollout reloads cannot fake tool call records.
+    // A resumed thread can record new calls, but cannot prove old calls from this payload.
+    /// Host-owned Code Mode cell shared by its `exec` and subsequent `wait` outputs.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub cell_id: Option<String>,
+    /// Warehouse-only Responses metadata, not part of the public app-server protocol.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub executed_tool_calls: Option<Vec<ExecutedToolCall>>,
+    /// Whether the host recorded the complete call inventory without losing calls or arguments.
+    /// For a direct tool output this covers its single invocation; with `cell_id`, it covers
+    /// the Code Mode cell across its outputs. Neither case describes tool success.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub tool_calls_complete: Option<bool>,
 }
 
 impl InternalChatMessageMetadataPassthrough {
@@ -875,6 +1082,9 @@ pub enum ResponseItem {
         // JSON, not as an already‑parsed object. We keep it as a raw string here and let
         // Session::handle_function_call parse it into a Value.
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_function_args: Option<Vec<String>>,
         call_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -904,7 +1114,15 @@ pub enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         id: Option<ResponseItemId>,
-        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        namespace: Option<String>,
         #[ts(as = "FunctionCallOutputBody")]
         #[schemars(with = "FunctionCallOutputBody")]
         output: FunctionCallOutputPayload,
@@ -1015,6 +1233,10 @@ pub enum ResponseItem {
         #[ts(optional)]
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     },
+    /// A durable input control interpreted by the backend at its position in history.
+    ConfigurationUpdate {
+        reasoning: ConfigurationReasoning,
+    },
     // Compaction triggers are request controls, not durable response items.
     CompactionTrigger {},
     ContextCompaction {
@@ -1056,7 +1278,7 @@ impl ResponseItem {
             | Self::ImageGenerationCall { id, .. }
             | Self::Compaction { id, .. }
             | Self::ContextCompaction { id, .. } => id.as_ref(),
-            Self::CompactionTrigger { .. } | Self::Other => None,
+            Self::ConfigurationUpdate { .. } | Self::CompactionTrigger { .. } | Self::Other => None,
         }
     }
 
@@ -1078,7 +1300,7 @@ impl ResponseItem {
             | Self::ImageGenerationCall { id, .. }
             | Self::Compaction { id, .. }
             | Self::ContextCompaction { id, .. } => *id = new_id,
-            Self::CompactionTrigger { .. } | Self::Other => {}
+            Self::ConfigurationUpdate { .. } | Self::CompactionTrigger { .. } | Self::Other => {}
         }
     }
 
@@ -1099,7 +1321,7 @@ impl ResponseItem {
             Self::WebSearchCall { .. } => Some("ws"),
             Self::ImageGenerationCall { .. } => Some("ig"),
             Self::Compaction { .. } | Self::ContextCompaction { .. } => Some("cmp"),
-            Self::CompactionTrigger { .. } | Self::Other => None,
+            Self::ConfigurationUpdate { .. } | Self::CompactionTrigger { .. } | Self::Other => None,
         }
     }
 
@@ -1118,10 +1340,58 @@ impl ResponseItem {
         InternalChatMessageMetadataPassthrough::set_turn_id_if_missing(metadata, turn_id);
     }
 
+    /// Stamps a harness-authored durable item without replacing its creation time.
+    pub fn set_create_time_if_missing(&mut self, create_time: serde_json::Number) {
+        let metadata = match self {
+            Self::Message {
+                role,
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            } if matches!(role.as_str(), "user" | "developer") => metadata,
+            Self::AgentMessage {
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            }
+            | Self::FunctionCallOutput {
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            }
+            | Self::CustomToolCallOutput {
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            }
+            | Self::ToolSearchOutput {
+                internal_chat_message_metadata_passthrough: metadata,
+                ..
+            } => metadata,
+            _ => return,
+        };
+
+        metadata
+            .get_or_insert_default()
+            .create_time
+            .get_or_insert(create_time);
+    }
+
     /// Removes internal chat message metadata passthrough before sending to a provider that does
     /// not accept it.
     pub fn clear_internal_chat_message_metadata_passthrough(&mut self) {
         if let Some(metadata) = self.internal_chat_message_metadata_passthrough_mut() {
+            *metadata = None;
+        }
+    }
+
+    /// Removes content item classifications while preserving other passthrough metadata.
+    pub fn clear_content_item_kinds(&mut self) {
+        let Some(metadata) = self.internal_chat_message_metadata_passthrough_mut() else {
+            return;
+        };
+        let Some(metadata_value) = metadata else {
+            return;
+        };
+
+        metadata_value.content_item_kinds = None;
+        if metadata_value == &InternalChatMessageMetadataPassthrough::default() {
             *metadata = None;
         }
     }
@@ -1186,7 +1456,10 @@ impl ResponseItem {
                 internal_chat_message_metadata_passthrough: metadata,
                 ..
             } => metadata.as_ref(),
-            Self::CompactionTrigger { .. } | Self::AdditionalTools { .. } | Self::Other => None,
+            Self::ConfigurationUpdate { .. }
+            | Self::CompactionTrigger { .. }
+            | Self::AdditionalTools { .. }
+            | Self::Other => None,
         }
     }
 
@@ -1250,24 +1523,43 @@ impl ResponseItem {
                 internal_chat_message_metadata_passthrough: metadata,
                 ..
             } => Some(metadata),
-            Self::CompactionTrigger { .. } | Self::AdditionalTools { .. } | Self::Other => None,
+            Self::ConfigurationUpdate { .. }
+            | Self::CompactionTrigger { .. }
+            | Self::AdditionalTools { .. }
+            | Self::Other => None,
         }
     }
 }
 
 pub const BASE_INSTRUCTIONS_DEFAULT: &str = include_str!("prompts/base_instructions/default.md");
 
+/// Describes whether persisted base instructions were supplied by the user or generated for a model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(tag = "type")]
+pub enum BaseInstructionsProvenance {
+    /// The instructions were explicitly configured and must survive model changes unchanged.
+    Custom,
+    /// The instructions were generated from this model's instruction template.
+    Model { model: String },
+}
+
 /// Base instructions for the model in a thread. Corresponds to the `instructions` field in the ResponsesAPI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(rename = "base_instructions", rename_all = "snake_case")]
 pub struct BaseInstructions {
     pub text: String,
+    /// Missing on rollouts written before base-instruction provenance was persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provenance: Option<BaseInstructionsProvenance>,
 }
 
 impl Default for BaseInstructions {
     fn default() -> Self {
         Self {
             text: BASE_INSTRUCTIONS_DEFAULT.to_string(),
+            provenance: None,
         }
     }
 }
@@ -1517,23 +1809,6 @@ pub enum LocalImagePreparation {
     Defer,
 }
 
-fn audio_mime_for_path(path: &std::path::Path) -> Option<&'static str> {
-    let extension = path.extension()?.to_str()?;
-    if extension.eq_ignore_ascii_case("wav") {
-        Some("audio/wav")
-    } else if extension.eq_ignore_ascii_case("mp3") {
-        Some("audio/mpeg")
-    } else if extension.eq_ignore_ascii_case("m4a") {
-        Some("audio/mp4")
-    } else if extension.eq_ignore_ascii_case("webm") {
-        Some("audio/webm")
-    } else if extension.eq_ignore_ascii_case("ogg") {
-        Some("audio/ogg")
-    } else {
-        None
-    }
-}
-
 fn unsupported_audio_error_placeholder(path: &std::path::Path) -> ContentItem {
     ContentItem::InputText {
         text: format!(
@@ -1578,7 +1853,7 @@ fn local_image_content_items(
         });
     }
     items.push(ContentItem::InputImage {
-        image_url,
+        image: ImageReference::Inline { image_url },
         detail: Some(detail),
     });
     if label_number.is_some() {
@@ -1605,7 +1880,9 @@ impl From<ResponseInputItem> for ResponseItem {
             },
             ResponseInputItem::FunctionCallOutput { call_id, output } => Self::FunctionCallOutput {
                 id: None,
-                call_id,
+                call_id: Some(call_id),
+                name: None,
+                namespace: None,
                 output,
                 internal_chat_message_metadata_passthrough: None,
             },
@@ -1613,7 +1890,9 @@ impl From<ResponseInputItem> for ResponseItem {
                 let output = output.into_function_call_output_payload();
                 Self::FunctionCallOutput {
                     id: None,
-                    call_id,
+                    call_id: Some(call_id),
+                    name: None,
+                    namespace: None,
                     output,
                     internal_chat_message_metadata_passthrough: None,
                 }
@@ -1714,80 +1993,91 @@ pub enum ReasoningItemContent {
 
 impl From<Vec<UserInput>> for ResponseInputItem {
     fn from(items: Vec<UserInput>) -> Self {
-        Self::from_user_input(items, LocalImagePreparation::Process)
+        Self::from_user_input(items, LocalImagePreparation::Process, &mut HashMap::new())
     }
 }
 
 impl ResponseInputItem {
+    /// Records original user-input indices to image slots in the generated message content.
+    /// Inputs that do not produce an image, including failed local reads, have no entry.
     pub fn from_user_input(
         items: Vec<UserInput>,
         local_image_preparation: LocalImagePreparation,
+        user_image_content_indices: &mut HashMap<usize, usize>,
     ) -> Self {
+        user_image_content_indices.clear();
         let mut image_index = 0;
         let mut audio_index = 0;
-        Self::Message {
-            role: "user".to_string(),
-            content: items
-                .into_iter()
-                .flat_map(|c| match c {
-                    UserInput::Text { text, .. } => vec![ContentItem::InputText { text }],
-                    UserInput::Image {
-                        image_url, detail, ..
-                    } => {
-                        image_index += 1;
-                        let detail = detail.unwrap_or(DEFAULT_IMAGE_DETAIL);
-                        vec![ContentItem::InputImage {
-                            image_url,
-                            detail: Some(detail),
-                        }]
-                    }
-                    UserInput::LocalImage { path, detail, .. } => {
-                        image_index += 1;
-                        let detail = detail.unwrap_or(DEFAULT_IMAGE_DETAIL);
-                        match std::fs::read(&path) {
-                            Ok(file_bytes) => match local_image_preparation {
-                                LocalImagePreparation::Process => {
-                                    local_image_content_items_with_label_number(
-                                        &path,
-                                        file_bytes,
-                                        Some(image_index),
-                                        detail,
-                                    )
-                                }
-                                LocalImagePreparation::Defer => local_image_content_items(
+        let mut content = Vec::new();
+        for (input_index, input) in items.into_iter().enumerate() {
+            let generated = match input {
+                UserInput::Text { text, .. } => vec![ContentItem::InputText { text }],
+                UserInput::Image { image, detail, .. } => {
+                    image_index += 1;
+                    let detail = detail.unwrap_or(DEFAULT_IMAGE_DETAIL);
+                    vec![ContentItem::InputImage {
+                        image,
+                        detail: Some(detail),
+                    }]
+                }
+                UserInput::LocalImage { path, detail, .. } => {
+                    image_index += 1;
+                    let detail = detail.unwrap_or(DEFAULT_IMAGE_DETAIL);
+                    match std::fs::read(&path) {
+                        Ok(file_bytes) => match local_image_preparation {
+                            LocalImagePreparation::Process => {
+                                local_image_content_items_with_label_number(
                                     &path,
-                                    data_url_from_bytes("application/octet-stream", &file_bytes),
+                                    file_bytes,
                                     Some(image_index),
                                     detail,
-                                ),
-                            },
-                            Err(err) => vec![local_media_error_placeholder(
-                                &path,
-                                err,
-                                LocalMediaKind::Image,
-                            )],
-                        }
-                    }
-                    UserInput::Audio { audio_url } => {
-                        audio_index += 1;
-                        vec![ContentItem::InputAudio { audio_url }]
-                    }
-                    UserInput::LocalAudio { path } => {
-                        audio_index += 1;
-                        match std::fs::read(&path) {
-                            Ok(file_bytes) => {
-                                local_audio_content_items(&path, &file_bytes, audio_index)
+                                )
                             }
-                            Err(err) => vec![local_media_error_placeholder(
+                            LocalImagePreparation::Defer => local_image_content_items(
                                 &path,
-                                err,
-                                LocalMediaKind::Audio,
-                            )],
-                        }
+                                data_url_from_bytes("application/octet-stream", &file_bytes),
+                                Some(image_index),
+                                detail,
+                            ),
+                        },
+                        Err(err) => vec![local_media_error_placeholder(
+                            &path,
+                            err,
+                            LocalMediaKind::Image,
+                        )],
                     }
-                    UserInput::Skill { .. } | UserInput::Mention { .. } => Vec::new(), // Tool bodies are injected later in core
-                })
-                .collect::<Vec<ContentItem>>(),
+                }
+                UserInput::Audio { audio_url } => {
+                    audio_index += 1;
+                    vec![ContentItem::InputAudio { audio_url }]
+                }
+                UserInput::LocalAudio { path } => {
+                    audio_index += 1;
+                    match std::fs::read(&path) {
+                        Ok(file_bytes) => {
+                            local_audio_content_items(&path, &file_bytes, audio_index)
+                        }
+                        Err(err) => vec![local_media_error_placeholder(
+                            &path,
+                            err,
+                            LocalMediaKind::Audio,
+                        )],
+                    }
+                }
+                UserInput::Skill { .. } | UserInput::Mention { .. } => Vec::new(), // Tool bodies are injected later in core
+            };
+            // Local images add framing text, while mentions and skills add no content.
+            // Capture the image's actual slot before preparation replaces its reference.
+            for (offset, item) in generated.iter().enumerate() {
+                if matches!(item, ContentItem::InputImage { .. }) {
+                    user_image_content_indices.insert(input_index, content.len() + offset);
+                }
+            }
+            content.extend(generated);
+        }
+        Self::Message {
+            role: "user".to_string(),
+            content,
             phase: None,
         }
     }
@@ -1798,32 +2088,6 @@ pub struct SearchToolCallParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub limit: Option<usize>,
-}
-
-/// If the `name` of a `ResponseItem::FunctionCall` is `shell_command`, the
-/// `arguments` field should deserialize to this struct.
-#[derive(Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-pub struct ShellCommandToolCallParams {
-    pub command: String,
-    pub workdir: Option<String>,
-
-    /// Whether to run the shell with login shell semantics
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub login: Option<bool>,
-    /// This is the maximum time in milliseconds that the command is allowed to run.
-    #[serde(alias = "timeout")]
-    pub timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub sandbox_permissions: Option<SandboxPermissions>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub prefix_rule: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub additional_permissions: Option<AdditionalPermissionProfile>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub justification: Option<String>,
 }
 
 /// Responses API compatible content items that can be returned by a tool call.
@@ -1837,7 +2101,8 @@ pub enum FunctionCallOutputContentItem {
     },
     // Do not rename, these are serialized and used directly in the responses API.
     InputImage {
-        image_url: String,
+        #[serde(flatten)]
+        image: ImageReference,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         detail: Option<ImageDetail>,
@@ -1895,7 +2160,7 @@ impl From<crate::dynamic_tools::DynamicToolCallOutputContentItem>
             }
             crate::dynamic_tools::DynamicToolCallOutputContentItem::InputImage { image_url } => {
                 Self::InputImage {
-                    image_url,
+                    image: ImageReference::Inline { image_url },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 }
             }
@@ -1961,13 +2226,6 @@ impl FunctionCallOutputPayload {
 
     pub fn text_content(&self) -> Option<&str> {
         match &self.body {
-            FunctionCallOutputBody::Text(content) => Some(content),
-            FunctionCallOutputBody::ContentItems(_) => None,
-        }
-    }
-
-    pub fn text_content_mut(&mut self) -> Option<&mut String> {
-        match &mut self.body {
             FunctionCallOutputBody::Text(content) => Some(content),
             FunctionCallOutputBody::ContentItems(_) => None,
         }
@@ -2042,13 +2300,12 @@ impl CallToolResult {
 
     pub fn as_function_call_output_payload(&self) -> FunctionCallOutputPayload {
         let content_items = convert_mcp_content_to_items(&self.content);
-        if content_items.as_ref().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| matches!(item, FunctionCallOutputContentItem::EncryptedContent { .. }))
-        }) {
+        if content_items
+            .iter()
+            .any(|item| matches!(item, FunctionCallOutputContentItem::EncryptedContent { .. }))
+        {
             return FunctionCallOutputPayload {
-                body: FunctionCallOutputBody::ContentItems(content_items.unwrap_or_default()),
+                body: FunctionCallOutputBody::ContentItems(content_items),
                 success: Some(self.success()),
             };
         }
@@ -2072,23 +2329,8 @@ impl CallToolResult {
             }
         }
 
-        let serialized_content = match serde_json::to_string(&self.content) {
-            Ok(serialized_content) => serialized_content,
-            Err(err) => {
-                return FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(err.to_string()),
-                    success: Some(false),
-                };
-            }
-        };
-
-        let body = match content_items {
-            Some(content_items) => FunctionCallOutputBody::ContentItems(content_items),
-            None => FunctionCallOutputBody::Text(serialized_content),
-        };
-
         FunctionCallOutputPayload {
-            body,
+            body: FunctionCallOutputBody::ContentItems(content_items),
             success: Some(self.success()),
         }
     }
@@ -2100,7 +2342,7 @@ impl CallToolResult {
 
 fn convert_mcp_content_to_items(
     contents: &[serde_json::Value],
-) -> Option<Vec<FunctionCallOutputContentItem>> {
+) -> Vec<FunctionCallOutputContentItem> {
     const CODEX_ENCRYPTED_CONTENT_META_KEY: &str = "codex/encryptedContent";
     const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
 
@@ -2133,7 +2375,6 @@ fn convert_mcp_content_to_items(
         Unknown,
     }
 
-    let mut saw_content_item = false;
     let mut items = Vec::with_capacity(contents.len());
 
     for content in contents {
@@ -2145,7 +2386,6 @@ fn convert_mcp_content_to_items(
                     .and_then(serde_json::Value::as_bool)
                     == Some(true)
                 {
-                    saw_content_item = true;
                     FunctionCallOutputContentItem::EncryptedContent {
                         encrypted_content: text,
                     }
@@ -2158,7 +2398,6 @@ fn convert_mcp_content_to_items(
                 mime_type,
                 meta,
             }) => {
-                saw_content_item = true;
                 let image_url = if data.starts_with("data:") {
                     data
                 } else {
@@ -2166,7 +2405,7 @@ fn convert_mcp_content_to_items(
                     format!("data:{mime_type};base64,{data}")
                 };
                 FunctionCallOutputContentItem::InputImage {
-                    image_url,
+                    image: ImageReference::Inline { image_url },
                     detail: meta
                         .as_ref()
                         .and_then(serde_json::Value::as_object)
@@ -2185,7 +2424,6 @@ fn convert_mcp_content_to_items(
             Ok(McpContent::Audio {
                 data, mime_type, ..
             }) => {
-                saw_content_item = true;
                 let audio_url = if data.starts_with("data:") {
                     data
                 } else {
@@ -2201,7 +2439,7 @@ fn convert_mcp_content_to_items(
         items.push(item);
     }
 
-    if saw_content_item { Some(items) } else { None }
+    items
 }
 
 // Implement Display so callers can treat the payload like a plain string when logging or doing
@@ -2238,6 +2476,31 @@ mod tests {
         0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2, 0, 0, 5, 0,
         1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ];
+
+    #[test]
+    fn base_instructions_preserve_provenance_and_accept_legacy_rollouts() -> Result<()> {
+        let legacy: BaseInstructions =
+            serde_json::from_value(serde_json::json!({ "text": "legacy instructions" }))?;
+        assert_eq!(legacy.provenance, None);
+
+        for provenance in [
+            BaseInstructionsProvenance::Custom,
+            BaseInstructionsProvenance::Model {
+                model: "gpt-5.2".to_string(),
+            },
+        ] {
+            let instructions = BaseInstructions {
+                text: "persisted instructions".to_string(),
+                provenance: Some(provenance),
+            };
+            assert_eq!(
+                serde_json::from_value::<BaseInstructions>(serde_json::to_value(&instructions)?)?,
+                instructions
+            );
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn plaintext_agent_message_content_rejects_mixed_encrypted_content() {
@@ -2295,6 +2558,25 @@ mod tests {
         }))?;
         assert_eq!(unknown_metadata, item);
 
+        item.append_executed_tool_calls(vec![ExecutedToolCall::new(
+            "test_tool".to_string(),
+            serde_json::json!({"value": 1}),
+        )]);
+        let serialized = serde_json::to_value(&item)?;
+        assert_eq!(
+            serialized["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
+            serde_json::json!([{"name": "test_tool", "arguments": {"value": 1}}]),
+        );
+        let deserialized = serde_json::from_value::<ResponseItem>(serialized)?;
+        assert_eq!(deserialized.turn_id(), Some("turn-1"));
+        assert!(
+            deserialized
+                .executed_tool_call_metadata()
+                .and_then(|metadata| metadata.executed_tool_calls.as_ref())
+                .is_none(),
+            "provider and rollout input cannot forge local attempted-tool metadata",
+        );
+        item.clear_executed_tool_calls();
         item.set_turn_id_if_missing("turn-2");
         assert_eq!(item.turn_id(), Some("turn-1"));
 
@@ -2306,9 +2588,19 @@ mod tests {
         let mut missing_turn_id = response_item_with_passthrough_metadata(
             /*internal_chat_message_metadata_passthrough*/ None,
         );
+        let create_time = serde_json::Number::from(123);
+        missing_turn_id.set_create_time_if_missing(create_time.clone());
         missing_turn_id.set_turn_id_if_missing("");
         missing_turn_id.set_turn_id_if_missing("turn-1");
-        assert_eq!(missing_turn_id.turn_id(), Some("turn-1"));
+        missing_turn_id.set_create_time_if_missing(serde_json::Number::from(456));
+        assert_eq!(
+            missing_turn_id.executed_tool_call_metadata(),
+            Some(&InternalChatMessageMetadataPassthrough {
+                turn_id: Some("turn-1".to_string()),
+                create_time: Some(create_time),
+                ..Default::default()
+            })
+        );
 
         let mut other = ResponseItem::Other;
         other.set_turn_id_if_missing("turn-1");
@@ -2360,6 +2652,7 @@ mod tests {
     fn passthrough_metadata(turn_id: &str) -> InternalChatMessageMetadataPassthrough {
         InternalChatMessageMetadataPassthrough {
             turn_id: Some(turn_id.to_string()),
+            ..Default::default()
         }
     }
 
@@ -2385,7 +2678,9 @@ mod tests {
         assert_eq!(
             content_item,
             ContentItem::InputImage {
-                image_url: "data:image/png;base64,abc".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                },
                 detail: Some(ImageDetail::Auto),
             }
         );
@@ -2436,11 +2731,13 @@ mod tests {
             "mimeType": "image/png",
         })];
 
-        let items = convert_mcp_content_to_items(&contents).expect("expected image items");
+        let items = convert_mcp_content_to_items(&contents);
         assert_eq!(
             items,
             vec![FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,Zm9v".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,Zm9v".to_string(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             }]
         );
@@ -2513,6 +2810,7 @@ mod tests {
                     pattern: "**/*.env".to_string(),
                 },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             }]);
         file_system_sandbox_policy.glob_scan_max_depth = Some(2);
 
@@ -2525,6 +2823,33 @@ mod tests {
             permission_profile.file_system_sandbox_policy(),
             file_system_sandbox_policy
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_profile_round_trip_preserves_ambiguous_native_denies() -> Result<()> {
+        let denied_path = AbsolutePathBuf::try_from(PathBuf::from("/C:/secret"))?;
+        let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(denied_path.into(), FileSystemAccessMode::Deny),
+        ]);
+        let permission_profile = PermissionProfile::from_runtime_permissions(
+            &file_system_sandbox_policy,
+            NetworkSandboxPolicy::Restricted,
+        );
+
+        assert_eq!(
+            serde_json::from_value::<PermissionProfile>(serde_json::to_value(
+                &permission_profile
+            )?)?,
+            permission_profile
+        );
+        Ok(())
     }
 
     #[test]
@@ -2558,6 +2883,7 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     }],
                     glob_scan_max_depth: NonZeroUsize::new(2),
                 },
@@ -2699,8 +3025,9 @@ mod tests {
         .expect("absolute path");
         let file_system_permissions = FileSystemPermissions {
             entries: vec![FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
+                path: path.into(),
                 access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
             }],
             glob_scan_max_depth: NonZeroUsize::new(2),
         };
@@ -2738,11 +3065,13 @@ mod tests {
             "mimeType": "image/png",
         })];
 
-        let items = convert_mcp_content_to_items(&contents).expect("expected image items");
+        let items = convert_mcp_content_to_items(&contents);
         assert_eq!(
             items,
             vec![FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,Zm9v".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,Zm9v".to_string(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             }]
         );
@@ -2766,25 +3095,30 @@ mod tests {
 
         assert_eq!(
             convert_mcp_content_to_items(&contents),
-            Some(vec![
+            vec![
                 FunctionCallOutputContentItem::InputAudio {
                     audio_url: "data:audio/wav;base64,Zm9v".to_string(),
                 },
                 FunctionCallOutputContentItem::InputAudio {
                     audio_url: "data:audio/ogg;base64,YmFy".to_string(),
                 },
-            ])
+            ]
         );
     }
 
     #[test]
-    fn convert_mcp_content_to_items_returns_none_without_media() {
+    fn convert_mcp_content_to_items_converts_text_without_media() {
         let contents = vec![serde_json::json!({
             "type": "text",
             "text": "hello",
         })];
 
-        assert_eq!(convert_mcp_content_to_items(&contents), None);
+        assert_eq!(
+            convert_mcp_content_to_items(&contents),
+            vec![FunctionCallOutputContentItem::InputText {
+                text: "hello".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -2794,7 +3128,9 @@ mod tests {
                 text: "line 1".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,AAA".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             FunctionCallOutputContentItem::InputText {
@@ -2813,7 +3149,9 @@ mod tests {
                 text: "   ".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,AAA".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             FunctionCallOutputContentItem::InputAudio {
@@ -2842,7 +3180,9 @@ mod tests {
                 text: "line 1".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,AAA".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]);
@@ -2869,10 +3209,76 @@ mod tests {
                 name: "mcp__codex_apps__gmail_get_recent_emails".to_string(),
                 namespace: Some("mcp__codex_apps__gmail".to_string()),
                 arguments: "{\"top_k\":5}".to_string(),
+                encrypted_function_args: None,
                 call_id: "call-1".to_string(),
                 internal_chat_message_metadata_passthrough: None,
             }
         );
+    }
+
+    #[test]
+    fn paired_function_call_output_preserves_existing_wire_shape() {
+        let value = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "done",
+        });
+        let item: ResponseItem = serde_json::from_value(value.clone())
+            .expect("paired function call output should deserialize");
+
+        assert_eq!(
+            item,
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("call-1".to_string()),
+                name: None,
+                namespace: None,
+                output: FunctionCallOutputPayload::from_text("done".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(item).expect("serialize item"), value);
+    }
+
+    #[test]
+    fn named_unpaired_function_call_output_round_trips_without_call_id() {
+        let value = serde_json::json!({
+            "type": "function_call_output",
+            "name": "notifications",
+            "namespace": "slack",
+            "output": "Alice mentioned you.",
+        });
+        let item: ResponseItem = serde_json::from_value(value.clone())
+            .expect("named unpaired function call output should deserialize");
+
+        assert_eq!(
+            item,
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: None,
+                name: Some("notifications".to_string()),
+                namespace: Some("slack".to_string()),
+                output: FunctionCallOutputPayload::from_text("Alice mentioned you.".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(item).expect("serialize item"), value);
+    }
+
+    #[test]
+    fn function_call_preserves_empty_encrypted_function_args() {
+        let value = serde_json::json!({
+            "type": "function_call",
+            "name": "spawn_agent",
+            "namespace": "collaboration",
+            "arguments": "{\"message\":\"hello\",\"task_name\":\"worker\"}",
+            "encrypted_function_args": [],
+            "call_id": "call-1",
+        });
+        let item: ResponseItem =
+            serde_json::from_value(value.clone()).expect("function_call should deserialize");
+
+        assert_eq!(serde_json::to_value(item).expect("serialize item"), value);
     }
 
     #[test]
@@ -2964,6 +3370,69 @@ mod tests {
     }
 
     #[test]
+    fn converts_unstructured_mcp_content_to_items() {
+        let content = vec![
+            serde_json::json!({"type":"text","text":"caption"}),
+            serde_json::json!({
+                "type": "resource_link",
+                "uri": "file:///notes.txt",
+                "name": "notes",
+            }),
+            serde_json::json!({
+                "type": "audio",
+                "mimeType": "audio/wav",
+            }),
+        ];
+        let call_tool_result = CallToolResult {
+            content: content.clone(),
+            structured_content: Some(serde_json::Value::Null),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        let resource_link = serde_json::to_string(&content[1]).expect("serialize resource link");
+        let malformed_audio =
+            serde_json::to_string(&content[2]).expect("serialize malformed audio");
+        assert_eq!(
+            call_tool_result.as_function_call_output_payload(),
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "caption".to_string(),
+                    },
+                    FunctionCallOutputContentItem::InputText {
+                        text: resource_link,
+                    },
+                    FunctionCallOutputContentItem::InputText {
+                        text: malformed_audio,
+                    },
+                ]),
+                success: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn preserves_structured_mcp_content() {
+        let call_tool_result = CallToolResult {
+            content: vec![serde_json::json!({"type":"text","text":"ignored"})],
+            structured_content: Some(serde_json::json!({"result":"structured"})),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        assert_eq!(
+            call_tool_result.as_function_call_output_payload(),
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(
+                    serde_json::json!({"result":"structured"}).to_string(),
+                ),
+                success: Some(true),
+            }
+        );
+    }
+
+    #[test]
     fn serializes_image_outputs_as_array() -> Result<()> {
         let call_tool_result = CallToolResult {
             content: vec![
@@ -2988,7 +3457,9 @@ mod tests {
                     text: "caption".into(),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,BASE64".into(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,BASE64".into(),
+                    },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
             ]
@@ -3063,7 +3534,9 @@ mod tests {
             name: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,BASE64".into(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,BASE64".into(),
+                    },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
             ]),
@@ -3128,7 +3601,9 @@ mod tests {
         assert_eq!(
             items,
             vec![FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,BASE64".into(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,BASE64".into(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             }]
         );
@@ -3160,7 +3635,9 @@ mod tests {
         assert_eq!(
             items,
             vec![FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,BASE64".into(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,BASE64".into(),
+                },
                 detail: Some(ImageDetail::Original),
             }]
         );
@@ -3192,7 +3669,9 @@ mod tests {
         assert_eq!(
             items,
             vec![FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,BASE64".into(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,BASE64".into(),
+                },
                 detail: Some(ImageDetail::High),
             }]
         );
@@ -3215,7 +3694,9 @@ mod tests {
                 text: "note".into(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,XYZ".into(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,XYZ".into(),
+                },
                 detail: None,
             },
         ];
@@ -3417,20 +3898,59 @@ mod tests {
         let image_url = "data:image/png;base64,abc".to_string();
 
         let item = ResponseInputItem::from(vec![UserInput::Image {
-            image_url: image_url.clone(),
+            image: ImageReference::Inline {
+                image_url: image_url.clone(),
+            },
             detail: None,
         }]);
 
         match item {
             ResponseInputItem::Message { content, .. } => {
                 let expected = vec![ContentItem::InputImage {
-                    image_url,
+                    image: ImageReference::Inline { image_url },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 }];
                 assert_eq!(content, expected);
             }
             other => panic!("expected message response but got {other:?}"),
         }
+
+        Ok(())
+    }
+
+    /// A file-backed user image must reach the Responses API without being resolved by Core.
+    #[test]
+    fn file_image_user_input_serializes_file_id() -> Result<()> {
+        let file_id = "file_123".to_string();
+
+        let item = ResponseInputItem::from(vec![UserInput::Image {
+            image: ImageReference::File {
+                file_id: file_id.clone(),
+            },
+            detail: None,
+        }]);
+
+        let expected = ResponseInputItem::Message {
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image: ImageReference::File { file_id },
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            }],
+            phase: None,
+        };
+        assert_eq!(item, expected);
+        assert_eq!(
+            serde_json::to_value(item)?,
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "file_id": "file_123",
+                    "detail": "high"
+                }]
+            })
+        );
 
         Ok(())
     }
@@ -3561,7 +4081,9 @@ mod tests {
         let image_url = "data:image/png;base64,abc".to_string();
 
         let item = ResponseInputItem::from(vec![UserInput::Image {
-            image_url: image_url.clone(),
+            image: ImageReference::Inline {
+                image_url: image_url.clone(),
+            },
             detail: Some(ImageDetail::Original),
         }]);
 
@@ -3570,7 +4092,7 @@ mod tests {
                 assert_eq!(
                     content.first(),
                     Some(&ContentItem::InputImage {
-                        image_url,
+                        image: ImageReference::Inline { image_url },
                         detail: Some(ImageDetail::Original),
                     })
                 );
@@ -3750,6 +4272,61 @@ mod tests {
         Ok(())
     }
 
+    /// Image associations use original input and expanded content positions, so omitted inputs,
+    /// local-image framing, failed reads, and duplicate URLs cannot shift a later substitution.
+    #[test]
+    fn user_input_image_indices_survive_content_expansion() -> Result<()> {
+        let dir = tempdir()?;
+        let local_path = dir.path().join("local.png");
+        std::fs::write(&local_path, TINY_PNG_BYTES)?;
+        let inline_image = UserInput::Image {
+            image: ImageReference::Inline {
+                image_url: data_url_from_bytes("image/png", TINY_PNG_BYTES),
+            },
+            detail: None,
+        };
+        let inputs = vec![
+            UserInput::Text {
+                text: "compare images".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Mention {
+                name: "app".to_string(),
+                path: "app://example".to_string(),
+            },
+            UserInput::Skill {
+                name: "skill".to_string(),
+                path: dir.path().join("SKILL.md"),
+            },
+            UserInput::LocalImage {
+                path: dir.path().join("missing.png"),
+                detail: None,
+            },
+            UserInput::LocalImage {
+                path: local_path,
+                detail: None,
+            },
+            inline_image.clone(),
+            inline_image,
+        ];
+        for preparation in [LocalImagePreparation::Defer, LocalImagePreparation::Process] {
+            let mut indices = HashMap::new();
+            let item =
+                ResponseInputItem::from_user_input(inputs.clone(), preparation, &mut indices);
+            assert_eq!(indices, HashMap::from([(4, 3), (5, 5), (6, 6)]));
+            let ResponseInputItem::Message { content, .. } = item else {
+                panic!("expected a user message");
+            };
+            for content_index in indices.into_values() {
+                assert!(matches!(
+                    content[content_index],
+                    ContentItem::InputImage { .. }
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn mixed_remote_and_local_images_share_label_sequence() -> Result<()> {
         let image_url = "data:image/png;base64,abc".to_string();
@@ -3759,7 +4336,9 @@ mod tests {
 
         let item = ResponseInputItem::from(vec![
             UserInput::Image {
-                image_url: image_url.clone(),
+                image: ImageReference::Inline {
+                    image_url: image_url.clone(),
+                },
                 detail: None,
             },
             UserInput::LocalImage {
@@ -3773,7 +4352,7 @@ mod tests {
                 assert_eq!(
                     content.first(),
                     Some(&ContentItem::InputImage {
-                        image_url,
+                        image: ImageReference::Inline { image_url },
                         detail: Some(DEFAULT_IMAGE_DETAIL),
                     })
                 );

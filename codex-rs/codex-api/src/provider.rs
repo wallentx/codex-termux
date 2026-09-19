@@ -82,11 +82,8 @@ impl Provider {
             body: None,
             compression: RequestCompression::None,
             timeout: None,
+            response_body_limit_bytes: None,
         }
-    }
-
-    pub fn is_azure_responses_endpoint(&self) -> bool {
-        is_azure_responses_provider(&self.name, Some(&self.base_url))
     }
 
     pub fn websocket_url_for_path(&self, path: &str) -> Result<Url, url::ParseError> {

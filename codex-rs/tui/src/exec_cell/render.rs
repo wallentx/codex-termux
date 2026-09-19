@@ -5,6 +5,7 @@ use super::model::ExecCall;
 use super::model::ExecCell;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::HistoryRenderMode;
 use crate::history_cell::plain_lines;
 use crate::motion::MotionMode;
 use crate::motion::ReducedMotionIndicator;
@@ -12,15 +13,14 @@ use crate::motion::activity_indicator;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::line_utils::prefix_lines;
 use crate::render::line_utils::push_owned_lines;
+use crate::tool_output::tool_output_preview;
 use crate::ui_consts::TRANSCRIPT_HINT;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
-use crate::wrapping::adaptive_wrap_lines;
 use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::bash::extract_bash_command;
-use codex_utils_elapsed::format_duration;
 use itertools::Itertools;
 use ratatui::prelude::*;
 use ratatui::style::Modifier;
@@ -110,9 +110,7 @@ pub(crate) fn output_lines(
         include_angle_pipe,
         include_prefix,
     } = params;
-    let CommandOutput {
-        aggregated_output, ..
-    } = match output {
+    let output = match output {
         Some(output) if only_err && output.exit_code == 0 => {
             return OutputLines {
                 lines: Vec::new(),
@@ -128,14 +126,12 @@ pub(crate) fn output_lines(
         }
     };
 
-    let src = aggregated_output;
-    let lines: Vec<&str> = src.lines().collect();
-    let total = lines.len();
+    let (total, retained) = output.line_counts();
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    let head_end = total.min(line_limit);
-    for (i, raw) in lines[..head_end].iter().enumerate() {
-        let mut line = ansi_escape_line(raw);
+    let head_end = total.min(line_limit).min(retained);
+    for (i, raw) in output.lines().take(head_end).enumerate() {
+        let mut line = dimmed_output_line(raw.as_ref());
         let prefix = if !include_prefix {
             ""
         } else if i == 0 && include_angle_pipe {
@@ -143,37 +139,26 @@ pub(crate) fn output_lines(
         } else {
             "    "
         };
-        line.spans.insert(0, prefix.into());
-        line.spans.iter_mut().for_each(|span| {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        });
+        line.spans.insert(0, prefix.dim());
         out.push(line);
     }
 
-    let show_ellipsis = total > 2 * line_limit;
-    let omitted = if show_ellipsis {
-        Some(total - 2 * line_limit)
-    } else {
-        None
-    };
-    if show_ellipsis {
-        let omitted = total - 2 * line_limit;
+    let tail_len = total
+        .saturating_sub(head_end)
+        .min(line_limit)
+        .min(retained.saturating_sub(head_end));
+    let omitted = total.saturating_sub(head_end + tail_len);
+    let omitted = (omitted > 0).then_some(omitted);
+    if let Some(omitted) = omitted {
         out.push(ExecCell::output_ellipsis_line(omitted));
     }
 
-    let tail_start = if show_ellipsis {
-        total - line_limit
-    } else {
-        head_end
-    };
-    for raw in lines[tail_start..].iter() {
-        let mut line = ansi_escape_line(raw);
+    let tail = output.lines().rev().take(tail_len).collect_vec();
+    for raw in tail.into_iter().rev() {
+        let mut line = dimmed_output_line(raw.as_ref());
         if include_prefix {
-            line.spans.insert(0, "    ".into());
+            line.spans.insert(0, "    ".dim());
         }
-        line.spans.iter_mut().for_each(|span| {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        });
         out.push(line);
     }
 
@@ -181,6 +166,23 @@ pub(crate) fn output_lines(
         lines: out,
         omitted,
     }
+}
+
+fn dimmed_output_line(raw: &str) -> Line<'static> {
+    let mut line = ansi_escape_line(raw);
+    for span in &mut line.spans {
+        span.style = span.style.add_modifier(Modifier::DIM);
+    }
+    line
+}
+
+fn output_preview_lines(output: &CommandOutput, width: usize) -> Vec<Line<'static>> {
+    let (total, _) = output.line_counts();
+    tool_output_preview(
+        output.lines().map(|raw| dimmed_output_line(raw.as_ref())),
+        width,
+        total,
+    )
 }
 
 fn activity_marker(start_time: Option<Instant>, animations_enabled: bool) -> Span<'static> {
@@ -193,6 +195,15 @@ fn activity_marker(start_time: Option<Instant>, animations_enabled: bool) -> Spa
 }
 
 impl HistoryCell for ExecCell {
+    fn append_reasoning(&mut self, cell: Box<dyn HistoryCell>) -> Result<(), Box<dyn HistoryCell>> {
+        if self.is_exploring_cell() {
+            self.group.push_reasoning(cell);
+            Ok(())
+        } else {
+            Err(cell)
+        }
+    }
+
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         if self.is_exploring_cell() {
             self.exploring_display_lines(width)
@@ -202,51 +213,11 @@ impl HistoryCell for ExecCell {
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = vec![];
-        for (i, call) in self.iter_calls().enumerate() {
-            if i > 0 {
-                lines.push("".into());
-            }
-            let script = strip_bash_lc_and_escape(&call.command);
-            let highlighted_script = highlight_bash_to_lines(&script);
-            let cmd_display = adaptive_wrap_lines(
-                &highlighted_script,
-                RtOptions::new(width as usize)
-                    .initial_indent("$ ".magenta().into())
-                    .subsequent_indent("    ".into()),
-            );
-            lines.extend(cmd_display);
-
-            if let Some(output) = call.output.as_ref() {
-                if !call.is_unified_exec_interaction() {
-                    let wrap_width = width.max(1) as usize;
-                    let wrap_opts = RtOptions::new(wrap_width);
-                    for unwrapped in output.formatted_output.lines().map(ansi_escape_line) {
-                        let wrapped = adaptive_wrap_line(&unwrapped, wrap_opts.clone());
-                        push_owned_lines(&wrapped, &mut lines);
-                    }
-                }
-                let duration = call
-                    .duration
-                    .map(format_duration)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let mut result: Line = if output.exit_code == 0 {
-                    Line::from("✓".green().bold())
-                } else {
-                    Line::from(vec![
-                        "✗".red().bold(),
-                        format!(" ({})", output.exit_code).into(),
-                    ])
-                };
-                result.push_span(format!(" • {duration}").dim());
-                lines.push(result);
-            }
-        }
-        lines
+        self.detailed_lines(width, HistoryRenderMode::Rich)
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        plain_lines(self.transcript_lines(u16::MAX))
+        plain_lines(self.detailed_lines(u16::MAX, HistoryRenderMode::Raw))
     }
 }
 
@@ -275,38 +246,41 @@ impl ExecCell {
             },
         ]));
 
-        let mut calls = self.calls.clone();
+        let mut calls = self.group.calls.as_slice();
         let mut out_indented = Vec::new();
-        while !calls.is_empty() {
-            let mut call = calls.remove(0);
-            if call
-                .parsed
-                .iter()
-                .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }))
-            {
-                while let Some(next) = calls.first() {
-                    if next
-                        .parsed
-                        .iter()
-                        .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }))
-                    {
-                        call.parsed.extend(next.parsed.clone());
-                        calls.remove(0);
-                    } else {
-                        break;
-                    }
-                }
-            }
-
+        let nonzero_exit = |call: &ExecCall| {
+            call.duration
+                .and(call.output.as_ref())
+                .map(|output| output.exit_code)
+                .filter(|code| *code != 0)
+        };
+        while let Some((call, remaining)) = calls.split_first() {
+            let exit_code = nonzero_exit(call);
             let reads_only = call
                 .parsed
                 .iter()
                 .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }));
+            let group_len = if reads_only && exit_code.is_none() {
+                1 + remaining
+                    .iter()
+                    .take_while(|next| {
+                        nonzero_exit(next).is_none()
+                            && next
+                                .parsed
+                                .iter()
+                                .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }))
+                    })
+                    .count()
+            } else {
+                1
+            };
+            let (group, remaining) = calls.split_at(group_len);
+            calls = remaining;
 
             let call_lines: Vec<(&str, Vec<Span<'static>>)> = if reads_only {
-                let names = call
-                    .parsed
+                let names = group
                     .iter()
+                    .flat_map(|call| &call.parsed)
                     .map(|parsed| match parsed {
                         ParsedCommand::Read { name, .. } => name.clone(),
                         _ => unreachable!(),
@@ -344,7 +318,31 @@ impl ExecCell {
                 lines
             };
 
-            for (title, line) in call_lines {
+            let line_count = call_lines.len();
+            for (index, (title, mut line)) in call_lines.into_iter().enumerate() {
+                if let Some(code) = exit_code
+                    && index + 1 == line_count
+                {
+                    // A compound command has one exit code, not an outcome for each parsed action.
+                    let status = if call.parsed.len() > 1 {
+                        format!(" (command exit {code})")
+                    } else {
+                        format!(" (exit {code})")
+                    };
+                    // Search exit 1 can mean no matches; report the code without calling it a failure.
+                    line.push(
+                        if code == 1
+                            && call
+                                .parsed
+                                .iter()
+                                .any(|p| matches!(p, ParsedCommand::Search { .. }))
+                        {
+                            status.dim()
+                        } else {
+                            status.red()
+                        },
+                    );
+                }
                 let line = Line::from(line);
                 let initial_indent = Line::from(vec![title.cyan(), " ".into()]);
                 let subsequent_indent = " ".repeat(initial_indent.width()).into();
@@ -363,11 +361,13 @@ impl ExecCell {
     }
 
     fn command_display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let [call] = &self.calls.as_slice() else {
+        let [call] = &self.group.calls.as_slice() else {
             panic!("Expected exactly one call in a command display cell");
         };
         let layout = EXEC_DISPLAY_LAYOUT;
-        let success = call.output.as_ref().map(|o| o.exit_code == 0);
+        let success = call
+            .duration
+            .and_then(|_| call.output.as_ref().map(|o| o.exit_code == 0));
         let bullet = match success {
             Some(true) => "•".green().bold(),
             Some(false) => "•".red().bold(),
@@ -440,25 +440,29 @@ impl ExecCell {
         }
 
         if let Some(output) = call.output.as_ref() {
-            let line_limit = if call.is_user_shell_command() {
-                USER_SHELL_TOOL_CALL_MAX_LINES
-            } else {
-                TOOL_CALL_MAX_LINES
-            };
+            if !call.is_user_shell_command() {
+                let preview = output_preview_lines(output, layout.output_block.wrap_width(width));
+                let preview = if preview.is_empty() && !call.is_unified_exec_interaction() {
+                    vec![Line::from("(no output)".dim())]
+                } else {
+                    preview
+                };
+                lines.extend(prefix_lines(
+                    preview,
+                    Span::from(layout.output_block.initial_prefix).dim(),
+                    Span::from(layout.output_block.subsequent_prefix),
+                ));
+                return lines;
+            }
             let raw_output = output_lines(
                 Some(output),
                 OutputLinesParams {
-                    line_limit,
+                    line_limit: USER_SHELL_TOOL_CALL_MAX_LINES,
                     only_err: false,
                     include_angle_pipe: false,
                     include_prefix: false,
                 },
             );
-            let display_limit = if call.is_user_shell_command() {
-                USER_SHELL_TOOL_CALL_MAX_LINES
-            } else {
-                layout.output_max_lines
-            };
 
             if raw_output.lines.is_empty() {
                 if !call.is_unified_exec_interaction() {
@@ -490,7 +494,7 @@ impl ExecCell {
                 );
                 let trimmed_output = Self::truncate_lines_middle(
                     &prefixed_output,
-                    display_limit,
+                    USER_SHELL_TOOL_CALL_MAX_LINES,
                     width,
                     raw_output.omitted,
                     Some(Line::from(
@@ -684,7 +688,6 @@ struct ExecDisplayLayout {
     command_continuation: PrefixedBlock,
     command_continuation_max_lines: usize,
     output_block: PrefixedBlock,
-    output_max_lines: usize,
 }
 
 impl ExecDisplayLayout {
@@ -692,13 +695,11 @@ impl ExecDisplayLayout {
         command_continuation: PrefixedBlock,
         command_continuation_max_lines: usize,
         output_block: PrefixedBlock,
-        output_max_lines: usize,
     ) -> Self {
         Self {
             command_continuation,
             command_continuation_max_lines,
             output_block,
-            output_max_lines,
         }
     }
 }
@@ -707,7 +708,6 @@ const EXEC_DISPLAY_LAYOUT: ExecDisplayLayout = ExecDisplayLayout::new(
     PrefixedBlock::new("  │ ", "  │ "),
     /*command_continuation_max_lines*/ 2,
     PrefixedBlock::new("  └ ", "    "),
-    /*output_max_lines*/ 5,
 );
 
 #[cfg(test)]
@@ -733,11 +733,7 @@ mod tests {
 
         // Baseline: how many screen lines would we get if we simply wrapped
         // all logical lines without any truncation?
-        let output = CommandOutput {
-            exit_code: 0,
-            aggregated_output,
-            formatted_output: String::new(),
-        };
+        let output = CommandOutput::new(/*exit_code*/ 0, aggregated_output);
         let width = 20;
         let layout = EXEC_DISPLAY_LAYOUT;
         let raw_output = output_lines(
@@ -859,11 +855,10 @@ mod tests {
 
     #[test]
     fn output_lines_ellipsis_includes_transcript_hint() {
-        let output = CommandOutput {
-            exit_code: 0,
-            aggregated_output: (1..=7).map(|n| n.to_string()).join("\n"),
-            formatted_output: String::new(),
-        };
+        let output = CommandOutput::new(
+            /*exit_code*/ 0,
+            (1..=7).map(|n| n.to_string()).join("\n"),
+        );
 
         let rendered: Vec<String> = output_lines(
             Some(&output),
@@ -879,12 +874,136 @@ mod tests {
         .map(render_line_text)
         .collect();
 
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains("… +3 lines (ctrl + t to view transcript)")),
-            "expected logical truncation to include transcript hint, got: {rendered:?}"
+        assert_eq!(
+            rendered,
+            vec![
+                "1",
+                "2",
+                "… +3 lines (ctrl + t to view transcript)",
+                "6",
+                "7",
+            ]
         );
+    }
+
+    #[test]
+    fn output_lines_handles_newline_dense_output_without_materializing_every_line() {
+        let output = CommandOutput::new(/*exit_code*/ 0, "\n".repeat(100_000));
+
+        let rendered = output_lines(
+            Some(&output),
+            OutputLinesParams {
+                line_limit: 5,
+                only_err: false,
+                include_angle_pipe: false,
+                include_prefix: false,
+            },
+        );
+
+        assert_eq!(rendered.lines.len(), 11);
+        assert_eq!(rendered.omitted, Some(99_990));
+    }
+
+    #[test]
+    fn streamed_output_renders_head_tail_previews() {
+        let mut cell = new_active_exec_command(
+            "call-id".to_string(),
+            vec!["bash".into(), "-lc".into(), "echo output".into()],
+            Vec::new(),
+            ExecCommandSource::Agent,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ false,
+        );
+        for line in 1..=160 {
+            assert!(cell.append_output("call-id", &format!("line {line}\n")));
+        }
+        let output = cell.group.calls[0]
+            .output
+            .as_ref()
+            .expect("streamed output");
+
+        let agent = output_lines(
+            Some(output),
+            OutputLinesParams {
+                line_limit: TOOL_CALL_MAX_LINES,
+                only_err: false,
+                include_angle_pipe: false,
+                include_prefix: false,
+            },
+        );
+        assert_eq!(agent.lines.len(), 11);
+        assert_eq!(agent.omitted, Some(150));
+        assert_eq!(render_line_text(&agent.lines[0]), "line 1");
+        assert_eq!(render_line_text(&agent.lines[10]), "line 160");
+
+        let user_shell = output_lines(
+            Some(output),
+            OutputLinesParams {
+                line_limit: USER_SHELL_TOOL_CALL_MAX_LINES,
+                only_err: false,
+                include_angle_pipe: false,
+                include_prefix: false,
+            },
+        );
+        assert_eq!(user_shell.lines.len(), 101);
+        assert_eq!(user_shell.omitted, Some(60));
+        assert_eq!(render_line_text(&user_shell.lines[0]), "line 1");
+        assert_eq!(render_line_text(&user_shell.lines[100]), "line 160");
+    }
+
+    #[test]
+    fn truncated_live_output_preview_and_transcript_snapshot() {
+        let mut cell = new_active_exec_command(
+            "call-id".to_string(),
+            vec!["bash".into(), "-lc".into(), "echo output".into()],
+            Vec::new(),
+            ExecCommandSource::Agent,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ false,
+        );
+        let hidden = "\x1b[2m".repeat(300_000);
+        let output = format!(
+            "\x1b[31mhead error that wraps onto the next row\x1b[0m{hidden}\x1b[32mtail output that also wraps\x1b[0m"
+        );
+        assert!(cell.append_output("call-id", &output));
+
+        let preview = cell.display_lines(/*width*/ 60);
+        cell.group.calls[0].start_time = None;
+        cell.mark_failed();
+        let transcript = cell.transcript_lines(/*width*/ 60);
+
+        insta::assert_debug_snapshot!(
+            "truncated_live_output_preview_and_transcript",
+            (preview, transcript)
+        );
+    }
+
+    #[test]
+    fn powershell_skill_read_snapshot() {
+        let command = vec![
+            "powershell.exe".to_string(),
+            "-Command".to_string(),
+            r"Get-Content C:\skills\demo\SKILL.md".to_string(),
+        ];
+        let parsed = codex_shell_command::parse_command::parse_command(&command);
+        let cell = new_active_exec_command(
+            "call-id".to_string(),
+            command,
+            parsed,
+            ExecCommandSource::Agent,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ false,
+        );
+        let rendered = cell
+            .display_lines(/*width*/ 80)
+            .iter()
+            .map(render_line_text)
+            .join("\n");
+
+        insta::assert_snapshot!(rendered, @r"
+        • Exploring
+          └ Read SKILL.md
+        ");
     }
 
     #[test]
@@ -1034,11 +1153,7 @@ mod tests {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "echo done".into()],
             parsed: Vec::new(),
-            output: Some(CommandOutput {
-                exit_code: 0,
-                formatted_output: String::new(),
-                aggregated_output: url.to_string(),
-            }),
+            output: Some(CommandOutput::new(/*exit_code*/ 0, url.to_string())),
             source: ExecCommandSource::UserShell,
             start_time: None,
             duration: None,
@@ -1071,11 +1186,7 @@ mod tests {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "echo done".into()],
             parsed: Vec::new(),
-            output: Some(CommandOutput {
-                exit_code: 0,
-                formatted_output: url.to_string(),
-                aggregated_output: url.to_string(),
-            }),
+            output: Some(CommandOutput::new(/*exit_code*/ 0, url.to_string())),
             source: ExecCommandSource::Agent,
             start_time: None,
             duration: None,

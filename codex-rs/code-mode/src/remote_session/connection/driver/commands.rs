@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use codex_code_mode_protocol::CellId;
+use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::WaitOutcome;
@@ -8,6 +9,7 @@ use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostRequest;
+use codex_code_mode_protocol::host::WireSessionCellExecutionLimits;
 use codex_code_mode_protocol::host::WireWaitRequest;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -27,17 +29,18 @@ impl ConnectionDriver {
         match command {
             DriverCommand::OpenSession {
                 session,
-                delegate,
+                limits,
                 cleanup,
                 caller_cancellation,
                 response_tx,
-            } => self.open_session(session, delegate, cleanup, caller_cancellation, response_tx),
+            } => self.open_session(session, limits, cleanup, caller_cancellation, response_tx),
             DriverCommand::Execute {
                 session,
                 request,
+                delegate,
                 caller_cancellation,
                 response_tx,
-            } => self.execute(session, request, caller_cancellation, response_tx),
+            } => self.execute(session, request, delegate, caller_cancellation, response_tx),
             DriverCommand::Wait {
                 session,
                 request,
@@ -59,7 +62,7 @@ impl ConnectionDriver {
     fn open_session(
         &mut self,
         session: RemoteSession,
-        delegate: Arc<dyn CodeModeSessionDelegate>,
+        limits: CodeModeSessionCellExecutionLimits,
         cleanup: super::cleanup::SessionCleanup,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<(), String>>,
@@ -71,6 +74,15 @@ impl ConnectionDriver {
             )));
             return true;
         }
+        let limits = match WireSessionCellExecutionLimits::try_from(limits) {
+            Ok(limits) => limits,
+            Err(error) => {
+                let _ = response_tx.send(Err(format!(
+                    "failed to encode code-mode session execution limits: {error}"
+                )));
+                return true;
+            }
+        };
         let request_id = match self.requests.allocate_id() {
             Ok(id) => id,
             Err(err) => {
@@ -82,6 +94,8 @@ impl ConnectionDriver {
             id: request_id,
             request: HostRequest::OpenSession {
                 session_id: session.id.clone(),
+                cell_execution_limits: (limits != WireSessionCellExecutionLimits::default())
+                    .then_some(limits),
             },
         };
         let frame = match EncodedFrame::encode(&message) {
@@ -98,7 +112,6 @@ impl ConnectionDriver {
             request_id,
             PendingRequest::OpenSession {
                 session,
-                delegate,
                 cleanup,
                 cancellation,
                 response_tx,
@@ -112,6 +125,7 @@ impl ConnectionDriver {
         &mut self,
         session: RemoteSession,
         request: ExecuteRequest,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
     ) -> bool {
@@ -157,6 +171,7 @@ impl ConnectionDriver {
             request_id,
             PendingRequest::Execute {
                 session,
+                delegate,
                 response_tx,
                 initial_response_tx,
                 initial_response_rx,

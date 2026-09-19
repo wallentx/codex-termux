@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -6,8 +7,10 @@ mod executor;
 mod host;
 mod orchestrator;
 
-use codex_core_skills::HostSkillsSnapshot;
+use crate::HostSkillsSnapshot;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
+use codex_exec_server::FileSystemSandboxContext;
+use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::McpResourceClient;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 
@@ -20,13 +23,17 @@ use crate::catalog::SkillResourceId;
 use crate::catalog::SkillSearchResult;
 
 pub use executor::ExecutorSkillProvider;
+pub(crate) use executor::attribute_executor_plugins;
 pub use host::HostSkillProvider;
 pub use orchestrator::OrchestratorSkillProvider;
+
+pub(crate) const MAX_SKILL_RESOURCE_CONTENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SkillListQuery {
     pub turn_id: String,
     pub executor_roots: Vec<SelectedCapabilityRoot>,
+    pub resolved_executor_roots: Vec<ResolvedSelectedCapabilityRoot>,
     pub host_snapshot: Option<Arc<HostSkillsSnapshot>>,
     pub include_host_skills: bool,
     pub include_bundled_skills: bool,
@@ -37,10 +44,14 @@ pub struct SkillListQuery {
 }
 
 #[derive(Clone, Debug)]
-pub struct SkillReadRequest {
+pub struct SkillReadRequest<'a> {
+    // TODO(anp): Replace the marker with callback-scoped environment access.
+    pub _lifetime: PhantomData<&'a ()>,
     pub authority: SkillAuthority,
     pub package: SkillPackageId,
     pub resource: SkillResourceId,
+    pub resolved_executor_roots: Vec<ResolvedSelectedCapabilityRoot>,
+    pub sandbox: Option<FileSystemSandboxContext>,
     pub host_snapshot: Option<Arc<HostSkillsSnapshot>>,
     pub mcp_resources: Option<Arc<McpResourceClient>>,
 }
@@ -63,7 +74,10 @@ pub type SkillProviderFuture<'a, T> =
 pub trait SkillProvider: Send + Sync {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>;
 
-    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult>;
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult>;
 
     fn search(&self, request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult>;
 }

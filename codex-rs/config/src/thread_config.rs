@@ -75,10 +75,6 @@ impl ThreadConfigLoadError {
     pub fn code(&self) -> ThreadConfigLoadErrorCode {
         self.code
     }
-
-    pub fn status_code(&self) -> Option<u16> {
-        self.status_code
-    }
 }
 
 /// Loads typed config sources for a new thread.
@@ -288,6 +284,7 @@ mod tests {
                     wire_api = "responses"
                     requires_openai_auth = false
                     supports_websockets = true
+                    supports_standalone_web_search = true
 
                     [features]
                     plugins = false
@@ -301,10 +298,12 @@ mod tests {
         ModelProviderInfo {
             name: name.to_string(),
             base_url: Some("http://127.0.0.1:8061/api/codex".to_string()),
+            model_catalog_url: None,
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,
             auth: None,
+            gateway_oauth: None,
             aws: None,
             wire_api: WireApi::Responses,
             query_params: None,
@@ -316,6 +315,7 @@ mod tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: true,
+            supports_standalone_web_search: true,
         }
     }
 }

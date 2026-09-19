@@ -4,13 +4,42 @@ use crate::terminal_palette::StdoutColorLevel;
 use crate::terminal_palette::best_color;
 use crate::terminal_palette::default_bg;
 use crate::terminal_palette::default_fg;
+use crate::terminal_palette::effective_stdout_color_level;
 use crate::terminal_palette::rgb_color;
 use crate::terminal_palette::stdout_color_level;
 use ratatui::style::Color;
 use ratatui::style::Style;
-use ratatui::style::Stylize;
 
 const LIGHT_BG_ACCENT_RGB: (u8, u8, u8) = (0, 95, 135);
+
+#[derive(Clone, Copy)]
+pub(crate) enum StatusTone {
+    Success,
+    Attention,
+    Failure,
+}
+
+/// Semantic status colors that preserve the terminal's configured palette.
+pub(crate) fn status_style(tone: StatusTone) -> Style {
+    status_style_for(tone, default_bg(), effective_stdout_color_level())
+}
+
+fn status_style_for(
+    tone: StatusTone,
+    terminal_bg: Option<(u8, u8, u8)>,
+    color_level: StdoutColorLevel,
+) -> Style {
+    let light = terminal_bg.is_some_and(is_light);
+    let color = match (tone, color_level) {
+        (_, StdoutColorLevel::Unknown) => Color::Reset,
+        (StatusTone::Success, _) => Color::Green,
+        (StatusTone::Failure, _) => Color::Red,
+        // Yellow can disappear on light themes; use it only with a known dark background.
+        (StatusTone::Attention, _) if light || terminal_bg.is_none() => Color::Reset,
+        (StatusTone::Attention, _) => Color::Yellow,
+    };
+    Style::default().fg(color).bold()
+}
 // Decorative table rules should remain visible without competing with cell content.
 const TABLE_SEPARATOR_FG_ALPHA: f32 = 0.20;
 
@@ -29,7 +58,34 @@ pub(crate) fn table_separator_style() -> Style {
 
 /// Returns the shared accent style for active or selected TUI controls.
 pub(crate) fn accent_style() -> Style {
+    if matches!(
+        effective_stdout_color_level(),
+        StdoutColorLevel::TrueColor | StdoutColorLevel::Ansi256
+    ) && let Some(mut style) =
+        crate::render::highlight::foreground_style_for_scopes(&["codex.accent"])
+    {
+        if let Some(Color::Rgb(r, g, b)) = style.fg {
+            style = style.fg(best_color((r, g, b)));
+        }
+        return style.bold();
+    }
     accent_style_for(default_bg())
+}
+
+pub(crate) fn footer_hint_key_style() -> Style {
+    if default_bg().is_some_and(is_light) {
+        Style::default().fg(Color::Black)
+    } else {
+        Style::default()
+    }
+}
+
+pub(crate) fn footer_hint_label_style() -> Style {
+    if default_bg().is_some_and(is_light) {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().dim()
+    }
 }
 
 /// Returns the style for a user-authored message using the provided terminal background.
@@ -74,12 +130,16 @@ fn table_separator_style_for(
 
 #[allow(clippy::disallowed_methods)]
 pub fn user_message_bg(terminal_bg: (u8, u8, u8)) -> Color {
+    best_color(user_message_bg_rgb(terminal_bg))
+}
+
+pub(crate) fn user_message_bg_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
     let (top, alpha) = if is_light(terminal_bg) {
         ((0, 0, 0), 0.04)
     } else {
         ((255, 255, 255), 0.12)
     };
-    best_color(blend(top, terminal_bg, alpha))
+    blend(top, terminal_bg, alpha)
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -92,6 +152,91 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use ratatui::style::Modifier;
+
+    #[test]
+    fn status_colors_preserve_light_terminal_themes() {
+        for level in [StdoutColorLevel::TrueColor, StdoutColorLevel::Ansi256] {
+            for bg in [(255, 255, 255), (130, 130, 130), (220, 210, 180)] {
+                for (tone, color) in [
+                    (StatusTone::Success, Color::Green),
+                    (StatusTone::Attention, Color::Reset),
+                    (StatusTone::Failure, Color::Red),
+                ] {
+                    assert_eq!(
+                        status_style_for(tone, Some(bg), level),
+                        Style::default().fg(color).bold(),
+                    );
+                }
+            }
+            for bg in [(0, 0, 0), (0, 218, 0)] {
+                assert_eq!(
+                    status_style_for(StatusTone::Attention, Some(bg), level),
+                    Style::default().fg(Color::Yellow).bold(),
+                );
+            }
+            assert_eq!(
+                status_style_for(StatusTone::Attention, /*terminal_bg*/ None, level),
+                Style::default().fg(Color::Reset).bold(),
+            );
+        }
+    }
+
+    #[test]
+    fn status_colors_preserve_ansi16_and_no_color_fallbacks() {
+        for (tone, light, dark) in [
+            (StatusTone::Success, Color::Green, Color::Green),
+            (StatusTone::Attention, Color::Reset, Color::Yellow),
+            (StatusTone::Failure, Color::Red, Color::Red),
+        ] {
+            for (bg, expected) in [((255, 255, 255), light), ((0, 0, 0), dark)] {
+                assert_eq!(
+                    status_style_for(tone, Some(bg), StdoutColorLevel::Ansi16),
+                    Style::default().fg(expected).bold()
+                );
+                assert_eq!(
+                    status_style_for(tone, Some(bg), StdoutColorLevel::Unknown),
+                    Style::default().fg(Color::Reset).bold()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn theme_accents_respect_terminal_color_depth() {
+        const CHILD: &str = "CODEX_ACCENT_COLOR_TEST_CHILD";
+        let Ok(level) = std::env::var(CHILD) else {
+            for level in ["0", "1", "2", "3"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "style::tests::theme_accents_respect_terminal_color_depth",
+                    ])
+                    .env(CHILD, level)
+                    .env("FORCE_COLOR", level)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "level {level}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let theme =
+            crate::render::highlight::resolve_theme_by_name("ada", /*codex_home*/ None).unwrap();
+        crate::render::highlight::set_syntax_theme(theme);
+        let expected = match level.as_str() {
+            "3" => Style::default().fg(rgb_color((95, 175, 255))).bold(),
+            "2" => Style::default()
+                .fg(crate::terminal_palette::indexed_color(/*index*/ 75))
+                .bold(),
+            "0" | "1" => accent_style_for(default_bg()),
+            _ => unreachable!(),
+        };
+        assert_eq!(accent_style(), expected);
+    }
 
     #[test]
     fn accent_style_uses_darker_cyan_on_light_backgrounds() {

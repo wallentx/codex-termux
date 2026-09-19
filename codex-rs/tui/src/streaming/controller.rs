@@ -19,6 +19,10 @@
 //! agent and proposed-plan streams. Lines in `Outside` and `Markdown` fence
 //! contexts are scanned; lines inside non-markdown fences are skipped.
 //!
+//! Mermaid stays mutable while its containing top-level block is last. The closing fence replaces
+//! source with a diagram, and resizing can replace a diagram that no longer fits with its source.
+//! Once another block starts, the diagram enters scrollback so later prose does not grow the tail.
+//!
 //! ## Resize handling
 //!
 //! On terminal width change, `StreamCore::set_width` re-renders at the new
@@ -30,8 +34,9 @@
 //! ## Invariants
 //!
 //! - `emitted_stable_len <= enqueued_stable_len <= render.lines.len()`.
-//! - `raw_source` is append-only until `reset()`; never modified mid-stream.
-//! - Tail starts exactly at `enqueued_stable_len`.
+//! - committed source is append-only until `reset()`; never modified mid-stream.
+//! - The committed-source tail starts at `enqueued_stable_len`; a bounded prose preview may
+//!   follow it without affecting any stable line counts.
 //! - During confirmed table streaming, only lines from the table header onward
 //!   are forced into tail; pre-table lines may remain stable.
 
@@ -51,6 +56,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::StreamState;
+use super::prose_preview::PreviewMode;
+use super::prose_preview::ProsePreview;
 use super::render::StreamingRender;
 use super::render::render_source;
 use super::table_holdback::TableHoldbackScanner;
@@ -75,10 +82,10 @@ struct StreamCore {
     state: StreamState,
     /// Current rendering width (columns available for markdown content).
     width: Option<usize>,
-    /// Accumulated raw markdown source for the current stream.
-    raw_source: String,
-    /// Incremental render of `raw_source` at `width`.
+    /// Incremental render of committed source at `width`.
     render: StreamingRender,
+    /// Disposable partial prose, never counted in the stable render or queue.
+    preview: ProsePreview,
     /// Lines enqueued into the commit-animation queue.
     enqueued_stable_len: usize,
     /// Lines actually emitted to scrollback.
@@ -94,11 +101,11 @@ struct StreamCore {
 }
 
 struct StablePrefixLenCache {
-    /// Byte offset of the candidate table/header start in `raw_source`.
+    /// Byte offset of the candidate table/header start in committed source.
     source_start: usize,
     /// Width that produced `stable_prefix_len`.
     width: Option<usize>,
-    /// Rendered line count for `raw_source[..source_start]` at `width`.
+    /// Rendered line count for the committed prefix before `source_start` at `width`.
     ///
     /// The streaming controller uses this to avoid repeatedly re-rendering the
     /// same stable prefix while a live table tail is still mutating.
@@ -115,8 +122,8 @@ impl StreamCore {
         Self {
             state: StreamState::new(width, cwd),
             width,
-            raw_source: String::with_capacity(1024),
             render: StreamingRender::new(),
+            preview: ProsePreview::default(),
             enqueued_stable_len: 0,
             emitted_stable_len: 0,
             cwd: cwd.to_path_buf(),
@@ -127,28 +134,33 @@ impl StreamCore {
         }
     }
 
-    /// Push a streaming delta and enqueue any newly-stable rendered lines.
+    /// Push a delta and report whether the queue or prose preview changed.
     ///
-    /// Only newline-terminated source is committed into `raw_source`. This is
+    /// Only newline-terminated source is committed to the stable render. This is
     /// important for tables because an unterminated partial row must stay out
     /// of both the stable queue and the live tail until its structure is
     /// unambiguous; otherwise the user can briefly see malformed columns that
-    /// immediately disappear on the next delta.
+    /// immediately disappear on the next delta. Unterminated prose gets a separate,
+    /// bounded preview that never advances the stable boundary.
     fn push_delta(&mut self, delta: &str) -> bool {
         if !delta.is_empty() {
             self.state.has_seen_delta = true;
         }
         self.state.collector.push_delta(delta);
 
+        if delta.contains('\n') {
+            self.preview = ProsePreview::default();
+        }
         let mut enqueued = false;
         if delta.contains('\n')
-            && let Some(committed_source) = self.state.collector.commit_complete_source()
+            && let Some(range) = self.state.collector.commit_complete_source()
         {
-            self.raw_source.push_str(&committed_source);
-            self.holdback_scanner.push_source_chunk(&committed_source);
+            let source = self.state.collector.committed_source();
+            let committed_source = &source[range];
+            self.holdback_scanner.push_source_chunk(committed_source);
             self.render.append(
-                &self.raw_source,
-                &committed_source,
+                source,
+                committed_source,
                 self.width,
                 self.cwd.as_path(),
                 self.render_mode,
@@ -156,7 +168,32 @@ impl StreamCore {
             );
             enqueued = self.sync_stable_queue();
         }
-        enqueued
+        let preview_changed = self.refresh_preview();
+        enqueued || preview_changed
+    }
+
+    fn refresh_preview(&mut self) -> bool {
+        let pending = self.state.collector.pending_source();
+        let prose_preview = self.holdback_scanner.allows_prose_preview();
+        let math = self.render_mode == HistoryRenderMode::Rich
+            && (self.render.pending_math_start.is_some()
+                || prose_preview && (pending.starts_with("$$") || pending.starts_with("\\[")));
+        if math || prose_preview {
+            self.preview.update(
+                pending,
+                self.width,
+                &self.cwd,
+                if math {
+                    PreviewMode::Math
+                } else {
+                    PreviewMode::Prose(self.render_mode)
+                },
+                self.inline_visualization_context.as_ref(),
+            )
+        } else {
+            self.preview = ProsePreview::default();
+            false
+        }
     }
 
     /// Drain the collector, render the final source snapshot, and return lines not yet emitted.
@@ -166,24 +203,17 @@ impl StreamCore {
     /// final render is the canonical transcript representation used for
     /// consolidation, so callers that skip `reset()` can accidentally replay a
     /// finished stream into the next answer.
-    fn finalize_remaining(&mut self) -> Vec<HyperlinkLine> {
-        let remainder_source = self.state.collector.finalize_and_drain_source();
-        if !remainder_source.is_empty() {
-            self.raw_source.push_str(&remainder_source);
-            self.holdback_scanner.push_source_chunk(&remainder_source);
-        }
-        let rendered = render_source(
-            &self.raw_source,
+    fn finalize_remaining(&mut self) -> (Vec<HyperlinkLine>, String) {
+        let source = self.state.collector.finalize_and_take_source();
+        let mut rendered = render_source(
+            &source,
             self.width,
             self.cwd.as_path(),
             self.render_mode,
             self.inline_visualization_context.as_ref(),
         );
-        if self.emitted_stable_len >= rendered.len() {
-            Vec::new()
-        } else {
-            rendered[self.emitted_stable_len..].to_vec()
-        }
+        let remaining = rendered.split_off(self.emitted_stable_len.min(rendered.len()));
+        (remaining, source)
     }
 
     /// Step animation: dequeue one line, update the emitted count.
@@ -234,9 +264,12 @@ impl StreamCore {
     #[inline]
     fn current_tail_lines(&self) -> Vec<HyperlinkLine> {
         let start = self.enqueued_stable_len.min(self.render.lines.len());
-        self.render.lines[start..].to_vec()
+        let mut lines = self.render.lines[start..].to_vec();
+        lines.extend(self.preview.lines.iter().cloned());
+        lines
     }
 
+    /// Whether committed Markdown needs tail reflow. Disposable prose previews do not.
     #[inline]
     fn has_tail(&self) -> bool {
         self.enqueued_stable_len < self.render.lines.len()
@@ -257,20 +290,17 @@ impl StreamCore {
         }
         let had_pending_queue = self.state.queued_len() > 0;
         let had_live_tail = self.has_tail();
+        let previous_width = self.width;
         self.width = width;
         self.state.collector.set_width(width);
-        if self.raw_source.is_empty() {
+        let source = self.state.collector.committed_source();
+        if source.is_empty() {
+            self.refresh_preview();
             return;
         }
 
-        self.render.recompute(
-            &self.raw_source,
-            self.width,
-            self.cwd.as_path(),
-            self.render_mode,
-            self.inline_visualization_context.as_ref(),
-        );
-        self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
+        self.recompute_render(previous_width, self.render_mode);
+        self.refresh_preview();
         if had_pending_queue
             && self.emitted_stable_len == self.render.lines.len()
             && self.emitted_stable_len > 0
@@ -285,6 +315,7 @@ impl StreamCore {
             // Avoid replaying already-emitted content after resize when no
             // stable lines were waiting in the queue and there was no mutable
             // tail to preserve.
+            self.emitted_stable_len = self.render.lines.len();
             self.enqueued_stable_len = self.render.lines.len();
             return;
         }
@@ -294,8 +325,8 @@ impl StreamCore {
     /// Clear all accumulated state for current stream.
     fn reset(&mut self) {
         self.state.clear();
-        self.raw_source.clear();
         self.render.clear();
+        self.preview = ProsePreview::default();
         self.enqueued_stable_len = 0;
         self.emitted_stable_len = 0;
         self.stable_prefix_len_cache = None;
@@ -309,19 +340,16 @@ impl StreamCore {
 
         let had_pending_queue = self.state.queued_len() > 0;
         let had_live_tail = self.has_tail();
+        let previous_render_mode = self.render_mode;
         self.render_mode = render_mode;
-        if self.raw_source.is_empty() {
+        let source = self.state.collector.committed_source();
+        if source.is_empty() {
+            self.refresh_preview();
             return;
         }
 
-        self.render.recompute(
-            &self.raw_source,
-            self.width,
-            self.cwd.as_path(),
-            self.render_mode,
-            self.inline_visualization_context.as_ref(),
-        );
-        self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
+        self.recompute_render(self.width, previous_render_mode);
+        self.refresh_preview();
         if had_pending_queue
             && self.emitted_stable_len == self.render.lines.len()
             && self.emitted_stable_len > 0
@@ -330,10 +358,71 @@ impl StreamCore {
         }
         self.state.clear_queue();
         if self.emitted_stable_len > 0 && !had_pending_queue && !had_live_tail {
+            self.emitted_stable_len = self.render.lines.len();
             self.enqueued_stable_len = self.render.lines.len();
             return;
         }
         self.rebuild_stable_queue_from_render();
+    }
+
+    /// Preserve an emitted source prefix when resizing changes earlier diagrams' heights.
+    fn recompute_render(
+        &mut self,
+        previous_width: Option<usize>,
+        previous_render_mode: HistoryRenderMode,
+    ) {
+        let previous_tail_start = self.active_tail_source_start(previous_render_mode);
+        let source = self.state.collector.committed_source();
+        self.render.recompute(
+            source,
+            self.width,
+            self.cwd.as_path(),
+            self.render_mode,
+            self.inline_visualization_context.as_ref(),
+        );
+        if let Some(start) = previous_tail_start.or(self.active_tail_source_start(self.render_mode))
+        {
+            let prefix_len = |width, mode| {
+                render_source(
+                    &source[..start],
+                    width,
+                    self.cwd.as_path(),
+                    mode,
+                    self.inline_visualization_context.as_ref(),
+                )
+                .len()
+            };
+            let previous_prefix_len = prefix_len(previous_width, previous_render_mode);
+            let prefix_len = prefix_len(self.width, self.render_mode);
+            if self.emitted_stable_len >= previous_prefix_len {
+                self.emitted_stable_len =
+                    prefix_len.saturating_add(self.emitted_stable_len - previous_prefix_len);
+            } else {
+                self.emitted_stable_len = self.emitted_stable_len.min(prefix_len);
+            }
+        }
+        self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
+    }
+
+    fn active_tail_source_start(&self, render_mode: HistoryRenderMode) -> Option<usize> {
+        if render_mode == HistoryRenderMode::Raw {
+            return None;
+        }
+        let table_start = match self.holdback_scanner.state() {
+            TableHoldbackState::Confirmed { table_start }
+            | TableHoldbackState::PendingHeader {
+                header_start: table_start,
+            } => Some(table_start),
+            TableHoldbackState::None => None,
+        };
+        [
+            table_start,
+            self.render.mermaid_start,
+            self.render.pending_math_start,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Compute how many rendered lines should be in the stable region.
@@ -396,20 +485,16 @@ impl StreamCore {
     /// column widths. For `PendingHeader`, only content from the speculative
     /// header line onward is kept mutable so earlier prose can continue
     /// streaming. When no table is detected, everything flows directly to
-    /// stable. This is the core decision point for the holdback mechanism.
+    /// stable. Unclosed display math also stays mutable until its closing delimiter arrives.
     fn active_tail_budget_lines(&mut self) -> usize {
         if self.render_mode == HistoryRenderMode::Raw {
             return 0;
         }
         let scan_start = Instant::now();
         let holdback_state = self.holdback_scanner.state();
-        let tail_budget = match holdback_state {
-            TableHoldbackState::Confirmed { table_start: start }
-            | TableHoldbackState::PendingHeader {
-                header_start: start,
-            } => self.tail_budget_from_source_start(start),
-            TableHoldbackState::None => 0,
-        };
+        let tail_budget = self
+            .active_tail_source_start(self.render_mode)
+            .map_or(0, |start| self.tail_budget_from_source_start(start));
         tracing::trace!(
             state = ?holdback_state,
             tail_budget,
@@ -428,7 +513,7 @@ impl StreamCore {
         if source_start == 0 {
             return self.render.lines.len();
         }
-        let source_start = source_start.min(self.raw_source.len());
+        let source_start = source_start.min(self.state.collector.committed_source().len());
         let stable_prefix_len = self.stable_prefix_len_for_source_start(source_start);
         self.render.lines.len().saturating_sub(stable_prefix_len)
     }
@@ -453,8 +538,9 @@ impl StreamCore {
         }
 
         let render_start = Instant::now();
+        let source = self.state.collector.committed_source();
         let stable_prefix_render = render_markdown_agent_with_links_cwd_and_visualizations(
-            &self.raw_source[..source_start.min(self.raw_source.len())],
+            &source[..source_start.min(source.len())],
             self.width,
             Some(self.cwd.as_path()),
             self.inline_visualization_context.as_ref(),
@@ -519,14 +605,12 @@ impl StreamController {
     /// Finalize the active stream. Returns the final cell (if any remaining lines) and the raw
     /// markdown source for consolidation.
     pub(crate) fn finalize(&mut self) -> (Option<Box<dyn HistoryCell>>, Option<String>) {
-        let remaining = self.core.finalize_remaining();
-        if self.core.raw_source.is_empty() {
+        let (remaining, source) = self.core.finalize_remaining();
+        if source.is_empty() {
             self.core.reset();
             return (None, None);
         }
 
-        // Move ownership — source is consumed before reset() clears it.
-        let source = std::mem::take(&mut self.core.raw_source);
         let out = self.emit(remaining);
         self.core.reset();
         (out, Some(source))
@@ -638,14 +722,12 @@ impl PlanStreamController {
     /// Finalize the active stream. Returns the final cell (if any remaining
     /// lines) plus raw markdown source for consolidation.
     pub(crate) fn finalize(&mut self) -> (Option<Box<dyn HistoryCell>>, Option<String>) {
-        let remaining = self.core.finalize_remaining();
-        if self.core.raw_source.is_empty() {
+        let (remaining, source) = self.core.finalize_remaining();
+        if source.is_empty() {
             self.core.reset();
             return (None, None);
         }
 
-        // Move ownership — source is consumed before reset() clears it.
-        let source = std::mem::take(&mut self.core.raw_source);
         let out = self.emit(remaining, /*include_bottom_padding*/ true);
         self.core.reset();
         (out, Some(source))
@@ -766,6 +848,14 @@ impl PlanStreamController {
         out_lines
     }
 }
+
+#[cfg(test)]
+#[path = "math_tests.rs"]
+mod math_tests;
+
+#[cfg(test)]
+#[path = "controller_preview_tests.rs"]
+mod preview_tests;
 
 #[cfg(test)]
 mod tests {
@@ -967,18 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn controller_live_tail_requires_table_holdback_state() {
-        let mut ctrl = stream_controller(Some(80));
-        ctrl.push("plain text without newline");
-
-        assert!(
-            ctrl.current_tail_lines().is_empty(),
-            "expected no live tail outside table holdback state",
-        );
-        assert!(!ctrl.has_live_tail());
-    }
-
-    #[test]
     fn controller_live_tail_rerenders_table_tail_after_resize() {
         let mut ctrl = stream_controller(Some(96));
         ctrl.push("| # | Feature | Details | Link |\n");
@@ -993,7 +1071,7 @@ mod tests {
 
             let mut expected = Vec::new();
             crate::markdown::append_markdown_agent(
-                &ctrl.core.raw_source,
+                ctrl.core.state.collector.committed_source(),
                 Some(width),
                 &mut expected,
             );
@@ -1659,7 +1737,7 @@ mod tests {
 
             let mut expected = Vec::new();
             crate::markdown::append_markdown_agent(
-                &ctrl.core.raw_source,
+                ctrl.core.state.collector.committed_source(),
                 /*width*/ width,
                 &mut expected,
             );

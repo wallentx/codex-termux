@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::key_hint;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::edit::ConfigEditsBuilder;
+use crate::local_settings::LocalSettings;
 use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
@@ -124,15 +125,17 @@ pub(crate) async fn run_cwd_selection_prompt(
         frame.render_widget_ref(&screen, frame.area());
     })?;
 
+    tui.discard_pending_input_before_interactive_screen()?;
     let events = tui.event_stream();
     tokio::pin!(events);
 
     while !screen.is_done() {
         if let Some(event) = events.next().await {
+            tui.screen_size_for_event(&event)?;
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
-                TuiEvent::Paste(_) => {}
-                TuiEvent::Draw | TuiEvent::Resize => {
+                TuiEvent::Paste(_) | TuiEvent::FocusLost => {}
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                     tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     })?;
@@ -147,7 +150,9 @@ pub(crate) async fn run_cwd_selection_prompt(
         Ok(CwdPromptOutcome::Exit)
     } else {
         let selection = screen.selection().unwrap_or(CwdSelection::Session);
-        if let Some(error_line) = persist_remembered_cwd_selection(config, selection).await {
+        if let Some(error_line) =
+            persist_remembered_cwd_selection(&LocalSettings::from(config), selection).await
+        {
             tui.insert_history_lines(vec![error_line]);
         }
         Ok(CwdPromptOutcome::Selection(selection))
@@ -155,11 +160,11 @@ pub(crate) async fn run_cwd_selection_prompt(
 }
 
 async fn persist_remembered_cwd_selection(
-    config: &Config,
+    config: &LocalSettings,
     selection: CwdSelection,
 ) -> Option<Line<'static>> {
     let mode = selection.remembered_mode()?;
-    match ConfigEditsBuilder::for_config(config)
+    match ConfigEditsBuilder::for_config_path(config.user_config_path.as_path())
         .set_resume_cwd(mode)
         .apply()
         .await
@@ -353,6 +358,7 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use pretty_assertions::assert_eq;
     use ratatui::Terminal;
+    use ratatui::widgets::FrameExt;
     use tempfile::TempDir;
 
     fn new_prompt() -> CwdPromptScreen {
@@ -518,7 +524,7 @@ mod tests {
                 expected_cwd
             );
             assert_eq!(
-                persist_remembered_cwd_selection(&config, selection).await,
+                persist_remembered_cwd_selection(&LocalSettings::from(&config), selection).await,
                 None
             );
             let persisted: toml::Value = toml::from_str(&std::fs::read_to_string(
@@ -540,10 +546,12 @@ mod tests {
         let config_path = temp_dir.path().join("config.toml");
         std::fs::create_dir(&config_path)?;
 
-        let error_line =
-            persist_remembered_cwd_selection(&config, CwdSelection::CurrentAndRemember)
-                .await
-                .expect("saving to a directory should fail");
+        let error_line = persist_remembered_cwd_selection(
+            &LocalSettings::from(&config),
+            CwdSelection::CurrentAndRemember,
+        )
+        .await
+        .expect("saving to a directory should fail");
         let mut terminal =
             Terminal::new(VT100Backend::new(/*width*/ 100, /*height*/ 1)).expect("terminal");
         terminal

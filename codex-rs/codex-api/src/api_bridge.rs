@@ -8,9 +8,12 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::auth::PlanType;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::error::ConnectionFailedError;
 use codex_protocol::error::RetryLimitReachedError;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::error::UsageLimitReachedError;
+use codex_protocol::protocol::MisalignmentErrorDetails;
 use http::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,8 +23,21 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
-        ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
-        ApiError::Stream(msg) => CodexErr::Stream(msg, None),
+        ApiError::Retryable { message, delay } => {
+            let error = CodexErr::Stream(message);
+            match delay {
+                Some(delay) => error.with_retry_delay(delay),
+                None => error,
+            }
+        }
+        ApiError::RateLimitExceeded { message, delay } => {
+            let error = CodexErr::new(CodexErrorDetails::RateLimitExceeded(message));
+            match delay {
+                Some(delay) => error.with_retry_delay(delay),
+                None => error,
+            }
+        }
+        ApiError::Stream(msg) => CodexErr::Stream(msg),
         ApiError::ServerOverloaded => CodexErr::ServerOverloaded,
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
@@ -37,7 +53,17 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             })
         }
         ApiError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
-        ApiError::CyberPolicy { message } => CodexErr::CyberPolicy { message },
+        ApiError::CyberPolicy { message } => {
+            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+        }
+        ApiError::BioPolicy { message } => CodexErr::new(CodexErrorDetails::BioPolicy { message }),
+        ApiError::MisalignmentPolicyViolation {
+            message,
+            misalignment,
+        } => CodexErr::new(CodexErrorDetails::MisalignmentPolicyViolation {
+            message,
+            misalignment,
+        }),
         ApiError::Transport(transport) => match transport {
             TransportError::Http {
                 status,
@@ -49,30 +75,68 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
-                    && matches!(
-                        value
-                            .get("error")
-                            .and_then(|error| error.get("code"))
-                            .and_then(serde_json::Value::as_str),
-                        Some("server_is_overloaded" | "slow_down")
-                    )
+                    && let Some(error) = value.get("error")
                 {
-                    return CodexErr::ServerOverloaded;
+                    match error.get("code").and_then(Value::as_str) {
+                        Some("server_is_overloaded") => return CodexErr::ServerOverloaded,
+                        Some("slow_down") => {
+                            return CodexErr::new(CodexErrorDetails::RateLimitExceeded(
+                                error
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if (status == http::StatusCode::BAD_REQUEST
+                    || status == http::StatusCode::FORBIDDEN)
+                    && let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
+                    && let Some(error) = parsed.get("error")
+                    && error.get("code").and_then(Value::as_str)
+                        == Some(MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE)
+                {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE.to_string()
+                        });
+                    return CodexErr::new(CodexErrorDetails::MisalignmentPolicyViolation {
+                        message,
+                        misalignment: error.get("misalignment").cloned().and_then(|details| {
+                            serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
+                        }),
+                    });
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
                         && let Some(error) = parsed.get("error")
-                        && error.get("code").and_then(Value::as_str)
-                            == Some(CYBER_POLICY_ERROR_CODE)
+                        && let Some(code @ (CYBER_POLICY_ERROR_CODE | BIO_POLICY_ERROR_CODE)) =
+                            error.get("code").and_then(Value::as_str)
                     {
+                        let fallback_message = if code == BIO_POLICY_ERROR_CODE {
+                            BIO_POLICY_FALLBACK_MESSAGE
+                        } else {
+                            CYBER_POLICY_FALLBACK_MESSAGE
+                        };
                         let message = error
                             .get("message")
                             .and_then(Value::as_str)
                             .filter(|message| !message.trim().is_empty())
                             .map(str::to_string)
-                            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
-                        CodexErr::CyberPolicy { message }
+                            .unwrap_or_else(|| fallback_message.to_string());
+                        if code == BIO_POLICY_ERROR_CODE {
+                            CodexErr::new(CodexErrorDetails::BioPolicy { message })
+                        } else {
+                            CodexErr::new(CodexErrorDetails::CyberPolicy { message })
+                        }
                     } else if body_text
                         .contains("The image data you provided does not represent a valid image")
                     {
@@ -111,6 +175,19 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                             });
                         } else if err.error.error_type.as_deref() == Some("usage_not_included") {
                             return CodexErr::UsageNotIncluded;
+                        } else if err.error.error_type.as_deref() == Some("insufficient_quota")
+                            || matches!(
+                                err.error.code.as_deref(),
+                                Some(
+                                    "insufficient_quota"
+                                        | "credit_balance_exhausted"
+                                        | "organization_spend_limit_exceeded"
+                                        | "project_spend_limit_exceeded"
+                                        | "organization_usage_limit_exceeded"
+                                )
+                            )
+                        {
+                            return CodexErr::QuotaExceeded;
                         }
                     }
 
@@ -139,11 +216,15 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 request_id: None,
             }),
             TransportError::Timeout => CodexErr::RequestTimeout,
-            TransportError::Network(msg) | TransportError::Build(msg) => {
-                CodexErr::Stream(msg, None)
+            TransportError::Connection(source) => {
+                CodexErr::ConnectionFailed(ConnectionFailedError { source })
+            }
+            TransportError::Network(msg) | TransportError::Build(msg) => CodexErr::Stream(msg),
+            error @ TransportError::ResponseTooLarge { .. } => {
+                CodexErr::InvalidRequest(error.to_string())
             }
         },
-        ApiError::RateLimit(msg) => CodexErr::Stream(msg, None),
+        ApiError::RateLimit(msg) => CodexErr::Stream(msg),
     }
 }
 
@@ -156,6 +237,11 @@ const X_ERROR_JSON_HEADER: &str = "x-error-json";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
+const BIO_POLICY_ERROR_CODE: &str = "bio_policy";
+const BIO_POLICY_FALLBACK_MESSAGE: &str = "This content was flagged for possible biological risk.";
+const MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE: &str = "misalignment_policy_violation";
+const MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE: &str =
+    "This request was blocked due to a misalignment policy violation.";
 const CLOUDFLARE_BLOCKED_MESSAGE: &str =
     "Access blocked by Cloudflare. This usually happens when connecting from a restricted region";
 
@@ -211,6 +297,7 @@ struct UsageErrorResponse {
 
 #[derive(Debug, Deserialize)]
 struct UsageErrorBody {
+    code: Option<String>,
     #[serde(rename = "type")]
     error_type: Option<String>,
     plan_type: Option<PlanType>,

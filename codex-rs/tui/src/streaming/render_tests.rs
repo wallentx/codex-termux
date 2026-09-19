@@ -11,6 +11,9 @@ use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[path = "code_fence_render_tests.rs"]
+mod code_fence_tests;
+
 fn test_cwd() -> PathBuf {
     std::env::temp_dir()
 }
@@ -107,6 +110,26 @@ fn incremental_render_keeps_final_block_mutable_and_matches_full_render() {
 }
 
 #[test]
+fn incremental_file_citations_preserve_metadata_unicode_and_markdown() {
+    let cwd = test_cwd();
+    let rendered_cases = [
+        (
+            "Quarterly Report.xlsx",
+            "- :codex-file-citation{artifact_kind=\"workbook\" ",
+        ),
+        ("Résumé *final* ✨.xlsx", "- :codex-file-citation{"),
+    ]
+    .map(|(filename, prefix)| {
+        let tail = format!("path=\"{}\"}}\n", cwd.join(filename).display());
+        let chunks = ["# Output\n\n", prefix, &tail, "\n", "Continue.\n"];
+        let (_, render) = assert_rich_stream_matches_full_render(&chunks, Some(80));
+
+        render.lines
+    });
+    assert_debug_snapshot!("incremental_file_citations", rendered_cases);
+}
+
+#[test]
 fn growing_single_top_level_blocks_render_and_scan_in_one_pass() {
     let streams: &[&[&str]] = &[
         &[
@@ -166,6 +189,41 @@ fn incremental_raw_render_preserves_blank_lines() {
 }
 
 #[test]
+fn inline_visualization_context_without_directives_keeps_stable_prefix() {
+    let cwd = test_cwd();
+    let context = InlineVisualizationContext::new(&cwd, ThreadId::new())
+        .expect("UUIDv7 thread id should provide a timestamp");
+    let width = Some(80);
+    let mut source = String::new();
+    let mut render = StreamingRender::new();
+
+    for chunk in ["First paragraph.\n\n", "Second paragraph.\n\n"] {
+        source.push_str(chunk);
+        render.append(
+            &source,
+            chunk,
+            width,
+            &cwd,
+            HistoryRenderMode::Rich,
+            Some(&context),
+        );
+        assert_eq!(
+            render.lines,
+            render_source(
+                &source,
+                width,
+                &cwd,
+                HistoryRenderMode::Rich,
+                Some(&context),
+            ),
+        );
+    }
+
+    assert!(render.stable_source_len > 0);
+    assert!(!render.has_inline_visualization_directive);
+}
+
+#[test]
 fn inline_visualizations_use_canonical_full_render() {
     let cwd = test_cwd();
     let context = InlineVisualizationContext::new(&cwd, ThreadId::new())
@@ -196,6 +254,8 @@ fn inline_visualizations_use_canonical_full_render() {
         );
         assert_eq!(render.stable_source_len, 0);
     }
+
+    assert!(render.has_inline_visualization_directive);
 }
 
 #[test]
@@ -206,10 +266,66 @@ fn inline_visualizations_without_context_use_canonical_full_render() {
     );
 
     assert_eq!(render.stable_source_len, 0);
+    assert!(render.has_inline_visualization_directive);
     assert_debug_snapshot!(
         "inline_visualizations_without_context_use_canonical_full_render",
         render.lines
     );
+}
+
+#[test]
+fn inline_visualization_content_references_use_canonical_full_render() {
+    let (_, render) = assert_rich_stream_matches_full_render(
+        &[
+            "Before.\n\n",
+            "\u{e200}visualize\u{e202}{\"path\":\"/tmp/missing.html\"}\u{e201}\n",
+        ],
+        Some(80),
+    );
+
+    assert_eq!(render.stable_source_len, 0);
+    assert!(render.has_inline_visualization_directive);
+}
+
+#[test]
+fn inline_visualization_directive_survives_raw_to_rich_render_mode_switch() {
+    let cwd = test_cwd();
+    let width = Some(80);
+    let mut source = String::new();
+    let mut render = StreamingRender::new();
+
+    append(
+        &mut render,
+        &mut source,
+        "::codex-inline-vis{file=\"missing.html\"}\n",
+        width,
+        &cwd,
+        HistoryRenderMode::Raw,
+    );
+    assert!(!render.has_inline_visualization_directive);
+
+    render.recompute(
+        &source,
+        width,
+        &cwd,
+        HistoryRenderMode::Rich,
+        /*inline_visualization_context*/ None,
+    );
+
+    assert!(render.has_inline_visualization_directive);
+    assert_eq!(
+        render.lines,
+        render_source(
+            &source,
+            width,
+            &cwd,
+            HistoryRenderMode::Rich,
+            /*inline_visualization_context*/ None,
+        ),
+    );
+
+    render.clear();
+    assert!(!render.has_inline_visualization_directive);
 }
 
 #[test]
@@ -329,5 +445,55 @@ fn paragraphs_after_unwrapped_table_fence_advance_stable_source() {
         append_rich_and_assert_matches_full(&mut render, &mut source, block, width, &cwd);
         assert!(render.stable_source_len > previous_stable_source_len);
         previous_stable_source_len = render.stable_source_len;
+    }
+}
+
+#[test]
+fn shell_pid_preserves_following_equations() {
+    for shell in [
+        "Shell examples: $HOME and echo $$.",
+        "Shell examples: $HOME.",
+    ] {
+        let source = format!("{shell}\n\nAfter rejected equations: $\\alpha$.\n\n$$\\beta$$");
+        for width in [80, 24] {
+            let (_, render) = assert_rich_stream_matches_full_render(
+                &source.split_inclusive('$').collect::<Vec<_>>(),
+                Some(width),
+            );
+            let expected = format!("{shell}\n\nAfter rejected equations: α.\n\nβ");
+            assert_eq!(
+                render.lines,
+                render_source(
+                    &expected,
+                    Some(width),
+                    &test_cwd(),
+                    HistoryRenderMode::Rich,
+                    /*inline_visualization_context*/ None,
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn rejected_math_openers_allow_bounded_incremental_rendering() {
+    let cwd = test_cwd();
+    for (open, close) in [
+        ("echo $$", "$$"),
+        ("Equation: \\[", "\\]"),
+        (r"\[label\]\*", "\\]"),
+    ] {
+        let (mut source, mut render) =
+            assert_rich_stream_matches_full_render(&[&format!("{open}\n\n")], Some(80));
+        let distant_closer = format!("{close}\n\nAfter $\\alpha$.\n\n");
+        for chunk in std::iter::repeat_n(
+            "An ordinary paragraph that must not retain the entire response.\n\n",
+            /*count*/ 160,
+        )
+        .chain(std::iter::once(distant_closer.as_str()))
+        {
+            append_rich_and_assert_matches_full(&mut render, &mut source, chunk, Some(80), &cwd);
+            assert!(source.len() - render.stable_source_len < 4200);
+        }
     }
 }

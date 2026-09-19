@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use codex_code_mode_protocol::CellId;
+use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::RuntimeResponse;
@@ -29,13 +30,14 @@ pub(in crate::remote_session) struct RemoteSession {
 pub(in crate::remote_session::connection) enum DriverCommand {
     OpenSession {
         session: RemoteSession,
-        delegate: Arc<dyn CodeModeSessionDelegate>,
+        limits: CodeModeSessionCellExecutionLimits,
         cleanup: SessionCleanup,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<(), String>>,
     },
     Execute {
         session: RemoteSession,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
         request: ExecuteRequest,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
@@ -134,13 +136,13 @@ pub(super) struct UnclaimedExecute {
 pub(super) enum PendingRequest {
     OpenSession {
         session: RemoteSession,
-        delegate: Arc<dyn CodeModeSessionDelegate>,
         cleanup: SessionCleanup,
         cancellation: CancellableRequest,
         response_tx: oneshot::Sender<Result<(), String>>,
     },
     Execute {
         session: RemoteSession,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
         initial_response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
         initial_response_rx: oneshot::Receiver<Result<RuntimeResponse, String>>,

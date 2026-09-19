@@ -4,10 +4,13 @@ use super::protocol::RemoteControlPairingStatusResponse as BackendRemoteControlP
 use super::protocol::RemoteControlTarget;
 use super::protocol::StartRemoteControlPairingRequest;
 use super::protocol::StartRemoteControlPairingResponse;
+use super::server_api::RemoteControlServerRequestError;
+use super::server_api::retry_after_with_jitter;
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_protocol::RemoteControlPairingStatusResponse;
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::create_client_without_request_logging;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
 use std::io;
@@ -59,7 +62,7 @@ impl RemoteControlEnrollment {
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
 
-        let response = build_reqwest_client()
+        let response = create_client_without_request_logging()
             .post(&self.remote_control_target.pair_url)
             .timeout(REMOTE_CONTROL_PAIRING_TIMEOUT)
             .bearer_auth(remote_control_token)
@@ -74,11 +77,17 @@ impl RemoteControlEnrollment {
             })?;
         let headers = response.headers().clone();
         let status = response.status();
+        let retry_at = retry_after_with_jitter(&headers, OffsetDateTime::now_utc());
         let body = response.bytes().await.map_err(|err| {
-            io::Error::other(format!(
-                "failed to read remote control pairing response from `{}`: {err}",
-                self.remote_control_target.pair_url
-            ))
+            pairing_response_error(
+                format!(
+                    "failed to read remote control pairing response from `{}`: {err}",
+                    self.remote_control_target.pair_url
+                ),
+                status,
+                retry_at,
+                ErrorKind::Other,
+            )
         })?;
         let body_preview = preview_remote_control_response_body(&body);
         if !status.is_success() {
@@ -87,13 +96,15 @@ impl RemoteControlEnrollment {
                 404 => ErrorKind::NotFound,
                 _ => ErrorKind::Other,
             };
-            return Err(io::Error::new(
-                error_kind,
+            return Err(pairing_response_error(
                 format!(
                     "remote control pairing failed at `{}`: HTTP {status}, {}, body: {body_preview}",
                     self.remote_control_target.pair_url,
                     format_headers(&headers)
                 ),
+                status,
+                retry_at,
+                error_kind,
             ));
         }
 
@@ -154,7 +165,7 @@ impl RemoteControlEnrollment {
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
 
-        let response = build_reqwest_client()
+        let response = create_client_without_request_logging()
             .post(&self.remote_control_target.pair_status_url)
             .timeout(REMOTE_CONTROL_PAIRING_TIMEOUT)
             .bearer_auth(remote_control_token)
@@ -169,11 +180,17 @@ impl RemoteControlEnrollment {
             })?;
         let headers = response.headers().clone();
         let status = response.status();
+        let retry_at = retry_after_with_jitter(&headers, OffsetDateTime::now_utc());
         let body = response.bytes().await.map_err(|err| {
-            io::Error::other(format!(
-                "failed to read remote control pairing status response from `{}`: {err}",
-                self.remote_control_target.pair_status_url
-            ))
+            pairing_response_error(
+                format!(
+                    "failed to read remote control pairing status response from `{}`: {err}",
+                    self.remote_control_target.pair_status_url
+                ),
+                status,
+                retry_at,
+                ErrorKind::Other,
+            )
         })?;
         let body_preview = preview_remote_control_response_body(&body);
         if !status.is_success() {
@@ -182,13 +199,15 @@ impl RemoteControlEnrollment {
                 404 | 410 => ErrorKind::InvalidInput,
                 _ => ErrorKind::Other,
             };
-            return Err(io::Error::new(
-                error_kind,
+            return Err(pairing_response_error(
                 format!(
                     "remote control pairing status failed at `{}`: HTTP {status}, {}, body: {body_preview}",
                     self.remote_control_target.pair_status_url,
                     format_headers(&headers)
                 ),
+                status,
+                retry_at,
+                error_kind,
             ));
         }
 
@@ -239,6 +258,27 @@ impl RemoteControlEnrollment {
     pub(super) fn clear_server_token(&mut self) {
         self.remote_control_token = None;
         self.expires_at = None;
+    }
+}
+
+fn pairing_response_error(
+    message: String,
+    status: StatusCode,
+    retry_at: Option<OffsetDateTime>,
+    fallback_kind: ErrorKind,
+) -> io::Error {
+    if matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        RemoteControlServerRequestError::io_error(
+            message,
+            Some(status),
+            retry_at,
+            /*timed_out*/ false,
+        )
+    } else {
+        io::Error::new(fallback_kind, message)
     }
 }
 
@@ -432,6 +472,7 @@ mod tests {
     use crate::transport::remote_control::protocol::normalize_remote_control_url;
     use crate::transport::remote_control::server_api::enroll_remote_control_server;
     use codex_state::StateRuntime;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::sync::Arc;
@@ -445,9 +486,12 @@ mod tests {
     use tokio::time::timeout;
 
     async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
-        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
-            .await
-            .expect("state runtime should initialize")
+        StateRuntime::init(
+            codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state runtime should initialize")
     }
 
     #[test]

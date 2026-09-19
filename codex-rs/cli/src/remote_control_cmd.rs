@@ -129,7 +129,7 @@ async fn run_foreground_remote_control(
         ..Default::default()
     };
     let (stop_rx, stop_signal_task) = foreground_stop_signal();
-    let mut app_server_task = tokio::spawn(codex_app_server::run_main_with_transport_options(
+    let app_server = codex_app_server::run_main_with_transport_options(
         arg0_paths,
         root_config_overrides,
         LoaderOverrides::default(),
@@ -139,7 +139,8 @@ async fn run_foreground_remote_control(
         SessionSource::VSCode,
         AppServerWebsocketAuthSettings::default(),
         runtime_options,
-    ));
+    );
+    let mut app_server_task = tokio::spawn(async move { app_server.await.map(|_| ()) });
 
     let summary = match wait_for_foreground_remote_control_start(
         &mut app_server_task,
@@ -673,17 +674,22 @@ mod tests {
     #[test]
     fn remote_control_pairing_human_output_labels_the_manual_code() {
         assert_eq!(
-            format_remote_control_pairing_output(&pairing_response(Some("ABCD-EFGH")), false)
-                .expect("manual pairing output"),
+            format_remote_control_pairing_output(
+                &pairing_response(Some("ABCD-EFGH")),
+                /*json*/ false,
+            )
+            .expect("manual pairing output"),
             "Pairing code: ABCD-EFGH"
         );
     }
 
     #[test]
     fn remote_control_pairing_json_output_preserves_pairing_artifacts() {
-        let output =
-            format_remote_control_pairing_output(&pairing_response(Some("ABCD-EFGH")), true)
-                .expect("pairing JSON output");
+        let output = format_remote_control_pairing_output(
+            &pairing_response(Some("ABCD-EFGH")),
+            /*json*/ true,
+        )
+        .expect("pairing JSON output");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&output).expect("valid JSON"),
             json!({
@@ -698,9 +704,12 @@ mod tests {
     #[test]
     fn remote_control_pairing_human_output_requires_manual_code() {
         assert_eq!(
-            format_remote_control_pairing_output(&pairing_response(None), false)
-                .expect_err("missing manual pairing code should fail")
-                .to_string(),
+            format_remote_control_pairing_output(
+                &pairing_response(/*manual_pairing_code*/ None),
+                /*json*/ false,
+            )
+            .expect_err("missing manual pairing code should fail")
+            .to_string(),
             "remote-control pairing response did not include a manual pairing code"
         );
     }

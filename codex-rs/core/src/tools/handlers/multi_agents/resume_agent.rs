@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::next_thread_spawn_depth;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -24,7 +25,10 @@ impl ToolExecutor<ToolInvocation> for Handler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_resume_agent(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -168,7 +172,7 @@ pub(crate) struct ResumeAgentResult {
 }
 
 impl ToolOutput for ResumeAgentResult {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         tool_output_json_text(self, "resume_agent")
     }
 
@@ -191,7 +195,8 @@ async fn try_resume_closed_agent(
     receiver_thread_id: ThreadId,
     child_depth: i32,
 ) -> Result<(), FunctionCallError> {
-    let config = build_agent_resume_config(turn.as_ref())?;
+    let config =
+        build_agent_resume_config(turn.as_ref()).map_err(FunctionCallError::RespondToModel)?;
     Box::pin(session.services.agent_control.resume_agent_from_rollout(
         config,
         receiver_thread_id,

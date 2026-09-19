@@ -18,6 +18,7 @@ use crate::app_event_sender::AppEventSender;
 use crate::clipboard_paste::normalize_pasted_search_query;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
+use crate::key_hint::ShortcutHint;
 use crate::key_hint::is_plain_text_key_event;
 use crate::keymap::ListKeymap;
 use crate::render::renderable::ColumnRenderable;
@@ -34,6 +35,7 @@ use super::selection_popup_common::GenericDisplayRow;
 use super::selection_popup_common::measure_rows_height_with_col_width_mode;
 use super::selection_popup_common::render_rows_single_line_with_col_width_mode;
 use super::selection_popup_common::render_rows_with_col_width_mode;
+pub(crate) use super::selection_row_layout::SelectionDescriptionLayout;
 use super::selection_tabs::SelectionTab;
 use super::selection_tabs::render_tab_bar;
 use super::selection_tabs::tab_bar_height;
@@ -105,6 +107,18 @@ pub(crate) enum SelectionRowDisplay {
 
 /// One selectable item in the generic selection list.
 pub(crate) type SelectionAction = Box<dyn Fn(&AppEventSender) + Send + Sync>;
+
+/// A second way to accept the highlighted row, sharing its dismissal behavior.
+pub(crate) struct SelectionSecondaryAction {
+    pub key: KeyBinding,
+    pub action: SelectionAction,
+    pub footer_hint: Line<'static>,
+}
+
+enum SelectionActionKind {
+    Primary,
+    Secondary,
+}
 pub(crate) type SelectionToggleAction = dyn Fn(bool, &AppEventSender) + Send + Sync;
 
 pub(crate) struct SelectionToggle {
@@ -134,17 +148,22 @@ pub(crate) struct SelectionItem {
     pub name_prefix_spans: Vec<Span<'static>>,
     pub toggle: Option<SelectionToggle>,
     pub toggle_placeholder: Option<&'static str>,
-    pub display_shortcut: Option<KeyBinding>,
+    pub display_shortcut: Option<ShortcutHint>,
     pub description: Option<String>,
     pub selected_description: Option<String>,
     pub is_current: bool,
     pub is_default: bool,
     pub is_disabled: bool,
     pub actions: Vec<SelectionAction>,
+    pub secondary_action: Option<SelectionSecondaryAction>,
     pub dismiss_on_select: bool,
+    /// Require an explicit accept key after a direct shortcut highlights this sensitive item.
+    pub require_explicit_confirmation: bool,
     pub dismiss_parent_on_child_accept: bool,
     pub search_value: Option<String>,
     pub disabled_reason: Option<String>,
+    /// Optional marker rendered in place of the number for a disabled row.
+    pub disabled_gutter_marker: Option<&'static str>,
 }
 
 /// Construction-time configuration for [`ListSelectionView`].
@@ -158,6 +177,8 @@ pub(crate) struct SelectionItem {
 /// `AutoAllRows` measures all rows to ensure stable column widths as the user scrolls
 /// `Fixed` used a fixed 30/70  split between columns
 /// `row_display` controls whether rows can wrap or stay single-line with ellipsis truncation
+/// `description_layout` optionally moves descriptions below labels when their
+/// column would become too narrow.
 pub(crate) struct SelectionViewParams {
     pub view_id: Option<&'static str>,
     pub title: Option<String>,
@@ -172,9 +193,12 @@ pub(crate) struct SelectionViewParams {
     pub search_placeholder: Option<String>,
     pub col_width_mode: ColumnWidthMode,
     pub row_display: SelectionRowDisplay,
+    pub description_layout: SelectionDescriptionLayout,
     /// Rendered left-column width to use for auto-sized rows.
     pub name_column_width: Option<usize>,
     pub header: Box<dyn Renderable>,
+    /// Blank rows after the header; defaults to one. Inline banners use zero.
+    pub header_gap: u16,
     pub initial_selected_idx: Option<usize>,
 
     /// Rich content rendered beside (wide terminals) or below (narrow terminals)
@@ -223,8 +247,10 @@ impl Default for SelectionViewParams {
             search_placeholder: None,
             col_width_mode: ColumnWidthMode::AutoVisible,
             row_display: SelectionRowDisplay::Wrapped,
+            description_layout: SelectionDescriptionLayout::Columns,
             name_column_width: None,
             header: Box::new(()),
+            header_gap: 1,
             initial_selected_idx: None,
             side_content: Box::new(()),
             side_content_width: SideContentWidth::default(),
@@ -253,17 +279,20 @@ pub(crate) struct ListSelectionView {
     active_tab_idx: Option<usize>,
     state: ScrollState,
     completion: Option<ViewCompletion>,
-    dismiss_after_child_accept: bool,
+    pub(super) dismiss_after_child_accept: bool,
     app_event_tx: AppEventSender,
     is_searchable: bool,
     search_query: String,
     search_placeholder: Option<String>,
     col_width_mode: ColumnWidthMode,
     row_display: SelectionRowDisplay,
+    description_layout: SelectionDescriptionLayout,
     name_column_width: Option<usize>,
     filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
+    rendered_item_count: std::cell::Cell<usize>,
     header: Box<dyn Renderable>,
+    header_gap: u16,
     initial_selected_idx: Option<usize>,
     side_content: Box<dyn Renderable>,
     side_content_width: SideContentWidth,
@@ -394,10 +423,13 @@ impl ListSelectionView {
             },
             col_width_mode: params.col_width_mode,
             row_display: params.row_display,
+            description_layout: params.description_layout,
             name_column_width: params.name_column_width,
             filtered_indices: Vec::new(),
             last_selected_actual_idx: None,
+            rendered_item_count: std::cell::Cell::new(0),
             header,
+            header_gap: params.header_gap,
             initial_selected_idx: params.initial_selected_idx,
             side_content: params.side_content,
             side_content_width: params.side_content_width,
@@ -448,6 +480,13 @@ impl ListSelectionView {
     }
 
     fn active_footer_hint(&self) -> Option<&Line<'static>> {
+        if let Some(action) = self
+            .selected_actual_idx()
+            .and_then(|idx| self.active_items().get(idx))
+            .and_then(|item| item.secondary_action.as_ref())
+        {
+            return Some(&action.footer_hint);
+        }
         self.active_tab_id()
             .and_then(|active_tab_id| {
                 self.tab_footer_hints
@@ -478,6 +517,11 @@ impl ListSelectionView {
             .selected_actual_idx()
             .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
             .or_else(|| {
+                self.initial_selected_idx
+                    .take()
+                    .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
+            })
+            .or_else(|| {
                 (!self.is_searchable)
                     .then(|| {
                         self.active_items()
@@ -485,11 +529,6 @@ impl ListSelectionView {
                             .position(|item| item.is_current && Self::item_is_enabled(item))
                     })
                     .flatten()
-            })
-            .or_else(|| {
-                self.initial_selected_idx
-                    .take()
-                    .filter(|actual_idx| self.enabled_actual_idx(*actual_idx).is_some())
             });
 
         if self.is_searchable && !self.search_query.is_empty() {
@@ -581,7 +620,14 @@ impl ListSelectionView {
                         // numbers be used for the search query).
                         format!("{prefix} ")
                     } else if is_disabled {
-                        format!("{prefix} {}", " ".repeat(enabled_row_number_width + 2))
+                        if let Some(disabled_gutter_marker) = item.disabled_gutter_marker {
+                            let marker_width = UnicodeWidthStr::width(disabled_gutter_marker);
+                            let marker_padding =
+                                " ".repeat(enabled_row_number_width.saturating_sub(marker_width));
+                            format!("{prefix} {marker_padding}{disabled_gutter_marker}  ")
+                        } else {
+                            format!("{prefix} {}", " ".repeat(enabled_row_number_width + 2))
+                        }
                     } else {
                         enabled_row_number += 1;
                         let n = enabled_row_number;
@@ -759,35 +805,52 @@ impl ListSelectionView {
         }
     }
 
-    fn accept(&mut self) {
-        let selected_actual_idx = self
-            .state
-            .selected_idx
-            .and_then(|idx| self.filtered_indices.get(idx).copied());
-        let selected_is_enabled = selected_actual_idx
-            .and_then(|actual_idx| self.active_items().get(actual_idx))
-            .is_some_and(|item| item.disabled_reason.is_none() && !item.is_disabled);
-        if selected_is_enabled {
-            self.last_selected_actual_idx = selected_actual_idx;
-            let Some(actual_idx) = selected_actual_idx else {
+    fn accept(&mut self, kind: SelectionActionKind) {
+        let selected_actual_idx = self.selected_actual_idx();
+        if let Some(item) = selected_actual_idx.and_then(|idx| self.active_items().get(idx)) {
+            if item.is_disabled || item.disabled_reason.is_some() {
                 return;
-            };
-            let Some(item) = self.active_items().get(actual_idx) else {
-                return;
-            };
-            for act in &item.actions {
-                act(&self.app_event_tx);
+            }
+            match kind {
+                SelectionActionKind::Primary => {
+                    for act in &item.actions {
+                        act(&self.app_event_tx);
+                    }
+                }
+                SelectionActionKind::Secondary => {
+                    let Some(action) = &item.secondary_action else {
+                        return;
+                    };
+                    (action.action)(&self.app_event_tx);
+                }
             }
             if item.dismiss_on_select {
                 self.completion = Some(ViewCompletion::Accepted);
             } else if item.dismiss_parent_on_child_accept {
                 self.dismiss_after_child_accept = true;
             }
+            self.last_selected_actual_idx = selected_actual_idx;
         } else if selected_actual_idx.is_none() {
             if let Some(cb) = &self.on_cancel {
                 cb(&self.app_event_tx);
             }
             self.completion = Some(ViewCompletion::Cancelled);
+        }
+    }
+
+    fn select_shortcut(&mut self, actual_idx: usize) {
+        let previously_selected = self.selected_actual_idx();
+        self.state.selected_idx = Some(actual_idx);
+        if self
+            .active_items()
+            .get(actual_idx)
+            .is_some_and(|item| item.require_explicit_confirmation)
+        {
+            if self.selected_actual_idx() != previously_selected {
+                self.fire_selection_changed();
+            }
+        } else {
+            self.accept(SelectionActionKind::Primary);
         }
     }
 
@@ -934,6 +997,10 @@ impl ListSelectionView {
 }
 
 impl BottomPaneView for ListSelectionView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         // Searchable lists reserve printable characters for query input. This
         // keeps vim-style plain j/k/h/l useful in non-search lists without
@@ -998,7 +1065,18 @@ impl BottomPaneView for ListSelectionView {
             _ if self.allow_cancel && self.keymap.cancel.is_pressed(key_event) => {
                 self.on_ctrl_c();
             }
-            _ if self.keymap.accept.is_pressed(key_event) => self.accept(),
+            _ if self.keymap.accept.is_pressed(key_event) => {
+                self.accept(SelectionActionKind::Primary)
+            }
+            _ if allow_plain_char_navigation
+                && self
+                    .selected_actual_idx()
+                    .and_then(|idx| self.active_items().get(idx))
+                    .and_then(|item| item.secondary_action.as_ref())
+                    .is_some_and(|action| action.key.is_press(key_event)) =>
+            {
+                self.accept(SelectionActionKind::Secondary);
+            }
             KeyEvent {
                 code: KeyCode::Char(c),
                 ..
@@ -1027,8 +1105,7 @@ impl BottomPaneView for ListSelectionView {
                         .is_some_and(|shortcut| shortcut.is_press(key_event))
                         && Self::item_is_enabled(item)
                 }) {
-                    self.state.selected_idx = Some(idx);
-                    self.accept();
+                    self.select_shortcut(idx);
                     return;
                 }
                 if let Some(idx) = c
@@ -1036,8 +1113,7 @@ impl BottomPaneView for ListSelectionView {
                     .map(|d| d as usize)
                     .and_then(|number| self.actual_idx_for_enabled_number(number))
                 {
-                    self.state.selected_idx = Some(idx);
-                    self.accept();
+                    self.select_shortcut(idx);
                 }
             }
             _ => {}
@@ -1115,7 +1191,8 @@ impl Renderable for ListSelectionView {
 
         // Measure wrapped height for up to MAX_POPUP_ROWS items.
         let rows = self.build_rows();
-        let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width);
+        let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width)
+            .with_description_layout(self.description_layout);
         let rows_height = match self.row_display {
             SelectionRowDisplay::Wrapped => measure_rows_height_with_col_width_mode(
                 &rows,
@@ -1131,7 +1208,7 @@ impl Renderable for ListSelectionView {
         let tab_height = tab_bar_height(&self.tabs, self.active_tab_idx.unwrap_or(0), inner_width);
         let mut height = header.desired_height(inner_width);
         height = height.saturating_add(tab_height + u16::from(tab_height > 0));
-        height = height.saturating_add(rows_height + 3);
+        height = height.saturating_add(rows_height + 2 + self.header_gap);
         if self.is_searchable {
             height = height.saturating_add(1);
         }
@@ -1160,6 +1237,7 @@ impl Renderable for ListSelectionView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.rendered_item_count.set(0);
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -1193,7 +1271,8 @@ impl Renderable for ListSelectionView {
         let header_height = header.desired_height(inner_width);
         let tab_height = tab_bar_height(&self.tabs, self.active_tab_idx.unwrap_or(0), inner_width);
         let rows = self.build_rows();
-        let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width);
+        let column_width = ColumnWidthConfig::new(self.col_width_mode, self.name_column_width)
+            .with_description_layout(self.description_layout);
         let rows_height = match self.row_display {
             SelectionRowDisplay::Wrapped => measure_rows_height_with_col_width_mode(
                 &rows,
@@ -1224,7 +1303,7 @@ impl Renderable for ListSelectionView {
             stacked_side_area,
         ] = Layout::vertical([
             Constraint::Max(header_height),
-            Constraint::Max(1),
+            Constraint::Max(self.header_gap),
             Constraint::Length(tab_height),
             Constraint::Length(u16::from(tab_height > 0)),
             Constraint::Length(if self.is_searchable { 1 } else { 0 }),
@@ -1278,7 +1357,7 @@ impl Renderable for ListSelectionView {
                 width: effective_rows_width.max(1),
                 height: list_area.height,
             };
-            match self.row_display {
+            let rendered_rows = match self.row_display {
                 SelectionRowDisplay::Wrapped => render_rows_with_col_width_mode(
                     render_area,
                     buf,
@@ -1298,6 +1377,7 @@ impl Renderable for ListSelectionView {
                     column_width,
                 ),
             };
+            self.rendered_item_count.set(rendered_rows.items);
         }
 
         // -- Side content (preview panel) --
@@ -1394,6 +1474,12 @@ impl Renderable for ListSelectionView {
     }
 }
 
+impl ListSelectionView {
+    pub(crate) fn rendered_item_count(&self) -> usize {
+        self.rendered_item_count.get()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1455,6 +1541,49 @@ mod tests {
 
     fn new_view(params: SelectionViewParams, tx: AppEventSender) -> ListSelectionView {
         ListSelectionView::new(params, tx, crate::keymap::RuntimeKeymap::defaults().list)
+    }
+
+    #[test]
+    fn secondary_action_respects_search_disabled_rows_and_dismissal() {
+        for (is_searchable, is_disabled, key, expected) in [
+            (false, false, KeyCode::Char('s'), Some("secondary")),
+            (false, false, KeyCode::Enter, Some("primary")),
+            (false, true, KeyCode::Char('s'), None),
+            (true, false, KeyCode::Char('s'), None),
+        ] {
+            let (tx, mut rx) = unbounded_channel();
+            let mut view = new_view(
+                SelectionViewParams {
+                    is_searchable,
+                    items: vec![SelectionItem {
+                        name: "Selection".into(),
+                        is_disabled,
+                        dismiss_on_select: true,
+                        actions: vec![Box::new(|tx| {
+                            tx.send(AppEvent::UpdateModel("primary".into()))
+                        })],
+                        secondary_action: Some(SelectionSecondaryAction {
+                            key: crate::key_hint::plain(KeyCode::Char('s')),
+                            action: Box::new(|tx| {
+                                tx.send(AppEvent::UpdateModel("secondary".into()))
+                            }),
+                            footer_hint: "s for secondary".into(),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                AppEventSender::new(tx),
+            );
+            view.handle_key_event(KeyEvent::from(key));
+            let actual = rx.try_recv().ok().map(|event| match event {
+                AppEvent::UpdateModel(model) => model,
+                event => panic!("unexpected event: {event:?}"),
+            });
+            assert_eq!(actual.as_deref(), expected);
+            assert_eq!(view.completion, expected.map(|_| ViewCompletion::Accepted));
+            assert_eq!(view.search_query, if is_searchable { "s" } else { "" });
+        }
     }
 
     fn make_selection_view(subtitle: Option<&str>) -> ListSelectionView {
@@ -2549,6 +2678,41 @@ mod tests {
             "list_selection_narrow_width_preserves_rows",
             render_lines_with_width(&view, /*width*/ 24)
         );
+    }
+
+    #[test]
+    fn snapshot_narrow_width_counts_halfwidth_sound_marks() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let items = vec![
+            SelectionItem {
+                name: "abｶﾞc".to_string(),
+                description: Some("dakuten description".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "aﾊﾟc".to_string(),
+                description: Some("handakuten description".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+        let view = new_view(
+            SelectionViewParams {
+                title: Some("Halfwidth sound marks".to_string()),
+                items,
+                ..Default::default()
+            },
+            tx,
+        );
+
+        let rendered = format!(
+            "width 20:\n{}\n\nwidth 24:\n{}",
+            render_lines_with_width(&view, /*width*/ 20),
+            render_lines_with_width(&view, /*width*/ 24)
+        );
+        assert_snapshot!("list_selection_halfwidth_sound_marks_narrow", rendered);
     }
 
     #[test]

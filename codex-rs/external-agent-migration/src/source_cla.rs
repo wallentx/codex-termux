@@ -3,7 +3,6 @@ use crate::RewriteProfile;
 use codex_core_plugins::CommandDescriptionMode;
 use codex_core_plugins::CommandMigrationProfile;
 use codex_core_plugins::CommandRewriteProfile;
-use codex_core_plugins::count_missing_commands_with_profile;
 use codex_core_plugins::import_commands_with_profile;
 use codex_core_plugins::marketplace_add::is_local_marketplace_source;
 use codex_core_plugins::missing_command_names_with_profile;
@@ -21,15 +20,26 @@ use crate::model::PluginsMigration;
 pub(super) const KNOWN_MARKETPLACES_PATH: &str = "plugins/known_marketplaces.json";
 pub(super) const OFFICIAL_MARKETPLACE_NAME: &str = "claude-plugins-official";
 pub(super) const OFFICIAL_MARKETPLACE_SOURCE: &str = "anthropics/claude-plugins-official";
+pub(super) const CLAUDE_CODE_MARKETPLACE_NAME: &str = "claude-code-plugins";
+pub(super) const CLAUDE_CODE_MARKETPLACE_SOURCE: &str = "anthropics/claude-code";
 pub(super) const REWRITE_PROFILE: RewriteProfile = ClaSource::REWRITE_PROFILE;
-const COMMAND_MIGRATION_PROFILE: CommandMigrationProfile = CommandMigrationProfile::new(
-    CommandRewriteProfile::new(
-        REWRITE_PROFILE.doc_file_name(),
-        REWRITE_PROFILE.term_variants(),
-    )
-    .with_case_sensitive_term_variants(REWRITE_PROFILE.case_sensitive_term_variants()),
-    CommandDescriptionMode::RequireFrontmatter,
-);
+const COMMAND_REWRITE_PROFILE: CommandRewriteProfile = CommandRewriteProfile::new(
+    REWRITE_PROFILE.doc_file_name(),
+    REWRITE_PROFILE.term_variants(),
+)
+.with_case_sensitive_term_variants(REWRITE_PROFILE.case_sensitive_term_variants());
+
+// Preserve described commands first. The fallback pass still checks all sources for collisions.
+const COMMAND_MIGRATION_PROFILES: [CommandMigrationProfile; 2] = [
+    CommandMigrationProfile::new(
+        COMMAND_REWRITE_PROFILE,
+        CommandDescriptionMode::RequireFrontmatter,
+    ),
+    CommandMigrationProfile::new(
+        COMMAND_REWRITE_PROFILE,
+        CommandDescriptionMode::UseSourceNameFallback,
+    ),
+];
 
 pub(super) fn marketplace_import_sources(
     settings: &JsonValue,
@@ -101,16 +111,21 @@ pub(super) fn marketplace_import_sources(
         ));
     }
 
-    if has_enabled_plugin_for_marketplace(settings, OFFICIAL_MARKETPLACE_NAME)
-        && !import_sources.contains_key(OFFICIAL_MARKETPLACE_NAME)
-    {
-        import_sources.insert(
-            OFFICIAL_MARKETPLACE_NAME.to_string(),
-            MarketplaceImportSource {
-                source: OFFICIAL_MARKETPLACE_SOURCE.to_string(),
-                ref_name: None,
-            },
-        );
+    for (marketplace_name, marketplace_source) in [
+        (OFFICIAL_MARKETPLACE_NAME, OFFICIAL_MARKETPLACE_SOURCE),
+        (CLAUDE_CODE_MARKETPLACE_NAME, CLAUDE_CODE_MARKETPLACE_SOURCE),
+    ] {
+        if has_enabled_plugin_for_marketplace(settings, marketplace_name)
+            && !import_sources.contains_key(marketplace_name)
+        {
+            import_sources.insert(
+                marketplace_name.to_string(),
+                MarketplaceImportSource {
+                    source: marketplace_source.to_string(),
+                    ref_name: None,
+                },
+            );
+        }
     }
 
     import_sources
@@ -120,21 +135,41 @@ pub(super) fn import_source_commands(
     source_commands: &Path,
     target_skills: &Path,
 ) -> io::Result<Vec<String>> {
-    import_commands_with_profile(source_commands, target_skills, COMMAND_MIGRATION_PROFILE)
+    let mut imported = Vec::new();
+    for profile in COMMAND_MIGRATION_PROFILES {
+        imported.extend(import_commands_with_profile(
+            source_commands,
+            target_skills,
+            profile,
+        )?);
+    }
+    imported.sort();
+    imported.dedup();
+    Ok(imported)
 }
 
 pub(super) fn count_missing_source_commands(
     source_commands: &Path,
     target_skills: &Path,
 ) -> io::Result<usize> {
-    count_missing_commands_with_profile(source_commands, target_skills, COMMAND_MIGRATION_PROFILE)
+    Ok(missing_source_command_names(source_commands, target_skills)?.len())
 }
 
 pub(super) fn missing_source_command_names(
     source_commands: &Path,
     target_skills: &Path,
 ) -> io::Result<Vec<String>> {
-    missing_command_names_with_profile(source_commands, target_skills, COMMAND_MIGRATION_PROFILE)
+    let mut names = Vec::new();
+    for profile in COMMAND_MIGRATION_PROFILES {
+        names.extend(missing_command_names_with_profile(
+            source_commands,
+            target_skills,
+            profile,
+        )?);
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 pub(crate) fn extract_plugin_migration_details(

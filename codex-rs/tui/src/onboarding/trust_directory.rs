@@ -1,3 +1,5 @@
+//! Folder trust disclosure and protected keyboard selection.
+
 use std::path::PathBuf;
 
 use crossterm::event::KeyEvent;
@@ -22,6 +24,9 @@ use crate::selection_list::selection_option_row;
 
 use super::onboarding_screen::StepState;
 pub(crate) struct TrustDirectoryWidget {
+    pub restricted: bool,
+    pub existing_task: bool,
+    pub cancel: TrustCancelAction,
     pub cwd: PathBuf,
     pub trust_target: PathBuf,
     pub show_windows_create_sandbox_hint: bool,
@@ -29,6 +34,12 @@ pub(crate) struct TrustDirectoryWidget {
     pub selection: Option<TrustDirectorySelection>,
     pub highlighted: TrustDirectorySelection,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrustCancelAction {
+    Quit,
+    AgentsOverview,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +59,7 @@ impl WidgetRef for &TrustDirectoryWidget {
         ]));
         column.push("");
 
-        if self.cwd != self.trust_target {
+        if !self.restricted && self.cwd != self.trust_target {
             #[allow(clippy::disallowed_methods)]
             let git_root_warning = Paragraph::new(format!(
                 "Note: You’re in a subdirectory of a Git project. Trusting will apply to the repository root: {}",
@@ -66,12 +77,20 @@ impl WidgetRef for &TrustDirectoryWidget {
         }
 
         column.push(
-            Paragraph::new(
-                "Do you trust the contents of this directory? Working with untrusted \
-                 contents comes with higher risk of prompt injection. Trusting the \
-                 directory allows project-local config, hooks, and exec policies to load."
-                    .to_string(),
-            )
+            Paragraph::new(if self.restricted && self.existing_task {
+                "This existing task may retain settings \
+                 and history, including project configuration or hooks loaded while it was trusted. \
+                 To use restricted settings, start a new task. The folder's trust setting will not change."
+            } else if self.restricted {
+                "Config, hooks, and exec policies from untrusted folders stay disabled. \
+                 Trusted project folders can still contribute settings. Skills still load, \
+                 and tools follow your permission settings. Opening will not change saved trust."
+            } else {
+                "Trust this folder? Codex can read, edit, and run files here, subject to \
+                 your permission settings. Folder settings can run code automatically, \
+                 even without a model request. Continue only if you trust these files. \
+                 Your trust decision will be saved."
+            })
             .wrap(Wrap { trim: true })
             .inset(Insets::tlbr(
                 /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
@@ -80,8 +99,23 @@ impl WidgetRef for &TrustDirectoryWidget {
         column.push("");
 
         let options: Vec<(&str, TrustDirectorySelection)> = vec![
-            ("Yes, continue", TrustDirectorySelection::Trust),
-            ("No, quit", TrustDirectorySelection::Quit),
+            (
+                if self.restricted && self.existing_task {
+                    "Open existing task"
+                } else if self.restricted {
+                    "Open restricted"
+                } else {
+                    "Trust and continue"
+                },
+                TrustDirectorySelection::Trust,
+            ),
+            (
+                match self.cancel {
+                    TrustCancelAction::Quit => "Quit",
+                    TrustCancelAction::AgentsOverview => "Back to Agent Command Center",
+                },
+                TrustDirectorySelection::Quit,
+            ),
         ];
 
         for (idx, (text, selection)) in options.iter().enumerate() {
@@ -110,10 +144,14 @@ impl WidgetRef for &TrustDirectoryWidget {
             Line::from(vec![
                 "Press ".dim(),
                 keys::CONFIRM[0].into(),
-                if self.show_windows_create_sandbox_hint {
+                if self.show_windows_create_sandbox_hint && !self.restricted {
                     " to continue and create a sandbox...".dim()
                 } else {
-                    " to continue".dim()
+                    match self.cancel {
+                        TrustCancelAction::Quit => " to continue; esc to quit",
+                        TrustCancelAction::AgentsOverview => " to continue; esc to go back",
+                    }
+                    .dim()
                 },
             ])
             .inset(Insets::tlbr(
@@ -127,7 +165,7 @@ impl WidgetRef for &TrustDirectoryWidget {
 
 impl KeyboardHandler for TrustDirectoryWidget {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        if key_event.kind == KeyEventKind::Release {
+        if key_event.kind != KeyEventKind::Press {
             return;
         }
 
@@ -136,7 +174,9 @@ impl KeyboardHandler for TrustDirectoryWidget {
         } else if keys::MOVE_DOWN.is_pressed(key_event) {
             self.highlighted = TrustDirectorySelection::Quit;
         } else if keys::SELECT_FIRST.is_pressed(key_event) {
-            self.handle_trust();
+            // A terminal response fragment can start with `1`; trust always requires an explicit
+            // Enter confirmation after the directory prompt is visible.
+            self.highlighted = TrustDirectorySelection::Trust;
         } else if keys::SELECT_SECOND.is_pressed(key_event)
             || keys::QUIT.is_pressed(key_event)
             || keys::CANCEL.is_pressed(key_event)
@@ -193,6 +233,9 @@ mod tests {
 
     fn widget(error: Option<String>) -> TrustDirectoryWidget {
         TrustDirectoryWidget {
+            restricted: false,
+            existing_task: false,
+            cancel: TrustCancelAction::Quit,
             cwd: PathBuf::from("/workspace/project"),
             trust_target: PathBuf::from("/workspace/project"),
             show_windows_create_sandbox_hint: false,
@@ -206,6 +249,9 @@ mod tests {
     #[test]
     fn release_event_does_not_change_selection() {
         let mut widget = TrustDirectoryWidget {
+            restricted: false,
+            existing_task: false,
+            cancel: TrustCancelAction::Quit,
             cwd: PathBuf::from("."),
             trust_target: PathBuf::from("."),
             show_windows_create_sandbox_hint: false,
@@ -222,14 +268,38 @@ mod tests {
         widget.handle_key_event(release);
         assert_eq!(widget.selection, None);
 
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat);
+        widget.handle_key_event(repeat);
+        assert_eq!(widget.selection, None);
+
         let press = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         widget.handle_key_event(press);
         assert!(widget.should_quit);
     }
 
     #[test]
+    fn fragmented_terminal_response_cannot_grant_directory_trust() {
+        let mut widget = widget(/*error*/ None);
+        widget.highlighted = TrustDirectorySelection::Quit;
+
+        // The prefix may have been consumed by the protected-screen input drain, leaving the
+        // numeric OSC slot as the first key delivered after the trust prompt becomes active.
+        for character in "10;rgb:ffff/ffff/ffff".chars() {
+            widget.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        assert_eq!(widget.selection, None);
+        assert_eq!(widget.highlighted, TrustDirectorySelection::Trust);
+
+        widget.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(widget.selection, Some(TrustDirectorySelection::Trust));
+    }
+
+    #[test]
     fn renders_snapshot_for_git_repo() {
-        let widget = widget(/*error*/ None);
+        let mut widget = widget(/*error*/ None);
+        widget.show_windows_create_sandbox_hint = true;
 
         let mut terminal =
             Terminal::new(VT100Backend::new(/*width*/ 70, /*height*/ 14)).expect("terminal");
@@ -241,6 +311,56 @@ mod tests {
     }
 
     #[test]
+    fn renders_snapshot_for_remote_git_subdirectory() {
+        let widget = TrustDirectoryWidget {
+            restricted: false,
+            existing_task: false,
+            cancel: TrustCancelAction::AgentsOverview,
+            cwd: PathBuf::from("/srv/remote/project/nested"),
+            trust_target: PathBuf::from("/srv/remote/project"),
+            ..widget(/*error*/ None)
+        };
+
+        let mut terminal =
+            Terminal::new(VT100Backend::new(/*width*/ 70, /*height*/ 18)).expect("terminal");
+        terminal
+            .draw(|f| (&widget).render_ref(f.area(), f.buffer_mut()))
+            .expect("draw");
+
+        insta::assert_snapshot!(
+            terminal
+                .backend()
+                .to_string()
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn renders_restricted_folder() {
+        for existing_task in [false, true] {
+            let widget = TrustDirectoryWidget {
+                restricted: true,
+                existing_task,
+                cancel: TrustCancelAction::AgentsOverview,
+                ..widget(/*error*/ None)
+            };
+            let mut terminal =
+                Terminal::new(VT100Backend::new(/*width*/ 70, /*height*/ 18)).expect("terminal");
+            terminal
+                .draw(|f| (&widget).render_ref(f.area(), f.buffer_mut()))
+                .expect("draw");
+            if existing_task {
+                insta::assert_snapshot!("existing_untrusted_task", terminal.backend());
+            } else {
+                insta::assert_snapshot!(terminal.backend());
+            }
+        }
+    }
+
+    #[test]
     fn renders_snapshot_for_trust_error() {
         let widget = widget(Some(
             "Failed to set trust for /workspace/project: config/batchWrite failed in TUI: Invalid configuration: features.fast_mode=true is not supported; allowed set [fast_mode=false]"
@@ -248,7 +368,7 @@ mod tests {
         ));
 
         let mut terminal =
-            Terminal::new(VT100Backend::new(/*width*/ 70, /*height*/ 18)).expect("terminal");
+            Terminal::new(VT100Backend::new(/*width*/ 70, /*height*/ 22)).expect("terminal");
         terminal
             .draw(|f| (&widget).render_ref(f.area(), f.buffer_mut()))
             .expect("draw");

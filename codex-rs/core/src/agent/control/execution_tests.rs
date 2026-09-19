@@ -1,12 +1,12 @@
-use crate::agent::AgentControl;
-use codex_protocol::error::CodexErr;
+use crate::agent::LocalAgentControl;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use pretty_assertions::assert_eq;
 
-fn control_with_limit(max_threads: usize) -> AgentControl {
-    let control = AgentControl::default();
+fn control_with_limit(max_threads: usize) -> LocalAgentControl {
+    let control = LocalAgentControl::default();
     control.agent_execution_limiter.initialize(max_threads);
     control
 }
@@ -29,10 +29,10 @@ fn execution_guards_count_active_v2_subagent_turns() {
     let Err(err) = control.ensure_execution_capacity(MultiAgentVersion::V2, &source) else {
         panic!("second active turn should exceed the derived non-root cap");
     };
-    let CodexErr::AgentLimitReached { max_threads } = err else {
+    let CodexErrorDetails::AgentLimitReached { max_threads } = err.details() else {
         panic!("expected AgentLimitReached");
     };
-    assert_eq!(max_threads, 1);
+    assert_eq!(*max_threads, 1);
 
     drop(first);
     control

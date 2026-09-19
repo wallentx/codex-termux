@@ -1,4 +1,5 @@
 use super::mcp_call_tool_result_output_schema;
+use super::parse_agent_plugin_mcp_tool;
 use super::parse_mcp_tool;
 use crate::JsonSchema;
 use crate::ToolDefinition;
@@ -33,9 +34,43 @@ fn parse_mcp_tool_inserts_empty_properties() {
                 /*required*/ None,
                 /*additional_properties*/ None
             ),
-            output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({}))),
+            output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({})).into()),
             defer_loading: false,
         }
+    );
+}
+
+#[test]
+fn agent_plugin_mcp_tool_bounds_model_visible_description() {
+    let description = format!("{}é", "a".repeat(super::MAX_MCP_TOOL_DESCRIPTION_BYTES - 1));
+    let tool = mcp_tool(
+        "bounded_description",
+        &description,
+        serde_json::json!({"type": "object"}),
+    );
+
+    let parsed = parse_agent_plugin_mcp_tool(&tool).expect("parse Agent Plugin MCP tool");
+
+    assert_eq!(
+        parsed.description.len(),
+        super::MAX_MCP_TOOL_DESCRIPTION_BYTES - 1
+    );
+}
+
+#[test]
+fn legacy_mcp_tool_preserves_long_description() {
+    let description = "a".repeat(super::MAX_MCP_TOOL_DESCRIPTION_BYTES + 100);
+    let tool = mcp_tool(
+        "legacy_description",
+        &description,
+        serde_json::json!({"type": "object"}),
+    );
+
+    assert_eq!(
+        parse_mcp_tool(&tool)
+            .expect("parse legacy MCP tool")
+            .description,
+        description
     );
 }
 
@@ -71,16 +106,19 @@ fn parse_mcp_tool_preserves_top_level_output_schema() {
                 /*required*/ None,
                 /*additional_properties*/ None
             ),
-            output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({
-                "properties": {
-                    "result": {
-                        "properties": {
-                            "nested": {}
+            output_schema: Some(
+                mcp_call_tool_result_output_schema(serde_json::json!({
+                    "properties": {
+                        "result": {
+                            "properties": {
+                                "nested": {}
+                            }
                         }
-                    }
-                },
-                "required": ["result"]
-            }))),
+                    },
+                    "required": ["result"]
+                }))
+                .into()
+            ),
             defer_loading: false,
         }
     );
@@ -111,9 +149,12 @@ fn parse_mcp_tool_preserves_output_schema_without_inferred_type() {
                 /*required*/ None,
                 /*additional_properties*/ None
             ),
-            output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({
-                "enum": ["ok", "error"]
-            }))),
+            output_schema: Some(
+                mcp_call_tool_result_output_schema(serde_json::json!({
+                    "enum": ["ok", "error"]
+                }))
+                .into()
+            ),
             defer_loading: false,
         }
     );

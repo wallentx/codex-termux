@@ -19,7 +19,6 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::style::Style;
-use ratatui::style::Stylize;
 use ratatui::text::Span;
 
 #[cfg(test)]
@@ -46,6 +45,37 @@ pub(crate) struct KeyBinding {
     modifiers: KeyModifiers,
 }
 
+/// A user-visible shortcut made from one key or a two-key chord.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ShortcutHint {
+    Single(KeyBinding),
+    Chord {
+        prefix: KeyBinding,
+        completion: KeyBinding,
+    },
+}
+
+impl ShortcutHint {
+    pub(crate) fn display_label(self) -> String {
+        match self {
+            Self::Single(binding) => binding.display_label(),
+            Self::Chord { prefix, completion } => {
+                format!("{} {}", prefix.display_label(), completion.display_label())
+            }
+        }
+    }
+
+    pub(crate) fn is_press(self, event: KeyEvent) -> bool {
+        matches!(self, Self::Single(binding) if binding.is_press(event))
+    }
+}
+
+impl From<KeyBinding> for ShortcutHint {
+    fn from(binding: KeyBinding) -> Self {
+        Self::Single(binding)
+    }
+}
+
 impl KeyBinding {
     pub(crate) const fn new(key: KeyCode, modifiers: KeyModifiers) -> Self {
         Self { key, modifiers }
@@ -66,9 +96,19 @@ impl KeyBinding {
         (self.key, self.modifiers)
     }
 
+    /// Legacy Ctrl+] is reported as Ctrl+5; keep matching and conflicts consistent.
+    pub(crate) fn normalized_parts(&self) -> (KeyCode, KeyModifiers) {
+        match self.parts() {
+            (KeyCode::Char('5'), KeyModifiers::CONTROL) => ctrl(KeyCode::Char(']')).parts(),
+            parts => parts,
+        }
+    }
+
     pub(crate) fn display_label(&self) -> String {
         let modifiers = modifiers_to_string(self.modifiers);
         let key = match self.key {
+            #[cfg(test)]
+            KeyCode::Delete => "del".to_string(),
             KeyCode::Enter => "enter".to_string(),
             KeyCode::Char(' ') => "space".to_string(),
             KeyCode::Up => "↑".to_string(),
@@ -93,13 +133,13 @@ pub(crate) fn normalize_key_parts(
     if modifiers.is_empty()
         && let Some(ctrl_char) = c0_control_char_to_ctrl_char(ch)
     {
-        return (KeyCode::Char(ctrl_char), KeyModifiers::CONTROL | modifiers);
+        return normalize_key_parts(KeyCode::Char(ctrl_char), KeyModifiers::CONTROL);
     }
     if ch.is_ascii_uppercase() {
         modifiers.insert(KeyModifiers::SHIFT);
         return (KeyCode::Char(ch.to_ascii_lowercase()), modifiers);
     }
-    (key, modifiers)
+    KeyBinding::new(key, modifiers).normalized_parts()
 }
 
 fn c0_control_char_to_ctrl_char(ch: char) -> Option<char> {
@@ -191,6 +231,12 @@ impl From<KeyBinding> for Span<'static> {
 impl From<&KeyBinding> for Span<'static> {
     fn from(binding: &KeyBinding) -> Self {
         Span::styled(binding.display_label(), key_hint_style())
+    }
+}
+
+impl From<ShortcutHint> for Span<'static> {
+    fn from(hint: ShortcutHint) -> Self {
+        Span::styled(hint.display_label(), key_hint_style())
     }
 }
 
@@ -314,6 +360,7 @@ mod tests {
             ('z', '\u{001a}'),
             ('4', '\u{001c}'),
             ('5', '\u{001d}'),
+            (']', '\u{001d}'),
             ('6', '\u{001e}'),
             ('7', '\u{001f}'),
         ];

@@ -19,7 +19,7 @@ use codex_extension_items::ExtensionItem;
 use codex_extension_items::web_search::WebSearchAction;
 use codex_extension_items::web_search::WebSearchItem;
 use codex_login::default_client::add_originator_header;
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::create_client;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
 use codex_protocol::protocol::EventMsg;
@@ -49,7 +49,7 @@ pub(crate) struct WebSearchTool {
     pub(crate) originator: Option<String>,
 }
 
-impl ToolExecutor<ToolCall> for WebSearchTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for WebSearchTool {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced(WEB_NAMESPACE, RUN_TOOL_NAME)
     }
@@ -83,13 +83,19 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
         true
     }
 
-    fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(self.handle_call(call))
     }
 }
 
 impl WebSearchTool {
-    async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    async fn handle_call(
+        &self,
+        call: ToolCall<'_>,
+    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let commands = parse_commands(&call)?;
         let command_action = command_action(&commands);
         let provider = self
@@ -103,7 +109,7 @@ impl WebSearchTool {
             .await
             .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
         let client = SearchClient::new(
-            ReqwestTransport::new(build_reqwest_client()),
+            ReqwestTransport::from_http_client(create_client()),
             provider,
             auth,
         );
@@ -196,7 +202,7 @@ fn search_request_headers(originator: Option<&str>, turn_metadata: Option<&str>)
     headers
 }
 
-fn parse_commands(call: &ToolCall) -> Result<SearchCommands, FunctionCallError> {
+fn parse_commands(call: &ToolCall<'_>) -> Result<SearchCommands, FunctionCallError> {
     let arguments = call.function_arguments()?;
     if arguments.trim().is_empty() {
         return Ok(SearchCommands::default());

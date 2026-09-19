@@ -3,6 +3,11 @@
 use super::*;
 
 impl ChatWidget {
+    pub(crate) fn on_review_started(&mut self) {
+        self.bottom_pane.dismiss_composer_sparkle();
+        self.bottom_pane.clear_pending_questions();
+    }
+
     pub(crate) fn open_review_popup(&mut self) {
         let mut items: Vec<SelectionItem> = Vec::new();
 
@@ -142,7 +147,7 @@ impl ChatWidget {
                 });
             }),
         );
-        self.bottom_pane.show_view(Box::new(view));
+        self.bottom_pane.show_text_prompt(view);
     }
 }
 

@@ -1,6 +1,7 @@
 use codex_config::McpServerConfig;
 use codex_exec_server_protocol::ExecutorCapabilityDiscoverySnapshot;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::protocol::SessionSource;
 
 use crate::ExtensionData;
 use crate::ExtensionDataInit;
@@ -13,10 +14,14 @@ use crate::ExtensionDataInit;
 pub struct McpServerContributionContext<'a, C> {
     /// Host configuration visible during MCP resolution.
     config: &'a C,
+    /// Whether pending auth differs from published auth; invalidate catalogs before projection.
+    auth_changed: bool,
     /// Extension-owned data for the active thread, when resolution is thread-scoped.
     thread_store: Option<&'a ExtensionData>,
     /// Stable host inputs for the active thread, when resolution is thread-scoped.
     thread_init: Option<&'a ExtensionDataInit>,
+    /// Source of the active thread, when supplied by the host runtime.
+    session_source: Option<&'a SessionSource>,
     /// Effective request originator for the active thread, when resolution is thread-scoped.
     originator: Option<&'a str>,
     /// Selected roots resolved against ready environments for this exact step.
@@ -38,8 +43,10 @@ impl<'a, C> McpServerContributionContext<'a, C> {
     pub fn global(config: &'a C) -> Self {
         Self {
             config,
+            auth_changed: false,
             thread_store: None,
             thread_init: None,
+            session_source: None,
             originator: None,
             ready_selected_capability_roots: None,
             executor_capability_discovery: None,
@@ -57,12 +64,31 @@ impl<'a, C> McpServerContributionContext<'a, C> {
     ) -> Self {
         Self {
             config,
+            auth_changed: false,
             thread_store: Some(thread_store),
             thread_init: Some(thread_init),
+            session_source: None,
             originator: Some(originator),
             ready_selected_capability_roots: Some(ready_selected_capability_roots),
             executor_capability_discovery,
         }
+    }
+
+    /// Marks whether this projection replaces the published MCP authentication.
+    pub fn with_auth_changed(mut self, auth_changed: bool) -> Self {
+        self.auth_changed = auth_changed;
+        self
+    }
+
+    /// Returns whether auth-scoped catalogs must be invalidated before projection.
+    pub fn auth_changed(&self) -> bool {
+        self.auth_changed
+    }
+
+    /// Attaches the stable source of the active thread to this contribution.
+    pub fn with_session_source(mut self, session_source: &'a SessionSource) -> Self {
+        self.session_source = Some(session_source);
+        self
     }
 
     /// Returns the host configuration visible during resolution.
@@ -78,6 +104,11 @@ impl<'a, C> McpServerContributionContext<'a, C> {
     /// Returns stable host inputs when resolving for a running thread.
     pub fn thread_init(&self) -> Option<&'a ExtensionDataInit> {
         self.thread_init
+    }
+
+    /// Returns the active thread's source when supplied by the host runtime.
+    pub fn session_source(&self) -> Option<&'a SessionSource> {
+        self.session_source
     }
 
     /// Returns the effective request originator when resolving for a running thread.
@@ -96,6 +127,21 @@ impl<'a, C> McpServerContributionContext<'a, C> {
     }
 }
 
+/// Validated plugin identities projected for the current set of selected roots.
+#[derive(Clone, Debug, Default)]
+pub struct SelectedPluginSnapshot {
+    pub plugins: Vec<SelectedPluginIdentity>,
+    /// Selected plugin roots suppressed by the effective plugin feature policy.
+    pub disabled_plugin_roots: Vec<String>,
+}
+
+/// The configured identity of a plugin resolved from one selected root.
+#[derive(Clone, Debug)]
+pub struct SelectedPluginIdentity {
+    pub selected_root_id: String,
+    pub plugin_id: String,
+}
+
 /// One extension-owned overlay for the runtime MCP server configuration.
 #[derive(Clone, Debug)]
 pub enum McpServerContribution {
@@ -103,6 +149,20 @@ pub enum McpServerContribution {
     Set {
         name: String,
         config: Box<McpServerConfig>,
+    },
+    /// Adds an ordinary extension-owned server with its own HTTP protocol mode.
+    /// The mode applies only if this registration wins server resolution; it
+    /// does not grant controller-owned Apps cache or environment authority.
+    SetWithProtocolMode {
+        name: String,
+        config: Box<McpServerConfig>,
+        protocol_mode: crate::McpProtocolMode,
+    },
+    /// Registers the controller-owned Apps server under its reserved name.
+    HostedApps {
+        config: Box<McpServerConfig>,
+        /// Overrides the HTTP protocol mode, or uses the hosted Apps default when absent.
+        protocol_mode: Option<crate::McpProtocolMode>,
     },
     /// Registers a server declared by a plugin selected for this thread.
     SelectedPlugin {
@@ -114,6 +174,7 @@ pub enum McpServerContribution {
     },
     /// Records a plugin selected for this thread and any connector IDs it declares.
     SelectedPluginPackage {
+        selected_root_id: String,
         plugin_id: String,
         plugin_display_name: String,
         connector_ids: Vec<String>,

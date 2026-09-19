@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::path::Path;
 
 use codex_analytics::GuardianReviewedAction;
@@ -6,35 +7,42 @@ use codex_protocol::approvals::GuardianCommandSource;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionProfile;
+#[cfg(unix)]
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathUri;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::GUARDIAN_MAX_ACTION_STRING_TOKENS;
-use super::prompt::guardian_truncate_text;
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GuardianApprovalRequest {
-    Shell {
-        id: String,
-        command: Vec<String>,
-        cwd: AbsolutePathBuf,
-        sandbox_permissions: crate::sandboxing::SandboxPermissions,
-        additional_permissions: Option<AdditionalPermissionProfile>,
-        justification: Option<String>,
-    },
     ExecCommand {
         id: String,
+        environment_id: String,
         command: Vec<String>,
-        cwd: AbsolutePathBuf,
+        cwd: PathUri,
+        /// Executor-native rendering sent to Guardian; `cwd` remains typed for attribution.
+        guardian_cwd: LegacyAppPathString,
         sandbox_permissions: crate::sandboxing::SandboxPermissions,
         additional_permissions: Option<AdditionalPermissionProfile>,
         justification: Option<String>,
         tty: bool,
     },
+    WriteStdin {
+        id: String,
+        approval_id: String,
+        environment_id: String,
+        process_id: i32,
+        input: String,
+        cwd: PathUri,
+        tty: bool,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions,
+        additional_permissions: Option<AdditionalPermissionProfile>,
+    },
     #[cfg(unix)]
     Execve {
         id: String,
+        environment_id: String,
         source: GuardianCommandSource,
         program: String,
         argv: Vec<String>,
@@ -43,13 +51,14 @@ pub(crate) enum GuardianApprovalRequest {
     },
     ApplyPatch {
         id: String,
-        cwd: AbsolutePathBuf,
-        files: Vec<AbsolutePathBuf>,
+        cwd: PathUri,
+        files: Vec<PathUri>,
         patch: String,
     },
     NetworkAccess {
         id: String,
         turn_id: String,
+        environment_id: String,
         target: String,
         host: String,
         protocol: NetworkApprovalProtocol,
@@ -77,13 +86,28 @@ pub(crate) enum GuardianApprovalRequest {
     },
 }
 
+impl GuardianApprovalRequest {
+    pub(super) fn background_environment_id(&self) -> Option<&str> {
+        match self {
+            Self::NetworkAccess { environment_id, .. } => Some(environment_id),
+            #[cfg(unix)]
+            Self::Execve { environment_id, .. } => Some(environment_id),
+            Self::ExecCommand { .. }
+            | Self::WriteStdin { .. }
+            | Self::ApplyPatch { .. }
+            | Self::McpToolCall { .. }
+            | Self::RequestPermissions { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GuardianNetworkAccessTrigger {
     pub(crate) call_id: String,
     pub(crate) tool_name: String,
     pub(crate) command: Vec<String>,
-    pub(crate) cwd: AbsolutePathBuf,
+    pub(crate) cwd: PathUri,
     pub(crate) sandbox_permissions: crate::sandboxing::SandboxPermissions,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) additional_permissions: Option<AdditionalPermissionProfile>,
@@ -107,7 +131,7 @@ pub(crate) struct GuardianMcpAnnotations {
 struct CommandApprovalAction<'a> {
     tool: &'a str,
     command: &'a [String],
-    cwd: &'a Path,
+    cwd: LegacyAppPathString,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
     #[serde(skip_serializing_if = "Option::is_none")]
     additional_permissions: Option<&'a AdditionalPermissionProfile>,
@@ -115,6 +139,27 @@ struct CommandApprovalAction<'a> {
     justification: Option<&'a String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tty: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ApplyPatchApprovalAction<'a> {
+    tool: &'static str,
+    cwd: LegacyAppPathString,
+    files: Vec<LegacyAppPathString>,
+    patch: &'a str,
+}
+
+#[derive(Serialize)]
+struct WriteStdinApprovalAction<'a> {
+    tool: &'static str,
+    environment_id: &'a str,
+    session_id: i32,
+    chars: &'a str,
+    cwd: LegacyAppPathString,
+    sandbox_permissions: crate::sandboxing::SandboxPermissions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_permissions: Option<&'a AdditionalPermissionProfile>,
+    tty: bool,
 }
 
 #[cfg(unix)]
@@ -179,7 +224,7 @@ fn serialize_guardian_action(value: impl Serialize) -> serde_json::Result<Value>
 fn serialize_command_guardian_action(
     tool: &'static str,
     command: &[String],
-    cwd: &Path,
+    cwd: LegacyAppPathString,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
     additional_permissions: Option<&AdditionalPermissionProfile>,
     justification: Option<&String>,
@@ -199,7 +244,7 @@ fn serialize_command_guardian_action(
 fn command_assessment_action(
     source: GuardianCommandSource,
     command: &[String],
-    cwd: &AbsolutePathBuf,
+    cwd: &LegacyAppPathString,
 ) -> GuardianAssessmentAction {
     GuardianAssessmentAction::Command {
         source,
@@ -216,73 +261,16 @@ fn guardian_command_source_tool_name(source: GuardianCommandSource) -> &'static 
     }
 }
 
-fn truncate_guardian_action_value(value: Value) -> (Value, bool) {
-    match value {
-        Value::String(text) => {
-            let (text, truncated) =
-                guardian_truncate_text(&text, GUARDIAN_MAX_ACTION_STRING_TOKENS);
-            (Value::String(text), truncated)
-        }
-        Value::Array(values) => {
-            let mut truncated = false;
-            let values = values
-                .into_iter()
-                .map(|value| {
-                    let (value, value_truncated) = truncate_guardian_action_value(value);
-                    truncated |= value_truncated;
-                    value
-                })
-                .collect::<Vec<_>>();
-            (Value::Array(values), truncated)
-        }
-        Value::Object(values) => {
-            let mut entries = values.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            let mut truncated = false;
-            let values = entries
-                .into_iter()
-                .map(|(key, value)| {
-                    let (value, value_truncated) = truncate_guardian_action_value(value);
-                    truncated |= value_truncated;
-                    (key, value)
-                })
-                .collect();
-            (Value::Object(values), truncated)
-        }
-        other => (other, false),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FormattedGuardianAction {
-    pub(crate) text: String,
-    pub(crate) truncated: bool,
-}
-
 pub(crate) fn guardian_approval_request_to_json(
     action: &GuardianApprovalRequest,
 ) -> serde_json::Result<Value> {
     match action {
-        GuardianApprovalRequest::Shell {
-            id: _,
-            command,
-            cwd,
-            sandbox_permissions,
-            additional_permissions,
-            justification,
-        } => serialize_command_guardian_action(
-            "shell",
-            command,
-            cwd,
-            *sandbox_permissions,
-            additional_permissions.as_ref(),
-            justification.as_ref(),
-            /*tty*/ None,
-        ),
         GuardianApprovalRequest::ExecCommand {
             id: _,
+            environment_id: _,
             command,
-            cwd,
+            cwd: _,
+            guardian_cwd,
             sandbox_permissions,
             additional_permissions,
             justification,
@@ -290,15 +278,35 @@ pub(crate) fn guardian_approval_request_to_json(
         } => serialize_command_guardian_action(
             "exec_command",
             command,
-            cwd,
+            guardian_cwd.clone(),
             *sandbox_permissions,
             additional_permissions.as_ref(),
             justification.as_ref(),
             Some(*tty),
         ),
+        GuardianApprovalRequest::WriteStdin {
+            environment_id,
+            process_id,
+            input,
+            cwd,
+            tty,
+            sandbox_permissions,
+            additional_permissions,
+            ..
+        } => serialize_guardian_action(WriteStdinApprovalAction {
+            tool: "write_stdin",
+            environment_id,
+            session_id: *process_id,
+            chars: input,
+            cwd: cwd.clone().into(),
+            sandbox_permissions: *sandbox_permissions,
+            additional_permissions: additional_permissions.as_ref(),
+            tty: *tty,
+        }),
         #[cfg(unix)]
         GuardianApprovalRequest::Execve {
             id: _,
+            environment_id: _,
             source,
             program,
             argv,
@@ -316,28 +324,35 @@ pub(crate) fn guardian_approval_request_to_json(
             cwd,
             files,
             patch,
-        } => Ok(serde_json::json!({
-            "tool": "apply_patch",
-            "cwd": cwd,
-            "files": files,
-            "patch": patch,
-        })),
+        } => serialize_guardian_action(ApplyPatchApprovalAction {
+            tool: "apply_patch",
+            cwd: cwd.clone().into(),
+            files: files.iter().cloned().map(Into::into).collect(),
+            patch,
+        }),
         GuardianApprovalRequest::NetworkAccess {
             id: _,
             turn_id: _,
+            environment_id: _,
             target,
             host,
             protocol,
             port,
             trigger,
-        } => serialize_guardian_action(NetworkAccessApprovalAction {
-            tool: "network_access",
-            target,
-            host,
-            protocol: *protocol,
-            port: *port,
-            trigger: trigger.as_ref(),
-        }),
+        } => {
+            let mut value = serialize_guardian_action(NetworkAccessApprovalAction {
+                tool: "network_access",
+                target,
+                host,
+                protocol: *protocol,
+                port: *port,
+                trigger: trigger.as_ref(),
+            })?;
+            if let Some(trigger) = trigger {
+                value["trigger"]["cwd"] = trigger.cwd.inferred_native_path_string().into();
+            }
+            Ok(value)
+        }
         GuardianApprovalRequest::McpToolCall {
             id: _,
             server,
@@ -381,12 +396,23 @@ pub(crate) fn guardian_assessment_action(
     action: &GuardianApprovalRequest,
 ) -> GuardianAssessmentAction {
     match action {
-        GuardianApprovalRequest::Shell { command, cwd, .. } => {
-            command_assessment_action(GuardianCommandSource::Shell, command, cwd)
-        }
-        GuardianApprovalRequest::ExecCommand { command, cwd, .. } => {
-            command_assessment_action(GuardianCommandSource::UnifiedExec, command, cwd)
-        }
+        GuardianApprovalRequest::ExecCommand {
+            command,
+            guardian_cwd,
+            ..
+        } => command_assessment_action(GuardianCommandSource::UnifiedExec, command, guardian_cwd),
+        GuardianApprovalRequest::WriteStdin {
+            approval_id,
+            process_id,
+            input,
+            cwd,
+            ..
+        } => GuardianAssessmentAction::WriteStdin {
+            approval_id: approval_id.clone(),
+            process_id: process_id.to_string(),
+            stdin: input.clone(),
+            cwd: cwd.clone(),
+        },
         #[cfg(unix)]
         GuardianApprovalRequest::Execve {
             source,
@@ -402,13 +428,14 @@ pub(crate) fn guardian_assessment_action(
         },
         GuardianApprovalRequest::ApplyPatch { cwd, files, .. } => {
             GuardianAssessmentAction::ApplyPatch {
-                cwd: cwd.clone(),
-                files: files.clone(),
+                cwd: cwd.clone().into(),
+                files: files.iter().cloned().map(Into::into).collect(),
             }
         }
         GuardianApprovalRequest::NetworkAccess {
             id: _id,
             turn_id: _turn_id,
+            environment_id: _,
             target,
             host,
             protocol,
@@ -449,14 +476,6 @@ pub(crate) fn guardian_reviewed_action(
     request: &GuardianApprovalRequest,
 ) -> GuardianReviewedAction {
     match request {
-        GuardianApprovalRequest::Shell {
-            sandbox_permissions,
-            additional_permissions,
-            ..
-        } => GuardianReviewedAction::Shell {
-            sandbox_permissions: *sandbox_permissions,
-            additional_permissions: additional_permissions.clone(),
-        },
         GuardianApprovalRequest::ExecCommand {
             sandbox_permissions,
             additional_permissions,
@@ -464,19 +483,20 @@ pub(crate) fn guardian_reviewed_action(
             ..
         } => GuardianReviewedAction::UnifiedExec {
             sandbox_permissions: *sandbox_permissions,
-            additional_permissions: additional_permissions.clone(),
+            additional_permissions: additional_permissions.as_ref().map(Into::into),
             tty: *tty,
         },
+        GuardianApprovalRequest::WriteStdin { tty, .. } => {
+            GuardianReviewedAction::WriteStdin { tty: *tty }
+        }
         #[cfg(unix)]
         GuardianApprovalRequest::Execve {
             source,
-            program,
             additional_permissions,
             ..
         } => GuardianReviewedAction::Execve {
             source: *source,
-            program: program.clone(),
-            additional_permissions: additional_permissions.clone(),
+            additional_permissions: additional_permissions.as_ref().map(Into::into),
         },
         GuardianApprovalRequest::ApplyPatch { .. } => GuardianReviewedAction::ApplyPatch {},
         GuardianApprovalRequest::NetworkAccess { protocol, port, .. } => {
@@ -507,8 +527,8 @@ pub(crate) fn guardian_reviewed_action(
 
 pub(crate) fn guardian_request_target_item_id(request: &GuardianApprovalRequest) -> Option<&str> {
     match request {
-        GuardianApprovalRequest::Shell { id, .. }
-        | GuardianApprovalRequest::ExecCommand { id, .. }
+        GuardianApprovalRequest::ExecCommand { id, .. }
+        | GuardianApprovalRequest::WriteStdin { id, .. }
         | GuardianApprovalRequest::ApplyPatch { id, .. }
         | GuardianApprovalRequest::McpToolCall { id, .. }
         | GuardianApprovalRequest::RequestPermissions { id, .. } => Some(id),
@@ -525,8 +545,8 @@ pub(crate) fn guardian_request_turn_id<'a>(
     match request {
         GuardianApprovalRequest::NetworkAccess { turn_id, .. }
         | GuardianApprovalRequest::RequestPermissions { turn_id, .. } => turn_id,
-        GuardianApprovalRequest::Shell { .. }
-        | GuardianApprovalRequest::ExecCommand { .. }
+        GuardianApprovalRequest::ExecCommand { .. }
+        | GuardianApprovalRequest::WriteStdin { .. }
         | GuardianApprovalRequest::ApplyPatch { .. }
         | GuardianApprovalRequest::McpToolCall { .. } => default_turn_id,
         #[cfg(unix)]
@@ -536,11 +556,9 @@ pub(crate) fn guardian_request_turn_id<'a>(
 
 pub(crate) fn format_guardian_action_pretty(
     action: &GuardianApprovalRequest,
-) -> serde_json::Result<FormattedGuardianAction> {
-    let value = guardian_approval_request_to_json(action)?;
-    let (value, truncated) = truncate_guardian_action_value(value);
-    Ok(FormattedGuardianAction {
-        text: serde_json::to_string_pretty(&value)?,
-        truncated,
-    })
+) -> serde_json::Result<String> {
+    let mut value =
+        codex_guardian_context::action_for_review(guardian_approval_request_to_json(action)?);
+    value.sort_all_objects();
+    serde_json::to_string_pretty(&value)
 }

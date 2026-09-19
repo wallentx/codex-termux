@@ -99,6 +99,7 @@ pub(super) use codex_app_server_protocol::RateLimitWindow;
 pub(super) use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
 pub(super) use codex_app_server_protocol::ReviewTarget;
 pub(super) use codex_app_server_protocol::ServerNotification;
+pub(super) use codex_app_server_protocol::SkillMetadata;
 pub(super) use codex_app_server_protocol::SkillSummary;
 pub(super) use codex_app_server_protocol::ThreadClosedNotification;
 pub(super) use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
@@ -113,16 +114,14 @@ pub(super) use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 pub(super) use codex_app_server_protocol::UserInput;
 pub(super) use codex_app_server_protocol::UserInput as AppServerUserInput;
 pub(super) use codex_app_server_protocol::WarningNotification;
+pub(super) use codex_app_server_protocol::WindowsSandboxSetupMode;
 pub(super) use codex_config::ConfigLayerStack;
 pub(super) use codex_config::Constrained;
 pub(super) use codex_config::ConstraintError;
 pub(super) use codex_config::RequirementSource;
 pub(super) use codex_config::types::ApprovalsReviewer;
 pub(super) use codex_config::types::Notifications;
-pub(super) use codex_config::types::WindowsSandboxModeToml;
 pub(super) use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
-pub(super) use codex_core_skills::model::SkillMetadata;
-pub(super) use codex_features::FEATURES;
 pub(super) use codex_features::Feature;
 pub(super) use codex_git_utils::CommitLogEntry;
 pub(super) use codex_models_manager::test_support::construct_model_info_offline_for_tests;
@@ -208,7 +207,7 @@ macro_rules! assert_chatwidget_snapshot {
         settings.bind(|| {
             insta::assert_snapshot!(
                 format!("codex_tui__chatwidget__tests__{}", $name),
-                &($value),
+                $value,
                 @$snapshot
             );
         });
@@ -233,7 +232,19 @@ fn next_goal_draft(
 
 mod app_server;
 mod approval_requests;
+#[path = "tests/backend_banners_tests.rs"]
+mod backend_banners_tests;
+#[path = "tests/bedrock_catalog_tests.rs"]
+mod bedrock_catalog_tests;
+#[path = "tests/collaboration_catalog_tests.rs"]
+mod collaboration_catalog_tests;
+#[path = "tests/compaction_tests.rs"]
+mod compaction_tests;
+#[path = "tests/completion_styling_tests.rs"]
+mod completion_styling;
 mod composer_submission;
+#[path = "tests/computer_activity_tests.rs"]
+mod computer_activity_tests;
 #[path = "tests/config_errors_tests.rs"]
 mod config_errors;
 mod exec_flow;
@@ -242,22 +253,50 @@ mod goal_validation;
 mod guardian;
 pub(crate) mod helpers;
 mod history_replay;
+#[path = "tests/luna_reserve_usage_tests.rs"]
+mod luna_reserve_usage_tests;
 mod mcp_startup;
+#[path = "tests/misalignment_policy_tests.rs"]
+mod misalignment_policy;
+#[path = "tests/model_display_name_tests.rs"]
+mod model_display_name_tests;
+#[path = "tests/permission_shortcuts_tests.rs"]
+mod permission_shortcuts_tests;
 mod permissions;
 mod plan_mode;
 #[path = "tests/plugin_catalog_tests.rs"]
 mod plugin_catalog;
 mod popups_and_settings;
+#[path = "tests/rate_limit_recovery_tests.rs"]
+mod rate_limit_recovery_tests;
+#[path = "tests/reasoning_status_tests.rs"]
+mod reasoning_status_tests;
+#[path = "tests/replay_render_tests.rs"]
+mod replay_render_tests;
 mod review_mode;
+#[path = "tests/session_model_selection_tests.rs"]
+mod session_model_selection_tests;
 mod side;
 mod slash_commands;
+#[path = "tests/sparkle_submission_tests.rs"]
+mod sparkle_submission_tests;
 mod status_and_layout;
 mod status_command_tests;
 mod status_surface_previews;
 mod terminal_title;
+#[path = "tests/tool_activity_tests.rs"]
+mod tool_activity_tests;
 mod usage;
+#[path = "tests/worktree_picker_tests.rs"]
+mod worktree_picker;
 
 pub(crate) use helpers::make_chatwidget_manual_with_sender;
 pub(crate) use helpers::set_chatgpt_auth;
 pub(crate) use helpers::set_fast_mode_test_catalog;
 pub(super) use helpers::*;
+
+#[path = "tests/questions_tests.rs"]
+mod questions_tests;
+
+#[path = "tests/question_notifications_tests.rs"]
+mod question_notifications_tests;

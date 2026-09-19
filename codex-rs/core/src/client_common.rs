@@ -2,12 +2,16 @@ pub use codex_api::ResponseEvent;
 use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -21,7 +25,7 @@ pub struct Prompt {
 
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
-    pub(crate) tools: Vec<ToolSpec>,
+    pub(crate) tools: Arc<[ToolSpec]>,
 
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
@@ -33,17 +37,20 @@ pub struct Prompt {
 
     /// Whether the Responses API should strictly validate `output_schema`.
     pub output_schema_strict: bool,
+
+    pub(crate) cyber_access_program: Option<codex_protocol::turn_input::CyberAccessProgram>,
 }
 
 impl Default for Prompt {
     fn default() -> Self {
         Self {
             input: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::default(),
             parallel_tool_calls: false,
             base_instructions: BaseInstructions::default(),
             output_schema: None,
             output_schema_strict: true,
+            cyber_access_program: None,
         }
     }
 }
@@ -51,23 +58,21 @@ impl Default for Prompt {
 impl Prompt {
     pub(crate) fn get_formatted_input_for_request(
         &self,
-        use_responses_lite: bool,
+        model_info: &ModelInfo,
     ) -> Vec<ResponseItem> {
         let mut input = self.input.clone();
-        if use_responses_lite {
-            strip_image_details(&mut input);
-        }
+        normalize_image_details(&mut input, model_info);
         input
     }
 }
 
-fn strip_image_details(items: &mut [ResponseItem]) {
+fn normalize_image_details(items: &mut [ResponseItem], model_info: &ModelInfo) {
     for item in items {
         match item {
             ResponseItem::Message { content, .. } => {
                 for content_item in content {
                     if let ContentItem::InputImage { detail, .. } = content_item {
-                        *detail = None;
+                        normalize_image_detail(detail, model_info);
                     }
                 }
             }
@@ -78,7 +83,7 @@ fn strip_image_details(items: &mut [ResponseItem]) {
                         if let FunctionCallOutputContentItem::InputImage { detail, .. } =
                             content_item
                         {
-                            *detail = None;
+                            normalize_image_detail(detail, model_info);
                         }
                     }
                 }
@@ -94,10 +99,19 @@ fn strip_image_details(items: &mut [ResponseItem]) {
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => {}
         }
+    }
+}
+
+fn normalize_image_detail(detail: &mut Option<ImageDetail>, model_info: &ModelInfo) {
+    if model_info.use_responses_lite {
+        *detail = None;
+    } else if *detail == Some(ImageDetail::Original) && !model_info.supports_image_detail_original {
+        *detail = Some(DEFAULT_IMAGE_DETAIL);
     }
 }
 

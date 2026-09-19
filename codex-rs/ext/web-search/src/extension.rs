@@ -43,7 +43,8 @@ impl From<&Config> for WebSearchExtensionConfig {
         Self {
             // Core selects this executor per turn using the feature flag or model metadata.
             available: (config.model_provider.is_openai()
-                || config.model_provider.uses_openai_actor_authorization())
+                || config.model_provider.uses_openai_actor_authorization()
+                || config.model_provider.supports_standalone_web_search)
                 && web_search_mode != WebSearchMode::Disabled,
             provider: config.model_provider.clone(),
             settings: search_settings(config, web_search_mode),
@@ -120,7 +121,9 @@ impl ToolContributor for WebSearchExtension {
         &self,
         session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>> {
+    ) -> Vec<
+        Arc<dyn for<'call> codex_extension_api::ToolExecutor<codex_extension_api::ToolCall<'call>>>,
+    > {
         let Some(config) = thread_store.get::<WebSearchExtensionConfig>() else {
             return Vec::new();
         };

@@ -1,5 +1,6 @@
 use crate::ResponsesApiNamespaceTool;
 use crate::ToolName;
+use crate::ToolOutputSchema;
 use crate::ToolSpec;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
@@ -37,7 +38,24 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             description: tool.description.clone(),
                             kind: CodeModeToolKind::Function,
                             input_schema: serde_json::to_value(&tool.parameters).ok(),
-                            output_schema: tool.output_schema.clone(),
+                            output_schema: tool
+                                .output_schema
+                                .as_ref()
+                                .map(ToolOutputSchema::to_value),
+                        };
+                        tool.description =
+                            codex_code_mode::augment_tool_definition(definition).description;
+                    }
+                    ResponsesApiNamespaceTool::Custom(tool) => {
+                        let tool_name =
+                            ToolName::namespaced(namespace.name.clone(), tool.name.clone());
+                        let definition = CodeModeToolDefinition {
+                            name: code_mode_name_for_tool_name(&tool_name),
+                            tool_name,
+                            description: tool.description.clone(),
+                            kind: CodeModeToolKind::Freeform,
+                            input_schema: None,
+                            output_schema: None,
                         };
                         tool.description =
                             codex_code_mode::augment_tool_definition(definition).description;
@@ -117,7 +135,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 description: tool.description.clone(),
                 kind: CodeModeToolKind::Function,
                 input_schema: serde_json::to_value(&tool.parameters).ok(),
-                output_schema: tool.output_schema.clone(),
+                output_schema: tool.output_schema.as_ref().map(ToolOutputSchema::to_value),
             }]
         }
         ToolSpec::Freeform(tool) => {
@@ -143,7 +161,18 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                         description: tool.description.clone(),
                         kind: CodeModeToolKind::Function,
                         input_schema: serde_json::to_value(&tool.parameters).ok(),
-                        output_schema: tool.output_schema.clone(),
+                        output_schema: tool.output_schema.as_ref().map(ToolOutputSchema::to_value),
+                    }
+                }
+                ResponsesApiNamespaceTool::Custom(tool) => {
+                    let tool_name = ToolName::namespaced(namespace.name.clone(), tool.name.clone());
+                    CodeModeToolDefinition {
+                        name: code_mode_name_for_tool_name(&tool_name),
+                        tool_name,
+                        description: tool.description.clone(),
+                        kind: CodeModeToolKind::Freeform,
+                        input_schema: None,
+                        output_schema: None,
                     }
                 }
             })
@@ -153,6 +182,10 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
 }
 
 pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
+    if tool_name.is_default_namespace() {
+        return tool_name.name.clone();
+    }
+
     match tool_name.namespace.as_deref() {
         Some(namespace) if namespace.ends_with('_') || tool_name.name.starts_with('_') => {
             format!("{namespace}{}", tool_name.name)

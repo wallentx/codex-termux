@@ -1,6 +1,8 @@
 mod config;
+mod discovery;
 mod signing;
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use aws_credential_types::provider::ProvideCredentials;
@@ -10,12 +12,86 @@ use http::HeaderMap;
 use http::Method;
 use thiserror::Error;
 
+pub use discovery::AwsProfile;
+pub use discovery::discover_aws_profiles;
+pub use discovery::validate_aws_profile;
+
 /// AWS auth configuration used to resolve credentials and sign requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsAuthConfig {
     pub profile: Option<String>,
     pub region: Option<String>,
     pub service: String,
+}
+
+/// Static AWS access keys supplied by a caller instead of the default SDK chain.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AwsAccessKeys {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for AwsAccessKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsAccessKeys")
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Supplies AWS access keys on demand without exposing AWS SDK credential types to callers.
+///
+/// Implementations should return current credentials for every call so request signing can
+/// observe credential refreshes. Errors must not contain credentials or command output.
+pub trait AwsCredentialsProvider: std::fmt::Debug + Send + Sync {
+    fn credentials(
+        &self,
+    ) -> impl std::future::Future<Output = std::io::Result<AwsAccessKeys>> + Send;
+}
+
+#[derive(Debug)]
+struct AwsCredentialsProviderAdapter<P>(Arc<P>);
+
+#[derive(Debug, Error)]
+#[error("{0}")]
+struct ProvidedCredentialsError(std::io::Error);
+
+impl<P: AwsCredentialsProvider> ProvideCredentials for AwsCredentialsProviderAdapter<P> {
+    fn provide_credentials<'a>(
+        &'a self,
+    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        aws_credential_types::provider::future::ProvideCredentials::new(async move {
+            let access_keys = self.0.credentials().await.map_err(|error| {
+                let error = ProvidedCredentialsError(error);
+                match error.0.kind() {
+                    std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied => {
+                        aws_credential_types::provider::error::CredentialsError::invalid_configuration(error)
+                    }
+                    _ => aws_credential_types::provider::error::CredentialsError::provider_error(error),
+                }
+            })?;
+
+            Ok(aws_credential_types::Credentials::new(
+                access_keys.access_key_id,
+                access_keys.secret_access_key,
+                access_keys.session_token,
+                /*expires_after*/ None,
+                "codex-bedrock-credential-export",
+            ))
+        })
+    }
 }
 
 /// Generic HTTP request shape consumed by SigV4 signing.
@@ -39,10 +115,14 @@ pub struct AwsSignedRequest {
 pub enum AwsAuthError {
     #[error("AWS service name must not be empty")]
     EmptyService,
+    #[error("AWS profile must be configured")]
+    MissingProfile,
     #[error("AWS SDK config did not resolve a credentials provider")]
     MissingCredentialsProvider,
     #[error("AWS SDK config did not resolve a region")]
     MissingRegion,
+    #[error("failed to load AWS profiles: {0}")]
+    ProfileLoad(#[from] aws_config::profile::ProfileFileLoadError),
     #[error("failed to load AWS credentials: {0}")]
     Credentials(#[from] aws_credential_types::provider::error::CredentialsError),
     #[error("request URL is not a valid URI: {0}")]
@@ -89,6 +169,45 @@ impl AwsAuthContext {
         })
     }
 
+    pub async fn load_with_access_keys(
+        config: AwsAuthConfig,
+        access_keys: AwsAccessKeys,
+    ) -> Result<Self, AwsAuthError> {
+        let mut context = Self::load(config).await?;
+        context.credentials_provider =
+            SharedCredentialsProvider::new(aws_credential_types::Credentials::new(
+                access_keys.access_key_id,
+                access_keys.secret_access_key,
+                access_keys.session_token,
+                /*expires_after*/ None,
+                "codex-managed-bedrock-access-keys",
+            ));
+        Ok(context)
+    }
+
+    pub async fn load_with_credentials_provider(
+        config: AwsAuthConfig,
+        provider: Arc<impl AwsCredentialsProvider + 'static>,
+    ) -> Result<Self, AwsAuthError> {
+        let mut context = Self::load(config).await?;
+        context.credentials_provider =
+            SharedCredentialsProvider::new(AwsCredentialsProviderAdapter(provider));
+        Ok(context)
+    }
+
+    pub async fn load_profile(config: AwsAuthConfig) -> Result<Self, AwsAuthError> {
+        let profile = config
+            .profile
+            .as_deref()
+            .ok_or(AwsAuthError::MissingProfile)?;
+        let credentials_provider = SharedCredentialsProvider::new(
+            discovery::profile_credentials_provider(profile, config.region.as_deref()).await,
+        );
+        let mut context = Self::load(config).await?;
+        context.credentials_provider = credentials_provider;
+        Ok(context)
+    }
+
     pub fn region(&self) -> &str {
         &self.region
     }
@@ -112,6 +231,16 @@ impl AwsAuthContext {
 }
 
 impl AwsAuthError {
+    /// Returns the caller-supplied credential error without exposing SDK error sources.
+    pub fn credentials_provider_error(&self) -> Option<&std::io::Error> {
+        let Self::Credentials(error) = self else {
+            return None;
+        };
+        std::error::Error::source(error)?
+            .downcast_ref::<ProvidedCredentialsError>()
+            .map(|error| &error.0)
+    }
+
     /// Returns whether retrying the outbound request can reasonably recover from this auth error.
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -121,8 +250,10 @@ impl AwsAuthError {
                     | aws_credential_types::provider::error::CredentialsError::ProviderError(_)
             ),
             AwsAuthError::EmptyService
+            | AwsAuthError::MissingProfile
             | AwsAuthError::MissingCredentialsProvider
             | AwsAuthError::MissingRegion
+            | AwsAuthError::ProfileLoad(_)
             | AwsAuthError::InvalidUri(_)
             | AwsAuthError::BuildHttpRequest(_)
             | AwsAuthError::InvalidHeaderValue(_)
@@ -202,6 +333,68 @@ mod tests {
         assert!(signing::header_value(&signed.headers, "x-amz-date").is_some());
     }
 
+    #[tokio::test]
+    async fn credentials_provider_adapter_converts_keys_and_provider_failures() {
+        #[derive(Debug)]
+        struct TestCredentialsProvider(Result<AwsAccessKeys, std::io::ErrorKind>);
+
+        impl AwsCredentialsProvider for TestCredentialsProvider {
+            async fn credentials(&self) -> std::io::Result<AwsAccessKeys> {
+                self.0
+                    .clone()
+                    .map_err(|kind| std::io::Error::new(kind, "credential export failed"))
+            }
+        }
+
+        let credentials =
+            AwsCredentialsProviderAdapter(Arc::new(TestCredentialsProvider(Ok(AwsAccessKeys {
+                access_key_id: "access-key-id".to_string(),
+                secret_access_key: "secret-access-key".to_string(),
+                session_token: Some("session-token".to_string()),
+            }))))
+            .provide_credentials()
+            .await
+            .expect("exported credentials should be available");
+
+        assert_eq!(
+            credentials,
+            Credentials::new(
+                "access-key-id",
+                "secret-access-key",
+                Some("session-token".to_string()),
+                /*expires_after*/ None,
+                "codex-bedrock-credential-export",
+            )
+        );
+
+        for (kind, retryable) in [
+            (std::io::ErrorKind::Other, true),
+            (std::io::ErrorKind::TimedOut, true),
+            (std::io::ErrorKind::InvalidData, false),
+            (std::io::ErrorKind::InvalidInput, false),
+            (std::io::ErrorKind::NotFound, false),
+            (std::io::ErrorKind::PermissionDenied, false),
+        ] {
+            let error = AwsCredentialsProviderAdapter(Arc::new(TestCredentialsProvider(Err(kind))))
+                .provide_credentials()
+                .await
+                .expect_err("credential export failure should be propagated");
+            let error = AwsAuthError::Credentials(error);
+            assert_eq!(
+                (
+                    error.is_retryable(),
+                    error
+                        .credentials_provider_error()
+                        .map(|error| (error.kind(), error.to_string())),
+                ),
+                (
+                    retryable,
+                    Some((kind, "credential export failed".to_string()))
+                ),
+            );
+        }
+    }
+
     #[test]
     fn credentials_provider_failures_are_retryable() {
         assert!(
@@ -217,6 +410,7 @@ mod tests {
     #[test]
     fn deterministic_aws_auth_errors_are_not_retryable() {
         assert!(!AwsAuthError::EmptyService.is_retryable());
+        assert!(!AwsAuthError::MissingProfile.is_retryable());
         assert!(
             !AwsAuthError::Credentials(CredentialsError::not_loaded_no_source()).is_retryable()
         );
@@ -247,7 +441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_rejects_empty_service_name() {
+    async fn load_rejects_invalid_configuration() {
         let err = AwsAuthContext::load(AwsAuthConfig {
             profile: None,
             region: None,
@@ -257,5 +451,15 @@ mod tests {
         .expect_err("empty service should be rejected");
 
         assert_eq!(err.to_string(), "AWS service name must not be empty");
+
+        let err = AwsAuthContext::load_profile(AwsAuthConfig {
+            profile: None,
+            region: Some("us-east-1".to_string()),
+            service: "bedrock".to_string(),
+        })
+        .await
+        .expect_err("profile auth should require a configured profile");
+
+        assert_eq!(err.to_string(), "AWS profile must be configured");
     }
 }

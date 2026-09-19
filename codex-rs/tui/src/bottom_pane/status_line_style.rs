@@ -8,6 +8,8 @@ use ratatui::text::Span;
 
 use super::status_line_setup::StatusLineItem;
 use crate::render::highlight::foreground_style_for_scopes;
+use crate::thread_color::thread_color;
+use codex_protocol::ThreadId;
 
 const STATUS_LINE_SEPARATOR: &str = " · ";
 const STATUS_LINE_COLOR_SATURATION_PERCENT: u16 = 85;
@@ -43,13 +45,19 @@ impl StatusLineAccent {
             | StatusLineItem::ContextWindowSize
             | StatusLineItem::UsedTokens
             | StatusLineItem::TotalInputTokens
-            | StatusLineItem::TotalOutputTokens => Self::Usage,
+            | StatusLineItem::TotalOutputTokens
+            | StatusLineItem::ThreadCredits
+            | StatusLineItem::EstimatedThreadCost => Self::Usage,
             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
-            StatusLineItem::CodexVersion | StatusLineItem::SessionId => Self::Metadata,
+            StatusLineItem::CodexVersion | StatusLineItem::Hostname | StatusLineItem::SessionId => {
+                Self::Metadata
+            }
             StatusLineItem::FastMode | StatusLineItem::RawOutput => Self::Mode,
             StatusLineItem::Permissions => Self::Mode,
             StatusLineItem::ApprovalMode => Self::Mode,
-            StatusLineItem::ThreadTitle | StatusLineItem::WorkspaceHeadline => Self::Thread,
+            StatusLineItem::ThreadName
+            | StatusLineItem::ThreadTitle
+            | StatusLineItem::WorkspaceHeadline => Self::Thread,
             StatusLineItem::TaskProgress => Self::Progress,
         }
     }
@@ -81,11 +89,12 @@ impl StatusLineAccent {
 pub(crate) fn status_line_from_segments<I>(
     segments: I,
     use_theme_colors: bool,
+    thread_id: Option<ThreadId>,
 ) -> Option<Line<'static>>
 where
     I: IntoIterator<Item = (StatusLineItem, String)>,
 {
-    status_line_from_segments_with_resolver(segments, use_theme_colors, |accent| {
+    status_line_from_segments_with_resolver(segments, use_theme_colors, thread_id, |accent| {
         foreground_style_for_scopes(accent.scopes())
     })
 }
@@ -93,6 +102,7 @@ where
 fn status_line_from_segments_with_resolver<I, F>(
     segments: I,
     use_theme_colors: bool,
+    thread_id: Option<ThreadId>,
     theme_style_for_accent: F,
 ) -> Option<Line<'static>>
 where
@@ -104,7 +114,15 @@ where
         if !spans.is_empty() {
             spans.push(STATUS_LINE_SEPARATOR.dim());
         }
-        let style = if use_theme_colors {
+        let style = if use_theme_colors
+            && matches!(
+                item,
+                StatusLineItem::ThreadName | StatusLineItem::ThreadTitle
+            )
+            && let Some(thread_id) = thread_id
+        {
+            Style::default().fg(thread_color(thread_id))
+        } else if use_theme_colors {
             let accent = StatusLineAccent::for_item(item);
             soften_status_line_style(
                 theme_style_for_accent(accent).unwrap_or_else(|| accent.fallback_style()),
@@ -198,6 +216,7 @@ mod tests {
                 (StatusLineItem::GitBranch, "main".to_string()),
             ],
             /*use_theme_colors*/ true,
+            /*thread_id*/ None,
             |_| None,
         )
         .expect("status line");
@@ -219,6 +238,7 @@ mod tests {
                 (StatusLineItem::ContextUsed, "Context 12% used".to_string()),
             ],
             /*use_theme_colors*/ true,
+            /*thread_id*/ None,
             |accent| match accent {
                 StatusLineAccent::Model => Some(Style::default().red()),
                 _ => None,
@@ -234,11 +254,30 @@ mod tests {
     }
 
     #[test]
+    fn thread_usage_items_share_an_accent_and_dim_separator() {
+        let line = status_line_from_segments_with_resolver(
+            [
+                (StatusLineItem::ThreadCredits, "5.2 credits".to_string()),
+                (StatusLineItem::EstimatedThreadCost, "~$0.21".to_string()),
+            ],
+            /*use_theme_colors*/ true,
+            /*thread_id*/ None,
+            |_| None,
+        )
+        .expect("thread usage status line");
+
+        assert_eq!(line_text(&line), "5.2 credits · ~$0.21");
+        assert_eq!(line.spans[0].style, line.spans[2].style);
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
     #[allow(clippy::disallowed_methods)]
     fn status_line_segments_soften_rgb_theme_styles_without_dimming_text() {
         let line = status_line_from_segments_with_resolver(
             [(StatusLineItem::ModelName, "gpt-5".to_string())],
             /*use_theme_colors*/ true,
+            /*thread_id*/ None,
             |_| Some(Style::default().fg(Color::Rgb(255, 0, 0))),
         )
         .expect("status line");
@@ -255,6 +294,7 @@ mod tests {
                 (StatusLineItem::ContextUsed, "Context 12% used".to_string()),
             ],
             /*use_theme_colors*/ false,
+            /*thread_id*/ None,
             |_| Some(Style::default().red()),
         )
         .expect("status line");
@@ -272,6 +312,7 @@ mod tests {
         let line = status_line_from_segments_with_resolver(
             [(StatusLineItem::PullRequestNumber, "PR #20252".to_string())],
             /*use_theme_colors*/ false,
+            /*thread_id*/ None,
             |_| None,
         )
         .expect("status line");
@@ -292,6 +333,7 @@ mod tests {
             status_line_from_segments_with_resolver(
                 Vec::<(StatusLineItem, String)>::new(),
                 /*use_theme_colors*/ true,
+                /*thread_id*/ None,
                 |_| None,
             ),
             None

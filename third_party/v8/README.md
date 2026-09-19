@@ -18,8 +18,8 @@ prebuilts.
 
 Current pinned versions:
 
-- Rust crate: `v8 = =149.2.0`
-- Embedded upstream V8 source for Bazel-produced release builds: `14.9.207.2`
+- Rust crate: `v8 = =150.4.0`
+- Embedded upstream V8 source for Bazel-produced release builds: `15.0.245.2`
 
 ## Updating to a new `v8` release
 
@@ -30,7 +30,10 @@ Use this as the maintainer flow for a version bump:
    matching checksum manifest and generated checksums as described below.
 3. Publish a release-candidate PR and validate that `v8-canary` passes.
 4. If the canary is green, publish the release tag and release build.
-5. Once the release build completes, rerun the build on the candidate branch
+5. Independently verify the published Codex-built checksum manifests and record
+   their SHA-256 digests in
+   `third_party/v8/rusty_v8_<version>_release_manifests.sha256`.
+6. Once the release build completes, rerun the build on the candidate branch
    and verify that the final artifact builds and tests pass.
 
 When changing the remaining prebuilt `rusty_v8` `http_file` inputs, keep the
@@ -92,7 +95,7 @@ from upstream `rusty_v8` source. Those ABI-specific outputs cannot be produced
 by Codex's Bazel Windows GNU toolchain.
 
 The Bazel graph pins the same libc++, libc++abi, and llvm-libc source revisions
-used by `rusty_v8 v149.2.0`, compiles published artifact targets with
+used by `rusty_v8 v150.4.0`, compiles published artifact targets with
 `--config=rusty-v8-upstream-libcxx`, and folds the matching runtime objects into
 the final static archive so consumers can link it with the `v8` crate's default
 `use_custom_libcxx` feature. The config keeps the object files and the bundled

@@ -17,10 +17,16 @@ use std::time::Instant;
 use crate::markdown_stream::MarkdownStreamCollector;
 use crate::terminal_hyperlinks::HyperlinkLine;
 pub(crate) mod chunking;
+mod code_fence;
 pub(crate) mod commit_tick;
 pub(crate) mod controller;
+mod prose_preview;
 mod render;
 mod table_holdback;
+
+#[cfg(test)]
+#[path = "mermaid_tests.rs"]
+mod mermaid_tests;
 
 struct QueuedLine {
     line: HyperlinkLine,

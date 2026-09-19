@@ -43,7 +43,7 @@ let settings = OtelSettings {
     tracestate: std::collections::BTreeMap::new(),
 };
 
-if let Some(provider) = OtelProvider::from(&settings)? {
+if let Some(provider) = OtelProvider::try_new(&settings)? {
     let registry = tracing_subscriber::registry()
         .with(provider.logger_layer())
         .with(provider.tracing_layer());
@@ -143,6 +143,26 @@ let metrics = MetricsClient::new(MetricsConfig::in_memory(
 metrics.counter("codex.turns", 1, &[("model", "gpt-5.1")])?;
 metrics.shutdown()?; // flushes in-memory exporter
 ```
+
+## WebSocket continuation
+
+`codex.websocket.continuation` counts `response.create` send attempts, including
+failed sends. It carries existing session tags plus `mode` (`incremental`/`full`),
+`phase` (`warmup`/`generation`), and `reason`:
+
+| Reason | Meaning |
+| --- | --- |
+| `incremental` | Send the previous response ID and new input. |
+| `no_previous_request` | First request from a fresh client. |
+| `restored_history` | First request after loading resumed or forked history. |
+| `connection_closed` | Full input after observing the previous socket closed. |
+| `other` | Full input for another reason, such as changed input/settings or unavailable response state. |
+
+Per-socket backend metrics label a resend after reconnect as `initial`; this client
+metric retains the first reset reason through reconnect failures and turn boundaries.
+Include warmups (`generate=false`), which can send full input before an incremental
+generation. Closes may be intentional; restored history includes manual resumes/forks.
+This measures client send attempts, not disconnect rates or engine cache reuse.
 
 ## Trace context
 

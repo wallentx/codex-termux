@@ -1,0 +1,82 @@
+//! Regression coverage for conflict diagnostics and validation pass ordering.
+
+use super::RuntimeKeymap;
+use codex_config::types::TuiKeymap;
+use pretty_assertions::assert_eq;
+use serde_json::Value;
+use serde_json::json;
+
+#[test]
+fn conflicting_contexts_report_the_first_conflict_in_validation_order() {
+    let contexts = [
+        ("editor", "insert_newline", "yank"),
+        ("vim_normal", "enter_insert", "cancel_operator"),
+        ("vim_operator", "delete_line", "cancel"),
+        ("vim_text_object", "word", "cancel"),
+        ("pager", "scroll_up", "close_transcript"),
+        ("list", "move_up", "cancel"),
+        ("agents", "search", "toggle_grouping"),
+        ("approval", "open_fullscreen", "cancel"),
+    ];
+    let mut config = serde_json::Map::new();
+    for (context, first, second) in contexts {
+        config.insert(context.to_string(), json!({first: "f12", second: "f12"}));
+    }
+
+    for (context, first, second) in contexts {
+        let keymap: TuiKeymap = serde_json::from_value(Value::Object(config.clone()))
+            .expect("valid keymap configuration");
+        assert_eq!(
+            RuntimeKeymap::from_config(&keymap).expect_err("expected binding conflict"),
+            format!(
+                "Ambiguous `tui.keymap.{context}` bindings: `{first}` and `{second}` use the same key. \
+Set unique keys in `~/.codex/config.toml` and retry. \
+See the Codex keymap documentation for supported actions and examples."
+            )
+        );
+        config.remove(context);
+    }
+}
+
+#[test]
+fn new_agents_defaults_preserve_existing_custom_bindings() {
+    for (action, alias) in [
+        ("archive", "a"),
+        ("delete", "delete"),
+        ("hide", "h"),
+        ("new_worktree", "w"),
+    ] {
+        for (context, existing, suffix) in [
+            ("agents", "stop", ""),
+            ("list", "move_down", ""),
+            ("global", "copy", ""),
+            ("agents", "stop", " f12"),
+            ("list", "move_down", " f12"),
+        ] {
+            // Plain keys are allowed in the dashboard, but global actions and list
+            // chord prefixes still share text-entry surfaces.
+            if alias != "delete" && (context == "global" || context == "list" && !suffix.is_empty())
+            {
+                continue;
+            }
+            let keymap: TuiKeymap = serde_json::from_value(
+                json!({context: {existing: format!("{alias}{suffix}")}, "approval": {"open_fullscreen": "f12", "approve_for_session": []},
+                    "editor": {"move_line_start": [], "move_line_end": [], "delete_backward_word": [], "delete_forward": []}}),
+            )
+            .unwrap();
+            let runtime =
+                RuntimeKeymap::from_config(&keymap).expect("existing configuration remains valid");
+            let bindings = match action {
+                "archive" => &runtime.agents.archive,
+                "delete" => &runtime.agents.delete,
+                "hide" => &runtime.agents.hide,
+                "new_worktree" => &runtime.agents.new_worktree,
+                _ => unreachable!(),
+            };
+            assert!(
+                bindings.is_empty(),
+                "{action} shadows {context}.{existing} = {alias}{suffix}"
+            );
+        }
+    }
+}
