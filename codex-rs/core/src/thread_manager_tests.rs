@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::types::SpawnAgentOptions;
+use crate::config::RolloutBudgetConfig;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -38,6 +39,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
@@ -1249,6 +1251,12 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
 
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
+    config.rollout_budget = Some(RolloutBudgetConfig {
+        limit_tokens: 100,
+        reminder_at_remaining_tokens: vec![75, 50, 25],
+        sampling_token_weight: 1.0,
+        prefill_token_weight: 1.0,
+    });
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
@@ -1350,7 +1358,6 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
             shell_environment_policy: Default::default(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
             windows_sandbox_type: config.permissions.windows_sandbox_type,
-            windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
             use_legacy_landlock: config.features.use_legacy_landlock(),
             exec_policy: Some(codex_execpolicy::RequirementsExecPolicy::new(
                 codex_execpolicy::Policy::empty(),
@@ -1379,20 +1386,24 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
         reviewer.session_configured.session_id,
         parent.session_configured.session_id
     );
-    assert!(std::ptr::eq(
-        reviewer
-            .thread
-            .session
-            .services
-            .agent_control
-            .rollout_budget(),
-        parent
-            .thread
-            .session
-            .services
-            .agent_control
-            .rollout_budget(),
-    ));
+    reviewer
+        .thread
+        .session
+        .services
+        .agent_control
+        .record_rollout_budget_usage(&TokenUsage {
+            output_tokens: 25,
+            ..Default::default()
+        })
+        .expect("record reviewer usage");
+    let reminder = parent
+        .thread
+        .session
+        .services
+        .agent_control
+        .pending_budget_reminder(parent.thread_id, "window")
+        .expect("parent budget reminder");
+    assert_eq!(reminder.remaining_tokens, 75);
     assert_eq!(reviewer_config.parent_thread_id, Some(parent.thread_id));
     assert_eq!(reviewer_config.forked_from_thread_id, None);
     assert_eq!(reviewer_config.originator, "codex_work_desktop");
@@ -1693,6 +1704,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &first_session.services.mcp_thread_init,
             &first_session.services.thread_extension_data,
             McpThreadIdentity {
+                auth_changed: false,
                 session_source: &SessionSource::Exec,
                 originator: &first_originator,
                 disabled_plugin_ids: &[],
@@ -1714,6 +1726,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &second_session.services.mcp_thread_init,
             &second_session.services.thread_extension_data,
             McpThreadIdentity {
+                auth_changed: false,
                 session_source: &second_session_source,
                 originator: &second_originator,
                 disabled_plugin_ids: &[],
@@ -1788,6 +1801,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
                 &first_session.services.mcp_thread_init,
                 &first_session.services.thread_extension_data,
                 McpThreadIdentity {
+                    auth_changed: false,
                     session_source: &SessionSource::Exec,
                     originator: &first_originator,
                     disabled_plugin_ids: &disabled_plugin_ids,
@@ -1956,10 +1970,16 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         .await
         .expect("build resumed turn context");
     let resumed_turn = prepared_turn;
-    assert_eq!(resumed_turn.environments.turn_environments().count(), 1);
     assert_eq!(
         resumed_turn
-            .environments
+            .initial_environments
+            .turn_environments()
+            .count(),
+        1
+    );
+    assert_eq!(
+        resumed_turn
+            .initial_environments
             .primary()
             .expect("primary environment")
             .cwd(),
@@ -1967,7 +1987,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     );
     assert_ne!(
         resumed_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("primary environment")
             .cwd(),
@@ -1993,10 +2013,13 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         .await
         .expect("build forked turn context");
     let forked_turn = prepared_turn;
-    assert_eq!(forked_turn.environments.turn_environments().count(), 1);
+    assert_eq!(
+        forked_turn.initial_environments.turn_environments().count(),
+        1
+    );
     assert_eq!(
         forked_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("primary environment")
             .cwd(),
@@ -2004,7 +2027,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     );
     assert_ne!(
         forked_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("primary environment")
             .cwd(),

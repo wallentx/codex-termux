@@ -599,10 +599,6 @@ async fn environment_permissions_follow_configuration_ownership() -> Result<()> 
                         shell_environment_policy: Default::default(),
                         windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
                         windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-                        windows_sandbox_private_desktop: test
-                            .config
-                            .permissions
-                            .windows_sandbox_private_desktop,
                         use_legacy_landlock: test.config.features.use_legacy_landlock(),
                         exec_policy: None,
                         mcp_policy: None,
@@ -911,6 +907,7 @@ async fn settings_update_does_not_retarget_active_turn_environment() -> Result<(
     let test = builder.build(&server).await?;
     let initial_cwd = test.config.cwd.clone();
     let initial_environments = test.codex.environment_selections().await;
+    assert_eq!(test.codex.active_turn_environment_selections().await, None);
     let next_workspace = TempDir::new()?;
     let next_cwd = next_workspace.path().abs();
     let next_environments =
@@ -927,6 +924,11 @@ async fn settings_update_does_not_retarget_active_turn_environment() -> Result<(
         _ => None,
     })
     .await;
+
+    assert_eq!(
+        test.codex.active_turn_environment_selections().await,
+        Some(initial_environments.clone())
+    );
 
     let preview = test
         .codex
@@ -958,6 +960,10 @@ async fn settings_update_does_not_retarget_active_turn_environment() -> Result<(
         test.codex.environment_selections().await,
         next_environments.environments
     );
+    assert_eq!(
+        test.codex.active_turn_environment_selections().await,
+        Some(initial_environments)
+    );
     let snapshot = test.codex.config_snapshot().await;
     assert_eq!(
         snapshot.environment_selections(),
@@ -982,6 +988,7 @@ async fn settings_update_does_not_retarget_active_turn_environment() -> Result<(
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    assert_eq!(test.codex.active_turn_environment_selections().await, None);
     test.submit_turn("start the next turn").await?;
 
     let request_texts = response_mock
@@ -1109,6 +1116,19 @@ async fn deferred_executor_promotes_primary_environment_when_startup_completes()
     })
     .await;
 
+    let active_environments = test
+        .codex
+        .active_turn_environment_selections()
+        .await
+        .context("active turn environments")?;
+    assert_eq!(
+        active_environments
+            .iter()
+            .map(|selection| selection.environment_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![REMOTE_ENVIRONMENT_ID, "local"]
+    );
+
     let requests = response_mock.requests();
     let initial_context = requests[1]
         .message_input_texts("user")
@@ -1168,6 +1188,10 @@ async fn deferred_executor_promotes_primary_environment_when_startup_completes()
         }
     });
     core_test_support::wait_for_mcp_server(&test.codex, "deferred").await?;
+    assert_eq!(
+        test.codex.active_turn_environment_selections().await,
+        Some(active_environments)
+    );
     test.codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id,
@@ -1185,6 +1209,8 @@ async fn deferred_executor_promotes_primary_environment_when_startup_completes()
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+
+    assert_eq!(test.codex.active_turn_environment_selections().await, None);
 
     let requests = response_mock.requests();
     assert!(
@@ -1464,10 +1490,6 @@ async fn shared_executor_keeps_ready_capability_roots_scoped_to_each_attachment(
             shell_environment_policy: Default::default(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
             windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-            windows_sandbox_private_desktop: test
-                .config
-                .permissions
-                .windows_sandbox_private_desktop,
             use_legacy_landlock: test.config.features.use_legacy_landlock(),
             exec_policy: None,
             mcp_policy: None,
@@ -1510,10 +1532,6 @@ async fn shared_executor_keeps_ready_capability_roots_scoped_to_each_attachment(
                     shell_environment_policy: Default::default(),
                     windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
                     windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-                    windows_sandbox_private_desktop: test
-                        .config
-                        .permissions
-                        .windows_sandbox_private_desktop,
                     use_legacy_landlock: test.config.features.use_legacy_landlock(),
                     exec_policy: None,
                     mcp_policy: None,
@@ -1540,10 +1558,6 @@ async fn shared_executor_keeps_ready_capability_roots_scoped_to_each_attachment(
                         shell_environment_policy: Default::default(),
                         windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
                         windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-                        windows_sandbox_private_desktop: test
-                            .config
-                            .permissions
-                            .windows_sandbox_private_desktop,
                         use_legacy_landlock: test.config.features.use_legacy_landlock(),
                         exec_policy: None,
                         mcp_policy: None,
@@ -1605,10 +1619,6 @@ async fn shared_executor_keeps_ready_capability_roots_scoped_to_each_attachment(
                             shell_environment_policy: Default::default(),
                             windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
                             windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-                            windows_sandbox_private_desktop: test
-                                .config
-                                .permissions
-                                .windows_sandbox_private_desktop,
                             use_legacy_landlock: test.config.features.use_legacy_landlock(),
                             exec_policy: None,
                             mcp_policy: None,
@@ -1686,7 +1696,6 @@ async fn owner_network_policy_rejects_unsupported_environment_authority() -> Res
         shell_environment_policy: test.config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
         windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: test.config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: test.config.features.use_legacy_landlock(),
         exec_policy: None,
         mcp_policy: None,
@@ -1776,7 +1785,6 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
         shell_environment_policy: Default::default(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
         windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: test.config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: test.config.features.use_legacy_landlock(),
         exec_policy: None,
         mcp_policy: None,
@@ -2022,7 +2030,6 @@ async fn future_pending_environment_can_finish_without_retargeting_the_active_tu
         shell_environment_policy: Default::default(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
         windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: test.config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: test.config.features.use_legacy_landlock(),
         exec_policy: None,
         mcp_policy: None,
@@ -2585,10 +2592,6 @@ async fn deferred_executor_spawn_agent_inherits_ready_step_environments(
             shell_environment_policy: Default::default(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
             windows_sandbox_type: test.config.permissions.windows_sandbox_type,
-            windows_sandbox_private_desktop: test
-                .config
-                .permissions
-                .windows_sandbox_private_desktop,
             use_legacy_landlock: test.config.features.use_legacy_landlock(),
             exec_policy: None,
             mcp_policy: None,
@@ -2732,7 +2735,8 @@ async fn deferred_executor_guardian_uses_newly_ready_step_environment() -> Resul
     let remote_cwd = test.cwd.path().join("guardian-remote").abs();
     let local_cwd = test.cwd.path().abs();
     fs::create_dir_all(remote_cwd.as_path())?;
-    let remote_denied_path = remote_cwd.canonicalize()?.join("private");
+    // Remote policy paths use the executor's spelling; only local paths are canonicalized here.
+    let remote_denied_path = remote_cwd.join("private");
     let local_denied_path = local_cwd.canonicalize()?.join("private");
     let remote_selection = TurnEnvironmentSelection {
         environment_id: REMOTE_ENVIRONMENT_ID.to_string(),

@@ -6,7 +6,6 @@ use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use crate::windows_sandbox::resolve_windows_sandbox_mode;
-use crate::windows_sandbox::resolve_windows_sandbox_private_desktop;
 use crate::windows_sandbox::windows_sandbox_level_for_legacy_checks;
 use codex_agent_roles::load_agent_roles;
 use codex_config::CloudConfigBundleLoader;
@@ -349,8 +348,6 @@ pub struct Permissions {
     pub windows_sandbox_mode: Option<WindowsSandboxModeToml>,
     /// Selected Windows sandbox implementation, separate from the legacy setup level.
     pub windows_sandbox_type: SandboxType,
-    /// Whether the final Windows sandboxed child should run on a private desktop.
-    pub windows_sandbox_private_desktop: bool,
 }
 
 impl Permissions {
@@ -372,7 +369,6 @@ impl Permissions {
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             windows_sandbox_mode: None,
             windows_sandbox_type: SandboxType::None,
-            windows_sandbox_private_desktop: true,
         })
     }
 
@@ -1654,7 +1650,10 @@ impl Config {
         } else {
             OutboundProxyPolicy::ReqwestDefault
         };
-        let factory = HttpClientFactory::new(outbound_proxy_policy);
+        let mut factory = HttpClientFactory::new(outbound_proxy_policy);
+        if !self.respect_system_proxy && self.features.enabled(Feature::SystemProxyFallback) {
+            factory = factory.with_system_proxy_fallback();
+        }
         if self.features.enabled(Feature::Psp) {
             factory.with_chatgpt_cookies([HeaderValue::from_static("oai-chat-psp=true")])
         } else {
@@ -2980,17 +2979,8 @@ pub fn resolve_bootstrap_respect_system_proxy(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<bool> {
-    let configured_features = Features::from_sources(
-        FeatureConfigSource {
-            features: cfg.features.as_ref(),
-            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-    let features =
-        ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())?;
-    Ok(features.get().enabled(Feature::RespectSystemProxy))
+    resolve_bootstrap_http_client_factory(cfg, feature_requirements)
+        .map(|factory| factory.outbound_proxy_policy() == OutboundProxyPolicy::RespectSystemProxy)
 }
 
 /// Resolves auth route settings for the initial cloud-config bootstrap.
@@ -3007,14 +2997,28 @@ pub fn resolve_bootstrap_http_client_factory(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<HttpClientFactory> {
-    resolve_bootstrap_respect_system_proxy(cfg, feature_requirements).map(|respect_system_proxy| {
-        let outbound_proxy_policy = if respect_system_proxy {
-            OutboundProxyPolicy::RespectSystemProxy
-        } else {
-            OutboundProxyPolicy::ReqwestDefault
-        };
-        HttpClientFactory::new(outbound_proxy_policy)
-    })
+    let configured_features = Features::from_sources(
+        FeatureConfigSource {
+            features: cfg.features.as_ref(),
+            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+    let features =
+        ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())?;
+    let outbound_proxy_policy = if features.enabled(Feature::RespectSystemProxy) {
+        OutboundProxyPolicy::RespectSystemProxy
+    } else {
+        OutboundProxyPolicy::ReqwestDefault
+    };
+    let mut factory = HttpClientFactory::new(outbound_proxy_policy);
+    if outbound_proxy_policy == OutboundProxyPolicy::ReqwestDefault
+        && features.enabled(Feature::SystemProxyFallback)
+    {
+        factory = factory.with_system_proxy_fallback();
+    }
+    Ok(factory)
 }
 
 pub(crate) fn resolve_web_search_mode_for_turn(
@@ -3232,7 +3236,6 @@ impl Config {
             auto_review_required_models: _,
             permission_profile: mut constrained_permission_profile,
             windows_sandbox_mode: mut constrained_windows_sandbox_mode,
-            windows_sandbox_private_desktop: _,
             web_search_mode: mut constrained_web_search_mode,
             allow_managed_hooks_only: _,
             allow_appshots: _,
@@ -3369,7 +3372,6 @@ impl Config {
             windows_sandbox_type,
             windows_sandbox_level,
         );
-        let windows_sandbox_private_desktop = resolve_windows_sandbox_private_desktop(&cfg);
         let resolved_cwd = AbsolutePathBuf::try_from(normalize_for_native_workdir({
             use std::env;
 
@@ -4200,7 +4202,6 @@ impl Config {
                 shell_environment_policy,
                 windows_sandbox_mode,
                 windows_sandbox_type,
-                windows_sandbox_private_desktop,
             },
             explicit_permission_profile_mode,
             custom_permission_profiles,

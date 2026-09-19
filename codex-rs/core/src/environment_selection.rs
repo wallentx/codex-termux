@@ -1018,13 +1018,21 @@ impl TurnEnvironmentSnapshot {
 
     /// Returns the first selected environment's host folders, even if setup is not ready yet.
     pub(crate) fn primary_workspace_roots(&self) -> Vec<AbsolutePathBuf> {
+        self.primary_workspace_root_uris()
+            .iter()
+            .filter_map(|root| root.to_abs_path().ok())
+            .collect()
+    }
+
+    /// Returns the first selection's executor paths, even when setup is not ready yet.
+    pub(crate) fn primary_workspace_root_uris(&self) -> &[PathUri] {
         let selection = match self.environments.first() {
             Some(TurnEnvironmentState::Ready(environment)) => &environment.selection,
             Some(TurnEnvironmentState::Starting(environment)) => &environment.selection,
             Some(TurnEnvironmentState::Failed { selection, .. }) => selection,
-            None => return Vec::new(),
+            None => return &[],
         };
-        ThreadEnvironments::primary_workspace_roots_for(std::slice::from_ref(selection))
+        &selection.workspace_roots
     }
 
     /// Returns the primary environment's resolved permissions, or the provided fallback.
@@ -1154,7 +1162,6 @@ mod tests {
             workspace_roots: Vec::new(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_type: codex_protocol::sandbox::SandboxType::None,
-            windows_sandbox_private_desktop: true,
             use_legacy_landlock: false,
             permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::read_only()),
             shell_environment_policy: Default::default(),
@@ -1335,7 +1342,6 @@ url = "ws://127.0.0.1:8765"
             workspace_roots: Vec::new(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_type: codex_protocol::sandbox::SandboxType::None,
-            windows_sandbox_private_desktop: true,
             use_legacy_landlock: false,
             permission_profile: PermissionProfileSnapshot::active_with_profile_workspace_roots(
                 PermissionProfile::read_only(),
@@ -1600,7 +1606,6 @@ url = "ws://127.0.0.1:8765"
             workspace_roots: Vec::new(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_type: codex_protocol::sandbox::SandboxType::None,
-            windows_sandbox_private_desktop: true,
             use_legacy_landlock: false,
             permission_profile: PermissionProfileSnapshot::active_with_profile_workspace_roots(
                 PermissionProfile::read_only(),
@@ -1988,7 +1993,6 @@ url = "ws://127.0.0.1:8765"
             workspace_roots: Vec::new(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_type: codex_protocol::sandbox::SandboxType::None,
-            windows_sandbox_private_desktop: true,
             use_legacy_landlock: false,
             permission_profile: PermissionProfileSnapshot::active_with_profile_workspace_roots(
                 PermissionProfile::read_only(),
@@ -2059,7 +2063,6 @@ url = "ws://127.0.0.1:8765"
             workspace_roots: selection.workspace_roots.clone(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_type: codex_protocol::sandbox::SandboxType::None,
-            windows_sandbox_private_desktop: true,
             use_legacy_landlock: false,
             permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::read_only()),
             shell_environment_policy: Default::default(),

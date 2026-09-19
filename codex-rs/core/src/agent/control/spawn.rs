@@ -6,6 +6,7 @@ use crate::agent::types::AgentMetadata;
 use crate::agent::types::LiveAgent;
 use crate::agent::types::SpawnAgentForkMode;
 use crate::agent::types::SpawnAgentOptions;
+use crate::agents_md_manager::SessionInstructions;
 use crate::codex_thread::CodexThread;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
@@ -405,7 +406,7 @@ impl LocalAgentControl {
                     "cannot resume multi-agent v2 child {thread_id} with the current parent settings"
                 ))
             })?;
-            Some((parent, turn.environments.clone()))
+            Some((parent, turn.initial_environments.clone()))
         } else {
             None
         };
@@ -576,7 +577,12 @@ impl LocalAgentControl {
         {
             Some(parent.session.inherited_instructions().await)
         } else {
-            None
+            self.shared_thread_instructions_provider
+                .get()
+                .map(|provider| SessionInstructions {
+                    thread_provider: Some(Arc::clone(provider)),
+                    ..Default::default()
+                })
         };
         // Reserving a slot can evict an idle nested parent. Capture its instructions
         // alongside its authority so the child does not depend on a later live lookup.
