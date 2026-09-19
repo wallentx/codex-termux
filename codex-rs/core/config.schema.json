@@ -1037,6 +1037,9 @@
             "step_model_switching": {
               "type": "boolean"
             },
+            "system_proxy_fallback": {
+              "type": "boolean"
+            },
             "telepathy": {
               "type": "boolean"
             },
@@ -2548,6 +2551,10 @@
           },
           "description": "Additional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and value.",
           "type": "object"
+        },
+        "model_catalog_url": {
+          "description": "Optional full URL for a Codex-native model catalog. When unset, OpenAI discovery uses the Codex backend unless `base_url` overrides the inference endpoint.",
+          "type": "string"
         },
         "name": {
           "default": "",
@@ -6207,10 +6214,6 @@
       "properties": {
         "sandbox": {
           "$ref": "#/definitions/WindowsSandboxModeToml"
-        },
-        "sandbox_private_desktop": {
-          "description": "Defaults to `true` for legacy sandboxes and `false` for MXC. Set to `false` to launch the final sandboxed child process on `Winsta0\\\\Default`.",
-          "type": "boolean"
         }
       },
       "type": "object"
@@ -6788,6 +6791,9 @@
           "type": "boolean"
         },
         "step_model_switching": {
+          "type": "boolean"
+        },
+        "system_proxy_fallback": {
           "type": "boolean"
         },
         "telepathy": {

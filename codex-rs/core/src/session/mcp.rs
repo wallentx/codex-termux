@@ -121,23 +121,26 @@ impl Session {
                 &environments,
             )
             .await;
-        let mcp_projection = self
-            .services
-            .mcp_manager
-            .runtime_config_for_step(
-                config,
-                &self.services.mcp_thread_init,
-                &self.services.thread_extension_data,
-                McpThreadIdentity {
-                    session_source: &session_source,
-                    originator: &originator,
-                    disabled_plugin_ids: &disabled_plugin_ids,
-                    environments: McpEnvironmentScope::Selected(&environment_selections),
-                },
-                &ready_selected_capability_roots,
-                executor_capability_discovery.as_deref(),
-            )
-            .await;
+        let mcp_projection =
+            self.services
+                .mcp_manager
+                .runtime_config_for_step(
+                    config,
+                    &self.services.mcp_thread_init,
+                    &self.services.thread_extension_data,
+                    McpThreadIdentity {
+                        auth_changed: !self.services.mcp_runtime.current_auth_matches(
+                            self.services.auth_manager.auth_cached().as_ref(),
+                        ),
+                        session_source: &session_source,
+                        originator: &originator,
+                        disabled_plugin_ids: &disabled_plugin_ids,
+                        environments: McpEnvironmentScope::Selected(&environment_selections),
+                    },
+                    &ready_selected_capability_roots,
+                    executor_capability_discovery.as_deref(),
+                )
+                .await;
         let mcp_config = self
             .project_selected_environment_mcp_servers(config, &environments, mcp_projection)
             .await
@@ -219,6 +222,10 @@ impl Session {
                     &self.services.mcp_thread_init,
                     &self.services.thread_extension_data,
                     McpThreadIdentity {
+                        auth_changed: !self
+                            .services
+                            .mcp_runtime
+                            .current_auth_matches(desired.auth.as_ref()),
                         session_source: &desired.session_source,
                         originator: &desired.originator,
                         disabled_plugin_ids: &desired.disabled_plugin_ids,
@@ -288,6 +295,10 @@ impl Session {
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
                 McpThreadIdentity {
+                    auth_changed: !self
+                        .services
+                        .mcp_runtime
+                        .current_auth_matches(desired.auth.as_ref()),
                     session_source: &desired.session_source,
                     originator: &desired.originator,
                     disabled_plugin_ids: &desired.disabled_plugin_ids,
@@ -688,6 +699,10 @@ impl Session {
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
                 McpThreadIdentity {
+                    auth_changed: !self
+                        .services
+                        .mcp_runtime
+                        .current_auth_matches(desired.auth.as_ref()),
                     session_source: &turn_context.session_source,
                     originator: &turn_context.originator,
                     disabled_plugin_ids: &disabled_plugin_ids,
@@ -733,7 +748,7 @@ async fn review_guardian_mcp_elicitation(
     let Some(mcp_config) = session.services.mcp_runtime.current_config() else {
         return Ok(None);
     };
-    let step_settings = turn_context.current_settings.load_full();
+    let step_settings = Arc::clone(&turn_context.next_step_input.load().settings);
 
     // User approval skips ordinary CUA checks, not separate sensitive requests.
     let user_cua_execution = step_settings.approvals_reviewer() == ApprovalsReviewer::User
@@ -749,7 +764,7 @@ async fn review_guardian_mcp_elicitation(
 
     // Full Access skips inference, not the active-turn and cancellation checks.
     if (user_cua_execution
-        || turn_context.environments.has_full_access(
+        || turn_context.initial_environments.has_full_access(
             turn_context.approval_policy(),
             &turn_context
                 .config

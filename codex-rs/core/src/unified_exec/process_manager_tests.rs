@@ -228,7 +228,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         windows_sandbox_policy_cwd: cwd.clone().into(),
         windows_sandbox_workspace_roots: vec![cwd],
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         permission_profile: permission_profile.clone(),
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
@@ -464,7 +463,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         #[allow(deprecated)]
         sandbox_cwd: turn.cwd.clone().into(),
         turn_environment: turn
-            .environments
+            .initial_environments
             .primary()
             .cloned()
             .expect("primary environment"),
@@ -632,7 +631,9 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 tty: false,
                 environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
                 permissions: super::super::TerminalPermissions::for_launch(
-                    turn.environments.primary().expect("turn environment"),
+                    turn.initial_environments
+                        .primary()
+                        .expect("turn environment"),
                     &turn,
                     super::super::TerminalSandboxSource::Native,
                     crate::sandboxing::SandboxPermissions::UseDefault,

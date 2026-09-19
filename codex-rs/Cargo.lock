@@ -3939,6 +3939,7 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "core_test_support",
  "futures",
  "pretty_assertions",
  "serde_json",
@@ -3947,6 +3948,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -4167,6 +4169,7 @@ dependencies = [
  "schemars 0.8.22",
  "security-framework 3.5.1",
  "serde",
+ "serde_ignored",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -4174,6 +4177,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "windows-sys 0.52.0",
 ]
