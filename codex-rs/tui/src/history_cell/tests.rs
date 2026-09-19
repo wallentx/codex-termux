@@ -730,6 +730,7 @@ async fn session_info_uses_availability_nux_tooltip_override() {
         &config,
         &crate::local_settings::LocalSettings::from(&config),
         "gpt-5",
+        "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
         Some("Model just became available".to_string()),
@@ -753,6 +754,7 @@ async fn session_info_availability_nux_tooltip_snapshot() {
         &config,
         &crate::local_settings::LocalSettings::from(&config),
         "gpt-5",
+        "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
         Some("Model just became available".to_string()),
@@ -770,6 +772,7 @@ async fn session_info_first_event_suppresses_tooltips_and_nux() {
     let cell = new_session_info(
         &config,
         &crate::local_settings::LocalSettings::from(&config),
+        "gpt-5",
         "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ true,
@@ -790,6 +793,7 @@ async fn session_info_hides_tooltips_when_disabled() {
     let cell = new_session_info(
         &config,
         &crate::local_settings::LocalSettings::from(&config),
+        "gpt-5",
         "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
@@ -1434,10 +1438,9 @@ fn code_mode_tool_call_uses_title_and_preserves_full_transcript() {
     history:
     • Inspect Spotify workspace
       └ 012345678901234567890123456789012345
-            67890123456789012345678901234567
-        … more · ctrl+t
-            23456789012345678901234567890123
-            45678901...
+        678901234567890123456789012345678901
+        234567890123456789012345678901234567
+        +1 line (ctrl + t to view transcrip…
 
     transcript:
     • Called node_repl.js({"title":"Inspect Spotify workspace","code":"await tools.exec_command({ cmd: 'git status' })"})
@@ -2204,7 +2207,7 @@ fn multiline_command_both_lines_wrap_with_correct_prefixes() {
 #[test]
 fn stderr_tail_more_than_five_lines_snapshot() {
     // Build an exec cell with a non-zero exit and 10 lines on stderr to exercise
-    // the head/tail rendering and gutter prefixes.
+    // the three-line preview, hidden-line count, and gutter prefixes.
     let call_id = "c_err".to_string();
     let mut cell = ExecCell::new(
         ExecCall {

@@ -5,6 +5,7 @@ use super::model::ExecCall;
 use super::model::ExecCell;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::HistoryRenderMode;
 use crate::history_cell::plain_lines;
 use crate::motion::MotionMode;
 use crate::motion::ReducedMotionIndicator;
@@ -12,15 +13,14 @@ use crate::motion::activity_indicator;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::line_utils::prefix_lines;
 use crate::render::line_utils::push_owned_lines;
+use crate::tool_output::tool_output_preview;
 use crate::ui_consts::TRANSCRIPT_HINT;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
-use crate::wrapping::adaptive_wrap_lines;
 use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::bash::extract_bash_command;
-use codex_utils_elapsed::format_duration;
 use itertools::Itertools;
 use ratatui::prelude::*;
 use ratatui::style::Modifier;
@@ -131,7 +131,7 @@ pub(crate) fn output_lines(
 
     let head_end = total.min(line_limit).min(retained);
     for (i, raw) in output.lines().take(head_end).enumerate() {
-        let mut line = ansi_escape_line(raw.as_ref());
+        let mut line = dimmed_output_line(raw.as_ref());
         let prefix = if !include_prefix {
             ""
         } else if i == 0 && include_angle_pipe {
@@ -139,10 +139,7 @@ pub(crate) fn output_lines(
         } else {
             "    "
         };
-        line.spans.insert(0, prefix.into());
-        line.spans.iter_mut().for_each(|span| {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        });
+        line.spans.insert(0, prefix.dim());
         out.push(line);
     }
 
@@ -158,13 +155,10 @@ pub(crate) fn output_lines(
 
     let tail = output.lines().rev().take(tail_len).collect_vec();
     for raw in tail.into_iter().rev() {
-        let mut line = ansi_escape_line(raw.as_ref());
+        let mut line = dimmed_output_line(raw.as_ref());
         if include_prefix {
-            line.spans.insert(0, "    ".into());
+            line.spans.insert(0, "    ".dim());
         }
-        line.spans.iter_mut().for_each(|span| {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        });
         out.push(line);
     }
 
@@ -172,6 +166,23 @@ pub(crate) fn output_lines(
         lines: out,
         omitted,
     }
+}
+
+fn dimmed_output_line(raw: &str) -> Line<'static> {
+    let mut line = ansi_escape_line(raw);
+    for span in &mut line.spans {
+        span.style = span.style.add_modifier(Modifier::DIM);
+    }
+    line
+}
+
+fn output_preview_lines(output: &CommandOutput, width: usize) -> Vec<Line<'static>> {
+    let (total, _) = output.line_counts();
+    tool_output_preview(
+        output.lines().map(|raw| dimmed_output_line(raw.as_ref())),
+        width,
+        total,
+    )
 }
 
 fn activity_marker(start_time: Option<Instant>, animations_enabled: bool) -> Span<'static> {
@@ -193,53 +204,11 @@ impl HistoryCell for ExecCell {
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = vec![];
-        for (i, call) in self.iter_calls().enumerate() {
-            if i > 0 {
-                lines.push("".into());
-            }
-            let script = strip_bash_lc_and_escape(&call.command);
-            let highlighted_script = highlight_bash_to_lines(&script);
-            let cmd_display = adaptive_wrap_lines(
-                &highlighted_script,
-                RtOptions::new(width as usize)
-                    .initial_indent("$ ".magenta().into())
-                    .subsequent_indent("    ".into()),
-            );
-            lines.extend(cmd_display);
-
-            if let Some(output) = call.output.as_ref() {
-                if !call.is_unified_exec_interaction() {
-                    let wrap_width = width.max(1) as usize;
-                    let wrap_opts = RtOptions::new(wrap_width);
-                    for unwrapped in output
-                        .transcript_lines()
-                        .map(|line| ansi_escape_line(line.as_ref()))
-                    {
-                        let wrapped = adaptive_wrap_line(&unwrapped, wrap_opts.clone());
-                        push_owned_lines(&wrapped, &mut lines);
-                    }
-                }
-                if let Some(duration) = call.duration {
-                    let duration = format_duration(duration);
-                    let mut result: Line = if output.exit_code == 0 {
-                        Line::from("✓".green().bold())
-                    } else {
-                        Line::from(vec![
-                            "✗".red().bold(),
-                            format!(" ({})", output.exit_code).into(),
-                        ])
-                    };
-                    result.push_span(format!(" • {duration}").dim());
-                    lines.push(result);
-                }
-            }
-        }
-        lines
+        self.detailed_lines(width, HistoryRenderMode::Rich)
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        plain_lines(self.transcript_lines(u16::MAX))
+        plain_lines(self.detailed_lines(u16::MAX, HistoryRenderMode::Raw))
     }
 }
 
@@ -270,18 +239,27 @@ impl ExecCell {
 
         let mut calls = self.calls.as_slice();
         let mut out_indented = Vec::new();
+        let nonzero_exit = |call: &ExecCall| {
+            call.duration
+                .and(call.output.as_ref())
+                .map(|output| output.exit_code)
+                .filter(|code| *code != 0)
+        };
         while let Some((call, remaining)) = calls.split_first() {
+            let exit_code = nonzero_exit(call);
             let reads_only = call
                 .parsed
                 .iter()
                 .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }));
-            let group_len = if reads_only {
+            let group_len = if reads_only && exit_code.is_none() {
                 1 + remaining
                     .iter()
                     .take_while(|next| {
-                        next.parsed
-                            .iter()
-                            .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }))
+                        nonzero_exit(next).is_none()
+                            && next
+                                .parsed
+                                .iter()
+                                .all(|parsed| matches!(parsed, ParsedCommand::Read { .. }))
                     })
                     .count()
             } else {
@@ -331,7 +309,31 @@ impl ExecCell {
                 lines
             };
 
-            for (title, line) in call_lines {
+            let line_count = call_lines.len();
+            for (index, (title, mut line)) in call_lines.into_iter().enumerate() {
+                if let Some(code) = exit_code
+                    && index + 1 == line_count
+                {
+                    // A compound command has one exit code, not an outcome for each parsed action.
+                    let status = if call.parsed.len() > 1 {
+                        format!(" (command exit {code})")
+                    } else {
+                        format!(" (exit {code})")
+                    };
+                    // Search exit 1 can mean no matches; report the code without calling it a failure.
+                    line.push(
+                        if code == 1
+                            && call
+                                .parsed
+                                .iter()
+                                .any(|p| matches!(p, ParsedCommand::Search { .. }))
+                        {
+                            status.dim()
+                        } else {
+                            status.red()
+                        },
+                    );
+                }
                 let line = Line::from(line);
                 let initial_indent = Line::from(vec![title.cyan(), " ".into()]);
                 let subsequent_indent = " ".repeat(initial_indent.width()).into();
@@ -429,25 +431,29 @@ impl ExecCell {
         }
 
         if let Some(output) = call.output.as_ref() {
-            let line_limit = if call.is_user_shell_command() {
-                USER_SHELL_TOOL_CALL_MAX_LINES
-            } else {
-                TOOL_CALL_MAX_LINES
-            };
+            if !call.is_user_shell_command() {
+                let preview = output_preview_lines(output, layout.output_block.wrap_width(width));
+                let preview = if preview.is_empty() && !call.is_unified_exec_interaction() {
+                    vec![Line::from("(no output)".dim())]
+                } else {
+                    preview
+                };
+                lines.extend(prefix_lines(
+                    preview,
+                    Span::from(layout.output_block.initial_prefix).dim(),
+                    Span::from(layout.output_block.subsequent_prefix),
+                ));
+                return lines;
+            }
             let raw_output = output_lines(
                 Some(output),
                 OutputLinesParams {
-                    line_limit,
+                    line_limit: USER_SHELL_TOOL_CALL_MAX_LINES,
                     only_err: false,
                     include_angle_pipe: false,
                     include_prefix: false,
                 },
             );
-            let display_limit = if call.is_user_shell_command() {
-                USER_SHELL_TOOL_CALL_MAX_LINES
-            } else {
-                layout.output_max_lines
-            };
 
             if raw_output.lines.is_empty() {
                 if !call.is_unified_exec_interaction() {
@@ -479,7 +485,7 @@ impl ExecCell {
                 );
                 let trimmed_output = Self::truncate_lines_middle(
                     &prefixed_output,
-                    display_limit,
+                    USER_SHELL_TOOL_CALL_MAX_LINES,
                     width,
                     raw_output.omitted,
                     Some(Line::from(
@@ -673,7 +679,6 @@ struct ExecDisplayLayout {
     command_continuation: PrefixedBlock,
     command_continuation_max_lines: usize,
     output_block: PrefixedBlock,
-    output_max_lines: usize,
 }
 
 impl ExecDisplayLayout {
@@ -681,13 +686,11 @@ impl ExecDisplayLayout {
         command_continuation: PrefixedBlock,
         command_continuation_max_lines: usize,
         output_block: PrefixedBlock,
-        output_max_lines: usize,
     ) -> Self {
         Self {
             command_continuation,
             command_continuation_max_lines,
             output_block,
-            output_max_lines,
         }
     }
 }
@@ -696,7 +699,6 @@ const EXEC_DISPLAY_LAYOUT: ExecDisplayLayout = ExecDisplayLayout::new(
     PrefixedBlock::new("  │ ", "  │ "),
     /*command_continuation_max_lines*/ 2,
     PrefixedBlock::new("  └ ", "    "),
-    /*output_max_lines*/ 5,
 );
 
 #[cfg(test)]
