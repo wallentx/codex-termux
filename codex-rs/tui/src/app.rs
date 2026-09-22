@@ -201,6 +201,7 @@ mod agent_message_consolidation;
 mod agent_navigation;
 mod agent_picker;
 mod agent_status_feed;
+#[cfg(any(unix, windows))]
 mod agents_overview;
 mod agents_overview_actions;
 mod agents_overview_details;
@@ -208,14 +209,17 @@ mod agents_overview_threads;
 mod agents_overview_usage;
 mod agents_overview_view;
 pub(crate) use agents_overview::AGENTS_OVERVIEW_VIEW_ID;
+mod activity_groups;
 mod app_server_event_targets;
 mod app_server_events;
 pub(crate) mod app_server_requests;
 mod backend_banner_fallback;
 mod background_requests;
+mod composer_hints;
 mod config_persistence;
 mod connector_mentions;
 mod daemon_menu;
+mod empty_state_policy;
 mod event_dispatch;
 mod exit_summary;
 mod experimental_features;
@@ -229,6 +233,8 @@ mod misalignment_policy;
 mod model_defaults;
 mod new_session;
 pub(crate) use new_session::has_launch_setting;
+mod native_history;
+mod owned_transcript;
 mod pending_interactive_replay;
 mod permission_shortcuts;
 mod pets;
@@ -259,9 +265,13 @@ mod thread_session_state;
 mod thread_settings;
 mod thread_title;
 mod transcript_export;
+mod tui_mode_picker;
 mod user_verification;
 mod user_verification_errors;
 mod user_verification_requests;
+#[cfg(test)]
+#[path = "app/warnings_tests.rs"]
+mod warnings_tests;
 mod working_directory;
 
 use self::agent_navigation::AgentNavigationDirection;
@@ -568,6 +578,9 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
+    composer_tips: composer_hints::ComposerTips,
+    native_history: native_history::NativeHistory,
+    pub(crate) transcript_view: crate::transcript_view::TranscriptView,
     last_rendered_history_tail: Option<history_ui::RenderedHistoryTail>,
     last_thread_usage_status_cell: Option<history_ui::ThreadUsageStatusHistory>,
     pub(crate) pending_thread_usage_history_refresh: bool,
@@ -846,7 +859,32 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        if matches!(&event, TuiEvent::Key(_))
+            && self.handle_composer_copy_event(tui, &event, tui::Tui::copy_transcript_selection)
+        {
+            return Ok(AppRunControl::Continue);
+        }
+        // Resume arrives after suspension; retain the last painted phase across hidden owners.
+        if matches!(&event, TuiEvent::Resume) || !tui.is_owned_screen() || self.overlay.is_some() {
+            self.chat_widget
+                .empty_state_animation
+                .borrow_mut()
+                .pause_clock();
+        }
+        let transcript_owns_input = match (&event, &self.overlay) {
+            (TuiEvent::Key(key), Some(Overlay::Transcript(overlay))) => {
+                overlay.owns_interaction_key(*key)
+            }
+            (TuiEvent::Key(key), None) => {
+                tui.is_owned_screen()
+                    && self.chat_widget.no_modal_or_popup_active()
+                    && self.transcript_view.owns_interaction_key(*key)
+            }
+            _ => false,
+        };
         if self.reconnect.offline
+            && !transcript_owns_input
+            && !self.chat_widget.keymap_contexts().is_warnings()
             && let TuiEvent::Key(key) = &event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -861,15 +899,31 @@ impl App {
         let screen_size = tui.screen_size_for_event(&event)?;
         if !matches!(
             &event,
-            TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::FocusLost
+            TuiEvent::Key(_) | TuiEvent::Mouse(_) | TuiEvent::Paste(_) | TuiEvent::FocusLost
         ) {
             self.expire_pending_key_chord();
             self.handle_draw_pre_render(tui, screen_size)?;
         }
 
-        let event = if let TuiEvent::Key(mut key_event) = event {
+        if matches!(&event, TuiEvent::Paste(_) | TuiEvent::FocusLost) {
+            self.cancel_pending_key_chord();
+        }
+
+        if self.overlay.is_none()
+            && self
+                .chat_widget
+                .handle_warning_event(&event, &self.transcript_cells)
+        {
+            self.cancel_primed_browsing_for_event(&event);
+            return Ok(AppRunControl::Continue);
+        }
+
+        let mut event = if let TuiEvent::Key(mut key_event) = event {
             let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-            if self.should_recover_vim_insert_escape(key_event) {
+            if self.should_recover_vim_insert_escape(key_event)
+                && !(tui.is_owned_screen()
+                    && crate::transcript_view::JumpTarget::from_key(key_event).is_some())
+            {
                 // Restore both strokes before chords or global shortcuts can consume them.
                 if let Some(escape) = self.route_key_chord_event(tui, escape) {
                     self.handle_key_event(tui, app_server, escape).await;
@@ -885,11 +939,46 @@ impl App {
             event
         };
 
+        self.cancel_primed_browsing_for_event(&event);
+        if self.handle_owned_transcript_event(tui, app_server, &event)? {
+            return Ok(AppRunControl::Continue);
+        }
+        // Leave browsing before unhandled editing input reaches shortcuts or offline input.
+        // Offline Enter cannot confirm a rewind and leaves the preview available to read.
+        if tui.is_owned_screen()
+            && self.overlay.is_none()
+            && self.backtrack.overlay_preview_active
+            && (matches!(&event, TuiEvent::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && !(self.reconnect.offline && key.code == KeyCode::Enter))
+                || matches!(&event, TuiEvent::Paste(text) if !text.is_empty()))
+        {
+            self.cancel_transcript_browsing(tui);
+            // The first lookup used browsing contexts; retry after restoring composer contexts.
+            if let TuiEvent::Key(key) = event {
+                let Some(key) = self.route_key_chord_event(tui, key) else {
+                    return Ok(AppRunControl::Continue);
+                };
+                event = TuiEvent::Key(key);
+            }
+        }
         if self.reconnect.offline
+            && !self.chat_widget.keymap_contexts().is_warnings()
+            && !matches!(&self.overlay, Some(Overlay::Transcript(_)))
             && let TuiEvent::Key(key) = &event
+            && !(self.overlay.is_none()
+                && self.chat_widget.no_modal_or_popup_active()
+                && self.keymap.app.open_warnings.is_pressed(*key))
         {
             if self.reconnect.presentation == reconnect::ReconnectPresentation::Overview {
                 self.chat_widget.handle_disconnected_view_key(*key);
+                if self
+                    .chat_widget
+                    .selected_index_for_present_view(agents_overview::AGENTS_OVERVIEW_VIEW_ID)
+                    .is_none()
+                {
+                    self.reconnect.presentation = reconnect::ReconnectPresentation::Conversation;
+                }
             } else {
                 self.chat_widget
                     .handle_restricted_key(*key, RestrictedInputMode::Disconnected);
@@ -932,8 +1021,16 @@ impl App {
                     // [tui-textarea]: https://github.com/rhysd/tui-textarea/blob/4d18622eeac13b309e0ff6a55a46ac6706da68cf/src/textarea.rs#L782-L783
                     // [iTerm2]: https://github.com/gnachman/iTerm2/blob/5d0c0d9f68523cbd0494dad5422998964a2ecd8d/sources/iTermPasteHelper.m#L206-L216
                     let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
+                    if self.backtrack.primed && !pasted.is_empty() {
+                        if self.backtrack.overlay_preview_active {
+                            self.cancel_transcript_browsing(tui);
+                        } else {
+                            self.reset_backtrack_state();
+                        }
+                    }
                     self.chat_widget.handle_paste(pasted);
                     if self.reconnect.offline
+                        && !self.chat_widget.keymap_contexts().is_warnings()
                         && self.reconnect.presentation
                             == reconnect::ReconnectPresentation::Conversation
                     {
@@ -944,7 +1041,7 @@ impl App {
                     }
                 }
                 TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
-                    if self.backtrack_render_pending {
+                    if self.backtrack_render_pending && !tui.is_owned_screen() {
                         self.rebuild_transcript_after_backtrack(tui, screen_size.into())?;
                         self.backtrack_render_pending = false;
                     }
@@ -957,12 +1054,18 @@ impl App {
                         return Ok(AppRunControl::Continue);
                     }
                     // Allow widgets to process any pending timers before rendering.
-                    let had_active_view = self.chat_widget.has_active_view();
+                    let had_active_modal = self.chat_widget.has_active_modal();
                     self.chat_widget.pre_draw_tick();
                     self.refresh_agents_overview_usage(app_server, tui.frame_requester());
                     let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
-                    if !had_active_view
-                        && self.chat_widget.has_active_view()
+                    if tui.is_owned_screen()
+                        && self.transcript_view.history
+                            != crate::pager_overlay::TranscriptHistoryState::Failed
+                    {
+                        self.request_owned_history(tui, app_server);
+                    }
+                    if !had_active_modal
+                        && self.chat_widget.has_active_modal()
                         && self.startup_protected_input_boundary
                     {
                         tui.discard_pending_input_before_interactive_screen()?;
@@ -997,7 +1100,7 @@ impl App {
                         self.app_event_tx.send(AppEvent::LaunchExternalEditor);
                     }
                 }
-                TuiEvent::FocusLost => {}
+                TuiEvent::FocusLost | TuiEvent::Mouse(_) => {}
             }
         }
         Ok(AppRunControl::Continue)
@@ -1017,6 +1120,14 @@ impl App {
         self.sync_thread_title_progress();
         self.chat_widget
             .set_sparkle_terminal_focus(tui.is_terminal_focused());
+        if tui.is_owned_screen() {
+            return self.render_owned_transcript(tui, screen_size);
+        }
+        self.chat_widget
+            .empty_state_animation
+            .borrow_mut()
+            .pause_clock();
+        self.chat_widget.sync_warnings(&self.transcript_cells);
         let dashboard_visible = self
             .chat_widget
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)

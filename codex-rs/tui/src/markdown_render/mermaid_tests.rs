@@ -42,11 +42,41 @@ fn mermaid_nested_fences_and_unicode() {
 }
 
 #[test]
+fn mermaid_stadium_flowchart() {
+    let source = "```mermaid
+flowchart TD
+    A([What should I work on?]) --> B{Anything urgent?}
+    B -->|Yes| C[Handle the urgent task]
+    B -->|No| D{Have a clear goal?}
+    D -->|No| E[Pick one useful outcome]
+    E --> F[Choose the smallest next step]
+    D -->|Yes| F
+    F --> G[Focus for 25 minutes]
+    C --> H{Done?}
+    G --> H
+    H -->|No| I[Take a short break]
+    I --> F
+    H -->|Yes| J([Celebrate. Stretch. Repeat.])
+```";
+    let output = markdown_text(source, /*width*/ 100);
+    assert!(output.starts_with('╭'));
+    assert_snapshot!(output);
+    assert_eq!(
+        markdown_text(source, /*width*/ 40),
+        markdown_text(
+            &source.replacen("mermaid", "unknown", /*count*/ 1),
+            /*width*/ 40,
+        )
+    );
+}
+
+#[test]
 fn mermaid_unclosed_invalid_unsupported_and_wide_blocks_keep_source() {
     for (source, width) in [
         ("```mermaid\nflowchart LR\nA --> B\n", 80),
         ("````mermaid\nflowchart LR\nA --> B\n```\n", 80),
         ("```mermaid\nflowchart LR\nA[unfinished\n```", 80),
+        ("```mermaid\nflowchart TD\nA([unfinished]\n```", 80),
         ("```mermaid\npie\n\"Cats\": 2\n```", 80),
         ("```mermaid\nflowchart LR\nA[Request] --> B[Reply]\n```", 8),
         ("> ```mermaid\n> flowchart LR\n> A --> B\n", 80),
@@ -71,7 +101,25 @@ fn mermaid_styles_follow_the_supplied_theme() {
         ("light", themes.get(EmbeddedThemeName::SolarizedLight)),
         ("fallback", &fallback),
     ] {
-        let lines = super::render("flowchart LR; A[请求] --> B[Reply]", Some(40), theme).unwrap();
+        let colors = if name == "light" {
+            crate::terminal_probe::DefaultColors {
+                fg: (30, 30, 30),
+                bg: (255, 255, 255),
+            }
+        } else {
+            crate::terminal_probe::DefaultColors {
+                fg: (220, 220, 220),
+                bg: (20, 20, 20),
+            }
+        };
+        let lines = crate::terminal_palette::with_test_default_colors(colors, || {
+            super::render(
+                "flowchart LR; A[请求] --> B[Reply]",
+                /*width*/ Some(40),
+                theme,
+            )
+            .unwrap()
+        });
         let styled = lines
             .into_iter()
             .map(|line| {

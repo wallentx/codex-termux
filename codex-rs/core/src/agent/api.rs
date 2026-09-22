@@ -170,6 +170,22 @@ pub enum AgentInfo {
     Unloaded(AgentMetadata),
 }
 
+impl AgentInfo {
+    pub fn metadata(&self) -> &AgentMetadata {
+        match self {
+            Self::Loaded { agent, .. } => &agent.metadata,
+            Self::Unloaded(metadata) => metadata,
+        }
+    }
+
+    pub fn status(&self) -> Option<&AgentStatus> {
+        match self {
+            Self::Loaded { agent, .. } => Some(&agent.status),
+            Self::Unloaded(_) => None,
+        }
+    }
+}
+
 /// User input starts or steers a turn; agent messages retain their sender and wake mode.
 pub enum AgentInput {
     UserInput(Vec<UserInput>),
@@ -199,6 +215,8 @@ pub struct SendRequest {
 
 pub struct DeliveryReceipt {
     pub thread_id: ThreadId,
+    /// Recipient identity captured during delivery, for activity and tool output.
+    pub metadata: AgentMetadata,
     /// Acceptance identifier, not evidence that the recipient processed the input.
     pub submission_id: String,
 }

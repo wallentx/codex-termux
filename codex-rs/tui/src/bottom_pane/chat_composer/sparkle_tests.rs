@@ -26,6 +26,7 @@ fn pane() -> BottomPane {
         placeholder_text: "Ask Codex to do anything".into(),
         disable_paste_burst: true,
         animations_enabled: true,
+        effects: Default::default(),
         skills: None,
     })
 }
@@ -43,7 +44,7 @@ fn palette<T>(render: impl FnOnce() -> T) -> T {
 fn enabled() -> Tui {
     Tui {
         animations: true,
-        whimsy: true,
+        effects: Default::default(),
         ..Tui::default()
     }
 }
@@ -55,20 +56,19 @@ fn draw(composer: &ChatComposer, width: u16, now: Instant) -> (Buffer, Rect) {
         width,
         composer.desired_height(width),
     );
-    let [padding, _, textarea, _] =
-        composer.layout_areas_with_textarea_right_reserve(area, /*textarea_right_reserve*/ 0);
+    let layout = composer.layout_with_options(area, Default::default());
     let phase = composer.sparkle.phase.replace(Phase::Unarmed);
     let mut buffer = Buffer::empty(area);
     composer.render(area, &mut buffer);
     composer.sparkle.phase.set(phase);
     composer.render_sparkle_at(
-        padding,
-        textarea,
+        layout.composer,
+        layout.textarea,
         composer.cursor_pos(area),
         now,
         &mut buffer,
     );
-    (buffer, textarea)
+    (buffer, layout.textarea)
 }
 
 fn text(buffer: &Buffer) -> String {
@@ -1056,7 +1056,10 @@ fn focus_startup_work_and_configuration_do_not_extend_a_started_deadline() {
 
         for settings in [
             Tui {
-                whimsy: false,
+                effects: codex_config::types::TuiEffects {
+                    starfield: false,
+                    ..Default::default()
+                },
                 ..enabled()
             },
             Tui {

@@ -21,7 +21,6 @@ use crate::app_event::AgentsOverviewThreadRefresh;
 use crate::bottom_pane::SelectionDescriptionLayout;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
-use crate::bottom_pane::popup_consts::standard_popup_hint_line_for_keymap;
 use crate::chatwidget::ThreadInputStateRestoreMode;
 use crate::startup_draft::StartupDraftPump;
 use codex_app_server_protocol::SessionSource;
@@ -35,6 +34,8 @@ pub(crate) const AGENTS_OVERVIEW_VIEW_ID: &str = "agents-overview";
 pub(super) struct AgentsOverviewState {
     /// Missing metadata records a local resume until the next metadata refresh.
     pub(super) threads: HashMap<ThreadId, Option<Thread>>,
+    /// Lifecycle removals take precedence over delayed tool registration responses.
+    pub(super) removed_threads: HashSet<ThreadId>,
     /// Local visibility only; activity and metadata refreshes never reveal hidden roots.
     pub(super) hidden_threads: HashSet<ThreadId>,
     pub(super) last_messages: HashMap<ThreadId, String>,
@@ -91,7 +92,6 @@ impl App {
                             .dim(),
                     )
                 }),
-                footer_hint: Some(standard_popup_hint_line_for_keymap(&self.keymap.list)),
                 items: [
                     #[cfg(any(unix, windows))]
                     (!workload_identity_selected).then(|| SelectionItem {
@@ -112,10 +112,10 @@ impl App {
                 .into_iter()
                 .flatten()
                 .collect(),
-                description_layout: SelectionDescriptionLayout::StackBelowWhenNarrow {
+                description_layout: SelectionDescriptionLayout::HideWhenNarrow {
                     min_description_width: 28,
                 },
-                ..Default::default()
+                ..SelectionViewParams::picker()
             });
             return;
         }
@@ -144,13 +144,17 @@ impl App {
         }
         self.agents_overview.request_id = None;
         self.agents_overview.refresh_task = None;
-        self.agents_overview
-            .view_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .refresh_failed = !result
-            .as_ref()
-            .is_ok_and(|refresh| refresh.recent_seed_complete);
+        {
+            let mut state = self
+                .agents_overview
+                .view_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.loading = false;
+            state.refresh_failed = !result
+                .as_ref()
+                .is_ok_and(|refresh| refresh.recent_seed_complete);
+        }
         match result {
             Ok(refresh) => {
                 self.agents_overview.initialized = refresh.recent_seed_complete;
@@ -209,9 +213,16 @@ impl App {
         };
         let selected_thread_id = self
             .agents_overview
-            .visible_thread_ids
-            .get(selected)
-            .copied();
+            .view_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rename_target
+            .or_else(|| {
+                self.agents_overview
+                    .visible_thread_ids
+                    .get(selected)
+                    .copied()
+            });
         let threads = self
             .agents_overview
             .threads
@@ -224,7 +235,7 @@ impl App {
         if selected_thread_id
             .is_some_and(|thread_id| !self.agents_overview.visible_thread_ids.contains(&thread_id))
             && let Ok(mut state) = self.agents_overview.view_state.lock()
-            && state.renaming
+            && state.rename_target.is_some()
         {
             self.chat_widget.add_info_message(
                 format!(
@@ -233,7 +244,7 @@ impl App {
                 ),
                 /*hint*/ None,
             );
-            state.renaming = false;
+            state.rename_target = None;
             state.input.clear();
         }
         self.chat_widget
@@ -421,10 +432,7 @@ impl App {
             );
             let preserve_explicit_permissions = unloaded || started.is_some();
             let (mut resume_config, mut local_settings) = if let Some((config, _)) = &started {
-                (
-                    config.clone(),
-                    crate::local_settings::LocalSettings::from(config),
-                )
+                (config.clone(), self.local_settings.reloaded(config))
             } else if unloaded {
                 let target_session = SessionTarget {
                     path: target_thread.path.clone(),
@@ -473,7 +481,7 @@ impl App {
                 {
                     return Ok(control);
                 }
-                local_settings = crate::local_settings::LocalSettings::from(&resume_config);
+                local_settings = self.local_settings.reloaded(&resume_config);
             }
             // Folder selection and trust prompts can replace or clear the loading frame.
             loading::draw(tui)?;
@@ -952,7 +960,11 @@ impl App {
                 let turns = match thread.history_mode {
                     ThreadHistoryMode::Paginated if app_server.supports_paginated_history() => {
                         app_server
-                            .thread_turns_page(thread_id, /*cursor*/ None)
+                            .thread_turns_page(
+                                thread_id,
+                                /*cursor*/ None,
+                                crate::app_server_session::INITIAL_HISTORY_TURN_LIMIT,
+                            )
                             .await?
                             .data
                     }

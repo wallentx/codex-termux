@@ -138,6 +138,7 @@ impl ChatWidget {
         if self.has_misalignment_policy_violation() {
             return (false, None);
         }
+        self.empty_state_animation.borrow_mut().dismiss();
         if self.input_queue.rate_limit_recovery_pending || self.pending_image_submission.is_some() {
             let model_prompt = source == UserMessageSource::Prompt
                 && (shell_escape_policy == ShellEscapePolicy::Disallow
@@ -423,6 +424,7 @@ impl ChatWidget {
         let submitted_image_display = (render_in_history && !local_images.is_empty())
             .then(|| Self::user_message_display_from_inputs(&items));
         let client_user_message_id = uuid::Uuid::new_v4().to_string();
+        crate::startup_recovery::bind_submission(&text, &client_user_message_id);
         let pending_steer = (!render_in_history).then(|| PendingSteer {
             client_id: client_user_message_id.clone(),
             user_message: UserMessage {

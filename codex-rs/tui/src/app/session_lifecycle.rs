@@ -219,7 +219,7 @@ impl App {
             footer_hint: Some(standard_popup_hint_line()),
             items,
             initial_selected_idx,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         }
     }
 
@@ -519,6 +519,7 @@ impl App {
             );
         }
         chat_widget.restore_kill_buffer_snapshot(self.chat_widget.take_kill_buffer_snapshot());
+        crate::markdown_render::preferences::init(chat_widget.local_settings.tui.rendering);
         self.chat_widget = chat_widget;
         self.sync_active_agent_label();
     }
@@ -770,7 +771,11 @@ impl App {
         }
         self.reset_transcript_state_after_clear();
         tui.clear_pending_history_lines();
-        Self::clear_terminal_for_thread_switch(&mut tui.terminal)?;
+        if tui.is_owned_screen() {
+            tui.terminal.clear()?;
+        } else {
+            Self::clear_terminal_for_thread_switch(&mut tui.terminal)?;
+        }
         Ok(())
     }
 
@@ -978,7 +983,7 @@ impl App {
                         tracing::warn!("failed to unsubscribe tracked thread {thread_id}: {err}");
                     }
                 }
-                self.local_settings = crate::local_settings::LocalSettings::from(&config);
+                self.local_settings = self.local_settings.reloaded(&config);
                 self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
                 self.config = config;
 
@@ -1022,7 +1027,10 @@ impl App {
                                 vec!["To continue this session, run ".into(), command.cyan()];
                             lines.push(spans.into());
                         }
-                        self.chat_widget.add_plain_history_lines(lines);
+                        self.chat_widget
+                            .add_to_history(history_cell::SessionNoticeCell(
+                                history_cell::PlainHistoryCell::new(lines),
+                            ));
                     }
                 }
             }
@@ -1061,6 +1069,10 @@ impl App {
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
         if matches!(presentation, ThreadAttachPresentation::Fresh) {
             self.chat_widget.mark_fresh_task_for_sparkle(&started);
+            self.chat_widget
+                .empty_state_animation
+                .borrow_mut()
+                .start_fresh();
         }
         self.chat_widget
             .set_task_mentions_enabled(started.task_tools_available);

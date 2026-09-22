@@ -293,6 +293,7 @@ trust_level = "trusted"
     ];
     let mut owner = None;
     let mut previous: Vec<String> = Vec::new();
+    let prompt = "describe checkout";
     for (fork, explicit_cd, analytics, auth_failure) in [
         (false, false, false, false),
         (true, false, false, false),
@@ -393,7 +394,7 @@ trust_level = "trusted"
         if analytics {
             args.extend(["-c".into(), "analytics.enabled=true".into()]);
         }
-        args.push("describe checkout".into());
+        args.push(prompt.into());
         if previous.is_empty() {
             let mut untrusted_args = args.clone();
             untrusted_args.extend([
@@ -436,6 +437,18 @@ trust_level = "trusted"
                     body = rx.recv() => {
                         let (body, checkout, metadata) = body.context("model request")??;
                         let body: Value = serde_json::from_slice(&body)?;
+                        // Background title generation can reach the model before the user turn.
+                        let is_user_turn = body["input"].as_array().is_some_and(|input| {
+                            input.iter().any(|item| {
+                                item["role"] == "user"
+                                    && item["content"].as_array().is_some_and(|content| {
+                                        content.iter().any(|part| part["text"] == prompt)
+                                    })
+                            })
+                        });
+                        if !is_user_turn {
+                            continue;
+                        }
                         return Ok::<_, anyhow::Error>((body, checkout, metadata));
                     }
                     bytes = stdout.recv() => {
@@ -498,7 +511,7 @@ trust_level = "trusted"
         if backend == "daemon" && !analytics && matches!(observed, Ok(Ok(_))) {
             session.writer_sender().send(b"/status\r".to_vec()).await?;
             tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
-                while !output.contains("app-server-control.sock") {
+                while !output.contains("Local background server") {
                     let bytes = stdout
                         .recv()
                         .await

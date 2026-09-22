@@ -58,6 +58,7 @@ members = [
     "exec-server/tests/support",
     "execpolicy",
     "ext/agent",
+    "ext/agent-message-board",
     "ext/connectors",
     "ext/extension-api",
     "ext/goal",
@@ -154,7 +155,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.156.0-alpha.8"
+version = "0.157.0-alpha.8"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -201,6 +202,7 @@ codex-websocket-client = { path = "websocket-client" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
 codex-agent-extension = { path = "ext/agent" }
+codex-agent-message-board-extension = { path = "ext/agent-message-board" }
 codex-connectors-extension = { path = "ext/connectors" }
 codex-context-fragments = { path = "context-fragments" }
 codex-core = { path = "core" }
@@ -334,6 +336,7 @@ bitflags = "2.13.1"
 blake3 = "1.8.2"
 bm25 = "2.3.2"
 bytes = "1.10.1"
+caseless = "0.2.2"
 chardetng = "0.1.17"
 chrono = "0.4.43"
 clap = "4"
@@ -467,11 +470,10 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     "wav",
 ] }
 socket2 = "0.6.1"
-# When bumping sqlx, audit the SQLite constructor deny list in clippy.toml.
-sqlx = { version = "0.9.0", default-features = false, features = [
+# Keep SQLx versions in sync; when bumping, audit the SQLite constructor deny list in clippy.toml.
+sqlx = { version = "=0.9.0", default-features = false, features = [
     "chrono",
     "json",
-    "macros",
     "migrate",
     "runtime-tokio",
     "tls-rustls",
@@ -479,6 +481,10 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "time",
     "uuid",
 ] }
+# Derives and migration embedding do not need query macros or a host SQLite driver.
+sqlx-macros = { version = "=0.9.0", default-features = false, features = ["derive", "migrate"] }
+# Preserve the target driver's query-description support without building it on the host.
+sqlx-sqlite = { version = "=0.9.0", default-features = false, features = ["offline"] }
 starlark = { version = "0.14.2", default-features = false }
 strum = "0.27.2"
 strum_macros = "0.28.0"

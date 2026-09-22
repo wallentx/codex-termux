@@ -33,8 +33,10 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::format_exec_output_str;
 use crate::tools::registry::ToolRegistry;
+use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
+use codex_analytics::CompactionTrigger;
 use codex_config::ConfigLayerStack;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::LoaderOverrides;
@@ -107,7 +109,9 @@ use tracing::Span;
 
 use crate::connectors::AppInfo;
 use crate::responses_metadata::CodexResponsesRequestKind;
+use crate::responses_metadata::CompactionTurnMetadata;
 use crate::rollout::recorder::RolloutRecorder;
+use crate::session::Submission;
 use crate::state::ActiveTurn;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
@@ -149,6 +153,9 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::build_hook_prompt_message;
+use codex_protocol::mcp::McpAttribution;
+use codex_protocol::mcp::McpAttributionSource;
+use codex_protocol::mcp::McpAttributionStatus;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
@@ -171,7 +178,6 @@ use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
-use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
@@ -638,9 +644,17 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
+#[test_case(SessionSource::Exec; "root")]
+#[test_case(SessionSource::SubAgent(SubAgentSource::Review); "subagent")]
+#[test_case(SessionSource::Internal(InternalSessionSource::Guardian); "guardian")]
 #[tokio::test]
-async fn request_mcp_server_elicitation_auto_accepts_when_auto_deny_is_enabled() {
-    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+async fn request_mcp_server_elicitation_auto_accepts_when_auto_deny_is_enabled(
+    source: SessionSource,
+) {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn_context)
+        .expect("turn context should not be shared")
+        .session_source = source;
     session
         .services
         .mcp_runtime
@@ -660,8 +674,7 @@ async fn request_mcp_server_elicitation_auto_accepts_when_auto_deny_is_enabled()
                 }),
             },
         )
-        .await
-        .expect("root thread elicitation should be accepted");
+        .await;
 
     assert_eq!(
         response.response,
@@ -675,56 +688,78 @@ async fn request_mcp_server_elicitation_auto_accepts_when_auto_deny_is_enabled()
     assert!(rx.try_recv().is_err());
 }
 
-#[test_case(false; "interactive")]
-#[test_case(true; "auto_accept")]
+#[test_case(SessionSource::Exec; "root")]
+#[test_case(SessionSource::SubAgent(SubAgentSource::Review); "subagent")]
+#[test_case(SessionSource::Internal(InternalSessionSource::Guardian); "guardian")]
 #[tokio::test]
-async fn request_mcp_server_elicitation_rejects_non_root_threads(auto_deny: bool) {
-    for source in [
-        SessionSource::SubAgent(SubAgentSource::Review),
-        SessionSource::Internal(InternalSessionSource::Guardian),
-    ] {
-        let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-        Arc::get_mut(&mut turn_context)
-            .expect("turn context should not be shared")
-            .session_source = source;
-        *session.active_turn.lock().await = Some(ActiveTurn::default());
-        session
-            .services
-            .mcp_runtime
-            .set_elicitations_auto_deny(auto_deny);
-        let paused = session.subscribe_elicitation_pause_state();
+async fn request_mcp_server_elicitation_waits_for_user_response(source: SessionSource) {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn_context)
+        .expect("turn context should not be shared")
+        .session_source = source;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    let paused = session.subscribe_elicitation_pause_state();
+    let request = ElicitationRequest::Url {
+        meta: None,
+        message: "Connect this app to continue.".to_string(),
+        url: "https://example.com/connect".to_string(),
+        elicitation_id: "connect-1".to_string(),
+    };
+    let pending = tokio::spawn({
+        let session = Arc::clone(&session);
+        let turn_context = Arc::clone(&turn_context);
+        let request = request.clone();
+        async move {
+            session
+                .request_mcp_server_elicitation(
+                    &turn_context,
+                    "codex_apps".to_string(),
+                    RequestId::String("request-1".into()),
+                    request,
+                )
+                .await
+        }
+    });
+    let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("elicitation event should arrive")
+        .expect("event channel should remain open");
+    let EventMsg::ElicitationRequest(event) = event.msg else {
+        panic!("expected MCP elicitation");
+    };
+    assert_eq!(
+        event,
+        codex_protocol::approvals::ElicitationRequestEvent {
+            turn_id: Some(turn_context.sub_id.clone()),
+            server_name: "codex_apps".to_string(),
+            id: codex_protocol::mcp::RequestId::String("request-1".to_string()),
+            request,
+        }
+    );
+    assert!(*paused.borrow());
+    assert!(!pending.is_finished());
 
-        let Err(error) = tokio::time::timeout(
-            Duration::from_secs(1),
-            session.request_mcp_server_elicitation(
-                turn_context.as_ref(),
-                "codex_apps".to_string(),
-                RequestId::String("request-1".into()),
-                ElicitationRequest::Url {
-                    meta: None,
-                    message: "Connect this app to continue.".to_string(),
-                    url: "https://example.com/connect".to_string(),
-                    elicitation_id: "connect-1".to_string(),
-                },
-            ),
+    let response = ElicitationResponse {
+        action: ElicitationAction::Accept,
+        content: None,
+        meta: None,
+    };
+    session
+        .resolve_elicitation(
+            "codex_apps".to_string(),
+            RequestId::String("request-1".into()),
+            response.clone(),
         )
         .await
-        .expect("non-root elicitation must not wait for user input") else {
-            panic!("non-root elicitation must be rejected");
-        };
-
-        assert_eq!(
-            error.to_string(),
-            codex_mcp::MCP_ELICITATION_HANDOFF_MESSAGE
-        );
-        assert!(rx.try_recv().is_err());
-        assert!(!*paused.borrow());
-        assert!(
-            !paused
-                .has_changed()
-                .expect("elicitation service should remain available")
-        );
-    }
+        .expect("user response should resolve the elicitation");
+    let outcome = tokio::time::timeout(Duration::from_secs(1), pending)
+        .await
+        .expect("elicitation should finish")
+        .expect("elicitation task should succeed");
+    assert_eq!(outcome.response, Some(response));
+    assert!(outcome.sent);
+    assert!(!*paused.borrow());
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -2633,6 +2668,12 @@ async fn annotated_history_uses_explicit_model_without_a_step(
     session
         .record_annotated_conversation_items(&turn_context, &model_info, expected.clone())
         .await;
+    expected[0].metadata.get_or_insert_default().mcp_attribution = Some(
+        session
+            .services
+            .executed_tool_calls
+            .mcp_attribution_snapshot(),
+    );
     for envelope in &mut expected {
         envelope
             .metadata
@@ -3678,9 +3719,14 @@ async fn start_new_context_window_persists_checkpoint_state() {
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::EventMsg(_) => None,
     });
+    let mut expected_history = live_history.annotated_items().to_vec();
+    // Compaction's parallel metadata vector represents absent entries as default metadata.
+    for envelope in &mut expected_history {
+        envelope.metadata.get_or_insert_default();
+    }
     assert_eq!(
         persisted_compacted.and_then(|compacted| compacted.replacement_history.clone()),
-        Some(live_history.annotated_items().to_vec())
+        Some(expected_history)
     );
     assert_eq!(
         persisted_compacted.map(|compacted| {
@@ -4472,6 +4518,8 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
         CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -5575,6 +5623,102 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
 }
 
 #[tokio::test]
+async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.services.executed_tool_calls =
+        crate::state::ExecutedToolCalls::new(&turn_context.config.features, &InitialHistory::New);
+    let rollout_path = attach_thread_persistence(&mut session).await;
+    let source = McpAttributionSource {
+        connector_id: None,
+        plugin_id: None,
+        server_name: "example".to_string(),
+        tool_name: "search".to_string(),
+        first_turn_id: "turn_1".to_string(),
+    };
+    session
+        .services
+        .executed_tool_calls
+        .record_mcp_source(source.clone());
+    let expected = McpAttribution {
+        status: McpAttributionStatus::Complete,
+        sources: vec![source],
+    };
+    session
+        .record_annotated_conversation_items(
+            &turn_context,
+            turn_context.model_info(),
+            vec![
+                ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: Some("call_1".to_string()),
+                    name: None,
+                    namespace: None,
+                    output: FunctionCallOutputPayload::from_text("result".to_string()),
+                    internal_chat_message_metadata_passthrough: None,
+                }),
+                ResponseItemEnvelope::new(user_message("next turn")),
+            ],
+        )
+        .await;
+    let checkpoints = session
+        .clone_history()
+        .await
+        .annotated_items()
+        .iter()
+        .map(|envelope| {
+            envelope
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.mcp_attribution.clone())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checkpoints,
+        vec![Some(expected.clone()), Some(expected.clone())]
+    );
+
+    let (window_number, window_ids) = session.advance_auto_compact_window().await;
+    session
+        .replace_compacted_history(
+            vec![ResponseItemEnvelope::new(user_message("compacted history"))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "summary".to_string(),
+                window_number,
+                window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+                reviewer_compaction_hash: None,
+            },
+        )
+        .await;
+    session
+        .flush_rollout()
+        .await
+        .expect("flush compacted history");
+
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path)
+        .await
+        .expect("read compacted history");
+    let checkpoint = items.iter().rev().find_map(|item| match item {
+        RolloutItem::Compacted(compacted) => compacted
+            .replacement_history
+            .as_ref()?
+            .iter()
+            .rev()
+            .find_map(|envelope| envelope.metadata.as_ref()?.mcp_attribution.as_ref()),
+        _ => None,
+    });
+    assert_eq!(checkpoint, Some(&expected));
+    let restored = crate::state::ExecutedToolCalls::new(
+        &turn_context.config.features,
+        &InitialHistory::Forked(items),
+    );
+    assert_eq!(restored.mcp_attribution_snapshot(), expected);
+}
+
+#[tokio::test]
 async fn session_settings_commit_keeps_snapshot_across_postcommit_wait() {
     let (session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
         CodexAuth::from_api_key("Test API Key"),
@@ -5990,6 +6134,50 @@ pub(crate) async fn build_world_state_from_turn_context(
 }
 
 #[tokio::test]
+async fn response_metadata_builders_capture_fresh_mcp_attribution() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.services.executed_tool_calls =
+        crate::state::ExecutedToolCalls::new(&turn_context.config.features, &InitialHistory::New);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let before = session
+        .responses_metadata(&step_context, CodexResponsesRequestKind::Turn)
+        .await;
+    let source = McpAttributionSource {
+        connector_id: None,
+        plugin_id: None,
+        server_name: "example".to_string(),
+        tool_name: "search".to_string(),
+        first_turn_id: turn_context.sub_id.clone(),
+    };
+    session
+        .services
+        .executed_tool_calls
+        .record_mcp_source(source.clone());
+    let after = session
+        .responses_metadata(&step_context, CodexResponsesRequestKind::Turn)
+        .await;
+    let compaction = session
+        .compaction_responses_metadata(
+            &turn_context,
+            CompactionTurnMetadata::new(
+                CompactionTrigger::Auto,
+                CompactionReason::ContextLimit,
+                CompactionImplementation::Responses,
+                CompactionPhase::MidTurn,
+            ),
+        )
+        .await;
+    let expected = Some(McpAttribution {
+        status: McpAttributionStatus::Complete,
+        sources: vec![source],
+    });
+    assert_eq!(before.mcp_attribution, Some(McpAttribution::default()));
+    assert_eq!(after.mcp_attribution, expected);
+    assert_eq!(compaction.mcp_attribution, expected);
+}
+
+#[tokio::test]
 async fn responses_metadata_uses_selected_harness_analytics_client() {
     for enabled in [true, false] {
         let (mut session, mut turn_context) = make_session_and_context().await;
@@ -6231,7 +6419,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         features: config.features.clone(),
         guardian_context_mode: GuardianContextMode::from_features(&config.features),
         isolation: codex_extension_api::SessionIsolation::Inherit,
-        allowed_tools: None,
+        tool_policy: Arc::default(),
         windows_sandbox_proxy_settings_mode:
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
@@ -7380,6 +7568,7 @@ async fn submit_with_trace_captures_current_span_trace_context() {
             /*trace*/ None,
             /*parent_turn_id*/ None,
             /*root_turn_id*/ None,
+            /*residency_guard*/ None,
         )
         .await
         .expect("submit should succeed");
@@ -7452,6 +7641,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
             op: Op::Interrupt,
             parent_turn_id: None,
             root_turn_id: None,
+            residency_guard: None,
             trace: Some(submission_trace),
         })
     });
@@ -7480,6 +7670,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
         }),
         parent_turn_id: None,
         root_turn_id: None,
+        residency_guard: None,
         trace: None,
     });
 
@@ -7837,6 +8028,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
         op: Op::Interrupt,
         parent_turn_id: None,
         root_turn_id: None,
+        residency_guard: None,
         trace: Some(submission_trace.clone()),
     });
     let dispatch_span_id = dispatch_span.context().span().span_context().span_id();
@@ -7899,6 +8091,8 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     let live_thread = LiveThread::create(
         Arc::clone(&thread_store),
         CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -8011,6 +8205,8 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     let live_thread = LiveThread::create(
         Arc::clone(&thread_store),
         CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -8489,7 +8685,7 @@ where
         features: config.features.clone(),
         guardian_context_mode: GuardianContextMode::from_features(&config.features),
         isolation: codex_extension_api::SessionIsolation::Inherit,
-        allowed_tools: None,
+        tool_policy: Arc::default(),
         windows_sandbox_proxy_settings_mode:
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
@@ -10673,6 +10869,8 @@ async fn attach_in_memory_thread_store(
     let live_thread = LiveThread::create(
         Arc::clone(&thread_store),
         CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,

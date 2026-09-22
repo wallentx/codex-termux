@@ -5,6 +5,7 @@ use crate::history_cell::plain_lines;
 use crate::history_cell::with_border_with_inner_width;
 use crate::legacy_core::config::Config;
 use crate::line_truncation::line_width;
+use crate::style::accent_color;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
@@ -804,12 +805,12 @@ impl StatusHistoryCell {
         let value_width = formatter.value_width(available_inner_width);
 
         let note_first_line = Line::from(vec![
-            Span::from("Visit ").cyan(),
-            CHATGPT_USAGE_URL.cyan().underlined(),
-            Span::from(" for up-to-date").cyan(),
+            Span::from("Visit ").fg(accent_color()),
+            CHATGPT_USAGE_URL.fg(accent_color()).underlined(),
+            Span::from(" for up-to-date").fg(accent_color()),
         ]);
         let note_second_line = Line::from(vec![
-            Span::from("information on rate limits and credits").cyan(),
+            Span::from("information on rate limits and credits").fg(accent_color()),
         ]);
         let note_lines = adaptive_wrap_lines(
             [note_first_line, note_second_line],
@@ -823,18 +824,20 @@ impl StatusHistoryCell {
             lines.push(Line::from(Vec::<Span<'static>>::new()));
         }
         if let Some(remote_connection) = self.remote_connection.as_ref() {
-            let wrapped_remote = word_wrap_lines(
-                [Line::from(vec![
+            let value = if remote_connection.is_local_daemon {
+                Line::from("Local background server")
+            } else {
+                Line::from(vec![
                     Span::from(remote_connection.address.clone()),
                     Span::from(" (").dim(),
                     Span::from(remote_connection.version.clone()).dim(),
                     Span::from(")").dim(),
-                ])],
-                RtOptions::new(value_width.max(1)),
-            );
+                ])
+            };
+            let wrapped_remote = word_wrap_lines([value], RtOptions::new(value_width.max(1)));
             let mut wrapped_remote = wrapped_remote.into_iter();
             if let Some(first) = wrapped_remote.next() {
-                lines.push(formatter.line("Remote", first.spans));
+                lines.push(formatter.line("Server", first.spans));
                 lines.extend(wrapped_remote.map(|line| formatter.continuation(line.spans)));
             }
             lines.push(Line::from(Vec::<Span<'static>>::new()));

@@ -188,23 +188,6 @@ impl GitSha {
     }
 }
 
-/// Submission Queue Entry - requests from user
-#[derive(Debug)]
-pub struct Submission {
-    /// Unique id for this Submission to correlate with Events
-    pub id: String,
-    /// Payload
-    pub op: Op,
-    /// Optional W3C trace carrier propagated across async submission handoffs.
-    pub trace: Option<W3cTraceContext>,
-    /// Core-provided ID of the parent turn that directly initiated this submission.
-    ///
-    /// This is only used for inter-agent communication.
-    pub parent_turn_id: Option<String>,
-    /// Core-provided ID of the top-level turn that causally initiated this submission.
-    pub root_turn_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct W3cTraceContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3115,6 +3098,12 @@ pub struct HistoryPosition {
 /// and should be used when there is no config override.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct SessionMeta {
+    /// ChatGPT user that created this thread; absent when unavailable or for older threads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_user_id: Option<String>,
+    /// ChatGPT account selected when this thread was created. Never updated on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_account_id: Option<String>,
     /// session_id is equal to the root thread's ID.
     pub session_id: SessionId,
     pub id: ThreadId,
@@ -3189,6 +3178,8 @@ impl Default for SessionMeta {
     fn default() -> Self {
         let id = ThreadId::default();
         SessionMeta {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: id.into(),
             id,
             forked_from_id: None,
