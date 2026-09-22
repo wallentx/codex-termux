@@ -77,8 +77,8 @@ def async_updater(text):
     )
 
 
-def merge_updater_additions(text):
-    """Join only reviewed Termux insertions with upstream's adjacent additions."""
+def merge_updater_additions(text, *, path=None):
+    """Carry only reviewed Termux updater edits through upstream changes."""
     additions = {
         "    /// Update by replacing the current Termux binary from wallentx/codex-termux.\n    TermuxSelfUpdate,\n",
         '            UpdateAction::TermuxSelfUpdate => ("codex", &["update"]),\n',
@@ -89,6 +89,28 @@ def merge_updater_additions(text):
 
     def resolve(match):
         ours, base, theirs = match.groups()
+        if path == "codex-rs/tui/src/update_prompt.rs":
+            declaration = "        let release_notes_url = self.update_action.release_notes_url();\n"
+            if text.count(declaration) != 1:
+                return match[0]
+            constant = 'const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";\n\n'
+            guard = "#[cfg(not(debug_assertions))]\n"
+            if base == constant and not theirs and ours == constant + guard:
+                return guard
+            # Upstream redesigned the picker. The downstream delta in these
+            # hunks changes only the URL expression, not layout or rendering.
+            for original in (
+                "                RELEASE_NOTES_URL.dim().underlined(),\n",
+                "        crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, RELEASE_NOTES_URL);\n",
+            ):
+                replacement = original.replace("RELEASE_NOTES_URL", "release_notes_url")
+                if (
+                    base.count(original) == 1
+                    and theirs == base.replace(original, replacement, 1)
+                    and ours.count(original) == 1
+                ):
+                    return ours.replace(original, replacement, 1)
+            return match[0]
         if not base and theirs in additions:
             return theirs + ours
         signature = (
@@ -203,11 +225,14 @@ def release_tree(upstream, source, baseline, excluded):
                 if path not in (
                     cli,
                     "codex-rs/tui/src/update_action.rs",
+                    "codex-rs/tui/src/update_prompt.rs",
                     "codex-rs/tui/src/updates.rs",
                 ):
                     remaining.append(path)
                     continue
-                text = merge_updater_additions(git("show", f"{result}:{path}").decode())
+                text = merge_updater_additions(
+                    git("show", f"{result}:{path}").decode(), path=path
+                )
                 if re.search(r"^(?:<<<<<<<|=======|>>>>>>>)", text, re.MULTILINE):
                     remaining.append(path)
                 else:

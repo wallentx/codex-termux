@@ -17,6 +17,26 @@ for upstream in "$@"; do
   git diff --exit-code "${upstream}" "${tree}" -- .github codex-rs/config codex-rs/features
   git grep -q 'TermuxSelfUpdate' "${tree}" -- codex-rs/tui/src/update_action.rs
   git grep -q 'code-mode-host' "${tree}" -- codex-rs/tui/src/termux_update.rs
+  # The complete prompt must remain upstream's layout, with only its URL
+  # routed through the downstream update action. This also covers 0.157's
+  # picker redesign without accepting old target-side rendering code.
+  python3 - "${upstream}" "${tree}" <<'PY'
+import subprocess
+import sys
+
+path = "codex-rs/tui/src/update_prompt.rs"
+upstream, tree = sys.argv[1:]
+expected = subprocess.check_output(["git", "show", f"{upstream}:{path}"], text=True)
+expected = expected.replace(
+    'const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";\n\n', ""
+).replace(
+    "        let update_command = self.update_action.command_str();\n",
+    "        let update_command = self.update_action.command_str();\n"
+    "        let release_notes_url = self.update_action.release_notes_url();\n",
+).replace("RELEASE_NOTES_URL", "release_notes_url")
+actual = subprocess.check_output(["git", "show", f"{tree}:{path}"], text=True)
+assert actual == expected, f"{upstream}: update prompt differs beyond the Termux release-notes URL"
+PY
   if git grep -q 'Daemon(DaemonUpdateSource)' "${upstream}" -- codex-rs/tui/src/update_action.rs; then
     git grep -q 'Daemon(DaemonUpdateSource)' "${tree}" -- codex-rs/tui/src/update_action.rs
     git grep -q 'run_update_action(action, cli_executable).await?' "${tree}" -- codex-rs/cli/src/main.rs

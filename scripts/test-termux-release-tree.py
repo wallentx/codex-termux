@@ -25,6 +25,8 @@ class ReleaseTreeTests(unittest.TestCase):
         self.git("init", "-q")
         self.git("config", "user.name", "Termux Release Test")
         self.git("config", "user.email", "termux-release-test@example.invalid")
+        # Fixture commits must not depend on the developer's signing agent.
+        self.git("config", "commit.gpgsign", "false")
         self.write(
             "codex-rs/Cargo.toml",
             '[workspace]\nmembers = ["cli"]\n[workspace.package]\nversion = "1.0.0-alpha.1"\n[workspace.dependencies]\n',
@@ -291,6 +293,70 @@ esac
 
 
 class UpdaterAdaptationTests(unittest.TestCase):
+    def test_prompt_constant_removal_preserves_upstream_debug_guard(self):
+        declaration = (
+            "        let release_notes_url = self.update_action.release_notes_url();\n"
+        )
+        constant = 'const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";\n\n'
+        guard = "#[cfg(not(debug_assertions))]\n"
+        conflict = f"<<<<<<< upstream\n{constant}{guard}||||||| baseline\n{constant}=======\n>>>>>>> target\n{declaration}"
+        self.assertEqual(
+            module.merge_updater_additions(
+                conflict, path="codex-rs/tui/src/update_prompt.rs"
+            ),
+            guard + declaration,
+        )
+        changed = conflict.replace(guard, "#[cfg(test)]\n")
+        self.assertEqual(
+            module.merge_updater_additions(
+                changed, path="codex-rs/tui/src/update_prompt.rs"
+            ),
+            changed,
+        )
+
+    def test_prompt_url_edits_preserve_new_upstream_layout(self):
+        declaration = (
+            "        let release_notes_url = self.update_action.release_notes_url();\n"
+        )
+        for base, ours in (
+            (
+                "                RELEASE_NOTES_URL.dim().underlined(),\n            ])\n            .inset(Insets::tlbr(0, 2, 0, 0)),\n",
+                "                RELEASE_NOTES_URL.dim().underlined(),\n            ]))\n            .wrap(Wrap { trim: false })\n            .inset(Insets::vh(/*v*/ 0, /*h*/ 2)),\n",
+            ),
+            (
+                "        column.render(area, buf);\n        crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, RELEASE_NOTES_URL);\n",
+                "        render_menu_surface(panel, buf);\n        column.render(panel, buf);\n        crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, RELEASE_NOTES_URL);\n",
+            ),
+        ):
+            with self.subTest(base=base):
+                theirs = base.replace("RELEASE_NOTES_URL", "release_notes_url")
+                conflict = f"{declaration}<<<<<<< upstream\n{ours}||||||| baseline\n{base}=======\n{theirs}>>>>>>> target\n"
+                expected = declaration + ours.replace(
+                    "RELEASE_NOTES_URL", "release_notes_url"
+                )
+                self.assertEqual(
+                    module.merge_updater_additions(
+                        conflict, path="codex-rs/tui/src/update_prompt.rs"
+                    ),
+                    expected,
+                )
+                # The rule must not operate on other files or without the
+                # action-specific URL binding, nor discard other target edits.
+                self.assertEqual(module.merge_updater_additions(conflict), conflict)
+                for unsafe in (
+                    conflict.replace(declaration, ""),
+                    conflict.replace(theirs, theirs + "        custom_render();\n"),
+                    conflict.replace(
+                        ours, ours.replace("RELEASE_NOTES_URL", "OTHER_URL")
+                    ),
+                ):
+                    self.assertEqual(
+                        module.merge_updater_additions(
+                            unsafe, path="codex-rs/tui/src/update_prompt.rs"
+                        ),
+                        unsafe,
+                    )
+
     def test_known_insertion_preserves_upstream_addition(self):
         ours = "    Daemon,\n"
         theirs = "    /// Update by replacing the current Termux binary from wallentx/codex-termux.\n    TermuxSelfUpdate,\n"
