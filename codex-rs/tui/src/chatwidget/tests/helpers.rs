@@ -67,6 +67,44 @@ pub(crate) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
     }
 }
 
+/// Normalize command-center fixture paths without moving fixed pane separators.
+/// Pad after each complete pane so group counts and destination hints keep their spacing.
+pub(crate) fn normalize_agent_center_snapshot(text: impl AsRef<str>) -> String {
+    text.as_ref()
+        .split('\n')
+        .map(|line| {
+            let quoted = line
+                .strip_prefix('"')
+                .and_then(|line| line.strip_suffix('"'));
+            let content = quoted.unwrap_or(line);
+            let normalized = content
+                .split('│')
+                .map(|pane| {
+                    let mut normalized = pane.to_owned();
+                    for unix_path in ["/tmp/second-project", "/tmp/project", "/project"] {
+                        // test_path_buf uses this drive for all absolute Windows fixtures.
+                        let windows_path = format!("C:{}", unix_path.replace('/', "\\"));
+                        normalized = normalized
+                            .replace(&windows_path, unix_path)
+                            .replace(&windows_path.replace('\\', "/"), unix_path);
+                    }
+                    // Only ASCII path bytes change, so this is also the removed cell width.
+                    let padding = pane.len().saturating_sub(normalized.len());
+                    normalized.push_str(&" ".repeat(padding));
+                    normalized
+                })
+                .collect::<Vec<_>>()
+                .join("│");
+            if quoted.is_some() {
+                format!("\"{normalized}\"")
+            } else {
+                normalized.trim_end().to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(super) fn normalized_backend_snapshot<T: std::fmt::Display>(value: &T) -> String {
     let platform_test_cwd = test_path_display("/tmp/project");
     let rendered = format!("{value}");
@@ -364,7 +402,34 @@ pub(super) fn drain_insert_history_normalized(
 pub(super) fn drain_insert_history_transcript(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
-    drain_insert_history_with(rx, |cell| cell.transcript_lines(/*width*/ 80))
+    drain_insert_history_with(rx, |cell| {
+        cell.transcript_lines(/*width*/ 80)
+            .into_iter()
+            .map(|mut line| {
+                if cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+                    line.spans = vec![normalize_completion_timestamps(cell, &line).into()];
+                }
+                line
+            })
+            .collect()
+    })
+}
+
+// Preserve ordering checks for history cells intentionally hidden from compact chat.
+pub(super) fn drain_insert_history_transcript_normalized(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| {
+        cell.transcript_lines(/*width*/ 80)
+            .into_iter()
+            .map(|mut line| {
+                if cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+                    line.spans = vec![normalize_completion_timestamps(cell, &line).into()];
+                }
+                line
+            })
+            .collect()
+    })
 }
 
 pub(super) fn drain_insert_history_with(
@@ -1418,6 +1483,7 @@ pub(super) fn plugins_test_summary(
     install_policy: PluginInstallPolicy,
 ) -> PluginSummary {
     PluginSummary {
+        extensions: None,
         id: id.to_string(),
         remote_plugin_id: None,
         version: None,
@@ -1454,6 +1520,7 @@ pub(super) fn plugins_test_remote_summary(
     installed: bool,
 ) -> PluginSummary {
     PluginSummary {
+        extensions: None,
         id: remote_plugin_id.to_string(),
         remote_plugin_id: Some(remote_plugin_id.to_string()),
         version: None,
@@ -1796,7 +1863,7 @@ pub(crate) fn normalize_completion_timestamps(
     }
     static COMPLETION_FOOTER: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(
         || {
-            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s · )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)(?P<padding>[ \t]*)$")
+            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s · )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2}(?: (?:AM|PM))?(?P<padding>[ \t]*)$")
                 .expect("valid completion footer pattern")
         },
     );

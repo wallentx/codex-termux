@@ -595,6 +595,21 @@ async fn handle_approved_mcp_tool_call(
     if let Some(elicitation_type) = elicitation_type {
         track_mcp_tool_call_elicitation(sess, turn_context, call_id, elicitation_type);
     }
+    // Direct and Code Mode calls share this boundary. Once an approved call enters
+    // it, conservatively attribute returned errors too: they may contain peer data.
+    let source_connector_id = prepared_call
+        .is_host_owned_apps()
+        .then(|| prepared_call.tool_info().connector_id.clone())
+        .flatten();
+    sess.services.executed_tool_calls.record_mcp_source(
+        codex_protocol::mcp::McpAttributionSource {
+            connector_id: source_connector_id,
+            plugin_id: prepared_call.plugin_id().map(str::to_string),
+            server_name: prepared_call.server_name().to_string(),
+            tool_name: prepared_call.tool_info().tool.name.to_string(),
+            first_turn_id: turn_context.sub_id.clone(),
+        },
+    );
     notify_mcp_tool_call_completed(
         sess,
         turn_context,
@@ -781,39 +796,14 @@ async fn maybe_request_codex_apps_auth_elicitation(
         url: plan.elicitation.url,
         elicitation_id: plan.elicitation.elicitation_id,
     };
-    let outcome = match sess
+    let outcome = sess
         .request_mcp_server_elicitation(
             turn_context,
             CODEX_APPS_MCP_SERVER_NAME.to_string(),
             request_id,
             request,
         )
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let mut result = result;
-            // Direct output prefers structured content. Preserve its diagnostic as
-            // text so both output paths show it alongside the recovery guidance.
-            if let Some(structured_content) = result.structured_content.take() {
-                result.content.push(serde_json::json!({
-                    "type": "text",
-                    "text": structured_content.to_string(),
-                }));
-            }
-            result.content.insert(
-                /*index*/ 0,
-                serde_json::json!({
-                    "type": "text",
-                    "text": format!(
-                        "Authentication for {} could not be completed. {error}",
-                        plan.auth_failure.connector_name
-                    ),
-                }),
-            );
-            return result;
-        }
-    };
+        .await;
     if !outcome
         .response
         .as_ref()
@@ -1130,6 +1120,7 @@ async fn maybe_track_codex_app_used(
         sess.thread_id.to_string(),
         turn_context.sub_id.clone(),
         turn_context.originator.clone(),
+        Some(turn_context.turn_metadata_state.clone()),
     );
     sess.services.analytics_events_client.track_app_used(
         tracking,
@@ -1622,10 +1613,6 @@ pub(crate) async fn request_mcp_tool_user_approval(
         );
     }
 
-    if turn_context.session_source.is_non_root_agent() {
-        return ReviewDecision::denied(codex_mcp::MCP_ELICITATION_HANDOFF_MESSAGE);
-    }
-
     let tool_call_mcp_elicitation_enabled = turn_context
         .config
         .features
@@ -1691,18 +1678,21 @@ pub(crate) async fn request_mcp_tool_user_approval(
                     .map(|rendered_template| rendered_template.elicitation_message.as_str()),
                 prompt_options,
             });
-        let outcome = match sess
+        let outcome = sess
             .request_mcp_server_elicitation(turn_context, server.clone(), request_id, request)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => return ReviewDecision::denied(error.to_string()),
-        };
+            .await;
         (
             outcome.sent,
             parse_mcp_tool_approval_elicitation_response(outcome.response, &question_id),
         )
     } else {
+        if turn_context.session_source.is_non_root_agent() {
+            return ReviewDecision::denied(concat!(
+                "MCP tool approval via request_user_input requires the root thread. ",
+                "Ask the parent agent to handle this request. ",
+                "Do not retry the blocked action until the parent confirms the blocker is resolved."
+            ));
+        }
         let args = RequestUserInputArgs {
             questions: vec![question],
             is_blocking: true,

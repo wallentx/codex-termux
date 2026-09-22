@@ -1,6 +1,5 @@
 ---
 source: tui/src/chatwidget/tests/status_and_layout.rs
-assertion_line: 34
 expression: rendered
 ---
 "                                                            "
@@ -12,7 +11,6 @@ expression: rendered
 "                                                            "
 "                                                            "
 " voice ● listening              ctrl+x mute     /voice stop "
-"   mic ▁▁▁▁▁▁  codex ▁▁▁▁▁▁                                 "
 "                                                            "
 "› Ask Codex to do anything                                  "
 "                                                            "

@@ -228,7 +228,7 @@ impl ChatWidget {
                             ..Default::default()
                         },
                     ],
-                    ..Default::default()
+                    ..SelectionViewParams::picker()
                 });
                 self.request_redraw();
             }
@@ -261,7 +261,7 @@ impl ChatWidget {
                             ..Default::default()
                         },
                     ],
-                    ..Default::default()
+                    ..SelectionViewParams::picker()
                 });
                 self.request_redraw();
             }
@@ -461,6 +461,7 @@ impl ChatWidget {
                 let enabled = self.toggle_raw_output_mode_and_notify();
                 self.emit_raw_output_mode_changed(enabled);
             }
+            SlashCommand::Tui => self.show_tui_mode_picker(),
             SlashCommand::Diff => {
                 self.add_diff_in_progress();
                 let tx = self.app_event_tx.clone();
@@ -501,6 +502,7 @@ impl ChatWidget {
                 self.add_hooks_output();
             }
             SlashCommand::Daemon => self.app_event_tx.send(AppEvent::OpenDaemonMenu),
+            SlashCommand::Warnings => self.app_event_tx.send(AppEvent::OpenWarnings),
             SlashCommand::Status => {
                 if self.should_prefetch_rate_limits() {
                     let request_id = self.next_status_refresh_request_id;
@@ -1232,6 +1234,7 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Feedback
+            | SlashCommand::Warnings
             | SlashCommand::Export
             | SlashCommand::New
             | SlashCommand::Archive
@@ -1265,6 +1268,7 @@ impl ChatWidget {
             | SlashCommand::Title
             | SlashCommand::Statusline
             | SlashCommand::Theme
+            | SlashCommand::Tui
             | SlashCommand::Pets => QueueDrain::Stop,
         }
     }

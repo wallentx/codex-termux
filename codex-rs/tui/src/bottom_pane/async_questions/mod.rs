@@ -184,6 +184,9 @@ impl AsyncQuestions {
                 let number = index + 1;
                 let prefix = format!("{prefix} {number}. ");
                 GenericDisplayRow {
+                    // Other stays an inline editor with foreground-only focus.
+                    selection_style: (index < self.options().len())
+                        .then(super::picker_style::selection_style),
                     name: format!("{prefix}{label}"),
                     wrap_indent: Some(prefix.width()),
                     ..Default::default()
@@ -196,7 +199,6 @@ impl AsyncQuestions {
         if !self.has_options() {
             return 0;
         }
-        let row_width = width.saturating_add(1);
         let rows = self.option_rows();
         if self.other_selected() {
             let prefix = self.other_prefix_width(width);
@@ -204,13 +206,13 @@ impl AsyncQuestions {
                 &rows[..rows.len() - 1],
                 &ScrollState::default(),
                 rows.len(),
-                row_width,
+                width,
             ) + self
                 .composer
                 .inline_input_height(width.saturating_sub(prefix).max(1))
                 .clamp(1, 8)
         } else {
-            measure_rows_height(&rows, &ScrollState::default(), rows.len(), row_width)
+            measure_rows_height(&rows, &ScrollState::default(), rows.len(), width)
         }
     }
 

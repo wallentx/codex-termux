@@ -665,6 +665,7 @@ async fn clipped_voice_composer_keeps_the_draft_and_cursor_visible() {
 
     insta::assert_snapshot!(layouts.join("\n\n"), @r"
     5 rows:
+    voice ● listening ctrl+x mute     /voice stop
     › typed
 
     6 rows:
@@ -680,7 +681,7 @@ async fn clipped_voice_composer_keeps_the_draft_and_cursor_visible() {
 #[tokio::test]
 async fn compact_voice_meters_keep_real_speaker_history_when_the_microphone_is_muted() {
     let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
-    chat.local_settings.tui.animations = false;
+    chat.local_settings.tui.animations = true;
     let thread_id = activate_voice(&mut chat);
     chat.realtime_conversation.audio_meter_history = [
         (0, 255),
@@ -721,6 +722,10 @@ async fn compact_voice_meters_keep_real_speaker_history_when_the_microphone_is_m
 #[tokio::test]
 async fn voice_toggle_shortcut_uses_the_slash_command_start_guard_and_preserves_draft() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
+    let config =
+        toml::from_str::<codex_config::types::TuiKeymap>("[chat]\ntoggle_voice = 'f8'").unwrap();
+    let runtime = crate::keymap::RuntimeKeymap::from_config(&config).unwrap();
+    chat.apply_keymap_update(config, &runtime);
     chat.set_side_conversation_active(/*active*/ true);
     chat.bottom_pane
         .set_composer_text("draft".to_string(), Vec::new(), Vec::new());
@@ -743,6 +748,10 @@ async fn voice_toggle_shortcut_uses_the_slash_command_start_guard_and_preserves_
 #[tokio::test]
 async fn voice_toggle_shortcut_stops_only_on_press_outside_popups() {
     let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    let config =
+        toml::from_str::<codex_config::types::TuiKeymap>("[chat]\ntoggle_voice = 'f8'").unwrap();
+    let runtime = crate::keymap::RuntimeKeymap::from_config(&config).unwrap();
+    chat.apply_keymap_update(config, &runtime);
     let thread_id = activate_voice(&mut chat);
     let shortcut = KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE);
     for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {

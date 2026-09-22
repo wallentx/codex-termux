@@ -158,6 +158,7 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
+use codex_rollout::should_persist_response_item;
 use codex_rollout::state_db;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
 use codex_rollout_trace::ThreadTraceContext;
@@ -234,7 +235,9 @@ mod guardian_checkpoint;
 mod handlers;
 mod inject;
 mod reasoning_effort;
+mod submission;
 pub(crate) use reasoning_effort::RequestEffortUsage;
+pub(crate) use submission::Submission;
 mod input_queue;
 mod mcp;
 mod mcp_prewarm;
@@ -379,7 +382,6 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionNetworkProxyRuntime;
 use codex_protocol::protocol::StreamErrorEvent;
-use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
@@ -961,6 +963,7 @@ impl SessionIo {
     pub(crate) async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(
             op, /*trace*/ None, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+            /*residency_guard*/ None,
         )
         .await
     }
@@ -971,6 +974,7 @@ impl SessionIo {
         trace: Option<W3cTraceContext>,
         parent_turn_id: Option<String>,
         root_turn_id: Option<String>,
+        residency_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> CodexResult<String> {
         let id = new_submission_id();
         let sub = Submission {
@@ -979,6 +983,7 @@ impl SessionIo {
             trace,
             parent_turn_id,
             root_turn_id,
+            residency_guard,
         };
         self.submit_with_id(sub).await?;
         Ok(id)
@@ -1018,6 +1023,7 @@ impl SessionIo {
             trace,
             parent_turn_id: None,
             root_turn_id: None,
+            residency_guard: None,
         })
         .await?;
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
@@ -1041,6 +1047,7 @@ impl SessionIo {
             trace,
             parent_turn_id: None,
             root_turn_id: None,
+            residency_guard: None,
         })
         .await?;
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
@@ -1725,6 +1732,7 @@ impl Session {
         // inline bytes, while existing file references bypass preparation and remain unchanged.
         // Bound replay future size now that image preparation can await storage.
         let _ = Box::pin(prepare_image_response_items(
+            &self.thread_id.to_string(),
             &mut prepared_history,
             ImagePreparationMode::DetailBased,
             ImageResizeNoticeMode::Disabled,
@@ -3411,6 +3419,7 @@ impl Session {
         };
         // Keep nested image-upload futures out of every caller's future frame.
         let image_preparations = Box::pin(prepare_image_response_items(
+            &self.thread_id.to_string(),
             &mut items,
             image_preparation_mode,
             image_resize_notice_mode,
@@ -3554,6 +3563,32 @@ impl Session {
                     .get_or_insert_with(|| with_serialization_allowance(policy).token_budget());
             }
         }
+        // Last-N-turn forks retain a suffix starting at a user turn boundary. Repeat the
+        // cumulative checkpoint there so the suffix remains self-contained even when the fork
+        // happens mid-turn; dirty checkpoints preserve new sources between boundaries.
+        let force_mcp_checkpoint = items
+            .iter()
+            .any(|envelope| crate::context_manager::is_user_turn_boundary(&envelope.item));
+        let mcp_revision = self
+            .services
+            .executed_tool_calls
+            .mcp_attribution_checkpoint(force_mcp_checkpoint)
+            .and_then(|(attribution, revision)| {
+                let first_persisted = items
+                    .iter()
+                    .position(|envelope| should_persist_response_item(&envelope.item))?;
+                for (index, envelope) in items.iter_mut().enumerate() {
+                    // Rollout batches may be partially written. Checkpoint the first persisted
+                    // item, and repeat the checkpoint at turn boundaries retained by forks.
+                    if index == first_persisted
+                        || crate::context_manager::is_user_turn_boundary(&envelope.item)
+                    {
+                        envelope.metadata.get_or_insert_default().mcp_attribution =
+                            Some(attribution.clone());
+                    }
+                }
+                Some(revision)
+            });
         let response_items = items
             .iter()
             .map(|envelope| envelope.item.clone())
@@ -3563,6 +3598,22 @@ impl Session {
             state
                 .current_time_reminder
                 .note_recorded_items(&response_items);
+            if self.guardian_context_mode == crate::context::GuardianContextMode::ThreadOwned {
+                for envelope in &mut items {
+                    if matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "assistant")
+                        || matches!(&envelope.item, ResponseItem::FunctionCall { .. })
+                        || crate::context::is_user_authorization_message(&envelope.item)
+                    {
+                        // Share accepted input order with recorded assistant messages and calls.
+                        // A call's result can arrive after a reply; it must not move the question.
+                        envelope
+                            .metadata
+                            .get_or_insert_default()
+                            .user_input_order
+                            .get_or_insert_with(|| state.history.reserve_input_order());
+                    }
+                }
+            }
             state
                 .history
                 .record_annotated_items(&items, model_info.truncation_policy.into());
@@ -3577,7 +3628,13 @@ impl Session {
         }
         let rollout_items: Vec<RolloutItem> =
             items.into_iter().map(RolloutItem::ResponseItem).collect();
-        self.persist_rollout_items(&rollout_items).await;
+        if self.persist_rollout_items(&rollout_items).await
+            && let Some(revision) = mcp_revision
+        {
+            self.services
+                .executed_tool_calls
+                .mark_mcp_attribution_persisted(revision);
+        }
         if turn_context.config.memories.disable_on_external_context
             && let Some(item) = response_items
                 .iter()
@@ -3943,6 +4000,16 @@ impl Session {
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
+        let mcp_revision = self
+            .services
+            .executed_tool_calls
+            .mcp_attribution_checkpoint(/*force*/ true)
+            .and_then(|(attribution, revision)| {
+                items.last_mut().map(|envelope| {
+                    envelope.metadata.get_or_insert_default().mcp_attribution = Some(attribution);
+                    revision
+                })
+            });
         if let Some(checkpoint) = items.iter_mut().rev().find(|envelope| {
             matches!(
                 envelope.item,
@@ -4006,7 +4073,13 @@ impl Session {
         rollout_items.push(RolloutItem::EventMsg(
             thread_settings::applied_event(self).await,
         ));
-        self.persist_rollout_items(&rollout_items).await;
+        if self.persist_rollout_items(&rollout_items).await
+            && let Some(revision) = mcp_revision
+        {
+            self.services
+                .executed_tool_calls
+                .mark_mcp_attribution_persisted(revision);
+        }
         {
             let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
@@ -4338,12 +4411,14 @@ impl Session {
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
-    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
+    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
         if let Some(live_thread) = self.live_thread()
             && let Err(e) = live_thread.append_items(items).await
         {
             error!("failed to record rollout items: {e:#}");
+            return false;
         }
+        true
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {

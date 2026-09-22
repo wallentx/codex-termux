@@ -115,6 +115,25 @@ impl ExecCell {
         }
     }
 
+    /// Historical grouping uses the same compatibility and failure boundary as live calls.
+    pub(crate) fn append_completed(&mut self, mut newer: Self) -> Result<(), Self> {
+        if !self.is_exploring_cell() || self.should_flush() || !newer.is_exploring_cell() {
+            return Err(newer);
+        }
+        newer.group.details.prepend(
+            std::mem::take(&mut self.group.details),
+            self.group.calls.len(),
+        );
+        self.group.details = newer.group.details;
+        self.group.calls.append(&mut newer.group.calls);
+        Ok(())
+    }
+
+    /// Preserve live clocks and pending output when a validated older page extends exploration.
+    pub(crate) fn prepend(&mut self, older: Self) {
+        self.group.prepend(older.group);
+    }
+
     /// Marks the most recently matching call as finished and returns whether a call was found.
     ///
     /// Callers should treat `false` as a routing mismatch rather than silently ignoring it. The

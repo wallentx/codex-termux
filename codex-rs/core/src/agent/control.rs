@@ -10,7 +10,6 @@ use crate::agent::types::AgentMetadata;
 use crate::agent::types::LiveAgent;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
-use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
 use crate::context::SubagentNotification;
@@ -66,22 +65,23 @@ use tokio::sync::watch;
 use tracing::warn;
 use uuid::Uuid;
 
-pub(crate) use self::delivery::MessageDeliveryError;
 use self::execution::AgentExecutionLimiter;
-pub(crate) use self::interrupt::AgentInterruptError;
-pub(crate) use self::interrupt::AgentInterruptOutcome;
 use self::residency::V2Residency;
 
 mod budget;
 mod completion;
 mod delivery;
 mod execution;
+mod inspection;
 mod interrupt;
 mod legacy;
 mod residency;
+mod resume;
 mod sender_context;
 mod service_tier;
 mod spawn;
+mod spawn_request;
+mod target;
 mod user_authorization;
 
 const MAX_ENVIRONMENT_SUBAGENTS: usize = 8;
@@ -424,40 +424,6 @@ impl LocalAgentControl {
         let mut thread_ids = vec![agent_id];
         thread_ids.extend(self.live_thread_spawn_descendants(agent_id).await?);
         Ok(thread_ids)
-    }
-
-    pub(crate) async fn get_agent_config_snapshot(
-        &self,
-        agent_id: ThreadId,
-    ) -> Option<ThreadConfigSnapshot> {
-        let Ok(state) = self.upgrade() else {
-            return None;
-        };
-        let Ok(thread) = state.get_thread(agent_id).await else {
-            return None;
-        };
-        Some(thread.config_snapshot().await)
-    }
-
-    pub(crate) async fn resolve_agent_reference(
-        &self,
-        _current_thread_id: ThreadId,
-        current_session_source: &SessionSource,
-        agent_reference: &str,
-    ) -> CodexResult<ThreadId> {
-        let current_agent_path = current_session_source
-            .get_agent_path()
-            .unwrap_or_else(AgentPath::root);
-        let agent_path = current_agent_path
-            .resolve(agent_reference)
-            .map_err(CodexErr::UnsupportedOperation)?;
-        if let Some(thread_id) = self.state.agent_id_for_path(&agent_path) {
-            return Ok(thread_id);
-        }
-        Err(CodexErr::UnsupportedOperation(format!(
-            "live agent path `{}` not found",
-            agent_path.as_str()
-        )))
     }
 
     /// Subscribe to status updates for `agent_id`, yielding the latest value and changes.

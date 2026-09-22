@@ -247,11 +247,17 @@ mod composer_submission;
 mod computer_activity_tests;
 #[path = "tests/config_errors_tests.rs"]
 mod config_errors;
+#[path = "tests/copy_export_picker_tests.rs"]
+mod copy_export_picker_tests;
+#[path = "tests/dynamic_activity_tests.rs"]
+mod dynamic_activity_tests;
 mod exec_flow;
 mod goal_menu;
 mod goal_validation;
 mod guardian;
 pub(crate) mod helpers;
+#[path = "tests/history_projection.rs"]
+mod history_projection;
 mod history_replay;
 #[path = "tests/luna_reserve_usage_tests.rs"]
 mod luna_reserve_usage_tests;
@@ -260,6 +266,10 @@ mod mcp_startup;
 mod misalignment_policy;
 #[path = "tests/model_display_name_tests.rs"]
 mod model_display_name_tests;
+#[path = "tests/model_picker_tests.rs"]
+mod model_picker_tests;
+#[path = "tests/permission_picker_tests.rs"]
+mod permission_picker_tests;
 #[path = "tests/permission_shortcuts_tests.rs"]
 mod permission_shortcuts_tests;
 mod permissions;
@@ -274,15 +284,21 @@ mod reasoning_status_tests;
 #[path = "tests/replay_render_tests.rs"]
 mod replay_render_tests;
 mod review_mode;
+#[path = "tests/review_picker_tests.rs"]
+mod review_picker_tests;
 #[path = "tests/session_model_selection_tests.rs"]
 mod session_model_selection_tests;
 mod side;
 mod slash_commands;
 #[path = "tests/sparkle_submission_tests.rs"]
 mod sparkle_submission_tests;
+#[path = "tests/startup_submission_tests.rs"]
+mod startup_submission_tests;
 mod status_and_layout;
 mod status_command_tests;
 mod status_surface_previews;
+#[path = "tests/subagent_activity_tests.rs"]
+mod subagent_activity;
 mod terminal_title;
 #[path = "tests/tool_activity_tests.rs"]
 mod tool_activity_tests;
@@ -297,6 +313,9 @@ pub(super) use helpers::*;
 
 #[path = "tests/questions_tests.rs"]
 mod questions_tests;
+
+#[path = "tests/list_spacing_tests.rs"]
+mod list_spacing_tests;
 
 #[path = "tests/question_notifications_tests.rs"]
 mod question_notifications_tests;

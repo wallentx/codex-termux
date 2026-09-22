@@ -37,6 +37,7 @@ use crate::config_update::RemoteProjectTrust;
 use crate::config_update::format_config_error;
 use crate::config_update::replace_config_value;
 use crate::config_update::write_trusted_project;
+use crate::empty_state_animation::Presentation;
 use crate::key_hint::KeyBindingListExt;
 use crate::legacy_core::config::Config;
 use crate::onboarding::auth::AuthModeWidget;
@@ -135,7 +136,7 @@ impl OnboardingScreen {
         steps.push(Step::Welcome(WelcomeWidget::new(
             !matches!(login_status, LoginStatus::NotAuthenticated),
             tui.frame_requester(),
-            local_settings.tui.animations,
+            local_settings.tui.animations && local_settings.tui.effects.welcome,
         )));
         #[cfg(target_os = "windows")]
         let show_windows_create_sandbox_hint = if show_trust_screen
@@ -170,7 +171,8 @@ impl OnboardingScreen {
                     app_server_request_handle,
                     auth_config,
                     bedrock_setup_enabled,
-                    animations_enabled: local_settings.tui.animations,
+                    animations_enabled: local_settings.tui.animations
+                        && local_settings.tui.effects.shimmer,
                     animations_suppressed: std::cell::Cell::new(false),
                 }));
             } else {
@@ -404,9 +406,16 @@ fn suppress_quit_while_typing(key_event: KeyEvent, text_entry_context: TextEntry
 impl WidgetRef for &OnboardingScreen {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let suppress_animations = self.should_suppress_animations();
+        let logo_presentation = if suppress_animations {
+            Presentation::Hidden
+        } else if self.text_entry_context().active {
+            Presentation::Faded
+        } else {
+            Presentation::Animated
+        };
         for step in self.current_steps() {
             match step {
-                Step::Welcome(widget) => widget.set_animations_suppressed(suppress_animations),
+                Step::Welcome(widget) => widget.set_presentation(logo_presentation),
                 Step::Auth(widget) => widget.set_animations_suppressed(suppress_animations),
                 Step::TrustDirectory(_) => {}
             }
@@ -572,7 +581,16 @@ async fn run_onboarding_screen(
                         TuiEvent::Draw
                         | TuiEvent::Resume
                         | TuiEvent::Resize(_)
-                        | TuiEvent::FocusGained => {
+                        | TuiEvent::FocusGained
+                        | TuiEvent::FocusLost => {
+                            for step in &onboarding_screen.steps {
+                                if let Step::Welcome(widget) = step {
+                                    if matches!(&event, TuiEvent::Resume) {
+                                        widget.set_presentation(crate::empty_state_animation::Presentation::Hidden);
+                                    }
+                                    widget.set_focused(tui.is_terminal_focused());
+                                }
+                            }
                             if !did_full_clear_after_success
                                 && onboarding_screen.steps.iter().any(|step| {
                                     if let Step::Auth(w) = step {
@@ -607,7 +625,7 @@ async fn run_onboarding_screen(
                                 frame.render_widget_ref(&onboarding_screen, frame.area());
                             });
                         }
-                        TuiEvent::FocusLost => {}
+                        TuiEvent::Mouse(_) => {}
                     }
                 }
             }

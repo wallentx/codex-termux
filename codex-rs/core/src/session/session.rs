@@ -72,7 +72,7 @@ pub(crate) struct Session {
     pub(super) features: ManagedFeatures,
     pub(crate) guardian_context_mode: GuardianContextMode,
     pub(super) isolation: codex_extension_api::SessionIsolation,
-    pub(crate) allowed_tools: Option<Arc<codex_extension_api::AllowedTools>>,
+    pub(crate) tool_policy: Arc<codex_extension_api::ToolPolicy>,
     pub(crate) windows_sandbox_proxy_settings_mode:
         codex_sandboxing::WindowsSandboxProxySettingsMode,
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
@@ -716,6 +716,7 @@ impl Session {
         CodexResponsesMetadata {
             window_number: Some(window_number),
             context_window_id: Some(context_window_id),
+            mcp_attribution: Some(self.services.executed_tool_calls.mcp_attribution_snapshot()),
             analytics_enabled: Some(self.services.analytics_events_client.is_enabled()),
             history_ingest_requested: turn_context
                 .config
@@ -959,12 +960,15 @@ impl Session {
         // Publish the already resolved model before extensions make startup decisions.
         // Turn construction refreshes this attachment when the selected model changes.
         thread_extension_init.insert(model_info);
-        let allowed_tools = thread_extension_init
-            .get::<codex_extension_api::AllowedTools>()
-            .or_else(|| {
-                // Older reviewer rollouts predate the explicit startup setting.
-                crate::guardian::is_basic_session_source(&session_configuration.session_source)
-                    .then(|| Arc::new(codex_guardian_reviewer::reviewer_allowed_tools()))
+        let tool_policy = thread_extension_init
+            .get::<codex_extension_api::ToolPolicy>()
+            .unwrap_or_else(|| {
+                // Older reviewer rollouts predate the explicit startup policy.
+                if crate::guardian::is_basic_session_source(&session_configuration.session_source) {
+                    Arc::new(codex_guardian_reviewer::reviewer_tool_policy())
+                } else {
+                    Arc::default()
+                }
             });
         let mcp_thread_init = thread_extension_init.clone();
         let thread_extension_data = codex_extension_api::ExtensionData::new_with_init(
@@ -979,6 +983,8 @@ impl Session {
         // - initialize thread persistence with new or resumed session info
         // - perform default shell discovery
         // - load history metadata (skipped for subagents)
+        let persistence_auth = futures::FutureExt::shared(auth_manager.auth());
+        let mcp_auth = persistence_auth.clone();
         let thread_persistence_fut = async {
             if config.ephemeral {
                 Ok::<_, anyhow::Error>((None, LiveThreadInitGuard::new(/*live_thread*/ None)))
@@ -991,7 +997,10 @@ impl Session {
                 let guard = managed_guard.as_deref_mut().unwrap_or(&mut local_guard);
                 let live_thread = match &initial_history {
                     InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
+                        let auth = persistence_auth.await;
                         let params = CreateThreadParams {
+                            creator_user_id: auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
+                            creator_account_id: auth.as_ref().and_then(CodexAuth::get_account_id),
                             session_id,
                             thread_id,
                             extra_config: config.extra_config.clone(),
@@ -1095,7 +1104,6 @@ impl Session {
         ));
 
         let mut mcp_auth_changes = auth_manager.auth_change_receiver();
-        let auth_manager_clone = Arc::clone(&auth_manager);
         let plugins_manager_for_prewarm = Arc::clone(&plugins_manager);
         let config_for_mcp = Arc::clone(&config);
         let mcp_manager_for_mcp = Arc::clone(&mcp_manager);
@@ -1110,7 +1118,7 @@ impl Session {
             .map(|cwd| cwd.to_path_buf())
             .unwrap_or_else(|| session_configuration.cwd().to_path_buf());
         let auth_and_mcp_fut = async move {
-            let auth = auth_manager_clone.auth().await;
+            let auth = mcp_auth.await;
             if config_for_mcp.features.plugin_recommendations_enabled() {
                 let plugins_config = config_for_mcp.plugins_config_input();
                 let auth_for_prewarm = auth.clone();
@@ -1605,6 +1613,8 @@ impl Session {
             let mcp_resource_client = Arc::new(McpResourceClient::new(Arc::clone(&mcp_runtime)));
             let extension_metrics =
                 extension_metrics::from_session_telemetry(session_telemetry.clone());
+            let workspace_routing = thread_extension_data
+                .get_or_init(|| config.workspace_routing_context());
             for contributor in extensions.thread_lifecycle_contributors() {
                 contributor.on_thread_start(codex_extension_api::ThreadStartInput {
                     config: config.as_ref(),
@@ -1703,7 +1713,7 @@ impl Session {
                         .enabled(Feature::ConcurrentReasoningSummaries),
                     attestation_provider,
                     config.http_client_factory(),
-                    config.workspace_routing_context(),
+                    workspace_routing.as_ref().clone(),
                 )
                 .with_restored_history(matches!(
                     &initial_history,
@@ -1740,7 +1750,7 @@ impl Session {
                 features: config.features.clone(),
                 guardian_context_mode,
                 isolation,
-                allowed_tools,
+                tool_policy,
                 windows_sandbox_proxy_settings_mode,
                 multi_agent_version,
                 mcp_refresh: McpRefresh::new(),
