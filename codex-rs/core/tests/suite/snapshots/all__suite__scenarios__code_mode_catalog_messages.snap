@@ -15,7 +15,7 @@ Settings:
     
     User authorization and preferences persist across turns. Do not request permission again when the user h... any guidelines provided in skills or external files. [hash=911f91c92c72882c]
     
-    <OMITTED 155 LINES; ~4895 TOKENS; hash=fd5ef18a80f62502>
+    <OMITTED 155 LINES; ~4935 TOKENS; hash=5573869716192298>
     
     - Skill naming: If a plugin contributes skills, those skill entries are prefixed with plugin_name: in the Skills list.
     - MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as mcp__server__tool; use tool provenance to tell which plugin they come from.
@@ -32,14 +32,14 @@ Settings:
   stream: true
   text: {"verbosity":"low"}
   tool_choice: "auto"
-  tools (7; hash=459dc91308e98762):
+  tools (7; hash=884bfb8fc9050f65):
     - custom/exec: Catalog exec instructions. Default yield: 1234 ms. `image(imageUrlOrItem: string | { image_url: s...; hash=a49b91fd82908e18
     - function/wait: Catalog wait instructions: resume the yielded cell.; args=[cell_id, max_tokens, terminate, yield_time_ms]; hash=67bc0f04da3505b3
     - function/request_user_input: Request user input for one to three short questions and wait for the response. This tool is only ...; args=[questions]; hash=64a729b25c424fc6
     - function/request_user_input_async: Ask the user one or more questions during ongoing work. Use this tool only to request missing inf...; args=[questions]; hash=d6d74f33db330162
     - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
       - function/sleep
-    - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=46d39bbce8bacc3f
+    - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=fd994b11525da73c
       - function/followup_task
       - function/interrupt_agent
       - function/list_agents
@@ -63,15 +63,12 @@ Settings:
 
         Use the `request_user_input` tool only when it is listed in the available tools for this turn.
 
-        In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions.
-
         Use the `request_user_input` tool only for optional questions where the answer would materially improve the quality of the work.
 
         If `request_user_input` returns no answers, continue with best judgment instead of asking again or treating the turn as blocked.
 
         Never use the `request_user_input` tool for permission requests or permission-related escalations.
-
-        If explicit user input is required for another reason before progress can safely continue, do not use th... as a textual assistant message.</collaboration_mode> [hash=8213052bde4a62b2]
+        </collaboration_mode>
 01:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 

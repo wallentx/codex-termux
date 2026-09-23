@@ -85,13 +85,16 @@ impl SamplingExecution {
             | LunaSamplerError::InputTooLarge
             | LunaSamplerError::Api(
                 ApiError::Transport(
-                    TransportError::Build(_) | TransportError::ResponseTooLarge { .. },
+                    TransportError::Build(_)
+                    | TransportError::ResponseTooLarge { .. }
+                    | TransportError::Policy(_),
                 )
                 | ApiError::ContextWindowExceeded
                 | ApiError::QuotaExceeded
                 | ApiError::UsageNotIncluded
                 | ApiError::RateLimit(_)
                 | ApiError::InvalidRequest { .. }
+                | ApiError::InvalidPrompt { .. }
                 | ApiError::MisalignmentPolicyViolation { .. }
                 | ApiError::CyberPolicy { .. }
                 | ApiError::BioPolicy { .. },

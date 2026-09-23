@@ -18,6 +18,8 @@ use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
@@ -36,12 +38,16 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
+use crate::session::ThreadEnvironmentDefaults;
 use crate::session::turn_context::ShellSnapshotCache;
 use crate::session::turn_context::ShellSnapshotTask;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::shell_snapshot::SnapshotCredentialBrokerState;
+
+// Reject pathological selected cwd values at the environment-selection boundary.
+const MAX_TURN_ENVIRONMENT_CWD_BYTES: usize = 8 * 1024;
 
 /// Records whether a normalized config should follow later thread setting updates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +139,36 @@ pub(crate) fn default_thread_environment_selections(
         .collect()
 }
 
+/// Checks that environment IDs are registered and unique and that working directories are not too long.
+pub fn validate_environment_ids_and_cwds(
+    environment_manager: &EnvironmentManager,
+    environments: &[TurnEnvironmentSelection],
+) -> CodexResult<()> {
+    let mut environment_ids = HashSet::with_capacity(environments.len());
+    for environment in environments {
+        if environment.cwd.inferred_native_path_string().len() > MAX_TURN_ENVIRONMENT_CWD_BYTES {
+            return Err(CodexErr::InvalidRequest(
+                "turn environment working directory exceeds the maximum size".to_string(),
+            ));
+        }
+        if !environment_ids.insert(environment.environment_id.as_str()) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "duplicate turn environment id `{}`",
+                environment.environment_id
+            )));
+        }
+        environment_manager
+            .get_environment(&environment.environment_id)
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(format!(
+                    "unknown turn environment id `{}`",
+                    environment.environment_id
+                ))
+            })?;
+    }
+    Ok(())
+}
+
 type TurnEnvironmentResult = Result<ResolvedEnvironment, Arc<ExecServerError>>;
 type TurnEnvironmentResolution = Shared<BoxFuture<'static, TurnEnvironmentResult>>;
 type PendingConfigurationResult = Result<EnvironmentConfig, String>;
@@ -171,17 +207,14 @@ pub(crate) struct StartingTurnEnvironment {
     resolution: TurnEnvironmentResolution,
 }
 
-/// Resolves config once at the attachment boundary and records who owns future updates.
+/// Uses the current thread defaults when requested and records who owns later config updates.
 fn resolve_selection_config(
     mut selection: TurnEnvironmentSelection,
-    thread_config: &EnvironmentConfig,
+    defaults: &ThreadEnvironmentDefaults,
 ) -> (TurnEnvironmentSelection, EnvironmentConfigOrigin) {
     let (config, origin) = match selection.config {
         EnvironmentConfigState::FromThread => (
-            EnvironmentConfigState::Ready(thread_config_for_selection(
-                &selection.workspace_roots,
-                thread_config,
-            )),
+            EnvironmentConfigState::Ready(defaults.for_selection(&selection)),
             EnvironmentConfigOrigin::Thread,
         ),
         config @ (EnvironmentConfigState::Ready(_)
@@ -192,23 +225,11 @@ fn resolve_selection_config(
     (selection, origin)
 }
 
-fn thread_config_for_selection(
-    workspace_roots: &[PathUri],
-    thread_config: &EnvironmentConfig,
-) -> EnvironmentConfig {
-    EnvironmentConfig {
-        workspace_roots: workspace_roots.to_vec(),
-        ..thread_config.clone()
-    }
-}
-
 impl SelectedTurnEnvironment {
-    fn refresh_thread_config(&mut self, config: &EnvironmentConfig) {
+    fn refresh_thread_config(&mut self, defaults: &ThreadEnvironmentDefaults) {
         if self.config_origin == EnvironmentConfigOrigin::Thread {
-            self.selection.config = EnvironmentConfigState::Ready(thread_config_for_selection(
-                &self.selection.workspace_roots,
-                config,
-            ));
+            self.selection.config =
+                EnvironmentConfigState::Ready(defaults.for_selection(&self.selection));
         }
     }
 }
@@ -239,15 +260,20 @@ pub(crate) struct ThreadEnvironments {
     local_shell: Shell,
     shell_snapshot: ShellSnapshot,
     non_blocking_snapshots: bool,
-    environments: Mutex<Vec<SelectedTurnEnvironment>>,
+    state: Mutex<ThreadEnvironmentsState>,
     connection_event_tx: OnceLock<Sender<Event>>,
+}
+
+struct ThreadEnvironmentsState {
+    thread_defaults: ThreadEnvironmentDefaults,
+    environments: Vec<SelectedTurnEnvironment>,
 }
 
 impl ThreadEnvironments {
     pub(crate) fn new(
         environment_manager: Arc<EnvironmentManager>,
         local_shell: Shell,
-        thread_environment_config: EnvironmentConfig,
+        thread_defaults: ThreadEnvironmentDefaults,
         shell_snapshot: ShellSnapshot,
         current: TurnEnvironmentSnapshot,
         non_blocking_snapshots: bool,
@@ -296,7 +322,7 @@ impl ThreadEnvironments {
                     pending_completion: None,
                 };
                 // Child threads re-infer thread-owned config while preserving owner config.
-                inherited_environment.refresh_thread_config(&thread_environment_config);
+                inherited_environment.refresh_thread_config(&thread_defaults);
                 Some(inherited_environment)
             })
             .collect();
@@ -305,7 +331,10 @@ impl ThreadEnvironments {
             local_shell,
             shell_snapshot,
             non_blocking_snapshots,
-            environments: Mutex::new(environments),
+            state: Mutex::new(ThreadEnvironmentsState {
+                thread_defaults,
+                environments,
+            }),
             connection_event_tx: OnceLock::new(),
         }
     }
@@ -340,23 +369,19 @@ impl ThreadEnvironments {
         shell_snapshot
     }
 
-    pub(crate) fn update_selections(
-        &self,
-        environments: &[TurnEnvironmentSelection],
-        thread_environment_config: &EnvironmentConfig,
-    ) {
-        let mut current = self
-            .environments
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+    /// Updates the selected list before waking work that was waiting on the previous selection.
+    pub(crate) fn update_selections(&self, environments: &[TurnEnvironmentSelection]) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let ThreadEnvironmentsState {
+            thread_defaults,
+            environments: current,
+        } = &mut *state;
         let mut seen_environment_ids = HashSet::with_capacity(environments.len());
         let mut next = Vec::with_capacity(environments.len());
         for selected_environment in environments {
             if !seen_environment_ids.insert(selected_environment.environment_id.as_str()) {
                 continue;
             }
-            let (selected_environment, config_origin) =
-                resolve_selection_config(selected_environment.clone(), thread_environment_config);
             if let Some(environment) = current.iter().find(|environment| {
                 let previous = &environment.selection;
                 previous.environment_id == selected_environment.environment_id
@@ -376,6 +401,8 @@ impl ThreadEnvironments {
                         );
 
                 if !failed && !restarting_as_pending {
+                    let (selected_environment, config_origin) =
+                        resolve_selection_config(selected_environment.clone(), thread_defaults);
                     let shell_settings_changed = matches!(
                         (&environment.selection.config, &selected_environment.config),
                         (EnvironmentConfigState::Ready(previous), EnvironmentConfigState::Ready(current))
@@ -402,6 +429,8 @@ impl ThreadEnvironments {
                 tracing::warn!("skipping unknown turn environment `{environment_id}`");
                 continue;
             };
+            let (selected_environment, config_origin) =
+                resolve_selection_config(selected_environment.clone(), thread_defaults);
             // Connection state belongs to the environment instance, not its cwd or roots.
             let connection_events_task = current
                 .iter()
@@ -460,7 +489,7 @@ impl ThreadEnvironments {
                 .then(|| Arc::clone(task))
             })
             .collect::<Vec<_>>();
-        let previous = std::mem::replace(&mut *current, next);
+        let previous = std::mem::replace(current, next);
 
         // Publish owner configuration before waking turns waiting on this attachment.
         for environment in current.iter() {
@@ -478,14 +507,16 @@ impl ThreadEnvironments {
         for task in removed_connection_tasks {
             task.abort();
         }
+
         drop(previous);
     }
 
     /// Projects canonical selections back to caller input form without losing config ownership.
     pub(crate) fn selections(&self) -> Vec<TurnEnvironmentSelection> {
-        self.environments
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .environments
             .iter()
             .map(|environment| {
                 environment
@@ -522,22 +553,28 @@ impl ThreadEnvironments {
             .unwrap_or_default()
     }
 
-    /// Refreshes attachments whose configuration is inferred from the thread.
-    pub(crate) fn update_thread_config(&self, config: &EnvironmentConfig) {
-        let mut environments = self
-            .environments
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+    /// Changes the defaults inherited by all selected and later-added environments. A step that
+    /// already captured its environments keeps the previous values.
+    pub(crate) fn set_active_thread_defaults(&self, defaults: EnvironmentConfig) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let ThreadEnvironmentsState {
+            thread_defaults,
+            environments,
+        } = &mut *state;
+        if thread_defaults.common == defaults {
+            return;
+        }
+        thread_defaults.common = defaults;
         for environment in environments.iter_mut() {
             let shell_settings_changed = environment.config_origin
                 == EnvironmentConfigOrigin::Thread
                 && matches!(
                     &environment.selection.config,
                     EnvironmentConfigState::Ready(previous)
-                        if previous.allow_login_shell != config.allow_login_shell
-                            || previous.shell_environment_policy != config.shell_environment_policy
+                        if previous.allow_login_shell != thread_defaults.common.allow_login_shell
+                            || previous.shell_environment_policy != thread_defaults.common.shell_environment_policy
                 );
-            environment.refresh_thread_config(config);
+            environment.refresh_thread_config(thread_defaults);
             if shell_settings_changed
                 && !environment.environment.is_remote()
                 && self.shell_snapshot.should_rebuild_inherited()
@@ -548,16 +585,13 @@ impl ThreadEnvironments {
         }
     }
 
-    pub(crate) fn set_snapshot_credential_broker(&self, state: SnapshotCredentialBrokerState) {
-        let mut environments = self
-            .environments
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !self.shell_snapshot.set_credential_broker(state) {
+    pub(crate) fn set_snapshot_credential_broker(&self, broker: SnapshotCredentialBrokerState) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.shell_snapshot.set_credential_broker(broker) {
             return;
         }
 
-        for selected in environments.iter_mut() {
+        for selected in &mut state.environments {
             if !selected.environment.is_remote()
                 && let Some(Ok(resolved)) = selected.resolution.clone().now_or_never()
             {
@@ -594,10 +628,8 @@ impl ThreadEnvironments {
         &self,
         thread_selected_capability_roots: &[SelectedCapabilityRoot],
     ) -> SelectedCapabilityRootsStatus {
-        let environments = self
-            .environments
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let environments = &state.environments;
         let mut selected_capability_roots = combine_selected_capability_roots(
             thread_selected_capability_roots,
             environments.iter().filter_map(|environment| {
@@ -675,12 +707,9 @@ impl ThreadEnvironments {
     }
 
     pub(crate) fn start_connection_event_forwarding(&self, tx_event: Sender<Event>) {
-        let mut environments = self
-            .environments
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let tx_event = self.connection_event_tx.get_or_init(|| tx_event);
-        for selected in environments.iter_mut() {
+        for selected in &mut state.environments {
             if selected.connection_events_task.is_none() {
                 selected.connection_events_task = Self::spawn_connection_event_listener(
                     selected.environment.as_ref(),
@@ -799,54 +828,58 @@ impl ThreadEnvironments {
     /// Captures the selected list immediately, then returns a future that may wait for setup.
     /// This lets callers release their locks before waiting without accidentally using a newer
     /// selection. The trace still covers the setup wait itself.
+    pub(crate) fn snapshot(
+        &self,
+    ) -> impl Future<Output = TurnEnvironmentSnapshot> + Send + 'static {
+        self.resolve_snapshot(self.snapshot_now())
+    }
+
+    /// Copies the current selection without waiting for any executor to connect.
+    pub(crate) fn snapshot_now(&self) -> TurnEnvironmentSnapshot {
+        // Keep the startup results, but not the senders that would keep removed Pending work alive.
+        let environments = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .environments
+            .iter()
+            .map(|environment| {
+                let starting = StartingTurnEnvironment {
+                    selection: environment.selection.clone(),
+                    config_origin: environment.config_origin,
+                    resolution: environment.resolution.clone(),
+                };
+                let resolved = starting.resolution.clone().now_or_never();
+                TurnEnvironmentState::from_resolution(starting, resolved)
+            })
+            .collect();
+        TurnEnvironmentSnapshot { environments }
+    }
+
+    /// Applies the same startup policy to an already captured selection without adopting newer ones.
     #[tracing::instrument(
         name = "environments.snapshot",
         skip_all,
         fields(
-            environment_count = selected.len(),
+            environment_count = snapshot.environments.len(),
             non_blocking = non_blocking_snapshots,
         )
     )]
-    pub(crate) fn snapshot(
+    fn resolve_snapshot(
         &self,
+        snapshot: TurnEnvironmentSnapshot,
     ) -> impl Future<Output = TurnEnvironmentSnapshot> + Send + 'static {
-        // Keep the startup results, but not the senders that would keep removed Pending work alive.
-        let selected = self
-            .environments
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .map(|environment| StartingTurnEnvironment {
-                selection: environment.selection.clone(),
-                config_origin: environment.config_origin,
-                resolution: environment.resolution.clone(),
-            })
-            .collect::<Vec<_>>();
         let non_blocking_snapshots = self.non_blocking_snapshots;
         async move {
-            let mut environments = Vec::with_capacity(selected.len());
-            for starting in selected {
-                if let EnvironmentConfigState::Failed(error) = &starting.selection.config {
-                    environments.push(TurnEnvironmentState::Failed {
-                        selection: starting
-                            .config_origin
-                            .into_input_selection(starting.selection.clone()),
-                        error: error.clone(),
-                    });
-                    continue;
+            if !non_blocking_snapshots {
+                for starting in snapshot.starting() {
+                    if !matches!(starting.selection.config, EnvironmentConfigState::Pending) {
+                        let _ = starting.wait_until_ready().await;
+                    }
                 }
-                let pending = matches!(starting.selection.config, EnvironmentConfigState::Pending);
-                let resolved = if non_blocking_snapshots || pending {
-                    starting.resolution.clone().now_or_never()
-                } else {
-                    Some(match starting.wait_until_ready().await {
-                        Ok(()) => starting.resolution.clone().await,
-                        Err(error) => Err(error),
-                    })
-                };
-                environments.push(TurnEnvironmentState::from_resolution(starting, resolved));
             }
-            TurnEnvironmentSnapshot { environments }
+            // An earlier environment may have become ready while we waited for a later one.
+            snapshot.refresh_readiness()
         }
     }
 
@@ -872,6 +905,15 @@ impl TurnEnvironmentState {
         starting: StartingTurnEnvironment,
         resolved: Option<TurnEnvironmentResult>,
     ) -> Self {
+        if let EnvironmentConfigState::Failed(error) = &starting.selection.config {
+            let error = error.clone();
+            return Self::Failed {
+                selection: starting
+                    .config_origin
+                    .into_input_selection(starting.selection),
+                error,
+            };
+        }
         match resolved {
             Some(Ok(environment)) => {
                 let mut selection = starting.selection;
@@ -1143,6 +1185,7 @@ mod tests {
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::permissions::FileSystemSandboxPolicyContext;
     use codex_protocol::protocol::TurnEnvironmentSelection;
+    use codex_protocol::sandbox::SandboxType;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_path_uri::PathUri;
     use futures::SinkExt;
@@ -1184,12 +1227,12 @@ mod tests {
         let turn_environments = Arc::new(ThreadEnvironments::new(
             environment_manager,
             crate::shell::default_user_shell(),
-            test_environment_config(),
+            ThreadEnvironmentDefaults::new(test_environment_config(), SandboxType::None),
             ShellSnapshot::disabled(),
             TurnEnvironmentSnapshot::default(),
             /*non_blocking_snapshots*/ false,
         ));
-        turn_environments.update_selections(selections, &test_environment_config());
+        turn_environments.update_selections(selections);
         turn_environments.snapshot().await;
         turn_environments
     }
@@ -1253,6 +1296,7 @@ mod tests {
                         "userHomeDir": "file:///home/remote",
                         "platformOs": "windows",
                         "temporaryDirectories": ["file:///tmp/remote"],
+                        "capabilities": {"windowsMxc": true},
                     }
                 })
                 .to_string()
@@ -1362,20 +1406,20 @@ url = "ws://127.0.0.1:8765"
         let turn_environments = ThreadEnvironments::new(
             Arc::new(EnvironmentManager::default_for_tests()),
             local_shell.clone(),
-            expected_config.clone(),
+            ThreadEnvironmentDefaults::new(
+                expected_config.clone(),
+                expected_config.windows_sandbox_type,
+            ),
             ShellSnapshot::disabled(),
             TurnEnvironmentSnapshot::default(),
             /*non_blocking_snapshots*/ false,
         );
-        turn_environments.update_selections(
-            &[TurnEnvironmentSelection {
-                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
-                cwd: PathUri::from_abs_path(&cwd),
-                workspace_roots: Vec::new(),
-                config: EnvironmentConfigState::FromThread,
-            }],
-            &expected_config,
-        );
+        turn_environments.update_selections(&[TurnEnvironmentSelection {
+            environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+            cwd: PathUri::from_abs_path(&cwd),
+            workspace_roots: Vec::new(),
+            config: EnvironmentConfigState::FromThread,
+        }]);
 
         let snapshot = turn_environments.snapshot().await;
         let environment = snapshot.primary().expect("local environment");
@@ -1537,13 +1581,12 @@ url = "ws://127.0.0.1:8765"
         let environments = Arc::new(ThreadEnvironments::new(
             manager,
             crate::shell::default_user_shell(),
-            test_environment_config(),
+            ThreadEnvironmentDefaults::new(test_environment_config(), SandboxType::None),
             ShellSnapshot::disabled(),
             TurnEnvironmentSnapshot::default(),
             /*non_blocking_snapshots*/ false,
         ));
-        environments
-            .update_selections(std::slice::from_ref(&selection), &test_environment_config());
+        environments.update_selections(std::slice::from_ref(&selection));
         // Exercise first-use callsite registration from a thread without a subscriber.
         std::thread::spawn({
             let environments = Arc::clone(&environments);
@@ -1590,8 +1633,15 @@ url = "ws://127.0.0.1:8765"
         );
     }
 
+    #[test_case::test_case(SandboxType::None, SandboxType::None, WindowsSandboxLevel::Disabled; "legacy")]
+    #[test_case::test_case(SandboxType::WindowsRestrictedToken, SandboxType::WindowsMxc, WindowsSandboxLevel::Elevated; "local preference")]
+    #[test_case::test_case(SandboxType::WindowsMxc, SandboxType::WindowsMxc, WindowsSandboxLevel::Disabled; "explicit MXC")]
     #[tokio::test]
-    async fn snapshot_refreshes_readiness_in_selection_order() {
+    async fn snapshot_refreshes_readiness_in_selection_order(
+        configured_sandbox: SandboxType,
+        local_sandbox: SandboxType,
+        legacy_level: WindowsSandboxLevel,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind websocket listener");
@@ -1609,8 +1659,8 @@ url = "ws://127.0.0.1:8765"
         let expected_config = EnvironmentConfig {
             allow_login_shell: false,
             workspace_roots: Vec::new(),
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_type: codex_protocol::sandbox::SandboxType::None,
+            windows_sandbox_level: legacy_level,
+            windows_sandbox_type: configured_sandbox,
             use_legacy_landlock: false,
             permission_profile: PermissionProfileSnapshot::active_with_profile_workspace_roots(
                 PermissionProfile::read_only(),
@@ -1622,6 +1672,10 @@ url = "ws://127.0.0.1:8765"
             mcp_policy: None,
             network_policy: None,
             selected_capability_roots: Vec::new(),
+        };
+        let expected_local_config = EnvironmentConfig {
+            windows_sandbox_type: local_sandbox,
+            ..expected_config.clone()
         };
         let cwd = PathUri::from_abs_path(&cwd);
         let remote = TurnEnvironmentSelection {
@@ -1637,20 +1691,32 @@ url = "ws://127.0.0.1:8765"
             config: EnvironmentConfigState::FromThread,
         };
         let turn_environments = ThreadEnvironments::new(
-            manager,
+            Arc::clone(&manager),
             crate::shell::default_user_shell(),
-            test_environment_config(),
+            ThreadEnvironmentDefaults::new(test_environment_config(), local_sandbox),
             ShellSnapshot::disabled(),
             TurnEnvironmentSnapshot::default(),
             /*non_blocking_snapshots*/ true,
         );
-        turn_environments
-            .update_selections(std::slice::from_ref(&local), &test_environment_config());
-        let resolution = turn_environments.environments.lock().unwrap()[0]
+        turn_environments.update_selections(std::slice::from_ref(&local));
+        let resolution = turn_environments.state.lock().unwrap().environments[0]
             .resolution
             .clone();
         resolution.await.expect("local environment should resolve");
-        turn_environments.update_selections(&[remote.clone(), local.clone()], &expected_config);
+        turn_environments.update_selections(&[remote.clone(), local.clone()]);
+        let initial = turn_environments.snapshot().await;
+        assert_eq!(
+            initial.primary().expect("local environment").config(),
+            &EnvironmentConfig {
+                windows_sandbox_type: local_sandbox,
+                ..test_environment_config()
+            },
+        );
+        assert_eq!(
+            initial.starting().next().unwrap().selection.config,
+            EnvironmentConfigState::Ready(test_environment_config()),
+        );
+        turn_environments.set_active_thread_defaults(expected_config.clone());
 
         let starting = turn_environments.snapshot().await;
         let resolved_remote = TurnEnvironmentSelection {
@@ -1669,7 +1735,7 @@ url = "ws://127.0.0.1:8765"
                 .turn_environments()
                 .map(|environment| environment.config().clone())
                 .collect::<Vec<_>>(),
-            vec![expected_config.clone()]
+            vec![expected_local_config.clone()]
         );
         assert_eq!(
             starting
@@ -1689,7 +1755,7 @@ url = "ws://127.0.0.1:8765"
             permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
             ..test_environment_config()
         };
-        turn_environments.update_thread_config(&next_config);
+        turn_environments.set_active_thread_defaults(next_config.clone());
         let next_starting = turn_environments.snapshot().await;
         assert!(
             !next_starting.has_full_access(AskForApproval::Never, &PermissionProfile::Disabled)
@@ -1713,6 +1779,27 @@ url = "ws://127.0.0.1:8765"
         let attached = starting.refresh_readiness();
 
         assert!(attached.starting().next().is_none());
+        let child = ThreadEnvironments::new(
+            manager,
+            crate::shell::default_user_shell(),
+            ThreadEnvironmentDefaults::new(next_config.clone(), local_sandbox),
+            ShellSnapshot::disabled(),
+            attached.clone(),
+            /*non_blocking_snapshots*/ true,
+        );
+        assert_eq!(
+            child
+                .snapshot()
+                .await
+                .turn_environments()
+                .map(|environment| environment.config().clone())
+                .collect::<Vec<_>>(),
+            next_starting
+                .refresh_readiness()
+                .turn_environments()
+                .map(|environment| environment.config().clone())
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(
             attached
                 .turn_environments()
@@ -1725,7 +1812,7 @@ url = "ws://127.0.0.1:8765"
                 .turn_environments()
                 .map(|environment| environment.config().clone())
                 .collect::<Vec<_>>(),
-            vec![expected_config.clone(), expected_config]
+            vec![expected_config, expected_local_config]
         );
         assert_eq!(
             attached
@@ -1756,7 +1843,13 @@ url = "ws://127.0.0.1:8765"
                 .turn_environments()
                 .map(|environment| environment.config().clone())
                 .collect::<Vec<_>>(),
-            vec![next_config.clone(), next_config]
+            vec![
+                next_config.clone(),
+                EnvironmentConfig {
+                    windows_sandbox_type: local_sandbox,
+                    ..next_config
+                }
+            ]
         );
         server.await.expect("server task");
     }
@@ -1779,15 +1872,14 @@ url = "ws://127.0.0.1:8765"
         let environments = ThreadEnvironments::new(
             Arc::clone(&manager),
             crate::shell::default_user_shell(),
-            test_environment_config(),
+            ThreadEnvironmentDefaults::new(test_environment_config(), SandboxType::None),
             ShellSnapshot::disabled(),
             TurnEnvironmentSnapshot::default(),
             /*non_blocking_snapshots*/ true,
         );
-        environments
-            .update_selections(std::slice::from_ref(&selection), &test_environment_config());
+        environments.update_selections(std::slice::from_ref(&selection));
         let starting = environments.snapshot().await;
-        let failed_resolution = environments.environments.lock().unwrap()[0]
+        let failed_resolution = environments.state.lock().unwrap().environments[0]
             .resolution
             .clone();
         let error = failed_resolution
@@ -1833,12 +1925,13 @@ url = "ws://127.0.0.1:8765"
             allow_login_shell: false,
             ..test_environment_config()
         };
-        environments.update_thread_config(&next_config);
+        environments.set_active_thread_defaults(next_config.clone());
         assert!(
-            failed_resolution.ptr_eq(&environments.environments.lock().unwrap()[0].resolution),
+            failed_resolution
+                .ptr_eq(&environments.state.lock().unwrap().environments[0].resolution),
             "updating environment config must not retry a failed environment"
         );
-        environments.update_selections(std::slice::from_ref(&selection), &next_config);
+        environments.update_selections(std::slice::from_ref(&selection));
 
         let replacement = environments.snapshot().await;
         let replacement = replacement
@@ -1882,14 +1975,13 @@ url = "ws://127.0.0.1:8765"
         let environments = Arc::new(ThreadEnvironments::new(
             Arc::clone(&manager),
             crate::shell::default_user_shell(),
-            test_environment_config(),
+            ThreadEnvironmentDefaults::new(test_environment_config(), SandboxType::None),
             ShellSnapshot::disabled(),
             TurnEnvironmentSnapshot::default(),
             /*non_blocking_snapshots*/ true,
         ));
         environments.start_connection_event_forwarding(tx_event);
-        environments
-            .update_selections(std::slice::from_ref(&selection), &test_environment_config());
+        environments.update_selections(std::slice::from_ref(&selection));
         let initial_snapshot = environments.snapshot().await;
         let second_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1907,16 +1999,12 @@ url = "ws://127.0.0.1:8765"
             )
             .expect("replace environment");
 
-        environments
-            .update_selections(std::slice::from_ref(&selection), &test_environment_config());
+        environments.update_selections(std::slice::from_ref(&selection));
         let reused_snapshot = environments.snapshot().await;
-        environments.update_selections(
-            &[TurnEnvironmentSelection {
-                cwd: PathUri::from_abs_path(&cwd.join("changed")),
-                ..selection
-            }],
-            &test_environment_config(),
-        );
+        environments.update_selections(&[TurnEnvironmentSelection {
+            cwd: PathUri::from_abs_path(&cwd.join("changed")),
+            ..selection
+        }]);
         let changed_snapshot = environments.snapshot().await;
 
         let initial = initial_snapshot
@@ -2014,7 +2102,7 @@ url = "ws://127.0.0.1:8765"
         let environments = ThreadEnvironments::new(
             manager,
             crate::shell::default_user_shell(),
-            child_config.clone(),
+            ThreadEnvironmentDefaults::new(child_config.clone(), child_config.windows_sandbox_type),
             ShellSnapshot::disabled(),
             TurnEnvironmentSnapshot {
                 environments: vec![TurnEnvironmentState::Ready(inherited)],
@@ -2022,7 +2110,7 @@ url = "ws://127.0.0.1:8765"
             /*non_blocking_snapshots*/ false,
         );
 
-        environments.update_selections(std::slice::from_ref(&selection), &child_config);
+        environments.update_selections(std::slice::from_ref(&selection));
         let snapshot = environments.snapshot().await;
 
         let inherited = snapshot.primary().expect("inherited environment");
@@ -2062,8 +2150,16 @@ url = "ws://127.0.0.1:8765"
             },
         };
         let manager = Arc::new(EnvironmentManager::default_for_tests());
-        let parent =
-            resolve_turn_environments(Arc::clone(&manager), std::slice::from_ref(&selection)).await;
+        let parent = ThreadEnvironments::new(
+            Arc::clone(&manager),
+            crate::shell::default_user_shell(),
+            ThreadEnvironmentDefaults::new(test_environment_config(), SandboxType::WindowsMxc),
+            ShellSnapshot::disabled(),
+            TurnEnvironmentSnapshot::default(),
+            /*non_blocking_snapshots*/ false,
+        );
+        parent.update_selections(std::slice::from_ref(&selection));
+        parent.snapshot().await;
         let parent_owner_config = EnvironmentConfig {
             allow_login_shell: false,
             workspace_roots: selection.workspace_roots.clone(),
@@ -2079,18 +2175,16 @@ url = "ws://127.0.0.1:8765"
         };
         let mut owner_selection = selection.clone();
         owner_selection.config = EnvironmentConfigState::Ready(parent_owner_config.clone());
-        parent.update_selections(
-            std::slice::from_ref(&owner_selection),
-            &test_environment_config(),
-        );
+        parent.update_selections(std::slice::from_ref(&owner_selection));
 
         let child_thread_config = EnvironmentConfig {
+            windows_sandbox_type: SandboxType::WindowsMxc,
             permission_profile: PermissionProfileSnapshot::legacy(
                 PermissionProfile::workspace_write(),
             ),
             ..test_environment_config()
         };
-        parent.update_thread_config(&child_thread_config);
+        parent.set_active_thread_defaults(child_thread_config.clone());
         assert_eq!(
             parent
                 .snapshot()
@@ -2103,7 +2197,7 @@ url = "ws://127.0.0.1:8765"
         let child = ThreadEnvironments::new(
             manager,
             crate::shell::default_user_shell(),
-            child_thread_config.clone(),
+            ThreadEnvironmentDefaults::new(child_thread_config.clone(), SandboxType::WindowsMxc),
             ShellSnapshot::disabled(),
             parent.snapshot().await,
             /*non_blocking_snapshots*/ false,
@@ -2116,7 +2210,7 @@ url = "ws://127.0.0.1:8765"
             ..parent_owner_config.clone()
         };
         owner_selection.config = EnvironmentConfigState::Ready(cleared_parent_owner_config.clone());
-        parent.update_selections(std::slice::from_ref(&owner_selection), &child_thread_config);
+        parent.update_selections(std::slice::from_ref(&owner_selection));
         let cleared_snapshot = parent.snapshot().await;
         assert_eq!(
             cleared_snapshot
@@ -2131,11 +2225,10 @@ url = "ws://127.0.0.1:8765"
             cwd: PathUri::from_abs_path(&cwd.join("changed")),
             ..selection
         };
-        let new_thread_config = test_environment_config();
-        parent.update_selections(std::slice::from_ref(&changed_selection), &new_thread_config);
+        parent.update_selections(std::slice::from_ref(&changed_selection));
         let changed_snapshot = parent.snapshot().await;
         let changed_environment = changed_snapshot.primary().expect("changed environment");
-        assert_eq!(changed_environment.config(), &new_thread_config);
+        assert_eq!(changed_environment.config(), &child_thread_config);
     }
 
     #[tokio::test]

@@ -189,11 +189,6 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
     }))?;
     append_rollout_item_to_path(
         &path,
-        &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
-    )
-    .await?;
-    append_rollout_item_to_path(
-        &path,
         &RolloutItem::Compacted(CompactedItem {
             message: "compacted history".to_string(),
             replacement_history: Some(Vec::new()),
@@ -206,7 +201,13 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
             window_id: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
+    )
+    .await?;
+    append_rollout_item_to_path(
+        &path,
+        &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
     )
     .await?;
 
