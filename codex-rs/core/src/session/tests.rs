@@ -1,3 +1,4 @@
+use crate::agent::LocalAgentControl;
 #[path = "notification_tests.rs"]
 mod notification_tests;
 
@@ -6199,7 +6200,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
-        LocalAgentControl::default(),
+        LocalAgentControl::default().into(),
         /*reserved_thread_id*/ None,
         environment_manager,
         /*inherited_environments*/ None,
@@ -6488,7 +6489,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         mcp_thread_init: codex_extension_api::ExtensionDataInit::default(),
         client_mcp_extensions: ClientMcpExtensions::default(),
         local_agent_runtime: agent_control.runtime.clone(),
-        agent_control,
+        agent_control: Arc::new(agent_control),
         network_proxy: arc_swap::ArcSwapOption::from(None),
         network_proxy_audit_metadata: crate::config::NetworkProxyAuditMetadata::default(),
         managed_network_requirements_configured: false,
@@ -6748,7 +6749,7 @@ async fn make_session_with_config_and_rx(
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
-        LocalAgentControl::default(),
+        LocalAgentControl::default().into(),
         /*reserved_thread_id*/ None,
         environment_manager,
         /*inherited_environments*/ None,
@@ -6880,7 +6881,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
-        agent_control,
+        agent_control.into(),
         /*reserved_thread_id*/ None,
         environment_manager,
         /*inherited_environments*/ None,
@@ -8758,7 +8759,7 @@ where
         mcp_thread_init: codex_extension_api::ExtensionDataInit::default(),
         client_mcp_extensions: ClientMcpExtensions::default(),
         local_agent_runtime: agent_control.runtime.clone(),
-        agent_control,
+        agent_control: Arc::new(agent_control),
         network_proxy: arc_swap::ArcSwapOption::from(None),
         network_proxy_audit_metadata: crate::config::NetworkProxyAuditMetadata::default(),
         managed_network_requirements_configured: false,
@@ -8916,6 +8917,94 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+#[tokio::test]
+async fn cancelled_step_capture_finishes_warning_delivery() {
+    struct WarningProvider {
+        warnings: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl codex_extension_api::ThreadInstructionsProvider for WarningProvider {
+        fn load_thread_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
+            Box::pin(async {
+                codex_extension_api::LoadedUserInstructions {
+                    instructions: None,
+                    warnings: std::mem::take(&mut *self.warnings.lock().expect("warnings")),
+                }
+            })
+        }
+    }
+
+    let warnings = vec![
+        "first provider warning".to_string(),
+        "second provider warning".to_string(),
+    ];
+    let warning_fields = |event: Event| match event.msg {
+        EventMsg::Warning(warning) => (event.id, warning.message),
+        other => panic!("expected a warning, got {other:?}"),
+    };
+    let (mut session, mut turn) = make_session_and_context().await;
+    Arc::make_mut(&mut turn.config).project_doc_max_bytes = 0;
+    session.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
+        thread_provider: Some(Arc::new(WarningProvider {
+            warnings: std::sync::Mutex::new(warnings.clone()),
+        })),
+        ..Default::default()
+    }));
+    attach_thread_persistence(&mut session).await;
+    let (tx, rx) = async_channel::bounded(/*cap*/ 1);
+    session.tx_event = tx;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let cancellation = CancellationToken::new();
+    let mut capture = Box::pin(tokio::task::unconstrained(
+        session.capture_step_context(Arc::clone(&turn), &cancellation),
+    ));
+    let first_warning = tokio::select! {
+        _ = &mut capture => panic!("capture must wait to deliver both warnings"),
+        event = timeout(Duration::from_secs(5), rx.recv()) => {
+            event.expect("first warning arrives").expect("event channel open")
+        }
+    };
+    assert_eq!(
+        warning_fields(first_warning.clone()),
+        (INITIAL_SUBMIT_ID.to_owned(), warnings[0].clone()),
+    );
+
+    // Keep the second warning blocked while cancellation is observed.
+    session
+        .tx_event
+        .try_send(first_warning.clone())
+        .expect("fill event channel");
+    cancellation.cancel();
+    assert!(futures::poll!(capture.as_mut()).is_pending());
+    assert_eq!(
+        warning_fields(rx.recv().await.expect("release event delivery")),
+        warning_fields(first_warning),
+    );
+    let Err(error) = capture.await else {
+        panic!("cancelled step cannot be published");
+    };
+    assert!(matches!(error.details(), CodexErrorDetails::TurnAborted));
+    assert_eq!(
+        warning_fields(
+            rx.try_recv()
+                .expect("second warning delivered before returning")
+        ),
+        (INITIAL_SUBMIT_ID.to_owned(), warnings[1].clone()),
+    );
+    assert!(
+        turn.extension_data
+            .get::<codex_extension_api::SelectedPluginSnapshot>()
+            .is_none()
+    );
+
+    session
+        .capture_step_context(turn, &CancellationToken::new())
+        .await
+        .expect("next capture succeeds without repeating consumed warnings");
+    assert!(rx.is_empty());
 }
 
 #[tokio::test]

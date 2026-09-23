@@ -108,6 +108,7 @@ members = [
     "user-verification",
     "tools",
     "v8-poc",
+    "websocket-auth",
     "websocket-client",
     "windows-sandbox-service",
     "worktree",
@@ -155,7 +156,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.157.0-alpha.11"
+version = "0.158.0-alpha.2"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -198,6 +199,7 @@ codex-code-mode-protocol = { path = "code-mode-protocol" }
 codex-code-mode-runtime = { path = "code-mode-runtime" }
 codex-home = { path = "codex-home" }
 codex-http-client = { path = "http-client" }
+codex-websocket-auth = { path = "websocket-auth" }
 codex-websocket-client = { path = "websocket-client" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
