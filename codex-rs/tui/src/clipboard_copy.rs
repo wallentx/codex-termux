@@ -365,10 +365,10 @@ impl Drop for SuppressStderr {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "android"), not(target_os = "macos")))]
 struct SuppressStderr;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "android"), not(target_os = "macos")))]
 impl SuppressStderr {
     fn new() -> Self {
         Self
