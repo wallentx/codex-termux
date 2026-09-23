@@ -1980,6 +1980,7 @@ version = "0.0.0"
 dependencies = [
  "codex-app-server-protocol",
  "codex-git-utils",
+ "codex-http-client",
  "codex-login",
  "codex-model-provider",
  "codex-plugin",
@@ -2275,6 +2276,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-config",
  "codex-core",
+ "codex-http-client",
  "codex-login",
  "codex-model-provider",
  "codex-protocol",
@@ -2283,6 +2285,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-file-lock",
  "codex-utils-rustls-provider",
+ "codex-websocket-client",
  "constant_time_eq",
  "futures",
  "gethostname",
@@ -2377,12 +2380,23 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "aws-types",
  "bytes",
+ "codex-http-client",
+ "codex-utils-rustls-provider",
  "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
  "pretty_assertions",
+ "rcgen",
+ "rustls",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
+ "url",
 ]
 
 [[package]]
@@ -2683,6 +2697,7 @@ dependencies = [
  "codex-code-mode",
  "codex-code-mode-protocol",
  "codex-code-mode-runtime",
+ "codex-http-client",
  "codex-otel",
  "codex-otel-trace-websocket",
  "codex-protocol",
@@ -3597,6 +3612,7 @@ dependencies = [
  "codex-utils-rustls-provider",
  "futures",
  "http 1.4.0",
+ "http-body 1.0.1",
  "native-tls",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3609,6 +3625,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2 0.10.9",
  "system-configuration",
  "tempfile",
@@ -4083,8 +4100,10 @@ dependencies = [
 name = "codex-otel"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "chrono",
  "codex-api",
+ "codex-http-client",
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-string",
@@ -4094,6 +4113,7 @@ dependencies = [
  "libc",
  "opentelemetry",
  "opentelemetry-appender-tracing",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
@@ -5161,6 +5181,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "codex-http-client",
  "codex-otel",
  "codex-protocol",
  "codex-utils-absolute-path",
@@ -5646,7 +5667,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/openai-oss-forks/crossterm?rev=45fecb9508105988f42fe6ff0441783ed3717f92#45fecb9508105988f42fe6ff0441783ed3717f92"
+source = "git+https://github.com/openai-oss-forks/crossterm?rev=efa177859fd9623d57b9fe7ae9bf491ae1ac6ec4#efa177859fd9623d57b9fe7ae9bf491ae1ac6ec4"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",

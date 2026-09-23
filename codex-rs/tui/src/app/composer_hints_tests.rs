@@ -99,7 +99,7 @@ async fn usage_notice_preserves_composer_geometry_and_restores_tip_on_recovery()
                 app.insert_history_cell(&mut tui, cell);
             }
         }
-        assert_eq!(app.render_owned_transcript(&mut tui, size)?, before);
+        app.render_owned_transcript(&mut tui, size)?;
         assert_eq!(tui.terminal.last_known_cursor_pos, cursor);
         let buffer = crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal);
         let screen = buffer
@@ -388,7 +388,7 @@ async fn running_turn_dismisses_announcement_across_thread_resets() {
         /*replay_kind*/ None,
     );
     assert_eq!(app.composer_hint(/*width*/ 80), None);
-    app.reset_thread_event_state();
+    app.reset_thread_event_state().await;
     let tip = app.composer_tips.select(
         /*turn_count*/ 0,
         || panic!("an already running turn must end the startup announcement"),

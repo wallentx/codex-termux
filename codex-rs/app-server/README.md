@@ -30,6 +30,18 @@ the choice unset. Ephemeral threads cannot save it.
 Use `thread/metadata/update` for later changes. This preference does not select
 `turn/start.cyberAccessProgram` or grant access to an access program.
 
+# Application network policy
+
+App-server loads application network policy at startup and existing explicit
+config/account reloads. Local requirements-file edits take effect on
+the next explicit reload or restart. Installing a new policy cancels requests
+that it no longer permits; a failed policy load blocks network traffic.
+
+Embedded app-server installs the same policy-aware requirements loader for clients
+it constructs. The embedding TUI and exec runtime install the same policy before
+creating their telemetry providers, background HTTP clients, and executor
+connections. TUI worktree cloud loaders retain that shared policy on reload.
+
 # User verification cancellation (experimental)
 
 Local UI clients can cancel a native user-verification RPC by sending
@@ -194,6 +206,12 @@ Bedrock login return an error without changing configuration or saved credential
 exporter configuration before selecting another credential source. `aws.credential_export` and
 `aws.profile` cannot be configured together.
 
+Application network restrictions apply to each AWS credential and region HTTP request and to
+the Bedrock destination. Static access keys with an explicit region need no credential discovery.
+AWS profile `credential_process` commands are run by the AWS SDK; their network traffic is outside
+the application's HTTP policy. Configured credential exporters and AWS reauthentication commands
+require unrestricted application policy; policy revocation cancels their active work.
+
 ## Stored thread attachments
 
 - `thread/attachment/add` — add a durable resource reference to a stored thread without loading it. Repeated writes with the same attachment type and identity key return the existing attachment.
@@ -293,6 +311,11 @@ in both `full` and `toolsAndAuthOnly` detail modes, including thread-scoped read
 This is the server's advertised MCP capabilities object, including its `extensions`
 map. It is null when the connection has not initialized successfully; capabilities
 are never inferred from tools or copied from a shared catalog cache.
+
+# MCP OAuth login
+
+`mcpServer/oauth/login` only returns HTTP(S) authorization URLs. Authorization
+endpoints with other schemes fail before client registration or URL return.
 
 # Thread rollback
 
@@ -398,3 +421,36 @@ requests fail promptly and can be retried when sign-in succeeds.
 `model/list` also checks gateway authentication before returning cached models.
 If authentication fails after the provider configuration changes, it asks the client
 to restart Codex so the retained catalog and gateway sign-in use the same provider.
+
+## Application network policy
+
+Application policy uses the same managed TOML merge as agent-network requirements:
+higher-priority layers override conflicting values, including `enabled` and each
+domain permission, while non-conflicting domain entries are retained. Omitted
+values inherit from lower layers. After merging, a present network block defaults
+to `enabled = true` and an empty domain map, meaning no external destinations are
+allowed. An effective `enabled = false` disables application destination policy.
+Domain keys are exact ASCII names, normalized to lowercase without a trailing dot
+before merging; wildcards, URLs, ports, invalid permissions, and duplicate
+normalized names are rejected.
+App-server enforces these rules for its HTTP and WebSocket traffic before route
+resolution or connection work, including redirects and reused clients. An allow
+entry permits only HTTPS or WSS to that exact host. Agent-network requirements
+remain separate in `network`.
+
+App-server reloads effective requirements on explicit config or account reloads.
+Local changes or read failures discovered on reload revoke active requests;
+unchanged requirements preserve them. Failed policy loads block traffic until
+requirements load successfully. Invalid request or project configuration does not
+revoke unrelated traffic. Account changes revoke
+outstanding requests and clients retaining the previous account's authorization.
+Policy updates also stop active requests to newly denied destinations. Narrow
+authentication and requirements-discovery clients use local requirements and
+exact endpoint URLs while workspace policy is loading. API-key-only deployments
+do not discover ChatGPT workspace requirements.
+
+SDK transports without destination enforcement, including OTLP exporters and AWS
+credential discovery/signing, are disabled while restrictions apply. Supported
+HTTP, WebSocket, and code-mode gRPC requests use the shared destination checks.
+User-directed Git, SSH, shell, and other subprocess traffic retain their existing
+execution and sandbox policies.

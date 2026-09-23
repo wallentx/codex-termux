@@ -250,6 +250,31 @@ pub fn create_client_for_route(
         ClientRedirectPolicy::Default => default_http_client_builder(),
         ClientRedirectPolicy::Reject => default_http_client_builder().without_redirects(),
     };
+    create_client_for_route_with_builder(http_client_factory, request_url, route_class, builder)
+}
+
+fn create_client_for_route_with_builder(
+    http_client_factory: &HttpClientFactory,
+    request_url: &str,
+    route_class: ClientRouteClass,
+    builder: HttpClientBuilder,
+) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+    if http_client_factory.network_policy().is_managed() {
+        let mut pool = codex_http_client::RouteAwareClientPool::with_builder(
+            http_client_factory.clone(),
+            route_class,
+            builder,
+        );
+        if is_sandboxed() {
+            pool = pool.with_legacy_direct_proxy_and_custom_ca_fallback();
+        } else if matches!(
+            http_client_factory.outbound_proxy_policy(),
+            OutboundProxyPolicy::ReqwestDefault
+        ) {
+            pool = pool.with_legacy_custom_ca_fallback();
+        }
+        return Ok(pool.into_client());
+    }
     if matches!(
         http_client_factory.outbound_proxy_policy(),
         OutboundProxyPolicy::ReqwestDefault
@@ -280,17 +305,50 @@ pub async fn create_client_for_route_async(
     route_class: ClientRouteClass,
     redirect_policy: ClientRedirectPolicy,
 ) -> std::io::Result<HttpClient> {
+    create_client_for_route_async_with_builder(
+        http_client_factory,
+        request_url,
+        route_class,
+        move || match redirect_policy {
+            ClientRedirectPolicy::Default => default_http_client_builder(),
+            ClientRedirectPolicy::Reject => default_http_client_builder().without_redirects(),
+        },
+    )
+    .await
+}
+
+/// Builds a routed default client without request URL or response-header diagnostics.
+pub async fn create_client_for_route_without_request_logging_async(
+    http_client_factory: HttpClientFactory,
+    request_url: String,
+    route_class: ClientRouteClass,
+) -> std::io::Result<HttpClient> {
+    create_client_for_route_async_with_builder(
+        http_client_factory,
+        request_url,
+        route_class,
+        || default_http_client_builder().without_request_logging(),
+    )
+    .await
+}
+
+async fn create_client_for_route_async_with_builder(
+    http_client_factory: HttpClientFactory,
+    request_url: String,
+    route_class: ClientRouteClass,
+    builder: impl FnOnce() -> HttpClientBuilder + Send + 'static,
+) -> std::io::Result<HttpClient> {
     let permit = ROUTE_AWARE_CLIENT_BUILD_PERMIT
         .acquire()
         .await
         .map_err(std::io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        create_client_for_route(
+        create_client_for_route_with_builder(
             &http_client_factory,
             &request_url,
             route_class,
-            redirect_policy,
+            builder(),
         )
         .map_err(std::io::Error::from)
     })
@@ -355,7 +413,7 @@ pub(crate) fn create_raw_auth_client(
     auth_route_config: &AuthRouteConfig,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
     auth_route_config
-        .http_client_factory()
+        .authentication_factory(endpoint)
         .build_client_without_request_logging(endpoint, ClientRouteClass::Auth)
 }
 
@@ -365,7 +423,7 @@ pub(crate) fn create_default_auth_client(
     auth_route_config: &AuthRouteConfig,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
     create_client_for_route(
-        auth_route_config.http_client_factory(),
+        &auth_route_config.authentication_factory(endpoint),
         endpoint,
         ClientRouteClass::Auth,
         ClientRedirectPolicy::Default,
