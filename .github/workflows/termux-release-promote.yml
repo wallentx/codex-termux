@@ -1,0 +1,135 @@
+name: termux-release-promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: "Release branch to promote, for example release/0.122.0"
+        required: true
+        type: string
+      release_sha:
+        description: "Release branch commit SHA to promote. Defaults to the branch head."
+        required: false
+        default: ""
+        type: string
+      pr_number:
+        description: "Merged PR number to promote. Optional; normally discovered automatically."
+        required: false
+        default: ""
+        type: string
+      pr_head_sha:
+        description: "Merged PR head SHA. Required only when pr_number is set."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+  attestations: read
+  checks: read
+  contents: read
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  statuses: read
+
+concurrency:
+  group: termux-release-promote-${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    env:
+      TERMUX_AUTOMATION_DIR: ${{ github.workspace }}/.termux-release-automation
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Export GitHub App token for gh
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: echo "GH_TOKEN=${APP_TOKEN}" >> "${GITHUB_ENV}"
+
+      - name: Checkout release branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.ref }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Checkout automation helpers
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          ref: ${{ github.workflow_sha }}
+          path: .termux-release-automation
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: 🧰 Actions Toolbox
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Validate GitHub CLI environment
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-validate-gh-env.sh"
+
+      - name: Resolve release ref
+        id: release-ref
+        env:
+          INPUT_RELEASE_BRANCH: ${{ inputs.release_branch }}
+          INPUT_RELEASE_SHA: ${{ inputs.release_sha }}
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-resolve-release-ref.sh"
+
+      - name: Read release metadata
+        id: metadata
+        env:
+          TERMUX_RELEASE_ACTION: promote
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-read-release-metadata.sh"
+
+      - name: Locate merged pull request
+        if: steps.metadata.outputs.promote == 'true'
+        id: pr
+        env:
+          RELEASE_BRANCH: ${{ steps.release-ref.outputs.branch }}
+          RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-find-release-pr.sh"
+
+      - name: Download promoted PR artifact
+        if: steps.metadata.outputs.promote == 'true'
+        env:
+          PR_ARTIFACT_NAME: ${{ steps.pr.outputs.artifact_name }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-download-release-artifact.sh"
+
+      - name: Create or update mirrored Termux release
+        if: steps.metadata.outputs.promote == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.metadata.outputs.upstream_tag }}
+          UPSTREAM_REPO: ${{ steps.metadata.outputs.upstream_repo }}
+          UPSTREAM_NAME: ${{ steps.metadata.outputs.upstream_name }}
+          TERMUX_TAG: ${{ steps.metadata.outputs.termux_tag }}
+          UPSTREAM_PRERELEASE: ${{ steps.metadata.outputs.upstream_prerelease }}
+          UPSTREAM_HTML_URL: ${{ steps.metadata.outputs.upstream_html_url }}
+          RELEASE_TRAIN: ${{ steps.metadata.outputs.release_train }}
+          RELEASE_EXISTS: ${{ steps.metadata.outputs.release_exists }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RELEASE_SHA: ${{ steps.release-ref.outputs.sha }}
+        run: bash "${TERMUX_AUTOMATION_DIR}/scripts/termux-create-or-update-mirrored-release.sh"
