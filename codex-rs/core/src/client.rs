@@ -32,6 +32,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+#[path = "client_tool_metadata.rs"]
+mod tool_metadata;
+
 use crate::CodexResponsesHeaders;
 use async_channel::Sender;
 use codex_api::AgentIdentityTelemetry;
@@ -100,7 +103,6 @@ use codex_tools::create_tools_json_for_responses_lite;
 use codex_tools::create_tools_raw_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
-use futures::FutureExt;
 use futures::StreamExt;
 use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
@@ -418,17 +420,6 @@ fn is_internal_metadata_destination(provider: &ApiProvider) -> bool {
 }
 
 impl WebsocketSession {
-    /// A nonblocking resume check. A busy stream is already in use, so resume
-    /// leaves it alone. The next request still validates provider, auth, and headers.
-    fn is_prewarmed(&self, auth_owner_generation: Option<u64>) -> bool {
-        self.auth_owner_generation == auth_owner_generation
-            && self.last_request.is_some()
-            && self
-                .connection
-                .as_ref()
-                .is_some_and(|connection| connection.is_closed().now_or_never() != Some(true))
-    }
-
     fn reset(&mut self, reason: Option<&'static str>) {
         // Per-socket backend metrics call a resend after reconnect "initial".
         // Retain the loss reason across reconnects/turns until the next send.
@@ -628,15 +619,6 @@ impl ModelClient {
 
     pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.state.provider.auth_manager()
-    }
-
-    pub(crate) fn is_websocket_prewarmed(&self) -> bool {
-        let auth_owner_generation = self.auth_owner_generation();
-        self.state
-            .cached_websocket_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_prewarmed(auth_owner_generation)
     }
 
     fn auth_owner_generation(&self) -> Option<u64> {
@@ -1361,11 +1343,6 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
-    pub(crate) fn is_websocket_prewarmed(&self) -> bool {
-        self.websocket_session
-            .is_prewarmed(self.client.auth_owner_generation())
-    }
-
     #[allow(clippy::too_many_arguments)]
     /// Builds shared Responses API transport options and request-body options.
     ///
@@ -1769,6 +1746,9 @@ impl ModelClientSession {
             );
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
+            if let Some(input) = tool_metadata::bounded_input(&request, &request.input) {
+                request.input = input;
+            }
             inference_trace_attempt.record_started(&request);
             let client = ApiResponsesClient::new(
                 transport,
@@ -2048,6 +2028,12 @@ impl ModelClientSession {
             );
             let mut ws_request = ResponsesWsRequest::ResponseCreate(ws_payload);
             stamp_ws_stream_request_start_ms(&mut ws_request);
+            let ResponsesWsRequest::ResponseCreate(payload) = &ws_request;
+            let bounded_input = tool_metadata::bounded_input(&ws_request, payload.input);
+            if let Some(input) = bounded_input.as_deref() {
+                let ResponsesWsRequest::ResponseCreate(payload) = &mut ws_request;
+                payload.input = input;
+            }
             if !previous_response_id_from_untraced_warmup {
                 inference_trace_attempt.record_started(&ws_request);
             }
@@ -2138,6 +2124,18 @@ impl ModelClientSession {
         websocket_telemetry
     }
 
+    /// Whether a previous request prepared a connection that is not known to be closed.
+    /// The next request still validates provider, auth, and headers before reuse.
+    pub(crate) async fn is_websocket_prewarmed(&self) -> bool {
+        if self.websocket_session.last_request.is_some()
+            && let Some(connection) = self.websocket_session.connection.as_ref()
+        {
+            !connection.is_closed().await
+        } else {
+            false
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn prewarm_websocket(
         &mut self,
@@ -2152,12 +2150,7 @@ impl ModelClientSession {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        // A previous request only makes prewarm unnecessary while its socket is
-        // still alive. Reconnecting below resets the old continuation normally.
-        if self.websocket_session.last_request.is_some()
-            && let Some(connection) = self.websocket_session.connection.as_ref()
-            && !connection.is_closed().await
-        {
+        if self.is_websocket_prewarmed().await {
             return Ok(());
         }
 
