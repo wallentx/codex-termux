@@ -709,7 +709,7 @@ impl Session {
         )
     }
 
-    fn with_window_and_fork_metadata(
+    pub(crate) fn with_window_and_fork_metadata(
         &self,
         turn_context: &TurnContext,
         responses_metadata: CodexResponsesMetadata,
@@ -1689,7 +1689,7 @@ impl Session {
                 agents_md_manager,
                 plugins_manager: Arc::clone(&plugins_manager),
                 mcp_manager: Arc::clone(&mcp_manager),
-                extensions,
+                extensions: Arc::clone(&extensions),
                 // TODO(jif): extract session to share between sub-agents
                 session_extension_data,
                 thread_extension_data,
@@ -1731,6 +1731,7 @@ impl Session {
                     attestation_provider,
                     config.http_client_factory(),
                     workspace_routing.as_ref().clone(),
+                    extensions.model_request_contributors().to_vec(),
                 )
                 .with_restored_history(matches!(
                     &initial_history,
