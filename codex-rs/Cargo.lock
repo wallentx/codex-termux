@@ -2282,6 +2282,7 @@ dependencies = [
  "codex-state",
  "codex-uds",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "codex-utils-rustls-provider",
  "codex-websocket-auth",
  "codex-websocket-client",
@@ -2339,6 +2340,7 @@ dependencies = [
  "codex-sandboxing",
  "codex-shell-escalation",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "codex-utils-home-dir",
  "codex-utils-pty",
  "codex-windows-sandbox",
@@ -2935,6 +2937,7 @@ dependencies = [
  "codex-utils-audio",
  "codex-utils-cache",
  "codex-utils-cargo-bin",
+ "codex-utils-file-lock",
  "codex-utils-git-discovery",
  "codex-utils-home-dir",
  "codex-utils-image",
@@ -3251,6 +3254,7 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "multimap",
  "pretty_assertions",
  "serde",
@@ -4376,6 +4380,7 @@ dependencies = [
  "codex-protocol",
  "codex-state",
  "codex-utils-absolute-path",
+ "codex-utils-file-lock",
  "codex-utils-path",
  "pretty_assertions",
  "regex",
@@ -4919,6 +4924,10 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-elapsed"
+version = "0.0.0"
+
+[[package]]
+name = "codex-utils-file-lock"
 version = "0.0.0"
 
 [[package]]
