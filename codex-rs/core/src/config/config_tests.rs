@@ -1263,6 +1263,7 @@ fn config_toml_deserializes_model_availability_nux() {
             question_esc_back: true,
             raw_output_mode: false,
             fullscreen_transcript: true,
+            copy_on_select: Default::default(),
             alternate_screen: AltScreenMode::default(),
             status_line: None,
             status_line_use_colors: true,
@@ -4402,6 +4403,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             question_esc_back: true,
             raw_output_mode: false,
             fullscreen_transcript: true,
+            copy_on_select: Default::default(),
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
             status_line_use_colors: true,
@@ -9898,6 +9900,7 @@ async fn metrics_exporter_defaults_to_statsig_when_missing() -> std::io::Result<
     .await?;
 
     assert_eq!(config.otel.metrics_exporter, OtelExporterKind::Statsig);
+    assert!(!config.otel.agent_response_logging_enabled());
     Ok(())
 }
 
@@ -9907,6 +9910,7 @@ async fn trace_exporter_defaults_to_none_when_log_exporter_is_set() -> std::io::
     let mut cfg = fixture.cfg.clone();
     cfg.otel = Some(OtelConfigToml {
         tool_result: toml::from_str("max_bytes = 8192").expect("tool-result logging config"),
+        log_agent_responses: Some(true),
         exporter: Some(OtelExporterKind::OtlpHttp {
             endpoint: "http://localhost:14318/v1/logs".to_string(),
             headers: HashMap::new(),
@@ -9928,6 +9932,7 @@ async fn trace_exporter_defaults_to_none_when_log_exporter_is_set() -> std::io::
     .await?;
 
     assert_eq!(config.otel.tool_result.max_bytes, 8192);
+    assert!(config.otel.agent_response_logging_enabled());
     assert!(matches!(
         config.otel.exporter,
         OtelExporterKind::OtlpHttp { .. }

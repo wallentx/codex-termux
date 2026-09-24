@@ -726,16 +726,6 @@ impl Session {
                 &model_info,
             )?;
             token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
-            if config
-                .token_budget
-                .as_ref()
-                .is_some_and(|token_budget| token_budget.use_history_notes_extension)
-                && !model_info.supports_experimental_context
-            {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "features.token_budget.use_history_notes_extension is not supported by model `{model}`; disable it or select a model that supports experimental context"
-                )));
-            }
         }
         let configured_config = Arc::clone(&config);
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
@@ -1081,7 +1071,7 @@ pub(crate) fn new_submission_id() -> String {
     Uuid::now_v7().to_string()
 }
 
-fn get_service_tier(
+pub(crate) fn get_service_tier(
     configured_service_tier: Option<String>,
     fast_mode_enabled: bool,
     model_info: &ModelInfo,
@@ -2996,6 +2986,7 @@ impl Session {
             };
             let action = ApprovalAction::RequestPermissions {
                 id: call_id.clone(),
+                environment_id: environment_selection.environment_id.clone(),
                 turn_id: turn_context.sub_id.clone(),
                 reason: args.reason.clone(),
                 permissions: requested_permissions.clone(),
@@ -3869,6 +3860,15 @@ impl Session {
                 .await;
             let extension_data =
                 codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
+            if let Some(messages) = settings
+                .model_info
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.tools.as_ref())
+                .and_then(|tools| tools.multi_agent.as_ref())
+            {
+                extension_data.insert(messages.clone());
+            }
             extension_data.insert(selected_capability_roots.clone());
             if let Some(discovery) = &executor_capability_discovery {
                 extension_data.insert(discovery.as_ref().clone());

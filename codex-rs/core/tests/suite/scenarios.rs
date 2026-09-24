@@ -85,6 +85,12 @@ mod agent_message_board;
 #[path = "scenarios_guardian_extra_policy.rs"]
 mod guardian_extra_policy;
 
+#[path = "scenarios_indirect_namespace_prefixes.rs"]
+mod indirect_namespace_prefixes;
+
+#[path = "scenarios_mcp_resource_messages.rs"]
+mod mcp_resource_messages;
+
 #[path = "scenarios_preparation.rs"]
 mod preparation;
 
@@ -1161,8 +1167,16 @@ async fn guardian_checkpoint_migration_request_history() -> Result<()> {
             .rewrite_known_segments()
             .include_request_settings(),
     );
-    // Normalize executor paths and shell wrappers in the reviewed actions.
+    // Normalize executor IDs, paths and shell wrappers in the reviewed actions.
     for (pattern, replacement) in [
+        (
+            r#"(?m)^(\s*"environment_id": )"(?:local|remote)""#,
+            "$1\"<ENVIRONMENT>\"",
+        ),
+        (
+            r#"(For this action on environment )"(?:local|remote)","#,
+            "$1\"<ENVIRONMENT>\",",
+        ),
         (r#"(?m)^(\s*"cwd": )"[^"]*""#, "$1\"<CWD>\""),
         (
             r#""command": \[\s*(?:"[^"]*",\s*)*"exit 0"\s*\]"#,

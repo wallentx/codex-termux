@@ -82,6 +82,8 @@ pub use contributors::ToolFinishInput;
 pub use contributors::ToolLifecycleContributor;
 pub use contributors::ToolLifecycleFuture;
 pub use contributors::ToolStartInput;
+pub use contributors::ToolTimingBoundary;
+pub use contributors::ToolTimingInput;
 pub use contributors::TurnAbortInput;
 pub use contributors::TurnContextContributionInput;
 pub use contributors::TurnErrorInput;
@@ -106,3 +108,14 @@ pub use user_instructions::LoadInstructionsFuture;
 pub use user_instructions::LoadedUserInstructions;
 pub use user_instructions::ThreadInstructionsProvider;
 pub use user_instructions::UserInstructionsProvider;
+
+pub use contributors::ToolDispatchInput;
+
+mod model_request;
+pub use model_request::ModelRequestContributor;
+pub use model_request::ModelRequestInput;
+pub use model_request::ModelRequestKind;
+pub use model_request::ModelResponseError;
+pub use model_request::ModelResponseInterceptor;
+pub use model_request::ModelResponseStream;
+pub use model_request::ResponseEvent;
