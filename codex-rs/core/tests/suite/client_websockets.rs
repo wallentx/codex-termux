@@ -648,14 +648,22 @@ async fn responses_websocket_resume_prewarm_reuses_and_repairs_connection() -> a
     test.submit_text_turn("hello").await?;
     ThreadIdle::wait(&test.codex).await;
 
-    // A healthy warm resume preserves the response baseline and skips preparation.
+    // A healthy warm resume skips preparation; only the user turn reloads instructions.
     let instruction_loads = instructions.load_count();
     test.codex.prewarm().await;
     test.codex.prewarm().await;
     test.submit_text_turn("continue").await?;
 
-    assert_eq!(server.handshakes().len(), 1);
     assert_eq!(instructions.load_count(), instruction_loads + 1);
+    assert_eq!(server.handshakes().len(), 1);
+    assert_eq!(
+        server.single_handshake().header(USER_AGENT_HEADER),
+        Some(codex_login::default_client::get_codex_user_agent())
+    );
+    assert_eq!(
+        server.single_handshake().header("x-codex-window-id"),
+        Some(format!("{}:0", test.session_configured.thread_id))
+    );
     let connection = server.single_connection();
     assert_eq!(connection.len(), 3);
     assert_eq!(connection[2].body_json()["previous_response_id"], "resp-1");
@@ -663,6 +671,7 @@ async fn responses_websocket_resume_prewarm_reuses_and_repairs_connection() -> a
     // Turn idle does not synchronize with the reader observing the server's close.
     // Retry resume until it sees the close; pending attempts must still share one socket.
     ThreadIdle::wait(&test.codex).await;
+    let instruction_loads = instructions.load_count();
     let warmup = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             test.codex.prewarm().await;
@@ -674,6 +683,7 @@ async fn responses_websocket_resume_prewarm_reuses_and_repairs_connection() -> a
         }
     })
     .await?;
+    assert!(instructions.load_count() > instruction_loads);
     assert_eq!(warmup.body_json()["generate"], false);
     assert!(warmup.body_json().get("previous_response_id").is_none());
 
