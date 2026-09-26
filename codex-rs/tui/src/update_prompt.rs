@@ -39,8 +39,6 @@ use ratatui::widgets::Wrap;
 #[cfg(not(debug_assertions))]
 use tokio_stream::StreamExt;
 
-const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
-
 #[cfg(not(debug_assertions))]
 pub(crate) enum UpdatePromptOutcome {
     Continue,
@@ -206,6 +204,7 @@ impl WidgetRef for &UpdatePromptScreen {
         let mut column = FlexRenderable::new();
 
         let update_command = self.update_action.command_str();
+        let release_notes_url = self.update_action.release_notes_url();
 
         column.push(/*flex*/ 1, RenderableItem::Borrowed(&""));
         column.push(
@@ -227,7 +226,7 @@ impl WidgetRef for &UpdatePromptScreen {
             /*flex*/ 1,
             Paragraph::new(Line::from(vec![
                 "Release notes: ".dim(),
-                RELEASE_NOTES_URL.dim().underlined(),
+                release_notes_url.dim().underlined(),
             ]))
             .wrap(Wrap { trim: false })
             .inset(Insets::vh(/*v*/ 0, /*h*/ 2)),
@@ -266,7 +265,7 @@ impl WidgetRef for &UpdatePromptScreen {
         };
         render_menu_surface(panel, buf);
         column.render(panel, buf);
-        crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, RELEASE_NOTES_URL);
+        crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, release_notes_url);
     }
 }
 
