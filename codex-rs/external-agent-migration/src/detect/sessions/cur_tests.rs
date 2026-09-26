@@ -35,6 +35,43 @@ fn detects_cur_transcript_with_project_cwd() {
 }
 
 #[test]
+fn detects_projectless_cur_transcript_without_embedded_metadata() {
+    let root = TempDir::new().expect("tempdir");
+    let external_agent_home = root.path().join(".cursor");
+    let transcript = write_transcript(
+        &external_agent_home,
+        "empty-window",
+        "projectless-session",
+        "first request",
+    );
+
+    let sessions =
+        detect_recent_cur_sessions(&external_agent_home, root.path()).expect("detect sessions");
+
+    assert_eq!(
+        sessions,
+        vec![ExternalAgentSessionMigration {
+            path: transcript,
+            cwd: root.path().to_path_buf(),
+            title: Some("first request".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn resolves_projectless_cur_cwd_from_relative_home() {
+    let current_dir = std::env::current_dir().expect("current dir");
+
+    assert_eq!(
+        cur_project_cwd(
+            Path::new(".cursor/projects/empty-window"),
+            Path::new(".cursor"),
+        ),
+        Some(current_dir)
+    );
+}
+
+#[test]
 fn detects_cur_transcript_with_embedded_unc_cwd() {
     let root = TempDir::new().expect("tempdir");
     let external_agent_home = root.path().join(".external");
@@ -139,6 +176,94 @@ fn rejects_ambiguous_encoded_project_cwd() {
 }
 
 #[test]
+fn resolves_cur_project_names_with_common_separators() {
+    for (project_name, encoded_name) in [
+        ("project", "project"),
+        ("my-project", "my-project"),
+        ("my--project", "my-project"),
+        ("my project", "my-project"),
+        ("my.project", "my-project"),
+        ("my..project", "my-project"),
+        ("my_project", "my-project"),
+        ("my+project", "my-project"),
+        ("my@project", "my-project"),
+        ("my&project", "my-project"),
+        ("my-awesome-project", "my-awesome-project"),
+        ("my-awesome-cool-project", "my-awesome-cool-project"),
+    ] {
+        let root = TempDir::new().expect("tempdir");
+        let project = root.path().join(project_name);
+        fs::create_dir_all(&project).expect("project root");
+        let encoded = format!("{}-{encoded_name}", encode_project_path(root.path()));
+
+        assert_eq!(decode_cur_project_path(&encoded), Some(project));
+    }
+}
+
+#[test]
+fn rejects_ambiguous_cur_project_without_a_direct_match() {
+    let root = TempDir::new().expect("tempdir");
+    for project_name in ["my-project", "my project", "my+project"] {
+        fs::create_dir_all(root.path().join(project_name)).expect("project root");
+    }
+    let encoded = format!("{}-my-project", encode_project_path(root.path()));
+
+    assert_eq!(decode_cur_project_path(&encoded), None);
+}
+
+#[test]
+fn rejects_ambiguous_cur_project_with_punctuated_ancestor() {
+    let root = TempDir::new().expect("tempdir");
+    let punctuated_ancestor = root.path().join("a-b").join("c");
+    let punctuated_leaf = root.path().join("a").join("b-c");
+    fs::create_dir_all(&punctuated_ancestor).expect("punctuated ancestor project");
+    fs::create_dir_all(&punctuated_leaf).expect("punctuated leaf project");
+    let encoded = encode_project_path(&punctuated_ancestor);
+
+    assert_eq!(encoded, encode_project_path(&punctuated_leaf));
+    assert_eq!(decode_cur_project_path(&encoded), None);
+}
+
+#[test]
+fn rejects_ambiguous_cur_project_with_multiple_punctuated_ancestors() {
+    for (first, second) in [
+        (&["a-b", "c-d", "e"][..], &["a", "b", "c", "d-e"][..]),
+        (&["a-b", "c-d"][..], &["a", "b", "c", "d"][..]),
+    ] {
+        let root = TempDir::new().expect("tempdir");
+        let first = first
+            .iter()
+            .fold(root.path().to_path_buf(), |path, component| {
+                path.join(component)
+            });
+        let second = second
+            .iter()
+            .fold(root.path().to_path_buf(), |path, component| {
+                path.join(component)
+            });
+        fs::create_dir_all(&first).expect("first project");
+        fs::create_dir_all(&second).expect("second project");
+        let encoded = encode_project_path(&first);
+
+        assert_eq!(encoded, encode_project_path(&second));
+        assert_eq!(decode_cur_project_path(&encoded), None);
+    }
+}
+
+#[test]
+fn parses_windows_cursor_fixture_project_directory() {
+    assert_eq!(
+        decode_cur_windows_project_drive("C--Users-fixture-Cursor"),
+        Some(('C', "-Users-fixture-Cursor"))
+    );
+    assert_eq!(
+        decode_cur_windows_project_drive("C-Users-fixture-Cursor"),
+        Some(('C', "Users-fixture-Cursor"))
+    );
+    assert_eq!(decode_cur_windows_project_drive("1-Users-fixture"), None);
+}
+
+#[test]
 fn ignores_cur_sessions_older_than_import_window() {
     let root = TempDir::new().expect("tempdir");
     let project_root = root.path().join("workspace");
@@ -171,7 +296,8 @@ fn detects_cur_sessions_in_batches_and_redetects_modified_imports() {
     let encoded_project = encode_project_path(&project_root);
     let modified_at = SystemTime::now();
     let mut expected = Vec::new();
-    for index in 0..=SESSION_IMPORT_MAX_COUNT {
+    let default_limits = ExternalAgentSessionImportLimits::default();
+    for index in 0..=default_limits.max_sessions {
         let session_id = format!("session-{index:02}");
         let title = format!("request {index}");
         let path = write_transcript(&external_agent_home, &encoded_project, &session_id, &title);
@@ -295,10 +421,12 @@ fn set_modified_at(path: &Path, modified_at: SystemTime) {
 
 #[cfg(windows)]
 fn encode_project_path(path: &Path) -> String {
-    cur_project_path_slug(path).replacen("--", "-", 1)
+    path.to_string_lossy().replace([':', '\\', '/'], "-")
 }
 
 #[cfg(not(windows))]
 fn encode_project_path(path: &Path) -> String {
-    cur_project_path_slug(path)
+    path.to_string_lossy()
+        .trim_start_matches('/')
+        .replace('/', "-")
 }

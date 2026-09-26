@@ -2,25 +2,46 @@ use core_test_support::test_codex::local_selections;
 use std::sync::Arc;
 
 use codex_core::CodexThread;
+use codex_core::StartIfIdleSubmission;
+use codex_core::StartThreadOptions;
+use codex_core::TurnInput;
+use codex_core::TurnInputRequest;
+use codex_core::TurnInputSubmission;
+use codex_core::TurnStartOptions;
 use codex_core::config::CurrentTimeReminderConfig;
 use codex_extension_items::ExtensionItem;
 use codex_extension_items::sleep::SleepItem;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
+use core_test_support::context_snapshot::SnapshotEntry;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
+use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_message_item_added;
@@ -39,7 +60,192 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::from_slice;
 use serde_json::json;
+use test_case::test_case;
 use tokio::sync::oneshot;
+use wiremock::Mock;
+use wiremock::Request;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_user_input_reaches_the_first_model_request() -> anyhow::Result<()> {
+    assert_idle_user_input_reaches_the_first_model_request(ModeKind::Default).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_user_input_reaches_the_first_model_request_in_plan_mode() -> anyhow::Result<()> {
+    assert_idle_user_input_reaches_the_first_model_request(ModeKind::Plan).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_response_items_include_pending_mailbox_in_first_request() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            ev_response_created("idle-response-items"),
+            ev_completed("idle-response-items"),
+        ]),
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+
+    submit_queue_only_agent_mail(test.codex.as_ref(), "pending mailbox input").await;
+    let submission = test
+        .codex
+        .start_turn_if_idle(TurnInputRequest::new(TurnInput::ResponseItem(
+            responses::user_message_item("automatic response item"),
+        )))
+        .await?;
+    let StartIfIdleSubmission::Started { turn_id } = submission else {
+        panic!("automatic input should start a turn");
+    };
+    wait_for_turn_complete(test.codex.as_ref()).await;
+
+    let request = response.single_request();
+    let request_body = request.body_json();
+    responses::assert_root_turn(&request_body, Some(&turn_id))?;
+    responses::assert_parent_turn(&request_body, /*expected*/ None)?;
+    let user_messages = request.message_input_texts("user");
+    assert!(
+        user_messages
+            .iter()
+            .any(|message| message == "automatic response item")
+    );
+    assert!(
+        request
+            .inputs_of_type("agent_message")
+            .iter()
+            .any(|message| {
+                message["author"] == "/root/worker"
+                    && message["recipient"] == "/root"
+                    && message["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|item| {
+                            item["type"] == "input_text" && item["text"] == "pending mailbox input"
+                        })
+                    })
+            })
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standalone_tool_output_starts_instruction_turn() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![ev_response_created("turn"), ev_completed("turn")]),
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+
+    let expected_output = json!({
+        "type": "function_call_output",
+        "name": "send_message_to_thread",
+        "namespace": "codex_app",
+        "output": "delegated work",
+    });
+    let output = serde_json::from_value(expected_output.clone())?;
+
+    let submission = test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::new(TurnInput::ResponseItem(output)))
+        .await?;
+    let TurnInputSubmission::Started { turn_id } = submission else {
+        panic!("standalone output should start a turn");
+    };
+    wait_for_turn_complete(test.codex.as_ref()).await;
+
+    let request = response.single_request();
+    responses::assert_root_turn(&request.body_json(), Some(&turn_id))?;
+    let output = &request.inputs_of_type("function_call_output")[0];
+    assert_eq!(output["name"], expected_output["name"]);
+    assert_eq!(output["namespace"], expected_output["namespace"]);
+    assert_eq!(output["output"], expected_output["output"]);
+    assert!(output.get("call_id").is_none());
+
+    Ok(())
+}
+
+async fn assert_idle_user_input_reaches_the_first_model_request(
+    mode: ModeKind,
+) -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            ev_response_created("idle-user-input"),
+            ev_completed("idle-user-input"),
+        ]),
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+
+    if mode == ModeKind::Plan {
+        core_test_support::submit_thread_settings(
+            test.codex.as_ref(),
+            ThreadSettingsOverrides {
+                collaboration_mode: Some(CollaborationMode {
+                    mode,
+                    settings: Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+
+    let expected_input = vec![UserInput::Text {
+        text: "queued user input reaches the first request".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let submission = test
+        .codex
+        .start_turn_if_idle(TurnInputRequest::new(TurnInput::UserInput {
+            content: expected_input.clone(),
+            client_id: Some("queued-user-message".to_string()),
+        }))
+        .await?;
+    assert!(matches!(submission, StartIfIdleSubmission::Started { .. }));
+
+    let user_message = core_test_support::wait_for_event_match(test.codex.as_ref(), |event| {
+        let EventMsg::ItemCompleted(event) = event else {
+            return None;
+        };
+        let TurnItem::UserMessage(item) = &event.item else {
+            return None;
+        };
+        Some(item.clone())
+    })
+    .await;
+    assert_eq!(
+        Some("queued-user-message".to_string()),
+        user_message.client_id
+    );
+    assert_eq!(expected_input, user_message.content);
+    wait_for_turn_complete(test.codex.as_ref()).await;
+
+    let request = response.single_request();
+    let request_body = request.body_json();
+    let turn_id = request_body["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("idle user turn id");
+    responses::assert_root_turn(&request_body, Some(turn_id))?;
+    assert!(
+        request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "queued user input reaches the first request"),
+        "the first Responses request should contain the queued user message"
+    );
+
+    Ok(())
+}
 
 fn ev_message_item_done(id: &str, text: &str) -> Value {
     serde_json::json!({
@@ -122,6 +328,7 @@ fn response_completed_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
 
 async fn build_codex(server: &StreamingSseServer) -> Arc<CodexThread> {
     test_codex()
+        .with_config(|config| config.update_plan_enabled = true)
         .with_model("gpt-5.4")
         .build_with_streaming_server(server)
         .await
@@ -131,16 +338,10 @@ async fn build_codex(server: &StreamingSseServer) -> Arc<CodexThread> {
 
 async fn submit_user_input(codex: &CodexThread, text: &str) {
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit user input");
 }
@@ -149,51 +350,43 @@ async fn submit_danger_full_access_user_turn(test: &TestCodex, text: &str) {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await
         .expect("submit user turn");
 }
 
 async fn steer_user_input(codex: &CodexThread, text: &str) {
-    codex
-        .steer_input(
-            vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            /*additional_context*/ Default::default(),
-            /*expected_turn_id*/ None,
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
+    let submission = codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("steer user input");
+    assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
 }
 
-async fn submit_queue_only_agent_mail(codex: &CodexThread, text: &str) {
+async fn enqueue_queue_only_agent_mail(codex: &CodexThread, text: &str) {
     codex
         .submit(Op::InterAgentCommunication {
             communication: InterAgentCommunication::new(
@@ -203,9 +396,14 @@ async fn submit_queue_only_agent_mail(codex: &CodexThread, text: &str) {
                 text.to_string(),
                 /*trigger_turn*/ false,
             ),
+            start_options: Default::default(),
         })
         .await
         .expect("submit queue-only agent mail");
+}
+
+async fn submit_queue_only_agent_mail(codex: &CodexThread, text: &str) {
+    enqueue_queue_only_agent_mail(codex, text).await;
     codex
         .submit(Op::RealtimeConversationListVoices)
         .await
@@ -238,6 +436,14 @@ async fn wait_for_agent_message(codex: &CodexThread, text: &str) {
 
 async fn wait_for_turn_complete(codex: &CodexThread) {
     wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+}
+
+async fn wait_for_successful_turn(codex: &CodexThread) {
+    let event = wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(
+        matches!(&event, EventMsg::TurnComplete(completed) if completed.error.is_none()),
+        "turn failed: {event:?}"
+    );
 }
 
 async fn wait_for_sleep_item_started(codex: &CodexThread, call_id: &str, duration_ms: u64) {
@@ -292,6 +498,95 @@ async fn wait_for_sleep_item_completed(codex: &CodexThread, call_id: &str, durat
             duration_ms,
         }
     );
+}
+
+struct SleepingRootExtension;
+
+impl codex_extension_api::ThreadLifecycleContributor<codex_core::config::Config>
+    for SleepingRootExtension
+{
+    fn on_thread_start<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadStartInput<'a, codex_core::config::Config>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input.thread_store.insert(SleepItem {
+                id: "clock-wait-1".to_string(),
+                duration_ms: 60_000,
+            });
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_only_agent_mail_wakes_sleeping_root_with_previous_turn_context() {
+    const CHILD_MESSAGE: &str = "worker completed";
+
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_completed("resp-initial"),
+            responses::sse_completed("resp-wake"),
+        ],
+    )
+    .await;
+    let mut extensions =
+        codex_extension_api::ExtensionRegistryBuilder::<codex_core::config::Config>::new();
+    extensions.thread_lifecycle_contributor(Arc::new(SleepingRootExtension));
+    let codex = test_codex()
+        .with_model("gpt-5.4")
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await
+        .expect("build Codex test session")
+        .codex;
+
+    codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "wait for the worker".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .on_start(TurnStartOptions {
+                cyber_access_program: Some(CyberAccessProgram::Standard),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("start initial turn");
+    wait_for_turn_complete(&codex).await;
+    enqueue_queue_only_agent_mail(&codex, CHILD_MESSAGE).await;
+    wait_for_turn_complete(&codex).await;
+
+    assert_eq!(
+        requests
+            .requests()
+            .iter()
+            .map(|request| request.body_json()["access_programs"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!({"cyber": "standard"}); 2],
+    );
+    let history = codex
+        .load_history(/*include_archived*/ true)
+        .await
+        .expect("load persisted thread history");
+    assert!(history.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::ResponseItem(envelope)
+                if matches!(
+                    &envelope.item,
+                    codex_protocol::models::ResponseItem::AgentMessage { content, .. }
+                        if content.iter().any(|content| matches!(
+                            content,
+                            codex_protocol::models::AgentMessageInputContent::InputText { text }
+                                if text == CHILD_MESSAGE
+                        ))
+                )
+        )
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -393,7 +688,7 @@ async fn any_new_input_interrupts_sleep() {
         response_completed_chunks("resp-3"),
     ])
     .await;
-    let codex = test_codex()
+    let test = test_codex()
         .with_model("gpt-5.4")
         .with_config(|config| {
             config
@@ -407,8 +702,8 @@ async fn any_new_input_interrupts_sleep() {
         })
         .build_with_streaming_server(&server)
         .await
-        .expect("build Codex test session")
-        .codex;
+        .expect("build Codex test session");
+    let codex = test.codex.clone();
 
     submit_user_input(&codex, INITIAL_PROMPT).await;
     wait_for_sleep_item_started(&codex, FIRST_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
@@ -417,7 +712,8 @@ async fn any_new_input_interrupts_sleep() {
     wait_for_sleep_item_completed(&codex, FIRST_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
     wait_for_sleep_item_started(&codex, SECOND_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
 
-    submit_queue_only_agent_mail(&codex, "new mailbox input").await;
+    // The list-voices barrier can consume the sleep completion that we need to observe next.
+    enqueue_queue_only_agent_mail(&codex, "new mailbox input").await;
     wait_for_sleep_item_completed(&codex, SECOND_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
     wait_for_turn_complete(&codex).await;
 
@@ -446,7 +742,7 @@ async fn any_new_input_interrupts_sleep() {
         .expect("read rollout");
     let persisted_sleep_items = rollout
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .filter_map(|line| match line.item {
             RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match event.item {
                 TurnItem::Extension(ExtensionItem::Sleep(item)) => Some(item),
@@ -474,22 +770,14 @@ async fn any_new_input_interrupts_sleep() {
 
 fn assert_two_responses_input_snapshot(snapshot_name: &str, requests: &[Vec<u8>]) {
     assert_eq!(requests.len(), 2);
-    let options = ContextSnapshotOptions::default().strip_capability_instructions();
+    let options = ContextSnapshotOptions::default().rewrite_known_segments();
     let first: Value = from_slice(&requests[0]).expect("parse first request");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
-    let first_items = first["input"]
-        .as_array()
-        .expect("first request input")
-        .clone();
-    let second_items = second["input"]
-        .as_array()
-        .expect("second request input")
-        .clone();
-    let snapshot = context_snapshot::format_labeled_items_snapshot(
-        "/responses POST bodies (input only, redacted like other suite snapshots)",
+    let snapshot = context_snapshot::format_context_snapshot(
+        "/responses POST bodies with pending input",
         &[
-            ("First request", first_items.as_slice()),
-            ("Second request", second_items.as_slice()),
+            SnapshotEntry::body(&first).labeled("First request"),
+            SnapshotEntry::body(&second).labeled("Second request"),
         ],
         &options,
     );
@@ -550,16 +838,10 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         .codex;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "first prompt".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first prompt".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -569,16 +851,10 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
     .await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "second prompt".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "second prompt".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -781,6 +1057,7 @@ async fn queued_inter_agent_mail_does_not_restart_after_final_answer() {
 async fn injected_response_item_reopens_turn_after_final_answer() {
     const INITIAL_PROMPT: &str = "first prompt";
     const INJECTED_CONTEXT: &str = "late injected context";
+    const EXTERNAL_CONTEXT: &str = "external injected context";
     let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
 
     let first_chunks = vec![
@@ -821,20 +1098,703 @@ async fn injected_response_item_reopens_turn_after_final_answer() {
             .await
             .is_ok()
     );
+    codex
+        .inject_response_items(vec![responses::user_message_item(EXTERNAL_CONTEXT)])
+        .await
+        .expect("external context should be injected");
     let _ = gate_completed_tx.send(());
 
     wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 2);
+    let first: Value = from_slice(&requests[0]).expect("parse first request");
+    let first_turn_id = first["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("first request should include its turn ID");
+    responses::assert_root_turn(&first, Some(first_turn_id))
+        .expect("initial root should be trusted");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
+    responses::assert_root_turn(&second, Some(first_turn_id))
+        .expect("external injection should preserve the active turn root");
     let relevant_user_input = message_input_texts(&second, "user")
         .into_iter()
-        .filter(|text| text == INITIAL_PROMPT || text == INJECTED_CONTEXT)
+        .filter(|text| {
+            text == INITIAL_PROMPT || text == INJECTED_CONTEXT || text == EXTERNAL_CONTEXT
+        })
         .collect::<Vec<_>>();
-    assert_eq!(relevant_user_input, vec![INITIAL_PROMPT, INJECTED_CONTEXT]);
+    assert_eq!(
+        relevant_user_input,
+        vec![INITIAL_PROMPT, INJECTED_CONTEXT, EXTERNAL_CONTEXT]
+    );
 
     server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_reconnects_websocket_and_sends_full_history() -> anyhow::Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+
+    let server = responses::start_websocket_server(vec![
+        vec![
+            vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+            vec![
+                ev_response_created("resp-interrupted"),
+                ev_reasoning_item_added("reason-1", &["thinking"]),
+            ],
+            // Keep the first connection open until the client closes it.
+            vec![],
+        ],
+        vec![vec![
+            ev_response_created("resp-follow-up"),
+            ev_completed("resp-follow-up"),
+        ]],
+    ])
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::InstantInterrupt)
+                .expect("enable InstantInterrupt feature");
+        })
+        .build_with_websocket_server(&server)
+        .await?;
+    let codex = &test.codex;
+
+    submit_user_input(codex, "first prompt").await;
+    wait_for_reasoning_item_started(codex).await;
+    let initial_request = server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 1)
+        .await
+        .body_json();
+    assert_eq!(initial_request["previous_response_id"], "warm-1");
+
+    steer_user_input(codex, "second prompt").await;
+    let follow_up = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 0),
+    )
+    .await
+    .expect("steer should close the first socket and open a new one")
+    .body_json();
+    assert!(follow_up.get("previous_response_id").is_none());
+    let prompts = message_input_texts(&follow_up, "user")
+        .into_iter()
+        .filter(|text| text == "first prompt" || text == "second prompt")
+        .collect::<Vec<_>>();
+    assert_eq!(prompts, vec!["first prompt", "second prompt"]);
+    wait_for_event(codex, |event| {
+        assert!(!matches!(
+            event,
+            EventMsg::TurnAborted(_) | EventMsg::StreamError(_)
+        ));
+        matches!(event, EventMsg::TurnComplete(completed) if completed.error.is_none())
+    })
+    .await;
+
+    assert_eq!(server.connections().len(), 2);
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_during_stream_retry_skips_backoff() {
+    let server = responses::start_mock_server().await;
+    let mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_failed(
+                "resp-failed",
+                "rate_limit_exceeded",
+                "Rate limit exceeded. Please try again in 60s.",
+            ),
+            responses::sse_completed("resp-follow-up"),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::InstantInterrupt)
+                .expect("enable InstantInterrupt feature");
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(1);
+        })
+        .build_with_auto_env(&server)
+        .await
+        .expect("build Codex test session");
+    let codex = &test.codex;
+
+    submit_user_input(codex, "first prompt").await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::StreamError(_))).await;
+    steer_user_input(codex, "second prompt").await;
+    // Completion must not wait for the server's 60-second retry delay.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wait_for_successful_turn(codex),
+    )
+    .await
+    .expect("steer should interrupt retry backoff");
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let second = requests[1].body_json();
+    let prompts = message_input_texts(&second, "user")
+        .into_iter()
+        .filter(|text| text == "first prompt" || text == "second prompt")
+        .collect::<Vec<_>>();
+    assert_eq!(prompts, vec!["first prompt", "second prompt"]);
+    codex
+        .shutdown_and_wait()
+        .await
+        .expect("shut down test session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steers_during_tool_drain_preserve_tool_output_and_each_input() {
+    const TOOL_CALL_ID: &str = "held-tool";
+    let (release_response, response_gate) = oneshot::channel();
+    let first_chunks = vec![
+        chunk(ev_response_created("resp-1")),
+        chunk(ev_function_call(TOOL_CALL_ID, "held_tool", "{}")),
+        gated_chunk(response_gate, vec![ev_completed("resp-1")]),
+    ];
+    let (server, _) =
+        start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::InstantInterrupt)
+                .expect("enable InstantInterrupt feature");
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build Codex test session");
+    let codex = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                name: "held_tool".to_string(),
+                description: "A tool held by the test until both steers are queued.".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                defer_loading: false,
+            })],
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await
+        .expect("start thread with dynamic tool")
+        .thread;
+
+    submit_user_input(&codex, "first prompt").await;
+    let EventMsg::DynamicToolCallRequest(tool_request) = wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::DynamicToolCallRequest(request) if request.call_id == TOOL_CALL_ID)
+    })
+    .await else {
+        unreachable!("predicate guarantees tool request");
+    };
+
+    steer_user_input(&codex, "second prompt").await;
+    steer_user_input(&codex, "third prompt").await;
+    codex
+        .submit(Op::DynamicToolResponse {
+            id: tool_request.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "held tool result".to_string(),
+                }],
+                success: true,
+            },
+        })
+        .await
+        .expect("complete dynamic tool");
+    wait_for_event(&codex, |event| {
+        assert!(!matches!(
+            event,
+            EventMsg::TurnAborted(_) | EventMsg::StreamError(_)
+        ));
+        matches!(event, EventMsg::TurnComplete(completed) if completed.error.is_none())
+    })
+    .await;
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    let second: Value = from_slice(&requests[1]).expect("parse replacement request");
+    let prompts = message_input_texts(&second, "user")
+        .into_iter()
+        .filter(|text| {
+            matches!(
+                text.as_str(),
+                "first prompt" | "second prompt" | "third prompt"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prompts,
+        vec!["first prompt", "second prompt", "third prompt"]
+    );
+    let result = function_call_output_text(&second, TOOL_CALL_ID).expect("real tool output");
+    assert!(result.contains("held tool result"), "tool output: {result}");
+    assert_eq!(
+        second["input"]
+            .as_array()
+            .expect("request input is an array")
+            .iter()
+            .filter(|item| item["type"] == "function_call_output" && item["call_id"] == TOOL_CALL_ID)
+            .count(),
+        1,
+        "the direct tool result should be recorded exactly once"
+    );
+
+    // The replacement request completed while the original response was still gated.
+    drop(release_response);
+    server.shutdown().await;
+}
+
+#[test_case(false; "disabled")]
+#[test_case(true; "enabled")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steers_yield_exec_and_wait_without_stopping_the_cell(instant_interrupt: bool) {
+    const EXEC_ID: &str = "exec-call";
+    const WAIT_ONE_ID: &str = "wait-one";
+    const WAIT_TWO_ID: &str = "wait-two";
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            if instant_interrupt {
+                config
+                    .features
+                    .enable(Feature::InstantInterrupt)
+                    .expect("enable InstantInterrupt feature");
+            } else {
+                config
+                    .features
+                    .disable(Feature::InstantInterrupt)
+                    .expect("disable InstantInterrupt feature");
+            }
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("enable CodeMode feature");
+            config
+                .features
+                .enable(Feature::CodeModeHost)
+                .expect("enable CodeModeHost feature");
+            config.code_mode.disable_in_process_fallback = true;
+            config
+                .features
+                .disable(Feature::EnableRequestCompression)
+                .expect("disable request compression");
+            config.model_provider.supports_websockets = false;
+        })
+        .build_with_auto_env(&server)
+        .await
+        .expect("build Codex test session");
+    test.codex
+        .shutdown_and_wait()
+        .await
+        .expect("shut down unused test session");
+    let codex = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                name: "held_tool".into(),
+                description: "A tool held until the test responds.".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                defer_loading: false,
+            })],
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await
+        .expect("start thread with dynamic tool")
+        .thread;
+
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            ev_response_created("resp-exec"),
+            ev_custom_tool_call(
+                EXEC_ID,
+                "exec",
+                "// @exec: {\"yield_time_ms\": 60000}\nawait tools.held_tool({}); text('background result');",
+            ),
+            ev_completed("resp-exec"),
+        ]),
+    )
+    .await;
+
+    if instant_interrupt {
+        for (response_id, call_id) in [
+            ("resp-wait-one", WAIT_ONE_ID),
+            ("resp-wait-two", WAIT_TWO_ID),
+        ] {
+            Mock::given(method("POST"))
+                .and(path_regex(".*/responses$"))
+                .respond_with(move |request: &Request| {
+                    let body: Value = from_slice(&request.body).expect("parse replacement request");
+                    let output = call_output_text(&body, "custom_tool_call_output", EXEC_ID)
+                        .expect("yielded exec output");
+                    // Every follow-up includes the real cell ID in the exec output.
+                    let id = output
+                        .strip_prefix("Script running with cell ID ")
+                        .and_then(|rest| rest.lines().next())
+                        .expect("running cell ID");
+                    responses::sse_response(responses::sse(vec![
+                        ev_response_created(response_id),
+                        ev_function_call(
+                            call_id,
+                            "wait",
+                            &json!({"cell_id": id, "yield_time_ms": 60000}).to_string(),
+                        ),
+                        ev_completed(response_id),
+                    ]))
+                })
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+    }
+    let final_response =
+        responses::mount_sse_once(&server, responses::sse_completed("resp-done")).await;
+
+    submit_user_input(&codex, "start the cell").await;
+    let EventMsg::DynamicToolCallRequest(tool_request) = wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::DynamicToolCallRequest(request) if request.tool == "held_tool")
+    })
+    .await else {
+        unreachable!("predicate guarantees tool request");
+    };
+    steer_user_input(&codex, "interrupt exec").await;
+    if !instant_interrupt {
+        codex
+            .submit(Op::DynamicToolResponse {
+                id: tool_request.call_id,
+                response: DynamicToolResponse {
+                    content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                        text: "released".into(),
+                    }],
+                    success: true,
+                },
+            })
+            .await
+            .expect("release nested tool");
+        wait_for_turn_complete(&codex).await;
+        let request = final_response.single_request().body_json();
+        assert!(
+            call_output_text(&request, "custom_tool_call_output", EXEC_ID)
+                .expect("exec output")
+                .contains("background result")
+        );
+        assert!(message_input_texts(&request, "user").contains(&"interrupt exec".to_string()));
+        codex
+            .shutdown_and_wait()
+            .await
+            .expect("shut down test session");
+        return;
+    }
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::RawResponseItem(raw) if matches!(&raw.item, ResponseItem::FunctionCall { call_id, .. } if call_id == WAIT_ONE_ID))
+    })
+    .await;
+    steer_user_input(&codex, "interrupt wait").await;
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::RawResponseItem(raw) if matches!(&raw.item, ResponseItem::FunctionCall { call_id, .. } if call_id == WAIT_TWO_ID))
+    })
+    .await;
+    codex
+        .submit(Op::DynamicToolResponse {
+            id: tool_request.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "released".into(),
+                }],
+                success: true,
+            },
+        })
+        .await
+        .expect("release nested tool");
+    wait_for_event(&codex, |event| {
+        assert!(!matches!(
+            event,
+            EventMsg::TurnAborted(_) | EventMsg::StreamError(_)
+        ));
+        matches!(event, EventMsg::TurnComplete(completed) if completed.error.is_none())
+    })
+    .await;
+
+    let request = final_response.single_request().body_json();
+    let exec_output =
+        call_output_text(&request, "custom_tool_call_output", EXEC_ID).expect("exec output");
+    let id = exec_output
+        .strip_prefix("Script running with cell ID ")
+        .and_then(|rest| rest.lines().next())
+        .expect("running cell ID");
+    let wait_output =
+        call_output_text(&request, "function_call_output", WAIT_ONE_ID).expect("first wait output");
+    assert!(wait_output.contains(&format!("Script running with cell ID {id}")));
+    let completed_output = call_output_text(&request, "function_call_output", WAIT_TWO_ID)
+        .expect("second wait output");
+    assert!(
+        completed_output.contains("background result"),
+        "{completed_output}"
+    );
+    let prompts = message_input_texts(&request, "user")
+        .into_iter()
+        .filter(|text| {
+            matches!(
+                text.as_str(),
+                "start the cell" | "interrupt exec" | "interrupt wait"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prompts,
+        vec!["start the cell", "interrupt exec", "interrupt wait"]
+    );
+    codex
+        .shutdown_and_wait()
+        .await
+        .expect("shut down test session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_during_compaction_is_sent_after_compaction() {
+    let (release_compact, compact_gate) = oneshot::channel();
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![
+            chunk(ev_response_created("resp-first")),
+            chunk(ev_function_call("call-1", "test_tool", "{}")),
+            chunk(ev_completed_with_tokens(
+                "resp-first",
+                /*total_tokens*/ 500,
+            )),
+        ],
+        vec![
+            chunk(ev_response_created("resp-compact")),
+            gated_chunk(
+                compact_gate,
+                vec![
+                    ev_message_item_done("msg-compact", "AUTO_COMPACT_SUMMARY"),
+                    ev_completed_with_tokens("resp-compact", /*total_tokens*/ 50),
+                ],
+            ),
+        ],
+        response_completed_chunks("resp-follow-up"),
+        response_completed_chunks("resp-extra-compaction"),
+        response_completed_chunks("resp-steered"),
+    ])
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config.model_provider.name = "OpenAI (test)".into();
+            config.model_provider.supports_websockets = false;
+            config.model_auto_compact_token_limit = Some(200);
+            config
+                .features
+                .enable(Feature::InstantInterrupt)
+                .expect("enable InstantInterrupt feature");
+            config
+                .features
+                .disable(Feature::EnableRequestCompression)
+                .expect("disable request compression");
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build Codex test session");
+    let codex = test.codex.clone();
+
+    submit_user_input(&codex, "first prompt").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server.wait_for_request_count(/*count*/ 2),
+    )
+    .await
+    .expect("compaction request should begin");
+    steer_user_input(&codex, "old steer").await;
+    release_compact.send(()).expect("finish compaction");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wait_for_successful_turn(&codex),
+    )
+    .await
+    .expect("turn should complete after the steer");
+
+    let requests = server.requests().await;
+    let steer_counts = requests
+        .iter()
+        .skip(2)
+        .map(|request| {
+            let body: Value = from_slice(request).expect("parse follow-up request");
+            message_input_texts(&body, "user")
+                .into_iter()
+                .filter(|text| text == "old steer")
+                .count()
+        })
+        .collect::<Vec<_>>();
+    assert!(steer_counts.contains(&1), "steer counts: {steer_counts:?}");
+    assert!(steer_counts.iter().all(|count| *count <= 1));
+
+    codex
+        .shutdown_and_wait()
+        .await
+        .expect("shut down test session");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_preempts_response_and_yields_running_code_mode_call() {
+    let (release_second_tx, release_second_rx) = oneshot::channel();
+    let (release_final_tx, release_final_rx) = oneshot::channel();
+    let (server, mut completions) = start_streaming_sse_server(vec![
+        vec![
+            chunk(ev_response_created("resp-calls")),
+            chunk(ev_custom_tool_call(
+                "first-exec",
+                "exec",
+                "// @exec: {\"yield_time_ms\": 60000}\nawait tools.held_tool({}); text('first completed');",
+            )),
+            // The second call remains unavailable while the steer is processed.
+            gated_chunk(
+                release_second_rx,
+                vec![
+                    ev_custom_tool_call(
+                        "second-exec",
+                        "exec",
+                        "// @exec: {\"yield_time_ms\": 60000}\nawait new Promise(() => {});",
+                    ),
+                    ev_completed("resp-calls"),
+                ],
+            ),
+        ],
+        vec![
+            chunk(ev_response_created("resp-follow-up")),
+            gated_chunk(release_final_rx, vec![ev_completed("resp-follow-up")]),
+        ],
+    ])
+    .await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::InstantInterrupt)
+                .expect("enable InstantInterrupt feature");
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("enable CodeMode feature");
+            config
+                .features
+                .enable(Feature::CodeModeHost)
+                .expect("enable CodeModeHost feature");
+            config.code_mode.disable_in_process_fallback = true;
+            config
+                .features
+                .disable(Feature::EnableRequestCompression)
+                .expect("disable request compression");
+            config.model_provider.supports_websockets = false;
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build Codex test session");
+    let codex = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                name: "held_tool".into(),
+                description: "A tool held until the test responds.".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                defer_loading: false,
+            })],
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await
+        .expect("start thread with dynamic tool")
+        .thread;
+
+    submit_user_input(&codex, "start cells").await;
+    let EventMsg::DynamicToolCallRequest(held_tool) = wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::DynamicToolCallRequest(request) if request.tool == "held_tool")
+    })
+    .await else {
+        unreachable!("predicate guarantees a dynamic tool request");
+    };
+    steer_user_input(&codex, "yield cells").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server.wait_for_request_count(/*count*/ 2),
+    )
+    .await
+    .expect("the first exec should yield before the follow-up");
+    let requests = server.requests().await;
+    let follow_up: Value = from_slice(&requests[1]).expect("parse follow-up request");
+    assert!(
+        call_output_text(&follow_up, "custom_tool_call_output", "first-exec")
+            .expect("yielded exec output")
+            .starts_with("Script running with cell ID ")
+    );
+    assert!(call_output_text(&follow_up, "custom_tool_call_output", "second-exec").is_none());
+    assert!(message_input_texts(&follow_up, "user").contains(&"yield cells".to_string()));
+    // Attempt to deliver the late call only after the replacement is running.
+    let _ = release_second_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), completions.remove(0))
+        .await
+        .expect("the old server response should finish or detect the closed client");
+
+    codex
+        .submit(Op::DynamicToolResponse {
+            id: held_tool.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "released".into(),
+                }],
+                success: true,
+            },
+        })
+        .await
+        .expect("release nested tool");
+    release_final_tx
+        .send(())
+        .expect("finish follow-up response");
+    wait_for_event(&codex, |event| {
+        assert!(!matches!(
+            event,
+            EventMsg::RawResponseItem(raw)
+                if matches!(&raw.item, ResponseItem::CustomToolCall { call_id, .. } if call_id == "second-exec")
+        ));
+        matches!(event, EventMsg::TurnComplete(completed) if completed.error.is_none())
+    })
+    .await;
+    codex
+        .shutdown_and_wait()
+        .await
+        .expect("shut down test session");
+    server.shutdown().await;
+}
+
+fn call_output_text(body: &Value, output_type: &str, call_id: &str) -> Option<String> {
+    let output = &body["input"]
+        .as_array()?
+        .iter()
+        .find(|item| item["type"] == output_type && item["call_id"] == call_id)?["output"];
+    match output {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -885,6 +1845,356 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
     );
 
     server.shutdown().await;
+}
+
+#[derive(Clone, Copy)]
+enum ConditionalInterruptCase {
+    CurrentTurn,
+    StaleTurn,
+    PendingUserInput,
+    PendingMailbox,
+    AbandonedRequest,
+}
+
+#[test_case(ConditionalInterruptCase::CurrentTurn; "current_turn_without_pending_input")]
+#[test_case(ConditionalInterruptCase::StaleTurn; "stale_turn")]
+#[test_case(ConditionalInterruptCase::PendingUserInput; "pending_user_input")]
+#[test_case(ConditionalInterruptCase::PendingMailbox; "pending_mailbox")]
+#[test_case(ConditionalInterruptCase::AbandonedRequest; "abandoned_request")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_if_no_pending_input_checks_turn_and_queue(
+    case: ConditionalInterruptCase,
+) -> anyhow::Result<()> {
+    const INITIAL_PROMPT: &str = "first prompt";
+    const PENDING_PROMPT: &str = "preserve this pending input";
+    let (release_response, response_gate) = oneshot::channel();
+    let first_chunks = vec![
+        chunk(ev_response_created("resp-1")),
+        chunk(ev_reasoning_item_added("reason-1", &["thinking"])),
+        gated_chunk(
+            response_gate,
+            vec![
+                ev_reasoning_item("reason-1", &["thinking"], &[]),
+                ev_completed("resp-1"),
+            ],
+        ),
+    ];
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
+    let config_server = responses::start_mock_server().await;
+    let base_url = format!("{}/v1", server.uri());
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(base_url);
+            let _ = config.features.disable(Feature::EnableRequestCompression);
+        })
+        .build_with_auto_env(&config_server)
+        .await?;
+    let codex = &test.codex;
+    let TurnInputSubmission::Started { turn_id } = codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: INITIAL_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?
+    else {
+        panic!("initial input should start a turn");
+    };
+    wait_for_reasoning_item_started(codex).await;
+    if matches!(case, ConditionalInterruptCase::PendingUserInput) {
+        steer_user_input(codex, PENDING_PROMPT).await;
+    }
+    if matches!(case, ConditionalInterruptCase::PendingMailbox) {
+        submit_queue_only_agent_mail(codex, PENDING_PROMPT).await;
+    }
+    let expected_turn_id = match case {
+        ConditionalInterruptCase::StaleTurn | ConditionalInterruptCase::AbandonedRequest => {
+            format!("stale-{turn_id}")
+        }
+        ConditionalInterruptCase::CurrentTurn
+        | ConditionalInterruptCase::PendingUserInput
+        | ConditionalInterruptCase::PendingMailbox => turn_id.clone(),
+    };
+    if matches!(case, ConditionalInterruptCase::AbandonedRequest) {
+        let (reply, result) = oneshot::channel();
+        drop(result);
+        codex
+            .submit(Op::InterruptIfNoPendingInput { turn_id, reply })
+            .await?;
+        // Wait for the abandoned request to be handled before releasing the response.
+        let (reply, result) = oneshot::channel();
+        codex
+            .submit(Op::InterruptIfNoPendingInput {
+                turn_id: expected_turn_id.clone(),
+                reply,
+            })
+            .await?;
+        assert!(!tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 10), result).await??);
+    }
+    let should_abort = matches!(case, ConditionalInterruptCase::CurrentTurn);
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(/*secs*/ 10),
+            codex.interrupt_if_no_pending_input(&expected_turn_id),
+        )
+        .await??,
+        should_abort,
+    );
+
+    if should_abort {
+        wait_for_event(codex, |event| {
+            assert!(!matches!(event, EventMsg::TurnComplete(_)));
+            matches!(event, EventMsg::TurnAborted(_))
+        })
+        .await;
+        let _ = release_response.send(());
+    } else {
+        release_response.send(()).expect("release model response");
+        wait_for_event(codex, |event| {
+            assert!(!matches!(event, EventMsg::TurnAborted(_)));
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+    }
+    let requests = server.requests().await;
+    if matches!(case, ConditionalInterruptCase::PendingUserInput) {
+        assert_eq!(requests.len(), 2);
+        let second: Value = from_slice(&requests[1])?;
+        let prompts = message_input_texts(&second, "user")
+            .into_iter()
+            .filter(|text| text == INITIAL_PROMPT || text == PENDING_PROMPT)
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, vec![INITIAL_PROMPT, PENDING_PROMPT]);
+    } else if matches!(case, ConditionalInterruptCase::PendingMailbox) {
+        assert_eq!(requests.len(), 2);
+        let second: Value = from_slice(&requests[1])?;
+        let mail = second["input"]
+            .as_array()
+            .expect("model input")
+            .iter()
+            .find(|item| item["type"] == "agent_message")
+            .expect("pending mailbox input");
+        assert_eq!(
+            mail["content"],
+            json!([{ "type": "input_text", "text": PENDING_PROMPT }])
+        );
+    } else {
+        assert_eq!(requests.len(), 1);
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompactionFailurePoint {
+    PreTurn,
+    MidTurn,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingInputAfterFailure {
+    Steer,
+    QueuedMail,
+    TriggeringMail,
+}
+
+#[test_case(CompactionFailurePoint::PreTurn, PendingInputAfterFailure::Steer; "pre_turn_steer")]
+#[test_case(CompactionFailurePoint::PreTurn, PendingInputAfterFailure::QueuedMail; "pre_turn_mail")]
+#[test_case(CompactionFailurePoint::PreTurn, PendingInputAfterFailure::TriggeringMail; "pre_turn_triggering_mail")]
+#[test_case(CompactionFailurePoint::MidTurn, PendingInputAfterFailure::Steer; "mid_turn_steer")]
+#[test_case(CompactionFailurePoint::MidTurn, PendingInputAfterFailure::QueuedMail; "mid_turn_mail")]
+#[test_case(CompactionFailurePoint::MidTurn, PendingInputAfterFailure::TriggeringMail; "mid_turn_triggering_mail")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_compaction_error_does_not_retry_pending_input(
+    failure_point: CompactionFailurePoint,
+    pending_input: PendingInputAfterFailure,
+) -> anyhow::Result<()> {
+    const PENDING_MESSAGE: &str = "pending input must survive the failed compaction";
+    let (release_failure, failure_gate) = oneshot::channel();
+    let initial_output = match failure_point {
+        CompactionFailurePoint::PreTurn => ev_message_item_done("initial", "first answer"),
+        CompactionFailurePoint::MidTurn => ev_function_call("call-1", "test_tool", "{}"),
+    };
+    let failure = responses::sse_failed("failed-compact", "insufficient_quota", "quota exhausted");
+    let mut streams = vec![
+        vec![
+            chunk(ev_response_created("initial")),
+            chunk(initial_output),
+            chunk(ev_completed_with_tokens(
+                "initial", /*total_tokens*/ 500_000,
+            )),
+        ],
+        vec![StreamingSseChunk {
+            gate: Some(failure_gate),
+            body: failure.clone(),
+        }],
+    ];
+    // Mail arriving during a failed turn may start one fresh turn. That turn must also
+    // stop on the terminal error, persist its mail, and not start another turn for it.
+    let failed_turns = if pending_input == PendingInputAfterFailure::TriggeringMail {
+        streams.push(vec![StreamingSseChunk {
+            gate: None,
+            body: failure,
+        }]);
+        2
+    } else {
+        1
+    };
+    streams.extend([
+        vec![
+            chunk(json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "RECOVERED_COMPACTION",
+                }
+            })),
+            chunk(ev_completed_with_tokens(
+                "recovered-compact",
+                /*total_tokens*/ 50,
+            )),
+        ],
+        vec![
+            chunk(ev_message_item_done("recovered", "recovered answer")),
+            chunk(ev_completed_with_tokens(
+                "recovered",
+                /*total_tokens*/ 60,
+            )),
+        ],
+    ]);
+    let (server, _completions) = start_streaming_sse_server(streams).await;
+    let config_server = responses::start_mock_server().await;
+    let base_url = format!("{}/v1", server.uri());
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(base_url);
+            config.model_auto_compact_token_limit = Some(100_000);
+            // The streaming fixture records raw request bodies for JSON assertions.
+            let _ = config.features.disable(Feature::EnableRequestCompression);
+        })
+        .build_with_auto_env(&config_server)
+        .await?;
+    let codex = &test.codex;
+
+    if failure_point == CompactionFailurePoint::PreTurn {
+        submit_user_input(codex, "initial prompt").await;
+        wait_for_turn_complete(codex).await;
+    }
+    if pending_input == PendingInputAfterFailure::QueuedMail {
+        submit_queue_only_agent_mail(codex, PENDING_MESSAGE).await;
+    }
+    submit_user_input(codex, "prompt that needs compaction").await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 10),
+        server.wait_for_request_count(/*count*/ 2),
+    )
+    .await?;
+    match pending_input {
+        PendingInputAfterFailure::Steer => steer_user_input(codex, PENDING_MESSAGE).await,
+        PendingInputAfterFailure::QueuedMail => {}
+        PendingInputAfterFailure::TriggeringMail => {
+            codex
+                .submit(Op::InterAgentCommunication {
+                    communication: InterAgentCommunication::new(
+                        AgentPath::root().join("worker").expect("valid worker path"),
+                        AgentPath::root(),
+                        Vec::new(),
+                        PENDING_MESSAGE.to_string(),
+                        /*trigger_turn*/ true,
+                    ),
+                    start_options: Default::default(),
+                })
+                .await?;
+            codex.submit(Op::RealtimeConversationListVoices).await?;
+            wait_for_event(codex, |event| {
+                matches!(event, EventMsg::RealtimeConversationListVoicesResponse(_))
+            })
+            .await;
+        }
+    }
+    release_failure.send(()).expect("release compact failure");
+
+    let mut errors = Vec::new();
+    let mut completed_turns = 0;
+    wait_for_event(codex, |event| {
+        match event {
+            EventMsg::Error(error) => {
+                assert_eq!(
+                    error.codex_error_info,
+                    Some(CodexErrorInfo::UsageLimitExceeded)
+                );
+                errors.push(error.clone());
+            }
+            EventMsg::TurnComplete(completed) => {
+                assert_eq!(completed.error.as_ref(), errors.last());
+                assert_eq!(completed.last_agent_message, None);
+                completed_turns += 1;
+            }
+            _ => {}
+        }
+        completed_turns == failed_turns
+    })
+    .await;
+    assert_eq!(errors.len(), failed_turns);
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 1 + failed_turns);
+    for request in &requests[1..] {
+        let body: Value = from_slice(request)?;
+        assert!(
+            body["input"]
+                .as_array()
+                .expect("compact input")
+                .iter()
+                .any(|item| { item["type"] == "compaction_trigger" })
+        );
+    }
+
+    codex.flush_rollout().await?;
+    let history = codex.load_history(/*include_archived*/ false).await?;
+    let saved_pending_messages = history
+        .items
+        .iter()
+        .filter_map(|item| {
+            let RolloutItem::ResponseItem(envelope) = item else {
+                return None;
+            };
+            match &envelope.item {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    content.iter().find_map(|item| match item {
+                        ContentItem::InputText { text } if text == PENDING_MESSAGE => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                }
+                ResponseItem::AgentMessage { content, .. } => {
+                    content.iter().find_map(|item| match item {
+                        AgentMessageInputContent::InputText { text } if text == PENDING_MESSAGE => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(saved_pending_messages, vec![PENDING_MESSAGE]);
+
+    // The failed turn must not poison a later explicit retry once compaction can succeed.
+    submit_user_input(codex, "retry after quota resets").await;
+    wait_for_agent_message(codex, "recovered answer").await;
+    let completed = wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!("expected turn completion");
+    };
+    assert_eq!(completed.error, None);
+    assert_eq!(server.requests().await.len(), 3 + failed_turns);
+    server.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1077,9 +2387,9 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         "printf '%04000d' 0"
     };
     let large_output_args = json!({
-        "command": large_output_command,
+        "cmd": large_output_command,
         "login": false,
-        "timeout_ms": 2000,
+        "yield_time_ms": 2000,
     })
     .to_string();
 
@@ -1087,7 +2397,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         chunk(ev_response_created("resp-1")),
         chunk(ev_function_call(
             "call-1",
-            "shell_command",
+            "exec_command",
             &large_output_args,
         )),
         gated_chunk(

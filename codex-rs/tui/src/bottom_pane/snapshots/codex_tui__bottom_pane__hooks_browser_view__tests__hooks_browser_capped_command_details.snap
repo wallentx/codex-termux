@@ -4,9 +4,10 @@ expression: "render_lines(&view, 44)"
 ---
                                             
   PreToolUse hooks                          
-  Turn hooks on or off. Your changes are s  
+  Turn hooks on or off. Your changes are    
+  saved automatically.                      
                                             
-  [x] Hook 1                                
+› [x] Hook 1                                
                                             
   Event     PreToolUse                      
   Matcher   Bash                            
@@ -14,7 +15,9 @@ expression: "render_lines(&view, 44)"
   Command   one two three four five six     
             seven eight nine ten eleven     
             twelve thirteen fourteen…       
+  Mode      Sync                            
   Timeout   30s                             
   Trust     Trusted                         
                                             
-  Press space or enter to toggle; esc to go
+                                            
+  space/enter toggle · esc back

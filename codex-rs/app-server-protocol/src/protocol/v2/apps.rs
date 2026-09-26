@@ -1,9 +1,9 @@
 use super::shared::default_enabled;
-use schemars::JsonSchema;
+use crate::JsonSchema;
+use crate::TS;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -107,7 +107,6 @@ pub struct AppMetadata {
     pub version: Option<String>,
     pub version_id: Option<String>,
     pub version_notes: Option<String>,
-    pub first_party_type: Option<String>,
     pub first_party_requires_install: Option<bool>,
     pub show_in_composer_when_unlinked: Option<bool>,
 }
@@ -178,6 +177,9 @@ pub struct AppsReadParams {
     /// App ids to read. The server accepts at most 100 ids and deduplicates repeated ids while
     /// preserving their first-request order.
     pub app_ids: Vec<String>,
+    /// Optional loaded thread id used to evaluate effective app configuration.
+    #[ts(optional = nullable)]
+    pub thread_id: Option<String>,
     /// When true, include display-only public tool summaries in the returned metadata.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_tools: bool,
@@ -191,6 +193,11 @@ pub struct AppToolSummary {
     pub name: String,
     pub title: Option<String>,
     pub description: String,
+    #[serde(default = "default_enabled")]
+    pub is_enabled: bool,
+    pub disabled_reason: Option<String>,
+    #[serde(default)]
+    pub is_read_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -202,6 +209,11 @@ pub struct ConnectorMetadata {
     pub name: String,
     pub description: Option<String>,
     pub icon_url: Option<String>,
+    pub icon_url_dark: Option<String>,
+    pub distribution_channel: Option<String>,
+    pub install_url: Option<String>,
+    #[serde(default)]
+    pub plugin_display_names: Vec<String>,
     pub tool_summaries: Option<Vec<AppToolSummary>>,
 }
 

@@ -4,22 +4,26 @@
 //! limits, add-credit nudges, and feedback uploads. Results are routed back through `AppEvent` so
 //! the main event loop remains single-threaded.
 
+use super::feedback_upload::fetch_feedback_upload;
 use super::plugin_mentions::fetch_plugin_mentions;
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_info::app_info_from_api;
+use crate::chatwidget::ThreadUsageOutcome;
 use crate::config_update::format_config_error;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditParams;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
+use codex_app_server_protocol::GetAccountRateLimitsParams;
+use codex_app_server_protocol::GetAccountTokenUsageParams;
+use codex_app_server_protocol::GetAccountTokenUsageResponse;
 use codex_app_server_protocol::MarketplaceAddParams;
 use codex_app_server_protocol::MarketplaceAddResponse;
 use codex_app_server_protocol::MarketplaceRemoveParams;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeParams;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
-
 use codex_app_server_protocol::RequestId;
 
 use crate::hooks_rpc::fetch_hooks_list;
@@ -27,8 +31,8 @@ use crate::hooks_rpc::write_hook_trust;
 use crate::hooks_rpc::write_hook_trusts;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
-const TOKEN_ACTIVITY_FETCH_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(/*secs*/ 15);
+pub(super) const THREAD_USAGE_FETCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(/*secs*/ 65);
 const RATE_LIMIT_RESET_REQUEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(/*secs*/ 15);
 const WORKSPACE_HEADLINE_FETCH_TIMEOUT: std::time::Duration =
@@ -69,22 +73,36 @@ impl App {
     /// Spawns a background task to fetch account rate limits and deliver the
     /// result as a `RateLimitsLoaded` event.
     ///
-    /// The `origin` is forwarded to the completion handler so it can distinguish
-    /// a startup prefetch (which updates cached snapshots and may surface a
-    /// reset-credit notice) from a `/status`-triggered refresh (which must
-    /// finalize the corresponding status card).
-    pub(super) fn refresh_rate_limits(
+    /// Recovery requests are coalesced and bounded by the reset-request timeout. The origin
+    /// also identifies command-specific completion work, such as finalizing a `/status` card,
+    /// without confusing sparse inference notifications with authoritative usage responses.
+    pub(crate) fn refresh_rate_limits(
         &mut self,
         app_server: &AppServerSession,
         origin: RateLimitRefreshOrigin,
     ) {
+        if matches!(
+            origin,
+            RateLimitRefreshOrigin::Recovery | RateLimitRefreshOrigin::ResetConsume { .. }
+        ) {
+            self.chat_widget.invalidate_ordinary_usage_recovery();
+            self.chat_widget.hold_rate_limit_recovery();
+        }
+        let Some((request_id, hard_stop_generation)) = self
+            .rate_limit_refresh_state
+            .start(origin, &mut self.rate_limit_hard_stop_generation)
+        else {
+            return;
+        };
+        self.chat_widget.start_usage_notice_read(request_id);
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
-        let hard_stop_generation = self.rate_limit_hard_stop_generation;
         tokio::spawn(async move {
-            let request = fetch_account_rate_limits(request_handle);
+            let request = fetch_account_rate_limits(request_handle, origin);
             let result = match origin {
-                RateLimitRefreshOrigin::ResetConsume { .. }
+                RateLimitRefreshOrigin::Recovery
+                | RateLimitRefreshOrigin::Periodic
+                | RateLimitRefreshOrigin::ResetConsume { .. }
                 | RateLimitRefreshOrigin::ResetPicker { .. } => {
                     tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, request)
                         .await
@@ -98,6 +116,7 @@ impl App {
                 }
             };
             app_event_tx.send(AppEvent::RateLimitsLoaded {
+                request_id,
                 origin,
                 hard_stop_generation,
                 result,
@@ -105,22 +124,27 @@ impl App {
         });
     }
 
-    pub(super) fn refresh_token_activity(
+    pub(super) fn refresh_thread_usage(
         &mut self,
         app_server: &AppServerSession,
+        thread_id: ThreadId,
         request_id: u64,
     ) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
-                TOKEN_ACTIVITY_FETCH_TIMEOUT,
-                fetch_account_token_activity(request_handle),
+                THREAD_USAGE_FETCH_TIMEOUT,
+                fetch_thread_usage(request_handle, thread_id),
             )
             .await
-            .map_err(|_| "account/usage/read timed out in TUI".to_string())
+            .map_err(|_| "thread usage request timed out in TUI".to_string())
             .and_then(|result| result.map_err(|err| err.to_string()));
-            app_event_tx.send(AppEvent::TokenActivityLoaded { request_id, result });
+            app_event_tx.send(AppEvent::ThreadUsageLoaded {
+                thread_id,
+                request_id,
+                result,
+            });
         });
     }
 
@@ -180,6 +204,7 @@ impl App {
     pub(super) fn send_add_credits_nudge_email(
         &mut self,
         app_server: &AppServerSession,
+        request_id: Uuid,
         credit_type: AddCreditsNudgeCreditType,
     ) {
         let request_handle = app_server.request_handle();
@@ -188,7 +213,7 @@ impl App {
             let result = send_add_credits_nudge_email(request_handle, credit_type)
                 .await
                 .map_err(|err| err.to_string());
-            app_event_tx.send(AppEvent::AddCreditsNudgeEmailFinished { result });
+            app_event_tx.send(AppEvent::AddCreditsNudgeEmailFinished { request_id, result });
         });
     }
 
@@ -204,10 +229,10 @@ impl App {
         let app_event_tx = self.app_event_tx.clone();
         let cwd = self.config.cwd.to_path_buf();
         tokio::spawn(async move {
-            let result = fetch_skills_list(request_handle, cwd)
+            let result = fetch_skills_list(request_handle, cwd.clone())
                 .await
                 .map_err(|err| format!("{err:#}"));
-            app_event_tx.send(AppEvent::SkillsListLoaded { result });
+            app_event_tx.send(AppEvent::SkillsListLoaded { cwd, result });
         });
     }
 
@@ -218,14 +243,21 @@ impl App {
     ) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
-        let thread_id = self
-            .current_displayed_thread_id()
-            .map(|thread_id| thread_id.to_string());
+        let thread_id = self.current_displayed_thread_id();
+        let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
+        let generation = self.chat_widget.connector_scope_generation();
         tokio::spawn(async move {
-            let result = fetch_connectors_list(request_handle, force_refetch, thread_id)
-                .await
-                .map_err(|err| err.to_string());
+            let result = fetch_connectors_list(
+                request_handle,
+                force_refetch,
+                thread_id.map(|thread_id| thread_id.to_string()),
+            )
+            .await
+            .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::ConnectorsLoaded {
+                thread_id,
+                cwd,
+                generation,
                 result,
                 is_final: true,
             });
@@ -530,14 +562,15 @@ impl App {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         if !self.config.features.enabled(Feature::Plugins) {
-            app_event_tx.send(AppEvent::PluginMentionsLoaded { plugins: None });
+            app_event_tx.send(AppEvent::PluginMentionsLoaded { cwd, plugins: None });
             return;
         }
 
         tokio::spawn(async move {
-            match fetch_plugin_mentions(request_handle, cwd).await {
+            match fetch_plugin_mentions(request_handle, cwd.clone()).await {
                 Ok(plugins) => {
                     app_event_tx.send(AppEvent::PluginMentionsLoaded {
+                        cwd,
                         plugins: Some(plugins),
                     });
                 }
@@ -572,8 +605,10 @@ impl App {
             turn_id,
             include_logs,
         );
+        let codex_home = app_server.codex_home_path(&self.config.codex_home);
+        let feedback = self.feedback.clone();
         tokio::spawn(async move {
-            let result = fetch_feedback_upload(request_handle, params)
+            let result = fetch_feedback_upload(request_handle, codex_home, params, feedback)
                 .await
                 .map(|response| response.thread_id)
                 .map_err(|err| err.to_string());
@@ -617,17 +652,7 @@ impl App {
 
         let should_send = {
             let mut guard = store.lock().await;
-            guard
-                .buffer
-                .push_back(ThreadBufferedEvent::FeedbackSubmission(event.clone()));
-            if guard.buffer.len() > guard.capacity
-                && let Some(removed) = guard.buffer.pop_front()
-                && let ThreadBufferedEvent::Request(request) = &removed
-            {
-                guard
-                    .pending_interactive_replay
-                    .note_evicted_server_request(request);
-            }
+            guard.push_buffered_event(ThreadBufferedEvent::FeedbackSubmission(event.clone()));
             guard.active
         };
 
@@ -717,6 +742,7 @@ impl App {
         };
 
         self.transcript_cells.remove(index);
+        self.native_history.retain(&self.transcript_cells);
         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
             overlay.replace_cells(self.transcript_cells.clone());
         }
@@ -759,28 +785,54 @@ pub(super) async fn fetch_all_mcp_server_statuses(
 
 pub(super) async fn fetch_account_rate_limits(
     request_handle: AppServerRequestHandle,
+    origin: RateLimitRefreshOrigin,
 ) -> Result<GetAccountRateLimitsResponse> {
     let request_id = RequestId::String(format!("account-rate-limits-{}", Uuid::new_v4()));
-    request_handle
+    let result = request_handle
         .request_typed(ClientRequest::GetAccountRateLimits {
-            request_id,
-            params: None,
+            request_id: request_id.clone(),
+            params: Some(GetAccountRateLimitsParams {
+                supports_luna_reserve: true,
+                exclude_reset_credit_details: origin == RateLimitRefreshOrigin::Periodic,
+            }),
         })
-        .await
-        .wrap_err("account/rateLimits/read failed in TUI")
+        .await;
+    // Older remote app servers accept only null params. Keep their usage reads working
+    // without opting them into exposure or pretending that they support the new capability.
+    if matches!(
+        &result,
+        Err(codex_app_server_client::TypedRequestError::Server { source, .. })
+            if matches!(source.code, -32600 | -32602)
+    ) {
+        return request_handle
+            .request_typed(ClientRequest::GetAccountRateLimits {
+                request_id,
+                params: None,
+            })
+            .await
+            .wrap_err("account/rateLimits/read failed in TUI");
+    }
+    result.wrap_err("account/rateLimits/read failed in TUI")
 }
 
-pub(super) async fn fetch_account_token_activity(
+pub(super) async fn fetch_thread_usage(
     request_handle: AppServerRequestHandle,
-) -> Result<codex_app_server_protocol::GetAccountTokenUsageResponse> {
-    let request_id = RequestId::String(format!("account-token-usage-{}", Uuid::new_v4()));
-    request_handle
+    thread_id: ThreadId,
+) -> Result<ThreadUsageOutcome> {
+    let request_id = RequestId::String(format!("thread-usage-{}", Uuid::new_v4()));
+    let response: GetAccountTokenUsageResponse = request_handle
         .request_typed(ClientRequest::GetAccountTokenUsage {
             request_id,
-            params: None,
+            params: Some(GetAccountTokenUsageParams {
+                thread_id: Some(thread_id.to_string()),
+            }),
         })
         .await
-        .wrap_err("account/usage/read failed in TUI")
+        .wrap_err("account/usage/read failed for thread usage in TUI")?;
+    Ok(response
+        .thread_usage
+        .map(ThreadUsageOutcome::Available)
+        .unwrap_or(ThreadUsageOutcome::Disabled))
 }
 
 pub(super) async fn consume_rate_limit_reset_credit_request(
@@ -948,24 +1000,24 @@ fn plugin_remote_section_error_message(label: &str, err: &str) -> String {
 fn plugin_remote_section_error_next_step(label: &str, err: &str) -> &'static str {
     let err = err.to_ascii_lowercase();
     if err.contains("api key auth is not supported") {
-        "Sign in with ChatGPT auth; API key auth cannot load remote plugin catalogs."
+        "Sign in with ChatGPT auth; API key auth cannot load remote plugin catalogs"
     } else if err.contains("authentication required")
         || err.contains("not signed in")
         || err.contains("not logged in")
     {
-        "Sign in to ChatGPT, then try loading this section again."
+        "Sign in to ChatGPT, then try loading this section again"
     } else if err.contains("codex plugins are disabled")
         || err.contains("plugin sharing is disabled")
         || err.contains("plugin sharing is not enabled")
         || err.contains("feature disabled")
     {
-        "Ask a workspace admin to enable Codex plugins or plugin sharing."
+        "Ask a workspace admin to enable Codex plugins or plugin sharing"
     } else if err.contains("workspace") && (err.contains("access") || err.contains("mismatch")) {
-        "Switch to the matching workspace or ask the sharer for access."
+        "Switch to the matching workspace or ask the sharer for access"
     } else if err.contains("not found") || err.contains("status 404") {
-        "Check that you are signed in to the correct workspace and still have access."
+        "Check that you are signed in to the correct workspace and still have access"
     } else if err.contains("old build") || err.contains("update codex") || err.contains("stale") {
-        "Update Codex, then try opening the shared plugin again."
+        "Update Codex, then try opening the shared plugin again"
     } else if err.contains("service unavailable")
         || err.contains("temporarily unavailable")
         || err.contains("status 503")
@@ -973,11 +1025,11 @@ fn plugin_remote_section_error_next_step(label: &str, err: &str) -> &'static str
         || err.contains("request")
         || err.contains("status")
     {
-        "Try again later; local plugin functionality is still available."
+        "Try again later; local plugin functionality is still available"
     } else if err.contains("disabled by admin") || err.contains("admin disabled") {
-        "Ask a workspace admin to confirm plugin access."
+        "Ask a workspace admin to confirm plugin access"
     } else if label == "Shared with me" && err.contains("plugin") && err.contains("disabled") {
-        "Ask the sharer or a workspace admin to confirm plugin access."
+        "Ask the sharer or a workspace admin to confirm plugin access"
     } else {
         ""
     }
@@ -987,7 +1039,7 @@ fn plugin_sharing_disabled_remote_section_error() -> PluginRemoteSectionError {
     PluginRemoteSectionError {
         section_id: "shared-with-me".to_string(),
         label: "Shared with me".to_string(),
-        message: "Plugin sharing is disabled for this Codex session. Enable plugin sharing to load shared plugins.".to_string(),
+        message: "Enable plugin sharing for this Codex session to load shared plugins".to_string(),
     }
 }
 
@@ -1028,6 +1080,7 @@ async fn request_plugin_list_with_marketplace_kinds(
             params: PluginListParams {
                 cwds: Some(vec![cwd]),
                 marketplace_kinds,
+                force_refetch: false,
             },
         })
         .await
@@ -1133,6 +1186,7 @@ pub(super) async fn fetch_plugin_install(
             params: PluginInstallParams {
                 marketplace_path,
                 remote_marketplace_name,
+                install_attempt_id: None,
                 plugin_name,
             },
         })
@@ -1227,17 +1281,6 @@ pub(super) fn build_feedback_upload_params(
     }
 }
 
-pub(super) async fn fetch_feedback_upload(
-    request_handle: AppServerRequestHandle,
-    params: FeedbackUploadParams,
-) -> Result<FeedbackUploadResponse> {
-    let request_id = RequestId::String(format!("feedback-upload-{}", Uuid::new_v4()));
-    request_handle
-        .request_typed(ClientRequest::FeedbackUpload { request_id, params })
-        .await
-        .wrap_err("feedback/upload failed in TUI")
-}
-
 /// Convert flat `McpServerStatus` responses into the per-server maps used by the
 /// in-process MCP subsystem (tools keyed as `mcp__{server}__{tool}`, plus
 /// per-server resource/template/auth maps). Test-only because the TUI
@@ -1262,6 +1305,7 @@ pub(super) fn mcp_inventory_maps_from_statuses(statuses: Vec<McpServerStatus>) -
         auth_statuses.insert(
             server_name.clone(),
             match status.auth_status {
+                codex_app_server_protocol::McpAuthStatus::Unknown => McpAuthStatus::Unknown,
                 codex_app_server_protocol::McpAuthStatus::Unsupported => McpAuthStatus::Unsupported,
                 codex_app_server_protocol::McpAuthStatus::NotLoggedIn => McpAuthStatus::NotLoggedIn,
                 codex_app_server_protocol::McpAuthStatus::BearerToken => McpAuthStatus::BearerToken,
@@ -1282,10 +1326,94 @@ pub(super) fn mcp_inventory_maps_from_statuses(statuses: Vec<McpServerStatus>) -
 mod tests {
     use super::*;
     use crate::app::test_support::make_test_app;
+    use app_test_support::ChatGptAuthFixture;
+    use app_test_support::write_chatgpt_auth;
     use codex_app_server_protocol::PluginMarketplaceEntry;
+    use codex_app_server_protocol::ThreadUsage;
+    use codex_config::types::AuthCredentialsStoreMode;
     use codex_protocol::mcp::Tool;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn fetch_thread_usage_uses_app_server_auth_after_persisted_account_changes() {
+        let mut app = make_test_app().await;
+        let server = wiremock::MockServer::start().await;
+        let thread_id = ThreadId::new();
+        app.config.chatgpt_base_url = server.uri();
+        app.cli_kv_overrides = vec![(
+            "chatgpt_base_url".to_string(),
+            toml::Value::String(server.uri()),
+        )];
+        app.config.cli_auth_credentials_store_mode = AuthCredentialsStoreMode::File;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/codex/config/bundle"))
+            .respond_with(wiremock::ResponseTemplate::new(/*s*/ 200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        write_chatgpt_auth(
+            app.config.codex_home.as_path(),
+            ChatGptAuthFixture::new("chatgpt-token").account_id("account-123"),
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("write ChatGPT authentication");
+        let app_server = crate::start_app_server_for_picker(
+            &app.config,
+            &crate::AppServerTarget::Embedded,
+            app.cli_kv_overrides.clone(),
+            app.loader_overrides.clone(),
+            /*state_db*/ None,
+            app.environment_manager.clone(),
+        )
+        .await
+        .expect("start authenticated embedded app server");
+        write_chatgpt_auth(
+            app.config.codex_home.as_path(),
+            ChatGptAuthFixture::new("different-token").account_id("different-account"),
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("replace persisted ChatGPT authentication");
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/api/codex/usage/thread_usage/query",
+            ))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer chatgpt-token",
+            ))
+            .and(wiremock::matchers::header(
+                "chatgpt-account-id",
+                "account-123",
+            ))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "thread_ids": [thread_id.to_string()]
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(/*s*/ 200).set_body_json(
+                serde_json::json!({
+                    "threads": [{
+                        "thread_id": thread_id.to_string(),
+                        "estimated_usage_credits_micros": 46_000_000,
+                        "estimated_usage_usd_micros": 1_820_000
+                    }]
+                }),
+            ))
+            .expect(/*r*/ 1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            fetch_thread_usage(app_server.request_handle(), thread_id)
+                .await
+                .expect("read thread usage through the authenticated app server"),
+            ThreadUsageOutcome::Available(ThreadUsage {
+                thread_id: thread_id.to_string(),
+                estimated_usage_credits_micros: 46_000_000,
+                estimated_usage_usd_micros: Some(1_820_000),
+                groups: Vec::new(),
+            })
+        );
+    }
 
     fn test_absolute_path(path: &str) -> AbsolutePathBuf {
         AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
@@ -1376,42 +1504,42 @@ mod tests {
             (
                 "Workspace",
                 "chatgpt authentication required for remote plugin catalog",
-                "Sign in to ChatGPT, then try loading this section again.",
+                "Sign in to ChatGPT, then try loading this section again",
             ),
             (
                 "OpenAI Curated",
                 "chatgpt authentication required for remote plugin catalog; api key auth is not supported",
-                "Sign in with ChatGPT auth; API key auth cannot load remote plugin catalogs.",
+                "Sign in with ChatGPT auth; API key auth cannot load remote plugin catalogs",
             ),
             (
                 "Shared with me",
                 "remote plugin catalog request failed with status 404: missing",
-                "Check that you are signed in to the correct workspace and still have access.",
+                "Check that you are signed in to the correct workspace and still have access",
             ),
             (
                 "Shared with me",
                 "workspace access mismatch",
-                "Switch to the matching workspace or ask the sharer for access.",
+                "Switch to the matching workspace or ask the sharer for access",
             ),
             (
                 "Shared with me",
                 "old build fallback",
-                "Update Codex, then try opening the shared plugin again.",
+                "Update Codex, then try opening the shared plugin again",
             ),
             (
                 "Shared with me",
                 "remote service unavailable",
-                "Try again later; local plugin functionality is still available.",
+                "Try again later; local plugin functionality is still available",
             ),
             (
                 "Workspace",
                 "plugin disabled by admin",
-                "Ask a workspace admin to confirm plugin access.",
+                "Ask a workspace admin to confirm plugin access",
             ),
             (
                 "Shared with me",
                 "plugin sharing is not enabled",
-                "Ask a workspace admin to enable Codex plugins or plugin sharing.",
+                "Ask a workspace admin to enable Codex plugins or plugin sharing",
             ),
         ];
 
@@ -1430,7 +1558,8 @@ mod tests {
             PluginRemoteSectionError {
                 section_id: "shared-with-me".to_string(),
                 label: "Shared with me".to_string(),
-                message: "Plugin sharing is disabled for this Codex session. Enable plugin sharing to load shared plugins.".to_string(),
+                message: "Enable plugin sharing for this Codex session to load shared plugins"
+                    .to_string(),
             }
         );
     }
@@ -1439,7 +1568,12 @@ mod tests {
     fn mcp_inventory_maps_prefix_tool_names_by_server() {
         let statuses = vec![
             McpServerStatus {
+                server_capabilities: None,
+                tools_error: None,
                 name: "docs".to_string(),
+                runtime_status: None,
+                plugin_id: None,
+                http_origin: None,
                 server_info: None,
                 tools: HashMap::from([(
                     "list".to_string(),
@@ -1459,7 +1593,12 @@ mod tests {
                 auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
             },
             McpServerStatus {
+                server_capabilities: None,
+                tools_error: None,
                 name: "disabled".to_string(),
+                runtime_status: None,
+                plugin_id: None,
+                http_origin: None,
                 server_info: None,
                 tools: HashMap::new(),
                 resources: Vec::new(),

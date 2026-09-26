@@ -1,4 +1,3 @@
-use codex_api::ReqwestTransport;
 use codex_api::SearchClient;
 use codex_api::SearchCommands;
 use codex_api::SearchQuery;
@@ -18,8 +17,10 @@ use codex_extension_api::parse_tool_input_schema_without_compaction;
 use codex_extension_items::ExtensionItem;
 use codex_extension_items::web_search::WebSearchAction;
 use codex_extension_items::web_search::WebSearchItem;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
 use codex_login::default_client::add_originator_header;
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::create_transport_for_routes_async;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
 use codex_protocol::protocol::EventMsg;
@@ -44,12 +45,13 @@ const RESULTS_PAYLOAD_BYTES_METRIC: &str = "codex.web_search.results.payload_byt
 
 pub(crate) struct WebSearchTool {
     pub(crate) session_id: String,
+    pub(crate) http_client_factory: HttpClientFactory,
     pub(crate) provider: SharedModelProvider,
     pub(crate) settings: SearchSettings,
     pub(crate) originator: Option<String>,
 }
 
-impl ToolExecutor<ToolCall> for WebSearchTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for WebSearchTool {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced(WEB_NAMESPACE, RUN_TOOL_NAME)
     }
@@ -83,13 +85,19 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
         true
     }
 
-    fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(self.handle_call(call))
     }
 }
 
 impl WebSearchTool {
-    async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    async fn handle_call(
+        &self,
+        call: ToolCall<'_>,
+    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let commands = parse_commands(&call)?;
         let command_action = command_action(&commands);
         let provider = self
@@ -102,11 +110,13 @@ impl WebSearchTool {
             .api_auth()
             .await
             .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
-        let client = SearchClient::new(
-            ReqwestTransport::new(build_reqwest_client()),
-            provider,
-            auth,
-        );
+        let transport = create_transport_for_routes_async(
+            self.http_client_factory.clone(),
+            ClientRouteClass::Api,
+        )
+        .await
+        .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+        let client = SearchClient::new(transport, provider, auth);
         let request = SearchRequest {
             id: self.session_id.clone(),
             model: call.model.clone(),
@@ -196,7 +206,7 @@ fn search_request_headers(originator: Option<&str>, turn_metadata: Option<&str>)
     headers
 }
 
-fn parse_commands(call: &ToolCall) -> Result<SearchCommands, FunctionCallError> {
+fn parse_commands(call: &ToolCall<'_>) -> Result<SearchCommands, FunctionCallError> {
     let arguments = call.function_arguments()?;
     if arguments.trim().is_empty() {
         return Ok(SearchCommands::default());

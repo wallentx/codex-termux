@@ -24,6 +24,9 @@ pub struct RemoteNetworkProxyLaunchConfig {
     pub environment_id: Option<String>,
     #[serde(default)]
     pub execution_id: Option<String>,
+    /// Controller-side policy decision budget. The executor adds transport overhead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_decision_timeout_ms: Option<u64>,
 }
 
 impl RemoteNetworkProxyLaunchConfig {
@@ -33,6 +36,7 @@ impl RemoteNetworkProxyLaunchConfig {
             audit_metadata: NetworkProxyAuditMetadata::default(),
             environment_id: None,
             execution_id: None,
+            policy_decision_timeout_ms: None,
         }
     }
 
@@ -71,23 +75,26 @@ pub struct RemoteNetworkProxyConfig {
 impl RemoteNetworkProxyConfig {
     pub fn from_effective_config(config: &NetworkProxyConfig) -> Result<Self> {
         ensure!(
-            !config.enabled
-                || (!config.mitm
-                    && !config.credential_broker
-                    && !config.dangerously_allow_plaintext_credential_injection
-                    && config.mitm_hooks.is_empty()),
-            "remote exec-server network proxy does not support MITM, credential injection, or MITM hooks"
+            config.mitm_ca.is_none()
+                && (!config.enabled
+                    || (!config.mitm
+                        && !config.credential_broker
+                        && !config.dangerously_allow_plaintext_credential_injection
+                        && config.mitm_hooks.is_empty())),
+            "remote exec-server network proxy does not support MITM, external CAs, credential injection, or MITM hooks"
         );
         Ok(Self {
             enabled: config.enabled,
             enable_socks5: config.enable_socks5,
             enable_socks5_udp: config.enable_socks5_udp,
             allow_upstream_proxy: config.allow_upstream_proxy,
-            dangerously_allow_all_unix_sockets: config.dangerously_allow_all_unix_sockets,
+            dangerously_allow_all_unix_sockets: config
+                .dangerously_allow_all_unix_sockets
+                .unwrap_or(false),
             mode: config.mode,
             domains: config.domains.clone(),
             unix_sockets: config.unix_sockets.clone(),
-            allow_local_binding: config.allow_local_binding,
+            allow_local_binding: config.allow_local_binding(),
         })
     }
 
@@ -97,11 +104,11 @@ impl RemoteNetworkProxyConfig {
             enable_socks5: self.enable_socks5,
             enable_socks5_udp: self.enable_socks5_udp,
             allow_upstream_proxy: self.allow_upstream_proxy,
-            dangerously_allow_all_unix_sockets: self.dangerously_allow_all_unix_sockets,
+            dangerously_allow_all_unix_sockets: Some(self.dangerously_allow_all_unix_sockets),
             mode: self.mode,
             domains: self.domains,
             unix_sockets: self.unix_sockets,
-            allow_local_binding: self.allow_local_binding,
+            allow_local_binding: Some(self.allow_local_binding),
             ..NetworkProxyConfig::default()
         }
     }

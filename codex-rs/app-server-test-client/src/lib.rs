@@ -1301,6 +1301,7 @@ async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u3
         println!("< initialize response: {initialize:?}");
 
         let response = client.thread_list(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(limit),
             sort_key: None,
@@ -1308,6 +1309,8 @@ async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u3
             model_providers: None,
             source_kinds: None,
             archived: None,
+            section_id: None,
+            project_id: None,
             parent_thread_id: None,
             ancestor_thread_id: None,
             cwd: None,
@@ -1749,6 +1752,7 @@ impl CodexClient {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                 },
                 capabilities: Some(InitializeCapabilities {
+                    explicit_gateway_oauth: false,
                     experimental_api,
                     request_attestation: false,
                     opt_out_notification_methods: Some(
@@ -1758,6 +1762,7 @@ impl CodexClient {
                             .collect(),
                     ),
                     mcp_server_openai_form_elicitation: false,
+                    extensions: None,
                 }),
             },
         };
@@ -2165,6 +2170,7 @@ impl CodexClient {
         params: CommandExecutionRequestApprovalParams,
     ) -> Result<()> {
         let CommandExecutionRequestApprovalParams {
+            kind: _,
             thread_id,
             turn_id,
             item_id,
