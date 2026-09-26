@@ -5,8 +5,10 @@ use codex_protocol::ThreadId;
 use tempfile::TempDir;
 
 use super::COORDINATION_LOCK_FILE;
+use super::TryWriterLockOutcome;
 use super::WRITER_LOCK_DIR;
 use super::WriterLockCoordinator;
+use super::try_lock_writer_file;
 use pretty_assertions::assert_eq;
 use std::io::ErrorKind;
 
@@ -106,13 +108,20 @@ fn publication_skips_live_writers_and_keeps_coordination_locked() {
         .open(writer.directory.join(COORDINATION_LOCK_FILE))
         .unwrap();
     assert!(matches!(
-        coordination.try_lock(),
-        Err(fs::TryLockError::WouldBlock)
+        try_lock_writer_file(
+            &coordination,
+            &writer.directory.join(COORDINATION_LOCK_FILE)
+        ),
+        Ok(TryWriterLockOutcome::WouldBlock)
     ));
     drop(publication);
-    coordination
-        .try_lock()
-        .expect("publication releases coordination");
+    let released_lock = try_lock_writer_file(
+        &coordination,
+        &writer.directory.join(COORDINATION_LOCK_FILE),
+    )
+    .expect("publication releases coordination");
+    assert!(matches!(released_lock, TryWriterLockOutcome::Acquired(_)));
+    drop(released_lock);
     drop(coordination);
     // An existing but unlocked file is also idle; file existence is not ownership.
     fs::File::create(writer.directory.join(format!("{thread_id}.lock"))).unwrap();
