@@ -292,6 +292,65 @@ esac
         self.assertEqual(self.git("ls-remote", "--heads", "origin"), before)
 
 
+class RetiredClipboardGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.baseline = (
+            b'#[cfg(not(target_os = "macos"))]\nstruct SuppressStderr;\n\n'
+            b'#[cfg(not(target_os = "macos"))]\nimpl SuppressStderr {\n'
+            b"    fn new() -> Self { Self }\n}\n"
+        )
+        self.source = self.baseline.replace(
+            b'#[cfg(not(target_os = "macos"))]',
+            b'#[cfg(all(not(target_os = "android"), not(target_os = "macos")))]',
+        )
+        self.upstream = b"pub(crate) mod worker;\n"
+
+    def test_retires_guard_only_when_upstream_removed_helper(self):
+        self.assertEqual(
+            module.drop_retired_clipboard_guard(
+                self.baseline, self.source, self.upstream
+            ),
+            self.baseline,
+        )
+        self.assertEqual(
+            module.drop_retired_clipboard_guard(
+                self.baseline, self.source, self.baseline
+            ),
+            self.source,
+        )
+
+    def test_preserves_other_downstream_edits(self):
+        for changed in (
+            self.source + b"fn termux_copy() {}\n",
+            self.source.replace(b"fn new()", b"fn create()"),
+        ):
+            with self.subTest(source=changed):
+                self.assertEqual(
+                    module.drop_retired_clipboard_guard(
+                        self.baseline, changed, self.upstream
+                    ),
+                    changed,
+                )
+
+    def test_unrecognized_or_partial_guard_changes_are_not_retired(self):
+        for source in (
+            self.baseline,
+            self.baseline.replace(
+                b'#[cfg(not(target_os = "macos"))]',
+                b'#[cfg(all(not(target_os = "android"), not(target_os = "macos")))]',
+                1,
+            ),
+            self.source.replace(b"struct SuppressStderr;", b"struct SuppressStderr {}"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    module.drop_retired_clipboard_guard(
+                        self.baseline, source, self.upstream
+                    ),
+                    source,
+                )
+
+
 class UpdaterAdaptationTests(unittest.TestCase):
     def test_prompt_constant_removal_preserves_upstream_debug_guard(self):
         declaration = (

@@ -42,9 +42,13 @@ jobs:
             refs/tags/rust-v0.155.0-alpha.16:refs/tags/rust-v0.155.0-alpha.16 \
             refs/tags/rust-v0.155.0-alpha.17:refs/tags/rust-v0.155.0-alpha.17 \
             refs/tags/rust-v0.156.0-alpha.8:refs/tags/rust-v0.156.0-alpha.8 \
-            refs/tags/rust-v0.157.0-alpha.8:refs/tags/rust-v0.157.0-alpha.8
+            refs/tags/rust-v0.157.0-alpha.8:refs/tags/rust-v0.157.0-alpha.8 \
+            refs/tags/rust-v0.158.0-alpha.8:refs/tags/rust-v0.158.0-alpha.8 \
+            refs/tags/rust-v0.159.0-alpha.4:refs/tags/rust-v0.159.0-alpha.4
       - name: Verify stable and alpha trees with the real Termux updater
         run: |
           bash scripts/test-termux-release-tags.sh
           bash scripts/test-termux-release-tags.sh \
             rust-v0.156.0-alpha.8-termux rust-v0.156.0-alpha.8 rust-v0.157.0-alpha.8
+          bash scripts/test-termux-release-tags.sh \
+            rust-v0.158.0-alpha.8-termux rust-v0.158.0-alpha.8 rust-v0.159.0-alpha.4

@@ -17,6 +17,11 @@ for upstream in "$@"; do
   git diff --exit-code "${upstream}" "${tree}" -- .github codex-rs/config codex-rs/features
   git grep -q 'TermuxSelfUpdate' "${tree}" -- codex-rs/tui/src/update_action.rs
   git grep -q 'code-mode-host' "${tree}" -- codex-rs/tui/src/termux_update.rs
+  if ! git grep -q 'SuppressStderr' "${upstream}" -- codex-rs/tui/src/clipboard_copy.rs; then
+    # The retired warning-only patch must not resurrect the helper or discard
+    # any part of upstream's replacement clipboard worker.
+    git diff --exit-code "${upstream}" "${tree}" -- codex-rs/tui/src/clipboard_copy.rs
+  fi
   # The complete prompt must remain upstream's layout, with only its URL
   # routed through the downstream update action. This also covers 0.157's
   # picker redesign without accepting old target-side rendering code.

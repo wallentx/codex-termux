@@ -77,6 +77,24 @@ def async_updater(text):
     )
 
 
+def drop_retired_clipboard_guard(baseline, source, upstream):
+    """Retire only the Android warning cleanup when its helper is gone."""
+    if b"SuppressStderr" in upstream:
+        return source
+    expected = baseline
+    for definition in (b"struct SuppressStderr;", b"impl SuppressStderr {"):
+        original = b'#[cfg(not(target_os = "macos"))]\n' + definition
+        replacement = (
+            b'#[cfg(all(not(target_os = "android"), not(target_os = "macos")))]\n'
+            + definition
+        )
+        if expected.count(original) != 1:
+            return source
+        expected = expected.replace(original, replacement, 1)
+    # Compare the entire file so no functional downstream edit can be dropped.
+    return baseline if source == expected else source
+
+
 def merge_updater_additions(text, *, path=None):
     """Carry only reviewed Termux updater edits through upstream changes."""
     additions = {
@@ -190,6 +208,22 @@ def release_tree(upstream, source, baseline, excluded):
                     lambda m: m[1] + match[0][len(match[1]) :], current, count=1
                 )
                 put_blob(path, normalized)
+                path = "codex-rs/tui/src/clipboard_copy.rs"
+                if all(
+                    git("ls-tree", ref, "--", path)
+                    for ref in (baseline, source, upstream)
+                ):
+                    original = git("show", f"{baseline}:{path}")
+                    current = git("show", f"{source}:{path}")
+                    normalized = drop_retired_clipboard_guard(
+                        original, current, git("show", f"{upstream}:{path}")
+                    )
+                    if normalized != current:
+                        put_blob(path, normalized)
+                        print(
+                            "Retired Android warning guards for removed SuppressStderr helper.",
+                            file=sys.stderr,
+                        )
             if has_termux_updater:
                 put_blob(
                     cli, async_updater(git("show", f"{ref}:{cli}").decode()).encode()

@@ -28,6 +28,10 @@ chain async for Termux. Only explicitly recognized Termux insertions can be
 combined with adjacent upstream additions; other conflicts fail the preflight.
 The historical self-update patch is no longer reapplied on every release.
 
+The Android warning guards for `SuppressStderr` are retired when upstream
+removes that helper, but only if those guards are the entire downstream change
+to `clipboard_copy.rs`. Any additional clipboard changes still need merging.
+
 Preflight completes before the generator creates, deletes, or pushes release
 branches. A retry producing the same PR tree preserves its commit and running
 CI. Metadata records both `patch_source_sha` and `patch_upstream_ref`; the source
