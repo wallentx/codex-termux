@@ -5,6 +5,11 @@
 #[cfg(any(target_os = "windows", test))]
 mod ssh_config_dependencies;
 
+#[doc(hidden)]
+pub mod environment_transport;
+#[cfg(any(windows, test))]
+mod launch_environment;
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -62,8 +67,6 @@ pub use app_package::registered_core_needs_refresh;
 #[cfg(target_os = "windows")]
 #[doc(hidden)]
 pub use app_package::registered_core_requested;
-#[cfg(target_os = "windows")]
-mod audit;
 #[cfg(target_os = "windows")]
 mod cap;
 #[cfg(target_os = "windows")]
@@ -237,8 +240,6 @@ pub use acl::path_or_child_file_has_standard_user_mutation_allow;
 pub use acl::path_write_aces_need_refresh;
 #[cfg(target_os = "windows")]
 pub use acl::revoke_ace;
-#[cfg(target_os = "windows")]
-pub use audit::apply_world_writable_scan_and_denies_for_permissions;
 #[cfg(target_os = "windows")]
 pub use cap::load_or_create_cap_sids;
 #[cfg(target_os = "windows")]

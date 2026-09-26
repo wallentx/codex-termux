@@ -1,5 +1,8 @@
 //! Black-box coverage for safe diagnostic execution and config error reporting.
 
+#[path = "support/executable.rs"]
+mod executable;
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,6 +15,7 @@ use codex_app_server_protocol::RequestId;
 use codex_config::loader::project_trust_key;
 use codex_state::SqliteConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use executable::copy_executable;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -34,22 +38,38 @@ struct Fixture {
 impl Fixture {
     fn new() -> Result<Self> {
         let root = TempDir::new()?;
+        let home = root.path().join("home");
+        std::fs::create_dir(&home)?;
         // Cargo-built paths deliberately ignore npm provenance. Launch outside
         // target/ so this fixture also exercises the packaged-install checks.
         let program = root
             .path()
             .join(format!("codex{}", std::env::consts::EXE_SUFFIX));
         let source = codex_utils_cargo_bin::cargo_bin("codex")?;
+        // Hard-link setup and teardown invalidate other tests' Rosetta translations.
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            copy_executable(&source, &program)?;
+            // Translate the fixture before the timed diagnostic command.
+            anyhow::ensure!(
+                std::process::Command::new(&program)
+                    .env("CODEX_HOME", &home)
+                    .arg("--version")
+                    .output()?
+                    .status
+                    .success(),
+                "failed to prepare diagnostic test executable"
+            );
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         if std::fs::hard_link(&source, &program).is_err() {
-            std::fs::copy(&source, &program)?;
+            copy_executable(&source, &program)?;
         }
         let workspace = root.path().join("workspace");
         let bin = workspace.join("node_modules/.bin");
-        let home = root.path().join("home");
         let marker = root.path().join("helper-ran");
         std::fs::create_dir_all(&bin)?;
         std::fs::create_dir_all(workspace.join(".git"))?;
-        std::fs::create_dir(&home)?;
         std::fs::write(
             home.join("config.toml"),
             r#"
@@ -511,7 +531,7 @@ async fn interactive_tmux_startup_does_not_execute_workspace_helpers() -> Result
             rows: 40,
             cols: 120,
         },
-        &[],
+        codex_utils_pty::ChildFds::Inherited(&[]),
     )
     .await?;
     let session = spawned.session;

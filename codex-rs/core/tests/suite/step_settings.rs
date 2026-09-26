@@ -328,6 +328,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
     let started = test
         .thread_manager
         .start_thread(StartThreadOptions {
+            history_mode: Some(ThreadHistoryMode::Legacy),
             dynamic_tools: vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
                 name: "diagnostics".to_string(),
                 description: "Returns diagnostic text and a screenshot.".to_string(),
@@ -490,6 +491,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
                     model: Some(model.to_string()),
                     ..Default::default()
                 },
+                reply: None,
             })
             .await?;
         test.submit_text_turn("review previous diagnostics").await?;
@@ -574,7 +576,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
         replay_config.model = Some(model.to_string());
         let resumed = test
             .thread_manager
-            .resume_thread_from_rollout(
+            .resume_legacy_thread_from_rollout(
                 replay_config.clone(),
                 rollout_path.clone(),
                 codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
@@ -585,7 +587,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
             .thread;
         let forked = test
             .thread_manager
-            .fork_thread(
+            .fork_legacy_thread(
                 ForkSnapshot::Interrupted,
                 StartThreadOptions::new(replay_config),
                 rollout_path.clone(),
@@ -600,6 +602,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
                         model: Some(model.to_string()),
                         ..Default::default()
                     },
+                    reply: None,
                 })
                 .await?;
             thread
@@ -707,7 +710,7 @@ async fn custom_tool_output_replay_preserves_originating_budget() -> Result<()> 
     replay_config.model = Some(MODEL_A.to_string());
     let resumed = test
         .thread_manager
-        .resume_thread_from_rollout(
+        .resume_legacy_thread_from_rollout(
             replay_config.clone(),
             rollout_path.clone(),
             codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
@@ -718,7 +721,7 @@ async fn custom_tool_output_replay_preserves_originating_budget() -> Result<()> 
         .thread;
     let forked = test
         .thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             ForkSnapshot::Interrupted,
             StartThreadOptions::new(replay_config),
             rollout_path,
@@ -780,6 +783,7 @@ async fn settings_updates_preserve_turn_identity_and_target(target: SettingsTarg
                         service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
                         ..Default::default()
                     },
+                    reply: None,
                 })
                 .await?;
         }
@@ -1978,6 +1982,7 @@ async fn sparse_updates_preserve_divergent_active_and_future_models() -> Result<
                 service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
                 ..Default::default()
             },
+            reply: None,
         })
         .await?;
     apply_turn_settings(
@@ -2266,6 +2271,22 @@ async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
             "additionalProperties": false,
         })
     };
+    let async_parameters = |model: &str| {
+        json!({
+            "type": "object",
+            "properties": {"questions": {
+                "type": "array",
+                "description": format!("Questions for {model}."),
+                "items": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"],
+                },
+            }},
+            "required": ["questions"],
+            "additionalProperties": false,
+        })
+    };
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
         &server,
@@ -2313,7 +2334,7 @@ async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
                     .tools = Some(ToolMessages {
                     send_user_message_async: Some(ToolMessage {
                         description: Some(format!("Async message description for {}.", model.slug)),
-                        ..Default::default()
+                        parameters: Some(async_parameters(&model.slug).to_string()),
                     }),
                     multi_agent: Some(MultiAgentToolMessages {
                         spawn_agent: tool_message("spawn_agent"),
@@ -2381,6 +2402,7 @@ async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
                 json!({
                     "model": body["model"],
                     "async_description": tool("request_user_input_async")["description"],
+                    "async_parameters": tool("request_user_input_async")["parameters"],
                     "multi_agent_messages": multi_agent_messages,
                     "channel_post_description": channel_post["description"].as_str().expect("post description").lines().next(),
                     "channel_post_required": channel_post["parameters"]["required"],
@@ -2394,6 +2416,7 @@ async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
             .map(|model| json!({
                 "model": model,
                 "async_description": format!("Async message description for {model}."),
+                "async_parameters": async_parameters(model),
                 "multi_agent_messages": MULTI_AGENT_TOOLS
                     .map(|name| (name.to_string(), json!({
                         "description": format!("{name} description for {model}."),

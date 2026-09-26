@@ -23,7 +23,7 @@ use crossterm::event::MouseEventKind::Up;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
 
-fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
+pub(in crate::app) fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
     Arc::new(UserHistoryCell {
         spoken: false,
         message: message.to_string(),
@@ -33,7 +33,7 @@ fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
     })
 }
 
-fn attach_thread(app: &mut App, thread_id: ThreadId) {
+pub(in crate::app) fn attach_thread(app: &mut App, thread_id: ThreadId) {
     app.chat_widget.handle_thread_session(ThreadSessionState {
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -59,7 +59,7 @@ fn attach_thread(app: &mut App, thread_id: ThreadId) {
     });
 }
 
-pub(super) fn buffer_text(buffer: &Buffer) -> String {
+pub(in crate::app) fn buffer_text(buffer: &Buffer) -> String {
     buffer
         .content()
         .chunks(usize::from(buffer.area.width))
@@ -285,11 +285,6 @@ async fn recap_spacing_belongs_to_the_transcript_tail() -> Result<()> {
                     .with_next_action(next_action.map(str::to_owned)),
             ),
         ];
-        crate::app::test_support::select_catalog_tip(
-            &mut app,
-            /*width*/ 80,
-            "Tip: Use /mcp to list configured MCP tools.",
-        );
         let mut tui = crate::tui::test_support::make_test_tui()?;
         tui.set_owned_screen(/*owned*/ true)?;
         let size = Size::new(width, height);
@@ -520,6 +515,7 @@ async fn owned_details_keep_the_composer_cursor_and_screen() -> Result<()> {
             /*footer*/ None,
             crate::bottom_pane::CommandPopupPlacement::Overlay,
             Some(&crate::bottom_pane::ComposerGap::default()),
+            /*working_tip*/ None,
         )
         .cursor_pos(bottom_area)
         .expect("composer cursor");
@@ -1369,6 +1365,16 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
         assert!(app.handle_owned_transcript_event(&mut tui, &mut server, &event)?);
     }
     assert!(!app.transcript_view.has_active_interaction());
+    app.start_right_click_paste(
+        &mut tui,
+        crossterm::event::MouseEvent {
+            kind: Down(Right),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(!tui.clipboard.is_busy());
     app.render_owned_transcript(&mut tui, size)?;
     let cursor = tui.terminal.last_known_cursor_pos;
     let draft = app.chat_widget.capture_thread_input_state();

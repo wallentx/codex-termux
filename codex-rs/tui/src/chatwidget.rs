@@ -288,6 +288,7 @@ mod input_flow;
 mod input_restore;
 mod input_submission;
 mod interrupts;
+mod prompt_suggestions;
 mod questions;
 mod startup_submission;
 use self::interrupts::InterruptManager;
@@ -301,10 +302,12 @@ mod pets;
 mod session_flow;
 mod session_header;
 use self::session_header::SessionHeader;
+mod clipboard;
 mod copy_picker;
 mod hook_lifecycle;
 mod hooks;
 mod interaction;
+pub(crate) use interaction::KeyEventAction;
 mod skills;
 mod slash_dispatch;
 mod worktree_picker;
@@ -576,7 +579,7 @@ pub(crate) struct ChatWidget {
     backend_banner_notice_model: Option<String>,
     // Remember the account's Reserve entry notice across chats and transient banner refreshes.
     luna_reserve_notice_account_id: Option<String>,
-    warning_display_state: WarningDisplayState,
+    pub(crate) warning_display_state: WarningDisplayState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
     add_credits_nudge_email_in_flight: Option<rate_limits::PendingCreditsNudge>,
     adaptive_chunking: AdaptiveChunkingPolicy,
@@ -585,8 +588,8 @@ pub(crate) struct ChatWidget {
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
     pending_stream_consolidations: usize,
-    /// Holds the platform clipboard lease so copied text remains available while supported.
-    clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
+    /// Copy feedback is discarded with its originating conversation.
+    pending_clipboard: Option<clipboard::PendingCopy>,
     copy_last_response_binding: Vec<KeyBinding>,
     running_commands: HashMap<String, RunningCommand>,
     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
@@ -655,6 +658,8 @@ pub(crate) struct ChatWidget {
     pet_image_support_override: Option<crate::pets::PetImageSupport>,
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
+    // Unknown until the server supplies live settings; resume responses omit summary.
+    pub(crate) prompt_suggestion_summary: Option<codex_protocol::config_types::ReasoningSummary>,
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
     blocks_direct_input: bool,
@@ -766,6 +771,9 @@ pub(crate) struct ChatWidget {
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     last_rendered_user_message_client_id: Option<String>,
     last_non_retry_error: Option<(String, String)>,
+    // Keep fixture storage alive until all other widget fields have been dropped.
+    #[cfg(test)]
+    pub(crate) test_codex_home: Option<tempfile::TempDir>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1770,6 +1778,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn show_external_writer_thread(&mut self) {
+        self.clear_prompt_suggestion();
         self.cancel_image_submission();
         self.blocks_direct_input = true;
         self.external_writer_view = true;

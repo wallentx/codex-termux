@@ -209,6 +209,14 @@ impl Command {
         self
     }
 
+    /// Explicit launch attachments, including CLOEXEC descriptors. The caller
+    /// owns them through spawn; only the child's flags are changed.
+    #[cfg(unix)]
+    pub(crate) fn inherit_fds(&mut self, fds: &[std::os::fd::RawFd]) -> &mut Self {
+        self.inherited_fds = fds.to_vec();
+        self
+    }
+
     /// Keep the existing Linux pipe behavior when the spawning parent exits.
     #[cfg(target_os = "linux")]
     pub fn terminate_on_parent_death(&mut self) -> &mut Self {
@@ -225,6 +233,12 @@ impl Command {
         self
     }
 
+    /// Set the Windows process creation flags, replacing any previously selected flags.
+    #[cfg(windows)]
+    pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+        self.inner.creation_flags(flags);
+        self
+    }
     /// Preserve Job Object assignment before the child begins executing on Windows.
     #[cfg(windows)]
     pub fn prepare_suspended_spawn(&mut self, job: &crate::JobObject) {
@@ -302,6 +316,7 @@ impl Command {
                         if explicit_fds {
                             crate::pty::close_inherited_fds_except(&targets);
                         }
+                        crate::pty::make_fds_inheritable(&targets)?;
                         Ok(())
                     });
                 }

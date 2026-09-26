@@ -230,14 +230,9 @@ fn exec_server_params_for_request(
         sandbox.windows_sandbox_proxy_settings_mode = Some(windows_sandbox_proxy_settings_mode);
         sandbox
     });
-    // Sandbox retries and memory-backed local launches can reuse a unified-exec
-    // ID while the executor still retains the previous process.
-    let exec_server_process_id =
-        if request.exec_server_sandbox.is_some() || request.exec_server_shell_snapshot.is_some() {
-            format!("{process_id}-{}", Uuid::new_v4())
-        } else {
-            process_id.to_string()
-        };
+    // Threads sharing an executor and sandbox retries can reuse a public handle
+    // while the executor still retains its previous process.
+    let exec_server_process_id = format!("{process_id}-{}", Uuid::new_v4());
     codex_exec_server::ExecParams {
         process_id: exec_server_process_id.into(),
         metadata: tool_ctx.map(|ctx| codex_exec_server::ExecMetadata {
@@ -1424,7 +1419,7 @@ impl UnifiedExecProcessManager {
             windows_sandbox,
             tty,
             stdin_open: tty,
-            inherited_fds: &inherited_fds,
+            inherited_fds: codex_utils_pty::ChildFds::Inherited(&inherited_fds),
         })
         .await;
         spawn_lifecycle.after_spawn();
@@ -1814,6 +1809,16 @@ impl UnifiedExecProcessManager {
             unregister_network_approval_for_entry(&entry).await;
             entry.process.terminate();
         }
+    }
+
+    /// Resolves stdin's target from the host-owned terminal, not model-supplied metadata.
+    pub(crate) async fn environment_id_for_process(&self, process_id: i32) -> Option<String> {
+        self.process_store
+            .lock()
+            .await
+            .processes
+            .get(&process_id)
+            .map(|entry| entry.environment_id.clone())
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {

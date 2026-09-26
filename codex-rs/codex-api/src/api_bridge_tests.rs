@@ -64,7 +64,13 @@ fn map_api_error_distinguishes_capacity_from_slow_down() {
             false,
         ),
         ("slow_down", CodexErrorInfo::RateLimitExceeded, true),
-        ("unknown_error", CodexErrorInfo::Other, true),
+        (
+            "unknown_error",
+            CodexErrorInfo::HttpConnectionFailed {
+                http_status_code: Some(503),
+            },
+            true,
+        ),
     ] {
         let err = map_api_error(ApiError::Transport(TransportError::Http {
             retry_after: None,
@@ -448,6 +454,48 @@ fn map_api_error_distinguishes_http_quota_errors_from_rate_limits() {
         }));
 
         assert_eq!(err.to_codex_protocol_error(), expected, "{error}");
+    }
+}
+
+#[test]
+fn map_api_error_preserves_optional_usage_limit_window() {
+    let cases = [
+        (None, None),
+        (Some(serde_json::json!(null)), None),
+        (Some(serde_json::json!(300)), Some(300)),
+        (Some(serde_json::json!(10080)), Some(10080)),
+        (Some(serde_json::json!(-1)), None),
+        (Some(serde_json::json!(65536)), None),
+        (Some(serde_json::json!("300")), None),
+        (Some(serde_json::json!({"minutes": 300})), None),
+    ];
+
+    for (window, expected) in cases {
+        let mut body = serde_json::json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "plan_type": "pro",
+            }
+        });
+        if let Some(window) = window.as_ref() {
+            body["error"]["limit_window_minutes"] = window.clone();
+        }
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            retry_after: None,
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: None,
+            headers: None,
+            body: Some(body.to_string()),
+        }));
+
+        let CodexErrorDetails::UsageLimitReached(usage_limit) = err.details() else {
+            panic!("expected usage-limit error for {window:?}, got {err:?}");
+        };
+        assert_eq!(usage_limit.limit_window_minutes, expected, "{window:?}");
+        assert_eq!(
+            err.to_codex_protocol_error(),
+            CodexErrorInfo::UsageLimitExceeded
+        );
     }
 }
 

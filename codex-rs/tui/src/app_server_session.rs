@@ -4,7 +4,7 @@
 //! request/response plumbing out of `App` and `ChatWidget`.
 
 mod external_agent_config;
-mod fs;
+pub(crate) mod fs;
 mod history;
 mod models;
 mod realtime;
@@ -364,6 +364,7 @@ impl ThreadParamsMode {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppServerStartedThread {
+    pub(crate) reasoning_summary: Option<codex_protocol::config_types::ReasoningSummary>,
     pub(crate) session: ThreadSessionState,
     pub(crate) turns: Vec<Turn>,
     pub(crate) blocks_direct_input: bool,
@@ -2201,6 +2202,14 @@ async fn started_thread_from_start_response(
         turns: response.thread.turns,
         blocks_direct_input,
         task_tools_available: false,
+        reasoning_summary: match thread_params_mode {
+            ThreadParamsMode::Embedded => Some(
+                config
+                    .model_reasoning_summary
+                    .unwrap_or(codex_protocol::config_types::ReasoningSummary::None),
+            ),
+            ThreadParamsMode::Remote => config.model_reasoning_summary,
+        },
     })
 }
 
@@ -2224,6 +2233,7 @@ async fn started_thread_from_resume_response(
         turns: response.thread.turns,
         blocks_direct_input,
         task_tools_available: false,
+        reasoning_summary: None,
     })
 }
 
@@ -2247,6 +2257,7 @@ async fn started_thread_from_fork_response(
         turns: response.thread.turns,
         blocks_direct_input,
         task_tools_available: false,
+        reasoning_summary: None,
     })
 }
 
@@ -3978,7 +3989,7 @@ mod tests {
                     duration_ms: None,
                 }],
             },
-            model: "gpt-5.4".to_string(),
+            model: "gpt-5.5".to_string(),
             model_provider: "openai".to_string(),
             service_tier: None,
             cwd: test_path_buf("/tmp/project").abs(),
@@ -4000,7 +4011,7 @@ mod tests {
             collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
                 mode: codex_protocol::config_types::ModeKind::Plan,
                 settings: codex_protocol::config_types::Settings {
-                    model: "gpt-5.4".to_string(),
+                    model: "gpt-5.5".to_string(),
                     reasoning_effort: None,
                     developer_instructions: Some("Keep planning".to_string()),
                 },

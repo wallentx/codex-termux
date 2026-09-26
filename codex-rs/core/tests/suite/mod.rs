@@ -36,12 +36,16 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
 #[cfg(not(target_os = "windows"))]
 mod abort_tasks;
 mod additional_context;
+#[path = "agent_control_tests.rs"]
+mod agent_control;
 mod agent_execution;
 mod agent_websocket;
 mod agents_md;
 mod app_tool_exposure;
 mod apply_patch_cli;
 mod apply_patch_serialization;
+#[cfg(target_os = "macos")]
+mod apply_patch_system_aliases;
 #[cfg(not(target_os = "windows"))]
 mod approvals;
 mod audio_truncation;
@@ -76,6 +80,7 @@ mod external_auth;
 mod fork_thread;
 mod git_enrichment;
 mod guardian_authorization;
+mod guardian_authorization_refresh;
 #[path = "guardian_cached_score_tests.rs"]
 mod guardian_cached_score;
 #[path = "guardian_checkpoint_migration_tests.rs"]

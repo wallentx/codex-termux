@@ -303,6 +303,7 @@ impl Session {
                     ) {
                         active_segment.previous_turn_settings = Some(PreviousTurnSettings {
                             model: ctx.model.clone(),
+                            cyber_access_program: ctx.cyber_access_program,
                             comp_hash: ctx.comp_hash.clone(),
                             realtime_active: ctx.realtime_active,
                         });
@@ -414,8 +415,8 @@ impl Session {
                     history.record_retained_context(event);
                 }
                 RolloutItem::ResponseItem(response_item) => {
-                    history.record_annotated_items(
-                        std::slice::from_ref(response_item),
+                    history.replay_annotated_item(
+                        response_item,
                         turn_context.model_info().truncation_policy.into(),
                     );
                 }

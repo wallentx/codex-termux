@@ -58,6 +58,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::McpAttribution;
+use codex_protocol::mcp::McpAttributionErrorReason;
 use codex_protocol::mcp::McpAttributionSource;
 use codex_protocol::mcp::McpAttributionStatus;
 use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
@@ -318,29 +319,13 @@ async fn persisted_originator(thread: &CodexThread) -> String {
         .expect("thread rollout should flush");
     let stored_thread = thread
         .read_thread(
-            /*include_archived*/ true, /*include_history*/ true,
+            /*include_archived*/ true, /*include_history*/ false,
         )
         .await
         .expect("thread should be readable");
-    let history = stored_thread.history.expect("history should be loaded");
-    history
-        .items
-        .iter()
-        .find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.originator.clone()),
-            RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::EventMsg(_)
-            | RolloutItem::Compacted(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::RealtimeItem(_)
-            | RolloutItem::RetainedContext(_)
-            | RolloutItem::SecurityRiskScore(_)
-            | RolloutItem::TokenUsageRecord(_)
-            | RolloutItem::TurnContext(_) => None,
-        })
-        .expect("session metadata should be persisted")
+    stored_thread
+        .originator
+        .expect("originator should be persisted")
 }
 
 fn has_subagent_notification<'a>(
@@ -1306,6 +1291,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
     let parent = harness
         .manager
         .start_thread(StartThreadOptions {
+            history_mode: Some(ThreadHistoryMode::Legacy),
             thread_instructions_provider: Some(Arc::new(TestThreadInstructionsProvider {
                 text: "initial thread instructions".into(),
                 shared,
@@ -1939,6 +1925,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
         previous_turn_settings: Some(codex_history::PreviousTurnSettings {
             model: "parent-model".into(),
             comp_hash: None,
+            cyber_access_program: None,
             realtime_active: None,
         }),
     };
@@ -2188,7 +2175,10 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         Some("Child subagent guidance.".to_string());
     let new_thread = harness
         .manager
-        .start_thread(StartThreadOptions::new(parent_config.clone()))
+        .start_thread(StartThreadOptions {
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..StartThreadOptions::new(parent_config.clone())
+        })
         .await
         .expect("start parent thread");
     let parent_thread_id = new_thread.thread_id;
@@ -3022,6 +3012,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                     previous_turn_settings: Some(codex_history::PreviousTurnSettings {
                         model: "parent-model".into(),
                         comp_hash: None,
+                        cyber_access_program: None,
                         realtime_active: None,
                     }),
                 }),
@@ -3159,10 +3150,23 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
     }
 }
 
+#[test_case::test_case(false; "complete")]
+#[test_case::test_case(true; "error_reason")]
 #[tokio::test]
-async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests() {
+async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests(
+    record_invalid_source: bool,
+) {
     let harness = AgentControlHarness::new().await;
-    let (source_thread_id, source_thread) = harness.start_thread().await;
+    let source = harness
+        .manager
+        .start_thread(StartThreadOptions {
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..StartThreadOptions::new(harness.config.clone())
+        })
+        .await
+        .expect("start legacy source");
+    let source_thread_id = source.thread_id;
+    let source_thread = source.thread;
     let turn_context = source_thread.session.new_default_turn().await;
     source_thread
         .session
@@ -3184,6 +3188,16 @@ async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests() 
         .services
         .executed_tool_calls
         .record_mcp_source(source.clone());
+    if record_invalid_source {
+        source_thread
+            .session
+            .services
+            .executed_tool_calls
+            .record_mcp_source(McpAttributionSource {
+                tool_name: String::new(),
+                ..source.clone()
+            });
+    }
     source_thread
         .session
         .record_conversation_items(
@@ -3213,7 +3227,7 @@ async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests() 
 
     let forked = harness
         .manager
-        .fork_thread(
+        .fork_legacy_thread(
             ForkSnapshot::Interrupted,
             StartThreadOptions::new(harness.config.clone()),
             rollout_path.clone(),
@@ -3222,7 +3236,7 @@ async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests() 
         .expect("fork unloaded source thread");
     let resumed = harness
         .manager
-        .resume_thread_from_rollout(
+        .resume_legacy_thread_from_rollout(
             harness.config.clone(),
             rollout_path,
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
@@ -3232,7 +3246,12 @@ async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests() 
         .await
         .expect("resume source thread");
     let expected = McpAttribution {
-        status: McpAttributionStatus::Complete,
+        status: if record_invalid_source {
+            McpAttributionStatus::AttributionError
+        } else {
+            McpAttributionStatus::Complete
+        },
+        error_reason: record_invalid_source.then_some(McpAttributionErrorReason::SourceInvalid),
         sources: vec![source],
     };
     assert_eq!(
@@ -3475,6 +3494,7 @@ async fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
         mcp_attribution_in_constructed_request(&child_thread).await,
         McpAttribution {
             status: McpAttributionStatus::Complete,
+            error_reason: None,
             sources: vec![source],
         }
     );

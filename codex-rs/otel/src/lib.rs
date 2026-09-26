@@ -1,3 +1,4 @@
+pub mod auth_storage;
 pub(crate) mod config;
 mod events;
 pub(crate) mod metrics;
@@ -5,6 +6,7 @@ pub(crate) mod provider;
 pub(crate) mod trace_context;
 
 mod agent_response;
+mod guardian_assessment;
 mod network_policy;
 mod otlp;
 mod targets;
