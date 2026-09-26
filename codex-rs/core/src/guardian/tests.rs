@@ -31,7 +31,7 @@ use codex_guardian_context::ConversationTranscriptEntryKind;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
 use codex_history::RolloutItem;
 use codex_model_provider::create_model_provider;
-use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
@@ -625,6 +625,13 @@ async fn approval_permissions_use_the_owning_environment() -> anyhow::Result<()>
         port: 443,
         trigger: None,
     };
+    assert_eq!(
+        super::permissions::for_environment(&context, /*environment_id*/ None)?,
+        super::permissions::for_environment(
+            &context,
+            Some(codex_exec_server::LOCAL_ENVIRONMENT_ID),
+        )?,
+    );
     let requests = [
         network_request("secondary"),
         network_request("windows"),
@@ -674,7 +681,7 @@ async fn approval_permissions_use_the_owning_environment() -> anyhow::Result<()>
         .await?;
         let text = guardian_prompt_text(&prompt.context.into_user_inputs()?);
         assert!(text.contains(&format!(
-            "For this action on environment {environment_id:?}"
+            "The active permission profile for environment {environment_id:?}"
         )));
         if is_windows {
             assert!(
@@ -1047,6 +1054,7 @@ fn collect_guardian_transcript_entries_skips_contextual_user_messages() {
             kind: ConversationTranscriptEntryKind::ProtectedAssistant,
             text: "hello".to_string(),
             original_bytes: "hello".len(),
+            retained_source: None,
         }
     );
 }
@@ -1102,6 +1110,7 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
             kind: ConversationTranscriptEntryKind::ToolCall("tool read_file call".to_string()),
             text: "{\"path\":\"README.md\"}".to_string(),
             original_bytes: "{\"path\":\"README.md\"}".len(),
+            retained_source: None,
         }
     );
     assert_eq!(
@@ -1110,6 +1119,7 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
             kind: ConversationTranscriptEntryKind::ToolOutput("tool read_file result".to_string()),
             text: "repo is public".to_string(),
             original_bytes: "repo is public".len(),
+            retained_source: None,
         }
     );
     if let ResponseItem::FunctionCall { namespace, .. } = &mut items[1] {
@@ -1138,6 +1148,7 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
                 ),
                 text: guardian_truncate_text(&oversized_result, token_cap).0,
                 original_bytes: oversized_result.len(),
+                retained_source: None,
             }
         );
         assert_eq!(entries.len(), 4);
@@ -3553,6 +3564,14 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
                     ev_completed("resp-guardian-4"),
                 ]),
             }],
+            vec![StreamingSseChunk {
+                gate: None,
+                body: sse(vec![
+                    ev_response_created("resp-guardian-5"),
+                    ev_assistant_message("msg-guardian-5", &second_assessment),
+                    ev_completed("resp-guardian-5"),
+                ]),
+            }],
         ])
         .await;
 
@@ -3636,6 +3655,7 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
             tty: false,
         };
 
+        let second_action = super::approval_request::format_guardian_action_pretty(&second_request)?;
         let session_for_second = Arc::clone(&session);
         let turn_for_second = Arc::clone(&turn);
         let mut second_review = tokio::spawn(async move {
@@ -3760,8 +3780,14 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         gate_tx
             .send(())
             .expect("second guardian review gate should still be open");
-        // The later user input revokes the in-flight trunk review's authorization version.
-        assert_eq!(second_review.await?, ReviewDecision::Abort);
+        // The later user input requires a fresh review of the same pending action.
+        assert_eq!(second_review.await?, ReviewDecision::Approved);
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 5);
+        let refreshed_request_body = serde_json::from_slice::<serde_json::Value>(&requests[4])?;
+        let refreshed_user_message = last_user_message_text_from_body(&refreshed_request_body);
+        assert!(refreshed_user_message.contains("Now inspect whether pushing is safe."));
+        assert!(refreshed_user_message.contains(&second_action));
         let feedback = codex_feedback::guardian_review_failures(&[session.thread_id()])
             .attachment
             .expect("failed ephemeral review survives cleanup and subsequent allowed reviews");
@@ -4065,7 +4091,7 @@ async fn guardian_review_session_config_allows_pinned_disabled_feature() {
 }
 
 #[tokio::test]
-async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5_4() {
+async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5_5() {
     let mut parent_config = test_config().await;
     parent_config.model_provider_id = AMAZON_BEDROCK_PROVIDER_ID.to_string();
     parent_config.model_provider =
@@ -4074,7 +4100,7 @@ async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5
     let guardian_config = build_guardian_review_session_config_for_test(
         crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
-        AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
+        AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
         Some(ReasoningEffort::Low),
         ReasoningSummary::default(),
         /*personality*/ None,
@@ -4093,7 +4119,7 @@ async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5
             guardian_config.model_provider,
         ),
         (
-            Some(AMAZON_BEDROCK_GPT_5_4_MODEL_ID.to_string()),
+            Some(AMAZON_BEDROCK_GPT_5_5_MODEL_ID.to_string()),
             AMAZON_BEDROCK_PROVIDER_ID.to_string(),
             expected_model_provider,
         )

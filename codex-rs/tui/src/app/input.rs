@@ -99,12 +99,13 @@ impl App {
         let was_pending = self.key_chord_matcher.is_pending();
         if !was_pending
             && contexts.is_warnings()
-            && !crate::key_hint::is_plain_text_key_event(key_event)
-            && self
-                .keymap
-                .list
-                .action_for(key_event)
-                .is_some_and(|action| action != crate::keymap::ListAction::Accept)
+            && (crate::key_hint::plain(KeyCode::Char('k')).is_press(key_event)
+                || (!crate::key_hint::is_plain_text_key_event(key_event)
+                    && self
+                        .keymap
+                        .list
+                        .action_for(key_event)
+                        .is_some_and(|action| action != crate::keymap::ListAction::Accept)))
         {
             return Some(key_event);
         }
@@ -260,7 +261,7 @@ impl App {
         let config = self.chat_widget.config_ref();
         let file_system_policy = config.permissions.file_system_sandbox_policy();
         let editor_result = tui
-            .with_restored(|| async {
+            .with_restored(tui::TerminalHandoff::KeepScreen, || async {
                 external_editor::run_editor(
                     &seed,
                     &editor_cmd,
@@ -562,6 +563,14 @@ impl App {
             && self.overlay.is_none()
             && self.chat_widget.no_modal_or_popup_active()
         {
+            if key_event.kind == KeyEventKind::Press
+                && key_event.code == KeyCode::Left
+                && key_event.modifiers == KeyModifiers::NONE
+                && self.chat_widget.agents_navigation_key_available()
+                && !matches!(self.app_server_target, AppServerTarget::Embedded)
+            {
+                self.open_agents_overview(app_server);
+            }
             return;
         }
 
@@ -586,7 +595,8 @@ impl App {
             } else if self.should_reject_side_backtrack_esc(key_event) {
                 self.reject_side_backtrack_esc();
             } else {
-                self.chat_widget.handle_key_event(key_event);
+                let action = self.chat_widget.handle_key_event(key_event);
+                self.handle_clipboard_key_action(tui, action);
             }
             return;
         }
@@ -620,7 +630,8 @@ impl App {
                         self.reset_backtrack_state();
                     }
                 }
-                self.chat_widget.handle_key_event(key_event);
+                let action = self.chat_widget.handle_key_event(key_event);
+                self.handle_clipboard_key_action(tui, action);
             }
             _ => {
                 self.chat_widget.handle_key_event(key_event);
@@ -717,6 +728,7 @@ impl App {
 
     pub(crate) fn should_handle_backtrack_esc(&self, key_event: KeyEvent) -> bool {
         !self.chat_widget.is_external_writer_view()
+            && !self.chat_widget.has_prompt_suggestion()
             && !self.chat_widget.side_conversation_active()
             && !self.chat_widget.shortcut_overlay_visible()
             && self.chat_widget.is_normal_backtrack_mode()

@@ -188,7 +188,6 @@ fn convert_configured_marketplace_plugin_to_plugin_summary(
 ) -> PluginSummary {
     let share_context = share_context_for_source(&plugin.source, shared_plugin_ids_by_local_path);
     PluginSummary {
-        extensions: None,
         id: plugin.id,
         remote_plugin_id: None,
         version: None,
@@ -1123,7 +1122,6 @@ impl PluginRequestProcessor {
                     marketplace_name: outcome.marketplace_name,
                     marketplace_path: outcome.marketplace_path,
                     summary: PluginSummary {
-                        extensions: None,
                         id: outcome.plugin.id,
                         remote_plugin_id: None,
                         version: None,
@@ -1900,7 +1898,7 @@ impl PluginRequestProcessor {
             let global_callback_url = config.mcp_oauth_callback_url.clone();
 
             tokio::spawn(async move {
-                let oauth_client_id = server.oauth_client_id();
+                let oauth_client_config = server.oauth.as_ref();
                 let first_attempt = perform_oauth_login_silent(
                     &oauth_credential_name,
                     &oauth_config.url,
@@ -1909,7 +1907,7 @@ impl PluginRequestProcessor {
                     oauth_config.http_headers.clone(),
                     oauth_config.env_http_headers.clone(),
                     &resolved_scopes.scopes,
-                    oauth_client_id,
+                    oauth_client_config,
                     McpOAuthClientRegistration::Auto,
                     server.oauth_resource.as_deref(),
                     callback_port,
@@ -1930,7 +1928,7 @@ impl PluginRequestProcessor {
                             oauth_config.http_headers,
                             oauth_config.env_http_headers,
                             &[],
-                            oauth_client_id,
+                            oauth_client_config,
                             McpOAuthClientRegistration::Auto,
                             server.oauth_resource.as_deref(),
                             callback_port,
@@ -2181,7 +2179,6 @@ fn remote_marketplace_to_info(marketplace: RemoteMarketplace) -> PluginMarketpla
 
 fn remote_plugin_summary_to_info(summary: RemoteCatalogPluginSummary) -> PluginSummary {
     PluginSummary {
-        extensions: summary.extensions,
         id: summary.id,
         remote_plugin_id: Some(summary.remote_plugin_id),
         version: summary.version,

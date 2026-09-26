@@ -6,6 +6,7 @@ use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
 use codex_config::types::McpServerConfig;
+use codex_config::types::OtelExporterKind;
 use codex_core::SleepFuture;
 use codex_core::TimeFuture;
 use codex_core::TimeProvider;
@@ -1484,7 +1485,7 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     extensions.tool_lifecycle_contributor(lifecycle_recorder.clone());
     let mut builder = test_codex()
-        .with_model("gpt-5.4")
+        .with_model_info_override("gpt-5.4", |_| {})
         .with_extensions(Arc::new(extensions.build()))
         .with_config(move |config| {
             let secret_file = config.cwd.join("guardian-secret.txt");
@@ -1697,7 +1698,7 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
     let permission_section = [
         "\n>>> PARENT TURN PERMISSION CONTEXT START\n".to_string(),
         format!(
-            "For this action on environment \"local\", the active permission profile denies reading these paths/globs. These are policy restrictions; do not approve escalation whose purpose is to read them.\n- path `{}`\n- glob `{}`\n",
+            "The active permission profile for environment \"local\" denies reading these paths/globs. These are policy restrictions; do not approve escalation whose purpose is to read them.\n- path `{}`\n- glob `{}`\n",
             fs::canonicalize(&secret_file)?.display(),
             test.config.cwd.join("guardian-*.key").display(),
         ),
@@ -1718,6 +1719,18 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
     }
     let first_guardian_request = guardian_requests[0].body_json();
     let second_guardian_request = guardian_requests[2].body_json();
+    let second_input = guardian_requests[2]
+        .message_input_text_groups("user")
+        .last()
+        .expect("second review input")
+        .concat();
+    assert_eq!(
+        second_input
+            .matches("run the second command that requires Guardian review")
+            .count(),
+        1
+    );
+    assert!(!second_input.contains("run the first command that requires Guardian review"));
     let first_parent_request = requests[0].body_json();
     let second_parent_request = requests[4].body_json();
     let first_parent_turn_id = first_parent_request["client_metadata"]["turn_id"]
@@ -1959,11 +1972,14 @@ async fn interrupted_guardian_review_across_model_change_does_not_execute_the_co
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(None; "legacy_fallback")]
-#[test_case(Some("Acting model rejection instructions."); "catalog_override")]
-#[test_case(Some(""); "empty_override")]
+#[tracing_test::traced_test]
+#[test_case(None, false; "legacy_fallback")]
+#[test_case(None, true; "otel_enabled")]
+#[test_case(Some("Acting model rejection instructions."), false; "catalog_override")]
+#[test_case(Some(""), false; "empty_override")]
 async fn guardian_denial_rejects_tool_call_with_rationale(
     rejection_instructions: Option<&'static str>,
+    log_assessments: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
@@ -2011,6 +2027,12 @@ async fn guardian_denial_rejects_tool_call_with_rationale(
             });
         })
         .with_config(move |config| {
+            config.otel.log_guardian_assessments = log_assessments;
+            config.otel.exporter = OtelExporterKind::OtlpGrpc {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                headers: Default::default(),
+                tls: None,
+            };
             config.permissions.approval_policy = Constrained::allow_any(approval_policy);
             config
                 .set_legacy_sandbox_policy(sandbox_policy_for_config)
@@ -2180,6 +2202,32 @@ async fn guardian_denial_rejects_tool_call_with_rationale(
         "Guardian-denied command unexpectedly executed"
     );
 
+    // Approval workers do not inherit the test span, so select the conversation explicitly.
+    let thread_id = test.session_configured.thread_id;
+    let logs = String::from_utf8(
+        tracing_test::internal::global_buf()
+            .lock()
+            .expect("captured logs")
+            .clone(),
+    )?;
+    let assessments: Vec<_> = logs
+        .lines()
+        .filter(|line| {
+            line.contains("codex.guardian_assessment")
+                && line.contains(&format!("conversation.id={thread_id}"))
+        })
+        .collect();
+    assert_eq!(assessments.len(), usize::from(log_assessments));
+    if let Some(log) = assessments.first() {
+        for field in [
+            "status=\"denied\"",
+            "outcome=\"deny\"",
+            "item.id=\"exec-call-denied\"",
+            "rationale=\"The requested write has unacceptable test risk.\"",
+        ] {
+            assert!(log.contains(field), "missing {field}: {log}");
+        }
+    }
     Ok(())
 }
 

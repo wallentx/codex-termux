@@ -1678,7 +1678,7 @@ print(json.dumps({"hookSpecificOutput": {
 
     let forked = test
         .thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(1),
             StartThreadOptions::new(test.config.clone()),
             test.codex.rollout_path().expect("parent rollout path"),
@@ -1936,12 +1936,10 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn(
         .await
         .context("timed out waiting for the async hook to start")?;
 
-    fs::write(
-        test.codex_home_path()
-            .join("async_user_prompt_submit_release"),
-        "ready",
-    )
-    .context("release gated async hook")?;
+    let release_path = test
+        .codex_home_path()
+        .join("async_user_prompt_submit_release");
+    fs::write(&release_path, "ready").context("release gated async hook")?;
 
     let finished_path = test
         .codex_home_path()
@@ -1962,6 +1960,10 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn(
         1,
         "an async hook result from the previous turn must not start a model turn"
     );
+
+    // Keep the next prompt's hook pending so only the first hook's buffered
+    // output can contribute to the next model turn.
+    fs::remove_file(release_path).context("reset the async hook gate")?;
 
     let next_prompt = "observe the buffered async context";
     let next_turn = if automatic_continuation {
@@ -2040,6 +2042,7 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn(
         "buffered async hook context should precede the next user prompt"
     );
 
+    test.codex.shutdown_and_wait().await?;
     Ok(())
 }
 
@@ -3651,8 +3654,8 @@ async fn pre_tool_use_hook_model_tracks_step_after_a_turn_update() -> Result<()>
         .expect("bundled models should parse")
         .models
         .into_iter()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("bundled gpt-5.4 model");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("bundled gpt-5.5 model");
     let models = [model_a, model_b]
         .into_iter()
         .map(|slug| {

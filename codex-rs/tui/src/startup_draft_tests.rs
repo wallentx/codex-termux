@@ -7,6 +7,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio_stream::StreamExt;
 
 use super::StartupDraftInitialScreen;
 use super::StartupDraftPump;
@@ -50,6 +51,12 @@ where
 pub(crate) fn quiet_startup_test_pump() -> StartupDraftPump {
     let mut pump = startup_test_pump(std::iter::empty());
     pump.events = Box::pin(futures::stream::pending());
+    pump
+}
+
+pub(crate) fn startup_test_pump_with_input(text: &str) -> StartupDraftPump {
+    let mut pump = startup_test_pump(std::iter::once(TuiEvent::Paste(text.to_string())));
+    pump.events = Box::pin(pump.events.chain(futures::stream::pending()));
     pump
 }
 
@@ -414,7 +421,7 @@ fn startup_draft_preserves_multiline_editing_without_submitting() {
     assert!(pump.app_event_rx.try_recv().is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn startup_draft_preserves_non_bracketed_multiline_pastes_without_submitting() {
     let events = "first line\n\nsecond line\nthird line"
         .chars()

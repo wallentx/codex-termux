@@ -485,22 +485,83 @@ fn output_with_tool_result_metadata(metadata: ToolResultMetadata) -> ResponseIte
     output
 }
 
-#[test]
-fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endpoint()
+#[tokio::test]
+async fn responses_request_includes_internal_metadata_for_provider_grant_or_first_party_destination()
 -> anyhow::Result<()> {
-    let provider =
+    use crate::session::step_context::StepContext;
+    use crate::tools::ExecutedToolCalls;
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::router::ToolCall;
+    use codex_features::Feature;
+    use codex_features::Features;
+
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
+    let step = StepContext::for_test(Arc::new(turn));
+    let mut features = Features::default();
+    features.enable(Feature::ExecutedToolCallMetadata);
+    let recorder = ExecutedToolCalls::new(&features, &codex_history::InitialHistory::New);
+    let resource_metadata = json!({"openai/resource_access": {"payload": "x".repeat(600 * 1024)}});
+    let mut outputs = Vec::new();
+    for id in ["first", "second"] {
+        let call = ToolCall {
+            tool_name: codex_tools::ToolName::plain("mcp__apps__read"),
+            call_id: id.to_string(),
+            payload: ToolPayload::Function {
+                arguments: json!({"query": id}).to_string(),
+            },
+            encrypted_function_args: None,
+        };
+        let (mut recorded, permit) = recorder
+            .prepare_direct_call(&call, &ToolCallSource::Direct, &step)
+            .expect("direct observation slot");
+        recorded.set_tool_result_metadata(ToolResultMetadata::new(&resource_metadata));
+        let mut item = ResponseItem::from(ResponseInputItem::FunctionCallOutput {
+            call_id: id.to_string(),
+            output: FunctionCallOutputPayload::from_text(format!("result for {id}")),
+        });
+        recorder.attach_direct_call_to_output(&mut item, Some((recorded, permit)));
+        outputs.push(item);
+    }
+    let original_outputs = outputs.clone();
+    recorder.attach_to_prompt(&mut outputs, &mut Default::default());
+    assert_eq!(outputs, original_outputs);
+    let recorded = serde_json::to_value(&outputs)?;
+    assert_eq!(
+        recorded[0]["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]["tool_result_metadata"],
+        resource_metadata,
+    );
+    assert!(
+        recorded[1]["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]
+            ["tool_result_metadata"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("omitted_due_to_size_limit (overage_bytes="))
+    );
+    let omitted_output = outputs.pop().expect("second direct output");
+    let mut without_omitted_metadata = ResponseItem::from(ResponseInputItem::FunctionCallOutput {
+        call_id: "second".to_string(),
+        output: FunctionCallOutputPayload::from_text("result for second".to_string()),
+    });
+    without_omitted_metadata.append_executed_tool_calls(vec![ExecutedToolCall::new(
+        "mcp__apps__read".to_string(),
+        json!({"query": "second"}),
+    )]);
+    without_omitted_metadata.mark_tool_calls_complete();
+
+    let mut provider =
         ModelProviderInfo::create_openai_provider(Some("https://api.openai.com/v1".to_string()));
     let mut api_provider = provider.to_api_provider(/*auth_mode*/ None)?;
     let mut client = test_model_client(SessionSource::Cli);
     Arc::get_mut(&mut client.state)
         .expect("test client should have unique session state")
-        .provider = create_model_provider(provider, /*auth_manager*/ None);
+        .provider = create_model_provider(provider.clone(), /*auth_manager*/ None);
     let output = output_with_tool_result_metadata(ToolResultMetadata::new(&json!({
         "private": { "resource": "raw-result-metadata" },
     })));
     let without_raw_metadata = output_with_tool_result_metadata(ToolResultMetadata::default());
     let attribution = McpAttribution {
         status: McpAttributionStatus::Complete,
+        error_reason: None,
         sources: vec![McpAttributionSource {
             connector_id: Some("connector_example".to_string()),
             plugin_id: Some("example@openai-bundled".to_string()),
@@ -510,7 +571,7 @@ fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endp
         }],
     };
     let prompt = Prompt {
-        input: vec![output.clone()],
+        input: vec![output.clone(), omitted_output.clone()],
         ..Default::default()
     };
     let mut responses_metadata = test_responses_metadata_for_client(
@@ -521,19 +582,27 @@ fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endp
         TestCodexResponsesRequestKind::Turn,
     );
     responses_metadata.mcp_attribution = Some(attribution.clone());
-    for (base_url, allowed) in [
-        ("https://api.openai.com/v1", true),
-        ("https://chatgpt.com/backend-api/codex", true),
-        ("https://api.chatgpt-staging.com/v1", true),
-        ("https://proxy.example.com/v1", false),
-        ("http://api.openai.com/v1", false),
-        ("https://api.openai.com.evil.example/v1", false),
-        ("https://chatgpt.com.evil.example/v1", false),
-        ("https://api.openai.com@proxy.example.com/v1", false),
-        ("not a URL", false),
+    for (provider_grant, base_url, allowed) in [
+        (false, "https://api.openai.com/v1", true),
+        (false, "https://chatgpt.com/backend-api/codex", true),
+        (false, "https://api.chatgpt-staging.com/v1", true),
+        (false, "https://proxy.example.com/v1", false),
+        (false, "http://api.openai.com/v1", false),
+        (false, "https://api.openai.com.evil.example/v1", false),
+        (false, "https://chatgpt.com.evil.example/v1", false),
+        (false, "https://api.openai.com@proxy.example.com/v1", false),
+        (false, "not a URL", false),
+        (true, "http://provider.example/v1", true),
     ] {
+        provider.include_internal_metadata = provider_grant;
+        Arc::get_mut(&mut client.state)
+            .expect("test client should have unique session state")
+            .provider = create_model_provider(provider.clone(), /*auth_manager*/ None);
         api_provider.base_url = base_url.to_string();
-        let include_internal = super::is_internal_metadata_destination(&api_provider);
+        let include_internal = client
+            .state
+            .provider
+            .include_internal_metadata(&api_provider);
         for responses_lite in [false, true] {
             let mut model = test_model_info();
             model.use_responses_lite = responses_lite;
@@ -546,14 +615,22 @@ fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endp
                 &responses_metadata,
                 include_internal,
             )?;
-            assert_eq!(
-                request.input.last(),
-                Some(if allowed {
-                    &output
-                } else {
-                    &without_raw_metadata
-                }),
+            let expected_input = if allowed {
+                vec![output.clone(), omitted_output.clone()]
+            } else {
+                vec![
+                    without_raw_metadata.clone(),
+                    without_omitted_metadata.clone(),
+                ]
+            };
+            assert!(
+                request.input.ends_with(&expected_input),
                 "resolved endpoint: {base_url}, responses_lite: {responses_lite}",
+            );
+            let expected_wire_input = serde_json::to_value(&request.input)?;
+            assert_eq!(
+                serde_json::to_value(&request)?["input"],
+                expected_wire_input
             );
             let expected_json = allowed
                 .then(|| serde_json::to_string(&attribution).map(serde_json::Value::String))
@@ -573,8 +650,10 @@ fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endp
                 client_metadata: Some(ws_client_metadata),
                 ..codex_api::ResponseCreateWsRequest::from(&request)
             };
+            let ws_request = serde_json::to_value(ws_request)?;
+            assert_eq!(ws_request["input"], expected_wire_input);
             assert_eq!(
-                serde_json::to_value(ws_request)?
+                ws_request
                     .get("client_metadata")
                     .and_then(|metadata| metadata.get(MCP_ATTRIBUTION_CLIENT_METADATA_KEY)),
                 expected_json.as_ref(),
@@ -584,9 +663,39 @@ fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endp
                     .get("mcp_attribution")
                     .is_none()
             );
-            assert_eq!(prompt.input, vec![output.clone()]);
+            assert_eq!(prompt.input, vec![output.clone(), omitted_output.clone()]);
         }
     }
+    responses_metadata.mcp_attribution = Some(McpAttribution {
+        status: McpAttributionStatus::AttributionError,
+        error_reason: Some(
+            codex_protocol::mcp::McpAttributionErrorReason::HistoryMissingCheckpoint,
+        ),
+        sources: attribution.sources.clone(),
+    });
+    let request = client.build_responses_request(
+        &prompt,
+        &test_model_info(),
+        /*effort*/ None,
+        codex_protocol::config_types::ReasoningSummary::None,
+        /*service_tier*/ None,
+        &responses_metadata,
+        /*include_internal*/ true,
+    )?;
+    assert_eq!(
+        request
+            .client_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(MCP_ATTRIBUTION_CLIENT_METADATA_KEY))
+            .map(|value| serde_json::from_str::<serde_json::Value>(value))
+            .transpose()?,
+        Some(json!({
+            "status": "attribution_error",
+            "sources": attribution.sources,
+            "error_reason": "history_missing_checkpoint",
+        })),
+    );
+
     let mut oversized_attribution = attribution;
     oversized_attribution.sources[0].tool_name = "a".repeat(MAX_MCP_ATTRIBUTION_BYTES);
     responses_metadata.mcp_attribution = Some(oversized_attribution);
@@ -605,7 +714,7 @@ fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endp
                 .get(MCP_ATTRIBUTION_CLIENT_METADATA_KEY)
                 .map(String::as_str)
         }),
-        Some(r#"{"status":"attribution_error"}"#),
+        Some(r#"{"status":"attribution_error","error_reason":"payload_too_large"}"#),
     );
     Ok(())
 }
@@ -675,7 +784,10 @@ fn responses_request_preserves_result_metadata_above_previous_aggregate_budget()
         codex_protocol::config_types::ReasoningSummary::None,
         /*service_tier*/ None,
         &responses_metadata,
-        super::is_internal_metadata_destination(&api_provider),
+        client
+            .state
+            .provider
+            .include_internal_metadata(&api_provider),
     )?;
     let body = serde_json::to_value(&request)?;
     // Whole-input equality covers bindings, arguments, results, sources and completion too.
@@ -696,8 +808,10 @@ fn responses_request_preserves_result_metadata_above_previous_aggregate_budget()
 
 #[test]
 fn websocket_incremental_reuse_tracks_raw_result_metadata() -> anyhow::Result<()> {
-    let provider =
-        ModelProviderInfo::create_openai_provider(Some("https://api.openai.com/v1".to_string()));
+    let provider = ModelProviderInfo {
+        include_internal_metadata: false,
+        ..ModelProviderInfo::create_openai_provider(Some("https://api.openai.com/v1".to_string()))
+    };
     let mut api_provider = provider.to_api_provider(/*auth_mode*/ None)?;
     let mut client = test_model_client(SessionSource::Cli);
     Arc::get_mut(&mut client.state)
@@ -768,7 +882,10 @@ fn websocket_incremental_reuse_tracks_raw_result_metadata() -> anyhow::Result<()
         previous_output.set_turn_id_if_missing("previous-turn");
         current_output.set_turn_id_if_missing("current-turn");
         api_provider.base_url = base_url.to_string();
-        let include_internal = super::is_internal_metadata_destination(&api_provider);
+        let include_internal = client
+            .state
+            .provider
+            .include_internal_metadata(&api_provider);
         let previous = client.build_responses_request(
             &Prompt {
                 input: vec![previous_output],
@@ -823,7 +940,7 @@ fn websocket_incremental_reuse_tracks_raw_result_metadata() -> anyhow::Result<()
 }
 
 #[tokio::test]
-async fn responses_http_omits_raw_tool_metadata_for_openai_named_custom_endpoint()
+async fn responses_http_preserves_raw_tool_metadata_for_openai_custom_endpoint()
 -> anyhow::Result<()> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -885,12 +1002,7 @@ async fn responses_http_omits_raw_tool_metadata_for_openai_named_custom_endpoint
     let requests = server.received_requests().await.expect("received requests");
     assert_eq!(requests.len(), 1);
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
-    assert_eq!(
-        body["input"],
-        serde_json::to_value(vec![output_with_tool_result_metadata(
-            ToolResultMetadata::default(),
-        )])?,
-    );
+    assert_eq!(body["input"], serde_json::to_value(vec![output.clone()])?);
     assert_eq!(prompt.input, vec![output]);
     Ok(())
 }
