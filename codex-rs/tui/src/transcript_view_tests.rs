@@ -69,7 +69,6 @@ fn startup_warning_keeps_first_visible_header_in_place() {
         Arc::new(crate::history_cell::SessionHeaderHistoryCell::new(
             "gpt-test".into(),
             /*reasoning_effort*/ None,
-            /*show_fast_status*/ false,
             crate::test_support::test_path_buf("/project"),
             "test",
         ));

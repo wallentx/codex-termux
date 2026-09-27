@@ -734,12 +734,9 @@ fn status_approval_label(
 impl StatusHistoryCell {
     fn content_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::from(vec![
-            Span::from(format!("{}>_ ", FieldFormatter::INDENT)).dim(),
-            Span::from("OpenAI Codex").bold(),
-            Span::from(" ").dim(),
-            Span::from(format!("(v{CODEX_CLI_VERSION})")).dim(),
-        ]));
+        let mut title = vec![FieldFormatter::INDENT.into()];
+        title.extend(crate::history_cell::codex_title(CODEX_CLI_VERSION));
+        lines.push(Line::from(title));
 
         let available_inner_width = usize::from(width.saturating_sub(4));
         if available_inner_width == 0 {

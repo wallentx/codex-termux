@@ -40,7 +40,7 @@ async fn shell_snapshot_concurrent_replays_keep_independent_readers(
         let (exe, linux_sandbox) = current_test_binary_helper_paths()?;
         let environment = Environment::create(
             /*exec_server_url*/ None,
-            codex_exec_server::ExecServerRuntimePaths::new(exe, linux_sandbox)?,
+            codex_exec_server::ExecServerRuntimeOptions::new(exe, linux_sandbox)?,
             codex_http_client::HttpClientFactory::new(
                 codex_http_client::OutboundProxyPolicy::ReqwestDefault,
             ),
