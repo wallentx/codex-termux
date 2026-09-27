@@ -2929,7 +2929,7 @@ async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_r
     let executor_address = listener.local_addr()?;
     let executor_url = format!("ws://{executor_address}");
     drop(listener);
-    let runtime_paths = codex_exec_server::ExecServerRuntimePaths::new(
+    let runtime_paths = codex_exec_server::ExecServerRuntimeOptions::new(
         std::env::current_exe()?,
         /*codex_linux_sandbox_exe*/ None,
     )?;

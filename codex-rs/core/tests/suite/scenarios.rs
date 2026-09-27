@@ -113,6 +113,9 @@ mod shared_instructions;
 #[path = "scenarios_mxc.rs"]
 mod mxc;
 
+#[path = "scenarios_tools_namespace_budget.rs"]
+mod tools_namespace_budget;
+
 fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
