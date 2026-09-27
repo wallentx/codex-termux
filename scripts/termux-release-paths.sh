@@ -15,9 +15,11 @@ readonly -a TERMUX_RELEASE_WORKFLOW_PATHS=(
 
 readonly -a TERMUX_RELEASE_GITHUB_SCRIPT_PATHS=(
   .github/scripts/termux-download-codex-artifact.sh
+  .github/scripts/termux-package.py
 )
 
 readonly -a TERMUX_RELEASE_BRANCH_SCRIPT_PATHS=(
+  scripts/get-codex
   scripts/termux-configure-git.sh
   scripts/termux-create-checkpoint-pr.sh
   scripts/termux-checkpoint-tree.sh

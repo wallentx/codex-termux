@@ -37,6 +37,29 @@ branches. A retry producing the same PR tree preserves its commit and running
 CI. Metadata records both `patch_source_sha` and `patch_upstream_ref`; the source
 snapshot remains the baseline for [checkpoints](termux-checkpoints.md).
 
+## Android runtime package
+
+The Android release archive uses the Codex package layout: `codex-package.json`,
+`bin/codex`, `bin/codex-code-mode-host`, and the `codex-path/` and
+`codex-resources/` directories. The version is read from the same Cargo manifest
+used for the build. Android uses `rg` from the daemon's inherited PATH;
+`pkg install ripgrep` supplies it without bundling another executable.
+
+Install an Actions artifact or downloaded release archive while preserving this
+layout:
+
+```sh
+python3 scripts/get-codex -o "$HOME/.local/bin/codex" /path/to/codex-aarch64-linux-android.tar.gz
+```
+
+The command links to the complete installed package. Previous package directories
+remain available; a replaced loose executable is saved in the download directory.
+The Termux self-updater also retains package metadata and migrates loose executables
+into a private package directory. Older flat archives keep their original layout.
+
+The daemon's Android target mapping and system-ripgrep validation exception live
+on `wallentx/termux-target`; the archive builder and installer live on `dev`.
+
 ## Git-only verification
 
 ```sh

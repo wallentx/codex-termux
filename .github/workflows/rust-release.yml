@@ -803,12 +803,11 @@ jobs:
               archive_name="codex-${{ matrix.target }}"
             fi
             if [[ "${{ matrix.target }}" == "aarch64-linux-android" && "${base}" == "codex" ]]; then
-              code_mode_host="codex-code-mode-host"
-              if [[ ! -x "$dest/$code_mode_host" ]]; then
-                echo "missing executable $dest/$code_mode_host" >&2
-                exit 1
-              fi
-              tar -C "$dest" -czf "$dest/${archive_name}.tar.gz" "$base" "$code_mode_host"
+              python3 "${GITHUB_WORKSPACE}/.github/scripts/termux-package.py" \
+                --codex "$dest/$base" \
+                --code-mode-host "$dest/codex-code-mode-host" \
+                --cargo-manifest Cargo.toml \
+                --output "$dest/${archive_name}.tar.gz"
             else
               tar -C "$dest" -czf "$dest/${archive_name}.tar.gz" "$base"
             fi

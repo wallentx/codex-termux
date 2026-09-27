@@ -84,6 +84,7 @@ jobs:
         libc++
         tar
         zstd
+        ripgrep
       copy-paths: |
         termux-smoke-artifact
       env: |
@@ -169,3 +170,16 @@ jobs:
         grep -Eiq 'usage' codex-exec-help.txt
         "$code_mode_host" --help | tee codex-code-mode-host-help.txt
         grep -Eiq 'usage' codex-code-mode-host-help.txt
+
+        if [[ -f codex-smoke/codex-package.json ]]; then
+          command -v rg
+          rg --version
+          test ! -e codex-smoke/codex-path/rg
+          # A separate home keeps this daemon independent of other device sessions.
+          export CODEX_HOME="$(mktemp -d "${TMPDIR:?}/codex-smoke.XXXXXX")"
+          trap '"$codex" app-server daemon stop >/dev/null 2>&1 || true' EXIT
+          "$codex" app-server daemon start | tee codex-daemon-start.json
+          "$codex" app-server daemon version | tee codex-daemon-version.json
+          "$codex" app-server daemon stop | tee codex-daemon-stop.json
+          trap - EXIT
+        fi
