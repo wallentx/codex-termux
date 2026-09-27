@@ -178,7 +178,9 @@ pub async fn update_current_exe(current_version: &str) -> Result<UpdateOutcome> 
         .context("failed to create update extraction directory")?;
     extract_archive(&archive_path, &extract_dir).await?;
     let (extracted_codex, extracted_code_mode_host) = find_extracted_binaries(&extract_dir)?;
-    let executable = replace_install_binaries(&extracted_codex, &extracted_code_mode_host)?;
+    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let executable =
+        replace_install_binaries(&current_exe, &extracted_codex, &extracted_code_mode_host)?;
 
     Ok(UpdateOutcome {
         previous_version: current.to_string(),
@@ -330,10 +332,10 @@ fn termux_asset_stem() -> String {
 }
 
 fn replace_install_binaries(
+    current_exe: &Path,
     extracted_codex: &Path,
     extracted_code_mode_host: &Path,
 ) -> Result<PathBuf> {
-    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let install_dir = current_exe
         .parent()
         .context("current executable has no parent directory")?;
@@ -351,7 +353,7 @@ fn replace_install_binaries(
             extracted_codex.display()
         )
     })?;
-    let current_permissions = fs::metadata(&current_exe)
+    let current_permissions = fs::metadata(current_exe)
         .with_context(|| format!("failed to read metadata for {}", current_exe.display()))?
         .permissions();
     fs::set_permissions(&staged_exe, current_permissions)
@@ -371,18 +373,184 @@ fn replace_install_binaries(
             staged_code_mode_host.display()
         )
     })?;
+
+    let source_package = extracted_codex
+        .parent()
+        .and_then(Path::parent)
+        .filter(|root| {
+            extracted_codex == root.join("bin/codex") && root.join("codex-package.json").is_file()
+        });
+    let mut staged_manifest = None;
+    if let Some(source_package) = source_package {
+        let metadata = fs::read(source_package.join("codex-package.json"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&metadata)?;
+        let version = manifest["version"]
+            .as_str()
+            .and_then(parse_release_version)
+            .context("invalid Android package version")?;
+        let target = format!("{}-linux-android", termux_arch());
+        anyhow::ensure!(
+            manifest["layoutVersion"] == 1
+                && manifest["target"] == target
+                && manifest["entrypoint"] == "bin/codex"
+                && extracted_code_mode_host == source_package.join("bin/codex-code-mode-host"),
+            "the downloaded Codex package does not match this Android installation"
+        );
+        let manifest_path = temp_dir.path().join("codex-package.json");
+        fs::write(&manifest_path, &metadata)?;
+        if install_dir.file_name().is_some_and(|name| name == "bin")
+            && let Some(root) = install_dir.parent()
+            && root.join("codex-package.json").is_file()
+        {
+            staged_manifest = Some((manifest_path, root.join("codex-package.json")));
+        } else {
+            // Migrate a loose executable into its own package; never treat the
+            // user's entire bin directory as a package for daemon installation.
+            let packages = install_dir.join(".codex-packages");
+            fs::create_dir_all(&packages)?;
+            let package = TempBuilder::new()
+                .prefix(&format!("{version}-"))
+                .tempdir_in(&packages)?;
+            for dir in ["bin", "codex-resources", "codex-path"] {
+                fs::create_dir(package.path().join(dir))?;
+            }
+            fs::rename(&staged_exe, package.path().join("bin/codex"))?;
+            fs::rename(
+                &staged_code_mode_host,
+                package.path().join("bin/codex-code-mode-host"),
+            )?;
+            fs::rename(manifest_path, package.path().join("codex-package.json"))?;
+            #[cfg(unix)]
+            {
+                let backup = packages.join(format!(
+                    "{}.previous",
+                    package
+                        .path()
+                        .file_name()
+                        .context("package has no name")?
+                        .to_string_lossy()
+                ));
+                fs::copy(current_exe, backup)?;
+                let launcher = temp_dir.path().join("codex-link");
+                std::os::unix::fs::symlink(package.path().join("bin/codex"), &launcher)?;
+                let _package = package.keep();
+                fs::rename(launcher, current_exe)?;
+                return Ok(current_exe.to_path_buf());
+            }
+            #[cfg(not(unix))]
+            bail!("Android package installation requires Unix symlinks");
+        }
+    }
     fs::rename(&staged_code_mode_host, &code_mode_host)
         .with_context(|| format!("failed to replace {}", code_mode_host.display()))?;
-    fs::rename(&staged_exe, &current_exe)
+    fs::rename(&staged_exe, current_exe)
         .with_context(|| format!("failed to replace {}", current_exe.display()))?;
+    if let Some((source, destination)) = staged_manifest {
+        fs::rename(source, destination)?;
+    }
 
-    Ok(current_exe)
+    Ok(current_exe.to_path_buf())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[cfg(unix)]
+    fn update_package(root: &Path) -> Result<serde_json::Value> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(root.join("bin"))?;
+        for (name, payload) in [("codex", "new cli"), ("codex-code-mode-host", "new host")] {
+            let path = root.join("bin").join(name);
+            fs::write(&path, payload)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        }
+        let manifest = serde_json::json!({
+            "layoutVersion": 1,
+            "version": "1.2.3-alpha.4",
+            "target": format!("{}-linux-android", termux_arch()),
+            "entrypoint": "bin/codex"
+        });
+        fs::write(root.join("codex-package.json"), manifest.to_string())?;
+        Ok(manifest)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_update_preserves_manifest_and_helpers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        let expected_manifest = update_package(&source)?;
+        let installed = temp.path().join("installed");
+        update_package(&installed)?;
+        fs::write(installed.join("codex-package.json"), "old metadata")?;
+        let current_exe = installed.join("bin/codex");
+        replace_install_binaries(
+            &current_exe,
+            &source.join("bin/codex"),
+            &source.join("bin/codex-code-mode-host"),
+        )?;
+        assert_eq!(
+            (
+                fs::read_to_string(current_exe)?,
+                fs::read_to_string(installed.join("bin/codex-code-mode-host"))?,
+                serde_json::from_slice::<serde_json::Value>(&fs::read(
+                    installed.join("codex-package.json")
+                )?)?,
+            ),
+            (
+                "new cli".to_string(),
+                "new host".to_string(),
+                expected_manifest
+            )
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_update_migrates_a_loose_executable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        let expected_manifest = update_package(&source)?;
+        let current_exe = temp.path().join("codex");
+        fs::copy(source.join("bin/codex"), &current_exe)?;
+        fs::write(&current_exe, "old cli")?;
+        replace_install_binaries(
+            &current_exe,
+            &source.join("bin/codex"),
+            &source.join("bin/codex-code-mode-host"),
+        )?;
+        let executable = fs::canonicalize(&current_exe)?;
+        let package = executable
+            .parent()
+            .and_then(Path::parent)
+            .context("package")?;
+        let backups = fs::read_dir(temp.path().join(".codex-packages"))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_file())
+            .map(fs::read_to_string)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(
+            (
+                fs::read_to_string(current_exe)?,
+                fs::read_to_string(package.join("bin/codex-code-mode-host"))?,
+                serde_json::from_slice::<serde_json::Value>(&fs::read(
+                    package.join("codex-package.json")
+                )?)?,
+                backups,
+            ),
+            (
+                "new cli".to_string(),
+                "new host".to_string(),
+                expected_manifest,
+                vec!["old cli".to_string()]
+            )
+        );
+        Ok(())
+    }
 
     fn release(tag_name: &str) -> GitHubRelease {
         GitHubRelease {
