@@ -96,11 +96,21 @@ mod mailbox_preemption;
 #[path = "scenarios_guardian_extra_policy.rs"]
 mod guardian_extra_policy;
 
+#[path = "scenarios_guardian_conversation_history_tests.rs"]
+mod guardian_conversation_history;
+
 #[path = "scenarios_indirect_namespace_prefixes.rs"]
 mod indirect_namespace_prefixes;
 
 #[path = "scenarios_mcp_resource_messages.rs"]
 mod mcp_resource_messages;
+
+#[path = "scenarios_guardian_agent_messages_tests.rs"]
+mod guardian_agent_messages;
+
+#[cfg(not(target_os = "windows"))]
+#[path = "scenarios_guardian_handoff.rs"]
+mod guardian_handoff;
 
 #[path = "scenarios_guardian_heartbeat.rs"]
 mod guardian_heartbeat;
