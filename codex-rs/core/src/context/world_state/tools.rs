@@ -9,8 +9,8 @@ use super::WorldStateSection;
 use crate::context::ContextualUserFragment;
 use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::RenderedWorldStateFragment;
-use codex_otel::CONTEXT_FRAGMENT_BYTES_BUCKETS;
 use codex_otel::THREAD_TOOLS_FRAGMENT_BYTES_METRIC;
+use codex_otel::THREAD_TOOLS_METRIC_BUCKETS;
 use codex_otel::THREAD_TOOLS_NAMESPACES_TOTAL_METRIC;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::protocol::TOOLS_CLOSE_TAG;
@@ -231,15 +231,16 @@ fn record_fragment_metrics(
     };
     for (stage, size) in [("before", &rendered.before), ("after", &rendered.after)] {
         let tags = [("stage", stage), ("kind", kind)];
-        metrics.histogram(
+        metrics.histogram_with_boundaries(
             THREAD_TOOLS_NAMESPACES_TOTAL_METRIC,
             i64::try_from(size.namespaces).unwrap_or(i64::MAX),
+            THREAD_TOOLS_METRIC_BUCKETS.as_slice(),
             &tags,
         );
         metrics.histogram_with_boundaries(
             THREAD_TOOLS_FRAGMENT_BYTES_METRIC,
             i64::try_from(size.bytes).unwrap_or(i64::MAX),
-            CONTEXT_FRAGMENT_BYTES_BUCKETS,
+            THREAD_TOOLS_METRIC_BUCKETS.as_slice(),
             &tags,
         );
     }

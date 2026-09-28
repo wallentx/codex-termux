@@ -7,6 +7,7 @@ use super::MAX_EDGES;
 use super::MAX_LABEL;
 use super::RenderError;
 use super::Shape;
+use super::syntax::delimited_label;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
@@ -29,7 +30,7 @@ pub(super) fn parse(header: &str, body: &[&str]) -> Result<Graph, RenderError> {
                 .ok_or(RenderError::Unsupported)?;
             rest = rest.trim_start();
             let label = if let Some(after) = rest.strip_prefix('|') {
-                let (label, remaining) = after.split_once('|').ok_or(RenderError::Unsupported)?;
+                let (label, remaining) = delimited_label(after, "|")?;
                 let label = flowchart_label(label)?;
                 rest = remaining;
                 label.to_owned()
@@ -74,9 +75,7 @@ fn node(rest: &mut &str, graph: &mut Graph) -> Result<usize, RenderError> {
     };
     let index = graph.node(id)?;
     if let Some((open, close, shape)) = declaration {
-        let (label, remaining) = rest[open.len()..]
-            .split_once(close)
-            .ok_or(RenderError::Unsupported)?;
+        let (label, remaining) = delimited_label(&rest[open.len()..], close)?;
         let label = flowchart_label(label)?;
         *rest = remaining;
         let node = &mut graph.nodes[index];
@@ -98,44 +97,29 @@ fn flowchart_label(label: &str) -> Result<&str, RenderError> {
     let label = if let Some(quoted) = label.strip_prefix('"') {
         quoted.strip_suffix('"').ok_or(RenderError::Unsupported)?
     } else {
+        if label.contains(['[', ']', '{', '}', '|']) {
+            return Err(RenderError::Unsupported);
+        }
         label
     };
-    check_label_text(label)?;
+    if label.contains('"') {
+        return Err(RenderError::Unsupported);
+    }
+    check_label(label)?;
     Ok(label)
 }
 
 pub(super) fn check_label(label: &str) -> Result<(), RenderError> {
-    // Only delimited flowchart labels support literal ampersands. Other families must keep
-    // rejecting them so statement splitting cannot turn an entity into truncated label text.
-    if label.contains('&') {
-        return Err(RenderError::Unsupported);
-    }
-    check_label_text(label)
-}
-
-fn check_label_text(label: &str) -> Result<(), RenderError> {
-    if label.trim().is_empty()
+    // Markup needs deliberate decoding/layout; printable comparison operators are plain text.
+    let markup = label.match_indices('<').any(|(index, _)| {
+        let after = &label[index + 1..];
+        after.starts_with(|ch: char| ch.is_ascii_alphabetic() || matches!(ch, '/' | '!' | '?'))
+    });
+    if markup
+        || label.trim().is_empty()
         || label.chars().any(|ch| {
             ch.is_control()
-                || matches!(
-                    ch,
-                    '[' | ']'
-                        | '{'
-                        | '}'
-                        | '|'
-                        | '<'
-                        | '>'
-                        | '"'
-                        | '\\'
-                        | '┌'
-                        | '┐'
-                        | '└'
-                        | '┘'
-                        | '├'
-                        | '┤'
-                        | '╪'
-                        | '◄'
-                )
+                || matches!(ch, '┌' | '┐' | '└' | '┘' | '├' | '┤' | '╪' | '◄')
                 || UnicodeWidthChar::width(ch).is_none_or(|width| width == 0)
         })
     {

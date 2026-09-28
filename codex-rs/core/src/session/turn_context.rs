@@ -956,7 +956,7 @@ impl Session {
         );
         if per_turn_config
             .features
-            .persistent_mode_enabled(step_settings.reasoning_effort())
+            .persistent_execution_enabled(step_settings.reasoning_effort())
         {
             super::time_reminder::apply_persistent_defaults(&mut per_turn_config);
         }

@@ -1,6 +1,3 @@
-#[path = "support/executable.rs"]
-mod executable;
-
 #[cfg(target_os = "linux")]
 #[path = "exec_server/pid_namespace_tests.rs"]
 mod pid_namespace_tests;
@@ -36,7 +33,7 @@ use codex_exec_server::NoiseRendezvousConnectBundle;
 use codex_exec_server::ProcessId;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
-use executable::copy_executable;
+use codex_utils_cargo_bin::copy_executable;
 use futures::SinkExt;
 use futures::StreamExt;
 use predicates::prelude::PredicateBooleanExt;

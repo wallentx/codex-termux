@@ -497,13 +497,14 @@ pub struct McpServerStatusSnapshot {
 pub async fn collect_mcp_server_status_snapshot_with_detail(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
-    submit_id: String,
     runtime_context: McpRuntimeContext,
     codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
     tool_catalog_cache: crate::McpToolCatalogCache,
     detail: McpSnapshotDetail,
+    server_name: Option<&str>,
 ) -> McpServerStatusSnapshot {
-    let mcp_servers = effective_mcp_servers(config, auth);
+    let mut mcp_servers = effective_mcp_servers(config, auth);
+    mcp_servers.retain(|name, _| server_name.is_none_or(|selected| name == selected));
     if mcp_servers.is_empty() {
         return McpServerStatusSnapshot {
             server_infos: HashMap::new(),
@@ -539,7 +540,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
             plugins_available: false,
             ready_selected_capability_roots: Vec::new(),
             mcp_servers,
-            submit_id,
+            submit_id: String::new(),
             tx_event: None,
             startup_cancellation_token: cancel_token.clone(),
             runtime_context,
@@ -788,21 +789,29 @@ fn convert_mcp_resource_templates(
         .collect::<HashMap<_, _>>()
 }
 
-async fn collect_mcp_server_status_snapshot_from_manager(
+pub(crate) async fn collect_mcp_server_status_snapshot_from_manager(
     mcp_connection_manager: &McpConnectionSet,
     auth_status_entries: HashMap<String, crate::mcp::auth::McpAuthStatusEntry>,
     server_names: Vec<String>,
     detail: McpSnapshotDetail,
 ) -> McpServerStatusSnapshot {
+    let selected_servers: HashSet<&str> = server_names.iter().map(String::as_str).collect();
+    let include_server = |name: &str| selected_servers.contains(name);
     let ((server_infos, (tools, tools_errors)), resources, resource_templates) = tokio::join!(
         async {
-            let server_infos = mcp_connection_manager.list_available_server_infos().await;
-            let tools = mcp_connection_manager.list_tools_with_errors().await;
+            let server_infos = mcp_connection_manager
+                .list_available_server_infos(include_server)
+                .await;
+            let tools = mcp_connection_manager
+                .list_tools_with_errors(include_server)
+                .await;
             (server_infos, tools)
         },
         async {
             if detail.include_resources() {
-                mcp_connection_manager.list_all_resources(|_| true).await
+                mcp_connection_manager
+                    .list_all_resources(include_server)
+                    .await
             } else {
                 HashMap::new()
             }
@@ -810,7 +819,7 @@ async fn collect_mcp_server_status_snapshot_from_manager(
         async {
             if detail.include_resources() {
                 mcp_connection_manager
-                    .list_all_resource_templates(|_| true)
+                    .list_all_resource_templates(include_server)
                     .await
             } else {
                 HashMap::new()

@@ -267,6 +267,7 @@ async fn new_config(
         guardian_policy_config: None,
         guardian_extra_policy: None,
         guardian_policy_template: None,
+        guardian_circuit_break_action: Default::default(),
         include_permissions_instructions: false,
         include_apps_instructions: false,
         include_collaboration_mode_instructions: false,

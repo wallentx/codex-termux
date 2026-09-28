@@ -6,6 +6,7 @@ use crate::context::world_state::WorldStateSection;
 use crate::context::world_state::test_support::render_section_cases;
 use codex_extension_api::ExtensionMetrics;
 use codex_otel::THREAD_TOOLS_FRAGMENT_BYTES_METRIC;
+use codex_otel::THREAD_TOOLS_METRIC_BUCKETS;
 use codex_otel::THREAD_TOOLS_NAMESPACES_TOTAL_METRIC;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
@@ -398,7 +399,13 @@ fn reserves_the_empty_state_notice_when_all_namespaces_are_removed() {
 
 #[derive(Default)]
 struct RecordingMetrics {
-    samples: Mutex<BTreeMap<(String, String, String), i64>>,
+    samples: Mutex<BTreeMap<(String, String, String), RecordedHistogram>>,
+}
+
+#[derive(Debug, PartialEq)]
+struct RecordedHistogram {
+    value: i64,
+    boundaries: Vec<f64>,
 }
 
 impl ExtensionMetrics for RecordingMetrics {
@@ -410,25 +417,28 @@ impl ExtensionMetrics for RecordingMetrics {
         &self,
         name: &str,
         value: i64,
-        _boundaries: &[f64],
+        boundaries: &[f64],
         tags: &[(&str, &str)],
     ) {
-        self.histogram(name, value, tags);
-    }
-
-    fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) {
         let [("stage", stage), ("kind", kind)] = tags else {
             panic!("unexpected tags: {tags:?}")
         };
         self.samples.lock().expect("metric samples lock").insert(
             (name.to_string(), (*stage).to_string(), (*kind).to_string()),
-            value,
+            RecordedHistogram {
+                value,
+                boundaries: boundaries.to_vec(),
+            },
         );
+    }
+
+    fn histogram(&self, name: &str, _value: i64, _tags: &[(&str, &str)]) {
+        panic!("expected explicit boundaries for {name}");
     }
 }
 
 impl RecordingMetrics {
-    fn take(&self) -> BTreeMap<(String, String, String), i64> {
+    fn take(&self) -> BTreeMap<(String, String, String), RecordedHistogram> {
         std::mem::take(&mut *self.samples.lock().expect("metric samples lock"))
     }
 }
@@ -437,7 +447,7 @@ fn expected_metrics(
     kind: &str,
     before: (usize, &str),
     after: (usize, &str),
-) -> BTreeMap<(String, String, String), i64> {
+) -> BTreeMap<(String, String, String), RecordedHistogram> {
     [("before", before), ("after", after)]
         .into_iter()
         .flat_map(|(stage, (count, text))| {
@@ -448,7 +458,10 @@ fn expected_metrics(
             .map(|(name, value)| {
                 (
                     (name.to_string(), stage.to_string(), kind.to_string()),
-                    value as i64,
+                    RecordedHistogram {
+                        value: value as i64,
+                        boundaries: THREAD_TOOLS_METRIC_BUCKETS.to_vec(),
+                    },
                 )
             })
         })

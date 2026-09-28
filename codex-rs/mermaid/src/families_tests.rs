@@ -10,9 +10,9 @@ const SEQUENCE: &str = "sequenceDiagram
     participant A as API
     participant S as 库存
     participant P as Payments
-    U->>A: Place order
+    U->>A: data[0] = {x: 1}
     A->>S: Reserve items
-    S-->>A: Reservation
+    S-->>A: say \"hello\" | C:\\tmp
     opt Items reserved
         loop Up to 3 attempts
             A->>P: Charge card
@@ -32,7 +32,7 @@ const STATE: &str = "stateDiagram-v2
     state \"Payment pending\" as Charging
     [*] --> Draft
     Draft --> Validating: submit
-    Validating --> Charging: valid
+    Validating --> Charging: [ready]
     Validating --> Rejected: invalid
     Charging --> Packing: paid
     Charging --> Rejected: declined
@@ -46,8 +46,8 @@ const STATE: &str = "stateDiagram-v2
 
 const CLASS: &str = "classDiagram
     class order {
-        +String id
-        +Status status
+        +int[] ids
+        +String a;b
         +submit()
         +cancel()
     }
@@ -192,6 +192,34 @@ fn class_relationship_endpoints() {
         assert!(ports[1].contains("(many)"));
         assert_eq!(output.contains('┆'), dashed);
     }
+    for source in [
+        "classDiagram\nclass A; A --> B : {ok}",
+        "classDiagram\nclass A; class B {\n+id\n}",
+    ] {
+        assert_eq!(
+            render(source, /*max_width*/ 100).unwrap(),
+            render(&source.replace(';', "\n"), /*max_width*/ 100).unwrap(),
+        );
+    }
+    let source = "classDiagram\nclass A {\nstring a;b\nObject[] elementData\n}\nA : +get()";
+    let statements = super::syntax::statements(source).unwrap();
+    assert_eq!(
+        super::relations::parse(statements[0], &statements[1..]).unwrap(),
+        super::Graph {
+            nodes: vec![super::Node {
+                id: "A".into(),
+                label: "A".into(),
+                shape: super::Shape::Rectangle,
+                declared: false,
+                members: vec![
+                    "string a;b".into(),
+                    "Object[] elementData".into(),
+                    "+get()".into()
+                ],
+            }],
+            ..super::Graph::default()
+        }
+    );
     for (line, target, target_tip, target_label, dashed) in [
         ("A --orange", "orange", '─', "", false),
         ("A ..o_range", "o_range", '─', "", true),
@@ -269,6 +297,9 @@ fn rejects_incomplete_and_unsupported_families() {
         "classDiagram; A --> B; click A",
         "classDiagram; class A {; +<html>; }",
         "erDiagram; A ||--o{ B",
+        "erDiagram; A ||--|| B: \"owns\"",
+        "erDiagram; A {; string value \"x\"junk\"; }",
+        "classDiagram\nclass A {\nstring a;b }\n}",
         "erDiagram; A ||--?? B : owns",
         "erDiagram; A {; int x KEY; }",
         "erDiagram; A {; int x PK \"open comment; }",
@@ -289,7 +320,7 @@ fn rejects_incomplete_and_unsupported_families() {
 #[test]
 fn metadata_names_and_style_text_remain_valid_in_content() {
     for source in [
-        "classDiagram; class accTitle {; +id; }; class accDescr {; +id; }",
+        "classDiagram; class accTitle {\n +id\n }\n class accDescr {\n +id\n }",
         "classDiagram; class A; A: ::: literal; A --> B: ::: literal",
         "erDiagram; accTitle {; int id; }",
         "erDiagram; A ||--|| B: ::: literal",
@@ -314,7 +345,7 @@ fn family_limits() {
             "loop retry;".repeat(5),
             "end;".repeat(5)
         ),
-        format!("classDiagram; class A {{; {} }}", "+field;".repeat(17)),
+        format!("classDiagram; class A {{\n {} }}", "+field\n".repeat(17)),
         format!("erDiagram; A {{; {} }}", "int id;".repeat(17)),
         format!("stateDiagram-v2; {}", "A --> B;".repeat(25)),
         format!("stateDiagram-v2\n{}", "S: Description\n".repeat(18)),
@@ -346,6 +377,8 @@ fn truncated_sources_and_terminal_widths() {
         "sequenceDiagram; A->>B: hi",
         "sequenceDiagram; A->>A: self",
         "sequenceDiagram; Note over A: memo",
+        "stateDiagram-v2; state \"a;b\" as A; A-->B: [ready]",
+        "erDiagram; A {; string value \"a;b\"; }",
     ] {
         let output = render(source, /*max_width*/ 100).unwrap();
         let width = output.lines().map(UnicodeWidthStr::width).max().unwrap();
@@ -388,6 +421,11 @@ fn sequence_arrows_preserve_sender_recipient_and_style() {
             assert_eq!(rows[row].contains(&'┄'), dashed);
         }
     }
+    let source = "sequenceDiagram; A->>B: say \"hello; B->>A: world\"";
+    assert_eq!(
+        render(source, /*max_width*/ 180).unwrap(),
+        render(&source.replace(';', "\n"), /*max_width*/ 180).unwrap(),
+    );
 }
 
 #[test]

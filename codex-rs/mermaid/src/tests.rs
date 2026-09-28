@@ -37,13 +37,46 @@ fn stadiums_with_other_shapes_in_every_direction() {
 
 #[test]
 fn quoted_flowchart_labels_match_unquoted_labels() {
-    let quoted = r#"A["Review & confirm"] -->|"Yes & continue"| B{"Ready?"}
+    let quoted = r#"A["Review & confirm;"] -->|"Yes & continue"| B{"Ready?"}
 B --> C(["Checkout"])
-A[Review & confirm]"#;
+A[Review & confirm;]"#;
     let unquoted = quoted.replace('"', "");
     assert_eq!(
         super::parse::parse("flowchart TD", &quoted.lines().collect::<Vec<_>>()).unwrap(),
         super::parse::parse("flowchart TD", &unquoted.lines().collect::<Vec<_>>()).unwrap(),
+    );
+    assert_eq!(
+        render(&format!("graph TD; {quoted}"), /*max_width*/ 180).unwrap(),
+        render(&format!("graph TD; {unquoted}"), /*max_width*/ 180).unwrap(),
+    );
+    let source = r#"graph TD;A["chimpansen hoppar ()[]"] -->|"x | y; z"| B{"x < 3?"};"#;
+    let statements = super::syntax::statements(source).unwrap();
+    assert_eq!(
+        super::parse::parse(statements[0], &statements[1..]).unwrap(),
+        super::Graph {
+            nodes: vec![
+                super::Node {
+                    id: "A".into(),
+                    label: "chimpansen hoppar ()[]".into(),
+                    shape: super::Shape::Rectangle,
+                    declared: true,
+                    members: Vec::new(),
+                },
+                super::Node {
+                    id: "B".into(),
+                    label: "x < 3?".into(),
+                    shape: super::Shape::Decision,
+                    declared: true,
+                    members: Vec::new(),
+                },
+            ],
+            edges: vec![super::Edge::directed(
+                /*from*/ 0,
+                /*to*/ 1,
+                "x | y; z".into()
+            )],
+            ..super::Graph::default()
+        }
     );
     for (quoted, label) in [
         (r#"A["(Database)"]"#, "(Database)"),
@@ -65,9 +98,12 @@ A[Review & confirm]"#;
 
 #[test]
 fn entity_labels_keep_source_fallback() {
-    for entity in ["&amp;", "&#38;", "&#x26;"] {
+    for entity in ["&amp;", "&#38;", "&#x26;", "#9829;", "#semi;"] {
         for source in [
             format!("sequenceDiagram\nA->>B: {entity}"),
+            format!("classDiagram\nclass A {{\n{entity}\n}}"),
+            format!("stateDiagram-v2; A-->B: {entity}"),
+            format!("erDiagram\nA {{\nstring value \"{entity}\"\n}}"),
             format!("flowchart TD; A[\"{entity}\"]"),
             format!("flowchart TD; A -->|\"{entity}\"| B"),
         ] {
@@ -102,6 +138,7 @@ fn quoted_flowchart_labels_reject_malformed_and_unsafe_text() {
         "\"embedded\"quote\"",
         "\"\"",
         "\"<b>HTML</b>\"",
+        "\"before <b\"",
         "\"\u{1b}\"",
     ] {
         for source in [
@@ -119,7 +156,7 @@ fn quoted_flowchart_labels_reject_malformed_and_unsafe_text() {
 
 #[test]
 fn branches_merges_and_retry_loop() {
-    let source = "flowchart TD\nA[Checkout] --> B{In stock?}\nB -->|yes| C[Reserve]\nB -->|no| D[Waitlist]\nC --> E{Paid?}\nE -->|yes| F[Ship]\nE -->|no| G[Retry payment]\nG --> E\nD --> H[Notify buyer]\nF --> H";
+    let source = "flowchart TD\nA[\"Go []; &\"] --> B{\"x < 3?\"}\nB -->|\"y|n\"| C[Reserve]\nB -->|no| D[Waitlist]\nC --> E{Paid?}\nE -->|yes| F[Ship]\nE -->|no| G[Retry payment]\nG --> E\nD --> H[Notify buyer]\nF --> H";
     assert_snapshot!(render(source, /*max_width*/ 100).unwrap());
 }
 
@@ -165,7 +202,6 @@ fn rejects_partial_or_unsupported_input() {
         "flowchart TD; A([same]); A[same]",
         "flowchart TD; A{same}; A([same])",
         "flowchart TD; A -->|unclosed B",
-        "flowchart TD; A[foo;bar]",
         "flowchart TD; A[لا]",
         "flowchart TD; A -->|yes┐| B",
     ] {
@@ -182,6 +218,7 @@ fn source_graph_and_width_limits() {
     for source in [
         " ".repeat(16 * 1024 + 1),
         format!("graph TD; A[{}]", "x".repeat(41)),
+        format!("graph TD; A[\"{}\"]", "[]".repeat(21)),
         format!("graph TD; A([{}])", "x".repeat(41)),
         format!(
             "graph TD; {}",

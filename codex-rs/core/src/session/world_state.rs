@@ -218,7 +218,7 @@ impl Session {
                         .iter()
                         .any(|tool| tool == "send_user_message_async");
             world_state.add_section(PersistentModeState::new(
-                turn_context.config.features.persistent_mode_enabled(
+                turn_context.config.features.persistent_execution_enabled(
                     step_context.settings.effective_reasoning_effort().as_ref(),
                 ),
                 model_messages.persistent_instructions(),

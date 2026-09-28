@@ -33,7 +33,7 @@ fn instructions_preserve_source_order_and_whole_records() {
         },
         RetainedInputSource::Local(None),
     );
-    let rendered = render_retained_instructions(&context);
+    let rendered = render_retained_instructions(&context, retained_assistant_message);
     assert_eq!(
         rendered
             .into_iter()
@@ -62,7 +62,7 @@ fn instructions_preserve_source_order_and_whole_records() {
         },
         RetainedInputSource::Local(None),
     );
-    let rendered = render_retained_instructions(&context);
+    let rendered = render_retained_instructions(&context, retained_assistant_message);
     assert_eq!(rendered.len(), 2);
     assert!(rendered[0].content.starts_with("Host notice:"));
     assert!(
@@ -106,7 +106,7 @@ fn ordinary_exchanges_keep_roles_and_drop_assistant_context_before_restrictions(
     ] {
         let composed = crate::composition::CollectedContext {
             sections: vec![ContextSection::RetainedUserInstructions {
-                items: render_retained_instructions(&context),
+                items: render_retained_instructions(&context, retained_assistant_message),
             }],
         }
         .compose(
@@ -141,18 +141,20 @@ fn ordinary_exchanges_keep_roles_and_drop_assistant_context_before_restrictions(
         assert!(text.contains("Some context was omitted."));
         assert!(!text.contains("Deploy to staging?"));
     }
-    let user_instruction = render_retained_instructions(&context).pop().unwrap();
+    let user_instruction = render_retained_instructions(&context, retained_assistant_message)
+        .pop()
+        .unwrap();
     let mut checkpoint = serde_json::to_value(&context).unwrap();
     checkpoint["assistant_messages"][0]["text"] = "".into();
     let restored = serde_json::from_value(checkpoint.clone()).unwrap();
     assert_eq!(
-        render_retained_instructions(&restored),
+        render_retained_instructions(&restored, retained_assistant_message),
         vec![user_instruction]
     );
     checkpoint["assistant_messages"][0]["complete"] = false.into();
     let restored = serde_json::from_value(checkpoint).unwrap();
     assert_eq!(
-        render_retained_instructions(&restored)[0],
+        render_retained_instructions(&restored, retained_assistant_message)[0],
         Budgeted::required(GuardianRootMessage::IncompleteAssistantContext.render())
     );
     context.record_assistant_message(
@@ -166,7 +168,7 @@ fn ordinary_exchanges_keep_roles_and_drop_assistant_context_before_restrictions(
         },
         RetainedInputSource::Local(Some(2)),
     );
-    let rendered = render_retained_instructions(&context);
+    let rendered = render_retained_instructions(&context, retained_assistant_message);
     assert_eq!(
         rendered[0],
         Budgeted::required(GuardianRootMessage::IncompleteAssistantContext.render())
@@ -210,7 +212,7 @@ fn delivery_uses_source_revision_and_complete_host_metadata() {
     let compose = |retained: &RetainedContext| {
         crate::CollectedContext {
             sections: vec![ContextSection::RetainedUserInstructions {
-                items: render_retained_instructions(retained),
+                items: render_retained_instructions(retained, retained_assistant_message),
             }],
         }
         .compose(

@@ -393,7 +393,10 @@ impl Session {
         .unwrap_or(u64::MAX);
 
         // Build model-visible history from the selected compaction and its newer suffix.
-        let mut history = ContextManager::for_session(&turn_context.session_source);
+        let mut history = ContextManager::for_session(
+            &turn_context.session_source,
+            &turn_context.config.features,
+        );
         let mut saw_legacy_compaction_without_replacement_history = false;
         if let Some(checkpoint) = history_checkpoint
             && let Some(items) = &checkpoint.compacted.replacement_history

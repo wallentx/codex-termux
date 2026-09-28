@@ -1,8 +1,5 @@
 //! Black-box coverage for safe diagnostic execution and config error reporting.
 
-#[path = "support/executable.rs"]
-mod executable;
-
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,7 +12,7 @@ use codex_app_server_protocol::RequestId;
 use codex_config::loader::project_trust_key;
 use codex_state::SqliteConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use executable::copy_executable;
+use codex_utils_cargo_bin::copy_executable;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;

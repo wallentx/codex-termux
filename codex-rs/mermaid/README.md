@@ -15,16 +15,20 @@ production dependency is needed.
 | `erDiagram` | Entities, multiline attribute bodies, `type name [PK, FK, UK] ["comment"]`, all four endpoint cardinalities, identifying/non-identifying relationships, relationship labels, direction declarations |
 
 Identifiers are ASCII letters followed by letters, digits, or underscores. Text
-supports ordinary Unicode and CJK. Full-line `%%` comments and semicolon-separated
-statements are supported; semicolons inside labels are not. Member/attribute bodies
-need a separate statement for each opening brace, member, and closing brace (for
-example `class Order {` followed by member lines and a final `}`). Class member text
-is retained in one compartment, including visibility, signatures, and return types.
-ER attribute types and names use the identifier grammar above.
+supports ordinary Unicode and CJK. Full-line `%%` comments and
+semicolon-separated statements are supported outside flowchart labels, quoted
+tokens, and class bodies. Sequence quotes are literal text; use newlines between
+class members, whose semicolons remain text. Member/attribute bodies need a
+separate statement for each opening brace, member, and closing brace (for
+example `class Order {` followed by member lines and a final `}`). Class member
+text is retained in one compartment, including visibility, signatures, and
+return types. ER attribute types and names use the identifier grammar above.
 
-Flowchart node and edge labels may be enclosed in double quotes. Literal ampersands
-are supported in these flowchart labels; other diagram families retain their stricter
-label subset. HTML and entity escapes remain unsupported.
+Flowchart node and edge labels may be enclosed in double quotes. Literal
+ampersands are supported in labels, as is printable punctuation after parsing.
+Quotes protect flowchart label delimiters such as brackets, pipes, and
+semicolons. HTML and entity escapes remain unsupported and return an error
+before statement splitting.
 
 These are explicit subsets, not complete Mermaid compatibility. Compound states,
 flowchart subgraphs, other shapes, sequence activation and parallel fragments,
