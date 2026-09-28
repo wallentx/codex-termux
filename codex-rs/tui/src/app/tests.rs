@@ -80,7 +80,6 @@ mod resume_shutdown_tests;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
-mod session_summary;
 mod startup;
 #[path = "tests/startup_frame_tests.rs"]
 mod startup_frame_tests;

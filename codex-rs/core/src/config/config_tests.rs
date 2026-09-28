@@ -8447,6 +8447,7 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template() -> s
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         auto_review: Some(AutoReviewToml {
+            circuit_break_action: None,
             policy: Some("  Use the user-configured guardian policy.  ".to_string()),
             extra_policy: Some("  Use the user-configured additional policy.  ".to_string()),
             experimental_policy_template: Some(
@@ -8505,6 +8506,7 @@ async fn requirements_guardian_policy_beats_auto_review() -> std::io::Result<()>
         .map_err(std::io::Error::other)?;
         let cfg = ConfigToml {
             auto_review: Some(AutoReviewToml {
+                circuit_break_action: None,
                 policy: Some("Use the user-configured guardian policy.".to_string()),
                 extra_policy: Some("Use the user-configured additional policy.".to_string()),
                 experimental_policy_template: None,
@@ -8543,6 +8545,7 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         auto_review: Some(AutoReviewToml {
+            circuit_break_action: None,
             policy: Some("   ".to_string()),
             extra_policy: Some("   ".to_string()),
             experimental_policy_template: None,

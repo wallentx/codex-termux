@@ -17,7 +17,7 @@ fn notification(method: &str, thread: ThreadId, turn: usize, status: &str) -> Se
         "method": method,
         "params": { "threadId": thread.to_string(), "turn": {
             "id": turn.to_string(), "items": [], "itemsView": "full", "status": status,
-            "error": null, "startedAt": null, "completedAt": null, "durationMs": null,
+            "error": null, "startedAt": null, "completedAt": null, "durationMs": 500,
         }},
     }))
     .unwrap()

@@ -1715,6 +1715,17 @@ impl ThreadRequestProcessor {
 
         let subtree_thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
 
+        // Fresh threads have no rollout until their first turn. Materialize the
+        // loaded persistent thread before looking it up for archival.
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await
+            && !thread.config_snapshot().await.ephemeral
+        {
+            self.thread_store
+                .persist_thread(thread_id, PersistContext::Standard)
+                .await
+                .map_err(|err| thread_store_mutation_error("archive", err))?;
+        }
+
         let mut archive_thread_ids = Vec::new();
         match self
             .thread_store

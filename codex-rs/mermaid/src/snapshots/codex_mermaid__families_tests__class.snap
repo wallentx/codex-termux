@@ -5,8 +5,8 @@ expression: output
 ┌──────────────────┐
 │ order            │
 │ ─────            │
-│ +String id       │
-│ +Status status   │
+│ +int[] ids       │
+│ +String a;b      │
 │ +submit()        │
 │ +cancel()        │
 │                  ├◆─(1) contains────┐

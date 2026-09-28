@@ -47,9 +47,13 @@ impl RetainedContext {
         message.bound();
         let empty = message.complete && message.text.is_empty();
         let inherited = source == RetainedInputSource::Inherited;
-        if let Some(index) = self.assistant_messages.iter().position(|entry| {
+        // A confirmed delivery is a distinct rollout fact even when the bounded live
+        // window immediately evicts it. Only a currently retained identical entry
+        // can be identified as a duplicate here.
+        let previous = self.assistant_messages.iter().position(|entry| {
             message.message_id.is_some() && entry.value.message_id == message.message_id
-        }) {
+        });
+        if let Some(index) = previous {
             if self.assistant_messages[index].value == message
                 && self.assistant_messages[index].inherited == inherited
                 && !empty

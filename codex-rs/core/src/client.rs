@@ -1845,6 +1845,7 @@ impl ModelClientSession {
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
+        let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
         let provider = Arc::clone(&self.client.state.provider);
         let auth_manager = provider.auth_manager();
 
@@ -2063,6 +2064,10 @@ impl ModelClientSession {
                     ("mode", mode),
                     ("reason", reason),
                     ("phase", if warmup { "warmup" } else { "generation" }),
+                    (
+                        "after_prewarm",
+                        if after_prewarm { "true" } else { "false" },
+                    ),
                 ],
             );
             let stream_result = websocket_connection

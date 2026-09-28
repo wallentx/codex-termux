@@ -70,6 +70,7 @@ mod input_boundary;
 #[cfg(unix)]
 mod job_control;
 mod keyboard_modes;
+mod link_pointer;
 #[cfg(test)]
 #[path = "tui/owned_screen_tests.rs"]
 mod owned_screen_tests;
@@ -651,6 +652,7 @@ impl OverlayInput {
 }
 
 pub struct Tui {
+    pub(crate) link_hover: link_pointer::LinkHover,
     frame_requester: FrameRequester,
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
@@ -727,6 +729,7 @@ impl Tui {
         );
 
         Self {
+            link_hover: link_pointer::LinkHover::default(),
             frame_requester,
             draw_tx,
             event_broker: Arc::new(event_broker),
@@ -855,6 +858,7 @@ impl Tui {
 
     // Drop crossterm EventStream to avoid stdin conflicts with other processes.
     pub fn pause_events(&mut self) {
+        self.link_hover.mouse = None;
         self.event_broker.pause_events();
     }
 

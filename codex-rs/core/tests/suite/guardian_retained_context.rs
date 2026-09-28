@@ -746,7 +746,7 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
                 text: "Never publish publicly.".to_owned(),
             }];
             window.push(shortened.into());
-            checkpoint.guardian_history = Some(GuardianHistoryCheckpoint(vec![source]));
+            checkpoint.guardian_history = Some(GuardianHistoryCheckpoint(vec![source.into()]));
         }
         LegacyInstructionSource::ModelWindow => window.push(source.into()),
         LegacyInstructionSource::Missing => expected = legacy,

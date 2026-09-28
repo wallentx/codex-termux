@@ -1,8 +1,5 @@
 #![cfg(unix)]
 
-#[path = "support/executable.rs"]
-mod executable;
-
 use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
@@ -13,7 +10,7 @@ use std::time::Instant;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
-use executable::copy_executable;
+use codex_utils_cargo_bin::copy_executable;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tempfile::TempDir;

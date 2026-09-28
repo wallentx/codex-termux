@@ -3561,6 +3561,7 @@ dependencies = [
  "codex-model-provider-info",
  "codex-prompts",
  "codex-protocol",
+ "codex-utils-cargo-bin",
  "core_test_support",
  "dirs",
  "http 1.4.0",
@@ -3571,6 +3572,8 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
+ "zstd",
 ]
 
 [[package]]

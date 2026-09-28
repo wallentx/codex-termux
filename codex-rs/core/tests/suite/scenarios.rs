@@ -1485,6 +1485,64 @@ async fn subagent_browser_auth_resolves_user_prompt() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_code_mode_messaging_request_history() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "Guardian approval actions require host-native paths"
+    );
+    let mut requests =
+        super::guardian_subagent_authorization::code_mode_guardian_request_history().await?;
+    let root =
+        requests.first().expect("root model request").body_json()["client_metadata"]["thread_id"]
+            .clone();
+    requests.sort_by_key(|request| {
+        let body = request.body_json();
+        let metadata = &body["client_metadata"];
+        if metadata["x-openai-subagent"] == "guardian" {
+            2
+        } else {
+            usize::from(metadata["thread_id"] != root)
+        }
+    });
+    let mut snapshot = context_snapshot::format_request_history_snapshot(
+        "A root uses Code Mode to send a confirmation and receives a real user reply; a worker then requests an action that Guardian reviews with the confirmed question as assistant context. Independent model streams are grouped as root, worker, then Guardian.",
+        &requests,
+        &ContextSnapshotOptions::default().rewrite_known_segments(),
+    );
+    for (pattern, replacement) in [
+        (
+            r#"(?m)^(\s*"environment_id": )"(?:local|remote)""#,
+            "$1\"<ENVIRONMENT>\"",
+        ),
+        (
+            r#"(For this action on environment )"(?:local|remote)","#,
+            "$1\"<ENVIRONMENT>\",",
+        ),
+        (r#"(?m)^(\s*"cwd": )"[^"]*""#, "$1\"<CWD>\""),
+        (
+            r#""command": \[\s*(?:"[^"]*",\s*)*"true"\s*\]"#,
+            "\"command\": [\"<SHELL>\", \"true\"]",
+        ),
+        (
+            r#"\{"type":"text","text":"Message sent\."\}"#,
+            r#"{"text":"Message sent.","type":"text"}"#,
+        ),
+        (
+            r#"\{"cmd":"true","sandbox_permissions":"require_escalated","justification":"Review the production deployment\."\}"#,
+            r#"{"cmd":"true","justification":"Review the production deployment.","sandbox_permissions":"require_escalated"}"#,
+        ),
+    ] {
+        snapshot = regex_lite::Regex::new(pattern)?
+            .replace_all(&snapshot, replacement)
+            .into_owned();
+    }
+    insta::assert_snapshot!("guardian_code_mode_messaging", snapshot);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_checkpoint_migration_request_history() -> Result<()> {
     skip_if_no_network!(Ok(()));

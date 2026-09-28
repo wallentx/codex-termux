@@ -2718,7 +2718,7 @@ async fn list_available_server_infos_uses_cache_while_client_is_pending() {
 
     let timeout_result = tokio::time::timeout(
         Duration::from_millis(10),
-        manager.list_available_server_infos(),
+        manager.list_available_server_infos(|_| true),
     )
     .await;
     let server_infos = timeout_result.expect("server info lookup should not block on startup");
@@ -4024,7 +4024,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
     assert_eq!(tool.callable_name, "calendar_create_event");
     assert_eq!(
         manager
-            .list_available_server_infos()
+            .list_available_server_infos(|_| true)
             .await
             .get(CODEX_APPS_MCP_SERVER_NAME),
         Some(&server_info)

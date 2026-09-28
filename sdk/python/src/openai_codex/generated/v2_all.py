@@ -547,6 +547,7 @@ class CodexErrorInfoValue(Enum):
     server_overloaded = "serverOverloaded"
     cyber_policy = "cyberPolicy"
     misalignment_policy_violation = "misalignmentPolicyViolation"
+    too_many_denials = "tooManyDenials"
     internal_server_error = "internalServerError"
     unauthorized = "unauthorized"
     bad_request = "badRequest"
@@ -8469,6 +8470,13 @@ class ListMcpServerStatusParams(BaseModel):
         int | None,
         Field(description="Optional page size; defaults to a server-defined value.", ge=0),
     ] = None
+    server_name: Annotated[
+        str | None,
+        Field(
+            alias="serverName",
+            description="Limit discovery to one server. With a thread ID, reuse that thread's MCP connection.",
+        ),
+    ] = None
     thread_id: Annotated[str | None, Field(alias="threadId")] = None
 
 
@@ -11466,7 +11474,7 @@ class Turn(BaseModel):
         ),
     ] = None
     error: Annotated[
-        TurnError | None, Field(description="Only populated when the Turn's status is failed.")
+        TurnError | None, Field(description="Error associated with a failed or interrupted turn.")
     ] = None
     id: Annotated[
         str, Field(description="Identifier for this turn. Codex-generated turn IDs are UUIDv7.")
