@@ -8,6 +8,8 @@ use codex_install_context::StandalonePlatform;
 /// Update action the CLI should perform after the TUI exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
+    /// Update by replacing the current Termux binary from wallentx/codex-termux.
+    TermuxSelfUpdate,
     /// Replace the local daemon after restoring the terminal.
     Daemon(DaemonUpdateSource),
     /// Update via `npm install -g @openai/codex@latest`.
@@ -29,6 +31,10 @@ pub enum UpdateAction {
 impl UpdateAction {
     #[cfg(any(not(debug_assertions), test))]
     pub(crate) fn from_install_context(context: &InstallContext) -> Option<Self> {
+        if cfg!(target_os = "android") {
+            return Some(UpdateAction::TermuxSelfUpdate);
+        }
+
         match &context.method {
             InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
             InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
@@ -46,6 +52,7 @@ impl UpdateAction {
     /// Returns the list of command-line arguments for invoking the update.
     pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
         match self {
+            UpdateAction::TermuxSelfUpdate => ("codex", &["update"]),
             UpdateAction::Daemon(source) => ("codex", source.command_args()),
             UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
             UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
@@ -76,6 +83,14 @@ impl UpdateAction {
         let (command, args) = self.command_args();
         shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
             .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
+    }
+
+    pub fn release_notes_url(self) -> &'static str {
+        if self == UpdateAction::TermuxSelfUpdate {
+            crate::termux_update::TERMUX_RELEASES_URL
+        } else {
+            "https://github.com/openai/codex/releases/latest"
+        }
     }
 }
 
@@ -157,6 +172,10 @@ mod tests {
 
     #[test]
     fn standalone_update_commands_rerun_latest_installer() {
+        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
         assert_eq!(
             UpdateAction::StandaloneUnix.command_args(),
             (
