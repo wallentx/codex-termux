@@ -159,7 +159,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.160.0-alpha.6"
+version = "0.161.0-alpha.2"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -207,6 +207,7 @@ codex-websocket-client = { path = "websocket-client" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
 codex-agent-extension = { path = "ext/agent" }
+codex-agent-message-board-client = { path = "agent-message-board-client" }
 codex-agent-message-board-extension = { path = "ext/agent-message-board" }
 codex-connectors-extension = { path = "ext/connectors" }
 codex-context-fragments = { path = "context-fragments" }
