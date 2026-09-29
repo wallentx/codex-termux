@@ -1,5 +1,8 @@
 //! App-level orchestration tests for the TUI.
 
+#[path = "tests/mcp_login_tests.rs"]
+mod mcp_login_tests;
+
 #[path = "tests/daybreak_tests.rs"]
 mod daybreak_tests;
 #[path = "tests/math_interruption_tests.rs"]
@@ -6090,6 +6093,8 @@ async fn make_test_app() -> Box<App> {
         startup_pending_protected_request: false,
         rate_limit_hard_stop_generation: 0,
         rate_limit_refresh_state: Default::default(),
+        pending_mcp_login_start: None,
+        active_mcp_login_ids: HashMap::new(),
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
         recap: recap::RecapState::default(),
@@ -6207,6 +6212,8 @@ pub(super) async fn make_test_app_with_channels() -> (
             startup_pending_protected_request: false,
             rate_limit_hard_stop_generation: 0,
             rate_limit_refresh_state: Default::default(),
+            pending_mcp_login_start: None,
+            active_mcp_login_ids: HashMap::new(),
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
             recap: recap::RecapState::default(),
@@ -8175,7 +8182,7 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
         Arc::new(EnvironmentManager::default_for_tests()),
     ))
     .await?;
-    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
     app.config = config;
     app.launch_cwd = launch_cwd.clone();
     app.state_db = state_db;
