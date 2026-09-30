@@ -160,7 +160,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.161.0-alpha.4"
+version = "0.161.0-alpha.5"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -378,6 +378,7 @@ dunce = "1.0.4"
 ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
 encoding_rs = "0.8.35"
 eventsource-stream = "0.2.3"
+file-id = "0.2.3"
 flate2 = "1.1.8"
 futures = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
