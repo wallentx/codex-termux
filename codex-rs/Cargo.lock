@@ -2021,8 +2021,10 @@ name = "codex-ansi-escape"
 version = "0.0.0"
 dependencies = [
  "ansi-to-tui",
+ "pretty_assertions",
  "ratatui",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2979,6 +2981,7 @@ dependencies = [
  "codex-utils-string",
  "codex-web-search-extension",
  "codex-windows-sandbox",
+ "codex-windows-sandbox-test-support",
  "core_test_support",
  "ctor 0.6.3",
  "dirs",
@@ -3216,6 +3219,7 @@ dependencies = [
  "codex-utils-rustls-provider",
  "codex-websocket-auth",
  "codex-websocket-client",
+ "codex-windows-sandbox-test-support",
  "ctor 0.6.3",
  "dirs",
  "futures",
@@ -3253,6 +3257,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "codex-file-system",
+ "codex-install-context",
  "codex-mxc-sandbox",
  "codex-network-proxy",
  "codex-protocol",
@@ -3817,6 +3822,7 @@ dependencies = [
  "jsonwebtoken",
  "keyring",
  "once_cell",
+ "opentelemetry_sdk",
  "os_info",
  "pretty_assertions",
  "rand 0.9.3",
@@ -4268,6 +4274,7 @@ dependencies = [
  "codex-utils-path-uri",
  "codex-utils-redacted-string",
  "codex-utils-string",
+ "derive_more 2.1.1",
  "encoding_rs",
  "gix-url",
  "globset",
@@ -4389,6 +4396,7 @@ dependencies = [
  "libc",
  "memchr",
  "oauth2",
+ "opentelemetry_sdk",
  "pretty_assertions",
  "rmcp",
  "serde",
@@ -5289,6 +5297,7 @@ dependencies = [
  "codex-utils-process",
  "codex-utils-pty",
  "codex-utils-string",
+ "codex-windows-sandbox-test-support",
  "dirs-next",
  "dunce",
  "glob",
@@ -5318,6 +5327,13 @@ dependencies = [
  "toml 0.9.11+spec-1.1.0",
  "windows 0.58.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "codex-windows-sandbox-test-support"
+version = "0.0.0"
+dependencies = [
+ "dirs",
 ]
 
 [[package]]

@@ -713,6 +713,9 @@
             "analytics_plan_history": {
               "type": "boolean"
             },
+            "api_key_cyber_access_programs": {
+              "type": "boolean"
+            },
             "api_key_model_discovery": {
               "type": "boolean"
             },
@@ -952,6 +955,9 @@
               "type": "boolean"
             },
             "local_thread_store_shared_compression": {
+              "type": "boolean"
+            },
+            "login_shell_package_path": {
               "type": "boolean"
             },
             "mcp_2026_07_28": {
@@ -6737,6 +6743,9 @@
         "analytics_plan_history": {
           "type": "boolean"
         },
+        "api_key_cyber_access_programs": {
+          "type": "boolean"
+        },
         "api_key_model_discovery": {
           "type": "boolean"
         },
@@ -6976,6 +6985,9 @@
           "type": "boolean"
         },
         "local_thread_store_shared_compression": {
+          "type": "boolean"
+        },
+        "login_shell_package_path": {
           "type": "boolean"
         },
         "mcp_2026_07_28": {
