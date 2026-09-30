@@ -619,7 +619,12 @@ async fn warm_plugins_and_skills_for_session_init(
     skills_service: Arc<HostSkillsService>,
     turn_environments: &TurnEnvironmentSnapshot,
     extensions: &codex_extension_api::ExtensionRegistry<Config>,
+    session_source: &SessionSource,
 ) -> Vec<SkillError> {
+    // Guardian does not consume skills, including the legacy empty-registry catalog.
+    if crate::guardian::is_basic_session_source(session_source) {
+        return Vec::new();
+    }
     let plugins_input = config.plugins_config_input();
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     if config.features.enabled(Feature::SkipHostSkillDiscovery)
@@ -1006,9 +1011,10 @@ impl Session {
         let mcp_auth = persistence_auth.clone();
         let thread_persistence_fut = async {
             if config.ephemeral {
-                Ok::<_, anyhow::Error>((None, LiveThreadInitGuard::new(/*live_thread*/ None)))
+                Ok::<_, anyhow::Error>((None, LiveThreadInitGuard::new(/*live_thread*/ None), None))
             } else {
                 let mut local_guard = LiveThreadInitGuard::default();
+                let mut resume_context = None;
                 let mut managed_guard = match &startup {
                     Some(startup) => Some(startup.persistence.lock().await),
                     None => None,
@@ -1077,6 +1083,7 @@ impl Session {
                     }
                     InitialHistory::Resumed(resumed_history) => {
                         let params = ResumeThreadParams {
+                            history_revision: resumed_history.history_revision.clone(),
                             thread_id: resumed_history.conversation_id,
                             rollout_path: resumed_history.rollout_path.clone(),
                             history: Some(resumed_history.history.clone()),
@@ -1091,16 +1098,23 @@ impl Session {
                                 },
                             },
                         };
-                        guard
-                            .acquire(LiveThread::resume(
-                                Arc::clone(&thread_store),
-                                session_configuration.history_mode,
-                                params,
-                            ))
-                            .await?
+                        let store = Arc::clone(&thread_store);
+                        let history_mode = session_configuration.history_mode;
+                        let (context_tx, context_rx) = tokio::sync::oneshot::channel();
+                        let live_thread = guard
+                            .acquire(async move {
+                                let (live_thread, history) =
+                                    LiveThread::resume(store, history_mode, params).await?;
+                                // Cancellation still leaves the writer with the acquisition guard.
+                                let _ = context_tx.send(history);
+                                Ok(live_thread)
+                            })
+                            .await?;
+                        resume_context = Some(context_rx.await?);
+                        live_thread
                     }
                 };
-                Ok((Some(live_thread), local_guard))
+                Ok((Some(live_thread), local_guard, resume_context))
             }
         }
         .instrument(info_span!(
@@ -1182,11 +1196,18 @@ impl Session {
         let (thread_persistence_result, state_db_ctx, (auth, mcp_projection)) =
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
 
-        let (live_thread, mut live_thread_init) = thread_persistence_result.map_err(|e| {
-            error!("failed to initialize thread persistence: {e:#}");
-            e
-        })?;
+        let (live_thread, mut live_thread_init, resume_context) = thread_persistence_result
+            .map_err(|e| {
+                error!("failed to initialize thread persistence: {e:#}");
+                e
+            })?;
         let session_result: anyhow::Result<Arc<Self>> = async {
+            if let InitialHistory::Resumed(resumed) = &mut initial_history
+                && let Some(history) = resume_context
+            {
+                resumed.history = history;
+                resumed.history_revision = None;
+            }
             let rollout_path = if let Some(live_thread) = live_thread.as_ref() {
                 live_thread.local_rollout_path().await?
             } else {
@@ -1282,6 +1303,7 @@ impl Session {
                 session_configuration.session_source.clone(),
             )
             .with_auth_env(auth_env_telemetry.to_otel_metadata())
+            .with_user_id(telemetry_auth.and_then(CodexAuth::get_chatgpt_user_id))
             .with_tool_result_log_config(config.otel.tool_result);
             if let Some(metrics) = thread_extension_data.get::<codex_otel::MetricsClient>() {
                 session_telemetry = session_telemetry.with_metrics(metrics.as_ref().clone());
@@ -1450,6 +1472,7 @@ impl Session {
                 Arc::clone(&skills_service),
                 &resolved_environments,
                 extensions.as_ref(),
+                &session_configuration.session_source,
             )
             .instrument(info_span!(
                 "session_init.plugin_skill_warmup",
@@ -1643,6 +1666,7 @@ impl Session {
             let session_extension_data =
                 codex_extension_api::ExtensionData::new(session_id.to_string());
             session_extension_data.insert(analytics_events_client.clone());
+            session_extension_data.insert(session_telemetry.clone());
             let mcp_resource_client = Arc::new(McpResourceClient::new(Arc::clone(&mcp_runtime)));
             let extension_metrics =
                 extension_metrics::from_session_telemetry(session_telemetry.clone());

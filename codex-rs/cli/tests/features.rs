@@ -218,7 +218,7 @@ async fn features_list_honors_cloud_managed_feature_requirements() -> Result<()>
     let chatgpt_base_url = format!("{}/backend-api", server.uri());
     let codex_home = TempDir::new()?;
     let user_config = format!(
-        "cli_auth_credentials_store = \"file\"\nchatgpt_base_url = \"{chatgpt_base_url}\"\n\n[features]\nfast_mode = true\n"
+        "cli_auth_credentials_store = \"file\"\nchatgpt_base_url = \"{chatgpt_base_url}\"\n\n[features]\nfast_mode = true\nin_app_voice = true\n"
     );
     std::fs::write(codex_home.path().join("config.toml"), &user_config)?;
 
@@ -258,7 +258,7 @@ async fn features_list_honors_cloud_managed_feature_requirements() -> Result<()>
                 "enterprise_managed": [{
                     "id": "managed-feature-requirements",
                     "name": "Managed feature requirements",
-                    "contents": "[features]\nfast_mode = false\n",
+                    "contents": "[features]\nfast_mode = false\nin_app_voice = false\n",
                 }],
             },
         })))
@@ -289,6 +289,14 @@ async fn features_list_honors_cloud_managed_feature_requirements() -> Result<()>
     assert_eq!(
         fast_mode.split_whitespace().collect::<Vec<_>>(),
         ["fast_mode", "stable", "false"]
+    );
+    let in_app_voice = stdout
+        .lines()
+        .find(|line| line.starts_with("in_app_voice "))
+        .context("feature list should include in_app_voice")?;
+    insta::assert_snapshot!(
+        in_app_voice.split_whitespace().collect::<Vec<_>>().join(" "),
+        @"in_app_voice stable false"
     );
     assert_eq!(
         std::fs::read_to_string(codex_home.path().join("config.toml"))?,
@@ -363,6 +371,8 @@ fn no_daemon_rejects_agents_and_explicit_remote_targets() -> Result<()> {
         "--no-daemon --remote ws://localhost:9999 agents",
         "--no-daemon --remote ws://localhost:9999",
         "--no-daemon --remote ws://localhost:9999 archive example",
+        "--no-daemon --remote ws://localhost:9999 unarchive example",
+        "--no-daemon --remote ws://localhost:9999 delete --force 123e4567-e89b-12d3-a456-426614174000",
         "--no-daemon --remote ws://localhost:9999 queue --thread example --message hello",
         "--remote ws://localhost:9999 resume --no-daemon --last",
         "--no-daemon fork --remote ws://localhost:9999 session-name",

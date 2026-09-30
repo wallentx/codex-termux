@@ -2484,6 +2484,7 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
@@ -3101,6 +3102,7 @@ async fn prepares_resumed_history_before_installing_it() {
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: ThreadId::default(),
             history: Arc::new(vec![RolloutItem::ResponseItem(ResponseItemEnvelope {
                 item: resumed_item,
@@ -3161,6 +3163,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
     assert_eq!(
         resolve_multi_agent_version(
             &InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
@@ -3172,6 +3175,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
     assert_eq!(
         resolve_multi_agent_version(
             &InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: thread_id,
                 history: Arc::new(Vec::new()),
                 rollout_path: None,
@@ -3183,6 +3187,7 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
     assert_eq!(
         resolve_multi_agent_version(
             &InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: thread_id,
                 history: Arc::new(vec![session_meta_item(
                     thread_id,
@@ -3248,6 +3253,7 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
@@ -3358,6 +3364,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: ThreadId::default(),
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
@@ -5869,6 +5876,7 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
             /*reference_context_item*/ None,
             /*world_state_baseline*/ None,
             CompactedHistoryMetadata {
+                input_goal_ids: Default::default(),
                 message: "summary".to_string(),
                 window_number,
                 window_ids,
@@ -6002,6 +6010,7 @@ async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore
             /*reference_context_item*/ None,
             /*world_state_baseline*/ None,
             CompactedHistoryMetadata {
+                input_goal_ids: Default::default(),
                 message: "summary".to_string(),
                 window_number,
                 window_ids,
@@ -6125,7 +6134,25 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
         thread_settings: session.thread_settings_snapshot().await,
     };
 
+    let mut first_live_history = None;
     for with_baselines in [true, false] {
+        let input_goal_ids =
+            crate::context::UserGoalUpdate::message_ids(session.clone_history().await.raw_items());
+        // The goal edit is accepted after the compaction input was captured.
+        let accepted_goal = if with_baselines {
+            session
+                .record_user_goal_update(crate::context::UserGoalUpdate::Clear)
+                .await
+                .expect("record concurrent clear");
+            session
+                .clone_history()
+                .await
+                .annotated_items()
+                .last()
+                .cloned()
+        } else {
+            None
+        };
         let (window_number, window_ids) = session.advance_auto_compact_window().await;
         session
             .replace_compacted_history(
@@ -6133,6 +6160,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
                 with_baselines.then_some(turn_context_baseline.clone()),
                 with_baselines.then_some(Arc::clone(&world_state)),
                 CompactedHistoryMetadata {
+                    input_goal_ids,
                     message: String::new(),
                     window_number,
                     window_ids,
@@ -6142,6 +6170,11 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
                 },
             )
             .await;
+        if let Some(accepted_goal) = accepted_goal {
+            let live_history = session.clone_history().await.annotated_items().to_vec();
+            assert_eq!(&live_history[1..], &[accepted_goal]);
+            first_live_history = Some(live_history);
+        }
     }
 
     session.flush_rollout().await.expect("flush checkpoints");
@@ -6163,6 +6196,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
     else {
         panic!("unexpected compaction records: {compaction_items:#?}");
     };
+    assert_eq!(first.replacement_history, first_live_history);
     assert_eq!(first.resume_metadata.as_ref(), Some(&expected));
     assert_eq!(second.resume_metadata.as_ref(), Some(&expected));
     assert_eq!(
@@ -7269,6 +7303,7 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
     let thread_id = ThreadId::new();
     let (session, rx_event) = make_session_with_history_source_and_agent_control_and_rx(
         InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: thread_id,
             history: Arc::new(Vec::new()),
             rollout_path: None,
@@ -7304,6 +7339,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
     });
     let (session, rx_event) = make_session_with_history_source_and_agent_control_and_rx(
         InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: thread_id,
             history: Arc::new(vec![RolloutItem::SessionMeta(SessionMetaLine {
                 meta: SessionMeta {
@@ -7365,6 +7401,7 @@ async fn resumed_copied_fork_ignores_source_history_base() {
     ];
     let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
         InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: None,
