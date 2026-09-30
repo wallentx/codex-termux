@@ -24,6 +24,7 @@ codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-state = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-file-lock = { workspace = true }
 codex-utils-path = { workspace = true }
 memchr = { workspace = true }
 regex = { workspace = true }
