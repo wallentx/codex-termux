@@ -112,6 +112,7 @@ members = [
     "v8-poc",
     "websocket-auth",
     "websocket-client",
+    "windows-sandbox-rs/tests/support",
     "windows-sandbox-service",
     "worktree",
     "workload-identity",
@@ -159,7 +160,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.161.0-alpha.2"
+version = "0.161.0-alpha.3"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -318,6 +319,7 @@ codex-user-verification = { path = "user-verification" }
 codex-v8-poc = { path = "v8-poc" }
 codex-workload-identity = { path = "workload-identity" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
+codex-windows-sandbox-test-support = { path = "windows-sandbox-rs/tests/support" }
 core_test_support = { path = "core/tests/common" }
 
 # External

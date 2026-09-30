@@ -91,6 +91,7 @@ use codex_models_manager::manager::SharedModelsManager;
 use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_network_proxy::normalize_host;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_otel::current_span_trace_id;
 use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
@@ -822,6 +823,7 @@ impl Session {
         );
         let service_tier =
             get_service_tier(config.service_tier.clone(), fast_mode_enabled, &model_info);
+        let storage_originator = AuthStorageOriginator::from_client_name(&originator);
         let session_configuration = SessionConfiguration {
             provider: create_model_provider(
                 config.model_provider.clone(),
@@ -930,11 +932,11 @@ impl Session {
 
         // This task will run until Op::Shutdown is received.
         let session_for_loop = Arc::clone(&session);
-        let session_loop_handle = tokio::spawn(async move {
+        let session_loop_handle = tokio::spawn(storage_originator.scope(async move {
             submission_loop(session_for_loop, configured_config, rx_sub)
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
                 .await;
-        });
+        }));
         let io = SessionIo {
             tx_sub,
             rx_event,
@@ -2319,6 +2321,7 @@ impl Session {
             return;
         };
 
+        let mut error_info = None;
         let status = match turn_context.terminal_error.lock().await.take() {
             Some(error) => {
                 let status = AgentStatus::Errored(error.message);
@@ -2326,10 +2329,21 @@ impl Session {
                 status
             }
             None => {
-                let Some(status) = agent_status_from_event(msg) else {
-                    return;
-                };
-                status
+                if let EventMsg::TurnAborted(event) = msg
+                    && event.reason == TurnAbortReason::Interrupted
+                    && let Some(error) = &event.error
+                    && error.codex_error_info == Some(CodexErrorInfo::TooManyDenials)
+                {
+                    // Report the safety stop to the parent without changing the child's
+                    // interrupted status or notifying for ordinary interruptions.
+                    error_info = error.codex_error_info.clone();
+                    AgentStatus::Errored(error.message.clone())
+                } else {
+                    let Some(status) = agent_status_from_event(msg) else {
+                        return;
+                    };
+                    status
+                }
             }
         };
         if !is_final(&status) {
@@ -2349,6 +2363,7 @@ impl Session {
                         .initiating_agent_path()
                         .cloned(),
                     status,
+                    error_info,
                 },
                 &self.services.rollout_thread_trace,
             )
@@ -3378,7 +3393,7 @@ impl Session {
         items
     }
 
-    fn assign_missing_response_item_id(item: &mut ResponseItem) {
+    pub(crate) fn assign_missing_response_item_id(item: &mut ResponseItem) {
         if item.id().is_some_and(|id| !id.is_empty()) {
             return;
         }

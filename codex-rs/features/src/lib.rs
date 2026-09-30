@@ -96,6 +96,8 @@ pub enum Feature {
     AnalyticsPlanHistory,
     /// Discover model catalogs for OpenAI API-key authentication.
     ApiKeyModelDiscovery,
+    /// Forward explicit programs with builtin OpenAI API keys.
+    ApiKeyCyberAccessPrograms,
     /// Deprecated no-op; use `tui.fullscreen_transcript` instead.
     TranscriptV2,
     // Stable.
@@ -168,6 +170,8 @@ pub enum Feature {
     UseLegacyLandlock,
     /// Experimental shell snapshotting.
     ShellSnapshot,
+    /// Restore bundled tools to PATH after Codex's login shell starts.
+    LoginShellPackagePath,
     /// Expose the selected PowerShell execution host's bounded major/minor version.
     PowerShellShellVersion,
     /// Keep policy-filtered shell snapshots entirely in executor memory.
@@ -1019,6 +1023,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::LoginShellPackagePath,
+        key: "login_shell_package_path",
+        stage: Stage::Experimental {
+            name: "Bundled tools in login shells",
+            menu_description: "Keep bundled tools such as ripgrep available when login shell startup resets PATH.",
+            announcement: "",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::PowerShellShellVersion,
         key: "powershell_shell_version",
         stage: Stage::UnderDevelopment,
@@ -1286,6 +1300,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::ApiKeyModelDiscovery,
         key: "api_key_model_discovery",
         stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ApiKeyCyberAccessPrograms,
+        key: "api_key_cyber_access_programs",
+        stage: Stage::Stable,
         default_enabled: false,
     },
     FeatureSpec {
