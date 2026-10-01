@@ -603,6 +603,7 @@ fn image_generation_call_renders_saved_path() {
 
 fn session_configured_event(model: &str) -> ThreadSessionState {
     ThreadSessionState {
+        daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
@@ -915,9 +916,17 @@ fn cyber_policy_error_event_astra_snapshot() {
 }
 
 #[test]
-fn cyber_policy_error_event_limited_snapshot() {
-    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Limited);
-    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+fn cyber_policy_error_event_available_snapshot() {
+    let rendered = [
+        crate::daybreak::Notice::Disabled,
+        crate::daybreak::Notice::Enabled,
+    ]
+    .into_iter()
+    .map(|notice| {
+        render_lines(&new_cyber_policy_error_event(notice).display_lines(/*width*/ 80)).join("\n")
+    })
+    .collect::<Vec<_>>()
+    .join("\n\n");
     insta::assert_snapshot!(rendered);
 }
 
@@ -1521,7 +1530,7 @@ fn code_mode_tool_call_uses_title_and_preserves_full_transcript() {
       └ 012345678901234567890123456789012345
         678901234567890123456789012345678901
         234567890123456789012345678901234567
-        +1 line (ctrl+t to view transcript)
+        +1 line (⌃t to view transcript)
 
     transcript:
     • Called node_repl.js({"title":"Inspect Spotify workspace","code":"await tools.exec_command({ cmd: 'git status' })"})
