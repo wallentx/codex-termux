@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -15,6 +17,8 @@ use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::ServerResponse;
+use codex_diagnostics::Gauge;
+use codex_diagnostics::GaugeGuard;
 use codex_otel::span_w3c_trace_context;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::W3cTraceContext;
@@ -39,6 +43,16 @@ use codex_protocol::account::PlanType;
 
 pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorError>;
 
+static IN_FLIGHT_REQUESTS: Gauge = Gauge::new("app.requests.in_flight");
+static PENDING_SERVER_REQUESTS: Gauge = Gauge::new("app.server_requests.pending");
+
+#[path = "account_notifications.rs"]
+mod account_notifications;
+pub(crate) use account_notifications::AccountNotification;
+
+#[path = "user_verification_auth.rs"]
+mod user_verification_auth;
+
 /// Stable identifier for a client request scoped to a transport connection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ConnectionRequestId {
@@ -46,25 +60,43 @@ pub(crate) struct ConnectionRequestId {
     pub(crate) request_id: RequestId,
 }
 
-/// Trace data we keep for an incoming request until we send its final
-/// response or error.
+/// Trace data and cancellation state retained until an incoming request's final response or error.
 #[derive(Clone)]
 pub(crate) struct RequestContext {
     request_id: ConnectionRequestId,
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
+    cancellation_scope: RequestCancellationScope,
     span: Span,
     parent_trace: Option<W3cTraceContext>,
+    _diagnostics_guard: Arc<GaugeGuard>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestCancellationScope {
+    Unavailable,
+    UserVerification,
 }
 
 impl RequestContext {
     pub(crate) fn new(
         request_id: ConnectionRequestId,
+        method: &str,
         span: Span,
         parent_trace: Option<W3cTraceContext>,
     ) -> Self {
         Self {
             request_id,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            cancellation_scope: match method {
+                "userVerification/status"
+                | "userVerification/enroll"
+                | "userVerification/delete"
+                | "userVerification/verify" => RequestCancellationScope::UserVerification,
+                _ => RequestCancellationScope::Unavailable,
+            },
             span,
             parent_trace,
+            _diagnostics_guard: Arc::new(IN_FLIGHT_REQUESTS.track()),
         }
     }
 
@@ -95,6 +127,8 @@ pub(crate) enum OutgoingEnvelope {
 
 /// Sends messages to the client and manages request callbacks.
 pub(crate) struct OutgoingMessageSender {
+    verification_auth: OnceLock<Arc<codex_login::AuthManager>>,
+    verification_connections: Mutex<HashSet<ConnectionId>>,
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
@@ -113,9 +147,13 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
 }
 
 struct PendingCallbackEntry {
+    verification_owner: Option<ConnectionId>,
+    verification_auth_revision: Option<u64>,
+    verification_identity: Option<user_verification_auth::Identity>,
     callback: oneshot::Sender<ClientRequestResult>,
     thread_id: Option<ThreadId>,
     request: ServerRequest,
+    _diagnostics_guard: GaugeGuard,
 }
 
 impl ThreadScopedOutgoingMessageSender {
@@ -161,7 +199,7 @@ impl ThreadScopedOutgoingMessageSender {
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
         self.outgoing
             .analytics_events_client
-            .track_notification(notification.clone());
+            .track_notification(&notification);
         if self.connection_ids.is_empty() {
             return;
         }
@@ -197,14 +235,6 @@ impl ThreadScopedOutgoingMessageSender {
     {
         self.outgoing.send_response(request_id, response).await;
     }
-
-    pub(crate) async fn send_error(
-        &self,
-        request_id: ConnectionRequestId,
-        error: impl Into<JSONRPCErrorError>,
-    ) {
-        self.outgoing.send_error(request_id, error).await;
-    }
 }
 
 impl OutgoingMessageSender {
@@ -213,6 +243,8 @@ impl OutgoingMessageSender {
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         Self {
+            verification_auth: OnceLock::new(),
+            verification_connections: Mutex::new(HashSet::new()),
             next_server_request_id: AtomicI64::new(0),
             sender,
             request_id_to_callback: Mutex::new(HashMap::new()),
@@ -231,7 +263,18 @@ impl OutgoingMessageSender {
         }
     }
 
+    pub(crate) async fn cancel_user_verification_request(&self, request_id: &ConnectionRequestId) {
+        let contexts = self.request_contexts.lock().await;
+        if let Some(context) = contexts.get(request_id)
+            && context.cancellation_scope == RequestCancellationScope::UserVerification
+        {
+            context.cancellation.cancel();
+        }
+    }
+
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+        self.disconnect_user_verification_connection(connection_id)
+            .await;
         let mut request_contexts = self.request_contexts.lock().await;
         request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
     }
@@ -293,18 +336,68 @@ impl OutgoingMessageSender {
         let id = self.next_request_id();
         let outgoing_message_id = id.clone();
         let request = request.request_with_id(outgoing_message_id.clone());
-
+        let user_verification = matches!(
+            &request,
+            ServerRequest::McpServerElicitationRequest { params, .. }
+                if matches!(&params.request, codex_app_server_protocol::McpServerElicitationRequest::UserVerification { .. })
+        );
+        // Snapshot before waiting on eligibility or callback locks. A request cannot inherit
+        // whichever account happens to be current after an unrelated operation releases a lock.
+        let verification_auth_revision = user_verification
+            .then(|| self.verification_auth_revision())
+            .flatten();
+        let verification_identity = user_verification
+            .then(|| self.verification_identity())
+            .flatten();
+        let auth_changed = || {
+            user_verification
+                && (verification_auth_revision != self.verification_auth_revision()
+                    || verification_identity != self.verification_identity())
+        };
         let (tx_approve, rx_approve) = oneshot::channel();
+        // One app owns this ceremony. Reconnect and other subscribers cannot answer it.
+        let verification_owner = if user_verification {
+            let eligible = self.verification_connections.lock().await;
+            connection_ids
+                .and_then(|ids| ids.iter().find(|id| eligible.contains(*id)))
+                .copied()
+        } else {
+            None
+        };
+        if user_verification && (verification_owner.is_none() || auth_changed()) {
+            return (outgoing_message_id, rx_approve);
+        }
+        let connection_ids = if user_verification {
+            verification_owner.as_ref().map(std::slice::from_ref)
+        } else {
+            connection_ids
+        };
         {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
             request_id_to_callback.insert(
                 id,
                 PendingCallbackEntry {
+                    verification_owner,
+                    verification_auth_revision,
+                    verification_identity: verification_identity.clone(),
                     callback: tx_approve,
                     thread_id,
                     request: request.clone(),
+                    _diagnostics_guard: PENDING_SERVER_REQUESTS.track(),
                 },
             );
+        }
+        // Disconnect may finish its callback cleanup before registration acquires the lock.
+        // Recheck afterward so that ordering cannot leave an orphaned verification callback.
+        if let Some(owner) = verification_owner {
+            let eligible = self.verification_connections.lock().await.contains(&owner);
+            if !eligible || auth_changed() {
+                self.request_id_to_callback
+                    .lock()
+                    .await
+                    .remove(&outgoing_message_id);
+                return (outgoing_message_id, rx_approve);
+            }
         }
 
         let outgoing_message = OutgoingMessage::Request(request.clone());
@@ -371,20 +464,28 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn notify_client_response(&self, id: RequestId, result: Result) {
-        let entry = self.take_request_callback(&id).await;
+    pub(crate) async fn notify_client_response(
+        &self,
+        connection_id: ConnectionId,
+        id: RequestId,
+        result: Result,
+    ) {
+        let entry = self.take_connection_callback(connection_id, &id).await;
 
         match entry {
             Some((id, entry)) => {
                 let completed_at_ms = now_unix_timestamp_ms();
-                if let Ok(response) = entry.request.response_from_result(result.clone())
-                    && !matches!(response, ServerResponse::PermissionsRequestApproval { .. })
+                if entry.verification_owner.is_none()
+                    && let Ok(response) = entry.request.response_from_result(result.clone())
                 {
-                    self.analytics_events_client
-                        .track_server_response(completed_at_ms, response);
+                    tracing::info!("<- response: {response:?}");
+                    if !matches!(response, ServerResponse::PermissionsRequestApproval { .. }) {
+                        self.analytics_events_client
+                            .track_server_response(completed_at_ms, response);
+                    }
                 }
-                if let Err(err) = entry.callback.send(Ok(result)) {
-                    warn!("could not notify callback for {id:?} due to: {err:?}");
+                if entry.callback.send(Ok(result)).is_err() {
+                    warn!("could not notify callback for {id:?}: receiver dropped");
                 }
             }
             None => {
@@ -393,16 +494,22 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn notify_client_error(&self, id: RequestId, error: JSONRPCErrorError) {
-        let entry = self.take_request_callback(&id).await;
+    pub(crate) async fn notify_client_error(
+        &self,
+        connection_id: ConnectionId,
+        id: RequestId,
+        error: JSONRPCErrorError,
+    ) {
+        let entry = self.take_connection_callback(connection_id, &id).await;
 
         match entry {
             Some((id, entry)) => {
-                warn!("client responded with error for {id:?}: {error:?}");
+                // Don't log error messages or data because they may contain credentials.
+                warn!(code = error.code, "client responded with error for {id:?}");
                 self.analytics_events_client
                     .track_server_request_aborted(now_unix_timestamp_ms(), id.clone());
-                if let Err(err) = entry.callback.send(Err(error)) {
-                    warn!("could not notify callback for {id:?} due to: {err:?}");
+                if entry.callback.send(Err(error)).is_err() {
+                    warn!("could not notify callback for {id:?}: receiver dropped");
                 }
             }
             None => {
@@ -435,10 +542,10 @@ impl OutgoingMessageSender {
             self.analytics_events_client
                 .track_server_request_aborted(now_unix_timestamp_ms(), entry.request.id().clone());
             if let Some(error) = error.as_ref()
-                && let Err(err) = entry.callback.send(Err(error.clone()))
+                && entry.callback.send(Err(error.clone())).is_err()
             {
                 let request_id = entry.request.id();
-                warn!("could not notify callback for {request_id:?} due to: {err:?}");
+                warn!("could not notify callback for {request_id:?}: receiver dropped");
             }
         }
     }
@@ -451,6 +558,27 @@ impl OutgoingMessageSender {
         request_id_to_callback.remove_entry(id)
     }
 
+    async fn take_connection_callback(
+        &self,
+        connection_id: ConnectionId,
+        id: &RequestId,
+    ) -> Option<(RequestId, PendingCallbackEntry)> {
+        let mut callbacks = self.request_id_to_callback.lock().await;
+        let entry = callbacks.get(id)?;
+        if let Some(owner) = entry.verification_owner {
+            if owner != connection_id {
+                return None;
+            }
+            if entry.verification_identity != self.verification_identity()
+                || entry.verification_auth_revision != self.verification_auth_revision()
+            {
+                callbacks.remove(id);
+                return None;
+            }
+        }
+        callbacks.remove_entry(id)
+    }
+
     pub(crate) async fn pending_requests_for_thread(
         &self,
         thread_id: ThreadId,
@@ -459,7 +587,8 @@ impl OutgoingMessageSender {
         let mut requests = request_id_to_callback
             .values()
             .filter_map(|entry| {
-                (entry.thread_id == Some(thread_id)).then_some(entry.request.clone())
+                (entry.thread_id == Some(thread_id) && entry.verification_owner.is_none())
+                    .then_some(entry.request.clone())
             })
             .collect::<Vec<_>>();
         requests.sort_by(|left, right| left.id().cmp(right.id()));
@@ -493,10 +622,10 @@ impl OutgoingMessageSender {
             self.analytics_events_client
                 .track_server_request_aborted(now_unix_timestamp_ms(), entry.request.id().clone());
             if let Some(error) = error.as_ref()
-                && let Err(err) = entry.callback.send(Err(error.clone()))
+                && entry.callback.send(Err(error.clone())).is_err()
             {
                 let request_id = entry.request.id();
-                warn!("could not notify callback for {request_id:?} due to: {err:?}",);
+                warn!("could not notify callback for {request_id:?}: receiver dropped");
             }
         }
     }
@@ -530,6 +659,44 @@ impl OutgoingMessageSender {
             .await;
     }
 
+    /// Revalidates a sensitive result after reserving queue capacity, with no
+    /// suspension between the identity check and handing off the response.
+    pub(crate) async fn send_response_as_checked(
+        &self,
+        request_id: ConnectionRequestId,
+        response: ClientResponsePayload,
+        check: impl FnOnce() -> std::result::Result<(), JSONRPCErrorError>,
+    ) {
+        // Remain cancellable while waiting to deliver a proof, including after native work ends.
+        let permit = self.sender.reserve().await;
+        let _context = self.take_request_context(&request_id).await;
+        let Ok(permit) = permit else {
+            return;
+        };
+        let message = match check() {
+            Ok(()) => {
+                self.analytics_events_client.track_response(
+                    request_id.connection_id.0,
+                    request_id.request_id.clone(),
+                    &response,
+                );
+                OutgoingMessage::Response(OutgoingResponse {
+                    id: request_id.request_id,
+                    result: Box::new(response),
+                })
+            }
+            Err(error) => OutgoingMessage::Error(OutgoingError {
+                id: request_id.request_id,
+                error,
+            }),
+        };
+        permit.send(OutgoingEnvelope::ToConnection {
+            connection_id: request_id.connection_id,
+            message,
+            write_complete_tx: None,
+        });
+    }
+
     async fn send_response_as_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -538,58 +705,57 @@ impl OutgoingMessageSender {
     ) {
         let connection_id = request_id.connection_id;
         let request_id_for_analytics = request_id.request_id.clone();
-        let serialized_response = response
-            .into_jsonrpc_parts_and_payload(request_id.request_id.clone())
-            .map(|(id, result, response)| {
-                if let Some(response) = response {
-                    match thread_originator {
-                        Some(thread_originator) => {
-                            self.analytics_events_client
-                                .track_response_with_thread_originator(
-                                    connection_id.0,
-                                    request_id_for_analytics,
-                                    response,
-                                    thread_originator,
-                                );
-                        }
-                        None => {
-                            self.analytics_events_client.track_response(
-                                connection_id.0,
-                                request_id_for_analytics,
-                                response,
-                            );
-                        }
-                    }
-                }
-                (id, result)
-            });
-        let request_context = self.take_request_context(&request_id).await;
-
-        match serialized_response {
-            Ok((id, result)) => {
-                let outgoing_message = OutgoingMessage::Response(OutgoingResponse { id, result });
-                self.send_outgoing_message_to_connection(
-                    request_context,
-                    connection_id,
-                    outgoing_message,
-                    "response",
-                )
-                .await;
+        match thread_originator {
+            Some(thread_originator) => {
+                self.analytics_events_client
+                    .track_response_with_thread_originator(
+                        connection_id.0,
+                        request_id_for_analytics,
+                        &response,
+                        thread_originator,
+                    );
             }
-            Err(err) => {
-                self.send_error_inner(
-                    request_context,
-                    request_id,
-                    internal_error(format!("failed to serialize response: {err}")),
-                )
-                .await;
+            None => {
+                self.analytics_events_client.track_response(
+                    connection_id.0,
+                    request_id_for_analytics,
+                    &response,
+                );
             }
         }
+        let response = Box::new(response);
+        let request_context = self.take_request_context(&request_id).await;
+        let outgoing_message = OutgoingMessage::Response(OutgoingResponse {
+            id: request_id.request_id,
+            result: response,
+        });
+        self.send_outgoing_message_to_connection(
+            request_context,
+            connection_id,
+            outgoing_message,
+            "response",
+        )
+        .await;
     }
 
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
+        if matches!(
+            notification,
+            ServerNotification::ThreadArchived(_) | ServerNotification::ThreadUnarchived(_)
+        ) {
+            self.analytics_events_client
+                .track_notification(&notification);
+        }
         self.send_server_notification_to_connections(&[], notification)
             .await;
+    }
+
+    pub(crate) fn try_send_server_notification(&self, notification: ServerNotification) {
+        if let Err(error) = self.sender.try_send(OutgoingEnvelope::Broadcast {
+            message: timestamped_server_notification(notification),
+        }) {
+            warn!("failed to queue server notification to clients: {error}");
+        }
     }
 
     pub(crate) async fn send_server_notification_to_connections(
@@ -633,7 +799,7 @@ impl OutgoingMessageSender {
         &self,
         connection_id: ConnectionId,
         notification: ServerNotification,
-    ) {
+    ) -> bool {
         tracing::trace!("app-server event: {notification}");
         let outgoing_message = timestamped_server_notification(notification);
         let (write_complete_tx, write_complete_rx) = oneshot::channel();
@@ -648,7 +814,7 @@ impl OutgoingMessageSender {
         {
             warn!("failed to send server notification to client: {err:?}");
         }
-        let _ = write_complete_rx.await;
+        write_complete_rx.await.is_ok()
     }
 
     pub(crate) async fn send_error(
@@ -737,6 +903,14 @@ fn timestamped_server_notification(notification: ServerNotification) -> Outgoing
 }
 
 #[cfg(test)]
+#[path = "user_verification_ownership_tests.rs"]
+mod user_verification_ownership_tests;
+
+#[cfg(test)]
+#[path = "user_verification_cancel_context_tests.rs"]
+mod user_verification_cancel_context_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
@@ -776,6 +950,7 @@ mod tests {
                 login_id: Some(Uuid::nil().to_string()),
                 success: true,
                 error: None,
+                onboarding_entrypoint: None,
             });
 
         let jsonrpc_notification =
@@ -790,6 +965,7 @@ mod tests {
                     "loginId": Uuid::nil().to_string(),
                     "success": true,
                     "error": null,
+                    "onboardingEntrypoint": null,
                 },
                 "emittedAtMs": 1_234,
             }),
@@ -806,6 +982,7 @@ mod tests {
                 login_id: Some(Uuid::nil().to_string()),
                 success: true,
                 error: None,
+                onboarding_entrypoint: None,
             });
 
         assert_eq!(
@@ -815,6 +992,7 @@ mod tests {
                     "loginId": Uuid::nil().to_string(),
                     "success": true,
                     "error": null,
+                    "onboardingEntrypoint": null,
                 },
             }),
             serde_json::to_value(notification)
@@ -830,6 +1008,7 @@ mod tests {
                 rate_limits: RateLimitSnapshot {
                     limit_id: Some("codex".to_string()),
                     limit_name: None,
+                    normal_model_slug: None,
                     primary: Some(RateLimitWindow {
                         used_percent: 25,
                         window_duration_mins: Some(15),
@@ -839,7 +1018,7 @@ mod tests {
                     credits: None,
                     individual_limit: None,
                     spend_control_reached: None,
-                    plan_type: Some(PlanType::Plus),
+                    plan_type: Some(PlanType::SelfServeBusinessProLite),
                     rate_limit_reached_type: None,
                 },
             });
@@ -851,6 +1030,7 @@ mod tests {
                         "rateLimits": {
                         "limitId": "codex",
                         "limitName": null,
+                        "normalModelSlug": null,
                         "primary": {
                             "usedPercent": 25,
                             "windowDurationMins": 15,
@@ -860,7 +1040,7 @@ mod tests {
                         "credits": null,
                         "individualLimit": null,
                         "spendControlReached": null,
-                        "planType": "plus",
+                        "planType": "self_serve_business_prolite",
                         "rateLimitReachedType": null
                     }
                 },
@@ -874,16 +1054,16 @@ mod tests {
     #[test]
     fn verify_account_updated_notification_serialization() {
         let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {
-            auth_mode: Some(AuthMode::ApiKey),
-            plan_type: None,
+            auth_mode: Some(AuthMode::Chatgpt),
+            plan_type: Some(PlanType::SelfServeBusinessProLite),
         });
 
         assert_eq!(
             json!({
                 "method": "account/updated",
                 "params": {
-                    "authMode": "apikey",
-                    "planType": null
+                    "authMode": "chatgpt",
+                    "planType": "self_serve_business_prolite"
                 },
             }),
             serde_json::to_value(notification)
@@ -1015,6 +1195,7 @@ mod tests {
         let request = ServerRequest::CommandExecutionRequestApproval {
             request_id: RequestId::Integer(7),
             params: CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item_id: "item-1".to_string(),
@@ -1087,7 +1268,10 @@ mod tests {
                     panic!("expected response message");
                 };
                 assert_eq!(response.id, request_id.request_id);
-                assert_eq!(response.result, json!({}));
+                assert_eq!(
+                    serde_json::to_value(response.result).expect("result should serialize"),
+                    json!({})
+                );
             }
             other => panic!("expected targeted response envelope, got: {other:?}"),
         }
@@ -1106,6 +1290,7 @@ mod tests {
         outgoing
             .register_request_context(RequestContext::new(
                 request_id.clone(),
+                "thread/start",
                 tracing::info_span!("app_server.request", rpc.method = "thread/start"),
                 /*parent_trace*/ None,
             ))
@@ -1265,6 +1450,7 @@ mod tests {
         outgoing
             .register_request_context(RequestContext::new(
                 closed_connection_request,
+                "turn/interrupt",
                 tracing::info_span!("app_server.request", rpc.method = "turn/interrupt"),
                 /*parent_trace*/ None,
             ))
@@ -1272,6 +1458,7 @@ mod tests {
         outgoing
             .register_request_context(RequestContext::new(
                 open_connection_request,
+                "turn/start",
                 tracing::info_span!("app_server.request", rpc.method = "turn/start"),
                 /*parent_trace*/ None,
             ))
@@ -1304,7 +1491,7 @@ mod tests {
         let error = internal_error("refresh failed");
 
         outgoing
-            .notify_client_error(request_id, error.clone())
+            .notify_client_error(ConnectionId(1), request_id, error.clone())
             .await;
 
         let result = timeout(Duration::from_secs(1), wait_for_result)
@@ -1347,6 +1534,7 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
                     auto_resolution_ms: None,
                 },
             ))
@@ -1410,6 +1598,7 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
                     auto_resolution_ms: None,
                 },
             ))

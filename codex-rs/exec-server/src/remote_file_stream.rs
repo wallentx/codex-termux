@@ -11,6 +11,7 @@ use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
 use crate::protocol::FS_READ_BLOCK_METHOD;
 use crate::protocol::FsCloseParams;
+use crate::protocol::FsOpenMode;
 use crate::protocol::FsOpenParams;
 use crate::protocol::FsReadBlockParams;
 
@@ -24,7 +25,7 @@ struct FileReadRegistration {
 pub(super) async fn open(
     client: ExecServerClient,
     path: PathUri,
-    sandbox: Option<FileSystemSandboxContext>,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> FileSystemResult<FileSystemReadStream> {
     let registration = FileReadRegistration {
         client,
@@ -37,7 +38,8 @@ pub(super) async fn open(
         .fs_open(FsOpenParams {
             handle_id: registration.handle_id.clone(),
             path,
-            sandbox,
+            mode: FsOpenMode::Read,
+            sandbox: sandbox.cloned(),
         })
         .await
         .map_err(map_remote_error)?;

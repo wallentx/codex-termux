@@ -1,8 +1,8 @@
 #![allow(warnings, clippy::all)]
 
 use super::*;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use crate::RolloutItem;
+use crate::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -20,26 +20,39 @@ fn write_index(path: &Path, lines: &[SessionIndexEntry]) -> std::io::Result<()> 
 }
 
 fn write_rollout_with_metadata(path: &Path, thread_id: ThreadId) -> std::io::Result<()> {
+    write_rollout_with_source_and_provider(path, thread_id, SessionSource::Cli, "test-provider")
+}
+
+fn write_rollout_with_source_and_provider(
+    path: &Path,
+    thread_id: ThreadId,
+    source: SessionSource,
+    model_provider: &str,
+) -> std::io::Result<()> {
     let timestamp = "2024-01-01T00-00-00Z".to_string();
     let line = RolloutLine {
         timestamp: timestamp.clone(),
         ordinal: None,
         item: RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                creator_user_id: None,
+                creator_account_id: None,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
+                forked_from_ordinal_exclusive: None,
                 parent_thread_id: None,
                 timestamp,
                 cwd: ".".into(),
+                runtime_workspace_roots: None,
                 originator: "test_originator".into(),
                 cli_version: "test_version".into(),
-                source: SessionSource::Cli,
+                source,
                 thread_source: None,
                 agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
-                model_provider: Some("test-provider".into()),
+                model_provider: Some(model_provider.to_string()),
                 base_instructions: None,
                 dynamic_tools: None,
                 selected_capability_roots: Vec::new(),
@@ -190,6 +203,78 @@ async fn find_thread_meta_by_name_str_ignores_historical_name_after_rename() -> 
     Ok(())
 }
 
+#[tokio::test]
+async fn find_thread_meta_candidates_filter_metadata_before_ranking() -> std::io::Result<()> {
+    let temp = TempDir::new()?;
+    let index_path = session_index_path(temp.path());
+    let allowed_id = ThreadId::new();
+    let other_id = ThreadId::new();
+    let noninteractive_id = ThreadId::new();
+    let rollout_dir = temp.path().join("sessions/2024/01/01");
+    let allowed_path = rollout_dir.join(format!("rollout-2024-01-01T00-00-00-{allowed_id}.jsonl"));
+    let other_path = rollout_dir.join(format!("rollout-2024-01-01T00-00-01-{other_id}.jsonl"));
+    let noninteractive_path = rollout_dir.join(format!(
+        "rollout-2024-01-01T00-00-02-{noninteractive_id}.jsonl"
+    ));
+    std::fs::create_dir_all(&rollout_dir)?;
+    write_rollout_with_metadata(&allowed_path, allowed_id)?;
+    write_rollout_with_source_and_provider(
+        &other_path,
+        other_id,
+        SessionSource::Cli,
+        "other-provider",
+    )?;
+    write_rollout_with_source_and_provider(
+        &noninteractive_path,
+        noninteractive_id,
+        SessionSource::Exec,
+        "test-provider",
+    )?;
+    write_index(
+        &index_path,
+        &[
+            SessionIndexEntry {
+                id: allowed_id,
+                thread_name: "same".to_string(),
+                updated_at: "2024-01-01T00:00:00Z".to_string(),
+            },
+            SessionIndexEntry {
+                id: other_id,
+                thread_name: "same".to_string(),
+                updated_at: "2024-01-02T00:00:00Z".to_string(),
+            },
+            SessionIndexEntry {
+                id: noninteractive_id,
+                thread_name: "same".to_string(),
+                updated_at: "2024-01-03T00:00:00Z".to_string(),
+            },
+        ],
+    )?;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&allowed_path)?
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))?;
+    let allowed_model_providers = vec!["test-provider".to_string()];
+
+    let found = find_thread_meta_candidates_by_name_str(
+        temp.path(),
+        "same",
+        /*state_db_ctx*/ None,
+        &[SessionSource::Cli],
+        &allowed_model_providers,
+    )
+    .await?;
+
+    assert_eq!(
+        found
+            .into_iter()
+            .map(|(path, session_meta)| (path, session_meta.meta.id))
+            .collect::<Vec<_>>(),
+        vec![(allowed_path, allowed_id)],
+    );
+    Ok(())
+}
+
 #[test]
 fn find_thread_name_by_id_prefers_latest_entry() -> std::io::Result<()> {
     let temp = TempDir::new()?;
@@ -307,6 +392,163 @@ async fn find_thread_names_by_ids_prefers_latest_entry() -> std::io::Result<()> 
     let found = find_thread_names_by_ids(temp.path(), &ids).await?;
     assert_eq!(found, expected);
     Ok(())
+}
+
+#[tokio::test]
+async fn find_thread_names_by_ids_skips_unusable_names_and_reads_across_chunks()
+-> std::io::Result<()> {
+    let temp = TempDir::new()?;
+    let path = session_index_path(temp.path());
+    let renamed = ThreadId::new();
+    let older = ThreadId::new();
+    let missing = ThreadId::new();
+    let mut contents = String::new();
+    for (id, thread_name) in [
+        (renamed, "original".to_string()),
+        (older, "  older name  ".to_string()),
+        (ThreadId::new(), "unrelated".repeat(/*n*/ 10_000)),
+        (renamed, "  最新 café  ".to_string()),
+        (renamed, " \t ".to_string()),
+    ] {
+        let entry = SessionIndexEntry {
+            id,
+            thread_name,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        contents.push_str(&serde_json::to_string(&entry)?);
+        contents.push_str("\n\nnot json\n");
+    }
+    // A partial final write must not hide the latest complete name.
+    contents.push_str("{\"id\":");
+    std::fs::write(path, contents)?;
+
+    for (ids, expected) in [
+        (
+            HashSet::from([renamed]),
+            HashMap::from([(renamed, "最新 café".to_string())]),
+        ),
+        (
+            HashSet::from([renamed, older]),
+            HashMap::from([
+                (renamed, "最新 café".to_string()),
+                (older, "older name".to_string()),
+            ]),
+        ),
+        (
+            HashSet::from([renamed, older, missing]),
+            HashMap::from([
+                (renamed, "最新 café".to_string()),
+                (older, "older name".to_string()),
+            ]),
+        ),
+    ] {
+        assert_eq!(find_thread_names_by_ids(temp.path(), &ids).await?, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn removal_preserves_other_names_and_malformed_lines() -> std::io::Result<()> {
+    let temp = TempDir::new()?;
+    let removed_id = ThreadId::new();
+    let kept_id = ThreadId::new();
+    append_thread_name(temp.path(), removed_id, "old").await?;
+    append_thread_name(temp.path(), removed_id, "new").await?;
+    append_thread_name(temp.path(), kept_id, "kept").await?;
+    let path = session_index_path(temp.path());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)?
+        .write_all(b"malformed\n")?;
+
+    remove_thread_name_entries(temp.path(), removed_id).await?;
+
+    assert_eq!(
+        find_thread_names_by_ids(temp.path(), &HashSet::from([removed_id, kept_id])).await?,
+        HashMap::from([(kept_id, "kept".to_string())]),
+    );
+    assert!(
+        std::fs::read_to_string(path)?
+            .lines()
+            .any(|line| line == "malformed")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_index_update_holds_lock_until_worker_finishes() -> std::io::Result<()> {
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let update = tokio::spawn(with_session_index_lock(&SESSION_INDEX_LOCK, move || {
+        let _ = reached_tx.send(());
+        // Dropping the sender on a test failure also releases the blocking worker.
+        let _ = resume_rx.recv();
+        Ok(())
+    }));
+    reached_rx.await.unwrap();
+    update.abort();
+    assert!(update.await.unwrap_err().is_cancelled());
+
+    let lock_is_held = SESSION_INDEX_LOCK.try_lock().is_err();
+    resume_tx.send(()).unwrap();
+    with_session_index_lock(&SESSION_INDEX_LOCK, || Ok(())).await?;
+    assert!(
+        lock_is_held,
+        "cancellation released the running worker's lock"
+    );
+    Ok(())
+}
+
+#[test]
+fn cancelled_queued_index_update_preserves_the_next_write() -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?;
+    runtime.block_on(async {
+        let home = TempDir::new()?;
+        let path = home.path().join("thread-name");
+        // A private lock ensures shared-process test runners cannot supply another owner's guard.
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = reached_tx.send(());
+            // Dropping the sender on a failure also lets runtime teardown finish.
+            let _ = resume_rx.recv();
+        });
+        reached_rx.await.unwrap();
+
+        let queued_path = path.clone();
+        let mut update = Box::pin(with_session_index_lock(&lock, move || {
+            std::fs::write(queued_path, "obsolete")
+        }));
+        let state = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(update.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            state.is_pending(),
+            "the blocking pool should hold the update queued"
+        );
+        assert!(
+            lock.try_lock().is_err(),
+            "this update must own the lock before cancellation"
+        );
+        drop(update);
+        let queued_update_holds_lock = lock.try_lock().is_err();
+
+        drop(resume_tx);
+        blocker.await.unwrap();
+        let next_path = path.clone();
+        with_session_index_lock(&lock, move || std::fs::write(next_path, "latest")).await?;
+        assert_eq!(
+            (queued_update_holds_lock, std::fs::read_to_string(path)?),
+            (true, "latest".to_string())
+        );
+        Ok(())
+    })
 }
 
 #[test]

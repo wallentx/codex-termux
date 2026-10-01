@@ -50,6 +50,8 @@ pub(crate) enum TerminalTitleItem {
     /// Compact runtime run-state text.
     #[strum(to_string = "run-state", serialize = "status")]
     Status,
+    /// Current thread name, omitted when unnamed.
+    ThreadName,
     /// Current thread title (if available).
     #[strum(to_string = "thread-title", serialize = "thread")]
     Thread,
@@ -72,11 +74,17 @@ pub(crate) enum TerminalTitleItem {
     TotalInputTokens,
     /// Total output tokens generated.
     TotalOutputTokens,
+    /// Estimated credits attributed directly to the current enterprise thread.
+    ThreadCredits,
+    /// Estimated dollar cost attributed directly to the current enterprise thread.
+    EstimatedThreadCost,
     /// Full thread UUID.
     #[strum(to_string = "thread-id", serialize = "session-id")]
     SessionId,
     /// Whether Fast mode is currently active.
     FastMode,
+    /// Whether Daybreak is enabled for this thread.
+    Daybreak,
     /// Current model name.
     #[strum(to_string = "model", serialize = "model-name")]
     Model,
@@ -95,11 +103,12 @@ impl TerminalTitleItem {
             TerminalTitleItem::Project => "Project name (falls back to current directory name)",
             TerminalTitleItem::CurrentDir => "Current working directory",
             TerminalTitleItem::Spinner => {
-                "Spinner while working, action-required message while blocked."
+                "Spinner while working, action-required message while blocked"
             }
             TerminalTitleItem::Status => {
                 "Compact session run-state text (Ready, Working, Thinking)"
             }
+            TerminalTitleItem::ThreadName => "Current thread name (omitted when unnamed)",
             TerminalTitleItem::Thread => "Current thread title, or thread identifier when unnamed",
             TerminalTitleItem::GitBranch => "Current Git branch (omitted when unavailable)",
             TerminalTitleItem::ContextRemaining => {
@@ -118,10 +127,17 @@ impl TerminalTitleItem {
             TerminalTitleItem::UsedTokens => "Total tokens used in session (omitted when zero)",
             TerminalTitleItem::TotalInputTokens => "Total input tokens used in session",
             TerminalTitleItem::TotalOutputTokens => "Total output tokens used in session",
+            TerminalTitleItem::ThreadCredits => {
+                "Estimated current-thread credits (Enterprise workspaces only; omitted when unavailable)"
+            }
+            TerminalTitleItem::EstimatedThreadCost => {
+                "Estimated current-thread cost (Enterprise workspaces only; omitted when unavailable)"
+            }
             TerminalTitleItem::SessionId => {
                 "Current thread identifier (omitted until thread starts)"
             }
             TerminalTitleItem::FastMode => "Whether Fast mode is currently active",
+            TerminalTitleItem::Daybreak => "Whether Daybreak is enabled for this thread",
             TerminalTitleItem::Model => "Current model name",
             TerminalTitleItem::ModelWithReasoning => "Current model name with reasoning level",
             TerminalTitleItem::Reasoning => "Current reasoning level",
@@ -138,6 +154,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::CurrentDir => Some(StatusSurfacePreviewItem::CurrentDir),
             TerminalTitleItem::Spinner => None,
             TerminalTitleItem::Status => Some(StatusSurfacePreviewItem::Status),
+            TerminalTitleItem::ThreadName => Some(StatusSurfacePreviewItem::ThreadName),
             TerminalTitleItem::Thread => Some(StatusSurfacePreviewItem::ThreadTitle),
             TerminalTitleItem::GitBranch => Some(StatusSurfacePreviewItem::GitBranch),
             TerminalTitleItem::ContextRemaining => Some(StatusSurfacePreviewItem::ContextRemaining),
@@ -150,8 +167,13 @@ impl TerminalTitleItem {
             TerminalTitleItem::TotalOutputTokens => {
                 Some(StatusSurfacePreviewItem::TotalOutputTokens)
             }
+            TerminalTitleItem::ThreadCredits => Some(StatusSurfacePreviewItem::ThreadCredits),
+            TerminalTitleItem::EstimatedThreadCost => {
+                Some(StatusSurfacePreviewItem::EstimatedThreadCost)
+            }
             TerminalTitleItem::SessionId => Some(StatusSurfacePreviewItem::SessionId),
             TerminalTitleItem::FastMode => Some(StatusSurfacePreviewItem::FastMode),
+            TerminalTitleItem::Daybreak => Some(StatusSurfacePreviewItem::Daybreak),
             TerminalTitleItem::Model => Some(StatusSurfacePreviewItem::Model),
             TerminalTitleItem::ModelWithReasoning => {
                 Some(StatusSurfacePreviewItem::ModelWithReasoning)
@@ -345,6 +367,10 @@ impl TerminalTitleSetupView {
 }
 
 impl BottomPaneView for TerminalTitleSetupView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: crossterm::event::KeyEvent) {
         self.picker.handle_key_event(key_event);
     }
@@ -530,6 +556,17 @@ mod tests {
     }
 
     #[test]
+    fn thread_usage_items_are_independently_selectable() {
+        assert_eq!(
+            parse_terminal_title_items(["thread-credits", "estimated-thread-cost"].into_iter()),
+            Some(vec![
+                TerminalTitleItem::ThreadCredits,
+                TerminalTitleItem::EstimatedThreadCost,
+            ])
+        );
+    }
+
+    #[test]
     fn parse_terminal_title_items_accepts_kebab_case_variants() {
         let items = parse_terminal_title_items(
             [
@@ -549,6 +586,8 @@ mod tests {
                 "used-tokens",
                 "total-input-tokens",
                 "total-output-tokens",
+                "thread-credits",
+                "estimated-thread-cost",
                 "session-id",
                 "fast-mode",
             ]
@@ -573,6 +612,8 @@ mod tests {
                 TerminalTitleItem::UsedTokens,
                 TerminalTitleItem::TotalInputTokens,
                 TerminalTitleItem::TotalOutputTokens,
+                TerminalTitleItem::ThreadCredits,
+                TerminalTitleItem::EstimatedThreadCost,
                 TerminalTitleItem::SessionId,
                 TerminalTitleItem::FastMode,
             ])

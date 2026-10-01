@@ -1,4 +1,6 @@
+use super::helpers::drain_insert_history_transcript;
 use super::*;
+use codex_app_server_protocol::ImageReference;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 
@@ -291,7 +293,7 @@ async fn esc_with_review_queued_steers_shows_warning_and_does_not_interrupt() {
     chat.thread_id = Some(ThreadId::new());
     handle_turn_started(&mut chat, "turn-1");
     handle_entered_review_mode(&mut chat, "feature branch");
-    let _ = drain_insert_history(&mut rx);
+    let _ = drain_insert_history_transcript(&mut rx);
     chat.input_queue
         .pending_steers
         .push_back(pending_steer("review follow-up"));
@@ -303,7 +305,7 @@ async fn esc_with_review_queued_steers_shows_warning_and_does_not_interrupt() {
     assert_eq!(chat.input_queue.pending_steers.len(), 1);
     assert_no_submit_op(&mut op_rx);
 
-    let cells = drain_insert_history(&mut rx);
+    let cells = drain_insert_history_transcript(&mut rx);
     let last = lines_to_single_string(cells.last().expect("review warning"));
     assert_chatwidget_snapshot!("review_submission_warning_snapshot", last);
 }
@@ -360,14 +362,15 @@ async fn review_restores_context_window_indicator() {
 #[tokio::test]
 async fn restore_thread_input_state_restores_pending_steers_without_downgrading_them() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let mut pending_steers = VecDeque::new();
-    pending_steers.push_back(UserMessage::from("pending steer"));
     let expected_compare_key = PendingSteerCompareKey {
         message: "hidden IDE context\npending steer".to_string(),
         image_count: 0,
     };
-    let mut pending_steer_compare_keys = VecDeque::new();
-    pending_steer_compare_keys.push_back(expected_compare_key.clone());
+    let expected_pending = PendingSteer {
+        client_id: "saved-submission".to_string(),
+        compare_key: expected_compare_key,
+        ..pending_steer("pending steer")
+    };
     let mut rejected_steers_queue = VecDeque::new();
     rejected_steers_queue.push_back(UserMessage::from("already rejected"));
     let mut queued_user_messages = VecDeque::new();
@@ -375,19 +378,25 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
 
     chat.restore_thread_input_state(
         Some(ThreadInputState {
+            pending_thread_settings: None,
+            questions: None,
             composer: None,
             safety_buffering_prompt: None,
-            pending_steers,
-            pending_steer_history_records: VecDeque::new(),
-            pending_steer_compare_keys,
+            safety_buffering_source: UserMessageSource::Prompt,
+            pending_steers: VecDeque::from([expected_pending.clone()]),
             rejected_steers_queue,
+            rejected_steer_sources: VecDeque::new(),
             rejected_steer_history_records: VecDeque::new(),
             queued_user_messages,
             queued_user_message_history_records: VecDeque::new(),
+            recovered_queue: false,
+            reconnect_pending: false,
             user_turn_pending_start: false,
+            pending_user_message_client_id: None,
             submit_pending_steers_after_interrupt: false,
             current_collaboration_mode: chat.current_collaboration_mode.clone(),
             active_collaboration_mask: chat.active_collaboration_mask.clone(),
+            plan_mode_reasoning_effort: chat.config.plan_mode_reasoning_effort.clone(),
             task_running: false,
             agent_turn_running: false,
         }),
@@ -400,20 +409,36 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
         chat.queued_user_message_texts(),
         vec!["already rejected", "queued draft"]
     );
-    assert_eq!(chat.input_queue.pending_steers.len(), 1);
     assert_eq!(
-        chat.input_queue
-            .pending_steers
-            .front()
-            .unwrap()
-            .user_message
-            .text,
-        "pending steer"
+        chat.input_queue.pending_steers,
+        VecDeque::from([expected_pending])
     );
-    assert_eq!(
-        chat.input_queue.pending_steers.front().unwrap().compare_key,
-        expected_compare_key
-    );
+}
+
+#[tokio::test]
+async fn identical_steer_receipts_only_acknowledge_the_matching_submission() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let pending = pending_steer("continue");
+    chat.input_queue.pending_steers.push_back(pending.clone());
+
+    for (client_id, expected) in [
+        ("older-submission", VecDeque::from([pending.clone()])),
+        (pending.client_id.as_str(), VecDeque::new()),
+    ] {
+        chat.handle_thread_item(
+            AppServerThreadItem::UserMessage {
+                id: client_id.to_string(),
+                client_id: Some(client_id.to_string()),
+                content: vec![UserInput::Text {
+                    text: "continue".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            },
+            "turn-1".to_string(),
+            ThreadItemRenderSource::Live,
+        );
+        assert_eq!(chat.input_queue.pending_steers, expected);
+    }
 }
 
 #[tokio::test]
@@ -627,7 +652,9 @@ async fn item_completed_pops_pending_steer_with_local_image_and_text_elements() 
         "user-1",
         vec![
             UserInput::Image {
-                url: "data:image/png;base64,placeholder".to_string(),
+                image: ImageReference::Inline {
+                    url: "data:image/png;base64,placeholder".to_string(),
+                },
                 detail: None,
             },
             UserInput::Text {
@@ -891,11 +918,11 @@ async fn esc_with_pending_steers_overrides_agent_command_interrupt_behavior() {
     }
 
     chat.bottom_pane
-        .set_composer_text("/agent ".to_string(), Vec::new(), Vec::new());
+        .set_composer_text("/subagents ".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
     next_interrupt_op(&mut op_rx);
-    assert_eq!(chat.bottom_pane.composer_text(), "/agent ");
+    assert_eq!(chat.bottom_pane.composer_text(), "/subagents ");
 }
 
 #[tokio::test]
@@ -1090,7 +1117,7 @@ async fn review_commit_picker_shows_subjects_without_timestamps() {
             subject: "Fix bug Y".to_string(),
         },
     ];
-    super::show_review_commit_picker_with_entries(&mut chat, entries);
+    chat.show_review_commits(entries);
 
     // Render the bottom pane and inspect the lines for subjects and absence of time words.
     let width = 72;
@@ -1193,8 +1220,7 @@ async fn interrupt_exec_marks_failed_snapshot() {
     assert_chatwidget_snapshot!("interrupt_exec_marks_failed", exec_blob);
 }
 
-// Snapshot test: after an interrupted turn, a gentle error message is inserted
-// suggesting the user to tell the model what to do differently and to use /feedback.
+// Interruptions show a short, neutral notice with the feedback command.
 #[tokio::test]
 async fn interrupted_turn_error_message_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -1208,9 +1234,18 @@ async fn interrupted_turn_error_message_snapshot() {
     let cells = drain_insert_history(&mut rx);
     assert!(
         !cells.is_empty(),
-        "expected error message to be inserted after interruption"
+        "expected notice to be inserted after interruption"
     );
-    let last = lines_to_single_string(cells.last().unwrap());
+    let last = cells.last().unwrap();
+    let line = last.last().unwrap();
+    assert_eq!(
+        line.spans
+            .iter()
+            .map(|span| line.style.patch(span.style))
+            .collect::<Vec<_>>(),
+        vec![crate::style::secondary_text_style(); line.spans.len()]
+    );
+    let last = lines_to_single_string(last);
     assert_chatwidget_snapshot!("interrupted_turn_error_message", last);
 }
 
@@ -1311,9 +1346,7 @@ async fn budget_limited_turn_restores_queued_input_without_submitting() {
     assert_no_submit_op(&mut op_rx);
 }
 
-// Snapshot test: interrupting specifically to submit pending steers shows an
-// informational banner instead of the generic "tell the model what to do
-// differently" error prompt.
+// Interrupting to submit pending steers shows the steer-specific notice.
 #[tokio::test]
 async fn interrupted_turn_pending_steers_message_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;

@@ -1,7 +1,7 @@
 //! Multi-agent picker navigation and labeling state for the TUI app.
 //!
 //! This module exists to keep the pure parts of multi-agent navigation out of [`crate::app::App`].
-//! It owns the stable spawn-order cache used by the `/agent` picker, keyboard next/previous
+//! It owns the stable spawn-order cache used by the `/subagents` picker, keyboard next/previous
 //! navigation, and the contextual footer label for the thread currently being watched.
 //!
 //! Responsibilities here are intentionally narrow:
@@ -28,6 +28,7 @@ use codex_protocol::ThreadId;
 use ratatui::text::Span;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use uuid::Uuid;
 
 /// Small state container for multi-agent picker ordering and labeling.
 ///
@@ -48,6 +49,8 @@ pub(crate) struct AgentNavigationState {
     stopped_threads: HashSet<ThreadId>,
     /// Spawned child threads whose instructions are owned by their parent agent.
     parent_owned_threads: HashSet<ThreadId>,
+    /// Coalesces root refreshes while rejecting replies from a previous session.
+    pub(super) picker_refresh: Option<(ThreadId, Uuid)>,
 }
 
 /// Direction of keyboard traversal through the stable picker order.
@@ -60,6 +63,23 @@ pub(crate) enum AgentNavigationDirection {
 }
 
 impl AgentNavigationState {
+    pub(crate) fn begin_picker_refresh(&mut self, thread_id: ThreadId) -> Option<Uuid> {
+        if self.picker_refresh.is_some() {
+            return None;
+        }
+        let request_id = Uuid::new_v4();
+        self.picker_refresh = Some((thread_id, request_id));
+        Some(request_id)
+    }
+
+    pub(crate) fn finish_picker_refresh(&mut self, thread_id: ThreadId, request_id: Uuid) -> bool {
+        if self.picker_refresh != Some((thread_id, request_id)) {
+            return false;
+        }
+        self.picker_refresh = None;
+        true
+    }
+
     /// Returns the cached picker entry for a specific thread id.
     ///
     /// Callers use this when they already know which thread they care about and need the last
@@ -203,13 +223,14 @@ impl AgentNavigationState {
         self.order.clear();
         self.stopped_threads.clear();
         self.parent_owned_threads.clear();
+        self.picker_refresh = None;
     }
 
     /// Removes a tracked thread entirely from picker metadata and traversal order.
     ///
     /// This is reserved for entries that were only discovered opportunistically and never became
     /// replayable local threads. Keeping those around after the backend confirms they are gone
-    /// would leave ghost rows in `/agent`.
+    /// would leave ghost rows in `/subagents`.
     pub(crate) fn remove(&mut self, thread_id: ThreadId) {
         self.threads.remove(&thread_id);
         self.order.retain(|candidate| *candidate != thread_id);
@@ -340,7 +361,7 @@ impl AgentNavigationState {
         )
     }
 
-    /// Builds the `/agent` picker subtitle from the same canonical bindings used by key handling.
+    /// Builds the `/subagents` picker subtitle from the same canonical bindings used by key handling.
     ///
     /// Keeping this text derived from the actual shortcut helpers prevents the picker copy from
     /// drifting if the bindings ever change on one platform.
@@ -431,6 +452,24 @@ mod tests {
         state.mark_parent_owned(second_agent_id);
         state.clear();
         assert!(!state.is_parent_owned(second_agent_id));
+    }
+
+    #[test]
+    fn picker_refresh_rejects_responses_from_before_clear() {
+        let mut state = AgentNavigationState::default();
+        let thread_id = ThreadId::new();
+        let stale_request = state
+            .begin_picker_refresh(thread_id)
+            .expect("first picker refresh");
+
+        assert_eq!(state.begin_picker_refresh(thread_id), None);
+        state.clear();
+        let current_request = state
+            .begin_picker_refresh(thread_id)
+            .expect("refresh after session reset");
+
+        assert!(!state.finish_picker_refresh(thread_id, stale_request));
+        assert!(state.finish_picker_refresh(thread_id, current_request));
     }
 
     #[test]

@@ -7,8 +7,17 @@ use crate::error_code::invalid_request;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_analytics::AnalyticsEventsClient;
+use codex_app_server_protocol::AllowDenyRequirement;
+use codex_app_server_protocol::AutoReviewRequirements;
+use codex_app_server_protocol::BrowserUseAccessApprovalLifetime;
+use codex_app_server_protocol::BrowserUseOriginPolicy;
+use codex_app_server_protocol::BrowserUseRequirements;
+use codex_app_server_protocol::CliAuthCredentialsStoreMode;
 use codex_app_server_protocol::ClientResponsePayload;
+use codex_app_server_protocol::ComputerUseMacosRequirements;
 use codex_app_server_protocol::ComputerUseRequirements;
+use codex_app_server_protocol::ComputerUseWindowsExeRequirement;
+use codex_app_server_protocol::ComputerUseWindowsRequirements;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigReadResponse;
@@ -21,6 +30,8 @@ use codex_app_server_protocol::ConfiguredHookHandler;
 use codex_app_server_protocol::ConfiguredHookMatcherGroup;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
+use codex_app_server_protocol::FeedbackRequirements;
+use codex_app_server_protocol::InAppBrowserRequirements;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ManagedHooksRequirements;
 use codex_app_server_protocol::ModelProviderCapabilitiesReadResponse;
@@ -30,7 +41,7 @@ use codex_app_server_protocol::NetworkRequirements;
 use codex_app_server_protocol::NetworkUnixSocketPermission;
 use codex_app_server_protocol::NewThreadModelDefaults;
 use codex_app_server_protocol::SandboxMode;
-use codex_app_server_protocol::WindowsSandboxSetupMode;
+use codex_app_server_protocol::WindowsSandboxImplementation;
 use codex_config::ConfigRequirementsToml;
 use codex_config::HookEventsToml;
 use codex_config::HookHandlerConfig as CoreHookHandlerConfig;
@@ -39,21 +50,32 @@ use codex_config::MatcherGroup as CoreMatcherGroup;
 use codex_config::ResidencyRequirement as CoreResidencyRequirement;
 use codex_config::SandboxModeRequirement as CoreSandboxModeRequirement;
 use codex_core::ThreadManager;
+use codex_features::Feature;
 use codex_features::canonical_feature_for_key;
 use codex_features::feature_for_key;
 use codex_model_provider::create_model_provider;
 use codex_plugin::PluginId;
+use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::WebSearchMode;
 use serde_json::json;
 use std::path::PathBuf;
 
+const BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE: &str =
+    "background_paginated_rollout_migration";
+
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
+    "api_key_cyber_access_programs",
+    "api_key_model_discovery",
     "auth_elicitation",
+    BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE,
+    "codex_apps_mcp_2026_07_28",
+    "mcp_2026_07_28",
     "memories",
     "mentions_v2",
     "remote_control",
     "remote_plugin",
     "tool_suggest",
+    "windows_sandbox_service",
 ];
 
 #[derive(Clone)]
@@ -115,8 +137,11 @@ impl ConfigRequestProcessor {
             .config_manager
             .read_requirements()
             .await
-            .map_err(map_error)?
-            .map(map_requirements_toml_to_api);
+            .map_err(map_error)?;
+        let requirements = map_requirements_to_api(
+            requirements,
+            self.thread_manager.auth_manager().allowed_login_methods(),
+        );
 
         Ok(ConfigRequirementsReadResponse { requirements })
     }
@@ -134,9 +159,26 @@ impl ConfigRequestProcessor {
         &self,
         params: ConfigBatchWriteParams,
     ) -> Result<ClientResponsePayload, JSONRPCErrorError> {
-        self.handle_config_mutation_result(self.batch_write_inner(params).await)
-            .await
-            .map(ClientResponsePayload::ConfigBatchWrite)
+        let session_defaults_only = !params.edits.is_empty()
+            && params.edits.iter().all(|edit| {
+                matches!(
+                    edit.key_path.as_str(),
+                    "model"
+                        | "model_reasoning_effort"
+                        | "plan_mode_reasoning_effort"
+                        | "service_tier"
+                        | "personality"
+                )
+            });
+        let should_reload = params.reload_user_config;
+        let response = self.batch_write_inner(params).await?;
+        if !session_defaults_only {
+            self.handle_config_mutation().await;
+            if should_reload {
+                reload_user_config(&self.config_manager, &self.thread_manager).await;
+            }
+        }
+        Ok(ClientResponsePayload::ConfigBatchWrite(response))
     }
 
     pub(crate) async fn experimental_feature_enablement_set(
@@ -147,6 +189,9 @@ impl ConfigRequestProcessor {
         let response = self
             .handle_config_mutation_result(self.set_experimental_feature_enablement(params).await)
             .await?;
+        if !response.enablement.is_empty() {
+            reload_user_config(&self.config_manager, &self.thread_manager).await;
+        }
         self.outgoing
             .send_response_as(
                 request_id,
@@ -217,7 +262,6 @@ impl ConfigRequestProcessor {
         &self,
         params: ConfigBatchWriteParams,
     ) -> Result<ConfigWriteResponse, JSONRPCErrorError> {
-        let reload_user_config = params.reload_user_config;
         let pending_changes = codex_core_plugins::toggles::collect_plugin_enabled_candidates(
             params
                 .edits
@@ -230,9 +274,6 @@ impl ConfigRequestProcessor {
             .await
             .map_err(map_error)?;
         self.emit_plugin_toggle_events(pending_changes).await;
-        if reload_user_config {
-            self.reload_user_config().await;
-        }
         Ok(response)
     }
 
@@ -259,6 +300,18 @@ impl ConfigRequestProcessor {
             return Ok(ExperimentalFeatureEnablementSetResponse { enablement });
         }
 
+        // Most runtime features are read later from config. Background migration is a one-shot
+        // process-scoped task, so start it when runtime enablement first changes it to on.
+        let feature = Feature::BackgroundPaginatedRolloutMigration;
+        let should_start_background_rollout_migration = enablement
+            .get(BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE)
+            .is_some_and(|enabled| *enabled)
+            && !self
+                .load_latest_config(/*fallback_cwd*/ None)
+                .await?
+                .features
+                .enabled(feature);
+
         self.config_manager
             .extend_runtime_feature_enablement(
                 enablement
@@ -267,30 +320,17 @@ impl ConfigRequestProcessor {
             )
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
-        self.load_latest_config(/*fallback_cwd*/ None).await?;
-        self.reload_user_config().await;
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        self.thread_manager
+            .get_models_manager()
+            .set_api_key_model_discovery_enabled(
+                config.features.enabled(Feature::ApiKeyModelDiscovery),
+            );
+        if should_start_background_rollout_migration && config.features.enabled(feature) {
+            self.thread_manager.start_background_rollout_migration();
+        }
 
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
-    }
-
-    async fn reload_user_config(&self) {
-        let next_config = match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(config) => config,
-            Err(err) => {
-                tracing::warn!(
-                    "failed to rebuild user config for runtime refresh: {}",
-                    err.message
-                );
-                return;
-            }
-        };
-        let thread_ids = self.thread_manager.list_thread_ids().await;
-        for thread_id in thread_ids {
-            let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
-                continue;
-            };
-            thread.refresh_runtime_config(next_config.clone()).await;
-        }
     }
 
     async fn emit_plugin_toggle_events(
@@ -314,8 +354,134 @@ impl ConfigRequestProcessor {
     }
 }
 
-fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigRequirements {
-    ConfigRequirements {
+pub(super) async fn reload_user_config(
+    config_manager: &ConfigManager,
+    thread_manager: &ThreadManager,
+) {
+    // Reload owns several config snapshots; do not inline that future into dispatch.
+    Box::pin(reload_user_config_inner(config_manager, thread_manager)).await;
+}
+
+async fn reload_user_config_inner(config_manager: &ConfigManager, thread_manager: &ThreadManager) {
+    if let Err(err) = config_manager.load_config_layers(/*cwd*/ None).await {
+        tracing::warn!("failed to rebuild user config for runtime refresh: {err}");
+        for thread_id in thread_manager.list_thread_ids().await {
+            if let Ok(thread) = thread_manager.get_thread(thread_id).await {
+                thread.disable_mcp_enterprise_auth().await;
+            }
+        }
+        return;
+    }
+    let thread_ids = thread_manager.list_thread_ids().await;
+    for thread_id in thread_ids {
+        let Ok(thread) = thread_manager.get_thread(thread_id).await else {
+            continue;
+        };
+        for attempt in 0..4 {
+            let current_config = thread.config().await;
+            let next_config = match config_manager
+                .load_latest_config_with_session_layers(
+                    &current_config.config_layer_stack,
+                    &current_config.cwd,
+                )
+                .await
+            {
+                Ok(config) => config,
+                Err(err) => {
+                    tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
+                    thread.disable_mcp_enterprise_auth().await;
+                    break;
+                }
+            };
+            let current_requirements = current_config.config_layer_stack.requirements();
+            let next_requirements = next_config.config_layer_stack.requirements();
+            let promote_mcp = current_requirements.mcp_servers != next_requirements.mcp_servers
+                || current_requirements.plugins != next_requirements.plugins
+                || current_requirements.feature_requirements
+                    != next_requirements.feature_requirements;
+            let outcome = if promote_mcp {
+                // Keep the loaded MCP map and its requirements under one owner,
+                // then reload the user update from that owner.
+                Box::pin(thread.refresh_mcp_config(current_config, next_config)).await
+            } else {
+                // Keep runtime refresh state off the request dispatcher's stack.
+                Box::pin(thread.refresh_runtime_config(current_config, next_config)).await
+            };
+            match outcome {
+                codex_core::ConfigRefreshOutcome::Published => {
+                    if !promote_mcp {
+                        break;
+                    }
+                }
+                codex_core::ConfigRefreshOutcome::Stale => {}
+                codex_core::ConfigRefreshOutcome::Rejected => {
+                    tracing::warn!(%thread_id, "stopped user configuration reload after rejected refresh");
+                    break;
+                }
+            }
+            if attempt == 3 {
+                thread.disable_mcp_enterprise_auth().await;
+                tracing::warn!(%thread_id, "configuration kept changing during user reload; enterprise MCP disabled");
+            }
+        }
+    }
+}
+
+fn map_requirements_to_api(
+    requirements: Option<ConfigRequirementsToml>,
+    allowed_login_methods: Vec<ForcedLoginMethod>,
+) -> Option<ConfigRequirements> {
+    let requirements = match requirements {
+        Some(requirements) => requirements,
+        None if allowed_login_methods == [ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt] => {
+            return None;
+        }
+        None => ConfigRequirementsToml::default(),
+    };
+
+    Some(ConfigRequirements {
+        model_provider: requirements.model_provider,
+        model_providers: requirements.model_providers.map(|providers| {
+            providers
+                .into_iter()
+                .map(|(id, provider)| (id, serde_json::json!(provider)))
+                .collect()
+        }),
+        allowed_login_methods: Some(allowed_login_methods),
+        application: requirements.application.map(|application| {
+            codex_app_server_protocol::ApplicationRequirements {
+                network: application.network.map(|network| {
+                    codex_app_server_protocol::ApplicationNetworkRequirements {
+                        enabled: network.enabled,
+                        domains: network
+                            .domains
+                            .into_iter()
+                            .map(|(domain, permission)| {
+                                (domain, map_network_domain_permission_to_api(permission))
+                            })
+                            .collect(),
+                    }
+                }),
+            }
+        }),
+        cli_auth_credentials_store: requirements.cli_auth_credentials_store.map(
+            |mode| match mode {
+                codex_config::types::AuthCredentialsStoreMode::File => {
+                    CliAuthCredentialsStoreMode::File
+                }
+                codex_config::types::AuthCredentialsStoreMode::Keyring => {
+                    CliAuthCredentialsStoreMode::Keyring
+                }
+                codex_config::types::AuthCredentialsStoreMode::Auto => {
+                    CliAuthCredentialsStoreMode::Auto
+                }
+                codex_config::types::AuthCredentialsStoreMode::Ephemeral => {
+                    CliAuthCredentialsStoreMode::Ephemeral
+                }
+            },
+        ),
+        chatgpt_base_url: requirements.chatgpt_base_url,
+        additional_developer_instructions: requirements.additional_developer_instructions,
         allowed_approval_policies: requirements.allowed_approval_policies.map(|policies| {
             policies
                 .into_iter()
@@ -341,11 +507,11 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
                     implementations
                         .into_iter()
                         .map(|implementation| match implementation {
-                            codex_config::types::WindowsSandboxModeToml::Elevated => {
-                                WindowsSandboxSetupMode::Elevated
+                            codex_config::WindowsSandboxImplementationToml::Elevated => {
+                                WindowsSandboxImplementation::Elevated
                             }
-                            codex_config::types::WindowsSandboxModeToml::Unelevated => {
-                                WindowsSandboxSetupMode::Unelevated
+                            codex_config::WindowsSandboxImplementationToml::Unelevated => {
+                                WindowsSandboxImplementation::Unelevated
                             }
                         })
                         .collect()
@@ -364,11 +530,21 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
             normalized
         }),
         allow_managed_hooks_only: requirements.allow_managed_hooks_only,
+        allow_browser_and_computer_use: requirements.allow_browser_and_computer_use,
         allow_appshots: requirements.allow_appshots,
         allow_remote_control: requirements.allow_remote_control,
         computer_use: requirements
             .computer_use
             .map(map_computer_use_requirements_to_api),
+        browser_use: requirements
+            .browser_use
+            .map(map_browser_use_requirements_to_api),
+        in_app_browser: requirements.in_app_browser.map(|in_app_browser| {
+            InAppBrowserRequirements {
+                allow_external_browser_settings_import: in_app_browser
+                    .allow_external_browser_settings_import,
+            }
+        }),
         feature_requirements: requirements
             .feature_requirements
             .map(|requirements| requirements.entries),
@@ -377,6 +553,12 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
             .enforce_residency
             .map(map_residency_requirement_to_api),
         network: requirements.network.map(map_network_requirements_to_api),
+        auto_review: requirements
+            .auto_review
+            .map(|auto_review| AutoReviewRequirements {
+                required_on_models: auto_review.required_on_models,
+                ignore_rules: auto_review.ignore_rules,
+            }),
         models: requirements.models.map(|models| ModelsRequirements {
             new_thread: models.new_thread.map(|new_thread| NewThreadModelDefaults {
                 model: new_thread.model,
@@ -384,7 +566,15 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
                 service_tier: new_thread.service_tier,
             }),
         }),
-    }
+        sqlite_home: requirements.sqlite_home.map(Into::into),
+        log_dir: requirements.log_dir.map(Into::into),
+        model_catalog_json: requirements.model_catalog_json.map(Into::into),
+        check_for_update_on_startup: requirements.check_for_update_on_startup,
+        allow_login_shell: requirements.allow_login_shell,
+        feedback: requirements.feedback.map(|feedback| FeedbackRequirements {
+            enabled: feedback.enabled,
+        }),
+    })
 }
 
 fn map_computer_use_requirements_to_api(
@@ -392,6 +582,104 @@ fn map_computer_use_requirements_to_api(
 ) -> ComputerUseRequirements {
     ComputerUseRequirements {
         allow_locked_computer_use: computer_use.allow_locked_computer_use,
+        allow_persistent_approval: computer_use.allow_persistent_approval,
+        default_app_access: computer_use
+            .default_app_access
+            .map(map_allow_deny_requirement_to_api),
+        macos: computer_use
+            .macos
+            .map(|macos| ComputerUseMacosRequirements {
+                bundle_ids: macos.bundle_ids.map(|bundle_ids| {
+                    bundle_ids
+                        .into_iter()
+                        .map(|(bundle_id, requirement)| {
+                            (bundle_id, map_allow_deny_requirement_to_api(requirement))
+                        })
+                        .collect()
+                }),
+            }),
+        windows: computer_use
+            .windows
+            .map(|windows| ComputerUseWindowsRequirements {
+                aumids: windows.aumids.map(|aumids| {
+                    aumids
+                        .into_iter()
+                        .map(|(aumid, requirement)| {
+                            (aumid, map_allow_deny_requirement_to_api(requirement))
+                        })
+                        .collect()
+                }),
+                exes: windows.exes.map(|exes| {
+                    exes.into_iter()
+                        .map(|exe| ComputerUseWindowsExeRequirement {
+                            publisher_name: exe.publisher_name,
+                            product_name: exe.product_name,
+                            binary_name: exe.binary_name,
+                            access: map_allow_deny_requirement_to_api(exe.access),
+                        })
+                        .collect()
+                }),
+            }),
+    }
+}
+
+fn map_browser_use_requirements_to_api(
+    browser_use: codex_config::BrowserUseRequirementsToml,
+) -> BrowserUseRequirements {
+    BrowserUseRequirements {
+        allow_webmcp: browser_use.allow_webmcp,
+        allow_history_access: browser_use.allow_history_access,
+        disable_auto_review: browser_use.disable_auto_review,
+        allow_global_persistent_approval: browser_use.allow_global_persistent_approval,
+        default_origin_policy: browser_use
+            .default_origin_policy
+            .map(map_browser_use_origin_policy_to_api),
+        origins: browser_use.origins.map(|origins| {
+            origins
+                .into_iter()
+                .map(|(pattern, policy)| (pattern, map_browser_use_origin_policy_to_api(policy)))
+                .collect()
+        }),
+    }
+}
+
+fn map_browser_use_origin_policy_to_api(
+    policy: codex_config::BrowserUseOriginPolicyToml,
+) -> BrowserUseOriginPolicy {
+    BrowserUseOriginPolicy {
+        access: policy.access.map(map_allow_deny_requirement_to_api),
+        downloads: policy.downloads.map(map_allow_deny_requirement_to_api),
+        uploads: policy.uploads.map(map_allow_deny_requirement_to_api),
+        full_cdp_access: policy
+            .full_cdp_access
+            .map(map_allow_deny_requirement_to_api),
+        auto_review: policy.auto_review.map(map_allow_deny_requirement_to_api),
+        persistent_approval: policy.persistent_approval,
+        access_approval_lifetime: policy
+            .access_approval_lifetime
+            .map(map_browser_use_access_approval_lifetime_to_api),
+    }
+}
+
+fn map_allow_deny_requirement_to_api(
+    requirement: codex_config::AllowDenyRequirementToml,
+) -> AllowDenyRequirement {
+    match requirement {
+        codex_config::AllowDenyRequirementToml::Allow => AllowDenyRequirement::Allow,
+        codex_config::AllowDenyRequirementToml::Deny => AllowDenyRequirement::Deny,
+    }
+}
+
+fn map_browser_use_access_approval_lifetime_to_api(
+    lifetime: codex_config::BrowserUseAccessApprovalLifetimeToml,
+) -> BrowserUseAccessApprovalLifetime {
+    match lifetime {
+        codex_config::BrowserUseAccessApprovalLifetimeToml::Turn => {
+            BrowserUseAccessApprovalLifetime::Turn
+        }
+        codex_config::BrowserUseAccessApprovalLifetimeToml::Thread => {
+            BrowserUseAccessApprovalLifetime::Thread
+        }
     }
 }
 
@@ -413,6 +701,7 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         subagent_start,
         subagent_stop,
         stop,
+        interrupt,
     } = hooks;
 
     ManagedHooksRequirements {
@@ -429,6 +718,7 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         subagent_start: map_hook_matcher_groups_to_api(subagent_start),
         subagent_stop: map_hook_matcher_groups_to_api(subagent_stop),
         stop: map_hook_matcher_groups_to_api(stop),
+        interrupt: map_hook_matcher_groups_to_api(interrupt),
     }
 }
 
@@ -460,11 +750,26 @@ fn map_hook_handler_to_api(handler: CoreHookHandlerConfig) -> ConfiguredHookHand
             timeout_sec,
             r#async,
             status_message,
+            additional_context_limit,
         } => ConfiguredHookHandler::Command {
             command,
             command_windows,
             timeout_sec,
             r#async,
+            status_message,
+            additional_context_limit,
+        },
+        CoreHookHandlerConfig::McpTool {
+            server,
+            tool,
+            input,
+            timeout_sec,
+            status_message,
+        } => ConfiguredHookHandler::McpTool {
+            server,
+            tool,
+            input,
+            timeout_sec,
             status_message,
         },
         CoreHookHandlerConfig::Prompt {} => ConfiguredHookHandler::Prompt {},
@@ -575,20 +880,131 @@ fn config_write_error(code: ConfigWriteErrorCode, message: impl Into<String>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::map_requirements_toml_to_api;
-    use codex_app_server_protocol::WindowsSandboxSetupMode;
+    use super::map_requirements_to_api;
+    use super::reload_user_config;
+    use crate::config_manager::ConfigManager;
+    use codex_app_server_protocol::AllowDenyRequirement;
+    use codex_app_server_protocol::AutoReviewRequirements;
+    use codex_app_server_protocol::BrowserUseAccessApprovalLifetime;
+    use codex_app_server_protocol::BrowserUseOriginPolicy;
+    use codex_app_server_protocol::BrowserUseRequirements;
+    use codex_app_server_protocol::ComputerUseMacosRequirements;
+    use codex_app_server_protocol::ComputerUseRequirements;
+    use codex_app_server_protocol::ComputerUseWindowsExeRequirement;
+    use codex_app_server_protocol::ComputerUseWindowsRequirements;
+    use codex_app_server_protocol::FeedbackRequirements;
+    use codex_app_server_protocol::WindowsSandboxImplementation;
+    use codex_config::AllowDenyRequirementToml;
+    use codex_config::AutoReviewRequirementsToml;
+    use codex_config::BrowserUseAccessApprovalLifetimeToml;
+    use codex_config::BrowserUseOriginPolicyToml;
+    use codex_config::BrowserUseRequirementsToml;
+    use codex_config::CloudConfigBundleLoader;
+    use codex_config::ComputerUseMacosRequirementsToml;
     use codex_config::ComputerUseRequirementsToml;
+    use codex_config::ComputerUseWindowsExeRequirementToml;
+    use codex_config::ComputerUseWindowsRequirementsToml;
     use codex_config::ConfigRequirementsToml;
+    use codex_config::LoaderOverrides;
     use codex_config::ModelsRequirementsToml;
     use codex_config::NewThreadModelDefaultsToml;
     use codex_config::WindowsRequirementsToml;
+    use codex_config::types::FeedbackConfigToml;
+    use codex_config::types::ToolSuggestDisabledTool;
+    use codex_exec_server::EnvironmentManager;
+    use codex_login::CodexAuth;
+    use codex_protocol::config_types::ForcedLoginMethod;
     use codex_protocol::openai_models::ReasoningEffort;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn reload_user_config_preserves_promoted_mcp_allowlist_denial() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let managed_config_path = home.path().join("managed_config.toml");
+        std::fs::write(
+            &managed_config_path,
+            r#"
+[features]
+use_xaa = true
+[mcp_enterprise_managed_auth.idp]
+issuer = "https://idp.example"
+client_id = "idp-client"
+[mcp_servers.enterprise]
+url = "https://resource.example/mcp"
+auth = "ema_auth"
+oauth_resource = "https://resource.example/mcp"
+[mcp_servers.enterprise.oauth]
+client_id = "mcp-client"
+"#,
+        )?;
+        let requirements_path = home.path().join("requirements.toml");
+        std::fs::write(
+            &requirements_path,
+            "[mcp_servers.enterprise.identity]\nurl = 'https://resource.example/mcp'\n",
+        )?;
+        let config_manager = ConfigManager::new_for_tests(
+            home.path().to_path_buf(),
+            Vec::new(),
+            LoaderOverrides::with_managed_config_path_for_tests(managed_config_path),
+            CloudConfigBundleLoader::default(),
+        );
+        let initial = config_manager
+            .load_latest_config(Some(home.path().to_path_buf()))
+            .await?;
+        let thread_manager = codex_core::test_support::thread_manager_with_models_provider_and_home(
+            CodexAuth::from_api_key("dummy"),
+            initial.model_provider.clone(),
+            initial.codex_home.to_path_buf(),
+            Arc::new(EnvironmentManager::default_for_tests()),
+        );
+        let thread = thread_manager
+            .start_thread(codex_core::StartThreadOptions::new(initial))
+            .await?
+            .thread;
+        assert!(thread.config().await.mcp_servers.get()["enterprise"].enabled);
+
+        std::fs::write(&requirements_path, "[mcp_servers]\n")?;
+        std::fs::write(
+            home.path().join(codex_config::CONFIG_TOML_FILE),
+            "[tool_suggest]\ndisabled_tools = [{ type = 'connector', id = 'calendar' }]\n",
+        )?;
+        reload_user_config(&config_manager, &thread_manager).await;
+
+        let refreshed = thread.config().await;
+        assert_eq!(
+            refreshed
+                .config_layer_stack
+                .requirements()
+                .mcp_servers
+                .as_ref()
+                .map(|requirements| &requirements.value),
+            Some(&BTreeMap::new())
+        );
+        assert!(!refreshed.mcp_servers.get()["enterprise"].enabled);
+        assert_eq!(
+            refreshed.tool_suggest.disabled_tools,
+            vec![ToolSuggestDisabledTool::connector("calendar")]
+        );
+        Ok(())
+    }
+
+    fn map_test_requirements(
+        requirements: ConfigRequirementsToml,
+    ) -> codex_app_server_protocol::ConfigRequirements {
+        map_requirements_to_api(
+            Some(requirements),
+            vec![ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt],
+        )
+        .expect("requirements")
+    }
 
     #[test]
     fn requirements_api_includes_allow_managed_hooks_only() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+        let mapped = map_test_requirements(ConfigRequirementsToml {
             allow_managed_hooks_only: Some(true),
             ..ConfigRequirementsToml::default()
         });
@@ -599,7 +1015,7 @@ mod tests {
 
     #[test]
     fn requirements_api_includes_permission_default_and_allowlist() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+        let mapped = map_test_requirements(ConfigRequirementsToml {
             allowed_permission_profiles: Some(BTreeMap::from([
                 ("managed-build".to_string(), false),
                 ("managed-standard".to_string(), true),
@@ -623,7 +1039,7 @@ mod tests {
 
     #[test]
     fn requirements_api_includes_allow_appshots() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+        let mapped = map_test_requirements(ConfigRequirementsToml {
             allow_appshots: Some(false),
             ..ConfigRequirementsToml::default()
         });
@@ -634,7 +1050,7 @@ mod tests {
 
     #[test]
     fn requirements_api_includes_allow_remote_control() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+        let mapped = map_test_requirements(ConfigRequirementsToml {
             allow_remote_control: Some(false),
             ..ConfigRequirementsToml::default()
         });
@@ -643,8 +1059,12 @@ mod tests {
     }
 
     #[test]
-    fn requirements_api_includes_new_thread_model_defaults() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+    fn requirements_api_includes_model_auto_review_and_new_thread_defaults() {
+        let mapped = map_test_requirements(ConfigRequirementsToml {
+            auto_review: Some(AutoReviewRequirementsToml {
+                required_on_models: Some(vec!["gpt-protected".to_string()]),
+                ignore_rules: Some(vec!["gpt-protected".to_string()]),
+            }),
             models: Some(ModelsRequirementsToml {
                 new_thread: Some(NewThreadModelDefaultsToml {
                     model: Some("gpt-managed".to_string()),
@@ -655,10 +1075,15 @@ mod tests {
             ..ConfigRequirementsToml::default()
         });
 
-        let defaults = mapped
-            .models
-            .and_then(|models| models.new_thread)
-            .expect("new-thread defaults");
+        assert_eq!(
+            mapped.auto_review,
+            Some(AutoReviewRequirements {
+                required_on_models: Some(vec!["gpt-protected".to_string()]),
+                ignore_rules: Some(vec!["gpt-protected".to_string()]),
+            })
+        );
+        let models = mapped.models.expect("managed model requirements");
+        let defaults = models.new_thread.expect("new-thread defaults");
         assert_eq!(defaults.model.as_deref(), Some("gpt-managed"));
         assert_eq!(
             defaults.model_reasoning_effort,
@@ -668,30 +1093,132 @@ mod tests {
     }
 
     #[test]
-    fn requirements_api_includes_computer_use_requirements() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+    fn requirements_api_includes_browser_and_computer_use_requirements() {
+        let mapped = map_test_requirements(ConfigRequirementsToml {
+            allow_browser_and_computer_use: Some(false),
+            browser_use: Some(BrowserUseRequirementsToml {
+                allow_webmcp: Some(true),
+                allow_history_access: Some(false),
+                disable_auto_review: Some(true),
+                allow_global_persistent_approval: Some(false),
+                default_origin_policy: Some(BrowserUseOriginPolicyToml {
+                    access: Some(AllowDenyRequirementToml::Deny),
+                    downloads: Some(AllowDenyRequirementToml::Allow),
+                    uploads: Some(AllowDenyRequirementToml::Deny),
+                    full_cdp_access: Some(AllowDenyRequirementToml::Allow),
+                    auto_review: Some(AllowDenyRequirementToml::Deny),
+                    persistent_approval: Some(false),
+                    access_approval_lifetime: Some(BrowserUseAccessApprovalLifetimeToml::Turn),
+                }),
+                origins: Some(BTreeMap::from([(
+                    "https://example.com".to_string(),
+                    BrowserUseOriginPolicyToml {
+                        access: Some(AllowDenyRequirementToml::Allow),
+                        downloads: Some(AllowDenyRequirementToml::Deny),
+                        uploads: Some(AllowDenyRequirementToml::Allow),
+                        full_cdp_access: Some(AllowDenyRequirementToml::Deny),
+                        auto_review: Some(AllowDenyRequirementToml::Deny),
+                        persistent_approval: Some(true),
+                        access_approval_lifetime: Some(
+                            BrowserUseAccessApprovalLifetimeToml::Thread,
+                        ),
+                    },
+                )])),
+            }),
             computer_use: Some(ComputerUseRequirementsToml {
                 allow_locked_computer_use: Some(false),
+                allow_persistent_approval: Some(false),
+                default_app_access: Some(AllowDenyRequirementToml::Deny),
+                macos: Some(ComputerUseMacosRequirementsToml {
+                    bundle_ids: Some(BTreeMap::from([(
+                        "com.apple.Safari".to_string(),
+                        AllowDenyRequirementToml::Allow,
+                    )])),
+                }),
+                windows: Some(ComputerUseWindowsRequirementsToml {
+                    aumids: Some(BTreeMap::from([(
+                        "Microsoft.Paint_8wekyb3d8bbwe!App".to_string(),
+                        AllowDenyRequirementToml::Allow,
+                    )])),
+                    exes: Some(vec![ComputerUseWindowsExeRequirementToml {
+                        publisher_name: "CN=Google LLC".to_string(),
+                        product_name: "Google Chrome".to_string(),
+                        binary_name: Some("chrome.exe".to_string()),
+                        access: AllowDenyRequirementToml::Deny,
+                    }]),
+                }),
             }),
             ..ConfigRequirementsToml::default()
         });
 
+        assert_eq!(mapped.allow_browser_and_computer_use, Some(false));
         assert_eq!(
-            mapped
-                .computer_use
-                .and_then(|requirements| requirements.allow_locked_computer_use),
-            Some(false)
+            mapped.browser_use,
+            Some(BrowserUseRequirements {
+                allow_webmcp: Some(true),
+                allow_history_access: Some(false),
+                disable_auto_review: Some(true),
+                allow_global_persistent_approval: Some(false),
+                default_origin_policy: Some(BrowserUseOriginPolicy {
+                    access: Some(AllowDenyRequirement::Deny),
+                    downloads: Some(AllowDenyRequirement::Allow),
+                    uploads: Some(AllowDenyRequirement::Deny),
+                    full_cdp_access: Some(AllowDenyRequirement::Allow),
+                    auto_review: Some(AllowDenyRequirement::Deny),
+                    persistent_approval: Some(false),
+                    access_approval_lifetime: Some(BrowserUseAccessApprovalLifetime::Turn),
+                }),
+                origins: Some(BTreeMap::from([(
+                    "https://example.com".to_string(),
+                    BrowserUseOriginPolicy {
+                        access: Some(AllowDenyRequirement::Allow),
+                        downloads: Some(AllowDenyRequirement::Deny),
+                        uploads: Some(AllowDenyRequirement::Allow),
+                        full_cdp_access: Some(AllowDenyRequirement::Deny),
+                        auto_review: Some(AllowDenyRequirement::Deny),
+                        persistent_approval: Some(true),
+                        access_approval_lifetime: Some(BrowserUseAccessApprovalLifetime::Thread),
+                    },
+                )])),
+            })
+        );
+        assert_eq!(
+            mapped.computer_use,
+            Some(ComputerUseRequirements {
+                allow_locked_computer_use: Some(false),
+                allow_persistent_approval: Some(false),
+                default_app_access: Some(AllowDenyRequirement::Deny),
+                macos: Some(ComputerUseMacosRequirements {
+                    bundle_ids: Some(BTreeMap::from([(
+                        "com.apple.Safari".to_string(),
+                        AllowDenyRequirement::Allow,
+                    )])),
+                }),
+                windows: Some(ComputerUseWindowsRequirements {
+                    aumids: Some(BTreeMap::from([(
+                        "Microsoft.Paint_8wekyb3d8bbwe!App".to_string(),
+                        AllowDenyRequirement::Allow,
+                    )])),
+                    exes: Some(vec![ComputerUseWindowsExeRequirement {
+                        publisher_name: "CN=Google LLC".to_string(),
+                        product_name: "Google Chrome".to_string(),
+                        binary_name: Some("chrome.exe".to_string()),
+                        access: AllowDenyRequirement::Deny,
+                    }]),
+                }),
+            })
         );
     }
 
     #[test]
     fn requirements_api_includes_allowed_windows_sandbox_implementations() {
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
+        let mapped = map_test_requirements(ConfigRequirementsToml {
             windows: Some(WindowsRequirementsToml {
                 allowed_sandbox_implementations: Some(vec![
-                    codex_config::types::WindowsSandboxModeToml::Elevated,
-                    codex_config::types::WindowsSandboxModeToml::Unelevated,
+                    codex_config::WindowsSandboxImplementationToml::Elevated,
+                    codex_config::WindowsSandboxImplementationToml::Unelevated,
                 ]),
+                allow_mxc: None,
             }),
             ..ConfigRequirementsToml::default()
         });
@@ -699,9 +1226,46 @@ mod tests {
         assert_eq!(
             mapped.allowed_windows_sandbox_implementations,
             Some(vec![
-                WindowsSandboxSetupMode::Elevated,
-                WindowsSandboxSetupMode::Unelevated,
+                WindowsSandboxImplementation::Elevated,
+                WindowsSandboxImplementation::Unelevated,
             ])
+        );
+    }
+
+    #[test]
+    fn requirements_api_includes_exact_managed_values() {
+        let sqlite_home = AbsolutePathBuf::try_from(std::env::temp_dir().join("managed-state"))
+            .expect("managed sqlite home should be absolute");
+        let log_dir = AbsolutePathBuf::try_from(std::env::temp_dir().join("managed-logs"))
+            .expect("managed log dir should be absolute");
+        let model_catalog_json =
+            AbsolutePathBuf::try_from(std::env::temp_dir().join("managed-models.json"))
+                .expect("managed model catalog path should be absolute");
+        let mapped = map_test_requirements(ConfigRequirementsToml {
+            sqlite_home: Some(sqlite_home.clone()),
+            log_dir: Some(log_dir.clone()),
+            model_catalog_json: Some(model_catalog_json.clone()),
+            check_for_update_on_startup: Some(false),
+            allow_login_shell: Some(false),
+            feedback: Some(FeedbackConfigToml {
+                enabled: Some(false),
+            }),
+            ..ConfigRequirementsToml::default()
+        });
+
+        assert_eq!(mapped.sqlite_home, Some(PathUri::from(sqlite_home)));
+        assert_eq!(mapped.log_dir, Some(PathUri::from(log_dir)));
+        assert_eq!(
+            mapped.model_catalog_json,
+            Some(PathUri::from(model_catalog_json))
+        );
+        assert_eq!(mapped.check_for_update_on_startup, Some(false));
+        assert_eq!(mapped.allow_login_shell, Some(false));
+        assert_eq!(
+            mapped.feedback,
+            Some(FeedbackRequirements {
+                enabled: Some(false),
+            })
         );
     }
 }

@@ -3,12 +3,11 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::strip_user_message_prefix;
 use regex::Regex;
 use regex::RegexBuilder;
@@ -17,6 +16,8 @@ use tokio::process::Command;
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
 use super::compression;
+use crate::ResponseItemEnvelope;
+use crate::RolloutItem;
 
 const MATCH_CONTEXT_BEFORE_CHARS: usize = 48;
 const MATCH_CONTEXT_AFTER_CHARS: usize = 96;
@@ -70,7 +71,7 @@ async fn ripgrep_rollout_paths(
         return Ok(Some(HashSet::new()));
     }
 
-    let output = match Command::new(rg_command)
+    let output = match Command::from(codex_utils_process::background_command(rg_command))
         .arg("-l")
         .arg("--fixed-strings")
         .arg("--ignore-case")
@@ -80,6 +81,7 @@ async fn ripgrep_rollout_paths(
         .arg("--")
         .arg(search_term)
         .arg(root)
+        .stdin(Stdio::null())
         .output()
         .await
     {
@@ -144,7 +146,16 @@ async fn scan_rollout_matches(
             };
             if rollout_file.is_compressed() {
                 if let Some(snippet) =
-                    first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
+                    first_rollout_content_match_snippet(rollout_file.path(), search_term)
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                path = %rollout_file.path().display(),
+                                %err,
+                                "Failed to search compressed rollout"
+                            );
+                            None
+                        })
                 {
                     matches.insert(
                         compression::plain_rollout_path(rollout_file.path()),
@@ -176,17 +187,18 @@ pub async fn first_rollout_content_match_snippet(
     path: &Path,
     search_term: &str,
 ) -> io::Result<Option<String>> {
-    let mut lines = compression::open_rollout_line_reader(path).await?;
+    let lines = compression::open_rollout_line_reader(path).await?;
     let json_search_term = case_insensitive_literal_regex(json_escaped_search_term(search_term)?)?;
     let search_term = case_insensitive_literal_regex(search_term)?;
-    while let Some(line) = lines.next_line().await? {
-        if json_search_term.is_match(line.as_str())
-            && let Some(snippet) = content_match_snippet(line.as_str(), &search_term)
-        {
-            return Ok(Some(snippet));
-        }
-    }
-    Ok(None)
+    lines
+        .find_map(move |line| {
+            if json_search_term.is_match(line) {
+                content_match_snippet(line, &search_term)
+            } else {
+                None
+            }
+        })
+        .await
 }
 
 async fn scan_compressed_rollout_matches(
@@ -219,7 +231,16 @@ async fn scan_compressed_rollout_matches(
                 continue;
             }
             if let Some(snippet) =
-                first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
+                first_rollout_content_match_snippet(rollout_file.path(), search_term)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            path = %rollout_file.path().display(),
+                            %err,
+                            "Failed to search compressed rollout"
+                        );
+                        None
+                    })
             {
                 matches.insert(
                     compression::plain_rollout_path(rollout_file.path()),
@@ -245,7 +266,7 @@ fn case_insensitive_literal_regex(search_term: impl AsRef<str>) -> io::Result<Re
 }
 
 fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String> {
-    let rollout_line = serde_json::from_str::<RolloutLine>(jsonl_line.trim()).ok()?;
+    let rollout_line = crate::parse_rollout_line(jsonl_line.trim()).ok()?;
     let text = conversation_text_from_item(&rollout_line.item)?;
     excerpt_around_match(text.as_str(), search_term)
 }
@@ -267,7 +288,10 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
                 Some(agent.message.trim().to_string())
             }
         }
-        RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) => {
+        RolloutItem::ResponseItem(ResponseItemEnvelope {
+            item: ResponseItem::Message { role, content, .. },
+            ..
+        }) => {
             let text = content
                 .iter()
                 .filter_map(content_item_text)
@@ -286,6 +310,10 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_) => None,
     }
 }

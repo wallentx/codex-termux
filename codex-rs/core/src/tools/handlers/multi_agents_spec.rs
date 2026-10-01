@@ -1,5 +1,5 @@
-use super::multi_agents_common::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
-use super::multi_agents_common::model_supports_multi_agent_backend;
+use crate::agent::child_config::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
+use crate::agent::child_config::model_supports_multi_agent_backend;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::JsonSchema;
@@ -15,11 +15,12 @@ pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 
 const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
+const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE_V2: &str = "Spawned agents inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model.";
+const SPAWN_AGENT_MODEL_CATALOG_GUIDANCE: &str =
+    "Pick model overrides from the latest <model_catalog> listing.";
 const SPAWN_AGENT_TYPE_OVERRIDE_DESCRIPTION_V1: &str = "Agent type override for the new agent. Omit to inherit the parent agent type with a full-history fork; otherwise, `default` is used.";
 const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
     "Model override for the new agent. Omit unless an explicit override is needed.";
-const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
-    "Service tier override for the new agent. Omit unless explicitly requested.";
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub struct SpawnAgentToolOptions {
     pub hide_agent_type_model_reasoning: bool,
     pub expose_spawn_agent_model_overrides: bool,
     pub multi_agent_version: MultiAgentVersion,
+    pub model_catalog_in_context: bool,
     pub usage_hint_text: Option<String>,
 }
 
@@ -42,6 +44,7 @@ impl Default for SpawnAgentToolOptions {
             hide_agent_type_model_reasoning: false,
             expose_spawn_agent_model_overrides: false,
             multi_agent_version: MultiAgentVersion::Disabled,
+            model_catalog_in_context: false,
             usage_hint_text: None,
         }
     }
@@ -65,9 +68,11 @@ impl Default for WaitAgentTimeoutOptions {
 }
 
 pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
-    let available_models_description = (!options.hide_agent_type_model_reasoning).then(|| {
-        spawn_agent_models_description(&options.available_models, options.multi_agent_version)
-    });
+    let available_models_description = (!options.model_catalog_in_context
+        && !options.hide_agent_type_model_reasoning)
+        .then(|| {
+            spawn_agent_models_description(&options.available_models, options.multi_agent_version)
+        });
     let inherited_model_guidance =
         (!options.hide_agent_type_model_reasoning).then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
     let return_value_description =
@@ -87,6 +92,7 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
             name: "spawn_agent".to_string(),
             description: spawn_agent_tool_description(
                 available_models_description.as_deref(),
+                options.model_catalog_in_context,
                 inherited_model_guidance,
                 return_value_description,
                 options.usage_hint_text,
@@ -94,24 +100,31 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
-            output_schema: Some(spawn_agent_output_schema_v1()),
+            output_schema: Some(spawn_agent_output_schema_v1().into()),
         })],
     })
 }
 
-pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
-    let available_models_description = options.expose_spawn_agent_model_overrides.then(|| {
-        spawn_agent_models_description(&options.available_models, options.multi_agent_version)
-    });
-    let inherited_model_guidance = (options.expose_spawn_agent_model_overrides
-        && !options.hide_agent_type_model_reasoning)
-        .then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
+pub fn create_spawn_agent_tool_v2(
+    options: SpawnAgentToolOptions,
+    description_override: Option<&str>,
+) -> ToolSpec {
+    let available_models_description = (!options.model_catalog_in_context
+        && options.expose_spawn_agent_model_overrides)
+        .then(|| {
+            spawn_agent_models_description(&options.available_models, options.multi_agent_version)
+        });
+    let inherited_model_guidance = if options.model_catalog_in_context {
+        options
+            .expose_spawn_agent_model_overrides
+            .then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE_V2)
+    } else {
+        (options.expose_spawn_agent_model_overrides && !options.hide_agent_type_model_reasoning)
+            .then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE)
+    };
     let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
     if !options.expose_agent_type {
         properties.remove("agent_type");
-    }
-    if options.hide_agent_type_model_reasoning {
-        properties.remove("service_tier");
     }
     if !options.expose_spawn_agent_model_overrides {
         properties.remove("model");
@@ -129,8 +142,13 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
         name: "spawn_agent".to_string(),
         description: spawn_agent_tool_description_v2(
             available_models_description.as_deref(),
+            options.model_catalog_in_context,
+            options
+                .expose_spawn_agent_model_overrides
+                .then_some(SPAWN_AGENT_MODEL_CATALOG_GUIDANCE),
             inherited_model_guidance,
             options.usage_hint_text,
+            description_override,
         ),
         strict: false,
         defer_loading: None,
@@ -139,9 +157,9 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
             Some(vec!["task_name".to_string(), "message".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(spawn_agent_output_schema_v2(
-            options.hide_agent_type_model_reasoning,
-        )),
+        output_schema: Some(
+            spawn_agent_output_schema_v2(options.hide_agent_type_model_reasoning).into(),
+        ),
     })
 }
 
@@ -178,7 +196,7 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
-            output_schema: Some(send_input_output_schema()),
+            output_schema: Some(send_input_output_schema().into()),
         })],
     })
 }
@@ -261,7 +279,7 @@ pub fn create_resume_agent_tool() -> ToolSpec {
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(properties, Some(vec!["id".to_string()]), Some(false.into())),
-            output_schema: Some(resume_agent_output_schema()),
+            output_schema: Some(resume_agent_output_schema().into()),
         })],
     })
 }
@@ -277,7 +295,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
             strict: false,
             defer_loading: None,
             parameters: wait_agent_tool_parameters_v1(options),
-            output_schema: Some(wait_output_schema_v1()),
+            output_schema: Some(wait_output_schema_v1().into()),
         })],
     })
 }
@@ -290,7 +308,7 @@ pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
         strict: false,
         defer_loading: None,
         parameters: wait_agent_tool_parameters_v2(options),
-        output_schema: Some(wait_output_schema_v2()),
+        output_schema: Some(wait_output_schema_v2().into()),
     })
 }
 
@@ -311,7 +329,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
-        output_schema: Some(list_agents_output_schema()),
+        output_schema: Some(list_agents_output_schema().into()),
     })
 }
 
@@ -330,9 +348,12 @@ pub fn create_close_agent_tool_v1() -> ToolSpec {
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
-            output_schema: Some(agent_previous_status_output_schema(
-                "The agent status observed before shutdown was requested.",
-            )),
+            output_schema: Some(
+                agent_previous_status_output_schema(
+                    "The agent status observed before shutdown was requested.",
+                )
+                .into(),
+            ),
         })],
     })
 }
@@ -351,9 +372,12 @@ pub fn create_interrupt_agent_tool_v2() -> ToolSpec {
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
-        output_schema: Some(agent_previous_status_output_schema(
-            "The agent status observed before the interrupt request was handled.",
-        )),
+        output_schema: Some(
+            agent_previous_status_output_schema(
+                "The agent status observed before the interrupt request was handled.",
+            )
+            .into(),
+        ),
     })
 }
 
@@ -517,7 +541,7 @@ fn wait_output_schema_v2() -> Value {
         "properties": {
             "message": {
                 "type": "string",
-                "description": "Brief wait summary without the agent's final content."
+                "description": "Brief wait summary without the agent's final content, including any timeout adjustment."
             },
             "timed_out": {
                 "type": "boolean",
@@ -619,12 +643,6 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
                     .to_string(),
             )),
         ),
-        (
-            "service_tier".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
-            )),
-        ),
     ])
 }
 
@@ -640,7 +658,7 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(format!(
-                "Agent type override for the new agent. Omit unless explicitly asked. Set `fork_turns` to `none` or a positive integer when an explicit override is needed.\n{agent_type_description}"
+                "Agent type override for the new agent. Omit unless explicitly asked. The selected role applies regardless of how much parent history is inherited.\n{agent_type_description}"
             ))),
         ),
         (
@@ -663,12 +681,6 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
                     .to_string(),
             )),
         ),
-        (
-            "service_tier".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
-            )),
-        ),
     ])
 }
 
@@ -676,23 +688,34 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("agent_type");
     properties.remove("model");
     properties.remove("reasoning_effort");
-    properties.remove("service_tier");
 }
 
 fn spawn_agent_tool_description(
     available_models_description: Option<&str>,
+    model_catalog_in_context: bool,
     inherited_model_guidance: Option<&str>,
     return_value_description: &str,
     usage_hint_text: Option<String>,
 ) -> String {
-    let agent_role_guidance = available_models_description.unwrap_or_default();
+    let model_catalog_guidance = inherited_model_guidance
+        .map(|_| SPAWN_AGENT_MODEL_CATALOG_GUIDANCE)
+        .unwrap_or_default();
     let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
 
-    let tool_description = format!(
-        r#"
-        {agent_role_guidance}
+    let tool_description = if model_catalog_in_context {
+        format!(
+            r#"
+        Spawn a sub-agent for a well-scoped task. {return_value_description} {inherited_model_guidance}
+{model_catalog_guidance}"#
+        )
+    } else {
+        let available_models_description = available_models_description.unwrap_or_default();
+        format!(
+            r#"
+        {available_models_description}
         Spawn a sub-agent for a well-scoped task. {return_value_description} {inherited_model_guidance}"#
-    );
+        )
+    };
 
     if let Some(usage_hint_text) = usage_hint_text {
         return format!(
@@ -701,19 +724,20 @@ fn spawn_agent_tool_description(
 {usage_hint_text}"#
         );
     }
-    let agent_role_usage_hint = available_models_description
-        .map(|_| {
-            "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
-        })
-        .unwrap_or_default();
+    let agent_role_usage_hint = if model_catalog_in_context {
+        ""
+    } else if available_models_description.is_some() {
+        "\nAgent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
+    } else {
+        "\n"
+    };
     format!(
         r#"
         {tool_description}
-This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
+This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model. You should follow the rules and guidelines below to use this tool.
 
 Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
-Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
-{agent_role_usage_hint}
+Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.{agent_role_usage_hint}
 
 ### When to delegate vs. do the subtask yourself
 - First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
@@ -748,25 +772,43 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 
 fn spawn_agent_tool_description_v2(
     available_models_description: Option<&str>,
+    model_catalog_in_context: bool,
+    model_catalog_guidance: Option<&str>,
     inherited_model_guidance: Option<&str>,
     usage_hint_text: Option<String>,
+    description: Option<&str>,
 ) -> String {
-    let agent_role_guidance = available_models_description.unwrap_or_default();
+    let model_catalog_guidance = model_catalog_guidance.unwrap_or_default();
     let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
 
-    let tool_description = format!(
-        r#"
-        {agent_role_guidance}
-        Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
+    let (catalog_prefix, catalog_suffix) = if model_catalog_in_context {
+        (String::new(), format!("\n{model_catalog_guidance}"))
+    } else {
+        let available_models_description = available_models_description.unwrap_or_default();
+        (
+            format!("        {available_models_description}\n"),
+            String::new(),
+        )
+    };
+    let tool_description = if let Some(description) = description {
+        format!(
+            r#"
+{catalog_prefix}        {description}
+{inherited_model_guidance}{catalog_suffix}"#
+        )
+    } else {
+        format!(
+            r#"
+{catalog_prefix}        Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
 You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
 The spawned agent will have the same tools as you and the ability to spawn its own subagents.
-{inherited_model_guidance}
-Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
+{inherited_model_guidance}{catalog_suffix}
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
 
 Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
-    );
+        )
+    };
 
     if let Some(usage_hint_text) = usage_hint_text {
         return format!(

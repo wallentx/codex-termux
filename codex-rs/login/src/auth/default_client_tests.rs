@@ -47,6 +47,71 @@ fn test_get_codex_user_agent() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn os_discovery_is_cached_without_freezing_user_agent_overrides() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const PROBE_DIR: &str = "CODEX_TEST_USER_AGENT_PROBE_DIR";
+    if std::env::var_os(PROBE_DIR).is_some() {
+        // Race the first lookup as well as exercising repeated requests.
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..4 {
+                        assert!(get_codex_user_agent().contains("Ubuntu 99.7.3"));
+                    }
+                });
+            }
+        });
+        set_default_originator("cached-os-test".to_string()).expect("set originator");
+        *USER_AGENT_SUFFIX.lock().expect("suffix lock") = Some("updated-client".to_string());
+        let user_agent = get_codex_user_agent();
+        assert!(user_agent.starts_with("cached-os-test/"));
+        assert!(user_agent.ends_with(" (updated-client)"));
+        return;
+    }
+
+    // Use a fresh process so neither the cached OS nor the mutable overrides can
+    // be initialized by another test. Only the child's environment is changed.
+    let temp = tempfile::tempdir().expect("probe directory");
+    for (program, output) in [
+        ("lsb_release", "Distributor ID: Ubuntu\nRelease: 99.7.3\n"),
+        ("getconf", "64\n"),
+    ] {
+        let script = temp.path().join(program);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '{program}\\n' >> \"${PROBE_DIR}/calls\"\nprintf '{output}'\n"
+            ),
+        )
+        .expect("write probe");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make probe executable");
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            concat!(
+                module_path!(),
+                "::os_discovery_is_cached_without_freezing_user_agent_overrides"
+            )
+            .trim_start_matches("codex_login::"),
+            "--nocapture",
+        ])
+        .env(PROBE_DIR, temp.path())
+        .env("PATH", temp.path())
+        .env_remove(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR)
+        .output()
+        .expect("run isolated user-agent test");
+    assert!(output.status.success(), "{output:?}");
+    let calls = std::fs::read_to_string(temp.path().join("calls")).expect("probe calls");
+    let mut calls = calls.lines().collect::<Vec<_>>();
+    calls.sort_unstable();
+    assert_eq!(calls, vec!["getconf", "lsb_release"]);
+}
+
+#[test]
 fn is_first_party_originator_matches_known_values() {
     assert_eq!(is_first_party_originator(DEFAULT_ORIGINATOR), true);
     assert_eq!(is_first_party_originator("codex-tui"), true);
@@ -198,8 +263,11 @@ async fn raw_auth_client_does_not_log_sensitive_request_or_response_data() {
     let endpoint = format!(
         "http://auth-user:password-secret-value@{authority}/token?client_secret=query-secret-value"
     );
-    let client = create_raw_auth_client(&endpoint, /*auth_route_config*/ None)
-        .expect("raw auth client should build");
+    let client = create_raw_auth_client(
+        &endpoint,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .expect("raw auth client should build");
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
@@ -228,9 +296,11 @@ async fn raw_auth_client_does_not_log_sensitive_request_or_response_data() {
     let unresponsive_endpoint = format!(
         "http://auth-user:failure-password-secret-value@{unresponsive_addr}/token?client_secret=failure-query-secret-value"
     );
-    let unresponsive_client =
-        create_raw_auth_client(&unresponsive_endpoint, /*auth_route_config*/ None)
-            .expect("raw auth client should build");
+    let unresponsive_client = create_raw_auth_client(
+        &unresponsive_endpoint,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .expect("raw auth client should build");
     let error = unresponsive_client
         .post(&unresponsive_endpoint)
         .header("x-sensitive-request", "failure-request-header-secret-value")

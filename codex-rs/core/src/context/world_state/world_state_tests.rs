@@ -1,4 +1,6 @@
 use super::*;
+use codex_context_fragments::AnnotatedContent;
+use codex_protocol::models::ContentItemKind;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use serde::Serialize;
@@ -15,27 +17,29 @@ impl WorldStateSection for TestSection {
     const ID: &'static str = "test";
     type Snapshot = Self;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        self.clone()
-    }
-
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        match previous {
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = self.clone();
+        let fragment: Option<Box<dyn ContextualUserFragment>> = match previous {
             PreviousSectionState::Known(previous) if self.value != previous.value => {
                 Some(Box::new(TestFragment(self.value.clone())))
             }
             PreviousSectionState::Unknown => Some(Box::new(TestFragment("unknown".to_string()))),
             PreviousSectionState::Absent | PreviousSectionState::Known(_) => None,
-        }
+        };
+        (Some(current), fragment)
     }
 }
 
 struct TestFragment(String);
 
 impl ContextualUserFragment for TestFragment {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("generic.test".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -67,13 +71,11 @@ impl WorldStateSection for DuplicateTestSection {
     const ID: &'static str = "test";
     type Snapshot = ();
 
-    fn snapshot(&self) -> Self::Snapshot {}
-
     fn render_diff(
         &self,
         _previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        None
+    ) -> SectionTransition<Self::Snapshot> {
+        (Some(()), None)
     }
 }
 
@@ -87,7 +89,7 @@ fn snapshot_uses_stable_section_ids_and_omits_null_fields() {
     });
 
     assert_eq!(
-        serde_json::to_value(world_state.snapshot()).expect("serialize world-state snapshot"),
+        serde_json::to_value(world_state.render_full().0).expect("serialize world-state snapshot"),
         json!({"test": {"value": "current", "array": [{"value": null}]}})
     );
 }
@@ -107,7 +109,9 @@ fn render_diff_restores_the_typed_section_snapshot() {
         array: Vec::new(),
     });
 
-    let rendered = current.render_diff(&previous.snapshot());
+    let rendered = current
+        .render_history_diff(Some(&previous.render_full().0), &[])
+        .1;
 
     assert_eq!(
         vec!["after"],
@@ -123,30 +127,34 @@ fn extension_owned_section_uses_its_snapshot_and_renderer() {
     let mut world_state = WorldState::default();
     world_state.add_extension_section(WorldStateSectionContribution::new(
         "extension_test",
-        json!({"value": "after", "optional": null}),
-        |previous| match previous {
-            PreviousWorldStateSection::Known(previous)
-                if previous == &json!({"value": "before"}) =>
-            {
-                Some(RenderedWorldStateFragment::new(
-                    "developer",
-                    ("<extension_test>", "</extension_test>"),
-                    "after",
-                ))
-            }
-            PreviousWorldStateSection::Absent
-            | PreviousWorldStateSection::Unknown
-            | PreviousWorldStateSection::Known(_) => None,
+        |previous| {
+            (
+                Some(json!({"value": "after", "optional": null})),
+                match previous {
+                    PreviousWorldStateSection::Known(previous)
+                        if previous == &json!({"value": "before"}) =>
+                    {
+                        Some(RenderedWorldStateFragment::new(
+                            "developer",
+                            ("<extension_test>", "</extension_test>"),
+                            "after",
+                        ))
+                    }
+                    PreviousWorldStateSection::Absent
+                    | PreviousWorldStateSection::Unknown
+                    | PreviousWorldStateSection::Known(_) => None,
+                },
+            )
         },
     ));
     let previous = WorldStateSnapshot {
         sections: BTreeMap::from([("extension_test".to_string(), json!({"value": "before"}))]),
     };
 
-    let rendered = world_state.render_diff(&previous);
+    let rendered = world_state.render_history_diff(Some(&previous), &[]).1;
 
     assert_eq!(
-        serde_json::to_value(world_state.snapshot()).expect("serialize world-state snapshot"),
+        serde_json::to_value(world_state.render_full().0).expect("serialize world-state snapshot"),
         json!({"extension_test": {"value": "after"}})
     );
     assert_eq!(rendered.len(), 1);
@@ -158,26 +166,62 @@ fn extension_owned_section_uses_its_snapshot_and_renderer() {
 }
 
 #[test]
+fn extension_owned_section_uses_its_stable_id_as_content_kind_feature() {
+    let mut world_state = WorldState::default();
+    world_state.add_extension_section(WorldStateSectionContribution::new("extension_test", |_| {
+        (
+            Some(json!({"value": "after"})),
+            Some(RenderedWorldStateFragment::new(
+                "developer",
+                ("<extension_test>", "</extension_test>"),
+                "after",
+            )),
+        )
+    }));
+
+    let rendered = world_state
+        .render_history_diff(Some(&WorldStateSnapshot::default()), &[])
+        .1;
+
+    assert_eq!(
+        rendered
+            .into_iter()
+            .map(|fragment| fragment.render_fragment().into_parts())
+            .collect::<Vec<_>>(),
+        vec![(
+            "developer",
+            AnnotatedContent::input_text(
+                "<extension_test>after</extension_test>",
+                ContentItemKind("extension_test.instructions".to_string()),
+            ),
+        )]
+    );
+}
+
+#[test]
 fn missing_retained_fragment_is_rendered_again() {
     let mut world_state = WorldState::default();
     world_state.add_extension_section(
-        WorldStateSectionContribution::new(
-            "extension_test",
-            json!({"body": "current catalog"}),
-            |previous| match previous {
-                PreviousWorldStateSection::Absent => Some(RenderedWorldStateFragment::new(
-                    "developer",
-                    ("<extension_test>", "</extension_test>"),
-                    "current catalog",
-                )),
-                PreviousWorldStateSection::Unknown | PreviousWorldStateSection::Known(_) => None,
-            },
-        )
+        WorldStateSectionContribution::new("extension_test", |previous| {
+            (
+                Some(json!({"body": "current catalog"})),
+                match previous {
+                    PreviousWorldStateSection::Absent => Some(RenderedWorldStateFragment::new(
+                        "developer",
+                        ("<extension_test>", "</extension_test>"),
+                        "current catalog",
+                    )),
+                    PreviousWorldStateSection::Unknown | PreviousWorldStateSection::Known(_) => {
+                        None
+                    }
+                },
+            )
+        })
         .with_retained_fragment_matcher(|role, text| {
             role == "developer" && text.contains("current catalog")
         }),
     );
-    let previous = world_state.snapshot();
+    let previous = world_state.render_full().0;
     let retained = ResponseItem::Message {
         id: None,
         role: "developer".to_string(),
@@ -191,6 +235,7 @@ fn missing_retained_fragment_is_rendered_again() {
     assert_eq!(
         world_state
             .render_history_diff(Some(&previous), &[])
+            .1
             .into_iter()
             .map(|fragment| fragment.body())
             .collect::<Vec<_>>(),
@@ -199,8 +244,39 @@ fn missing_retained_fragment_is_rendered_again() {
     assert!(
         world_state
             .render_history_diff(Some(&previous), &[retained])
+            .1
             .is_empty()
     );
+}
+
+#[test]
+fn extension_snapshot_updates_preserve_skipped_state() {
+    let previous = WorldStateSnapshot {
+        sections: BTreeMap::from([("extension_test".to_string(), json!({"published": true}))]),
+    };
+    let mut removed = WorldState::default();
+    removed.add_extension_section(WorldStateSectionContribution::new("extension_test", |_| {
+        (Some(Value::Null), None)
+    }));
+    let (snapshot, fragments) = removed.render_history_diff(Some(&previous), &[]);
+    assert!(fragments.is_empty());
+    assert_eq!(snapshot, WorldStateSnapshot::default());
+    assert_eq!(
+        snapshot.merge_patch_from(&previous).unwrap()["extension_test"],
+        Value::Null
+    );
+
+    let mut invalidated = WorldState::default();
+    invalidated.add_extension_section(
+        WorldStateSectionContribution::new("extension_test", |previous| {
+            assert!(matches!(previous, PreviousWorldStateSection::Absent));
+            (None, None)
+        })
+        .with_retained_fragment_matcher(|_, _| false),
+    );
+    let (snapshot, fragments) = invalidated.render_history_diff(Some(&previous), &[]);
+    assert!(fragments.is_empty());
+    assert_eq!(snapshot, previous);
 }
 
 #[test]
@@ -215,7 +291,7 @@ fn unreadable_section_snapshot_is_treated_as_unknown() {
         sections: BTreeMap::from([("test".to_string(), json!({"invalid": true}))]),
     };
 
-    let rendered = current.render_diff(&previous);
+    let rendered = current.render_history_diff(Some(&previous), &[]).1;
 
     assert_eq!(
         vec!["unknown"],
@@ -258,19 +334,16 @@ fn snapshot_merge_patch_changes_and_removes_nested_values() {
     };
 
     assert_eq!(
-        current.merge_patch_from(&previous),
+        current.merge_patch_from(&previous).map(Value::Object),
         Some(json!({
             "kept": {"changed": "after", "removed": null},
             "removed_section": null,
         }))
     );
-    previous
-        .apply_merge_patch(
-            &current
-                .merge_patch_from(&previous)
-                .expect("changed snapshots should produce a patch"),
-        )
-        .expect("apply world-state merge patch");
+    let patch = current
+        .merge_patch_from(&previous)
+        .expect("changed snapshots should produce a patch");
+    previous.apply_merge_patch(&patch);
     assert_eq!(previous, current);
     assert_eq!(current.merge_patch_from(&current), None);
 }

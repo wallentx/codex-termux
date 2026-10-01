@@ -1,11 +1,12 @@
 //! Helpers for rendering and navigating multi-agent state in the TUI.
 //!
-//! This module owns the shared presentation contracts for multi-agent history rows, `/agent` picker
-//! entries, and the fast-switch keyboard shortcuts. Higher-level coordination, such as deciding
-//! which thread becomes active or when a thread closes, stays in [`crate::app::App`].
+//! This module owns the shared presentation contracts for multi-agent history rows, `/subagents`
+//! picker entries, and the fast-switch keyboard shortcuts. Higher-level coordination, such as
+//! deciding which thread becomes active or when a thread closes, stays in [`crate::app::App`].
 
 use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
+use crate::style::accent_color;
 use crate::text_formatting::truncate_text;
 use codex_app_server_protocol::CollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus;
@@ -223,6 +224,11 @@ pub(crate) fn tool_call_history_cell(
     let prompt = prompt.as_deref().unwrap_or_default();
 
     match tool {
+        // V2 uses SubAgentActivity for display; these variants are analytics-only.
+        CollabAgentTool::SendMessage
+        | CollabAgentTool::FollowupTask
+        | CollabAgentTool::InterruptAgent
+        | CollabAgentTool::ListAgents => None,
         CollabAgentTool::SpawnAgent => {
             if matches!(status, CollabAgentToolCallStatus::InProgress) {
                 return None;
@@ -291,7 +297,7 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
     let is_running_hint = match kind {
         SubAgentActivityKind::Started => true,
         SubAgentActivityKind::Interacted => return None,
-        SubAgentActivityKind::Interrupted => false,
+        SubAgentActivityKind::Interrupted | SubAgentActivityKind::Completed => false,
     };
     Some(SubAgentActivityDisplay {
         thread_id: parse_thread_id(agent_thread_id)?,
@@ -313,23 +319,16 @@ pub(crate) fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<Plain
     ))
 }
 
-pub(crate) fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path: &str) -> String {
-    match kind {
-        SubAgentActivityKind::Started => format!("Started `{agent_path}`"),
-        SubAgentActivityKind::Interacted => format!("Interacted with `{agent_path}`"),
-        SubAgentActivityKind::Interrupted => format!("Interrupted `{agent_path}`"),
-    }
-}
-
 fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Line<'static> {
     let (prefix, path) = match kind {
         SubAgentActivityKind::Started => ("Started ", agent_path),
         SubAgentActivityKind::Interacted => ("Interacted with ", agent_path),
         SubAgentActivityKind::Interrupted => ("Interrupted ", agent_path),
+        SubAgentActivityKind::Completed => ("Completed ", agent_path),
     };
     title_spans_line(vec![
         Span::from(prefix).bold(),
-        Span::from(format!("`{path}`")).cyan(),
+        Span::from(format!("`{path}`")).fg(accent_color()),
     ])
 }
 
@@ -513,11 +512,11 @@ fn agent_label_spans(agent: AgentLabel<'_>) -> Vec<Span<'static>> {
     let role = agent.role.map(str::trim).filter(|role| !role.is_empty());
 
     if let Some(nickname) = nickname {
-        spans.push(Span::from(nickname.to_string()).cyan().bold());
+        spans.push(Span::from(nickname.to_string()).fg(accent_color()).bold());
     } else if let Some(thread_id) = agent.thread_id {
-        spans.push(Span::from(thread_id.to_string()).cyan());
+        spans.push(Span::from(thread_id.to_string()).fg(accent_color()));
     } else {
-        spans.push(Span::from("agent").cyan());
+        spans.push(Span::from("agent").fg(accent_color()));
     }
 
     if let Some(role) = role {
@@ -625,8 +624,8 @@ fn status_summary_line(status: Option<&CollabAgentState>, fallback_error: &str) 
 
 fn status_summary_spans(status: &CollabAgentState) -> Vec<Span<'static>> {
     match status.status {
-        CollabAgentStatus::PendingInit => vec![Span::from("Pending init").cyan()],
-        CollabAgentStatus::Running => vec![Span::from("Running").cyan().bold()],
+        CollabAgentStatus::PendingInit => vec![Span::from("Pending init").fg(accent_color())],
+        CollabAgentStatus::Running => vec![Span::from("Running").fg(accent_color()).bold()],
         // Allow `.yellow()`
         #[allow(clippy::disallowed_methods)]
         CollabAgentStatus::Interrupted => vec![Span::from("Interrupted").yellow()],
@@ -689,6 +688,26 @@ mod tests {
         };
 
         assert_eq!(sub_agent_activity_display(&item), None);
+    }
+
+    #[test]
+    fn completed_sub_agent_activity_stops_running_liveness() {
+        let thread_id = ThreadId::new();
+        let item = ThreadItem::SubAgentActivity {
+            id: "activity-1".to_string(),
+            kind: SubAgentActivityKind::Completed,
+            agent_thread_id: thread_id.to_string(),
+            agent_path: "/root/child".to_string(),
+        };
+
+        assert_eq!(
+            sub_agent_activity_display(&item),
+            Some(SubAgentActivityDisplay {
+                thread_id,
+                agent_path: "/root/child".to_string(),
+                is_running_hint: false,
+            })
+        );
     }
 
     #[test]
@@ -890,7 +909,7 @@ mod tests {
         let lines = cell.display_lines(/*width*/ 200);
         let title = &lines[0];
         assert_eq!(title.spans[2].content.as_ref(), "Robie");
-        assert_eq!(title.spans[2].style.fg, Some(Color::Cyan));
+        assert_eq!(title.spans[2].style.fg, Some(accent_color()));
         assert!(title.spans[2].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(title.spans[4].content.as_ref(), "[explorer]");
         assert_eq!(title.spans[4].style.fg, None);

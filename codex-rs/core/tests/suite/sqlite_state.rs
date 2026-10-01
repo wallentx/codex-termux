@@ -1,11 +1,18 @@
 use anyhow::Result;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
@@ -15,13 +22,13 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::ThreadMetadataPatch;
 use codex_web_search_extension::install as install_web_search_extension;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
@@ -53,6 +60,145 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_creator_survives_resume_and_forks_use_current_auth() -> Result<()> {
+    use base64::Engine;
+
+    let server = start_mock_server().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    responses::sse(vec![ev_response_created("resp"), ev_completed("resp")]),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let chatgpt_auth = |user_id: &str, account_id: &str| {
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({"https://api.openai.com/auth": {"chatgpt_user_id": user_id}}).to_string(),
+        );
+        CodexAuth::from_external_chatgpt_tokens(
+            &format!("e30.{claims}.sig"),
+            account_id,
+            /*chatgpt_plan_type*/ None,
+        )
+    };
+    for auth in [
+        chatgpt_auth("creator-user", "creator-account")?,
+        CodexAuth::from_api_key("test"),
+    ] {
+        let expected_creator = (auth.get_chatgpt_user_id(), auth.get_account_id());
+        let mut builder = test_codex().with_auth(auth).with_config(|config| {
+            config
+                .features
+                .enable(Feature::Sqlite)
+                .expect("enable SQLite");
+        });
+        let test = builder.build_with_auto_env(&server).await?;
+        test.submit_turn("persist creator").await?;
+        let thread_id = test.session_configured.thread_id;
+        let rollout_path = test.codex.rollout_path().expect("rollout path");
+        test.codex.shutdown_and_wait().await?;
+        let meta = codex_rollout::read_session_meta_line(&rollout_path)
+            .await?
+            .meta;
+        let stored = test
+            .codex
+            .state_db()
+            .expect("SQLite")
+            .get_thread(thread_id)
+            .await?
+            .expect("thread");
+        assert_eq!(
+            (meta.creator_user_id, meta.creator_account_id),
+            expected_creator
+        );
+        assert_eq!(
+            (stored.creator_user_id, stored.creator_account_id),
+            expected_creator
+        );
+
+        let mut resume_builder = test_codex()
+            .with_auth(chatgpt_auth("resuming-user", "resuming-account")?)
+            .with_config(|config| {
+                config
+                    .features
+                    .enable(Feature::Sqlite)
+                    .expect("enable SQLite");
+            });
+        let resumed = resume_builder
+            .resume(&server, test.home.clone(), rollout_path.clone())
+            .await?;
+        resumed.submit_turn("resume under another account").await?;
+        resumed.codex.shutdown_and_wait().await?;
+        let meta = codex_rollout::read_session_meta_line(&rollout_path)
+            .await?
+            .meta;
+        let stored = resumed
+            .codex
+            .state_db()
+            .expect("SQLite")
+            .get_thread(thread_id)
+            .await?
+            .expect("thread");
+        assert_eq!(
+            (meta.creator_user_id, meta.creator_account_id),
+            expected_creator
+        );
+        assert_eq!(
+            (stored.creator_user_id, stored.creator_account_id),
+            expected_creator
+        );
+
+        let fork = resumed
+            .thread_manager
+            .fork_legacy_thread(
+                codex_core::ForkSnapshot::Interrupted,
+                StartThreadOptions::new(resumed.config.clone()),
+                rollout_path,
+            )
+            .await?;
+        fork.thread
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "persist fork".to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        wait_for_event(&fork.thread, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        let fork_path = fork.thread.rollout_path().expect("fork rollout");
+        fork.thread.shutdown_and_wait().await?;
+        let meta = codex_rollout::read_session_meta_line(&fork_path)
+            .await?
+            .meta;
+        let stored = fork
+            .thread
+            .state_db()
+            .expect("SQLite")
+            .get_thread(fork.thread_id)
+            .await?
+            .expect("fork");
+        let expected_fork = (
+            Some("resuming-user".to_string()),
+            Some("resuming-account".to_string()),
+        );
+        assert_eq!(
+            (meta.creator_user_id, meta.creator_account_id),
+            expected_fork
+        );
+        assert_eq!(
+            (stored.creator_user_id, stored.creator_account_id),
+            expected_fork
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_thread_is_recorded_in_state_db() -> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
@@ -65,7 +211,7 @@ async fn new_thread_is_recorded_in_state_db() -> Result<()> {
 
     let thread_id = test.session_configured.thread_id;
     let rollout_path = test.codex.rollout_path().expect("rollout path");
-    let db_path = codex_state::state_db_path(test.config.sqlite_home.as_path());
+    let db_path = test.config.sqlite.state_db_path();
 
     for _ in 0..100 {
         if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
@@ -104,6 +250,65 @@ async fn new_thread_is_recorded_in_state_db() -> Result<()> {
         rollout_path.exists(),
         "rollout should be materialized after first user message"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_metadata_is_persisted_on_first_turn() -> Result<()> {
+    let server = start_mock_server().await;
+    let _mock = mount_sse_once(
+        &server,
+        responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Sqlite)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    let thread_id = test.thread_manager.reserve_thread_id();
+    test.thread_store
+        .stage_pending_thread_metadata(
+            thread_id,
+            ThreadMetadataPatch {
+                name: Some(Some("staged-name".to_string())),
+                model_provider: Some("staged-provider".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut options = StartThreadOptions::new(test.config.clone());
+    options.reserved_thread_id = Some(thread_id);
+    let started = test.thread_manager.start_thread(options).await?;
+
+    started
+        .thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "persist staged metadata".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let db = test.codex.state_db().expect("state db enabled");
+    let metadata = db
+        .get_thread(started.thread_id)
+        .await?
+        .expect("thread should exist in state db");
+    let thread = started
+        .thread
+        .read_thread(
+            /*include_archived*/ false, /*include_history*/ false,
+        )
+        .await?;
+    assert_eq!(thread.name.as_deref(), Some("staged-name"));
+    assert_eq!(metadata.model_provider, test.config.model_provider_id);
 
     Ok(())
 }
@@ -151,7 +356,11 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     let base_test = builder.build(&server).await?;
     let started = base_test
         .thread_manager
-        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![dynamic_tool],
+            history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
         .await?;
     let rollout_path = started
         .session_configured
@@ -161,22 +370,17 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
 
     started
         .thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "persist this thread".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "persist this thread".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&started.thread, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
 
+    started.thread.shutdown_and_wait().await?;
     let mut resume_builder = test_codex().with_config(|config| {
         config
             .features
@@ -248,7 +452,10 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
     let base_test = builder.build(&server).await?;
     let started = base_test
         .thread_manager
-        .start_thread_with_tools(base_test.config.clone(), Vec::new())
+        .start_thread(StartThreadOptions {
+            history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
         .await?;
     let rollout_path = started
         .session_configured
@@ -258,16 +465,10 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
 
     started
         .thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "persist this thread".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "persist this thread".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&started.thread, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -356,12 +557,16 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
             fs::create_dir_all(parent).expect("should create rollout directory");
             let session_meta_line = SessionMetaLine {
                 meta: SessionMeta {
+                    creator_user_id: None,
+                    creator_account_id: None,
                     session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: None,
+                    forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
                     timestamp: "2026-01-27T12:00:00Z".to_string(),
                     cwd: codex_home.to_path_buf(),
+                    runtime_workspace_roots: None,
                     originator: "test".to_string(),
                     cli_version: "test".to_string(),
                     source: SessionSource::default(),
@@ -419,7 +624,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
 
     let test = builder.build(&server).await?;
 
-    let db_path = codex_state::state_db_path(test.config.sqlite_home.as_path());
+    let db_path = test.config.sqlite.state_db_path();
     let rollout_path = test.config.codex_home.join(&rollout_rel_path);
     let default_provider = test.config.model_provider_id.clone();
 
@@ -470,7 +675,7 @@ async fn user_messages_persist_in_state_db() -> Result<()> {
     });
     let test = builder.build(&server).await?;
 
-    let db_path = codex_state::state_db_path(test.config.sqlite_home.as_path());
+    let db_path = test.config.sqlite.state_db_path();
     for _ in 0..100 {
         if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
             break;
@@ -677,7 +882,10 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
                 environment_id: "local".to_string(),
                 enabled: true,
                 required: false,
+                startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
+                tool_input_schema_max_bytes: None,
+                omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(Duration::from_secs(10)),
                 tool_timeout_sec: None,
@@ -704,30 +912,27 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
         turn_permission_fields(PermissionProfile::read_only(), cwd.as_path());
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "call the rmcp echo tool".to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::McpToolCallEnd(_))
@@ -758,8 +963,8 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
     let server = start_mock_server().await;
     let call_id = "call-1";
     let args = json!({
-        "command": "echo hello",
-        "timeout_ms": 1_000,
+        "cmd": "echo hello",
+        "yield_time_ms": 1_000,
         "login": false,
     });
     let args_json = serde_json::to_string(&args)?;
@@ -768,7 +973,7 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
         vec![
             responses::sse(vec![
                 ev_response_created("resp-1"),
-                ev_function_call(call_id, "shell_command", &args_json),
+                ev_function_call(call_id, "exec_command", &args_json),
                 ev_completed("resp-1"),
             ]),
             responses::sse(vec![ev_completed("resp-2")]),
@@ -788,13 +993,14 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
 
     test.submit_turn("run a shell command").await?;
 
-    let log_db_layer = codex_state::log_db::start(db.clone());
+    let log_db_layer =
+        codex_state::log_db::start(db.clone(), Arc::new(codex_feedback::CodexFeedback::new()));
     let subscriber = tracing_subscriber::registry().with(log_db_layer.clone());
     let dispatch = tracing::Dispatch::new(subscriber);
     tracing::dispatcher::with_default(&dispatch, || {
         let span = tracing::info_span!("test_log_span", thread_id = %expected_thread_id);
         let _entered = span.enter();
-        tracing::info!("ToolCall: shell_command {{\"command\":\"echo hello\"}}");
+        tracing::info!("ToolCall: exec_command {{\"cmd\":\"echo hello\"}}");
     });
     log_db_layer.flush().await;
 
