@@ -281,7 +281,10 @@ impl App {
         ) {
             label_parts.push(format!("{} to switch", binding.display_label()));
         }
-        label_parts.push("ctrl+c to close".to_string());
+        label_parts.push(format!(
+            "{} to close",
+            crate::key_hint::ctrl(KeyCode::Char('c')).display_label()
+        ));
         self.chat_widget
             .set_side_conversation_context_label(Some(format!("Side {}", label_parts.join(" · "))));
     }
@@ -628,6 +631,7 @@ impl App {
         fork_config.model_reasoning_effort = self.chat_widget.current_reasoning_effort();
         fork_config.service_tier = self.chat_widget.configured_service_tier();
         fork_config.ephemeral = true;
+        fork_config.daybreak_enabled = false;
         fork_config.developer_instructions = Some(Self::side_developer_instructions(
             fork_config.developer_instructions.as_deref(),
         ));

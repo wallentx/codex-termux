@@ -43,6 +43,153 @@ use tokio_tungstenite::tungstenite::Message;
 pub(super) type RecordedRequests = Arc<Mutex<Vec<JSONRPCRequest>>>;
 pub(super) type RecordingAppServer = (AppServerSession, RecordedRequests, JoinHandle<Result<()>>);
 
+#[tokio::test]
+async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
+    use codex_protocol::openai_models::ModelAccessPrograms;
+    use codex_protocol::turn_input::CyberAccessProgram;
+
+    let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
+    let (mut server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let mut enabled_config = app.config.clone();
+    enabled_config.daybreak_enabled = true;
+    let startup = crate::app_server_session::start_thread_with_request_handle(
+        server.request_handle(),
+        &app.local_settings,
+        enabled_config.clone(),
+        crate::app_server_session::ThreadParamsMode::Embedded,
+        /*remote_cwd_override*/ None,
+        server.thread_tool_transport(),
+        /*model_provider_override*/ None,
+    )
+    .await?;
+    assert!(startup.session.daybreak_enabled);
+    enabled_config.ephemeral = true;
+    let ephemeral = server.start_thread(&enabled_config).await?;
+    assert!(ephemeral.session.daybreak_enabled);
+    let starts = recorded_params(&requests, "thread/start");
+    assert_eq!(starts[0]["daybreakEnabled"], true);
+    assert!(starts[1]["daybreakEnabled"].is_null());
+
+    let started = server.start_thread(&app.config).await?;
+    let thread_id = started.session.thread_id;
+    app.active_thread_id = Some(thread_id);
+    app.chat_widget.handle_thread_session_quiet(started.session);
+    app.chat_widget.update_account_state(
+        /*status_account_display*/ None, /*plan_type*/ None,
+        /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ true,
+    );
+    app.chat_widget.open_model_popup();
+    let request_id = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::FetchModels { request_id } => Some(request_id),
+            _ => None,
+        })
+        .expect("model catalog request");
+    let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
+    model.model = app.chat_widget.current_model().to_string();
+    model.available_access_programs = Some(ModelAccessPrograms {
+        cyber: vec![
+            CyberAccessProgram::Standard,
+            CyberAccessProgram::DaybreakBlue,
+        ],
+    });
+    let mut unsupported_model = model.clone();
+    unsupported_model.model = "standard-only".into();
+    unsupported_model.available_access_programs = Some(ModelAccessPrograms {
+        cyber: vec![CyberAccessProgram::Standard],
+    });
+    app.chat_widget
+        .on_models_loaded(request_id, Ok(vec![model, unsupported_model]));
+    app.chat_widget
+        .handle_key_event(KeyEvent::from(KeyCode::Esc));
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut confirmations = Vec::new();
+    for enabled in [true, false] {
+        app.chat_widget.insert_str("/daybreak");
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::Esc));
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::Enter));
+        let selection = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|event| matches!(event, AppEvent::PersistDaybreakSelection { .. }))
+            .expect("Daybreak selection event");
+        app.handle_event(&mut tui, &mut server, selection).await?;
+        confirmations.push(next_history_message(&mut events));
+        assert_eq!(
+            server
+                .thread_read(thread_id, /*include_turns*/ false)
+                .await?
+                .daybreak_enabled,
+            Some(enabled)
+        );
+        assert_eq!(app.config.daybreak_enabled, enabled);
+        let writes = recorded_params(&requests, "config/batchWrite");
+        let edit = &writes.last().expect("config write")["edits"][0];
+        assert_eq!(edit["keyPath"], "daybreak");
+        assert_eq!(edit["value"], enabled);
+    }
+    insta::assert_snapshot!("daybreak_toggle_confirmations", confirmations.join("\n\n"));
+
+    app.chat_widget.set_daybreak_enabled(/*enabled*/ true);
+    app.chat_widget
+        .handle_key_event(KeyEvent::from(KeyCode::Esc));
+    app.chat_widget
+        .apply_external_edit("side prompt".to_string());
+    app.chat_widget
+        .handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let turn = next_user_turn_op(&mut ops);
+    let mut unsupported_turn = turn.clone();
+    let Op::UserTurn { model, .. } = &mut unsupported_turn else {
+        unreachable!("expected user turn");
+    };
+    *model = "standard-only".into();
+    while events.try_recv().is_ok() {}
+    app.submit_thread_op(&mut server, thread_id, unsupported_turn)
+        .await?;
+    assert!(recorded_params(&requests, "turn/start").is_empty());
+    assert!(next_history_message(&mut events).contains("Daybreak support for model standard-only"));
+
+    app.chat_widget
+        .set_side_conversation_active(/*active*/ true);
+    app.submit_thread_op(&mut server, thread_id, turn.clone())
+        .await?;
+    app.chat_widget
+        .set_side_conversation_active(/*active*/ false);
+    app.submit_thread_op(&mut server, thread_id, turn.clone())
+        .await?;
+    let background_thread_id = server.start_thread(&app.config).await?.session.thread_id;
+    app.side_threads.insert(
+        background_thread_id,
+        crate::app::side::SideThreadState::new(thread_id),
+    );
+    app.submit_thread_op(&mut server, background_thread_id, turn)
+        .await?;
+    let turns = recorded_params(&requests, "turn/start");
+    assert_eq!(turns.len(), 3);
+    assert_eq!(turns[0]["cyberAccessProgram"], "standard");
+    assert_eq!(turns[1]["cyberAccessProgram"], "daybreakBlue");
+    assert_eq!(turns[2]["cyberAccessProgram"], "standard");
+    app.chat_widget.set_daybreak_enabled(/*enabled*/ false);
+    while events.try_recv().is_ok() {}
+
+    let missing_thread_id = ThreadId::new();
+    app.active_thread_id = Some(missing_thread_id);
+    app.persist_daybreak_selection(&mut server, missing_thread_id, /*enabled*/ true)
+        .await;
+    assert!(next_history_message(&mut events).contains("Failed to read the thread"));
+    assert!(!app.chat_widget.daybreak_enabled);
+    assert!(!app.config.daybreak_enabled);
+    server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
 async fn complete_managed_worktree_creation(
     app: &mut App,
     tui: &mut crate::tui::Tui,
@@ -1599,8 +1746,37 @@ async fn embedded_server_rejects_unowned_dynamic_tool_calls() -> Result<()> {
 async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespace() -> Result<()> {
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
     let codex_home = tempdir()?;
+    let backend = wiremock::MockServer::start().await;
+    let backend_url = format!("{}/backend-api", backend.uri());
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+    let mut catalog = codex_models_manager::bundled_models_response()?;
+    for model in &mut catalog.models {
+        model.available_access_programs =
+            Some(codex_protocol::openai_models::ModelAccessPrograms {
+                cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
+            });
+    }
+    let catalog_path = codex_home.path().join("models.json");
+    std::fs::write(&catalog_path, serde_json::to_vec(&catalog)?)?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "daybreak = true\nmodel_catalog_json = {:?}\nchatgpt_base_url = {backend_url:?}\ncli_auth_credentials_store = \"file\"\n",
+            catalog_path.display().to_string()
+        ),
+    )?;
+    app.config.chatgpt_base_url = backend_url;
+    app.config.model_catalog = Some(catalog);
+    app.config.cli_auth_credentials_store_mode = codex_login::AuthCredentialsStoreMode::File;
+    app_test_support::write_chatgpt_auth(
+        codex_home.path(),
+        app_test_support::ChatGptAuthFixture::new("test-token")
+            .chatgpt_user_id("test-user")
+            .plan_type("plus"),
+        codex_login::AuthCredentialsStoreMode::File,
+    )
+    .expect("write fixture auth");
     app.config
         .permissions
         .set_permission_profile(PermissionProfile::workspace_write_with(
@@ -1794,7 +1970,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
             params: codex_app_server_protocol::ThreadMetadataUpdateParams {
                 thread_id: creation_source.to_string(),
                 project_id: Some(project.project.id.clone()),
-                daybreak_enabled: None,
+                daybreak_enabled: Some(false),
                 git_info: None,
             },
         })
@@ -1880,6 +2056,10 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
         project.project.id
     );
     assert_eq!(
+        recorded_params(&requests, "thread/start").last().unwrap()["daybreakEnabled"],
+        true
+    );
+    assert_eq!(
         recorded_params(&requests, "thread/start")
             .last()
             .expect("background task creation")["permissions"],
@@ -1892,6 +2072,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
     let turn = recorded_params(&requests, "turn/start")
         .pop()
         .expect("background task turn request");
+    assert_eq!(turn["cyberAccessProgram"], "daybreakBlue");
     assert_eq!(turn["input"], serde_json::json!([]));
     assert_eq!(
         turn["toolOutput"],
@@ -1919,6 +2100,13 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
         1
     );
 
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace("daybreak = true", "daybreak = false"),
+    )?;
+
     spawn_approved_task_tool_call(
         &app,
         &app_server,
@@ -1930,7 +2118,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
             namespace: Some("codex_tui".to_string()),
             tool: "send_message_to_thread".to_string(),
             arguments: serde_json::json!({
-                "threadId": creation_source,
+                "threadId": created_thread_id,
                 "prompt": "Follow <up> & report"
             }),
         },
@@ -1945,7 +2133,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
     else {
         panic!("expected follow-up task registration before its next turn")
     };
-    assert_eq!(ThreadId::from_string(&thread.id)?, creation_source);
+    assert_eq!(ThreadId::from_string(&thread.id)?, created_thread_id);
     assert_eq!(recorded_params(&requests, "turn/start").len(), 1);
     Box::pin(app.handle_event(
         &mut tui,
@@ -1966,6 +2154,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
     };
     assert!(response.success, "{response:?}");
     let turn = &recorded_params(&requests, "turn/start")[1];
+    assert_eq!(turn["cyberAccessProgram"], "daybreakBlue");
     assert_eq!(turn["input"], serde_json::json!([]));
     assert_eq!(
         turn["toolOutput"],

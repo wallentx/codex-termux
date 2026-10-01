@@ -147,6 +147,11 @@ impl App {
         {
             session.approval_policy = policy;
         }
+        if let Some(reviewer) = self.runtime_approvals_reviewer_override
+            && reviewer == cached.approvals_reviewer
+        {
+            session.approvals_reviewer = reviewer;
+        }
         if let Some(profile) = &self.runtime_permission_profile_override
             && profile.permission_profile == cached.permission_profile
             && profile.active_permission_profile == cached.active_permission_profile
@@ -308,7 +313,6 @@ impl App {
             !self.app_server_target.uses_remote_workspace()
                 && app_server.app_server_platform_os() == Some("windows");
         self.chat_widget.windows_sandbox_host = WindowsSandboxHost::Unknown;
-        self.chat_widget.cyber_policy_notice = Default::default();
         self.chat_widget.requires_openai_auth = bootstrap.requires_openai_auth;
         self.chat_widget.remote_connection =
             crate::status::remote_connection::remote_connection_status_value(
@@ -489,11 +493,6 @@ impl App {
                 app_server,
                 self.app_event_tx.clone(),
                 self.chat_widget.security_setup_request_id,
-            );
-            crate::daybreak::prefetch_notice(
-                &self.config,
-                app_server,
-                self.chat_widget.cyber_policy_notice.clone(),
             );
         }
         self.feedback_audience = bootstrap.feedback_audience;
