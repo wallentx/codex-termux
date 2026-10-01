@@ -29,6 +29,7 @@ pub enum ContextPresentation<'a> {
     SyncFull { session_id: &'a str },
     SyncDelta { session_id: &'a str },
     Async,
+    AsyncDelta,
 }
 
 /// Host-selected transcript entries and omission notice, before request admission.
@@ -39,6 +40,7 @@ pub struct RenderedTranscript {
 }
 
 /// Evidence collected successfully before host transcript selection.
+#[derive(Clone)]
 pub struct CollectedContext {
     pub(crate) sections: Vec<ContextSection>,
 }
@@ -47,7 +49,7 @@ pub struct CollectedContext {
 #[derive(Clone, PartialEq)]
 pub(crate) enum SectionDelivery {
     UserContent(Vec<Budgeted<ContentItem>>),
-    Message(Budgeted<Box<ResponseItem>>),
+    Message(Budgeted<Box<ResponseItemEnvelope>>),
 }
 
 /// Rendered evidence with a stable identity, independent of its source type.
@@ -108,6 +110,15 @@ impl CollectedContext {
                 ">>> TRANSCRIPT END\n\n",
                 None,
             ),
+            ContextPresentation::AsyncDelta => (
+                ActionPresentation::Async,
+                Some(
+                    "Continue the classification using the transcript added since your last assessment and the current action. Apply the same classifier policy to the whole conversation. Previous classifications are decisions, not authorization.\n",
+                ),
+                ">>> TRANSCRIPT DELTA START\n",
+                ">>> TRANSCRIPT DELTA END\n\n",
+                None,
+            ),
         };
         let mut sections = Vec::new();
         let mut truncations = std::mem::take(&mut transcript.truncations);
@@ -126,20 +137,22 @@ impl CollectedContext {
                 ContextSection::PreviousReviews(reviews) => (
                     6,
                     "previous_reviews",
-                    SectionDelivery::Message(Budgeted::required(Box::new(reviews.into_message()))),
+                    SectionDelivery::Message(Budgeted::required(Box::new(
+                        reviews.into_annotated_message(),
+                    ))),
                 ),
                 ContextSection::TrustedTool(tool) => (
                     7,
                     "trusted_tool",
                     SectionDelivery::Message(Budgeted::required(Box::new(
-                        ContextualUserFragment::into(tool),
+                        ResponseItemEnvelope::new(ContextualUserFragment::into(tool)),
                     ))),
                 ),
                 ContextSection::TrustedSkills(skills) => (
                     8,
                     "trusted_skills",
                     SectionDelivery::Message(Budgeted::required(Box::new(
-                        ContextualUserFragment::into(skills),
+                        ResponseItemEnvelope::new(ContextualUserFragment::into(skills)),
                     ))),
                 ),
                 ContextSection::RootConversation { items } => {
@@ -199,7 +212,7 @@ impl CollectedContext {
                                     SectionOutput {
                                         id: "conversation_transcript",
                                         delivery: SectionDelivery::Message(Budgeted {
-                                            content: message,
+                                            content: Box::new(ResponseItemEnvelope::new(*message)),
                                             retention: entry.retention,
                                             source: entry.source,
                                         }),
@@ -414,7 +427,7 @@ impl ComposedContext {
                             std::mem::take(&mut metadata),
                         ));
                     }
-                    messages.push(ResponseItemEnvelope::new(*message.content));
+                    messages.push(*message.content);
                 }
             }
         }
@@ -428,9 +441,13 @@ impl ComposedContext {
 impl SectionOutput {
     fn extend_delivery_metadata(&self, metadata: &mut CodexHarnessMetadata) {
         if let SectionDelivery::UserContent(items) = &self.delivery {
-            metadata.guardian_source_order_guidance |= self.id == "retained_user_instructions"
+            if self.id == "retained_user_instructions"
                 && items.iter().any(|item| matches!(&item.content, ContentItem::InputText { text }
-                    if text.strip_suffix('\n').is_some_and(|text| text == crate::retained_instructions::START || text == crate::retained_instructions::LEGACY_START)));
+                    if text.strip_suffix('\n').is_some_and(|text| text == crate::retained_instructions::START || text == crate::retained_instructions::LEGACY_START)))
+            {
+                metadata.guardian_source_order_guidance = true;
+                metadata.guardian_retained_omissions = Some(crate::retained_instructions::omission_state(items));
+            }
             metadata.guardian_sources.extend(
                 items
                     .iter()

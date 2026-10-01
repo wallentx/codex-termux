@@ -326,6 +326,7 @@ impl App {
                 self.agents_overview.usage_disabled = false;
                 self.repaint_agents_overview();
                 self.chat_widget.cyber_policy_notice = Default::default();
+                self.chat_widget.invalidate_security_setup();
                 if let Some(crate::pager_overlay::Overlay::Analytics(view)) = &mut self.overlay {
                     view.refresh();
                 }
@@ -360,6 +361,12 @@ impl App {
                     has_codex_backend_auth,
                 );
                 if self.chat_widget.has_chatgpt_account() {
+                    crate::security_setup::prefetch(
+                        &self.config,
+                        app_server_client,
+                        self.app_event_tx.clone(),
+                        self.chat_widget.security_setup_request_id,
+                    );
                     crate::daybreak::prefetch_notice(
                         &self.config,
                         app_server_client,
@@ -681,6 +688,7 @@ impl App {
         }
         if let Some(thread_id) = thread_id
             && self.primary_thread_id != Some(thread_id)
+            && self.active_thread_id != Some(thread_id)
             && !unsupported_request
             && !background_voice
             && let Some(requests) = self.agents_overview.dispatched_requests.get_mut(&thread_id)
