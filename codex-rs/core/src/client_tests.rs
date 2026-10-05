@@ -70,6 +70,9 @@ use codex_rollout_trace::RawTraceEventPayload;
 use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
+use codex_tools::ToolSpec;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -1017,7 +1020,18 @@ fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
     let client = test_model_client_with_thread_id(thread_id, SessionSource::Cli);
     let mut model = test_model_info();
     model.use_responses_lite = true;
+    let mut tool = codex_tools::FreeformTool {
+        name: "exec".to_string(),
+        description: "Execute JavaScript.".to_string(),
+        defer_loading: None,
+        format: codex_tools::FreeformToolFormat {
+            r#type: "grammar".to_string(),
+            syntax: "lark".to_string(),
+            definition: "start: /.+/".to_string(),
+        },
+    };
     let mut prompt = Prompt {
+        tools: vec![codex_tools::ToolSpec::Freeform(tool.clone())].into(),
         base_instructions: BaseInstructions {
             text: "base instructions".to_string(),
             provenance: None,
@@ -1050,17 +1064,9 @@ fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
     assert_eq!(changed_instructions.input[0], original.input[0]);
     assert_ne!(changed_instructions.input[1].id(), original.input[1].id());
 
-    prompt.tools = vec![codex_tools::ToolSpec::Freeform(codex_tools::FreeformTool {
-        name: "exec".to_string(),
-        description: "Execute JavaScript.".to_string(),
-        defer_loading: None,
-        format: codex_tools::FreeformToolFormat {
-            r#type: "grammar".to_string(),
-            syntax: "lark".to_string(),
-            definition: "start: /.+/".to_string(),
-        },
-    })]
-    .into();
+    tool.description
+        .push_str(" Updated execution instructions.");
+    prompt.tools = vec![codex_tools::ToolSpec::Freeform(tool)].into();
     let changed_tools = build(&client, &prompt)?;
     assert_ne!(
         changed_tools.input[0].id(),
@@ -2126,4 +2132,56 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
         serde_json::from_slice(&std::fs::read(temp.path().join(&payload.path))?)?;
     assert_eq!(recorded["output_items"], serde_json::to_value(&delivered)?);
     Ok(())
+}
+
+#[tokio::test]
+async fn inference_tools_changes_follow_full_specs_across_turns() {
+    let client = test_model_client(SessionSource::Cli);
+    let telemetry = test_session_telemetry();
+    let model_info = test_model_info();
+    let alpha = ResponsesApiTool {
+        name: "alpha".into(),
+        description: "Original".into(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::default(),
+        output_schema: None,
+    };
+    let beta = ResponsesApiTool {
+        name: "beta".into(),
+        ..alpha.clone()
+    };
+    let mut output_changed = alpha.clone();
+    output_changed.output_schema = Some(json!({"type": "object"}).into());
+    let mut params_changed = beta.clone();
+    params_changed.parameters = JsonSchema::string(Some("Changed parameters".into()));
+    let mut session = client.new_session();
+    for (index, (tools, expected)) in [
+        (vec![alpha.clone()], false),
+        (vec![output_changed.clone()], true),
+        (vec![output_changed.clone(), beta.clone()], true),
+        (vec![output_changed, beta.clone()], false),
+        (vec![beta, alpha.clone()], true),
+        (vec![params_changed, alpha], true),
+        (vec![], true),
+        (vec![], false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 4 {
+            session.try_switch_fallback_transport(&telemetry, &model_info);
+            drop(session);
+            session = client.new_session();
+        }
+        let specs = tools
+            .into_iter()
+            .map(ToolSpec::Function)
+            .collect::<Arc<[_]>>();
+        assert_eq!(
+            session.inference_tools_changed(&specs),
+            expected,
+            "step {index}"
+        );
+    }
 }

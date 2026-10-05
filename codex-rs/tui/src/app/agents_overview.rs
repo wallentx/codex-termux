@@ -12,6 +12,9 @@ mod errors;
 #[path = "agents_overview_loading.rs"]
 mod loading;
 
+#[path = "agents_overview_selection.rs"]
+mod selection;
+
 use super::agents_overview_view::AgentsOverviewGroup;
 use super::agents_overview_view::AgentsOverviewRow;
 use super::agents_overview_view::AgentsOverviewView;
@@ -55,6 +58,8 @@ pub(super) struct AgentsOverviewState {
     pub(super) refresh_notifications: HashMap<ThreadId, Vec<ServerNotification>>,
     pub(super) rendered_full_screen: bool,
     pub(super) visible_thread_ids: Vec<ThreadId>,
+    /// One-shot successor selected before a removal invalidates the displayed rows.
+    pub(super) selection_after_removal: Option<ThreadId>,
     pub(super) view_state:
         Arc<std::sync::Mutex<super::agents_overview_view::AgentsOverviewViewState>>,
     /// Explicit permission-profile choices for new-session carryover, retained across navigation.
@@ -133,7 +138,8 @@ impl App {
             .flatten()
             .cloned()
             .collect();
-        let view = self.agents_overview_view(threads, /*selected_thread_id*/ None);
+        let selected_thread_id = self.agents_overview.selection_after_removal.take();
+        let view = self.agents_overview_view(threads, selected_thread_id);
         self.agents_overview.visible_thread_ids = view.thread_ids();
         self.chat_widget.show_bottom_pane_view(Box::new(view));
         if self.reconnect.offline {
@@ -271,6 +277,11 @@ impl App {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .rename_target
+            .filter(|id| {
+                self.agents_overview.threads.contains_key(id)
+                    && !self.agents_overview.hidden_threads.contains(id)
+            })
+            .or(self.agents_overview.selection_after_removal.take())
             .or_else(|| {
                 self.agents_overview
                     .visible_thread_ids
@@ -286,20 +297,20 @@ impl App {
             .collect();
         let view = self.agents_overview_view(threads, selected_thread_id);
         self.agents_overview.visible_thread_ids = view.thread_ids();
-        if selected_thread_id
-            .is_some_and(|thread_id| !self.agents_overview.visible_thread_ids.contains(&thread_id))
-            && let Ok(mut state) = self.agents_overview.view_state.lock()
-            && state.rename_target.is_some()
+        if let Ok(mut state) = self.agents_overview.view_state.lock()
+            && state
+                .rename_target
+                .is_some_and(|id| !self.agents_overview.visible_thread_ids.contains(&id))
         {
             self.chat_widget.add_info_message(
                 format!(
                     "The rename target disappeared. Unsubmitted title: {}",
-                    state.input
+                    state.input.text()
                 ),
                 /*hint*/ None,
             );
             state.rename_target = None;
-            state.input.clear();
+            state.input.set_text_clearing_elements("");
         }
         self.chat_widget
             .replace_bottom_pane_view_if_present(AGENTS_OVERVIEW_VIEW_ID, Box::new(view));
@@ -364,6 +375,11 @@ impl App {
             });
         }
 
+        self.agents_overview
+            .view_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .vim_enabled = self.chat_widget.composer_is_vim_enabled();
         AgentsOverviewView::new(
             rows,
             selected_thread_id,

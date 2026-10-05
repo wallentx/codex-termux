@@ -195,6 +195,7 @@ impl App {
             }
             self.retire_background_voice();
             self.reconnect.offline = true;
+            self.account_email_request_id = None;
             // Cached blank sessions are usable only while this connection owns a subscription.
             self.agents_overview.blank_sessions.clear();
             self.reconnect.failed = false;
@@ -290,6 +291,7 @@ impl App {
         self.agent_navigation.picker_refresh = None;
         self.last_subagent_backfill_attempt = None;
         self.rate_limit_refresh_state.invalidate_recovery();
+        session.worktree_source_config_builder = app_server.worktree_source_config_builder.clone();
         session.inherit_task_tool_capabilities(app_server);
         *app_server = session;
         #[cfg(any(target_os = "windows", test))]

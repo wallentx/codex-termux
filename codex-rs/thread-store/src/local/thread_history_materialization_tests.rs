@@ -4,17 +4,25 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::Utc;
+use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::ThreadItem;
 use codex_protocol::ThreadId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::CommandExecutionItem;
+use codex_protocol::items::CommandExecutionStatus;
+use codex_protocol::items::McpToolCallItem;
+use codex_protocol::items::McpToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
+use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -432,6 +440,163 @@ WHERE thread_id = ?
     .await
     .expect("read projection state");
     assert_eq!(projection_state, (rollout_len, 5));
+}
+
+#[tokio::test]
+async fn paginated_command_history_caps_aggregated_output() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    let output = format!("head\n{}\ntail", "x".repeat(128 * 1024));
+    let command = CommandExecutionItem {
+        sandbox_type: None,
+        model_context: None,
+        id: "exec-1".to_string(),
+        plugin_id: None,
+        script_path: None,
+        process_id: None,
+        command: vec!["echo".to_string(), "hello".to_string()],
+        cwd: home.path().abs().into(),
+        parsed_cmd: vec![ParsedCommand::Unknown {
+            cmd: "echo hello".to_string(),
+        }],
+        source: ExecCommandSource::Agent,
+        interaction_input: None,
+        status: CommandExecutionStatus::Completed,
+        aggregated_output: Some(output),
+        exit_code: Some(0),
+        duration: Some(Duration::from_millis(12)),
+    };
+
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1"),
+                completed_item(thread_id, "turn-1", TurnItem::CommandExecution(command)),
+                turn_completed("turn-1"),
+            ],
+        })
+        .await
+        .expect("append command history");
+
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let item_json = sqlx::query_scalar::<_, String>(
+        "SELECT item_json FROM thread_items WHERE thread_id = ? AND item_id = ?",
+    )
+    .bind(thread_id.to_string())
+    .bind("exec-1")
+    .fetch_one(&pool)
+    .await
+    .expect("read projected command");
+    let projected: ThreadItem =
+        serde_json::from_str(&item_json).expect("deserialize projected command");
+    let ThreadItem::CommandExecution {
+        aggregated_output: Some(output),
+        ..
+    } = projected
+    else {
+        panic!("expected projected command output");
+    };
+    assert_eq!(output.len(), 64 * 1024);
+    assert!(output.starts_with("head\n"));
+    assert!(output.ends_with("\ntail"));
+    assert!(output.contains("command output truncated for persistence"));
+}
+
+#[tokio::test]
+async fn paginated_mcp_history_caps_large_results() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    let arguments = serde_json::json!({"query": "large result"});
+    let tool_call = McpToolCallItem {
+        id: "mcp-1".to_string(),
+        server: "test".to_string(),
+        tool: "large_result".to_string(),
+        arguments: arguments.clone(),
+        connector_id: None,
+        mcp_app_resource_uri: None,
+        mcp_app_ui: None,
+        link_id: None,
+        app_name: None,
+        action_name: None,
+        plugin_id: None,
+        read_only_hint: None,
+        status: McpToolCallStatus::Failed,
+        result: Some(CallToolResult {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": format!("head\n{}\ntail", "x".repeat(200_000)),
+            })],
+            structured_content: None,
+            is_error: Some(true),
+            meta: None,
+        }),
+        error: None,
+        duration: Some(Duration::from_millis(25)),
+    };
+
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1"),
+                completed_item(thread_id, "turn-1", TurnItem::McpToolCall(tool_call)),
+                turn_completed("turn-1"),
+            ],
+        })
+        .await
+        .expect("append MCP history");
+
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let item_json = sqlx::query_scalar::<_, String>(
+        "SELECT item_json FROM thread_items WHERE thread_id = ? AND item_id = ?",
+    )
+    .bind(thread_id.to_string())
+    .bind("mcp-1")
+    .fetch_one(&pool)
+    .await
+    .expect("read projected MCP tool call");
+    let projected: ThreadItem =
+        serde_json::from_str(&item_json).expect("deserialize projected MCP tool call");
+    let ThreadItem::McpToolCall {
+        arguments: projected_arguments,
+        result: Some(result),
+        ..
+    } = projected
+    else {
+        panic!("expected projected MCP tool call");
+    };
+    assert_eq!(projected_arguments, arguments);
+    let preview = result.content[0]["text"]
+        .as_str()
+        .expect("persisted MCP result preview");
+    assert_eq!(
+        *result,
+        McpToolCallResult {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": preview,
+            })],
+            structured_content: None,
+            meta: None,
+        }
+    );
+    assert!(preview.len() < 65 * 1024);
+    assert!(preview.contains("head"));
+    assert!(preview.contains("chars truncated"));
+    assert!(preview.contains("tail"));
 }
 
 #[tokio::test]

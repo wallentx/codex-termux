@@ -57,6 +57,8 @@ mod auth_recovery_policy;
 mod auto_review;
 #[path = "bedrock_multi_agent_tests.rs"]
 mod bedrock_multi_agent;
+#[path = "bedrock_service_tier_tests.rs"]
+mod bedrock_service_tier;
 mod catalog_permission_messages;
 mod cli_stream;
 mod client;
@@ -129,7 +131,6 @@ mod mcp_auth_refresh;
 mod mcp_ema_config;
 mod mcp_extension_protocol;
 mod mcp_optional_startup_grace;
-#[cfg(unix)]
 mod mcp_refresh_cleanup;
 mod mcp_startup_refresh_http_proxy;
 mod mcp_subagent_elicitation;
@@ -210,6 +211,7 @@ mod step_settings;
 mod step_settings_snapshots;
 mod stream_error_allows_next_turn;
 mod stream_no_completed;
+mod subagent_dynamic_tools;
 mod subagent_notifications;
 mod subagent_service_tier;
 mod token_budget;
