@@ -93,6 +93,15 @@ async fn seeds_full_package() {
     assert!(validate_package(&selected).is_ok());
 }
 
+#[cfg(target_os = "android")]
+#[test]
+fn accepts_android_package_without_bundled_ripgrep() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    package(temp.path(), "0.159.0-alpha.6");
+    std::fs::remove_file(temp.path().join("codex-path/rg")).expect("remove bundled ripgrep");
+    validate_package(temp.path()).expect("Android uses system ripgrep");
+}
+
 #[tokio::test]
 async fn incomplete_source_fails_without_selecting_it() {
     let temp = tempfile::TempDir::new().expect("temp");
