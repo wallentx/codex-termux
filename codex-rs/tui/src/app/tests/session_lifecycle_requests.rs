@@ -64,7 +64,7 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         server.thread_tool_transport(),
-        /*model_provider_override*/ None,
+        crate::app_server_session::StartupLaunchChoices::default(),
     )
     .await?;
     assert!(startup.session.daybreak_enabled);
@@ -168,14 +168,30 @@ async fn daybreak_command_persists_and_confirms_each_selection() -> Result<()> {
         background_thread_id,
         crate::app::side::SideThreadState::new(thread_id),
     );
-    app.submit_thread_op(&mut server, background_thread_id, turn)
+    app.submit_thread_op(&mut server, background_thread_id, turn.clone())
         .await?;
     let turns = recorded_params(&requests, "turn/start");
     assert_eq!(turns.len(), 3);
     assert_eq!(turns[0]["cyberAccessProgram"], "standard");
     assert_eq!(turns[1]["cyberAccessProgram"], "daybreakBlue");
     assert_eq!(turns[2]["cyberAccessProgram"], "standard");
+    app.chat_widget.update_account_state(
+        Some(crate::status::StatusAccountDisplay::ApiKey),
+        /*plan_type*/ None,
+        /*has_chatgpt_account*/ false,
+        /*has_codex_backend_auth*/ false,
+    );
+    assert!(
+        !app.chat_widget
+            .set_feature_enabled(Feature::ApiKeyCyberAccessPrograms, /*enabled*/ false,)
+    );
+    app.submit_thread_op(&mut server, thread_id, turn.clone())
+        .await?;
     app.chat_widget.set_daybreak_enabled(/*enabled*/ false);
+    app.submit_thread_op(&mut server, thread_id, turn).await?;
+    let turns = recorded_params(&requests, "turn/start");
+    assert_eq!(turns[3]["cyberAccessProgram"], "daybreakBlue");
+    assert!(turns[4]["cyberAccessProgram"].is_null());
     while events.try_recv().is_ok() {}
 
     let missing_thread_id = ThreadId::new();
@@ -1024,7 +1040,7 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         app_server.thread_tool_transport(),
-        /*model_provider_override*/ None,
+        crate::app_server_session::StartupLaunchChoices::default(),
     )
     .await?;
     assert!(startup.task_tools_available);
@@ -1273,12 +1289,14 @@ async fn archive_current_thread_returns_shared_servers_to_agents() -> Result<()>
 #[tokio::test]
 async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() -> Result<()> {
     let (mut app, events, _ops) = Box::pin(make_test_app_with_channels()).await;
+    // Invalid optional worktree settings must preserve both daemon start paths.
+    app.config.features.enable(Feature::Worktrees)?;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
     std::fs::write(
         codex_home.path().join("config.toml"),
-        "web_search = \"disabled\"\n",
+        "web_search = \"disabled\"\n[desktop]\ngit-worktree-root = 'relative'\n",
     )?;
     // Keep the large lifecycle futures off the Windows test thread's stack.
     let (mut app_server, mut requests, mut proxy) = Box::pin(start_recording_app_server(
@@ -1305,7 +1323,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         app_server.thread_tool_transport(),
-        /*model_provider_override*/ None,
+        crate::app_server_session::StartupLaunchChoices::default(),
     )
     .await?;
     assert!(startup.task_tools_available);
@@ -1696,7 +1714,7 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         app_server.thread_tool_transport(),
-        /*model_provider_override*/ None,
+        crate::app_server_session::StartupLaunchChoices::default(),
     )
     .await?;
     assert!(!startup.task_tools_available);
@@ -4737,11 +4755,12 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 })
                 .await?;
                 if let AppEvent::AgentPickerThreadsLoaded {
-                    result: Ok(threads),
+                    result: Ok(refresh),
                     ..
                 } = &mut completion
                 {
-                    let child = threads
+                    let child = refresh
+                        .threads
                         .iter_mut()
                         .find(|thread| thread.id == child_thread_id.to_string())
                         .expect("root-scoped response includes the cached child");
@@ -4751,7 +4770,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     child.status = ThreadStatus::Active {
                         active_flags: Vec::new(),
                     };
-                    threads.push(discovered);
+                    refresh.threads.push(discovered);
                 }
                 Box::pin(app.handle_event(&mut tui, &mut app_server, completion)).await?;
                 assert_eq!(

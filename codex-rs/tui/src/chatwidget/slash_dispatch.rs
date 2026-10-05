@@ -190,8 +190,8 @@ impl ChatWidget {
         match cmd {
             SlashCommand::Daybreak => {
                 if !self.daybreak_enabled {
-                    if !self.has_chatgpt_account || self.config.model_provider_id != "openai" {
-                        self.add_error_message("Daybreak requires a signed-in ChatGPT account and the OpenAI provider.".into());
+                    if !self.daybreak_account_eligible() {
+                        self.add_error_message("Daybreak requires the OpenAI provider with either ChatGPT sign-in or an API key with Daybreak support enabled.".into());
                         return;
                     }
                     if !crate::daybreak::available(&self.model_catalog.models) {
@@ -238,7 +238,12 @@ impl ChatWidget {
                 self.bottom_pane.show_selection_view(SelectionViewParams {
                     title: Some("Archive this session?".to_string()),
                     subtitle: Some(
-                        "Are you sure? This will archive the current session".to_string(),
+                        if self.bottom_pane.is_task_running() {
+                            "This will stop the current turn and archive the session."
+                        } else {
+                            "Are you sure? This will archive the current session"
+                        }
+                        .to_string(),
                     ),
                     footer_hint: Some(standard_popup_hint_line()),
                     items: vec![
@@ -258,7 +263,7 @@ impl ChatWidget {
                             ..Default::default()
                         },
                     ],
-                    ..SelectionViewParams::picker()
+                    ..SelectionViewParams::confirmation()
                 });
                 self.request_redraw();
             }
@@ -291,7 +296,7 @@ impl ChatWidget {
                             ..Default::default()
                         },
                     ],
-                    ..SelectionViewParams::picker()
+                    ..SelectionViewParams::confirmation()
                 });
                 self.request_redraw();
             }

@@ -21,6 +21,7 @@ use crate::context::world_state::PersistentModeState;
 use crate::context::world_state::PluginsInstructionsState;
 use crate::context::world_state::RealtimeState;
 use crate::context::world_state::ToolsState;
+use crate::context::world_state::TopLevelToolsState;
 use crate::context::world_state::WorldState;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use codex_connectors::AppToolPolicyEvaluator;
@@ -117,6 +118,11 @@ impl Session {
             String::new()
         };
         let mut world_state = WorldState::default();
+        if step_context.uses_incremental_tools() {
+            let specs = step_context.tool_router.model_visible_specs();
+            let definitions = codex_tools::create_tools_json_for_responses_lite(&specs)?;
+            world_state.add_section(TopLevelToolsState::new(definitions)?);
+        }
         world_state.add_section(ModelInstructionsState::new(
             &model_info.slug,
             previous_model.as_deref(),
@@ -311,6 +317,7 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
+                    step_store: &step_context.extension_data,
                     previous_world_state: previous_world_state.as_ref().map(|state| &state.state),
                 })
                 .await
@@ -339,12 +346,7 @@ impl Session {
                 .expose_spawn_agent_model_overrides
                 .then(|| {
                     ToolName::new(
-                        turn_context
-                            .provider
-                            .capabilities()
-                            .namespace_tools
-                            .then(|| turn_context.config.multi_agent_v2.tool_namespace.clone())
-                            .flatten(),
+                        turn_context.config.multi_agent_v2.tool_namespace.clone(),
                         "spawn_agent",
                     )
                 }),

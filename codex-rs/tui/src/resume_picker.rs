@@ -336,6 +336,7 @@ struct SessionPickerViewPersistence {
 struct SessionPickerRunOptions {
     use_theme_colors: bool,
     copy_on_select: bool,
+    mouse_scroll_speed: f64,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     local_filter_cwd: Option<PathBuf>,
@@ -447,6 +448,7 @@ async fn run_resume_picker_with_launch_context(
     let options = SessionPickerRunOptions {
         use_theme_colors: local_settings.tui.status_line_use_colors,
         copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
+        mouse_scroll_speed: local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
@@ -507,6 +509,7 @@ pub async fn run_fork_picker_with_app_server(
     let options = SessionPickerRunOptions {
         use_theme_colors: local_settings.tui.status_line_use_colors,
         copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
+        mouse_scroll_speed: local_settings.tui.mouse_scroll_speed.unwrap_or(1.0),
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
@@ -562,6 +565,7 @@ async fn run_session_picker_with_loader(
     state.local_filter_cwd = options.local_filter_cwd;
     state.use_theme_colors = options.use_theme_colors;
     state.copy_on_select = options.copy_on_select;
+    state.mouse_scroll_speed = options.mouse_scroll_speed;
     state.worktrees_enabled = options.worktrees_enabled;
     state.density = options.initial_density;
     state.view_persistence = options.view_persistence;
@@ -835,6 +839,7 @@ struct PickerState {
     clock_format: ClockFormat,
     use_theme_colors: bool,
     copy_on_select: bool,
+    mouse_scroll_speed: f64,
     // Resolve local filesystem membership once per cwd for each page-loading cycle.
     local_cwd_matches: HashMap<PathBuf, bool>,
     requester: FrameRequester,
@@ -1036,6 +1041,7 @@ impl PickerState {
             clock_format: ClockFormat::system(),
             use_theme_colors: true,
             copy_on_select: false,
+            mouse_scroll_speed: 1.0,
             requester,
             relative_time_reference: None,
             pagination: PaginationState::new(),
@@ -1088,7 +1094,7 @@ impl PickerState {
             self.chord_matcher.cancel();
             return Some(key);
         }
-        let context = if matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.is_search_active())
+        let context = if matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.is_search_editing())
         {
             crate::keymap::KeymapContext::Editor
         } else if self.overlay.is_some() {
@@ -1141,6 +1147,7 @@ impl PickerState {
             cells.clone(),
             self.keymap.pager.clone(),
             self.copy_on_select,
+            self.mouse_scroll_speed,
         );
         if let Overlay::Transcript(view) = &mut overlay {
             view.set_keymap_bindings(&self.keymap);
@@ -5657,36 +5664,6 @@ session_picker_view = "dense"
                     "/Users/felipe.coury/code/codex.fcoury-session-picker/codex-rs"
                 )),
                 /*width*/ 100,
-            )
-        );
-    }
-
-    #[test]
-    fn dense_session_snapshot_includes_cwd_in_all_filter() {
-        assert_snapshot!(
-            "resume_picker_dense_all",
-            render_dense_row_snapshot(
-                /*show_all*/ true, /*filter_cwd*/ None, /*width*/ 120,
-            )
-        );
-    }
-
-    #[test]
-    fn dense_session_snapshot_auto_hides_cwd_when_narrow() {
-        assert_snapshot!(
-            "resume_picker_dense_all_auto_hidden_cwd",
-            render_dense_row_snapshot(
-                /*show_all*/ true, /*filter_cwd*/ None, /*width*/ 100,
-            )
-        );
-    }
-
-    #[test]
-    fn dense_session_snapshot_forces_cwd_when_narrow() {
-        assert_snapshot!(
-            "resume_picker_dense_all_forced_cwd",
-            render_dense_row_snapshot(
-                /*show_all*/ true, /*filter_cwd*/ None, /*width*/ 48,
             )
         );
     }

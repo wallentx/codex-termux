@@ -46,7 +46,7 @@ fn exec_override_renders_only_known_literal_placeholders() {
         assert_eq!(
             description,
             format!(
-                " \nDefaults to 10000 ms. 4567 ms.\n{image_helper}\n{{{{ unknown }}}} {{{{default_exec_yield_time_ms}}}}\t "
+                " \nDefaults to 10000 ms. 4567 ms.\n{image_helper}\n{{{{ unknown }}}} {{{{default_exec_yield_time_ms}}}}\t \n\n{DEFERRED_NESTED_TOOLS_GUIDANCE}"
             ),
         );
     }
@@ -75,7 +75,15 @@ fn exec_override_preserves_empty_and_whitespace_only_text() {
                     ..Default::default()
                 }),
             ),
-            description_override,
+            [
+                description_override,
+                "No deferred tools; omit this.",
+                "Shared MCP Types:\n```ts\nNo MCP tools; omit this.\n```"
+            ]
+            .into_iter()
+            .filter(|section| !section.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
         );
     }
 }
@@ -158,4 +166,90 @@ fn exec_override_preserves_runtime_sections() {
             expected,
         );
     }
+}
+
+#[test]
+fn mcp_types_stay_stable_when_a_deferred_tool_changes_its_output_schema() {
+    let mut tool = ToolDefinition {
+        name: "sample".to_string(),
+        tool_name: ToolName::plain("sample"),
+        description: "Deferred tool".to_string(),
+        kind: CodeModeToolKind::Function,
+        input_schema: None,
+        input_schema_max_bytes: None,
+        output_schema: None,
+    };
+    let render = |tool: &ToolDefinition, preamble: Option<&str>| {
+        build_exec_tool_description(
+            &[],
+            std::slice::from_ref(tool),
+            &BTreeMap::new(),
+            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            /*code_mode_only*/ true,
+            ImageDetailVisibility::Visible,
+            Some(&CodeModeToolMessages {
+                mcp_typescript_preamble: preamble.map(str::to_string),
+                ..Default::default()
+            }),
+        )
+    };
+    // Keep one deferred tool throughout to isolate this from the independent
+    // discovery guidance transition when the entire deferred catalog empties.
+    for preamble in [None, Some("type CustomMcpResult = string;"), Some("")] {
+        tool.output_schema = None;
+        let before = render(&tool, preamble);
+        tool.output_schema = Some(json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "array", "items": { "type": "object" } },
+                "isError": { "type": "boolean" },
+                "_meta": { "type": "object" }
+            }
+        }));
+        assert_eq!(before, render(&tool, preamble));
+    }
+}
+
+#[test]
+fn nested_guidance_survives_catalog_changes_and_respects_overrides() {
+    let deferred_tools = [ToolDefinition {
+        name: "deferred_echo".to_string(),
+        tool_name: ToolName::plain("deferred_echo"),
+        description: "Echo a value.".to_string(),
+        kind: CodeModeToolKind::Function,
+        input_schema: None,
+        input_schema_max_bytes: None,
+        output_schema: None,
+    }];
+    let render = |tools: &[ToolDefinition], code_mode_only, guidance: Option<&str>| {
+        build_exec_tool_description(
+            &[],
+            tools,
+            &BTreeMap::new(),
+            crate::DEFAULT_EXEC_YIELD_TIME_MS,
+            code_mode_only,
+            ImageDetailVisibility::Visible,
+            Some(&CodeModeToolMessages {
+                exec: Some(ToolMessage {
+                    description: Some(String::new()),
+                    ..Default::default()
+                }),
+                deferred_nested_tools_guidance: guidance.map(str::to_string),
+                mcp_typescript_preamble: Some(String::new()),
+                ..Default::default()
+            }),
+        )
+    };
+    for code_mode_only in [false, true] {
+        for (guidance, expected) in [
+            (None, DEFERRED_NESTED_TOOLS_GUIDANCE),
+            (Some("Catalog discovery."), "Catalog discovery."),
+            (Some(""), ""),
+        ] {
+            let prompt = render(&[], code_mode_only, guidance);
+            assert_eq!(prompt, expected);
+            assert_eq!(prompt, render(&deferred_tools, code_mode_only, guidance));
+        }
+    }
+    assert!(DEFERRED_NESTED_TOOLS_GUIDANCE.contains("Tool availability can change between calls"));
 }

@@ -14,7 +14,9 @@ use crate::json_schema_types::render_json_schema_to_typescript_with_budget;
 
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
-To find one, filter `ALL_TOOLS` by `name` and `description`."#;
+To find one, filter `ALL_TOOLS` by `name` and `description`.
+
+Tool availability can change between calls."#;
 const LEGACY_IMAGE_HELPER_DESCRIPTION: &str = r#"`image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null } | ImageContent, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`. MCP image blocks may request detail with `_meta: { "codex/imageDetail": "original" }`. When provided, the second `detail` argument overrides any detail embedded in the first argument."#;
 const UNIFIED_IMAGE_HELPER_DESCRIPTION: &str = r#"`image(imageUrlOrItem: string | { image_url: string } | ImageContent)`: Appends an image item. `image_url` should be a base64-encoded `data:` URL. To forward an MCP tool image, pass an individual `ImageContent` block from `result.content`, for example `image(result.content[0])`."#;
 const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/compose tool calls
@@ -268,7 +270,7 @@ pub enum ImageDetailVisibility {
 
 pub fn build_exec_tool_description(
     enabled_tools: &[ToolDefinition],
-    deferred_tools: &[ToolDefinition],
+    _deferred_tools: &[ToolDefinition],
     namespace_descriptions: &BTreeMap<String, ToolNamespaceDescription>,
     default_exec_yield_time_ms: u64,
     code_mode_only: bool,
@@ -292,29 +294,21 @@ pub fn build_exec_tool_description(
     if !description.is_empty() {
         sections.push(description);
     }
-    if !deferred_tools.is_empty() {
-        let guidance = messages
-            .and_then(|messages| messages.deferred_nested_tools_guidance.as_deref())
-            .unwrap_or(DEFERRED_NESTED_TOOLS_GUIDANCE);
-        if !guidance.is_empty() {
-            sections.push(guidance.to_string());
-        }
+    let guidance = messages
+        .and_then(|messages| messages.deferred_nested_tools_guidance.as_deref())
+        .unwrap_or(DEFERRED_NESTED_TOOLS_GUIDANCE);
+    if !guidance.is_empty() {
+        sections.push(guidance.to_string());
     }
     if !code_mode_only {
         return sections.join("\n\n");
     }
 
-    let has_mcp_tools = enabled_tools
-        .iter()
-        .chain(deferred_tools)
-        .any(|tool| mcp_structured_content_schema(tool.output_schema.as_ref()).is_some());
-    if has_mcp_tools {
-        let preamble = messages
-            .and_then(|messages| messages.mcp_typescript_preamble.as_deref())
-            .unwrap_or(MCP_TYPESCRIPT_PREAMBLE);
-        if !preamble.is_empty() {
-            sections.push(format!("Shared MCP Types:\n```ts\n{preamble}\n```"));
-        }
+    let preamble = messages
+        .and_then(|messages| messages.mcp_typescript_preamble.as_deref())
+        .unwrap_or(MCP_TYPESCRIPT_PREAMBLE);
+    if !preamble.is_empty() {
+        sections.push(format!("Shared MCP Types:\n```ts\n{preamble}\n```"));
     }
 
     if !enabled_tools.is_empty() {
