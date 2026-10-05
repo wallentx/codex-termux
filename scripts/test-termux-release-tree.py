@@ -125,6 +125,78 @@ class ReleaseTreeTests(unittest.TestCase):
         self.assertEqual(self.git("write-tree"), before)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_adjacent_workspace_dependencies_merge_without_losing_either_side(self):
+        self.git("checkout", "--detach", self.baseline)
+        workspace = (self.repo / "codex-rs/Cargo.toml").read_text()
+        workspace += """codex-utils-absolute-path = "0.0.0"
+codex-utils-file-lock = "0.0.0"
+codex-utils-output-truncation = "0.0.0"
+codex-utils-path = "0.0.0"
+"""
+        self.write("codex-rs/Cargo.toml", workspace)
+        manifest = """[package]
+name = "codex-cli"
+version.workspace = true
+[dependencies]
+codex-utils-absolute-path = { workspace = true }
+codex-utils-path = { workspace = true }
+"""
+        lock = """[[package]]
+name = "codex-cli"
+version = "0.0.0"
+dependencies = [
+ "codex-utils-absolute-path",
+ "codex-utils-path",
+]
+"""
+        self.write("codex-rs/cli/Cargo.toml", manifest)
+        self.write("codex-rs/Cargo.lock", lock)
+        self.baseline = self.commit("dependency baseline")
+
+        self.write(
+            "codex-rs/cli/Cargo.toml",
+            manifest.replace(
+                "codex-utils-path =",
+                "codex-utils-file-lock = { workspace = true }\ncodex-utils-path =",
+            ),
+        )
+        self.write(
+            "codex-rs/Cargo.lock",
+            lock.replace(
+                ' "codex-utils-path",',
+                ' "codex-utils-file-lock",\n "codex-utils-path",',
+            ),
+        )
+        self.source = self.commit("Termux file lock")
+
+        self.git("checkout", "--detach", self.baseline)
+        self.write(
+            "codex-rs/cli/Cargo.toml",
+            manifest.replace(
+                "codex-utils-path =",
+                "codex-utils-output-truncation = { workspace = true }\ncodex-utils-path =",
+            ),
+        )
+        self.write(
+            "codex-rs/Cargo.lock",
+            lock.replace(
+                ' "codex-utils-path",',
+                ' "codex-utils-output-truncation",\n "codex-utils-path",',
+            ),
+        )
+        self.upstream = self.commit("upstream output truncation")
+        tree = self.tree()
+        self.assertIn(
+            "codex-utils-file-lock = { workspace = true }\n"
+            "codex-utils-output-truncation = { workspace = true }",
+            self.git("show", f"{tree}:codex-rs/cli/Cargo.toml"),
+        )
+        self.assertIn(
+            ' "codex-utils-file-lock",\n "codex-utils-output-truncation",',
+            self.git("show", f"{tree}:codex-rs/Cargo.lock"),
+        )
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
     def test_upstream_rename_preserves_termux_edit(self):
         self.git("mv", "src/shared", "src/renamed")
         self.upstream = self.commit("move platform source")
@@ -437,6 +509,40 @@ class UpdaterAdaptationTests(unittest.TestCase):
     def test_unrecognized_conflicts_remain_conflicts(self):
         conflict = "<<<<<<< upstream\nnew\n||||||| baseline\nold\n=======\nTermux\n>>>>>>> target\n"
         self.assertEqual(module.merge_updater_additions(conflict), conflict)
+
+
+class DependencyAdditionTests(unittest.TestCase):
+    def test_only_disjoint_codex_utils_insertions_are_combined(self):
+        for path, upstream, target in (
+            (
+                "codex-rs/rollout/Cargo.toml",
+                "codex-utils-output-truncation = { workspace = true }\n",
+                "codex-utils-file-lock = { workspace = true }\n",
+            ),
+            (
+                "codex-rs/Cargo.lock",
+                ' "codex-utils-cargo-bin",\n',
+                ' "codex-utils-file-lock",\n',
+            ),
+        ):
+            with self.subTest(path=path):
+                conflict = (
+                    f"<<<<<<< upstream\n{upstream}"
+                    f"||||||| baseline\n=======\n{target}>>>>>>> target\n"
+                )
+                self.assertEqual(
+                    module.merge_dependency_additions(conflict, path=path),
+                    "".join(sorted((upstream, target))),
+                )
+                for unsafe in (
+                    conflict.replace("||||||| baseline\n", "||||||| baseline\nold\n"),
+                    conflict.replace(target, "other-change\n"),
+                    conflict.replace(target, upstream),
+                ):
+                    self.assertEqual(
+                        module.merge_dependency_additions(unsafe, path=path),
+                        unsafe,
+                    )
 
 
 if __name__ == "__main__":

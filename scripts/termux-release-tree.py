@@ -150,6 +150,34 @@ def merge_updater_additions(text, *, path=None):
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
 
 
+def merge_dependency_additions(text, *, path):
+    """Combine disjoint codex-utils dependencies added at the same position."""
+    if path.startswith("codex-rs/") and path.endswith("/Cargo.toml"):
+        addition = re.compile(r"codex-utils-[a-z0-9-]+ = \{ workspace = true \}\n")
+    elif path == "codex-rs/Cargo.lock":
+        addition = re.compile(r' "codex-utils-[a-z0-9-]+",\n')
+    else:
+        return text
+    pattern = r"^<<<<<<<[^\n]*\n(.*?)^\|\|\|\|\|\|\|[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n"
+
+    def resolve(match):
+        ours, base, theirs = match.groups()
+        ours_lines = ours.splitlines(keepends=True)
+        theirs_lines = theirs.splitlines(keepends=True)
+        lines = ours_lines + theirs_lines
+        if (
+            base
+            or not ours_lines
+            or not theirs_lines
+            or len(set(lines)) != len(lines)
+            or not all(addition.fullmatch(line) for line in lines)
+        ):
+            return match[0]
+        return "".join(sorted(lines))
+
+    return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
+
+
 def release_tree(upstream, source, baseline, excluded):
     upstream, source, baseline = (
         git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip()
@@ -252,21 +280,27 @@ def release_tree(upstream, source, baseline, excluded):
         )
         result = merged.stdout.splitlines()[0] if merged.stdout else ""
         conflicts = merged.stdout.splitlines()[1:]
-        if merged.returncode == 1 and has_termux_updater:
+        if merged.returncode == 1:
             git("read-tree", result, env=env)
             remaining = []
             for path in conflicts:
-                if path not in (
+                updater_path = path in (
                     cli,
                     "codex-rs/tui/src/update_action.rs",
                     "codex-rs/tui/src/update_prompt.rs",
                     "codex-rs/tui/src/updates.rs",
-                ):
+                )
+                dependency_path = path == "codex-rs/Cargo.lock" or (
+                    path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
+                )
+                if not (has_termux_updater and updater_path) and not dependency_path:
                     remaining.append(path)
                     continue
-                text = merge_updater_additions(
-                    git("show", f"{result}:{path}").decode(), path=path
-                )
+                text = git("show", f"{result}:{path}").decode()
+                if has_termux_updater and updater_path:
+                    text = merge_updater_additions(text, path=path)
+                if dependency_path:
+                    text = merge_dependency_additions(text, path=path)
                 if re.search(r"^(?:<<<<<<<|=======|>>>>>>>)", text, re.MULTILINE):
                     remaining.append(path)
                 else:
