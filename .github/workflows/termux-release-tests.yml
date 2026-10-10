@@ -49,7 +49,9 @@ jobs:
             refs/tags/rust-v0.156.0-alpha.8:refs/tags/rust-v0.156.0-alpha.8 \
             refs/tags/rust-v0.157.0-alpha.8:refs/tags/rust-v0.157.0-alpha.8 \
             refs/tags/rust-v0.158.0-alpha.8:refs/tags/rust-v0.158.0-alpha.8 \
-            refs/tags/rust-v0.159.0-alpha.4:refs/tags/rust-v0.159.0-alpha.4
+            refs/tags/rust-v0.159.0-alpha.4:refs/tags/rust-v0.159.0-alpha.4 \
+            refs/tags/rust-v0.162.0-alpha.16:refs/tags/rust-v0.162.0-alpha.16 \
+            refs/tags/rust-v0.162.1:refs/tags/rust-v0.162.1
       - name: Verify stable and alpha trees with the real Termux updater
         run: |
           bash scripts/test-termux-release-tags.sh
@@ -57,3 +59,8 @@ jobs:
             rust-v0.156.0-alpha.8-termux rust-v0.156.0-alpha.8 rust-v0.157.0-alpha.8
           bash scripts/test-termux-release-tags.sh \
             rust-v0.158.0-alpha.8-termux rust-v0.158.0-alpha.8 rust-v0.159.0-alpha.4
+          bash scripts/test-termux-release-tags.sh \
+            rust-v0.162.0-alpha.16-termux rust-v0.162.0-alpha.16 rust-v0.162.1
+      - uses: dtolnay/rust-toolchain@1.93
+      - name: Test generated startup locks with native and unsupported file locking
+        run: python3 -B scripts/test-termux-startup-lock.py

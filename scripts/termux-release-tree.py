@@ -178,6 +178,141 @@ def merge_dependency_additions(text, *, path):
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
 
 
+def adapt_removable_startup_lock(baseline, source, upstream):
+    """Carry the reviewed lock fallback through upstream's removable-lock redesign."""
+    removable = "pub(super) fn try_acquire_removable_app_server_startup_lock("
+    if (
+        removable not in upstream
+        or removable in baseline
+        or source == baseline
+        or "use codex_utils_file_lock::" not in source
+    ):
+        return source
+
+    imports = """use codex_utils_file_lock::FileLockOutcome;
+use codex_utils_file_lock::LockDirGuard;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
+use codex_utils_file_lock::lock_exclusive_optional;
+"""
+    import_anchor = "use codex_utils_absolute_path::AbsolutePathBuf;\n"
+    field = "    _file: std::fs::File,\n"
+    guard_field = "    _lock_dir_guard: Option<LockDirGuard>,\n"
+    blocking_lock = """        let lock_dir_guard = match lock_exclusive_optional(&file)? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => {
+                Some(acquire_sibling_lock_dir(startup_lock_path.as_path())?)
+            }
+        };
+"""
+    expected = baseline
+    for before, after in (
+        (import_anchor, import_anchor + imports),
+        (field, field + guard_field),
+        (
+            "        file.lock()?;\n        Ok(AppServerStartupLock { _file: file })\n",
+            blocking_lock
+            + """        Ok(AppServerStartupLock {
+            _file: file,
+            _lock_dir_guard: lock_dir_guard,
+        })
+""",
+        ),
+    ):
+        if expected.count(before) != 1:
+            raise ValueError("unrecognized startup-lock baseline; refusing adaptation")
+        expected = expected.replace(before, after, 1)
+    if source != expected:
+        raise ValueError("unrecognized Termux startup-lock delta; refusing adaptation")
+
+    adapted = upstream
+    for before, after in (
+        (
+            import_anchor,
+            import_anchor
+            + """use codex_utils_file_lock::FileLockOutcome;
+use codex_utils_file_lock::LockDirGuard;
+#[cfg(unix)]
+use codex_utils_file_lock::TryFileLockOutcome;
+#[cfg(unix)]
+use codex_utils_file_lock::TryLockDirOutcome;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
+use codex_utils_file_lock::lock_exclusive_optional;
+#[cfg(unix)]
+use codex_utils_file_lock::try_acquire_sibling_lock_dir;
+#[cfg(unix)]
+use codex_utils_file_lock::try_lock_exclusive_optional;
+""",
+        ),
+        (field, field + guard_field),
+        (
+            "        file.lock()?;\n        Ok(AppServerStartupLock {\n            _file: file,\n",
+            blocking_lock
+            + "        Ok(AppServerStartupLock {\n            _file: file,\n"
+            + "            _lock_dir_guard: lock_dir_guard,\n",
+        ),
+        (
+            "    socket_guard._startup_lock._file.unlock()?;",
+            """    let socket_guard = {
+        let mut socket_guard = socket_guard;
+        if socket_guard._startup_lock._lock_dir_guard.take().is_none() {
+            socket_guard._startup_lock._file.unlock()?;
+        }
+        socket_guard
+    };""",
+        ),
+        (
+            """        match self._file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
+""",
+            """        let _cleanup_lock_dir_guard = if self._lock_dir_guard.is_some() {
+            None
+        } else {
+            match try_lock_exclusive_optional(&self._file)? {
+                TryFileLockOutcome::Acquired => None,
+                TryFileLockOutcome::WouldBlock => return Ok(()),
+                TryFileLockOutcome::Unsupported => {
+                    match try_acquire_sibling_lock_dir(path.as_path())? {
+                        TryLockDirOutcome::Acquired(guard) => Some(guard),
+                        TryLockDirOutcome::WouldBlock => return Ok(()),
+                    }
+                }
+            }
+        };
+""",
+        ),
+        (
+            "    file.try_lock()?;\n",
+            """    let lock_dir_guard = match try_lock_exclusive_optional(&file)? {
+        TryFileLockOutcome::Acquired => None,
+        TryFileLockOutcome::WouldBlock => return Err(ErrorKind::WouldBlock.into()),
+        TryFileLockOutcome::Unsupported => {
+            match try_acquire_sibling_lock_dir(startup_lock_path.as_path())? {
+                TryLockDirOutcome::Acquired(guard) => Some(guard),
+                TryLockDirOutcome::WouldBlock => return Err(ErrorKind::WouldBlock.into()),
+            }
+        }
+    };
+""",
+        ),
+        (
+            "        _file: file,\n        removable_path: Some(startup_lock_path),",
+            (
+                "        _file: file,\n        _lock_dir_guard: lock_dir_guard,\n"
+                "        removable_path: Some(startup_lock_path),"
+            ),
+        ),
+    ):
+        if adapted.count(before) != 1:
+            raise ValueError(
+                "unrecognized removable startup-lock code; refusing adaptation"
+            )
+        adapted = adapted.replace(before, after, 1)
+    return adapted
+
+
 def release_tree(upstream, source, baseline, excluded):
     upstream, source, baseline = (
         git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip()
@@ -192,6 +327,25 @@ def release_tree(upstream, source, baseline, excluded):
         cli = "codex-rs/cli/src/main.rs"
         source_cli = git("show", f"{source}:{cli}")
         has_termux_updater = b"async fn run_termux_update()" in source_cli
+        socket_path = "codex-rs/app-server-transport/src/transport/unix_socket.rs"
+        adapted_socket = None
+        if all(
+            git("ls-tree", ref, "--", socket_path)
+            for ref in (baseline, source, upstream)
+        ):
+            source_socket = git("show", f"{source}:{socket_path}").decode()
+            upstream_socket = git("show", f"{upstream}:{socket_path}").decode()
+            adapted = adapt_removable_startup_lock(
+                git("show", f"{baseline}:{socket_path}").decode(),
+                source_socket,
+                upstream_socket,
+            )
+            if adapted != source_socket:
+                adapted_socket = adapted
+                print(
+                    "Adapted Termux fallback to removable startup locks.",
+                    file=sys.stderr,
+                )
 
         def put_blob(path, content):
             blob = git("hash-object", "-w", "--stdin", data=content).decode().strip()
@@ -252,6 +406,13 @@ def release_tree(upstream, source, baseline, excluded):
                             "Retired Android warning guards for removed SuppressStderr helper.",
                             file=sys.stderr,
                         )
+            if adapted_socket is not None:
+                # The adapter verifies the entire old downstream delta before
+                # porting it. Merge that reviewed delta against the new API.
+                put_blob(
+                    socket_path,
+                    (adapted_socket if ref == source else upstream_socket).encode(),
+                )
             if has_termux_updater:
                 put_blob(
                     cli, async_updater(git("show", f"{ref}:{cli}").decode()).encode()
