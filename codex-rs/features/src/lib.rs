@@ -98,6 +98,8 @@ pub enum Feature {
     ApiKeyModelDiscovery,
     /// Forward explicit programs with builtin OpenAI API keys.
     ApiKeyCyberAccessPrograms,
+    /// Enable Daybreak controls and automatic access-program selection in CLI clients.
+    CliDaybreak,
     /// Deprecated no-op; use `tui.fullscreen_transcript` instead.
     TranscriptV2,
     // Stable.
@@ -125,6 +127,8 @@ pub enum Feature {
     ExecutedToolCallMetadata,
     /// Enable JavaScript code mode backed by the standalone host process.
     CodeMode,
+    /// Expose ranked tool discovery inside JavaScript code mode.
+    CodeModeToolSearch,
     /// Removed compatibility flag for the configurable code-mode exec yield timeout.
     CodeModeBufferedExec,
     /// Run JavaScript code mode in the standalone host process.
@@ -156,7 +160,7 @@ pub enum Feature {
     TerminalVisualizationInstructions,
     /// Stream structured progress while apply_patch input is being generated.
     ApplyPatchStreamingEvents,
-    /// Preserve existing line endings when apply_patch updates files.
+    /// Removed compatibility flag. Patches always preserve existing line endings.
     ApplyPatchPreserveLineEndings,
     /// Allow exec tools to request additional permissions while staying sandboxed.
     ExecPermissionApprovals,
@@ -397,6 +401,8 @@ pub enum Feature {
     Artifact,
     /// Enable Fast mode selection in the TUI and request layer.
     FastMode,
+    /// Enable Ultra Fast mode independently of Fast mode.
+    UltrafastMode,
     /// Enable explicitly requested model changes for later step captures.
     StepModelSwitching,
     /// Enable voice conversations in the TUI.
@@ -546,6 +552,15 @@ impl Features {
 
     pub fn enabled(&self, f: Feature) -> bool {
         self.enabled.contains(&f)
+    }
+
+    /// Whether a routing tier is enabled, independently of model catalog support.
+    pub fn service_tier_enabled(&self, service_tier: &str) -> bool {
+        match service_tier {
+            "flex" => true,
+            "ultrafast" => self.enabled(Feature::UltrafastMode),
+            _ => self.enabled(Feature::FastMode),
+        }
     }
 
     /// Returns whether persistent execution is enabled for the selected effort.
@@ -1111,6 +1126,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::CodeModeToolSearch,
+        key: "code_mode_tool_search",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::CodeModeBufferedExec,
         key: "code_mode_buffered_exec",
         stage: Stage::Removed,
@@ -1138,7 +1159,7 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::InstantInterrupt,
         key: "instant_interrupt",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CodeModeOnly,
@@ -1257,7 +1278,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ApplyPatchPreserveLineEndings,
         key: "apply_patch_preserve_line_endings",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1337,6 +1358,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "api_key_model_discovery",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::CliDaybreak,
+        key: "cli_daybreak",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ApiKeyCyberAccessPrograms,
@@ -1873,6 +1900,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::FastMode,
         key: "fast_mode",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::UltrafastMode,
+        key: "ultrafast_mode",
         stage: Stage::Stable,
         default_enabled: true,
     },

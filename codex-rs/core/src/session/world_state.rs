@@ -6,6 +6,7 @@ use crate::connectors;
 use crate::context::TokenBudgetContext;
 use crate::context::world_state::AgentsMdState;
 use crate::context::world_state::AppsInstructionsState;
+use crate::context::world_state::BaseInstructionsState;
 use crate::context::world_state::CollaborationModeState;
 use crate::context::world_state::CompactPermissionsState;
 use crate::context::world_state::ContextWindowGuidanceState;
@@ -40,11 +41,32 @@ const MAX_ENVIRONMENT_SUBAGENTS: usize = 8;
 const MAX_ENVIRONMENT_SUBAGENT_BYTES: usize = 1_024;
 
 impl Session {
+    pub(crate) async fn current_window_uses_incremental_tools(
+        &self,
+        step_context: &StepContext,
+    ) -> bool {
+        if !step_context.settings.model_info.use_responses_lite {
+            return false;
+        }
+        let state = self.state.lock().await;
+        if state.history.annotated_items().is_empty() {
+            return step_context.incremental_tools_enabled();
+        }
+        state.history.has_tool_declarations()
+    }
+
     #[tracing::instrument(name = "world_state.build", level = "info", skip_all)]
     pub(crate) async fn build_world_state_for_step(
         &self,
         step_context: &StepContext,
+        new_window: bool,
     ) -> CodexResult<WorldState> {
+        let incremental_tools = if new_window {
+            step_context.incremental_tools_enabled()
+        } else {
+            self.current_window_uses_incremental_tools(step_context)
+                .await
+        };
         let turn_context = step_context.turn.as_ref();
         let settings = &step_context.settings;
         let model_info = settings.model_info.as_ref();
@@ -118,10 +140,11 @@ impl Session {
             String::new()
         };
         let mut world_state = WorldState::default();
-        if step_context.uses_incremental_tools() {
+        if incremental_tools {
             let specs = step_context.tool_router.model_visible_specs();
             let definitions = codex_tools::create_tools_json_for_responses_lite(&specs)?;
             world_state.add_section(TopLevelToolsState::new(definitions)?);
+            world_state.add_section(BaseInstructionsState(base_instructions));
         }
         world_state.add_section(ModelInstructionsState::new(
             &model_info.slug,

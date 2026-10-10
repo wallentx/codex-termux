@@ -714,26 +714,20 @@ fn reference_context_item() -> TurnContextItem {
                 .join("reference-cwd"),
         )
         .expect("absolute reference cwd"),
-        workspace_roots: None,
-        current_date: Some("2026-03-23".to_string()),
-        timezone: Some("America/Los_Angeles".to_string()),
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: None,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         permission_profile: None,
         active_permission_profile: None,
-        network: None,
         file_system_sandbox_policy: None,
         model: "gpt-test".to_string(),
         comp_hash: None,
-        personality: None,
         collaboration_mode: None,
         multi_agent_version: None,
-        multi_agent_mode: None,
         realtime_active: Some(false),
         cyber_access_program: None,
         effort: None,
-        summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
     }
 }
 
@@ -1496,6 +1490,24 @@ fn estimate_token_count_with_base_instructions_uses_provided_text() {
     let expected_delta = approx_token_count_for_text(&long_base.text)
         - approx_token_count_for_text(&short_base.text);
     assert_eq!(long_estimate - short_estimate, expected_delta);
+}
+
+#[test]
+fn estimate_token_count_counts_recorded_base_instructions_once() {
+    use crate::context::ContextualUserFragment;
+
+    let base = BaseInstructions {
+        text: "base instructions ".repeat(100),
+        provenance: None,
+    };
+    let item =
+        ContextualUserFragment::into(crate::context::BaseInstructionsFragment(base.text.clone()));
+    let expected = estimate_item_token_count(&item);
+    let history = create_history_with_items(vec![item]);
+    assert_eq!(
+        history.estimate_token_count_with_base_instructions(&base),
+        Some(expected)
+    );
 }
 
 #[test]

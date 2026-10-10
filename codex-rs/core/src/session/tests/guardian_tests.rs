@@ -1113,24 +1113,27 @@ async fn compaction_initial_context_preserves_separate_guardian_developer_messag
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     let world_state = Arc::new(
         session
-            .build_world_state_for_step(&step_context)
+            .build_world_state_for_step(&step_context, /*new_window*/ true)
             .await
             .expect("world state should build"),
     );
-    let (refreshed, _) =
-        crate::compact::build_compaction_initial_context(&session, &step_context, &world_state)
-            .await;
+    let (refreshed, _) = crate::compact::build_compaction_replacement_history(
+        &session,
+        &step_context,
+        &world_state,
+        Vec::new(),
+    )
+    .await;
 
     let developer_messages = refreshed
         .iter()
-        .filter_map(|envelope| match &envelope.item {
+        .map(|item| &item.item)
+        .filter_map(|item| match item {
             ResponseItem::Message { role, content, .. } if role == "developer" => {
                 crate::content_items_to_text(content).map(|text| {
                     (
                         text,
-                        envelope
-                            .item
-                            .executed_tool_call_metadata()
+                        item.executed_tool_call_metadata()
                             .and_then(|metadata| metadata.content_item_kinds.clone()),
                     )
                 })
@@ -1318,7 +1321,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
-        environment_selections: Vec::new(),
+        environment_requests: Vec::new(),
         thread_extension_init,
         turn_extension_init: Default::default(),
         client_mcp_extensions: ClientMcpExtensions::default(),

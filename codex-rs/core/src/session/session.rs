@@ -42,6 +42,7 @@ use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_sandboxing::SandboxType;
 use codex_skills::SkillError;
@@ -340,9 +341,12 @@ impl SessionConfiguration {
         environment_selections: Vec<TurnEnvironmentSelection>,
     ) -> CodexThreadSettingsOverrides {
         CodexThreadSettingsOverrides {
-            environments: Some(TurnEnvironmentSelections::new(
+            environments: Some(TurnEnvironmentRequests::new(
                 self.legacy_fallback_cwd.clone(),
-                environment_selections,
+                environment_selections
+                    .into_iter()
+                    .map(TurnEnvironmentSelection::into_request)
+                    .collect(),
             )),
             runtime_workspace_roots: Some(self.runtime_workspace_roots.clone()),
             profile_workspace_roots: Some(
@@ -982,17 +986,10 @@ impl Session {
             config.current_time_reminder.as_ref(),
             external_time_provider,
         )?;
-        let selected_capability_roots =
-            match thread_extension_init.get::<Vec<SelectedCapabilityRoot>>() {
-                Some(roots) => roots.as_ref().clone(),
-                None => {
-                    let roots = initial_history.get_selected_capability_roots();
-                    if !roots.is_empty() {
-                        thread_extension_init.insert(roots.clone());
-                    }
-                    roots
-                }
-            };
+        let selected_capability_roots = thread_extension_init
+            .get::<Vec<SelectedCapabilityRoot>>()
+            .map(|roots| roots.as_ref().clone())
+            .unwrap_or_default();
         thread_extension_init.insert(codex_extension_api::ThreadOriginator(
             session_configuration.originator.clone(),
         ));
@@ -1849,7 +1846,7 @@ impl Session {
                 next_internal_sub_id: AtomicU64::new(0),
             });
             if let Some(startup) = &startup {
-                let _ = startup.session.set(Arc::clone(&sess));
+                startup.set_session(Arc::clone(&sess));
             }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

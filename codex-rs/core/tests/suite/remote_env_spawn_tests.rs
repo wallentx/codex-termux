@@ -89,7 +89,7 @@ pub(crate) async fn pending_subagent_scenario(
     let root = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            environments: Some(vec![pending.clone()]),
+            environments: Some(vec![pending.clone().into_request()]),
             ..StartThreadOptions::new(test.config.clone())
         })
         .await?;
@@ -157,7 +157,7 @@ pub(crate) async fn pending_subagent_scenario(
         .await;
 
     let mut created = test.thread_manager.subscribe_thread_created();
-    let TurnInputSubmission::Started { turn_id } = root
+    let TurnInputSubmission::Started { turn_id, .. } = root
         .thread
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: "Delegate waiting for the shared workspace, and report what the worker finds."
@@ -202,7 +202,7 @@ pub(crate) async fn pending_subagent_scenario(
                 .submit(Op::TurnSettings {
                     turn_id,
                     update: TurnSettingsUpdate {
-                        environments: Some(vec![expected.clone()]),
+                        environments: Some(vec![expected.clone().into_request()]),
                         ..Default::default()
                     },
                     reply,

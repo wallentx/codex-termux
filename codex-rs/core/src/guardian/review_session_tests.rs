@@ -10,6 +10,7 @@ use codex_history::ResponseItemEnvelope;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_prompts::GuardianPolicyInstructions;
 use codex_prompts::ResolvedModelMessages;
+use codex_protocol::TranscriptFormat;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::protocol::AgentStatus;
@@ -107,6 +108,7 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
         let text = serde_json::to_string(&content).unwrap();
         reply
             .send(Ok(TurnInputSubmission::Started {
+                root_turn_id: id.clone(),
                 turn_id: id.clone(),
             }))
             .unwrap();
@@ -179,6 +181,7 @@ fn turn_complete_event(
     Event {
         id: turn_id.to_string(),
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            root_turn_id: None,
             turn_id: turn_id.to_string(),
             started_at: None,
             last_agent_message: last_agent_message.map(str::to_string),
@@ -194,6 +197,7 @@ fn turn_aborted_event(turn_id: &str) -> Event {
     Event {
         id: turn_id.to_string(),
         msg: EventMsg::TurnAborted(TurnAbortedEvent {
+            root_turn_id: None,
             turn_id: Some(turn_id.to_string()),
             started_at: None,
             reason: TurnAbortReason::Interrupted,
@@ -653,6 +657,7 @@ async fn guardian_review_session_config_resolves_policy_and_template(
         guardian_config.base_instructions,
         Some(
             GuardianPolicyInstructions::new(
+                TranscriptFormat::Line,
                 expected_policy,
                 "",
                 expected_template,
@@ -728,6 +733,7 @@ async fn run_review_on_reused_session_waits_for_submitted_turn() {
     };
     reply
         .send(Ok(TurnInputSubmission::Started {
+            root_turn_id: id.clone(),
             turn_id: id.clone(),
         }))
         .expect("reply to guardian submission");
@@ -791,7 +797,10 @@ async fn run_review_removes_trunk_when_event_stream_is_broken() {
         panic!("expected turn-input submission");
     };
     reply
-        .send(Ok(TurnInputSubmission::Started { turn_id: id }))
+        .send(Ok(TurnInputSubmission::Started {
+            root_turn_id: id.clone(),
+            turn_id: id,
+        }))
         .expect("reply to guardian submission");
     drop(tx_event);
 

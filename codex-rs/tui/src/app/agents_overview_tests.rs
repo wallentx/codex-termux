@@ -376,6 +376,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
             ]),
             recent_seed_complete: true,
             discovery: None,
+            pinned_thread_ids: None,
         }),
     );
     retained_thread.name = Some("New name".to_string());
@@ -396,6 +397,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
             threads: HashMap::from([(retained, None)]),
             recent_seed_complete: true,
             discovery: None,
+            pinned_thread_ids: None,
         }),
     );
     assert_eq!(app.agents_overview.threads, expected);
@@ -445,6 +447,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
                     last_messages,
                     recent_seed_complete: true,
                     discovery: None,
+                    pinned_thread_ids: None,
                 }),
             );
             assert!(app.agents_overview.last_messages.is_empty());
@@ -2357,6 +2360,7 @@ async fn resume_picker_round_trip_preserves_each_threads_input() -> Result<()> {
                         thread_id: target.thread_id.to_string(),
                         turn: codex_app_server_protocol::Turn {
                             id: "turn-with-follow-up".to_string(),
+                            root_turn_id: None,
                             items_view: codex_app_server_protocol::TurnItemsView::Full,
                             items: Vec::new(),
                             status: codex_app_server_protocol::TurnStatus::InProgress,
@@ -2696,6 +2700,7 @@ async fn command_center_refresh_failure_is_inline_and_clears_on_success() -> Res
             last_messages: HashMap::new(),
             recent_seed_complete: false,
             discovery: None,
+            pinned_thread_ids: None,
         }),
     ] {
         let request_id = Uuid::new_v4();
@@ -2727,6 +2732,7 @@ async fn command_center_refresh_failure_is_inline_and_clears_on_success() -> Res
             last_messages: HashMap::new(),
             recent_seed_complete: true,
             discovery: None,
+            pinned_thread_ids: None,
         }),
     );
     assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 48), before);
@@ -3022,7 +3028,18 @@ async fn command_center_new_actions_use_selection_and_leave_metadata_text_alone(
         ThreadStatus::Idle,
     );
     target.cwd = test_path_buf("/tmp/checkout/subdir").abs();
+    app.agents_overview.pinned_thread_ids = Some(Vec::new());
     let mut view = app.agents_overview_view(vec![target.clone()], Some(id));
+    view.handle_key_event(KeyCode::Char('p').into());
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::ToggleAgentsOverviewPin {
+            thread_id,
+            pinned: true,
+        }) if thread_id == id
+    ));
+    view.handle_key_event(KeyCode::Char('p').into());
+    assert!(rx.try_recv().is_err());
     for _ in 0..3 {
         view.handle_key_event(KeyCode::Char('n').into());
         assert!(
@@ -3039,13 +3056,13 @@ async fn command_center_new_actions_use_selection_and_leave_metadata_text_alone(
         ));
     }
     view.handle_key_event(KeyCode::Char('r').into());
-    for character in "nwogrxfha".chars() {
+    for character in "nwogrxfhap".chars() {
         view.handle_key_event(KeyCode::Char(character).into());
     }
     assert!(rx.try_recv().is_err());
     view.handle_key_event(KeyCode::Enter.into());
     assert!(
-        matches!(rx.try_recv(), Ok(AppEvent::RenameAgentsOverviewThread { name, .. }) if name.ends_with("nwogrxfha"))
+        matches!(rx.try_recv(), Ok(AppEvent::RenameAgentsOverviewThread { name, .. }) if name.ends_with("nwogrxfhap"))
     );
     let mut empty = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
     empty.handle_key_event(KeyCode::Char('n').into());

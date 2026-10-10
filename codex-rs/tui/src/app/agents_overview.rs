@@ -49,11 +49,16 @@ pub(super) struct AgentsOverviewState {
     pub(super) initialized: bool,
     pub(super) discovery: super::agents_overview_discovery::AgentsOverviewDiscovery,
     pub(super) show_more_requested: bool,
+    pub(super) refresh_show_more: bool,
     /// Vacancies left by lifecycle removals, filled without expanding the visible window.
     pub(super) refill_count: usize,
     pub(super) request_id: Option<Uuid>,
     pub(super) refresh_pending: bool,
+    pub(super) pin_refresh_requested: bool,
     pub(super) refresh_thread_ids: HashSet<ThreadId>,
+    pub(super) active_refresh_thread_ids: HashSet<ThreadId>,
+    pub(super) pinned_thread_ids: Option<Vec<ThreadId>>,
+    pub(super) pending_pin_change: Option<Uuid>,
     pub(super) refresh_task: Option<tokio::task::AbortHandle>,
     pub(super) refresh_notifications: HashMap<ThreadId, Vec<ServerNotification>>,
     pub(super) rendered_full_screen: bool,
@@ -170,6 +175,8 @@ impl App {
             return;
         }
         self.agents_overview.request_id = None;
+        self.agents_overview.refresh_show_more = false;
+        self.agents_overview.active_refresh_thread_ids.clear();
         self.agents_overview.refresh_task = None;
         let refill_succeeded = result
             .as_ref()
@@ -185,6 +192,9 @@ impl App {
         }
         match result {
             Ok(refresh) => {
+                if let Some(pinned_thread_ids) = refresh.pinned_thread_ids {
+                    self.agents_overview.pinned_thread_ids = pinned_thread_ids;
+                }
                 self.agents_overview.initialized = refresh.recent_seed_complete;
                 if let Some(discovery) = refresh.discovery {
                     if !discovery.has_more() {
@@ -380,7 +390,7 @@ impl App {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .vim_enabled = self.chat_widget.composer_is_vim_enabled();
-        AgentsOverviewView::new(
+        let mut view = AgentsOverviewView::new(
             rows,
             selected_thread_id,
             self.config.features.enabled(Feature::Worktrees)
@@ -392,7 +402,16 @@ impl App {
             self.app_event_tx.clone(),
             self.keymap.clone(),
             Arc::clone(&self.agents_overview.view_state),
-        )
+        );
+        view.pinned_thread_ranks = self.agents_overview.pinned_thread_ids.as_ref().map(|ids| {
+            ids.iter()
+                .copied()
+                .enumerate()
+                .map(|(rank, id)| (id, rank))
+                .collect()
+        });
+        view.pin_action_pending = self.agents_overview.pending_pin_change.is_some();
+        view
     }
 
     pub(super) async fn select_agents_overview_thread(
@@ -547,7 +566,7 @@ impl App {
                 }
             };
             if !unloaded && started.is_none() {
-                if let Err(control) = self
+                match self
                     .confirm_directory_trust(
                         tui,
                         app_server,
@@ -561,9 +580,10 @@ impl App {
                     )
                     .await
                 {
-                    return Ok(control);
+                    Ok(Some(reloaded)) => local_settings = reloaded,
+                    Ok(None) => {}
+                    Err(control) => return Ok(control),
                 }
-                local_settings = self.local_settings.reloaded(&resume_config);
             }
             // Folder selection and trust prompts can replace or clear the loading frame.
             if startup_draft.is_none() {
@@ -1081,7 +1101,8 @@ impl App {
         );
         if server_model_cleared
             && config.model.is_none()
-            && config.features.enabled(Feature::FastMode)
+            && (config.features.enabled(Feature::FastMode)
+                || config.features.enabled(Feature::UltrafastMode))
         {
             // Bootstrap's fallback model may be seeded from the client. Resolve tiers
             // against the server catalog when config/read cleared the model.

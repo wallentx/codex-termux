@@ -12,6 +12,7 @@
 #[path = "history_user_authorization.rs"]
 mod user_authorization;
 
+use crate::context::BaseInstructionsFragment;
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
 use crate::context::is_guardian_context_message;
@@ -619,6 +620,11 @@ impl ContextManager {
         self.items.iter().map(|envelope| &envelope.item)
     }
 
+    pub(crate) fn has_tool_declarations(&self) -> bool {
+        self.raw_items()
+            .any(|item| matches!(item, ResponseItem::AdditionalTools { .. }))
+    }
+
     /// Returns annotated history items without cloning their response payloads.
     pub(crate) fn annotated_items(&self) -> &[ResponseItemEnvelope] {
         &self.items
@@ -653,8 +659,14 @@ impl ContextManager {
         &self,
         base_instructions: &BaseInstructions,
     ) -> Option<i64> {
-        let base_tokens =
-            i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
+        // Incremental windows already account for their recorded base instructions below.
+        let has_recorded_instructions =
+            self.raw_items().any(BaseInstructionsFragment::matches_item);
+        let base_tokens = if has_recorded_instructions {
+            0
+        } else {
+            i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX)
+        };
 
         let items_tokens = self
             .items

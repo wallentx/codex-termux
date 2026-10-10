@@ -1131,6 +1131,7 @@ pub(super) fn app_server_turn(
 ) -> AppServerTurn {
     AppServerTurn {
         id: turn_id.to_string(),
+        root_turn_id: None,
         items_view: codex_app_server_protocol::TurnItemsView::Full,
         items: Vec::new(),
         status,
@@ -1349,7 +1350,7 @@ pub(crate) fn render_bottom_popup(chat: &ChatWidget, width: u16) -> String {
                 if symbol.is_empty() {
                     line.push(' ');
                 } else {
-                    line.push_str(symbol);
+                    line.push_str(&crate::terminal_hyperlinks::strip_osc8(symbol));
                 }
             }
             line.trim_end().to_string()
@@ -1607,9 +1608,7 @@ pub(super) fn plugins_test_detail(
                 description: format!("{name} description"),
                 short_description: None,
                 interface: None,
-                path: Some(plugins_test_absolute_path(&format!(
-                    "skills/{name}/SKILL.md"
-                ))),
+                path: Some(plugins_test_absolute_path(&format!("skills/{name}/SKILL.md")).into()),
                 enabled: true,
             })
             .collect(),

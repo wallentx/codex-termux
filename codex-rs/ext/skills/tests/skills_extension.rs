@@ -230,7 +230,7 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
         interface: None,
         dependencies: None,
         policy: None,
-        path_to_skills_md: skill_path,
+        path_to_skills_md: PathUri::from_abs_path(&skill_path),
         scope: SkillScope::User,
         plugin_id: None,
         remote_plugin_id: None,
@@ -311,7 +311,7 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
         interface: None,
         dependencies: None,
         policy: None,
-        path_to_skills_md: skill_path,
+        path_to_skills_md: PathUri::from_abs_path(&skill_path),
         scope: SkillScope::User,
         plugin_id: None,
         remote_plugin_id: None,
@@ -380,7 +380,7 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
         interface: None,
         dependencies: None,
         policy: None,
-        path_to_skills_md: second_skill_path,
+        path_to_skills_md: PathUri::from_abs_path(&second_skill_path),
         scope: SkillScope::User,
         plugin_id: None,
         remote_plugin_id: None,
@@ -436,7 +436,7 @@ async fn persisted_host_snapshot_deduplicates_warning_after_reinitialization() -
         interface: None,
         dependencies: None,
         policy: None,
-        path_to_skills_md: skill_path,
+        path_to_skills_md: PathUri::from_abs_path(&skill_path),
         scope: SkillScope::User,
         plugin_id: None,
         remote_plugin_id: None,
@@ -1158,6 +1158,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
 
     let turn_store = ExtensionData::new("turn-1");
     let turn_environment = TurnEnvironmentSelection {
+        selected_capability_roots: Default::default(),
         environment_id: "env-1".to_string(),
         cwd: PathUri::parse("file:///workspace").expect("cwd URI"),
         workspace_roots: Vec::new(),
@@ -2380,6 +2381,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
             thread_id: codex_protocol::ThreadId::new(),
             turn_id: "turn-1",
             environments: &[TurnEnvironmentSelection {
+                selected_capability_roots: Default::default(),
                 environment_id: "env-1".to_string(),
                 cwd: PathUri::parse("file:///workspace").expect("cwd URI"),
                 workspace_roots: Vec::new(),

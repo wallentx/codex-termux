@@ -372,6 +372,8 @@ pub use provisioning_client::refresh_registered_core_via_service;
 #[cfg(target_os = "windows")]
 pub use provisioning_client::register_desktop_installation;
 #[cfg(target_os = "windows")]
+pub use provisioning_client::start_windows_sandbox_service_for_setup;
+#[cfg(target_os = "windows")]
 pub use provisioning_protocol::FramedProvisioningMessage;
 #[cfg(target_os = "windows")]
 pub use provisioning_protocol::PROVISIONING_PROTOCOL_VERSION;
@@ -395,6 +397,8 @@ pub use provisioning_protocol::write_provisioning_frame;
 pub use resolved_permissions::ResolvedWindowsSandboxPermissions;
 #[cfg(target_os = "windows")]
 pub use resolved_permissions::WindowsSandboxTokenMode;
+#[cfg(target_os = "windows")]
+pub use resolved_permissions::resolve_workload_temp_paths;
 #[cfg(target_os = "windows")]
 pub use resolved_permissions::token_mode_for_permission_profile;
 #[cfg(target_os = "windows")]
