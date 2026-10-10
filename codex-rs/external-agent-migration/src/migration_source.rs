@@ -2,8 +2,14 @@ use crate::ClaSource;
 use crate::CurSource;
 use crate::RewriteProfile;
 use crate::detect::plugins;
-use crate::detect::sessions::detect_recent_cla_sessions;
-use crate::detect::sessions::detect_recent_cur_sessions;
+use crate::detect::sessions::detect_cla_session_connectors;
+use crate::detect::sessions::detect_cla_session_connectors_by_source_path;
+use crate::detect::sessions::detect_cur_session_connectors;
+use crate::detect::sessions::detect_cur_session_connectors_by_source_path;
+use crate::detect::sessions::detect_recent_cla_sessions_with_limits;
+use crate::detect::sessions::detect_recent_cur_sessions_with_limits;
+use crate::model::DetectedConnectorCandidate;
+use crate::model::ExternalAgentSessionImportLimits;
 use crate::sessions::ExternalAgentSessionMigration;
 use crate::sessions::SessionMetadataMode;
 use serde_json::Value as JsonValue;
@@ -67,6 +73,14 @@ impl ExternalAgentSource {
         }
     }
 
+    pub(super) fn skills_dir_names(self, scope: &MigrationScope) -> &'static [&'static str] {
+        match (self, scope) {
+            // skills-cursor is Cursor-managed and only exists under the home config.
+            (Self::Cur, MigrationScope::Home) => &["skills", "skills-cursor"],
+            _ => &["skills"],
+        }
+    }
+
     pub(super) fn supports_memory(self) -> bool {
         match self {
             Self::Cla => true,
@@ -84,12 +98,11 @@ impl ExternalAgentSource {
 
     pub(super) fn effective_settings(
         self,
-        source_config_dir: &Path,
         source_settings: &Path,
     ) -> io::Result<Option<JsonValue>> {
         match self {
             Self::Cla => ClaSource::effective_settings(source_settings),
-            Self::Cur => CurSource::effective_settings(source_config_dir, source_settings),
+            Self::Cur => CurSource::effective_settings(source_settings),
         }
     }
 
@@ -122,10 +135,15 @@ impl ExternalAgentSource {
         self,
         external_agent_home: &Path,
         codex_home: &Path,
+        limits: ExternalAgentSessionImportLimits,
     ) -> io::Result<Vec<ExternalAgentSessionMigration>> {
         match self {
-            Self::Cla => detect_recent_cla_sessions(external_agent_home, codex_home),
-            Self::Cur => detect_recent_cur_sessions(external_agent_home, codex_home),
+            Self::Cla => {
+                detect_recent_cla_sessions_with_limits(external_agent_home, codex_home, limits)
+            }
+            Self::Cur => {
+                detect_recent_cur_sessions_with_limits(external_agent_home, codex_home, limits)
+            }
         }
     }
 
@@ -140,6 +158,34 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::connector_metadata_roots(external_agent_home),
             Self::Cur => Vec::new(),
+        }
+    }
+
+    pub(super) fn detect_session_connectors(
+        self,
+        sessions: &[ExternalAgentSessionMigration],
+        connector_metadata_roots: &[PathBuf],
+        external_agent_home: &Path,
+    ) -> Vec<DetectedConnectorCandidate> {
+        match self {
+            Self::Cla => detect_cla_session_connectors(sessions, connector_metadata_roots),
+            Self::Cur => detect_cur_session_connectors(sessions, external_agent_home),
+        }
+    }
+
+    pub(super) fn detect_session_connectors_by_source_path(
+        self,
+        sessions: &[ExternalAgentSessionMigration],
+        connector_metadata_roots: &[PathBuf],
+        external_agent_home: &Path,
+    ) -> BTreeMap<PathBuf, Vec<DetectedConnectorCandidate>> {
+        match self {
+            Self::Cla => {
+                detect_cla_session_connectors_by_source_path(sessions, connector_metadata_roots)
+            }
+            Self::Cur => {
+                detect_cur_session_connectors_by_source_path(sessions, external_agent_home)
+            }
         }
     }
 

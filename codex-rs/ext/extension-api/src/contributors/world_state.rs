@@ -3,23 +3,35 @@ use std::sync::Arc;
 use codex_exec_server_protocol::ExecutorCapabilityDiscoverySnapshot;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use serde_json::Value;
 
 use crate::ExtensionData;
+use crate::ExtensionMetrics;
 
 /// Host state available while an extension contributes one sampling step's World State.
 pub struct WorldStateContributionInput<'a> {
     pub thread_id: ThreadId,
     pub turn_id: &'a str,
+    /// Resolved model metadata captured for this sampling step, retained across discovery.
+    pub model_info: &'a ModelInfo,
     pub environments: &'a [TurnEnvironmentSelection],
     /// Selected roots whose stable environments are ready in this sampling step.
     pub ready_selected_capability_roots: &'a [SelectedCapabilityRoot],
     /// Executor-materialized capability files shared by all consumers in this exact step.
     pub executor_capability_discovery: Option<&'a ExecutorCapabilityDiscoverySnapshot>,
+    /// Metrics bound to the captured model for this sampling step.
+    pub extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
     pub session_store: &'a ExtensionData,
     pub thread_store: &'a ExtensionData,
     pub turn_store: &'a ExtensionData,
+    /// The same captured extension inputs that were used to build this step's tools.
+    pub step_store: &'a ExtensionData,
+    /// Persisted comparison state from the last recorded step. Its rendered text may have
+    /// left model history; use a retained-fragment matcher before referring back to it.
+    /// After compaction, sections may contain only retained extension metadata.
+    pub previous_world_state: Option<&'a serde_json::Map<String, Value>>,
 }
 
 /// What the harness knows about the previous value of one extension-owned section.
@@ -63,7 +75,7 @@ impl RenderedWorldStateFragment {
     }
 }
 
-type RenderDiff = dyn for<'a> Fn(PreviousWorldStateSection<'a>) -> Option<RenderedWorldStateFragment>
+type RenderDiff = dyn for<'a> Fn(PreviousWorldStateSection<'a>) -> (Option<Value>, Option<RenderedWorldStateFragment>)
     + Send
     + Sync;
 type LegacyFragmentMatcher = dyn Fn(&str, &str) -> bool + Send + Sync;
@@ -75,26 +87,26 @@ type LegacyFragmentMatcher = dyn Fn(&str, &str) -> bool + Send + Sync;
 #[derive(Clone)]
 pub struct WorldStateSectionContribution {
     id: &'static str,
-    snapshot: Value,
     render_diff: Arc<RenderDiff>,
     matches_legacy_fragment: Arc<LegacyFragmentMatcher>,
     matches_retained_fragment: Option<Arc<LegacyFragmentMatcher>>,
 }
 
 impl WorldStateSectionContribution {
+    /// Return a replacement snapshot and/or fragment. A missing snapshot retains the
+    /// previous section state; a missing fragment emits no model-visible update. A null
+    /// snapshot removes the section from persisted state.
     pub fn new(
         id: &'static str,
-        snapshot: Value,
         render_diff: impl for<'a> Fn(
             PreviousWorldStateSection<'a>,
-        ) -> Option<RenderedWorldStateFragment>
+        ) -> (Option<Value>, Option<RenderedWorldStateFragment>)
         + Send
         + Sync
         + 'static,
     ) -> Self {
         Self {
             id,
-            snapshot,
             render_diff: Arc::new(render_diff),
             matches_legacy_fragment: Arc::new(|_, _| false),
             matches_retained_fragment: None,
@@ -122,14 +134,10 @@ impl WorldStateSectionContribution {
         self.id
     }
 
-    pub fn snapshot(&self) -> &Value {
-        &self.snapshot
-    }
-
     pub fn render_diff(
         &self,
         previous: PreviousWorldStateSection<'_>,
-    ) -> Option<RenderedWorldStateFragment> {
+    ) -> (Option<Value>, Option<RenderedWorldStateFragment>) {
         (self.render_diff)(previous)
     }
 

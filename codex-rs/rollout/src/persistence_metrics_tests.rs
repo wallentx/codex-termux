@@ -1,21 +1,27 @@
+use std::time::Duration;
+
 use codex_protocol::ThreadId;
+use codex_protocol::items::CommandExecutionItem;
+use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::EnteredReviewModeItem;
 use codex_protocol::items::ExitedReviewModeItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EnteredReviewModeEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewTarget;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 
 use super::CompletedTurnMeasurement;
@@ -25,9 +31,12 @@ use super::TurnSizeTotals;
 use super::is_thread_sampled;
 use super::measure_and_filter_rollout_items;
 use super::update_turn_measurements;
+use crate::ResponseItemEnvelope;
+use crate::RolloutItem;
+use crate::policy::PERSISTED_COMMAND_OUTPUT_MAX_BYTES;
 
 fn retained_message(text: &str) -> RolloutItem {
-    RolloutItem::ResponseItem(ResponseItem::Message {
+    RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -35,12 +44,14 @@ fn retained_message(text: &str) -> RolloutItem {
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
-    })
+    }))
 }
 
 fn turn_started(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_attribution: None,
         turn_id: turn_id.to_string(),
+        root_turn_id: None,
         trace_id: None,
         started_at: None,
         model_context_window: None,
@@ -50,6 +61,7 @@ fn turn_started(turn_id: &str) -> RolloutItem {
 
 fn turn_complete(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
         turn_id: turn_id.to_string(),
         started_at: None,
         last_agent_message: None,
@@ -62,9 +74,11 @@ fn turn_complete(turn_id: &str) -> RolloutItem {
 
 fn turn_aborted(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+        root_turn_id: None,
         turn_id: Some(turn_id.to_string()),
         started_at: None,
         reason: TurnAbortReason::Interrupted,
+        error: None,
         completed_at: None,
         duration_ms: None,
     }))
@@ -106,7 +120,7 @@ fn thread_sampling_is_stable_and_selects_whole_threads() {
 #[test]
 fn mixed_batch_reports_exact_policy_counts_and_bytes() {
     let kept = retained_message("hello");
-    let dropped = RolloutItem::ResponseItem(ResponseItem::Other);
+    let dropped = RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Other));
     let items = vec![kept.clone(), dropped.clone()];
 
     let (persisted, measurement) =
@@ -157,7 +171,7 @@ fn turn_measurements_span_batches_and_include_items_before_start() {
         retained_message("first prompt"),
         turn_started("turn-1"),
         retained_message("first response"),
-        RolloutItem::ResponseItem(ResponseItem::Other),
+        RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Other)),
         turn_complete("turn-1"),
     ];
     let second_turn = vec![
@@ -258,6 +272,7 @@ fn item_completion_persistence_depends_on_history_mode() {
             client_id: None,
             content: Vec::new(),
         }),
+        started_at_ms: Some(0),
         completed_at_ms: 0,
     }));
 
@@ -287,6 +302,63 @@ fn item_completion_persistence_depends_on_history_mode() {
 }
 
 #[test]
+fn projected_items_report_post_projection_bytes() {
+    let original_output = "x".repeat(PERSISTED_COMMAND_OUTPUT_MAX_BYTES * 2);
+    let item = RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+        thread_id: ThreadId::default(),
+        turn_id: "turn".to_string(),
+        item: TurnItem::CommandExecution(CommandExecutionItem {
+            sandbox_type: None,
+            model_context: None,
+            id: "exec".to_string(),
+            plugin_id: None,
+            script_path: None,
+            process_id: None,
+            command: vec!["echo".to_string()],
+            cwd: std::env::temp_dir().abs().into(),
+            parsed_cmd: vec![ParsedCommand::Unknown {
+                cmd: "echo".to_string(),
+            }],
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+            status: CommandExecutionStatus::Completed,
+            aggregated_output: Some(original_output),
+            exit_code: Some(0),
+            duration: Some(Duration::ZERO),
+        }),
+        started_at_ms: Some(0),
+        completed_at_ms: 0,
+    }));
+    let original_bytes = serde_json::to_vec(&item)
+        .expect("serialize original command")
+        .len() as u64;
+
+    let (persisted, measurement) =
+        measure_and_filter_rollout_items(std::slice::from_ref(&item), ThreadHistoryMode::Paginated);
+    let persisted_bytes = serde_json::to_vec(&persisted[0])
+        .expect("serialize persisted command")
+        .len() as u64;
+    assert_eq!(
+        measurement.pre_filter,
+        super::RolloutSizeTotals {
+            items: 1,
+            payload_bytes: original_bytes,
+        }
+    );
+    assert_eq!(
+        measurement.post_filter,
+        super::RolloutSizeTotals {
+            items: 1,
+            payload_bytes: persisted_bytes,
+        }
+    );
+    assert!(
+        persisted_bytes < original_bytes,
+        "projection should reduce serialized bytes"
+    );
+}
+
+#[test]
 fn review_mode_persistence_depends_on_history_mode() {
     let completed_items = vec![
         RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -299,6 +371,7 @@ fn review_mode_persistence_depends_on_history_mode() {
                 },
                 user_facing_hint: "Review requested.".to_string(),
             }),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         })),
         RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -308,6 +381,7 @@ fn review_mode_persistence_depends_on_history_mode() {
                 id: "exited-review".to_string(),
                 review_output: None,
             }),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         })),
     ];

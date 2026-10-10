@@ -40,8 +40,10 @@ impl BundledBwrapLauncher {
                 self.program.as_path().display()
             )
         });
-        verify_digest(&bwrap_file, expected_sha256(), self.program.as_path())
-            .unwrap_or_else(|err| panic!("{err}"));
+        if let Err(err) = verify_digest(&bwrap_file, expected_sha256(), self.program.as_path()) {
+            eprintln!("{err}");
+            std::process::exit(crate::BUNDLED_BWRAP_DIGEST_VERIFICATION_FAILURE_EXIT_CODE);
+        }
 
         make_files_inheritable(&preserved_files);
 
@@ -309,8 +311,6 @@ mod tests {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create parent dir");
         }
-        fs::write(path, b"").expect("write executable");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .expect("set executable permissions");
+        codex_utils_cargo_bin::write_executable(path, "").expect("write executable");
     }
 }

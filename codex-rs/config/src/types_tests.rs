@@ -2,6 +2,27 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn mouse_scroll_speed_accepts_integer_and_fractional_multipliers() {
+    for (value, expected) in [("1", 1.0), ("0.5", 0.5), ("3.0", 3.0)] {
+        let tui: Tui = toml::from_str(&format!("mouse_scroll_speed = {value}")).unwrap();
+        assert_eq!(tui.mouse_scroll_speed, Some(expected));
+    }
+}
+
+#[test]
+fn mouse_scroll_speed_rejects_nonpositive_and_nonfinite_values() {
+    for value in ["0", "-0.5", "nan", "inf", "-inf"] {
+        let error = toml::from_str::<Tui>(&format!("mouse_scroll_speed = {value}")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tui.mouse_scroll_speed must be a finite positive number"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn deserialize_skill_config_with_name_selector() {
     let cfg: SkillConfig = toml::from_str(
         r#"
@@ -85,4 +106,39 @@ fn memories_config_clamps_rate_limit_remaining_threshold() {
             ..MemoriesConfig::default()
         }
     );
+}
+
+#[test]
+fn memories_version_selects_pipeline_without_changing_other_defaults() {
+    for (source, version) in [
+        ("", MemoryVersion::V1),
+        ("version = \"v2\"", MemoryVersion::V2),
+    ] {
+        let parsed: MemoriesToml = toml::from_str(source).expect("parse memories config");
+        assert_eq!(
+            MemoriesConfig::from(parsed),
+            MemoriesConfig {
+                version,
+                ..Default::default()
+            }
+        );
+    }
+    assert!(toml::from_str::<MemoriesToml>("version = \"v3\"").is_err());
+}
+
+#[test]
+fn rendering_preferences_default_individually_and_ignore_animation_switch() {
+    for key in ["mermaid", "math", "tables", "lists"] {
+        let tui: Tui =
+            toml::from_str(&format!("animations = false\n[rendering]\n{key} = false\n")).unwrap();
+        assert_eq!(
+            tui.rendering,
+            TuiRendering {
+                mermaid: key != "mermaid",
+                math: key != "math",
+                tables: key != "tables",
+                lists: key != "lists",
+            }
+        );
+    }
 }

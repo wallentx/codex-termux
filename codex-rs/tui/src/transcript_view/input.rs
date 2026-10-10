@@ -1,0 +1,479 @@
+//! Transcript gestures leave ordinary typing and composer editing with the existing input path.
+//! Stationary link clicks open on release; dragging or scrolling keeps the gesture in selection.
+//! Shift-click extends the existing selection from its original text unit.
+//! Optional automatic copying happens only when a nonempty mouse selection is released.
+//! Automatic copies retain the selection; explicit copies clear it after confirmed delivery.
+//! Wheel input accumulates fractional rows and discards the remainder when direction reverses.
+
+use crate::key_hint::KeyBindingListExt;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
+use crossterm::event::MouseButton;
+use crossterm::event::MouseEvent;
+use crossterm::event::MouseEventKind;
+use ratatui::layout::Position as ScreenPosition;
+
+use super::*;
+
+pub(crate) enum ViewAction {
+    Changed,
+    Copy(String),
+    CopyOnSelect(String),
+    PrimarySelection(String),
+    CopyAndFollow(String),
+    OpenLink(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseMode {
+    Interactive,
+    Selection,
+}
+
+/// Transcript jumps shared with input routing so legacy terminals preserve their Alt modifier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JumpTarget {
+    Beginning,
+    Latest,
+}
+
+impl JumpTarget {
+    /// Include the Alt alternative for terminals that do not send Ctrl+Home/End.
+    pub(crate) fn hint_label(self) -> String {
+        let (control, alternate) = match self {
+            Self::Beginning => (KeyCode::Home, KeyCode::Char('<')),
+            Self::Latest => (KeyCode::End, KeyCode::Char('>')),
+        };
+        let alternate = crate::key_hint::alt(alternate).display_label();
+        format!(
+            "{alternate}/{}",
+            crate::key_hint::ctrl(control).display_label()
+        )
+    }
+
+    pub(crate) fn from_key(key: KeyEvent) -> Option<Self> {
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Home, KeyModifiers::CONTROL) => Some(Self::Beginning),
+            (KeyCode::End, KeyModifiers::CONTROL) => Some(Self::Latest),
+            // Zellij can omit the shifted alternate character from enhanced key events.
+            (KeyCode::Char(','), modifiers)
+                if modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                Some(Self::Beginning)
+            }
+            (KeyCode::Char('.'), modifiers)
+                if modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                Some(Self::Latest)
+            }
+            // Terminals differ on whether shifted punctuation retains the Shift modifier.
+            (KeyCode::Char('<'), modifiers)
+                if modifiers.difference(KeyModifiers::SHIFT) == KeyModifiers::ALT =>
+            {
+                Some(Self::Beginning)
+            }
+            (KeyCode::Char('>'), modifiers)
+                if modifiers.difference(KeyModifiers::SHIFT) == KeyModifiers::ALT =>
+            {
+                Some(Self::Latest)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl TranscriptView {
+    /// Resolve links in the last rendered transcript, sharing geometry with click activation.
+    pub(crate) fn link_at(&self, column: u16, row: u16) -> Option<String> {
+        if !self.area.contains(ScreenPosition::new(column, row)) {
+            return None;
+        }
+        let visible = self.visible.get(usize::from(row - self.area.y))?;
+        visible.layout.link_at(visible.row, column - self.area.x)
+    }
+
+    pub(crate) fn navigate_pager(
+        &mut self,
+        key: KeyEvent,
+        cells: &[Arc<dyn HistoryCell>],
+        keymap: &crate::keymap::PagerKeymap,
+    ) -> bool {
+        if keymap.jump_top.is_pressed(key) {
+            self.jump_to_beginning(cells);
+            return true;
+        }
+        if keymap.jump_bottom.is_pressed(key) {
+            self.jump_to_latest();
+            return true;
+        }
+        let page = self.area.height.max(/*other*/ 1) as isize;
+        let half = (page + 1) / 2;
+        let delta = [
+            (&keymap.scroll_up, -1),
+            (&keymap.scroll_down, 1),
+            (&keymap.page_up, -page),
+            (&keymap.page_down, page),
+            (&keymap.half_page_up, -half),
+            (&keymap.half_page_down, half),
+        ]
+        .into_iter()
+        .find_map(|(bindings, delta)| bindings.is_pressed(key).then_some(delta));
+        let Some(delta) = delta else {
+            return false;
+        };
+        self.scroll(cells, delta);
+        true
+    }
+
+    /// Keep selection and Find control keys ahead of configurable chord prefixes.
+    pub(crate) fn owns_interaction_key(&self, key: KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        let (code, modifiers) = crate::key_hint::normalize_key_parts(key.code, key.modifiers);
+        if (code == KeyCode::Char(' ') && modifiers == KeyModifiers::CONTROL)
+            || JumpTarget::from_key(key).is_some()
+        {
+            return true;
+        }
+        if self.copy_mode.is_some() {
+            return true;
+        }
+        if self.selection.is_some() {
+            return crate::text_selection::is_copy_key(key)
+                || code == KeyCode::Esc
+                || (code == KeyCode::Enter && modifiers == KeyModifiers::NONE)
+                || (matches!(modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+                    && matches!(
+                        code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                    ))
+                || (modifiers == KeyModifiers::NONE
+                    && matches!(code, KeyCode::PageUp | KeyCode::PageDown));
+        }
+        self.search.is_active()
+            && (code == KeyCode::Esc
+                || (code == KeyCode::Enter
+                    && (self.is_search_editing() || modifiers == KeyModifiers::NONE))
+                || (modifiers == KeyModifiers::NONE
+                    && matches!(code, KeyCode::PageUp | KeyCode::PageDown))
+                || (modifiers == KeyModifiers::CONTROL
+                    && matches!(code, KeyCode::Char('c' | 'n' | 'p'))))
+    }
+
+    pub(crate) fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<ViewAction> {
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        if let Some(action) = self.handle_copy_mode_key(key, cells) {
+            return Some(action);
+        }
+        if let Some(action) = self.handle_disclosure_key(key, cells) {
+            return Some(action);
+        }
+        if self.selection.is_some() {
+            if let Some(action) = self.handle_selection_key(key, cells) {
+                return Some(action);
+            }
+            self.end_selection(cells);
+        }
+        let (code, modifiers) = crate::key_hint::normalize_key_parts(key.code, key.modifiers);
+        if modifiers == KeyModifiers::CONTROL && code == KeyCode::Char(' ') {
+            self.begin_selection(cells, self.area.x, self.area.y, /*clicks*/ 1);
+            if let Some(selection) = &mut self.selection {
+                selection.dragging = false;
+                selection.resume_on_empty = false;
+            }
+            return Some(ViewAction::Changed);
+        }
+        if self.handle_search_key(key, cells) {
+            return Some(ViewAction::Changed);
+        }
+        self.handle_scroll_key(key, cells)
+    }
+
+    pub(crate) fn handle_mouse(
+        &mut self,
+        event: MouseEvent,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<ViewAction> {
+        self.handle_mouse_with_mode(event, cells, MouseMode::Interactive)
+    }
+
+    /// Handles selection and scrolling without activating transcript content.
+    pub(crate) fn handle_selection_mouse(
+        &mut self,
+        event: MouseEvent,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<ViewAction> {
+        self.handle_mouse_with_mode(event, cells, MouseMode::Selection)
+    }
+
+    fn handle_mouse_with_mode(
+        &mut self,
+        event: MouseEvent,
+        cells: &[Arc<dyn HistoryCell>],
+        mode: MouseMode,
+    ) -> Option<ViewAction> {
+        if mode == MouseMode::Interactive
+            && let Some(action) = self.handle_follow_control_mouse(event)
+        {
+            return Some(action);
+        }
+        if mode == MouseMode::Interactive
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
+            && event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            && let Some((area, tip)) = &self.composer_tip
+            && area.contains(ScreenPosition::new(event.column, event.row))
+        {
+            let column = usize::from(event.column - area.x);
+            return tip
+                .hyperlinks
+                .iter()
+                .find(|link| link.columns.contains(&column))?
+                .terminal_destination()
+                .map(ViewAction::OpenLink);
+        }
+        let inside = self
+            .area
+            .contains(ScreenPosition::new(event.column, event.row));
+        let dragging = self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging);
+        if !inside && !dragging {
+            return None;
+        }
+        // Wheel navigation supersedes the last drag position. A real drag event can resume it.
+        if matches!(
+            event.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && let Some(selection) = &mut self.selection
+        {
+            selection.pointer = None;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let direction = if event.kind == MouseEventKind::ScrollUp {
+                    -1.0
+                } else {
+                    1.0
+                };
+                if self.pending_mouse_scroll.signum() != direction {
+                    self.pending_mouse_scroll = 0.0;
+                }
+                self.pending_mouse_scroll += direction * self.mouse_scroll_speed;
+                // Decimal speeds can land just short of a whole row after repeated addition.
+                let rounded = self.pending_mouse_scroll.round();
+                if rounded != 0.0 && (self.pending_mouse_scroll - rounded).abs() < 1e-9 {
+                    self.pending_mouse_scroll = rounded;
+                }
+                let rows = self.pending_mouse_scroll as isize;
+                self.pending_mouse_scroll = self.pending_mouse_scroll.fract();
+                if rows != 0 {
+                    self.scroll(cells, rows);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if inside => {
+                return self
+                    .selected_text(cells)
+                    .filter(|text| !text.is_empty())
+                    .map(ViewAction::Copy);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                return self.pointer_down(event, cells, mode);
+            }
+            MouseEventKind::Drag(MouseButton::Left) if dragging => {
+                self.extend_selection(event.column, event.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) if dragging => {
+                // Open only a stationary click. Dragging back to the origin is still selection,
+                // and wheel scrolling clears the pointer even when it cannot move the viewport.
+                let link = if mode == MouseMode::Interactive {
+                    self.selection.as_mut().and_then(|selection| {
+                        (inside
+                            && !selection.moved
+                            && selection.pointer
+                                == Some(ScreenPosition::new(event.column, event.row))
+                            && event.modifiers.is_empty())
+                        .then(|| selection.pressed_link.take())
+                        .flatten()
+                    })
+                } else {
+                    None
+                };
+                let link = link.filter(|destination| {
+                    self.link_at(event.column, event.row).as_ref() == Some(destination)
+                });
+                if self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.moved && selection.pointer.is_some())
+                {
+                    self.extend_selection(event.column, event.row);
+                }
+                self.end_drag();
+                let selected = self.selected_text(cells);
+                if selected.is_none() {
+                    self.end_selection(cells);
+                }
+                if let Some(link) = link {
+                    return Some(ViewAction::OpenLink(link));
+                }
+                if let Some(text) = selected.filter(|text| !text.is_empty()) {
+                    if self.copy_on_select {
+                        return Some(ViewAction::CopyOnSelect(text));
+                    }
+                    if self.primary_selection {
+                        return Some(ViewAction::PrimarySelection(text));
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(ViewAction::Changed)
+    }
+
+    fn handle_selection_key(
+        &mut self,
+        key: KeyEvent,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<ViewAction> {
+        if crate::text_selection::is_copy_key(key)
+            || (key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Enter)
+        {
+            return Some(
+                self.selected_text(cells)
+                    .filter(|text| !text.is_empty())
+                    .map_or(ViewAction::Changed, |text| {
+                        if key.code == KeyCode::Enter {
+                            ViewAction::CopyAndFollow(text)
+                        } else {
+                            ViewAction::Copy(text)
+                        }
+                    }),
+            );
+        }
+        if key.code == KeyCode::Esc {
+            self.end_selection(cells);
+            return Some(ViewAction::Changed);
+        }
+        if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+            && self.selection_key(cells, key.code)
+        {
+            return Some(ViewAction::Changed);
+        }
+        self.handle_scroll_key(key, cells)
+    }
+
+    pub(super) fn handle_scroll_key(
+        &mut self,
+        key: KeyEvent,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<ViewAction> {
+        let jump = JumpTarget::from_key(key);
+        match (key.code, key.modifiers) {
+            (KeyCode::PageUp | KeyCode::PageDown, KeyModifiers::NONE) => {
+                // Share page-key configuration without taking the pager's typing shortcuts.
+                // Full pages retain the main view's existing one-row overlap.
+                let keymap = &self.disclosure.keymap.pager;
+                let height = self.area.height.max(/*other*/ 1) as isize;
+                let page = (height - 1).max(/*other*/ 1);
+                let half = (height + 1) / 2;
+                let delta = [
+                    (&keymap.scroll_up, -1),
+                    (&keymap.scroll_down, 1),
+                    (&keymap.page_up, -page),
+                    (&keymap.page_down, page),
+                    (&keymap.half_page_up, -half),
+                    (&keymap.half_page_down, half),
+                ]
+                .into_iter()
+                .find_map(|(bindings, delta)| bindings.is_pressed(key).then_some(delta))?;
+                self.scroll(cells, delta);
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) if self.can_return_to_latest() => {
+                self.jump_to_latest();
+            }
+            _ if jump == Some(JumpTarget::Beginning) => {
+                self.jump_to_beginning(cells);
+            }
+            _ if jump == Some(JumpTarget::Latest) => self.jump_to_latest(),
+            _ => return None,
+        }
+        Some(ViewAction::Changed)
+    }
+
+    fn pointer_down(
+        &mut self,
+        event: MouseEvent,
+        cells: &[Arc<dyn HistoryCell>],
+        mode: MouseMode,
+    ) -> Option<ViewAction> {
+        if mode == MouseMode::Interactive
+            && event.modifiers.is_empty()
+            && self.toggle_disclosure_at(cells, event.column, event.row)
+        {
+            return Some(ViewAction::Changed);
+        }
+        self.disclosure.focused = None;
+        let visible = self
+            .visible
+            .get(usize::from(event.row.checked_sub(self.area.y)?))?;
+        if mode == MouseMode::Interactive
+            && event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            return self
+                .link_at(event.column, event.row)
+                .map(ViewAction::OpenLink);
+        }
+        if event.modifiers == KeyModifiers::SHIFT && self.has_selection_range() {
+            self.last_click = None;
+            self.extend_selection(event.column, event.row);
+            if let Some(selection) = &mut self.selection {
+                selection.dragging = true;
+                selection.pressed_link = None;
+            }
+            return Some(ViewAction::Changed);
+        }
+        let clicks =
+            crate::text_selection::click_count(&mut self.last_click, event.column, event.row);
+        if clicks >= 2
+            && visible
+                .layout
+                .position_at(visible.row, event.column.saturating_sub(self.area.x))
+                == visible.layout.position_at(visible.row, u16::MAX)
+        {
+            return None;
+        }
+        let link = (mode == MouseMode::Interactive && clicks == 1 && event.modifiers.is_empty())
+            .then(|| self.link_at(event.column, event.row))
+            .flatten();
+        self.begin_selection(cells, event.column, event.row, clicks);
+        if let Some(selection) = &mut self.selection {
+            selection.pressed_link = link;
+        }
+        Some(ViewAction::Changed)
+    }
+}
+
+#[cfg(test)]
+#[path = "input_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "right_click_copy_tests.rs"]
+mod right_click_copy_tests;

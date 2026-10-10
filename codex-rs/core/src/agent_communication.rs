@@ -1,6 +1,9 @@
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::InterAgentCommunication;
 
+pub(crate) static PENDING_MAILBOX_MESSAGES: codex_diagnostics::Gauge =
+    codex_diagnostics::Gauge::new("core.mailbox.pending");
+
 const AGENT_COMMUNICATION_TARGET: &str = "codex_otel.agent_communication";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,11 +59,10 @@ pub(crate) fn emit_agent_communication_send(
             state = "send",
             sender_thread_id = %context.sender_thread_id,
             receiver_thread_id = %receiver_thread_id,
-            content = if communication.content.is_empty() {
-                communication.encrypted_content.as_deref().unwrap_or_default()
-            } else {
-                communication.content.as_str()
-            },
+            content = communication
+                .encrypted_content
+                .as_deref()
+                .unwrap_or("[plaintext]"),
         },
         "agent communication"
     );

@@ -98,7 +98,9 @@ impl AccountRequestProcessor {
     }
 
     async fn rate_limit_reset_backend_client(&self) -> Result<BackendClient, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required for rate limit reset credits",
             ));
@@ -109,8 +111,11 @@ impl AccountRequestProcessor {
             ));
         }
 
-        BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
-            .map_err(|err| internal_error(format!("failed to construct backend client: {err}")))
+        Ok(BackendClient::from_auth(
+            self.config.chatgpt_base_url.clone(),
+            &auth,
+            http_client_factory,
+        ))
     }
 }
 

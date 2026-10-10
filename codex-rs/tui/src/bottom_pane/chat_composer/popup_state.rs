@@ -89,6 +89,7 @@ fn complete_token_occurrences_before(textarea: &TextArea, token: &str, before: u
 #[derive(Default)]
 pub(super) struct PopupState {
     pub(super) active: ActivePopup,
+    pub(super) daybreak_command_description: Option<&'static str>,
     pub(super) dismissed_command_token: Option<String>,
     pub(super) dismissed_file_token: Option<DismissedToken>,
     pub(super) current_file_query: Option<String>,
@@ -110,6 +111,23 @@ pub(super) enum ActivePopup {
     File(FileSearchPopup),
     Skill(SkillPopup),
     MentionV2(MentionV2Popup),
+}
+
+impl ActivePopup {
+    /// Shared suggestion menus render above the draft and retain its status footer.
+    pub(super) fn is_above_composer(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(super) fn required_height(&self, width: u16, footer_total_height: u16) -> u16 {
+        match self {
+            Self::None => footer_total_height,
+            Self::Command(popup) => popup.calculate_required_height(width) + footer_total_height,
+            Self::File(popup) => popup.calculate_required_height() + footer_total_height,
+            Self::Skill(popup) => popup.calculate_required_height(width) + footer_total_height,
+            Self::MentionV2(popup) => popup.calculate_required_height(width) + footer_total_height,
+        }
+    }
 }
 
 #[cfg(test)]

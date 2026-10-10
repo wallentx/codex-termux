@@ -1,15 +1,23 @@
 use crate::function_tool::FunctionCallError;
+use crate::tools::code_mode::prepare_code_mode_tool_definitions;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::ToolSearchOutput;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::tool_search_spec::create_tool_search_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use bm25::Document;
+use crate::tools::registry::ToolRegistry;
+use crate::tools::router::ToolRouter;
+use bm25::Embedder;
+use bm25::EmbedderBuilder;
 use bm25::Language;
-use bm25::SearchEngine;
-use bm25::SearchEngineBuilder;
+use bm25::Scorer;
+use codex_prompts::ResolvedModelMessages;
+use codex_tools::IndirectNamespacePrefixes;
+use codex_tools::JsonToolOutput;
 use codex_tools::LoadableToolSpec;
 use codex_tools::TOOL_SEARCH_DEFAULT_LIMIT;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
@@ -18,46 +26,117 @@ use codex_tools::ToolSearchEntry;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use codex_tools::coalesce_loadable_tool_specs;
+use serde::Serialize;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use tracing::instrument;
+
+#[derive(Serialize)]
+struct CodeModeSearchResult {
+    name: String,
+    description: String,
+}
 
 pub struct ToolSearchHandler {
     search_infos: Vec<ToolSearchInfo>,
+    source_listing: ToolSearchSourceListing,
     spec: ToolSpec,
-    search_engine: SearchEngine<usize>,
+    search_embedder: Embedder,
+    search_scorer: Scorer<usize>,
 }
 
 #[derive(Default)]
 pub(crate) struct ToolSearchHandlerCache {
-    cached: Mutex<Option<Arc<ToolSearchHandler>>>,
+    cached: Mutex<Option<CachedToolSearchHandler>>,
+}
+
+struct CachedToolSearchHandler {
+    handler: Arc<ToolSearchHandler>,
+    sources: Vec<ToolSearchSource>,
+}
+
+enum ToolSearchSource {
+    Immutable(Weak<dyn CoreToolRuntime>),
+    Dynamic(Box<ToolSearchInfo>),
 }
 
 impl ToolSearchHandlerCache {
-    #[instrument(level = "trace", skip_all, fields(search_info_count = search_infos.len()))]
-    pub(crate) fn get_or_build(&self, search_infos: Vec<ToolSearchInfo>) -> Arc<ToolSearchHandler> {
+    #[instrument(level = "trace", skip_all)]
+    pub(crate) fn get_or_build(
+        &self,
+        registry: &ToolRegistry,
+        source_listing: ToolSearchSourceListing,
+    ) -> Arc<ToolSearchHandler> {
+        let sources = registry
+            .entries()
+            .filter(|tool| tool.exposure.is_deferred())
+            .filter_map(|tool| {
+                if tool.runtime.immutable_spec().is_some() {
+                    Some(ToolSearchSource::Immutable(Arc::downgrade(&tool.runtime)))
+                } else {
+                    tool.runtime
+                        .search_info()
+                        .map(Box::new)
+                        .map(ToolSearchSource::Dynamic)
+                }
+            })
+            .collect::<Vec<_>>();
+
         {
             let cached = self.cached();
             if let Some(cached) = cached.as_ref()
-                && cached.search_infos == search_infos
+                && cached.handler.source_listing == source_listing
+                && Self::sources_match(&cached.sources, &sources)
             {
-                return Arc::clone(cached);
+                return Arc::clone(&cached.handler);
             }
         }
 
-        let handler = Arc::new(ToolSearchHandler::new(search_infos));
+        let search_infos = sources
+            .iter()
+            .filter_map(|source| match source {
+                ToolSearchSource::Immutable(runtime) => {
+                    runtime.upgrade().and_then(|runtime| runtime.search_info())
+                }
+                ToolSearchSource::Dynamic(search_info) => Some(search_info.as_ref().clone()),
+            })
+            .collect();
+
+        let handler = Arc::new(ToolSearchHandler::new(search_infos, source_listing));
         let mut cached = self.cached();
         if let Some(cached) = cached.as_ref()
-            && cached.search_infos == handler.search_infos
+            && cached.handler.source_listing == source_listing
+            && Self::sources_match(&cached.sources, &sources)
         {
-            return Arc::clone(cached);
+            return Arc::clone(&cached.handler);
         }
-
-        *cached = Some(Arc::clone(&handler));
+        *cached = Some(CachedToolSearchHandler {
+            handler: Arc::clone(&handler),
+            sources,
+        });
         handler
     }
 
-    fn cached(&self) -> std::sync::MutexGuard<'_, Option<Arc<ToolSearchHandler>>> {
+    fn sources_match(cached_sources: &[ToolSearchSource], sources: &[ToolSearchSource]) -> bool {
+        cached_sources.len() == sources.len()
+            && cached_sources
+                .iter()
+                .zip(sources)
+                .all(|(cached, current)| match (cached, current) {
+                    (ToolSearchSource::Immutable(cached), ToolSearchSource::Immutable(current)) => {
+                        Weak::ptr_eq(cached, current)
+                    }
+                    (ToolSearchSource::Dynamic(cached), ToolSearchSource::Dynamic(current)) => {
+                        cached == current
+                    }
+                    (ToolSearchSource::Immutable(_), ToolSearchSource::Dynamic(_))
+                    | (ToolSearchSource::Dynamic(_), ToolSearchSource::Immutable(_)) => false,
+                })
+    }
+
+    fn cached(&self) -> std::sync::MutexGuard<'_, Option<CachedToolSearchHandler>> {
         match self.cached.lock() {
             Ok(cached) => cached,
             Err(poisoned) => poisoned.into_inner(),
@@ -71,25 +150,36 @@ impl ToolSearchHandler {
         skip_all,
         fields(search_info_count = search_infos.len())
     )]
-    pub(crate) fn new(search_infos: Vec<ToolSearchInfo>) -> Self {
+    pub(crate) fn new(
+        search_infos: Vec<ToolSearchInfo>,
+        source_listing: ToolSearchSourceListing,
+    ) -> Self {
         let search_source_infos = search_infos
             .iter()
             .filter_map(|search_info| search_info.source_info.clone())
             .collect::<Vec<_>>();
-        let spec = create_tool_search_tool(&search_source_infos, TOOL_SEARCH_DEFAULT_LIMIT);
-        let documents: Vec<Document<usize>> = search_infos
+        let spec = create_tool_search_tool(
+            &search_source_infos,
+            TOOL_SEARCH_DEFAULT_LIMIT,
+            source_listing,
+        );
+        let corpus = search_infos
             .iter()
-            .map(|search_info| search_info.entry.search_text.clone())
-            .enumerate()
-            .map(|(idx, search_text)| Document::new(idx, search_text))
-            .collect();
-        let search_engine =
-            SearchEngineBuilder::<usize>::with_documents(Language::English, documents).build();
+            .map(|search_info| search_info.entry.search_text.as_str())
+            .collect::<Vec<_>>();
+        let search_embedder =
+            EmbedderBuilder::with_fit_to_corpus(Language::English, &corpus).build();
+        let mut search_scorer = Scorer::new();
+        for (id, text) in corpus.into_iter().enumerate() {
+            search_scorer.upsert(&id, search_embedder.embed(text));
+        }
 
         Self {
             search_infos,
+            source_listing,
             spec,
-            search_engine,
+            search_embedder,
+            search_scorer,
         }
     }
 }
@@ -107,7 +197,10 @@ impl ToolExecutor<ToolInvocation> for ToolSearchHandler {
         true
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -117,10 +210,17 @@ impl ToolSearchHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation {
+            payload,
+            source,
+            step_context,
+            ..
+        } = invocation;
+        let nested = matches!(source, ToolCallSource::CodeMode { .. });
 
         let args = match payload {
             ToolPayload::ToolSearch { arguments } => arguments,
+            ToolPayload::Function { arguments } if nested => super::parse_arguments(&arguments)?,
             _ => {
                 return Err(FunctionCallError::Fatal(format!(
                     "{TOOL_SEARCH_TOOL_NAME} handler received unsupported payload"
@@ -142,11 +242,36 @@ impl ToolSearchHandler {
             ));
         }
 
+        let model_messages = ResolvedModelMessages::from_model(&step_context.settings.model_info);
+        let indirect_prefixes = IndirectNamespacePrefixes::new(
+            model_messages.indirect_description_prefixes(),
+            step_context.tool_router.mcp_namespaces(),
+        )
+        .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
+
+        if nested {
+            let tools = self.search_code_mode(
+                query,
+                limit,
+                &step_context.tool_router,
+                step_context
+                    .turn
+                    .config
+                    .code_mode
+                    .tool_input_schema_max_bytes,
+                &indirect_prefixes,
+            );
+            return Ok(boxed_tool_output(JsonToolOutput::new(serde_json::json!({
+                "tools": tools,
+            }))));
+        }
+
         if self.search_infos.is_empty() {
             return Ok(boxed_tool_output(ToolSearchOutput { tools: Vec::new() }));
         }
 
-        let tools = self.search(query, limit)?;
+        let mut tools = self.search(query, limit);
+        indirect_prefixes.apply_search(&mut tools);
 
         Ok(boxed_tool_output(ToolSearchOutput { tools }))
     }
@@ -155,28 +280,71 @@ impl ToolSearchHandler {
 impl CoreToolRuntime for ToolSearchHandler {}
 
 impl ToolSearchHandler {
-    fn search(
+    fn search_code_mode(
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<LoadableToolSpec>, FunctionCallError> {
-        let results = self
-            .search_engine
-            .search(query, limit)
-            .into_iter()
-            .map(|result| result.document.id)
-            .filter_map(|id| self.search_infos.get(id))
-            .map(|search_info| &search_info.entry);
-        self.search_output_tools(results)
+        router: &ToolRouter,
+        code_mode_input_schema_max_bytes: Option<usize>,
+        indirect_prefixes: &IndirectNamespacePrefixes<'_>,
+    ) -> Vec<CodeModeSearchResult> {
+        let mut tools = Vec::new();
+        // Apply the exact step's nested-tool policy before limiting ranked results.
+        for entry in self.search_entries(query) {
+            for candidate_name in entry.tool_names() {
+                let candidate_name = candidate_name.with_default_namespace();
+                let name = codex_code_mode::normalize_code_mode_identifier(
+                    &codex_tools::code_mode_name_for_tool_name(&candidate_name),
+                );
+                let Some(tool_name) =
+                    router
+                        .code_mode_tool_names()
+                        .get(&name)
+                        .filter(|tool_name| {
+                            (*tool_name).clone().with_default_namespace() == candidate_name
+                        })
+                else {
+                    continue;
+                };
+                let Some(runtime) = router.tool_runtime(tool_name) else {
+                    continue;
+                };
+                let definitions = prepare_code_mode_tool_definitions(
+                    Some(runtime.as_ref()),
+                    || Cow::Owned(runtime.spec()),
+                    code_mode_input_schema_max_bytes,
+                );
+                let Some(definition) = definitions.iter().find(|definition| {
+                    definition.tool_name.clone().with_default_namespace() == candidate_name
+                }) else {
+                    continue;
+                };
+                let mut description = definition.description.clone();
+                indirect_prefixes
+                    .apply_code_mode_description(&definition.tool_name, &mut description);
+                tools.push(CodeModeSearchResult { name, description });
+                if tools.len() == limit {
+                    return tools;
+                }
+            }
+        }
+        tools
     }
 
-    fn search_output_tools<'a>(
-        &self,
-        results: impl IntoIterator<Item = &'a ToolSearchEntry>,
-    ) -> Result<Vec<LoadableToolSpec>, FunctionCallError> {
-        Ok(coalesce_loadable_tool_specs(
-            results.into_iter().map(|entry| entry.output.clone()),
-        ))
+    fn search(&self, query: &str, limit: usize) -> Vec<LoadableToolSpec> {
+        coalesce_loadable_tool_specs(
+            self.search_entries(query)
+                .take(limit)
+                .map(ToolSearchEntry::to_loadable_spec),
+        )
+    }
+
+    fn search_entries(&self, query: &str) -> impl Iterator<Item = &ToolSearchEntry> + '_ {
+        self.search_scorer
+            .matches(&self.search_embedder.embed(query))
+            .into_iter()
+            .filter_map(|result| self.search_infos.get(result.id))
+            .map(|search_info| &search_info.entry)
     }
 }
 
@@ -185,6 +353,7 @@ mod tests {
     use super::*;
     use crate::tools::handlers::DynamicToolHandler;
     use crate::tools::handlers::McpHandler;
+    use crate::tools::registry::ToolExposure;
     use codex_mcp::ToolInfo;
     use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
     use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
@@ -196,26 +365,86 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn cache_reuses_handler_for_identical_search_infos_and_rebuilds_for_changes() {
+    fn cache_reuses_immutable_handlers_and_rebuilds_for_current_registry_changes() {
         let cache = ToolSearchHandlerCache::default();
-        let search_infos = vec![
+        let runtime: Arc<dyn CoreToolRuntime> = Arc::new(
             McpHandler::new(tool_info("calendar", "create_event", "Create events"))
-                .expect("MCP tool should convert")
-                .search_info()
-                .expect("MCP handler should return search info"),
-        ];
+                .expect("MCP tool should convert"),
+        );
+        let mut registry = ToolRegistry::default();
+        registry.register_trusted_with_exposure(Arc::clone(&runtime), ToolExposure::Deferred);
 
-        let first = cache.get_or_build(search_infos.clone());
-        let second = cache.get_or_build(search_infos.clone());
+        let first = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
+        let second = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
         assert!(Arc::ptr_eq(&first, &second));
 
-        let mut changed_search_infos = search_infos;
-        changed_search_infos[0]
-            .entry
-            .search_text
-            .push_str(" changed");
-        let changed = cache.get_or_build(changed_search_infos);
-        assert!(!Arc::ptr_eq(&first, &changed));
+        let without_sources = cache.get_or_build(&registry, ToolSearchSourceListing::Omit);
+        assert!(!Arc::ptr_eq(&first, &without_sources));
+
+        let mut replacement_registry = ToolRegistry::default();
+        let replacement = Arc::new(
+            McpHandler::new(tool_info("calendar", "create_event", "Create events"))
+                .expect("replacement MCP tool should convert"),
+        );
+        replacement_registry.register_trusted_with_exposure(replacement, ToolExposure::Deferred);
+        let replacement = cache.get_or_build(&replacement_registry, ToolSearchSourceListing::Omit);
+        assert!(!Arc::ptr_eq(&without_sources, &replacement));
+
+        let mut disabled_registry = ToolRegistry::default();
+        disabled_registry.register_trusted_with_exposure(runtime, ToolExposure::Direct);
+        let disabled = cache.get_or_build(&disabled_registry, ToolSearchSourceListing::Omit);
+        assert!(!Arc::ptr_eq(&replacement, &disabled));
+        assert!(disabled.search_infos.is_empty());
+    }
+
+    #[test]
+    fn cache_rechecks_dynamic_tool_metadata_while_reusing_immutable_mcp_handlers() {
+        let cache = ToolSearchHandlerCache::default();
+        let mcp_runtime: Arc<dyn CoreToolRuntime> = Arc::new(
+            McpHandler::new(tool_info("calendar", "create_event", "Create events"))
+                .expect("MCP tool should convert"),
+        );
+        let mut dynamic_tool = DynamicToolFunctionSpec {
+            name: "lookup".to_string(),
+            description: "Search current records".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            defer_loading: true,
+        };
+
+        let mut first_registry = ToolRegistry::default();
+        first_registry
+            .register_trusted_with_exposure(Arc::clone(&mcp_runtime), ToolExposure::Deferred);
+        first_registry.register_external_with_exposure(
+            Arc::new(DynamicToolHandler::new(&dynamic_tool).expect("dynamic tool should convert")),
+            ToolExposure::Deferred,
+        );
+        let first = cache.get_or_build(&first_registry, ToolSearchSourceListing::Include);
+
+        let mut equivalent_registry = ToolRegistry::default();
+        equivalent_registry
+            .register_trusted_with_exposure(Arc::clone(&mcp_runtime), ToolExposure::Deferred);
+        equivalent_registry.register_external_with_exposure(
+            Arc::new(DynamicToolHandler::new(&dynamic_tool).expect("dynamic tool should convert")),
+            ToolExposure::Deferred,
+        );
+        let equivalent = cache.get_or_build(&equivalent_registry, ToolSearchSourceListing::Include);
+        assert!(Arc::ptr_eq(&first, &equivalent));
+
+        dynamic_tool.description = "Search refreshed records".to_string();
+        let mut refreshed_registry = ToolRegistry::default();
+        refreshed_registry.register_trusted_with_exposure(mcp_runtime, ToolExposure::Deferred);
+        refreshed_registry.register_external_with_exposure(
+            Arc::new(DynamicToolHandler::new(&dynamic_tool).expect("dynamic tool should convert")),
+            ToolExposure::Deferred,
+        );
+        let refreshed = cache.get_or_build(&refreshed_registry, ToolSearchSourceListing::Include);
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert!(
+            refreshed.search_infos[1]
+                .entry
+                .search_text
+                .contains("refreshed")
+        );
     }
 
     #[test]
@@ -257,16 +486,16 @@ mod tests {
                 .search_info()
                 .expect("dynamic handler should return search info")
         }));
-        let handler = ToolSearchHandler::new(search_infos);
+        let handler = ToolSearchHandler::new(search_infos, ToolSearchSourceListing::Include);
         let results = [
             &handler.search_infos[0].entry,
             &handler.search_infos[2].entry,
             &handler.search_infos[1].entry,
         ];
 
-        let tools = handler
-            .search_output_tools(results)
-            .expect("mixed search output should serialize");
+        let tools = coalesce_loadable_tool_specs(
+            results.into_iter().map(ToolSearchEntry::to_loadable_spec),
+        );
 
         assert_eq!(
             tools,

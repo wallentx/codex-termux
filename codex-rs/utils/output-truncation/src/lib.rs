@@ -1,6 +1,11 @@
-//! Helpers for truncating tool and exec output using [`TruncationPolicy`](codex_protocol::protocol::TruncationPolicy).
+//! Shared byte/token truncation for tool and exec output.
 
+use std::borrow::Cow;
+
+use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 pub use codex_utils_string::approx_bytes_for_tokens;
 pub use codex_utils_string::approx_token_count;
 pub use codex_utils_string::approx_tokens_from_byte_count;
@@ -8,6 +13,12 @@ use codex_utils_string::truncate_middle_chars;
 use codex_utils_string::truncate_middle_with_token_budget;
 
 pub use codex_protocol::protocol::TruncationPolicy;
+
+/// Adds the existing 20% allowance for serialization and headers.
+/// Saved history budgets already include this allowance.
+pub fn with_serialization_allowance(policy: TruncationPolicy) -> TruncationPolicy {
+    policy * 1.2
+}
 
 pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
     if content.len() <= policy.byte_budget() {
@@ -29,6 +40,70 @@ pub fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
     }
 }
 
+/// Replaces an oversized serialized MCP result with a bounded text preview while preserving its
+/// error status and supported bounded metadata.
+pub fn truncate_mcp_tool_result(
+    result: &CallToolResult,
+    max_bytes: usize,
+) -> Cow<'_, CallToolResult> {
+    let Ok(serialized) = serde_json::to_string(result) else {
+        return Cow::Borrowed(result);
+    };
+    if serialized.len() <= max_bytes {
+        return Cow::Borrowed(result);
+    }
+
+    let meta = None;
+
+    let mut preview_budget = max_bytes;
+    loop {
+        let preview = if preview_budget == 0 {
+            String::new()
+        } else {
+            truncate_text(&serialized, TruncationPolicy::Bytes(preview_budget))
+        };
+        let truncated = CallToolResult {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": preview,
+            })],
+            structured_content: None,
+            is_error: result.is_error,
+            meta: meta.clone(),
+        };
+        let Ok(truncated_serialized) = serde_json::to_string(&truncated) else {
+            return Cow::Borrowed(result);
+        };
+        let truncated_len = truncated_serialized.len();
+        if truncated_len <= max_bytes || preview_budget == 0 {
+            return Cow::Owned(truncated);
+        }
+
+        // The preview is serialized as a JSON string, so escaping can make it exceed its raw byte
+        // budget. Scale the next budget by the observed size of the complete replacement.
+        preview_budget = (preview_budget.saturating_mul(max_bytes) / truncated_len)
+            .min(preview_budget.saturating_sub(1));
+    }
+}
+
+/// Applies the existing byte/token budget without changing success metadata or media ordering.
+pub fn truncate_function_output_payload(
+    output: &mut FunctionCallOutputPayload,
+    policy: TruncationPolicy,
+    estimate_audio_token_count: impl Fn(&str) -> usize,
+) {
+    match &mut output.body {
+        FunctionCallOutputBody::Text(text) => *text = truncate_text(text, policy),
+        FunctionCallOutputBody::ContentItems(items) => {
+            *items = truncate_function_output_items_with_policy(
+                items,
+                policy,
+                estimate_audio_token_count,
+            );
+        }
+    }
+}
+
 pub fn formatted_truncate_text_content_items_with_policy(
     items: &[FunctionCallOutputContentItem],
     policy: TruncationPolicy,
@@ -42,16 +117,9 @@ pub fn formatted_truncate_text_content_items_with_policy(
             | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })
         .collect::<Vec<_>>();
-    let without_audio = || {
-        items
-            .iter()
-            .filter(|item| !matches!(item, FunctionCallOutputContentItem::InputAudio { .. }))
-            .cloned()
-            .collect()
-    };
 
     if text_segments.is_empty() {
-        return (without_audio(), None);
+        return (items.to_vec(), None);
     }
 
     let mut combined = String::new();
@@ -63,7 +131,7 @@ pub fn formatted_truncate_text_content_items_with_policy(
     }
 
     if combined.len() <= policy.byte_budget() {
-        return (without_audio(), None);
+        return (items.to_vec(), None);
     }
 
     let original_token_count = approx_token_count(&combined);
@@ -71,13 +139,17 @@ pub fn formatted_truncate_text_content_items_with_policy(
         text: formatted_truncate_text(&combined, policy),
     }];
     out.extend(items.iter().filter_map(|item| match item {
-        FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+        FunctionCallOutputContentItem::InputImage { image, detail } => {
             Some(FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.clone(),
+                image: image.clone(),
                 detail: *detail,
             })
         }
-        FunctionCallOutputContentItem::InputAudio { .. } => None,
+        FunctionCallOutputContentItem::InputAudio { audio_url } => {
+            Some(FunctionCallOutputContentItem::InputAudio {
+                audio_url: audio_url.clone(),
+            })
+        }
         FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
             Some(FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: encrypted_content.clone(),
@@ -92,6 +164,7 @@ pub fn formatted_truncate_text_content_items_with_policy(
 pub fn truncate_function_output_items_with_policy(
     items: &[FunctionCallOutputContentItem],
     policy: TruncationPolicy,
+    estimate_audio_token_count: impl Fn(&str) -> usize,
 ) -> Vec<FunctionCallOutputContentItem> {
     let mut out: Vec<FunctionCallOutputContentItem> = Vec::with_capacity(items.len());
     let mut remaining_budget = match policy {
@@ -99,10 +172,15 @@ pub fn truncate_function_output_items_with_policy(
         TruncationPolicy::Tokens(_) => policy.token_budget(),
     };
     let mut omitted_text_items = 0usize;
+    let mut omitted_audio_items = 0usize;
 
     for item in items {
         match item {
             FunctionCallOutputContentItem::InputText { text } => {
+                // Empty text contributes no model content but still consumes an API array slot.
+                if text.is_empty() {
+                    continue;
+                }
                 if remaining_budget == 0 {
                     omitted_text_items += 1;
                     continue;
@@ -130,13 +208,27 @@ pub fn truncate_function_output_items_with_policy(
                     remaining_budget = 0;
                 }
             }
-            FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+            FunctionCallOutputContentItem::InputImage { image, detail } => {
                 out.push(FunctionCallOutputContentItem::InputImage {
-                    image_url: image_url.clone(),
+                    image: image.clone(),
                     detail: *detail,
                 });
             }
-            FunctionCallOutputContentItem::InputAudio { .. } => {}
+            FunctionCallOutputContentItem::InputAudio { audio_url } => {
+                let token_cost = estimate_audio_token_count(audio_url);
+                let cost = match policy {
+                    TruncationPolicy::Bytes(_) => approx_bytes_for_tokens(token_cost),
+                    TruncationPolicy::Tokens(_) => token_cost,
+                };
+                if cost <= remaining_budget {
+                    out.push(FunctionCallOutputContentItem::InputAudio {
+                        audio_url: audio_url.clone(),
+                    });
+                    remaining_budget = remaining_budget.saturating_sub(cost);
+                } else {
+                    omitted_audio_items += 1;
+                }
+            }
             FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
                 out.push(FunctionCallOutputContentItem::EncryptedContent {
                     encrypted_content: encrypted_content.clone(),
@@ -148,6 +240,11 @@ pub fn truncate_function_output_items_with_policy(
     if omitted_text_items > 0 {
         out.push(FunctionCallOutputContentItem::InputText {
             text: format!("[omitted {omitted_text_items} text items ...]"),
+        });
+    }
+    if omitted_audio_items > 0 {
+        out.push(FunctionCallOutputContentItem::InputText {
+            text: format!("[omitted {omitted_audio_items} audio items ...]"),
         });
     }
 

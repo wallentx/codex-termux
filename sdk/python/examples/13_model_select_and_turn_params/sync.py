@@ -14,7 +14,6 @@ from openai_codex import (
     Sandbox,
 )
 from openai_codex.types import (
-    Personality,
     ReasoningEffort,
     ReasoningSummary,
 )
@@ -26,6 +25,8 @@ REASONING_RANK = {
     "medium": 3,
     "high": 4,
     "xhigh": 5,
+    "max": 6,
+    "ultra": 7,
 }
 
 
@@ -93,7 +94,6 @@ with Codex(config=runtime_config()) as codex:
         effort=selected_effort,
         model=selected_model.model,
         output_schema=OUTPUT_SCHEMA,
-        personality=Personality.pragmatic,
         sandbox=Sandbox.read_only,
         summary=ReasoningSummary.model_validate("concise"),
     ).run()

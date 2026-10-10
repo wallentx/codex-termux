@@ -176,8 +176,10 @@ impl<'a> SlashInput<'a> {
                 plugins_command_enabled: self.command_flags.plugins_command_enabled,
                 token_activity_command_enabled: self.command_flags.token_activity_command_enabled,
                 service_tier_commands_enabled: self.command_flags.service_tier_commands_enabled,
+                daybreak_command_description: self.command_flags.daybreak_command_description,
                 goal_command_enabled: self.command_flags.goal_command_enabled,
-                personality_command_enabled: self.command_flags.personality_command_enabled,
+                voice_command_enabled: self.command_flags.voice_command_enabled,
+                worktrees_enabled: self.command_flags.worktrees_enabled,
                 windows_degraded_sandbox_active: self.command_flags.allow_elevate_sandbox,
                 side_conversation_active: self.command_flags.side_conversation_active,
             },
@@ -206,12 +208,36 @@ pub(super) fn queued_input_action(
 }
 
 impl ChatComposer {
+    pub(super) fn builtin_command_flags(&self) -> BuiltinCommandFlags {
+        BuiltinCommandFlags {
+            collaboration_modes_enabled: self.collaboration_modes_enabled,
+            connectors_enabled: self.connectors_enabled,
+            plugins_command_enabled: self.plugins_command_enabled,
+            token_activity_command_enabled: self.token_activity_command_enabled,
+            service_tier_commands_enabled: self.service_tier_commands_enabled,
+            daybreak_command_description: self.popups.daybreak_command_description,
+            goal_command_enabled: self.goal_command_enabled,
+            voice_command_enabled: self.voice_command_enabled,
+            worktrees_enabled: self.worktrees_enabled,
+            allow_elevate_sandbox: self.windows_degraded_sandbox_active,
+            side_conversation_active: self.side_conversation_active,
+        }
+    }
+
+    pub fn set_daybreak_command_description(&mut self, description: Option<&'static str>) {
+        self.popups.daybreak_command_description = description;
+    }
+
+    pub fn set_worktrees_enabled(&mut self, enabled: bool) {
+        self.worktrees_enabled = enabled;
+    }
+
     /// Handle key event when the slash-command popup is visible.
     pub(super) fn handle_key_event_with_slash_popup(
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
+        if self.handle_empty_prompt_shortcut(&key_event) {
             return (InputResult::None, true);
         }
         if key_event.code == KeyCode::Esc {
@@ -262,7 +288,10 @@ impl ChatComposer {
                 let filter_text = command_popup_filter_text(&first_line, cursor)
                     .unwrap_or_else(|| first_line.clone());
                 popup.on_composer_text_change(filter_text);
-                if let Some(selected_cmd) = popup.selected_item() {
+                let has_visible_items = !popup.filtered_items().is_empty();
+                let selected_item = popup.selected_item();
+                let has_selectable_item = selected_item.is_some();
+                if let Some(selected_cmd) = selected_item {
                     if selected_command_dispatches_immediately_on_tab(&selected_cmd)
                         && let CommandItem::Builtin(cmd) = &selected_cmd
                     {
@@ -293,6 +322,9 @@ impl ChatComposer {
                         }
                         return (InputResult::None, true);
                     }
+                }
+                if has_visible_items && !has_selectable_item {
+                    return (InputResult::None, true);
                 }
                 if self.is_task_running {
                     return self.handle_submission(/*should_queue*/ true);
@@ -334,8 +366,9 @@ impl ChatComposer {
                             .textarea
                             .set_cursor(self.draft.textarea.text().len());
                     }
+                    return (InputResult::None, true);
                 }
-                (InputResult::None, true)
+                self.handle_key_event_without_popup(key_event)
             }
             KeyEvent {
                 code: KeyCode::Enter,
@@ -366,8 +399,11 @@ impl ChatComposer {
                     }
 
                     self.stage_selected_slash_command_history(&sel);
-                    self.draft.textarea.set_text_clearing_elements("");
-                    self.draft.is_bash_mode = false;
+                    if !matches!(sel, CommandItem::Builtin(cmd) if cmd.requires_dispatch_validation())
+                    {
+                        self.draft.textarea.set_text_clearing_elements("");
+                        self.draft.is_bash_mode = false;
+                    }
                     return (
                         match sel {
                             CommandItem::Builtin(cmd) => InputResult::Command(cmd),
@@ -611,6 +647,79 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_side_conversation_command_still_opens_popup() {
+        let mut composer = test_composer();
+        composer.set_side_conversation_active(/*active*/ true);
+        composer.draft.textarea.set_text_clearing_elements("/arch");
+        composer.draft.textarea.set_cursor(/*pos*/ 5);
+        composer.sync_popups();
+
+        assert!(matches!(composer.popups.active, ActivePopup::Command(_)));
+    }
+
+    #[test]
+    fn side_conversation_tab_completes_available_match_after_unavailable_rows() {
+        let mut composer = test_composer();
+        composer.set_side_conversation_active(/*active*/ true);
+        composer.draft.textarea.set_text_clearing_elements("/a");
+        composer.draft.textarea.set_cursor(/*pos*/ 2);
+        composer.sync_popups();
+
+        assert_eq!(press(&mut composer, KeyCode::Tab), InputResult::None);
+        assert_eq!(composer.draft.textarea.text(), "/agents ");
+    }
+
+    #[test]
+    fn side_conversation_tab_does_not_queue_unavailable_match_while_task_running() {
+        let mut composer = test_composer();
+        composer.set_side_conversation_active(/*active*/ true);
+        composer.set_task_running(/*running*/ true);
+        composer.draft.textarea.set_text_clearing_elements("/arch");
+        composer.draft.textarea.set_cursor(/*pos*/ 5);
+        composer.sync_popups();
+
+        assert_eq!(press(&mut composer, KeyCode::Tab), InputResult::None);
+        assert_eq!(composer.draft.textarea.text(), "/arch");
+    }
+
+    #[test]
+    fn side_conversation_tab_queues_exact_available_match_while_task_running() {
+        let mut composer = test_composer();
+        composer.set_side_conversation_active(/*active*/ true);
+        composer.set_task_running(/*running*/ true);
+        composer
+            .draft
+            .textarea
+            .set_text_clearing_elements("/agents");
+        composer.draft.textarea.set_cursor(/*pos*/ 7);
+        composer.sync_popups();
+
+        assert_eq!(
+            press(&mut composer, KeyCode::Tab),
+            InputResult::Queued {
+                text: "/agents".to_string(),
+                text_elements: Vec::new(),
+                action: QueuedInputAction::ParseSlash,
+                pending_pastes: Vec::new(),
+            }
+        );
+        assert!(composer.draft.textarea.is_empty());
+    }
+
+    #[test]
+    fn side_conversation_slash_is_inserted_after_unavailable_match() {
+        let mut composer = test_composer();
+        composer.set_side_conversation_active(/*active*/ true);
+        composer.set_disable_paste_burst(/*disabled*/ true);
+        composer.draft.textarea.set_text_clearing_elements("/new");
+        composer.draft.textarea.set_cursor(/*pos*/ 4);
+        composer.sync_popups();
+
+        assert_eq!(press(&mut composer, KeyCode::Char('/')), InputResult::None);
+        assert_eq!(composer.draft.textarea.text(), "/new/");
+    }
+
+    #[test]
     fn esc_dismisses_slash_popup_while_idle() {
         let mut composer = composer_with_text_at_cursor("/rev", "/rev".len());
         assert!(composer.popup_active());
@@ -662,6 +771,6 @@ mod tests {
             press(&mut composer, KeyCode::Enter),
             InputResult::Command(SlashCommand::Review)
         );
-        assert!(composer.draft.textarea.is_empty());
+        assert_eq!(composer.draft.textarea.text(), "/review ");
     }
 }

@@ -1,3 +1,8 @@
+#[cfg(target_os = "linux")]
+#[path = "exec_server/pid_namespace_tests.rs"]
+mod pid_namespace_tests;
+
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::io::BufRead as _;
 #[cfg(unix)]
@@ -16,14 +21,32 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
+use codex_exec_server::EnvironmentInfo;
+use codex_exec_server::ExecParams;
+use codex_exec_server::ExecServerClient;
+use codex_exec_server::NoiseChannelIdentity;
+use codex_exec_server::NoiseChannelPublicKey;
+use codex_exec_server::NoiseRendezvousConnectArgs;
+use codex_exec_server::NoiseRendezvousConnectBundle;
+use codex_exec_server::ProcessId;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_utils_cargo_bin::copy_executable;
+use futures::SinkExt;
+use futures::StreamExt;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
+use tokio::net::TcpListener;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::accept_async;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -71,6 +94,384 @@ fn local_exec_server_ignores_invalid_config_without_strict_config() -> Result<()
         .success()
         .stderr(contains("not valid toml").not());
 
+    Ok(())
+}
+
+/// Real global CLI flags must reach executor config reads; unrelated startup flags stay private.
+#[tokio::test]
+async fn local_exec_server_projects_global_mxc_preference() -> Result<()> {
+    let home = TempDir::new()?;
+    let cwd = url::Url::from_directory_path(home.path())
+        .map_err(|()| anyhow::anyhow!("could not convert home to file URL"))?;
+    let mut child = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+        .env("CODEX_HOME", home.path())
+        .args([
+            "-c",
+            "features.prefer_mxc=true",
+            "-c",
+            "model='private-startup-model'",
+            "exec-server",
+            "--listen",
+            "stdio",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("exec-server stdin")?;
+    let mut stdout = BufReader::new(child.stdout.take().context("exec-server stdout")?);
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        send_json_line(
+            &mut stdin,
+            &serde_json::json!({"id": 1, "method": "initialize",
+                "params": {"clientName": "mxc-test", "resumeSessionId": null}}),
+        )
+        .await?;
+        wait_for_response(&mut stdout, /*expected_id*/ 1).await?;
+        send_json_line(
+            &mut stdin,
+            &serde_json::json!({"method": "initialized", "params": {}}),
+        )
+        .await?;
+        send_json_line(
+            &mut stdin,
+            &serde_json::json!({"id": 2, "method": "environmentConfig/read", "params": {
+                "cwd": cwd, "configPaths": [["features", "prefer_mxc"], ["model"]],
+                "requirementsPaths": []
+            }}),
+        )
+        .await?;
+        wait_for_response(&mut stdout, /*expected_id*/ 2).await
+    })
+    .await
+    .context("executor CLI config read timed out")??;
+    let layers = result["result"]["config"]["layers"]
+        .as_array()
+        .context("config layers")?;
+    let session = layers
+        .iter()
+        .find(|l| l["source"] == "session-flags")
+        .context("session flags")?;
+    let value: toml::Value = toml::from_str(session["toml"].as_str().context("session TOML")?)?;
+    assert_eq!(
+        value,
+        toml::Value::Table(toml::toml! { [features] prefer_mxc = true })
+    );
+    drop(stdin);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), child.wait())
+            .await??
+            .success()
+    );
+    Ok(())
+}
+
+/// The standalone exec-server accepts an explicit per-connection concurrency limit.
+#[test]
+fn local_exec_server_accepts_concurrent_requests_flag() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.args([
+        "exec-server",
+        "--listen",
+        "stdio",
+        "--concurrent-requests",
+        "2",
+    ])
+    .assert()
+    .success();
+
+    Ok(())
+}
+
+#[test]
+fn local_exec_server_allows_disabled_parent_lifetime_environment_variable() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.env(
+        codex_exec_server::CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR,
+        "false",
+    )
+    .args(["exec-server", "--listen", "stdio"])
+    .assert()
+    .success();
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_exec_server_gracefully_stops_when_parent_stdin_closes() -> Result<()> {
+    const ENVIRONMENT_ID: &str = "environment-parent-lifetime";
+    const EXECUTOR_REGISTRATION_ID: &str = "registration-parent-lifetime";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/metrics"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&collector)
+        .await;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let rendezvous_url = format!("ws://{}", listener.local_addr()?);
+    let registry = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/cloud/environment/{ENVIRONMENT_ID}/register"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "environment_id": ENVIRONMENT_ID,
+            "url": format!("{rendezvous_url}/relay?role=environment"),
+            "security_profile": "noise_hybrid_ik_v1",
+            "executor_registration_id": EXECUTOR_REGISTRATION_ID,
+        })))
+        .mount(&registry)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/cloud/environment/{ENVIRONMENT_ID}/validate"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid": true,
+        })))
+        .mount(&registry)
+        .await;
+
+    let codex_home = TempDir::new()?;
+    let collector_url = collector.uri();
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            r#"
+[analytics]
+enabled = true
+
+[otel]
+environment = "test"
+metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", protocol = "json" }} }}
+"#
+        ),
+    )?;
+    let package = TempDir::new()?;
+    let bin_dir = package.path().join("bin");
+    std::fs::create_dir(&bin_dir)?;
+    let executable = bin_dir.join(format!("codex{}", std::env::consts::EXE_SUFFIX));
+    copy_executable(&codex_utils_cargo_bin::cargo_bin("codex")?, &executable)?;
+    let codex_path_dir = package.path().join("codex-path");
+    std::fs::create_dir(&codex_path_dir)?;
+    let manifest = package.path().join("codex-package.json");
+    std::fs::write(&manifest, r#"{"version":"1.2.3-alpha.4"}"#)?;
+
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .env("CODEX_HOME", codex_home.path())
+        .env("CODEX_API_KEY", "test-api-key")
+        .env(
+            codex_exec_server::CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR,
+            "true",
+        )
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "exec-server",
+            "--remote",
+            &registry.uri(),
+            "--environment-id",
+            ENVIRONMENT_ID,
+            "--concurrent-requests",
+            "2",
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("remote exec-server stdin was not piped"))?;
+
+    let environment_websocket = accept_parent_lifetime_websocket(&listener, TEST_TIMEOUT).await?;
+    // Remote startup must capture the version before registration, not on the first initialize.
+    std::fs::write(&manifest, r#"{"version":"9.9.9"}"#)?;
+    let executor_public_key = registered_parent_lifetime_executor_public_key(&registry).await?;
+    let harness_args = NoiseRendezvousConnectArgs {
+        bundle: NoiseRendezvousConnectBundle {
+            websocket_url: format!("{rendezvous_url}/relay?role=harness"),
+            environment_id: ENVIRONMENT_ID.to_string(),
+            executor_registration_id: EXECUTOR_REGISTRATION_ID.to_string(),
+            executor_public_key,
+            harness_key_authorization: "parent-lifetime-harness".to_string(),
+        },
+        harness_identity: NoiseChannelIdentity::generate()?,
+        client_name: "parent-lifetime-test".to_string(),
+        connect_timeout: TEST_TIMEOUT,
+        initialize_timeout: TEST_TIMEOUT,
+        resume_session_id: None,
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    };
+    let client_task =
+        tokio::spawn(async move { ExecServerClient::connect_noise_rendezvous(harness_args).await });
+    let harness_websocket = accept_parent_lifetime_websocket(&listener, TEST_TIMEOUT).await?;
+    let relay_task = tokio::spawn(proxy_parent_lifetime_relay(
+        environment_websocket,
+        harness_websocket,
+    ));
+    let client = tokio::time::timeout(TEST_TIMEOUT, client_task)
+        .await
+        .context("remote harness did not connect")???;
+
+    let environment_info = client.environment_info().await?;
+    assert_eq!(
+        environment_info
+            .prepend_path_dirs
+            .iter()
+            .map(|path| std::fs::canonicalize(path.inferred_native_path_string()))
+            .collect::<std::io::Result<Vec<_>>>()?,
+        vec![codex_path_dir.canonicalize()?]
+    );
+    let expected_info = EnvironmentInfo {
+        executor_version: "1.2.3-alpha.4".to_string(),
+        // The build identity belongs to the spawned CLI, not this test process.
+        provider_id: environment_info.provider_id.clone(),
+        prepend_path_dirs: environment_info.prepend_path_dirs.clone(),
+        ..EnvironmentInfo::local()
+    };
+    assert_eq!(environment_info.as_ref(), &expected_info);
+    std::fs::remove_file(&manifest)?;
+    assert_eq!(client.force_environment_info().await?, expected_info);
+
+    #[cfg(windows)]
+    let argv = vec![
+        "cmd.exe",
+        "/C",
+        "if defined CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE (exit /b 1) else ping -n 61 127.0.0.1",
+    ];
+    #[cfg(not(windows))]
+    let argv = vec![
+        "/bin/sh",
+        "-c",
+        "[ -z \"${CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE+present}\" ] && exec /bin/sleep 60",
+    ];
+    let cwd = url::Url::from_directory_path(std::env::current_dir()?)
+        .map_err(|()| anyhow::anyhow!("could not convert cwd to file URL"))?;
+    client
+        .exec(ExecParams {
+            metadata: Default::default(),
+            process_id: ProcessId::from("parent-lifetime-process"),
+            argv: argv.into_iter().map(str::to_string).collect(),
+            cwd: cwd.as_str().parse()?,
+            shell_snapshot: None,
+            env_policy: Some(codex_exec_server::ExecEnvPolicy {
+                inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::All,
+                ignore_default_excludes: false,
+                exclude: Vec::new(),
+                r#set: HashMap::new(),
+                include_only: Vec::new(),
+            }),
+            env: HashMap::new(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    anyhow::ensure!(
+        child.try_wait()?.is_none(),
+        "remote exec-server exited while its parent stdin remained open"
+    );
+
+    drop(stdin);
+
+    let output = tokio::time::timeout(TEST_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| anyhow::anyhow!("remote exec-server did not exit after stdin closed"))??;
+    anyhow::ensure!(
+        output.status.success(),
+        "remote exec-server exited with {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    relay_task.abort();
+    let _ = relay_task.await;
+
+    let requests = collector
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("failed to read OTLP collector requests"))?;
+    let metrics = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/metrics")
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body))
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    assert_metric_point(&metrics, "exec_server_processes_active", &[], Some(0));
+    assert_metric_point(
+        &metrics,
+        "exec_server_processes_finished_total",
+        &[("result", "terminated")],
+        Some(1),
+    );
+    assert_metric_point(
+        &metrics,
+        "exec_server_requests_total",
+        &[("method", "process/start"), ("result", "success")],
+        Some(1),
+    );
+
+    Ok(())
+}
+
+async fn accept_parent_lifetime_websocket(
+    listener: &TcpListener,
+    timeout: Duration,
+) -> Result<WebSocketStream<tokio::net::TcpStream>> {
+    let (socket, _) = tokio::time::timeout(timeout, listener.accept())
+        .await
+        .context("remote executor or harness did not reach rendezvous")??;
+    tokio::time::timeout(timeout, accept_async(socket))
+        .await
+        .context("fake rendezvous did not complete websocket handshake")?
+        .map_err(Into::into)
+}
+
+async fn registered_parent_lifetime_executor_public_key(
+    registry: &MockServer,
+) -> Result<NoiseChannelPublicKey> {
+    let requests = registry
+        .received_requests()
+        .await
+        .context("failed to read remote registry requests")?;
+    let request = requests
+        .iter()
+        .find(|request| request.url.path().ends_with("/register"))
+        .context("remote executor did not register before connecting")?;
+    let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+    serde_json::from_value(body["executor_public_key"].clone()).map_err(Into::into)
+}
+
+async fn proxy_parent_lifetime_relay(
+    mut environment: WebSocketStream<tokio::net::TcpStream>,
+    mut harness: WebSocketStream<tokio::net::TcpStream>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            message = environment.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                harness.send(message?).await?;
+            }
+            message = harness.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                environment.send(message?).await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -285,7 +686,7 @@ fn local_exec_server_exits_successfully_on_sigterm() -> Result<()> {
 async fn wait_for_response(
     stdout: &mut (impl tokio::io::AsyncBufRead + Unpin),
     expected_id: i64,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     loop {
         let mut line = String::new();
         if stdout.read_line(&mut line).await? == 0 {
@@ -297,7 +698,7 @@ async fn wait_for_response(
                 message.get("error").is_none(),
                 "exec-server request {expected_id} failed: {message}"
             );
-            return Ok(());
+            return Ok(message);
         }
     }
 }

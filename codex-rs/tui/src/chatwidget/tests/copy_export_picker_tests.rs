@@ -1,0 +1,170 @@
+//! Copy/export presentation and exact payload routing through their production views.
+
+use super::*;
+use crate::app_event::TranscriptExportDestination;
+use crate::clipboard_copy::CopyFormat;
+use pretty_assertions::assert_eq;
+
+#[tokio::test]
+async fn whole_response_copy_uses_followup_labels() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Terminal;
+    let directive = r#":codex-followup[**Inspect items[0]**]{prompt="private"}"#;
+    let literal =
+        format!("\n\n`{directive}`\n\n```text\n{directive}\n```\n\n:codex-followup[unfinished");
+    let source = format!("- {directive}{literal}");
+    let expected = format!("- **Inspect items[0]**{literal}");
+    replay_agent_message(
+        &mut chat,
+        "followups",
+        source.clone(),
+        ReplayKind::ThreadSnapshot,
+    );
+    let shortcut = match chat.prepare_last_response_copy() {
+        crate::chatwidget::KeyEventAction::CopyLastResponse(text) => Some(text.to_string()),
+        _ => None,
+    };
+    assert_eq!(shortcut, Some(expected.clone()));
+    chat.show_copy_picker();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let copied = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        AppEvent::CopySelection { text, format, .. } => Some((text.to_string(), format)),
+        _ => None,
+    });
+    assert_eq!(copied, Some((expected, CopyFormat::Markdown)));
+    assert_eq!(chat.transcript.last_agent_source, Some(source));
+}
+
+#[tokio::test]
+async fn completed_response_copy_preserves_markdown_line_endings() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Terminal;
+    let markdown = "Hard break:  \nstarts a new line.\n\n```text\ncode with trailing spaces  \n```";
+    replay_agent_message(
+        &mut chat,
+        "hard-break",
+        format!("{markdown}\n\n::git-stage{{cwd=\"/repo\"}}"),
+        ReplayKind::ThreadSnapshot,
+    );
+    chat.show_copy_picker();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let copied = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        AppEvent::CopySelection { text, format, .. } => Some((text.to_string(), format)),
+        _ => None,
+    });
+    assert_eq!(copied, Some((markdown.to_string(), CopyFormat::Markdown)));
+    insta::assert_debug_snapshot!(crate::clipboard_html::render_markdown(
+        chat.transcript.last_agent_markdown.as_deref().unwrap()
+    ), @r#""<p>Hard break:<br />\nstarts a new line.</p>\n<pre><code class=\"language-text\">code with trailing spaces  \n</code></pre>\n""#);
+}
+
+#[tokio::test]
+async fn copy_export_picker_custom_keys_preserve_payloads_and_composer_draft() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Terminal;
+    let mut keymap = crate::keymap::RuntimeKeymap::defaults();
+    keymap.list.accept = vec![key_hint::plain(KeyCode::F(/*n*/ 3))];
+    keymap.list.cancel = vec![key_hint::plain(KeyCode::F(/*n*/ 2))];
+    chat.bottom_pane.set_keymap_bindings(&keymap);
+    chat.bottom_pane
+        .set_composer_text("Keep this draft".into(), Vec::new(), Vec::new());
+    let source =
+        "A long preview with 日本語 and cafe\u{301}; keep all of it. ".repeat(/*n*/ 4);
+    chat.transcript.last_agent_markdown = Some(source.clone());
+    chat.show_copy_picker();
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("..."), "{popup}");
+    assert!(popup.contains("f3 select · f2 back"), "{popup}");
+    chat.handle_key_event(KeyEvent::from(KeyCode::F(/*n*/ 3)));
+    let copied = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        AppEvent::CopySelection {
+            text,
+            label,
+            format,
+        } => Some((text.to_string(), label, format)),
+        _ => None,
+    });
+    assert_eq!(
+        copied,
+        Some((source, "Whole response".into(), CopyFormat::Markdown))
+    );
+    assert_eq!(chat.bottom_pane.composer_text(), "Keep this draft");
+
+    chat.show_transcript_export_popup();
+    chat.handle_key_event(KeyEvent::from(KeyCode::F(/*n*/ 2)));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok()).all(|event| !matches!(
+            event,
+            AppEvent::ExportTranscript { .. } | AppEvent::OpenTranscriptExportFilePrompt
+        ))
+    );
+    chat.show_transcript_export_popup();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::F(/*n*/ 3)));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::OpenTranscriptExportFilePrompt))
+    );
+    chat.show_transcript_export_file_prompt();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
+    assert!(chat.no_modal_or_popup_active());
+    assert_eq!(chat.bottom_pane.composer_text(), "Keep this draft");
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .all(|event| !matches!(event, AppEvent::ExportTranscript { .. }))
+    );
+
+    chat.show_transcript_export_file_prompt();
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    let filename = "reviews/日本語 - result.md";
+    chat.handle_paste(filename.into());
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    let exported = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+        AppEvent::ExportTranscript {
+            destination: TranscriptExportDestination::File(path),
+        } => Some(path),
+        _ => None,
+    });
+    assert_eq!(exported, Some(PathBuf::from(filename)));
+    assert!(chat.no_modal_or_popup_active());
+    assert_eq!(chat.bottom_pane.composer_text(), "Keep this draft");
+}
+
+#[tokio::test]
+async fn owned_copy_opens_transcript_selection() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Owned;
+    let markdown = "Latest **response**\n\n```sh\necho hello  \n```";
+    chat.transcript.last_agent_markdown = Some(markdown.into());
+    chat.show_copy_picker();
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::SelectTranscriptCopy { .. }))
+    );
+    assert!(chat.no_modal_or_popup_active());
+}
+
+#[tokio::test]
+async fn completed_copy_source_survives_replay_and_stream_consolidation() {
+    let source = "Intro\r\n\r\n```sh\r\necho x  \r\n```\r\n";
+    for replay in [false, true] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        if replay {
+            replay_agent_message(&mut chat, "source", source, ReplayKind::ThreadSnapshot);
+        } else {
+            complete_assistant_message(
+                &mut chat,
+                "source",
+                source,
+                Some(MessagePhase::FinalAnswer),
+            );
+        }
+        let retained = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => cell.copy_source().map(str::to_owned),
+            AppEvent::ConsolidateAgentMessage { copy_source, .. } => copy_source,
+            _ => None,
+        });
+        assert_eq!(retained.as_deref(), Some(source));
+    }
+}

@@ -105,7 +105,10 @@ impl ToolExecutor<ToolInvocation> for DynamicToolHandler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -162,7 +165,11 @@ impl DynamicToolHandler {
     }
 }
 
-impl CoreToolRuntime for DynamicToolHandler {}
+impl CoreToolRuntime for DynamicToolHandler {
+    fn is_third_party_tool(&self) -> bool {
+        true
+    }
+}
 
 #[expect(
     clippy::await_holding_invalid_type,

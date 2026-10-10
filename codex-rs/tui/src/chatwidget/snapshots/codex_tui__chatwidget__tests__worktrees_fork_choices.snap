@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests/worktree_picker_tests.rs
+expression: popup
+---
+  Where should the forked conversation run?
+
+
+› 1. Use current Git worktree  Keep using the current working directory
+  2. Create new Git worktree   Create a separate checkout of this repository in
+                               another directory
+
+  enter select · esc back

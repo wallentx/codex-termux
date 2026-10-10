@@ -197,17 +197,30 @@ async fn try_verify_apply_patch_args(
     let mut changes = HashMap::new();
     for hunk in hunks {
         let path = hunk.resolve_path(&effective_cwd)?;
+        if changes.contains_key(&path) {
+            return Err(ParseError::InvalidPatchError(format!(
+                "multiple operations target {}",
+                path.inferred_native_path_string()
+            ))
+            .into());
+        }
         match hunk {
             Hunk::AddFile { contents, .. } => {
                 changes.insert(path, ApplyPatchFileChange::Add { content: contents });
             }
             Hunk::DeleteFile { .. } => {
-                let content = fs.read_file_text(&path, sandbox).await.map_err(|source| {
-                    ApplyPatchError::IoError(IoError {
-                        context: format!("Failed to read {}", path.inferred_native_path_string()),
-                        source,
-                    })
-                })?;
+                let content = fs
+                    .read_file_text(&path, Default::default(), sandbox)
+                    .await
+                    .map_err(|source| {
+                        ApplyPatchError::IoError(IoError {
+                            context: format!(
+                                "Failed to read {}",
+                                path.inferred_native_path_string()
+                            ),
+                            source,
+                        })
+                    })?;
                 changes.insert(path, ApplyPatchFileChange::Delete { content });
             }
             Hunk::UpdateFile {

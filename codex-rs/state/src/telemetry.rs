@@ -3,17 +3,28 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::DB_CORRUPTION_METRIC;
 use crate::DB_FALLBACK_METRIC;
 use crate::DB_INIT_DURATION_METRIC;
 use crate::DB_INIT_METRIC;
+use crate::LOG_QUEUE_DROPPED_METRIC;
+use crate::LOG_WRITE_BYTES_METRIC;
+use crate::LOG_WRITE_DURATION_METRIC;
+use crate::LOG_WRITE_ENTRIES_METRIC;
+use crate::LOG_WRITE_MAX_ENTRY_BYTES_METRIC;
+use crate::LOG_WRITE_METRIC;
+use crate::LogEntry;
+use crate::runtime::reclamation::ReclamationPass;
+
 use tracing::debug;
 
-/// Low-cardinality sink for SQLite startup and fallback telemetry.
+/// Low-cardinality sink for SQLite startup, corruption, fallback, log-write, and reclamation telemetry.
 ///
 /// Implementations should absorb delivery failures locally. Database behavior
 /// must not depend on whether telemetry export succeeds.
 pub trait DbTelemetry: Send + Sync + 'static {
     fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]);
+    fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]);
     fn record_duration(&self, name: &str, duration: Duration, tags: &[(&str, &str)]);
 }
 
@@ -41,6 +52,7 @@ pub(crate) enum DbKind {
     Logs,
     Goals,
     Memories,
+    Queue,
     ThreadHistory,
 }
 
@@ -51,9 +63,18 @@ impl DbKind {
             Self::Logs => "logs",
             Self::Goals => "goals",
             Self::Memories => "memories",
+            Self::Queue => "queue",
             Self::ThreadHistory => "thread_history",
         }
     }
+}
+
+pub(crate) fn record_corruption(telemetry: Option<&dyn DbTelemetry>, db: Option<DbKind>) {
+    record_counter(
+        telemetry,
+        DB_CORRUPTION_METRIC,
+        &[("db", db.map_or("other", DbKind::as_str))],
+    );
 }
 
 pub(crate) fn record_init_result<T>(
@@ -92,6 +113,63 @@ pub fn record_fallback(
         DB_FALLBACK_METRIC,
         &[("caller", caller), ("reason", reason)],
     );
+}
+
+pub(crate) fn record_log_write(
+    telemetry: Option<&dyn DbTelemetry>,
+    duration: Duration,
+    entries: &[LogEntry],
+    result: &anyhow::Result<()>,
+) {
+    let Some(telemetry) = resolve_telemetry(telemetry) else {
+        return;
+    };
+
+    let outcome = DbOutcomeTags::from_result(result);
+    let tags = [("status", outcome.status), ("error", outcome.error)];
+    let mut batch_bytes = 0_i64;
+    let mut max_entry_bytes = 0_i64;
+    for entry in entries {
+        let entry_bytes = entry.estimated_bytes();
+        batch_bytes = batch_bytes.saturating_add(entry_bytes);
+        max_entry_bytes = max_entry_bytes.max(entry_bytes);
+    }
+    let entry_count = i64::try_from(entries.len()).unwrap_or(i64::MAX);
+
+    telemetry.counter(LOG_WRITE_METRIC, /*inc*/ 1, &tags);
+    telemetry.record_duration(LOG_WRITE_DURATION_METRIC, duration, &tags);
+    telemetry.histogram(LOG_WRITE_BYTES_METRIC, batch_bytes, &tags);
+    telemetry.histogram(LOG_WRITE_ENTRIES_METRIC, entry_count, &tags);
+    telemetry.histogram(LOG_WRITE_MAX_ENTRY_BYTES_METRIC, max_entry_bytes, &tags);
+}
+
+pub(crate) fn record_log_queue_drop(reason: &'static str, telemetry: Option<&dyn DbTelemetry>) {
+    record_counter(telemetry, LOG_QUEUE_DROPPED_METRIC, &[("reason", reason)]);
+}
+
+pub(crate) fn record_reclamation(
+    db: &'static str,
+    duration: Duration,
+    result: &anyhow::Result<ReclamationPass>,
+) {
+    let Some(telemetry) = resolve_telemetry(/*telemetry*/ None) else {
+        return;
+    };
+    let outcome = DbOutcomeTags::from_result(result);
+    let tags = [
+        ("db", db),
+        ("status", outcome.status),
+        ("error", outcome.error),
+    ];
+    telemetry.counter("codex.sqlite.reclamation.count", /*inc*/ 1, &tags);
+    telemetry.record_duration("codex.sqlite.reclamation.duration_ms", duration, &tags);
+    if let Ok(pass) = result {
+        telemetry.histogram(
+            "codex.sqlite.reclamation.pages",
+            i64::from(pass.pages),
+            &tags,
+        );
+    }
 }
 
 fn record_counter(telemetry: Option<&dyn DbTelemetry>, name: &str, tags: &[(&str, &str)]) {
@@ -135,7 +213,7 @@ impl DbOutcomeTags {
     }
 }
 
-fn classify_error(err: &anyhow::Error) -> &'static str {
+pub(crate) fn classify_error(err: &anyhow::Error) -> &'static str {
     for cause in err.chain() {
         if let Some(sqlx_err) = cause.downcast_ref::<sqlx::Error>() {
             return classify_sqlx_error(sqlx_err);
@@ -153,7 +231,11 @@ fn classify_error(err: &anyhow::Error) -> &'static str {
             return "io";
         }
     }
-    "unknown"
+    if crate::is_sqlite_corruption_error(err) {
+        "corrupt"
+    } else {
+        "unknown"
+    }
 }
 
 fn classify_sqlx_error(err: &sqlx::Error) -> &'static str {
@@ -203,3 +285,7 @@ mod tests {
         assert_eq!(classify_sqlite_code("2067"), "constraint");
     }
 }
+
+#[cfg(test)]
+#[path = "log_write_telemetry_tests.rs"]
+mod log_write_telemetry_tests;

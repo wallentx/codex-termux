@@ -1,9 +1,9 @@
-use schemars::JsonSchema;
+use crate::JsonSchema;
+use crate::TS;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -27,4 +27,9 @@ pub struct FeedbackUploadParams {
 #[ts(export_to = "v2/")]
 pub struct FeedbackUploadResponse {
     pub thread_id: String,
+    /// Whitespace-normalized SHA-256 of the session base instructions, matching the
+    /// uploaded `prompt_hash` tag. Does not include later developer messages.
+    /// Null when the reported rollout has no prompt metadata.
+    #[serde(default)]
+    pub prompt_hash: Option<String>,
 }

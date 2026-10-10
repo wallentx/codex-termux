@@ -2,6 +2,7 @@ use clap::Args;
 use clap::FromArgMatches;
 use clap::Parser;
 use clap::ValueEnum;
+use codex_protocol::protocol::ThreadSource;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
 use std::path::PathBuf;
@@ -23,6 +24,15 @@ pub struct Cli {
     #[clap(flatten)]
     pub shared: ExecSharedCliOptions,
 
+    /// Source classification for newly created or forked threads.
+    #[arg(long = "thread-source", value_name = "SOURCE", global = true)]
+    pub thread_source: Option<ThreadSource>,
+
+    /// Request an experimental Cyber access program for this turn (OpenAI provider only).
+    /// Omit to use server defaults. Not supported with review; fork requires a prompt.
+    #[arg(long, value_enum, value_name = "PROGRAM", global = true)]
+    pub cyber_access_program: Option<CyberAccessProgramCliArg>,
+
     /// Allow running Codex outside a Git repository.
     #[arg(long = "skip-git-repo-check", global = true, default_value_t = false)]
     pub skip_git_repo_check: bool,
@@ -38,16 +48,6 @@ pub struct Cli {
     /// Do not load user or project execpolicy `.rules` files.
     #[arg(long = "ignore-rules", global = true, default_value_t = false)]
     pub ignore_rules: bool,
-
-    /// Legacy compatibility trap for the removed `--full-auto` flag.
-    #[arg(
-        long = "full-auto",
-        hide = true,
-        global = true,
-        default_value_t = false,
-        conflicts_with = "dangerously_bypass_approvals_and_sandbox"
-    )]
-    pub removed_full_auto: bool,
 
     /// Path to a JSON Schema file describing the model's final response shape.
     #[arg(long = "output-schema", value_name = "FILE", global = true)]
@@ -85,6 +85,24 @@ pub struct Cli {
     pub prompt: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum CyberAccessProgramCliArg {
+    Standard,
+    DaybreakBlue,
+    DaybreakRed,
+}
+
+impl From<CyberAccessProgramCliArg> for codex_app_server_protocol::CyberAccessProgram {
+    fn from(value: CyberAccessProgramCliArg) -> Self {
+        match value {
+            CyberAccessProgramCliArg::Standard => Self::Standard,
+            CyberAccessProgramCliArg::DaybreakBlue => Self::DaybreakBlue,
+            CyberAccessProgramCliArg::DaybreakRed => Self::DaybreakRed,
+        }
+    }
+}
+
 impl std::ops::Deref for Cli {
     type Target = SharedCliOptions;
 
@@ -96,18 +114,6 @@ impl std::ops::Deref for Cli {
 impl std::ops::DerefMut for Cli {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.shared.0
-    }
-}
-
-impl Cli {
-    pub fn removed_full_auto_warning(&self) -> Option<&'static str> {
-        if self.removed_full_auto {
-            return Some(
-                "warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.",
-            );
-        }
-
-        None
     }
 }
 
@@ -160,6 +166,7 @@ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
             arg.global(true)
         })
         .mut_arg("bypass_hook_trust", |arg| arg.global(true))
+        .mut_arg("worktree", |arg| arg.global(true))
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -167,8 +174,32 @@ pub enum Command {
     /// Resume a previous session by id or pick the most recent with --last.
     Resume(ResumeArgs),
 
+    /// Fork a previous session by id into a new session.
+    Fork(ForkArgs),
+
     /// Run a code review against the current repository.
     Review(ReviewArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ForkArgs {
+    /// Conversation/session id (UUID) or thread name to fork.
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: String,
+
+    /// Optional image(s) to attach to the prompt sent after forking.
+    #[arg(
+        long = "image",
+        short = 'i',
+        value_name = "FILE",
+        value_delimiter = ',',
+        num_args = 1
+    )]
+    pub images: Vec<PathBuf>,
+
+    /// Optional prompt to send after forking. If `-` is used, read from stdin.
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+    pub prompt: Option<String>,
 }
 
 #[derive(Args, Debug)]

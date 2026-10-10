@@ -1,3 +1,5 @@
+//! Restore terminal modes and screen placement across suspend/resume.
+
 use std::io::Result;
 use std::io::stdout;
 use std::sync::Arc;
@@ -10,15 +12,12 @@ use std::sync::atomic::Ordering;
 use crossterm::cursor::MoveTo;
 use crossterm::cursor::Show;
 use crossterm::event::KeyCode;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
+use ratatui::layout::Size;
 
 use crate::key_hint;
 
-use super::DisableAlternateScroll;
-use super::EnableAlternateScroll;
 use super::Terminal;
 
 pub const SUSPEND_KEY: key_hint::KeyBinding = key_hint::ctrl(KeyCode::Char('z'));
@@ -63,8 +62,7 @@ impl SuspendContext {
     pub(crate) fn suspend(&self, alt_screen_active: &Arc<AtomicBool>) -> Result<()> {
         if alt_screen_active.load(Ordering::Relaxed) {
             // Leave alt-screen so the terminal returns to the normal buffer while suspended; also turn off alt-scroll.
-            let _ = execute!(stdout(), DisableAlternateScroll);
-            let _ = execute!(stdout(), LeaveAlternateScreen);
+            let _ = super::ALTERNATE_SCREEN.leave(&mut stdout());
             self.set_resume_action(ResumeAction::RestoreAlt);
         } else {
             self.set_resume_action(ResumeAction::RealignInline);
@@ -178,19 +176,24 @@ pub(crate) enum PreparedResumeAction {
 }
 
 impl PreparedResumeAction {
-    pub(crate) fn apply(self, terminal: &mut Terminal) -> Result<()> {
+    pub(crate) fn apply(
+        self,
+        terminal: &mut Terminal,
+        screen_size: Size,
+        owned: bool,
+        capture_mouse: bool,
+    ) -> Result<()> {
         match self {
             PreparedResumeAction::RealignViewport(area) => {
                 terminal.set_viewport_area(area);
             }
             PreparedResumeAction::RestoreAltScreen => {
-                execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                // Enable "alternate scroll" so terminals may translate wheel to arrows
-                execute!(terminal.backend_mut(), EnableAlternateScroll)?;
-                if let Ok(size) = terminal.size() {
-                    terminal.set_viewport_area(Rect::new(0, 0, size.width, size.height));
-                    terminal.clear()?;
+                super::ALTERNATE_SCREEN.enter(terminal.backend_mut(), capture_mouse)?;
+                if owned {
+                    terminal.hide_cursor()?;
                 }
+                terminal.set_viewport_area(Rect::from(screen_size));
+                terminal.clear()?;
             }
         }
         Ok(())
@@ -199,13 +202,78 @@ impl PreparedResumeAction {
 
 /// Deliver SIGTSTP after restoring terminal state, then re-applies terminal modes once resumed.
 fn suspend_process() -> Result<()> {
+    static JOB_RESUMED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn record_job_resumed(_signal: libc::c_int) {
+        JOB_RESUMED.store(true, Ordering::Release);
+    }
     super::restore()?;
     super::terminal_stderr::pause()?;
-    unsafe {
-        libc::kill(/*pid*/ 0, libc::SIGTSTP)
+    // SAFETY: both actions are initialized before they are passed to libc.
+    let (mut action, mut previous_action): (libc::sigaction, libc::sigaction) =
+        unsafe { std::mem::zeroed() };
+    let (mut continue_set, mut previous_mask): (libc::sigset_t, libc::sigset_t) =
+        unsafe { std::mem::zeroed() };
+    action.sa_sigaction = record_job_resumed as *const () as libc::sighandler_t;
+    action.sa_flags = libc::SA_RESTART;
+    let action_installed = unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGCONT, &action, &mut previous_action) == 0
     };
-    // After the process resumes, reapply terminal modes so drawing can continue.
-    super::terminal_stderr::resume()?;
-    super::set_modes()?;
-    Ok(())
+    let unblock_result = if action_installed {
+        unsafe {
+            libc::sigemptyset(&mut continue_set);
+            libc::sigaddset(&mut continue_set, libc::SIGCONT);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &continue_set, &mut previous_mask)
+        }
+    } else {
+        0
+    };
+    let suspend_result = if !action_installed {
+        Err(std::io::Error::last_os_error())
+    } else if unblock_result != 0 {
+        Err(std::io::Error::from_raw_os_error(unblock_result))
+    } else if unsafe {
+        JOB_RESUMED.store(false, Ordering::Relaxed);
+        libc::kill(/*pid*/ 0, libc::SIGTSTP)
+    } == 0
+    {
+        for _ in 0..1000 {
+            if JOB_RESUMED.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        if JOB_RESUMED.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    } else {
+        Err(std::io::Error::last_os_error())
+    };
+    let restore_mask_result = if action_installed && unblock_result == 0 {
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut())
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(result))
+        }
+    } else {
+        Ok(())
+    };
+    // SAFETY: previous_action was initialized by the successful sigaction call above.
+    let restore_result = if !action_installed
+        || unsafe { libc::sigaction(libc::SIGCONT, &previous_action, std::ptr::null_mut()) } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    };
+    suspend_result
+        .and(restore_mask_result)
+        .and(restore_result)
+        .and(super::terminal_stderr::resume())
+        .and(super::set_modes())
 }

@@ -3,14 +3,15 @@
 use std::sync::Arc;
 
 use codex_core::NewThread;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
-use codex_protocol::protocol::ResumedHistory;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -29,34 +30,37 @@ fn resume_history(
     let turn_id = "resume-warning-seed-turn".to_string();
     let turn_ctx = TurnContextItem {
         turn_id: Some(turn_id.clone()),
+        root_turn_id: None,
+        disabled_plugin_ids: None,
         cwd: config.cwd.clone(),
-        workspace_roots: None,
-        current_date: None,
-        timezone: None,
         approval_policy: config.permissions.approval_policy.value(),
         approvals_reviewer: None,
         sandbox_policy: config.legacy_sandbox_policy(),
         permission_profile: None,
-        network: None,
+        active_permission_profile: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
         comp_hash: None,
-        personality: None,
         collaboration_mode: None,
         multi_agent_version: None,
-        multi_agent_mode: None,
         realtime_active: None,
+        cyber_access_program: None,
         effort: config.model_reasoning_effort.clone(),
-        summary: config
-            .model_reasoning_summary
-            .unwrap_or(ReasoningSummary::Auto),
+        summary: Some(
+            config
+                .model_reasoning_summary
+                .unwrap_or(ReasoningSummary::Auto),
+        ),
     };
 
     InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
         conversation_id: ThreadId::default(),
         history: Arc::new(vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: turn_id.clone(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -72,6 +76,7 @@ fn resume_history(
             })),
             RolloutItem::TurnContext(turn_ctx),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id,
                 last_agent_message: None,
                 error: None,
@@ -116,7 +121,7 @@ async fn emits_warning_when_resumed_model_differs() {
             initial_history,
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume conversation");

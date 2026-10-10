@@ -1,26 +1,68 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_config::types::McpServerEnvVar;
-use reqwest::ClientBuilder;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
-use reqwest::header::HeaderValue;
+use codex_network_proxy::CUSTOM_CA_ENV_KEYS;
+use codex_protocol::shell_environment::is_non_inheritable_env_var;
+use http::HeaderMap;
+use http::HeaderName;
+use http::HeaderValue;
+use http::header::USER_AGENT;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
+
+pub(crate) const MCP_USER_AGENT: &str = concat!("codex-mcp-client/", env!("CARGO_PKG_VERSION"));
 
 pub(crate) fn create_env_for_mcp_server(
     extra_env: Option<HashMap<OsString, OsString>>,
     env_vars: &[McpServerEnvVar],
 ) -> Result<HashMap<OsString, OsString>> {
+    create_env_for_mcp_server_with_lookup(extra_env, env_vars, |name| env::var_os(name))
+}
+
+fn create_env_for_mcp_server_with_lookup(
+    extra_env: Option<HashMap<OsString, OsString>>,
+    env_vars: &[McpServerEnvVar],
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Result<HashMap<OsString, OsString>> {
     let additional_env_vars = local_stdio_env_var_names(env_vars)?;
-    let env = DEFAULT_ENV_VARS
+    let mut env: HashMap<OsString, OsString> = DEFAULT_ENV_VARS
         .iter()
         .copied()
         .chain(additional_env_vars)
-        .filter_map(|var| env::var_os(var).map(|value| (OsString::from(var), value)))
-        .chain(extra_env.unwrap_or_default())
+        .filter_map(|var| lookup(var).map(|value| (OsString::from(var), value)))
         .collect();
+    for name in CUSTOM_CA_ENV_KEYS {
+        let Some(value) = lookup(name) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        let value = std::path::absolute(value)?.into_os_string();
+        #[cfg(windows)]
+        env.retain(|key, _| !key.to_string_lossy().eq_ignore_ascii_case(name));
+        env.insert(OsString::from(name), value);
+    }
+    for (name, value) in extra_env.unwrap_or_default() {
+        if cfg!(windows)
+            || name.to_str().is_some_and(|name| {
+                CUSTOM_CA_ENV_KEYS
+                    .iter()
+                    .any(|ca_name| ca_name.eq_ignore_ascii_case(name))
+            })
+        {
+            env.retain(|key, _| {
+                !key.to_string_lossy()
+                    .eq_ignore_ascii_case(&name.to_string_lossy())
+            });
+        }
+        env.insert(name, value);
+    }
+    env.retain(|name, _| {
+        name.to_str()
+            .is_none_or(|name| !is_non_inheritable_env_var(name))
+    });
     Ok(env)
 }
 
@@ -31,18 +73,24 @@ pub(crate) fn create_env_overlay_for_remote_mcp_server(
     // Remote stdio should inherit PATH/HOME/etc. from the executor side, not
     // from the orchestrator process. Only forward variables explicitly named
     // by the MCP config plus literal env overrides from that config.
-    env_vars
+    let mut env: HashMap<OsString, OsString> = env_vars
         .iter()
         .filter(|var| !var.is_remote_source())
         .filter_map(|var| env::var_os(var.name()).map(|value| (OsString::from(var.name()), value)))
         .chain(extra_env.unwrap_or_default())
-        .collect()
+        .collect();
+    env.retain(|name, _| {
+        name.to_str()
+            .is_none_or(|name| !is_non_inheritable_env_var(name))
+    });
+    env
 }
 
 pub(crate) fn remote_mcp_env_var_names(env_vars: &[McpServerEnvVar]) -> Vec<String> {
     env_vars
         .iter()
         .filter(|var| var.is_remote_source())
+        .filter(|var| !is_non_inheritable_env_var(var.name()))
         .map(|var| var.name().to_string())
         .collect()
 }
@@ -54,7 +102,10 @@ fn local_stdio_env_var_names(env_vars: &[McpServerEnvVar]) -> Result<impl Iterat
             remote_var.name()
         ));
     }
-    Ok(env_vars.iter().map(McpServerEnvVar::name))
+    Ok(env_vars
+        .iter()
+        .map(McpServerEnvVar::name)
+        .filter(|name| !is_non_inheritable_env_var(name)))
 }
 
 pub(crate) fn build_default_headers(
@@ -62,6 +113,7 @@ pub(crate) fn build_default_headers(
     env_http_headers: Option<HashMap<String, String>>,
 ) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(MCP_USER_AGENT));
 
     if let Some(static_headers) = http_headers {
         for (name, value) in static_headers {
@@ -115,17 +167,6 @@ pub(crate) fn build_default_headers(
     Ok(headers)
 }
 
-pub(crate) fn apply_default_headers(
-    builder: ClientBuilder,
-    default_headers: &HeaderMap,
-) -> ClientBuilder {
-    if default_headers.is_empty() {
-        builder
-    } else {
-        builder.default_headers(default_headers.clone())
-    }
-}
-
 #[cfg(unix)]
 pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
     "HOME",
@@ -139,6 +180,15 @@ pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
     "TERM",
     "TMPDIR",
     "TZ",
+    // Android local MCP children need the parent's Termux execution policy and
+    // preload hooks. Preserve values only when set; omit PROC_SELF_EXE by default,
+    // which describes the parent rather than the child being launched.
+    #[cfg(target_os = "android")]
+    "LD_PRELOAD",
+    #[cfg(target_os = "android")]
+    "TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE",
+    #[cfg(target_os = "android")]
+    "TERMUX_EXEC__EXECVE_CALL__INTERCEPT",
 ];
 
 #[cfg(windows)]
@@ -185,16 +235,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_mcp_preserves_only_platform_runtime_defaults() {
+        let runtime = HashMap::from([
+            (
+                OsString::from("LD_PRELOAD"),
+                OsString::from("/termux/lib/exec.so"),
+            ),
+            (
+                OsString::from("TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE"),
+                OsString::from("disable"),
+            ),
+            (
+                OsString::from("TERMUX_EXEC__EXECVE_CALL__INTERCEPT"),
+                OsString::from("enable"),
+            ),
+        ]);
+        let mut parent = runtime.clone();
+        parent.insert(
+            OsString::from("TERMUX_EXEC__PROC_SELF_EXE"),
+            OsString::from("/parent/codex"),
+        );
+        parent.insert(
+            OsString::from("UNRELATED_SECRET"),
+            OsString::from("not-inherited"),
+        );
+        let actual = create_env_for_mcp_server_with_lookup(None, &[], |name| {
+            parent.get(OsStr::new(name)).cloned()
+        })
+        .expect("local MCP env should build");
+        let expected = if cfg!(target_os = "android") {
+            runtime
+        } else {
+            HashMap::new()
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn local_mcp_does_not_invent_runtime_settings() {
+        let actual = create_env_for_mcp_server_with_lookup(None, &[], |_| None)
+            .expect("local MCP env should build");
+        assert_eq!(actual, HashMap::new());
+    }
+
+    #[test]
+    fn local_mcp_runtime_overrides_win_including_empty_preload() {
+        let overrides = HashMap::from([
+            (OsString::from("LD_PRELOAD"), OsString::new()),
+            (
+                OsString::from("TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE"),
+                OsString::from("force"),
+            ),
+        ]);
+        let actual =
+            create_env_for_mcp_server_with_lookup(
+                Some(overrides.clone()),
+                &[],
+                |name| match name {
+                    "LD_PRELOAD" => Some(OsString::from("/termux/lib/exec.so")),
+                    "TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE" => Some(OsString::from("disable")),
+                    _ => None,
+                },
+            )
+            .expect("local MCP env should build");
+        assert_eq!(actual, overrides);
+    }
+
     #[tokio::test]
     async fn create_env_honors_overrides() {
         let value = "custom".to_string();
         let expected = OsString::from(&value);
         let env = create_env_for_mcp_server(
-            Some(HashMap::from([(OsString::from("TZ"), expected.clone())])),
+            Some(HashMap::from([
+                (OsString::from("TZ"), expected.clone()),
+                (
+                    OsString::from("openai_identity_token_file"),
+                    OsString::from("/run/identity-token"),
+                ),
+            ])),
             &[],
         )
         .expect("local MCP env should build");
         assert_eq!(env.get(OsStr::new("TZ")), Some(&expected));
+        assert!(!env.contains_key(OsStr::new("openai_identity_token_file")));
     }
 
     #[test]
@@ -218,8 +342,13 @@ mod tests {
         let _default_guard = EnvVarGuard::set(default_var, "from-default");
         let _custom_guard = EnvVarGuard::set(custom_var, &custom_value);
 
-        let env =
-            create_env_overlay_for_remote_mcp_server(/*extra_env*/ None, &[custom_var.into()]);
+        let env = create_env_overlay_for_remote_mcp_server(
+            Some(HashMap::from([(
+                OsString::from("OpenAI_Federation_Rule_Id"),
+                OsString::from("rule"),
+            )])),
+            &[custom_var.into()],
+        );
 
         assert_eq!(
             env,
@@ -266,6 +395,10 @@ mod tests {
             },
             McpServerEnvVar::Config {
                 name: "REMOTE".to_string(),
+                source: Some("remote".to_string()),
+            },
+            McpServerEnvVar::Config {
+                name: "openai_identity_token_file".to_string(),
                 source: Some("remote".to_string()),
             },
         ]);

@@ -1,6 +1,11 @@
 use super::*;
+use crate::config::NetworkProxyConfig;
+use crate::state::network_proxy_state_for_policy;
 use pretty_assertions::assert_eq;
 use rama_http::StatusCode;
+use rama_http::Version;
+use rama_net::address::Host;
+use rama_net::address::HostWithPort;
 use rama_tls_rustls::dep::pki_types::CertificateDer;
 use rama_tls_rustls::dep::pki_types::PrivateKeyDer;
 use rama_tls_rustls::dep::pki_types::pem::PemObject;
@@ -94,11 +99,14 @@ async fn mitm_upstream_client_trusts_startup_custom_ca() {
             .unwrap();
     });
 
-    let client =
-        UpstreamClient::direct_with_allow_local_binding(/*allow_local_binding*/ true, roots);
+    let mut config = NetworkProxyConfig::default();
+    config.set_allowed_domains(vec!["localhost".to_string()]);
+    let state = Arc::new(network_proxy_state_for_policy(config));
+    let client = UpstreamClient::direct_with_tls_root_store(state, roots);
     let response = client
         .serve(
             Request::builder()
+                .version(Version::HTTP_2)
                 .uri(format!("https://localhost:{}/", address.port()))
                 .body(Body::empty())
                 .unwrap(),
@@ -108,4 +116,46 @@ async fn mitm_upstream_client_trusts_startup_custom_ca() {
 
     assert_eq!(response.status(), StatusCode::OK);
     server.await.unwrap();
+}
+
+#[test]
+fn private_ip_upstream_routing_is_opt_in() {
+    let proxy = ProxyAddress::try_from("http://127.0.0.1:43128").unwrap();
+    for enabled in [false, true] {
+        let config = ProxyConfig {
+            http: Some(proxy.clone()),
+            https: Some(proxy.clone()),
+            proxy_private_ips_via_upstream: enabled,
+            ..ProxyConfig::default()
+        };
+        for (host, use_proxy) in [
+            ("10.0.0.1", enabled),
+            ("172.16.0.1", enabled),
+            ("192.168.0.1", enabled),
+            ("100.68.58.50", enabled),
+            ("fd00::1", enabled),
+            ("::ffff:100.68.58.50", enabled),
+            ("localhost", false),
+            ("127.0.0.1", false),
+            ("::1", false),
+            ("169.254.169.254", false),
+            ("fe80::1", false),
+            ("0.0.0.0", false),
+            ("224.0.0.1", false),
+            ("192.0.2.1", false),
+            ("240.0.0.1", false),
+            ("example.com", true),
+            ("100.63.255.255", true),
+            ("100.128.0.0", true),
+        ] {
+            let target = HostWithPort::new(host.parse::<Host>().unwrap(), /*port*/ 443);
+            for is_secure in [false, true] {
+                assert_eq!(
+                    config.proxy_for_target(&target, is_secure),
+                    use_proxy.then(|| proxy.clone()),
+                    "host={host}, enabled={enabled}, secure={is_secure}"
+                );
+            }
+        }
+    }
 }

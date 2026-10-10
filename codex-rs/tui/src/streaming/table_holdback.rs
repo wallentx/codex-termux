@@ -3,6 +3,7 @@
 //! Agent streams with markdown tables keep the active table as mutable tail so
 //! adding a row can reflow earlier table rows instead of committing a stale
 //! render to scrollback.
+//! Literal tables only retain candidate headers until their delimiter arrives.
 //!
 //! The scanner is intentionally conservative: it only looks for enough
 //! structure to decide where the mutable tail should start. It does not try to
@@ -44,16 +45,17 @@ struct PreviousLineState {
 
 /// Incremental scanner for table holdback state on append-only source streams.
 ///
-/// `push_source_chunk` must receive source in the same order it will be
-/// appended to the stream. The scanner stores byte offsets into that logical
-/// source buffer, so feeding chunks out of order would make later tail
-/// boundaries point at the wrong rendered region.
+/// `scan` receives the append-only source and the renderer's completed-block
+/// boundary. Completed tables are released only when their containing top-level
+/// block is stable; the remaining tail is rescanned to find later tables.
 pub(super) struct TableHoldbackScanner {
     source_offset: usize,
     fence_tracker: FenceTracker,
     previous_line: Option<PreviousLineState>,
     pending_header_start: Option<usize>,
     confirmed_table_start: Option<usize>,
+    /// Unlike scrollback holdback, partial-row holdback ends at a blank line.
+    in_table: bool,
 }
 
 impl TableHoldbackScanner {
@@ -64,6 +66,7 @@ impl TableHoldbackScanner {
             previous_line: None,
             pending_header_start: None,
             confirmed_table_start: None,
+            in_table: false,
         }
     }
 
@@ -77,7 +80,7 @@ impl TableHoldbackScanner {
     /// header but the delimiter row has not arrived yet, so callers should
     /// optimistically keep that region mutable. `Confirmed` means the header
     /// and delimiter pair has been seen and all subsequent body rows remain in
-    /// the live tail until finalization.
+    /// the live tail until their containing top-level block is stable.
     pub(super) fn state(&self) -> TableHoldbackState {
         if let Some(table_start) = self.confirmed_table_start {
             TableHoldbackState::Confirmed { table_start }
@@ -88,14 +91,31 @@ impl TableHoldbackScanner {
         }
     }
 
-    /// Advance the scanner with newly committed source.
+    /// Partial prose can be previewed only outside tables and fenced blocks.
+    pub(super) fn allows_prose_preview(&self) -> bool {
+        !self.in_table
+            && !self.previous_line.is_some_and(|line| line.is_header)
+            && self.fence_tracker.kind() == FenceKind::Outside
+    }
+
+    /// Scan newly committed source, releasing holdback for completed blocks.
     ///
-    /// Chunks are expected to contain only source that is now safe to commit
-    /// into `raw_source`, typically newline-terminated lines from the
-    /// streaming collector. Partial rows are intentionally excluded so the
-    /// scanner never treats an unfinished table row as a stable structural
-    /// signal.
-    pub(super) fn push_source_chunk(&mut self, source_chunk: &str) {
+    /// Source must contain only complete lines. Releasing a table rescans from
+    /// the final top-level block, where fence state can safely start outside.
+    /// This also detects later tables that arrived in the same delta.
+    pub(super) fn scan(&mut self, source: &str, completed_source_len: usize) {
+        let holdback_start = match self.state() {
+            TableHoldbackState::Confirmed { table_start } => Some(table_start),
+            TableHoldbackState::PendingHeader { header_start } => Some(header_start),
+            TableHoldbackState::None => None,
+        };
+        if self.source_offset < completed_source_len
+            || holdback_start.is_some_and(|start| start < completed_source_len)
+        {
+            self.reset();
+            self.source_offset = completed_source_len;
+        }
+        let source_chunk = &source[self.source_offset..];
         if source_chunk.is_empty() {
             return;
         }
@@ -129,15 +149,21 @@ impl TableHoldbackScanner {
         let is_header = candidate_text.is_some_and(is_table_header_line);
         let is_delimiter = candidate_text.is_some_and(is_table_delimiter_line);
 
-        if self.confirmed_table_start.is_none()
-            && let Some(previous_line) = self.previous_line
+        if strip_blockquote_prefix(line).is_empty() {
+            self.in_table = false;
+        }
+        if let Some(previous_line) = self.previous_line
             && previous_line.fence_kind != FenceKind::Other
             && fence_kind != FenceKind::Other
             && previous_line.is_header
             && is_delimiter
         {
-            self.confirmed_table_start = Some(previous_line.source_start);
+            if crate::markdown_render::preferences::current().tables {
+                self.confirmed_table_start
+                    .get_or_insert(previous_line.source_start);
+            }
             self.pending_header_start = None;
+            self.in_table = true;
         }
 
         if self.confirmed_table_start.is_none() && !line.trim().is_empty() {
@@ -155,6 +181,9 @@ impl TableHoldbackScanner {
         });
 
         self.fence_tracker.advance(line);
+        if fence_kind != FenceKind::Outside && self.fence_tracker.kind() == FenceKind::Outside {
+            self.in_table = false;
+        }
         self.source_offset = self.source_offset.saturating_add(source_line.len());
     }
 }
