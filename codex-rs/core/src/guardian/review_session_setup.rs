@@ -8,6 +8,7 @@ use super::*;
 use crate::guardian::input_budget::CheckpointRecovery;
 use codex_guardian_reviewer::ReviewerPool;
 use codex_guardian_reviewer::ReviewerRequest;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 
 /// Controls whether selection may reuse a session or must start from the parent checkpoint.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,7 +149,14 @@ impl PreparedGuardianContext {
                 }),
             }),
             initial_history: initial_history.unwrap_or(InitialHistory::New),
-            environments: Some(self.context.environments().to_selections()),
+            environments: Some(
+                self.context
+                    .environments()
+                    .to_selections()
+                    .into_iter()
+                    .map(TurnEnvironmentSelection::into_request)
+                    .collect(),
+            ),
             inherited_environments: Some(self.context.environments().clone()),
             client_mcp_extensions: self.parent.services.client_mcp_extensions.clone(),
             ..crate::StartThreadOptions::new(config)
@@ -196,6 +204,7 @@ impl PreparedGuardianContext {
             Some(self.parent.thread_id()),
             session.thread_config_snapshot().await,
             SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_owned()),
+            /*resumed_created_at*/ None,
         );
         GuardianReviewSession {
             session,

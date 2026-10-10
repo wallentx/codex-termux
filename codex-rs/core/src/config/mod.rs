@@ -221,6 +221,7 @@ pub use windows_sandbox_config::PreparedWindowsSandboxConfig;
 use windows_sandbox_config::config_allows_mxc;
 pub use windows_sandbox_config::prepare_windows_sandbox_config;
 use windows_sandbox_config::resolve_windows_sandbox_type;
+pub use windows_sandbox_config::windows_mxc_allowed_by_config;
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
@@ -708,6 +709,8 @@ pub struct Config {
     /// The resolved policy config replaces its `{{ tenant_policy_config }}`
     /// placeholder when a review session is built.
     pub guardian_policy_template: Option<String>,
+    /// Transcript encoding shared by Guardian review and scoring.
+    pub guardian_transcript_mode: codex_protocol::TranscriptFormat,
 
     /// Optional replacement for the gated history-retrieval instructions.
     /// Blank config values are treated as unset, like other Guardian policy overrides.
@@ -3989,6 +3992,9 @@ impl Config {
                     .enabled(Feature::FastMode)
                     .then(|| ServiceTier::Fast.request_value().to_string()),
                 Some(ServiceTier::Flex) => Some(ServiceTier::Flex.request_value().to_string()),
+                None if service_tier == "ultrafast" => features
+                    .enabled(Feature::UltrafastMode)
+                    .then_some(service_tier),
                 None => Some(service_tier),
             }
         });
@@ -4053,6 +4059,15 @@ impl Config {
                 normalize_guardian_policy_config(auto_review.extra_policy.as_deref())
             })
         });
+        let guardian_transcript_mode = cfg
+            .features
+            .as_ref()
+            .and_then(|features| features.guardianv2.as_ref())
+            .and_then(|feature| match feature {
+                FeatureToml::Config(config) => config.transcript_mode,
+                FeatureToml::Enabled(_) => None,
+            })
+            .unwrap_or_default();
         let guardian_policy_template = cfg
             .auto_review
             .as_ref()
@@ -4422,6 +4437,7 @@ impl Config {
             guardian_policy_config,
             guardian_extra_policy,
             guardian_policy_template,
+            guardian_transcript_mode,
             guardian_conversation_history_prompt,
             guardian_conversation_history_max_output_tokens,
             guardian_circuit_break_action: cfg

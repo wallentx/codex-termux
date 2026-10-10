@@ -49,7 +49,8 @@ pub(crate) struct StepContext {
 }
 
 impl StepContext {
-    pub(crate) fn uses_incremental_tools(&self) -> bool {
+    /// Whether new context windows should record tool declarations in history.
+    pub(crate) fn incremental_tools_enabled(&self) -> bool {
         self.settings.model_info.use_responses_lite
             && self
                 .turn
@@ -75,7 +76,6 @@ impl StepContext {
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
         let mut item = self.turn.to_turn_context_item();
         item.realtime_active = Some(self.realtime.active);
-        item.summary = self.settings.reasoning_summary;
         item
     }
 

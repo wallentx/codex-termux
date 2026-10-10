@@ -141,6 +141,84 @@ fn long_prompt_keeps_the_active_input_visible() {
 }
 
 #[test]
+fn wrapped_question_url_keeps_its_complete_destination() {
+    let url = "https://github.com/openai/codex/pull/12345?diff=split";
+    let mut editor = editor();
+    editor.navigate(/*forward*/ true);
+    editor.state.pending[1].question.title = format!("Review this change ({url})?");
+
+    let width = 40;
+    let full_height = editor.desired_height(width);
+    for height in [full_height, 4] {
+        let buffer = render_editor(&editor, width, height);
+        let linked_text = buffer
+            .content
+            .iter()
+            .filter_map(|cell| {
+                let symbol = cell.symbol();
+                symbol.contains("\x1b]8;;").then(|| {
+                    let text = crate::terminal_hyperlinks::strip_osc8(symbol);
+                    assert_eq!(
+                        symbol,
+                        crate::terminal_hyperlinks::osc8_hyperlink(url, &text)
+                    );
+                    text
+                })
+            })
+            .collect::<String>();
+        if height == full_height {
+            assert_eq!(linked_text, url);
+            insta::assert_snapshot!(
+                "question_wrapped_url",
+                crate::terminal_hyperlinks::strip_osc8(&buffer_text(&buffer))
+            );
+        } else {
+            assert!(!linked_text.is_empty());
+            assert!(url.starts_with(&linked_text));
+            assert_ne!(linked_text, url);
+        }
+    }
+}
+
+#[test]
+fn multiline_question_preserves_line_breaks_and_link_destinations() {
+    let url = "https://example.com/diagnostics?view=full";
+    let title = format!("Run this command:\n\n```sh\nprintf '診断'\n```\nThen review ({url})?\n");
+    let mut rendered = Vec::new();
+    for line_ending in ["\n", "\r\n"] {
+        let mut editor = editor();
+        editor.state.pending[0].question.title = title.replace('\n', line_ending);
+
+        for width in [20, 60] {
+            let height = editor.desired_height(width);
+            let buffer = render_editor(&editor, width, height);
+            let linked_text = buffer
+                .content
+                .iter()
+                .filter_map(|cell| {
+                    let symbol = cell.symbol();
+                    symbol.contains("\x1b]8;;").then(|| {
+                        let text = crate::terminal_hyperlinks::strip_osc8(symbol);
+                        assert_eq!(
+                            symbol,
+                            crate::terminal_hyperlinks::osc8_hyperlink(url, &text)
+                        );
+                        text
+                    })
+                })
+                .collect::<String>();
+            assert_eq!(linked_text, url);
+            let text = crate::terminal_hyperlinks::strip_osc8(&buffer_text(&buffer));
+            if width == 60 {
+                rendered.push(text);
+            }
+        }
+    }
+    assert_eq!(rendered[0], rendered[1]);
+    insta::assert_snapshot!("question_multiline", rendered[0]);
+}
+
+#[test]
 fn selected_other_renders_as_a_dim_placeholder() {
     let mut editor = editor();
     editor.navigate(/*forward*/ true);

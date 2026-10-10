@@ -540,6 +540,12 @@ async fn run_safety_retry(
     let model_catalog_path = codex_home.path().join("models.json");
     std::fs::write(&model_catalog_path, serde_json::to_vec(&model_catalog)?)?;
     let model_catalog_path = toml::Value::String(model_catalog_path.display().to_string());
+    // The committed-steer case counts usage from the response that finishes before steering.
+    let instant_interrupt_config = if committed_steer.is_some() {
+        "instant_interrupt = false"
+    } else {
+        ""
+    };
     std::fs::write(
         codex_home.path().join("config.toml"),
         format!(
@@ -557,6 +563,7 @@ stream_max_retries = 0
 
 [features]
 goals = true
+{instant_interrupt_config}
 "#,
             server.uri()
         ),
@@ -784,6 +791,8 @@ goals = true
             /*status_account_display*/ None, /*plan_type*/ None,
             /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ false,
         );
+        app.chat_widget
+            .set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
         app.chat_widget.set_daybreak_enabled(/*enabled*/ true);
         Box::pin(app.retry_safety_buffered_turn(
             &mut tui,

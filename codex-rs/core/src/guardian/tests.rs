@@ -41,6 +41,7 @@ use codex_network_proxy::NetworkProxyConfig;
 use codex_prompts::GuardianPolicyInstructions;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::ThreadId;
+use codex_protocol::TranscriptFormat;
 use codex_protocol::approvals::GuardianAssessmentAction;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::config_types::ReasoningSummary;
@@ -747,6 +748,7 @@ async fn guardian_mcp_uses_thread_permissions_for_an_unavailable_captured_enviro
     selection.config = codex_protocol::protocol::EnvironmentConfigState::Failed("offline".into());
     let captured = crate::environment_selection::TurnEnvironmentSnapshot {
         environments: vec![TurnEnvironmentState::Failed {
+            required_skills: Vec::new(),
             selection,
             error: "offline".into(),
         }],
@@ -1885,7 +1887,7 @@ enum GuardianTestCatalog {
 #[test_case::test_case(None; "captured_policy")]
 #[test_case::test_case(Some("configured policy wins"); "configured_policy")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_reuse_respects_effective_policy_and_personality(
+async fn guardian_reuse_respects_effective_policy_and_personality_opt_out(
     configured_policy: Option<&str>,
 ) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1893,7 +1895,7 @@ async fn guardian_reuse_respects_effective_policy_and_personality(
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
         &server,
-        (0..3)
+        (0..4)
             .map(|index| {
                 sse(vec![
                     ev_response_created(&format!("review-{index}")),
@@ -1939,9 +1941,16 @@ async fn guardian_reuse_respects_effective_policy_and_personality(
         .policy = Some("changed action policy".to_string());
     let mut different_personality = changed_policy.clone();
     different_personality.personality = Some(codex_protocol::config_types::Personality::Pragmatic);
-    for (index, context) in [captured, changed_policy, different_personality]
-        .into_iter()
-        .enumerate()
+    let mut omit_personality = different_personality.clone();
+    omit_personality.personality = Some(codex_protocol::config_types::Personality::None);
+    for (index, context) in [
+        captured,
+        changed_policy,
+        different_personality,
+        omit_personality,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let (outcome, _) = run_guardian_review_session_for_test(
             Arc::clone(&session),
@@ -1955,7 +1964,7 @@ async fn guardian_reuse_respects_effective_policy_and_personality(
         assert!(matches!(outcome, GuardianReviewOutcome::Completed(_)));
     }
     let requests = responses.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     let contract = guardian_output_contract_prompt();
     for (request, policy) in requests
         .iter()
@@ -1972,7 +1981,8 @@ async fn guardian_reuse_respects_effective_policy_and_personality(
         .map(|request| request.body_json()["client_metadata"]["thread_id"].clone())
         .collect::<Vec<_>>();
     assert_eq!(thread_ids[0] == thread_ids[1], configured_policy.is_some());
-    assert_ne!(thread_ids[1], thread_ids[2]);
+    assert_eq!(thread_ids[1], thread_ids[2]);
+    assert_ne!(thread_ids[2], thread_ids[3]);
     Ok(())
 }
 
@@ -2962,6 +2972,7 @@ async fn guardian_reused_trunk_ignores_stale_prior_turn_completion() -> anyhow::
         .send_trunk_event_raw_for_test(Event {
             id: "stale-turn".to_string(),
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: "stale-turn".to_string(),
                 started_at: None,
                 last_agent_message: Some(
@@ -4064,6 +4075,7 @@ async fn guardian_review_session_config_isolates_parent_customizations() {
         guardian_config.base_instructions,
         Some(
             GuardianPolicyInstructions::new(
+                TranscriptFormat::Line,
                 defaults.policy,
                 "",
                 defaults.policy_template,
@@ -4184,6 +4196,7 @@ async fn guardian_review_session_config_uses_requirements_guardian_policy_config
         guardian_config.base_instructions,
         Some(
             GuardianPolicyInstructions::new(
+                TranscriptFormat::Line,
                 "Use the workspace-managed guardian policy.",
                 "",
                 ResolvedModelMessages::bundled()

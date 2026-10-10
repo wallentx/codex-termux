@@ -19,7 +19,6 @@ use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadIdGenerator;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::default_thread_id_generator;
-use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
@@ -143,7 +142,7 @@ impl LocalAgentControl {
             .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
             .await
         {
-            Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
+            Ok(TurnInputSubmission::Started { turn_id, .. }) => Ok(turn_id),
             Ok(TurnInputSubmission::Steered { .. }) => {
                 // MAv1 exposes an opaque `submission_id` to the model. The legacy
                 // `Op::UserInput` path returned a fresh ID for every steer, while the
@@ -467,7 +466,7 @@ impl LocalAgentControl {
         let Ok(membership) = self.runtime.admit_start() else {
             return;
         };
-        let teardown = membership.into_teardown_guard();
+        let teardown = membership.into_teardown_guard("completion_watcher", Some(child_thread_id));
         let control = self.clone();
         let watcher = async move {
             let status = match control.subscribe_status(child_thread_id).await {

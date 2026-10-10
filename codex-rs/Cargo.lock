@@ -2012,6 +2012,7 @@ dependencies = [
  "codex-protocol",
  "codex-state",
  "codex-utils-absolute-path",
+ "codex-utils-path-uri",
  "os_info",
  "pretty_assertions",
  "serde",
@@ -2152,6 +2153,7 @@ dependencies = [
  "hmac 0.12.1",
  "http 1.4.0",
  "keyring",
+ "libc",
  "opentelemetry",
  "opentelemetry_sdk",
  "pretty_assertions",
@@ -3564,6 +3566,7 @@ dependencies = [
  "codex-history",
  "codex-protocol",
  "pretty_assertions",
+ "serde",
  "serde_json",
 ]
 
@@ -3614,6 +3617,7 @@ dependencies = [
  "codex-prompts",
  "codex-protocol",
  "codex-utils-cargo-bin",
+ "codex-websocket-client",
  "core_test_support",
  "dirs",
  "http 1.4.0",

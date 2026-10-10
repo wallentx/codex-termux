@@ -19,7 +19,7 @@ async fn resumed_initial_messages_render_history() {
 
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
-    let configured = crate::session_state::ThreadSessionState {
+    let mut configured = crate::session_state::ThreadSessionState {
         daybreak_enabled: true,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -43,6 +43,18 @@ async fn resumed_initial_messages_render_history() {
         rollout_path: Some(rollout_file.path().to_path_buf()),
     };
 
+    chat.handle_thread_session(configured.clone());
+    assert!(!chat.daybreak_enabled);
+    insta::assert_snapshot!(
+        drain_insert_history(&mut rx).into_iter().flatten()
+            .map(|line| line.to_string())
+            .filter(|line| line.contains("Daybreak"))
+            .collect::<Vec<_>>().join("\n"),
+        @""
+    );
+
+    chat.set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
+    configured.thread_id = ThreadId::new();
     chat.handle_thread_session(configured);
     assert!(chat.daybreak_enabled);
     replay_user_message_text(
@@ -1128,6 +1140,7 @@ async fn replayed_retryable_app_server_error_keeps_turn_running() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1463,6 +1476,7 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1522,6 +1536,7 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
