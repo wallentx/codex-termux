@@ -349,6 +349,7 @@ async fn execute_inner(
                 request(&handle, |request_id| ClientRequest::ThreadList {
                     request_id,
                     params: ThreadListParams {
+                        excluded_thread_ids: None,
                         originators: None,
                         cursor: arguments.cursor.clone(),
                         limit: Some(limit),
@@ -1242,6 +1243,7 @@ async fn start_turn(
             // Older app-server/TUI versions are intentionally unsupported:
             // preserving tool authority takes precedence over legacy fallback.
             tool_output: Some(Box::new(TurnToolOutput {
+                retain: false,
                 name: tool.to_string(),
                 namespace: Some(NAMESPACE.to_string()),
                 output: FunctionCallOutputBody::Text(prompt),

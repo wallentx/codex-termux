@@ -600,8 +600,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         service_tier: None,
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
-        default_zsh_path: None,
+        main_execve_wrapper_exe: None,
         base_instructions: None,
         developer_instructions: None,
         personality: None,
@@ -1865,6 +1864,7 @@ async fn resolve_resume_thread_id(
                 ClientRequest::ThreadList {
                     request_id: RequestId::Integer(0),
                     params: ThreadListParams {
+                        excluded_thread_ids: None,
                         originators: None,
                         cursor,
                         limit: Some(100),
@@ -1951,6 +1951,7 @@ async fn resolve_resume_thread_id(
             ClientRequest::ThreadList {
                 request_id: RequestId::Integer(0),
                 params: ThreadListParams {
+                    excluded_thread_ids: None,
                     originators: None,
                     cursor,
                     limit: Some(100),

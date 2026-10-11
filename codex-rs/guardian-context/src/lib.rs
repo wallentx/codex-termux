@@ -41,6 +41,7 @@ pub use transcript::MANUAL_APPROVAL_DEVELOPER_PREFIX;
 pub use transcript::TranscriptEntryLimits;
 pub use transcript::TranscriptRetentionConfig;
 pub use transcript::collect_transcript;
+pub use transcript::is_inherited_manual_approval;
 pub use truncation::truncate_text;
 
 mod verified_answers;
@@ -48,6 +49,7 @@ pub use verified_answers::RenderedVerifiedAnswers;
 pub use verified_answers::render_verified_answer;
 pub use verified_answers::render_verified_answers;
 
+mod retained_assistant_context;
 mod retained_instructions;
 mod sender_user_messages;
 pub use retained_instructions::retained_assistant_message;
@@ -96,6 +98,7 @@ mod trusted_skills;
 mod trusted_tool;
 pub use trusted_skills::TrustedSkills;
 pub use trusted_tool::TrustedTool;
+pub use trusted_tool::TrustedToolSource;
 mod reviews;
 pub use reviews::MAX_PREVIOUS_REVIEWS;
 pub use reviews::PreviousReview;

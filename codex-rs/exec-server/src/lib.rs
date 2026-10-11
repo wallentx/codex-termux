@@ -41,6 +41,8 @@ mod rpc;
 mod rpc_server_requests;
 mod rpc_timing;
 mod runtime_options;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+mod sandbox_integrity;
 mod sandbox_selection;
 mod sandboxed_file_open;
 mod sandboxed_file_system;
@@ -243,3 +245,9 @@ pub use server::RequestDispatchMode;
 pub use server::run_main;
 pub use server::run_main_with_telemetry;
 pub use telemetry::ExecServerTelemetry;
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub use sandbox_integrity::run_integrity_checks;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub async fn run_integrity_checks(_request: &codex_sandboxing::SandboxExecRequest) {}

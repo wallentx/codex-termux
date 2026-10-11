@@ -21,6 +21,7 @@ use super::agents_overview_view::AgentsOverviewView;
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
 use crate::app_event::AgentsOverviewThreadRefresh;
+use crate::bottom_pane::BottomPaneView;
 use crate::bottom_pane::SelectionDescriptionLayout;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
@@ -281,6 +282,11 @@ impl App {
         else {
             return;
         };
+        let previous_thread_id = self
+            .agents_overview
+            .visible_thread_ids
+            .get(selected)
+            .copied();
         let selected_thread_id = self
             .agents_overview
             .view_state
@@ -292,12 +298,7 @@ impl App {
                     && !self.agents_overview.hidden_threads.contains(id)
             })
             .or(self.agents_overview.selection_after_removal.take())
-            .or_else(|| {
-                self.agents_overview
-                    .visible_thread_ids
-                    .get(selected)
-                    .copied()
-            });
+            .or(previous_thread_id);
         let threads = self
             .agents_overview
             .threads
@@ -307,6 +308,17 @@ impl App {
             .collect();
         let view = self.agents_overview_view(threads, selected_thread_id);
         self.agents_overview.visible_thread_ids = view.thread_ids();
+        let next_thread_id = view
+            .selected_index()
+            .and_then(|index| self.agents_overview.visible_thread_ids.get(index).copied());
+        if (previous_thread_id.is_none() || previous_thread_id != next_thread_id)
+            && self
+                .chat_widget
+                .selected_index_for_active_view(AGENTS_OVERVIEW_VIEW_ID)
+                .is_some()
+        {
+            self.cancel_pending_key_chord();
+        }
         if let Ok(mut state) = self.agents_overview.view_state.lock()
             && state
                 .rename_target
@@ -690,25 +702,6 @@ impl App {
                     }
                 }
             };
-            if !previous_running_thread_ids.is_empty() {
-                for side_thread_id in Vec::from_iter(self.side_threads.keys().copied()) {
-                    let discarded = match startup_draft.as_deref_mut() {
-                        Some(draft) => {
-                            draft
-                                .run_until(
-                                    tui,
-                                    self.discard_side_thread(app_server, side_thread_id),
-                                )
-                                .await?
-                        }
-                        None => self.discard_side_thread(app_server, side_thread_id).await,
-                    };
-                    if !discarded {
-                        let _ = app_server.thread_unsubscribe(root_thread_id).await;
-                        return Ok(AppRunControl::Continue);
-                    }
-                }
-            }
             for (thread_id, requests) in previous_pending_requests {
                 self.agents_overview
                     .dispatched_requests
@@ -849,6 +842,7 @@ impl App {
             for thread_id in previous_thread_ids {
                 if previous_running_thread_ids.is_empty()
                     && thread_id != root_thread_id
+                    && !self.side_threads.contains_key(&thread_id)
                     && self.voice_owner_thread_id() != Some(thread_id)
                     && Some(thread_id) != previous_displayed_thread_id
                     && !self.agents_overview.blank_sessions.contains_key(&thread_id)
@@ -868,7 +862,7 @@ impl App {
             || (self.thread_unavailable(root_thread_id)
                 && !self.chat_widget.is_external_writer_view())
         {
-            self.select_agent_thread_and_discard_side(tui, app_server, root_thread_id)
+            self.select_agent_thread(tui, app_server, root_thread_id)
                 .await?;
         }
         let read_only = self.chat_widget.is_external_writer_view();

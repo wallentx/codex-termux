@@ -156,6 +156,7 @@ pub struct McpConfig {
     pub permission_profile: PermissionProfile,
     /// Configuration layers used to evaluate Apps tool policy and reviewer selection.
     pub config_layer_stack: ConfigLayerStack,
+    pub plugins: codex_config::types::PluginsConfigToml,
     /// Default reviewer used when an Apps tool has no reviewer override.
     pub approvals_reviewer: ApprovalsReviewer,
     /// Working directories for the exact environment handles used by this runtime.
@@ -164,6 +165,9 @@ pub struct McpConfig {
     pub environment_use_mxc: HashMap<String, bool>,
     /// Explicit server permissions; unresolved or unavailable servers have no entry.
     pub server_permission_profiles: HashMap<String, PermissionProfile>,
+    /// Host-supplied re-exec binary. Probe its sandbox capability before advertising it.
+    /// Never infer this from PATH or an MCP server's configuration.
+    pub codex_self_exe: Option<PathBuf>,
     /// Optional path to `codex-linux-sandbox` for sandboxed MCP tool execution.
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     /// Whether to use legacy Landlock behavior in the MCP sandbox state.

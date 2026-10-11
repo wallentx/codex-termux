@@ -46,12 +46,16 @@ use tonic::transport::Server;
 mod admission_tests;
 #[path = "support/host.rs"]
 mod host;
+#[path = "grpc/image_cancellation_tests.rs"]
+mod image_cancellation_tests;
 #[path = "support/large_tool_delegate.rs"]
 mod large_tool_delegate;
 #[path = "grpc/network_policy_tests.rs"]
 mod network_policy_tests;
 #[path = "support/recording_delegate.rs"]
 mod recording_delegate;
+#[path = "grpc/session_recovery_tests.rs"]
+mod session_recovery_tests;
 
 use host::HostHarness;
 use large_tool_delegate::LargeToolResultDelegate;
