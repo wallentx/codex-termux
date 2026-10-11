@@ -10,7 +10,7 @@ machines that should expose app-server with `remote_control` enabled.
 
 ## Platform support
 
-The daemon supports Linux, macOS, and Windows using platform-specific process
+The daemon supports Linux, macOS, Windows, and Android (Termux) using platform-specific process
 and file-locking primitives. Windows startup requires a non-elevated terminal
 whose host permits detached child processes.
 
@@ -22,6 +22,12 @@ shorter `CODEX_HOME` to share the daemon; discovery does not trust a mutable ali
 Shared clients use the environment inherited when the daemon started. Opening a
 new terminal or clearing variables there does not clear the running daemon's
 environment; per-client environment isolation is not provided.
+
+Android packages use the native `rg` on that PATH (install it with
+`pkg install ripgrep`) rather than shipping a second copy. The Android package
+contains `codex-package.json`, `bin/codex`, and `bin/codex-code-mode-host`;
+the daemon recognizes the `aarch64-linux-android` package target.
+
 An invocation that sets `CODEX_EXEC_SERVER_URL` skips implicit daemon attachment
 so its executor selection is preserved. If an implicitly discovered daemon cannot
 initialize the connection, the TUI starts an embedded server instead. Explicit
