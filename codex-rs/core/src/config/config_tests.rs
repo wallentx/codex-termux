@@ -255,9 +255,9 @@ async fn load_config_applies_optional_mcp_startup_grace() -> std::io::Result<()>
 async fn load_config_resolves_thread_unload_delay() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     for (toml, seconds) in [
-        ("", 60),
+        ("", 1800),
         ("thread_unload_delay_secs = 0", 0),
-        ("thread_unload_delay_secs = 1800", 1800),
+        ("thread_unload_delay_secs = 60", 60),
     ] {
         let config = Config::load_from_base_config_with_overrides(
             toml::from_str(toml)?,
@@ -1913,6 +1913,7 @@ async fn network_proxy_feature_matrix_preserves_sandbox_network_semantics() -> s
                 }),
                 windows: Some(WindowsToml {
                     sandbox: Some(WindowsSandboxModeToml::Elevated),
+                    ..Default::default()
                 }),
                 features,
                 ..Default::default()
@@ -3682,6 +3683,7 @@ async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_se
             }),
             windows: Some(WindowsToml {
                 sandbox: Some(WindowsSandboxModeToml::Elevated),
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -3746,6 +3748,7 @@ async fn implicit_builtin_workspace_profile_preserves_add_dir_metadata_carveouts
             )])),
             windows: Some(WindowsToml {
                 sandbox: Some(WindowsSandboxModeToml::Elevated),
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -5608,7 +5611,6 @@ async fn rebuild_with_session_layers_refreshes_requirements() -> std::io::Result
         thread_config.cwd.to_path_buf(),
         &refreshed_layer_stack,
         codex_home.abs(),
-        /*default_zsh_path*/ None,
     )
     .await?;
 
@@ -5724,7 +5726,6 @@ async fn rebuild_with_session_layers_refreshes_plugin_derived_mcp_config() -> an
         thread_config.cwd.to_path_buf(),
         &refreshed_layer_stack,
         codex_home.abs(),
-        /*default_zsh_path*/ None,
     )
     .await?;
     let plugins_manager =
@@ -6030,25 +6031,6 @@ async fn add_dir_override_extends_workspace_writable_roots() -> std::io::Result<
             other => panic!("expected workspace-write policy, got {other:?}"),
         }
     }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn default_zsh_path_sets_runtime_zsh_path() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let default_zsh_path = codex_home.path().join("packaged-zsh");
-
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
-        ConfigOverrides {
-            default_zsh_path: Some(default_zsh_path.abs()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await?;
-    assert_eq!(config.zsh_path, Some(default_zsh_path));
 
     Ok(())
 }
@@ -11112,12 +11094,22 @@ async fn explicit_sandbox_mode_falls_back_when_disallowed_by_requirements() -> s
     Ok(())
 }
 
+#[test_case::test_case(false; "optional")]
+#[test_case::test_case(true; "required")]
 #[tokio::test]
-async fn local_mxc_preference_preserves_configured_backend() -> anyhow::Result<()> {
+async fn local_mxc_preference_preserves_configured_backend(
+    require_mxc: bool,
+) -> anyhow::Result<()> {
     use codex_sandboxing::SandboxType::WindowsMxc;
     use codex_sandboxing::SandboxType::WindowsRestrictedToken as RestrictedToken;
 
     let codex_home = TempDir::new()?;
+    let permission_selection = EffectivePermissionSelection {
+        profiles: None,
+        selected_profile_id: None,
+        persisted_profile_id_was_provided: false,
+        requirements_force_profile_selection: false,
+    };
     for (prefer, resolved_preference, binding, allow_mxc, mode, expected) in [
         (true, true, true, true, "unelevated", WindowsMxc),
         (true, false, true, true, "unelevated", RestrictedToken),
@@ -11134,32 +11126,63 @@ async fn local_mxc_preference_preserves_configured_backend() -> anyhow::Result<(
             codex_home.path().join(CONFIG_TOML_FILE),
             toml::to_string(&cfg)?,
         )?;
-        let mut config = ConfigBuilder::without_managed_config_for_tests()
+        let loaded = ConfigBuilder::without_managed_config_for_tests()
             .codex_home(codex_home.path().to_path_buf())
             .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .cloud_config_bundle(
                 CloudConfigBundleFixture::loader_with_enterprise_requirement(format!(
-                    "[windows]\nallow_mxc = {allow_mxc}\n"
+                    "[windows]\nallow_mxc = {allow_mxc}\nrequire_mxc = {require_mxc}\n"
                 )),
             )
             .build()
             .await?;
+        let mut config = Config::rebuild_with_session_layers(
+            &loaded.config_layer_stack,
+            loaded.cwd.to_path_buf(),
+            &loaded.config_layer_stack,
+            loaded.codex_home.clone(),
+        )
+        .await?;
+        let mut caller_config = config.clone();
+        caller_config.config_layer_stack = ConfigLayerStack::default();
+        caller_config.prefer_mxc = false;
+        caller_config.permissions.windows_sandbox_type = RestrictedToken;
+        assert_eq!(
+            caller_config
+                .validate_windows_mxc_requirement_from(&config)
+                .is_err(),
+            cfg!(windows) && require_mxc,
+        );
+        let result = config.validate_windows_mxc_requirement();
+        caller_config.config_layer_stack = config.config_layer_stack.clone();
+        assert_eq!(
+            config
+                .resolve_runtime_refresh(&caller_config, RuntimeConfigRefresh::Mcp)
+                .is_err(),
+            result.is_err(),
+        );
+        if cfg!(windows)
+            && require_mxc
+            && mode != "mxc"
+            && !(prefer && binding && allow_mxc && codex_sandboxing::windows_mxc_available())
+        {
+            let error = result.expect_err("MXC must already be selected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("windows.require_mxc = true"));
+            continue;
+        }
+        result?;
         assert_eq!(
             config_allows_mxc(
                 &config
                     .config_layer_stack
                     .requirements()
                     .windows_sandbox_mode,
-                &EffectivePermissionSelection {
-                    profiles: None,
-                    selected_profile_id: None,
-                    persisted_profile_id_was_provided: false,
-                    requirements_force_profile_selection: false,
-                },
+                &permission_selection,
                 /*profiles_are_active*/ false,
                 /*permission_profile*/ None,
                 /*network_requirements*/ None,
-                cfg.features.as_ref(),
+                &cfg,
                 /*enable_network_proxy*/ true,
             )?,
             binding && allow_mxc,
@@ -11185,6 +11208,36 @@ async fn local_mxc_preference_preserves_configured_backend() -> anyhow::Result<(
             ),
             "prefer={prefer}, resolved={resolved_preference}, binding={binding}, mode={mode}"
         );
+    }
+    for sandbox in ["unelevated", "mxc"] {
+        let cfg: ConfigToml = toml::from_str(&format!(
+            "[windows]\nsandbox = {sandbox:?}\nallow_mxc = false\n[features]\nprefer_mxc = true\n"
+        ))?;
+        assert!(!config_allows_mxc(
+            &ConfigRequirements::default().windows_sandbox_mode,
+            &permission_selection,
+            /*profiles_are_active*/ false,
+            /*permission_profile*/ None,
+            /*network_requirements*/ None,
+            &cfg,
+            /*enable_network_proxy*/ false,
+        )?);
+        let result = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await;
+        if sandbox == "mxc" {
+            assert_eq!(
+                result
+                    .expect_err("explicit MXC must respect the opt-out")
+                    .to_string(),
+                "windows.sandbox = \"mxc\" is not allowed when windows.allow_mxc = false",
+            );
+        } else {
+            assert!(!result?.prefer_mxc);
+        }
     }
     Ok(())
 }
@@ -11601,7 +11654,6 @@ async fn feature_requirements_can_still_disable_unified_exec() -> std::io::Resul
 [features]
 unified_exec = false
 shell_tool = true
-unified_exec_zsh_fork = false
 use_xaa = false
 "#,
             ),
@@ -11611,7 +11663,6 @@ use_xaa = false
 
     assert!(!config.features.enabled(Feature::UnifiedExec));
     assert!(config.features.enabled(Feature::ShellTool));
-    assert!(!config.features.enabled(Feature::UnifiedExecZshFork));
     assert!(!config.features.enabled(Feature::UseXaa));
     assert!(
         !config
@@ -11626,13 +11677,8 @@ use_xaa = false
         .features
         .enable(Feature::UnifiedExec)
         .expect("managed feature mutations should normalize successfully");
-    config
-        .features
-        .enable(Feature::UnifiedExecZshFork)
-        .expect("managed feature updates should preserve administrator policy");
     assert!(!config.features.enabled(Feature::UnifiedExec));
     assert!(config.features.enabled(Feature::ShellTool));
-    assert!(!config.features.enabled(Feature::UnifiedExecZshFork));
 
     Ok(())
 }
@@ -11796,6 +11842,8 @@ shell_tool = false
 
 #[test_case::test_case(Feature::Personality; "personality")]
 #[test_case::test_case(Feature::GuardianThreadContext; "guardian thread context")]
+#[test_case::test_case(Feature::ShellZshFork; "shell zsh fork")]
+#[test_case::test_case(Feature::UnifiedExecZshFork; "unified exec zsh fork")]
 fn retired_feature_requirements_do_not_pin_configured_values(
     feature: Feature,
 ) -> std::io::Result<()> {
@@ -11842,7 +11890,7 @@ fn retired_feature_requirements_do_not_pin_configured_values(
             (
                 Features::with_defaults().enabled(feature),
                 false,
-                usize::from(feature == Feature::GuardianThreadContext),
+                usize::from(feature != Feature::Personality),
             ),
         );
     }
@@ -11874,6 +11922,7 @@ async fn prompt_instruction_blocks_can_be_disabled_from_config() -> std::io::Res
 include_apps_instructions = false
 include_collaboration_mode_instructions = false
 include_environment_context = false
+include_environment_context_time = false
 
 [skills]
 include_instructions = false
@@ -11891,6 +11940,7 @@ include_instructions = false
     assert!(!config.include_collaboration_mode_instructions);
     assert!(!config.include_skill_instructions);
     assert!(!config.include_environment_context);
+    assert!(!config.include_environment_context_time);
     Ok(())
 }
 
@@ -12093,6 +12143,7 @@ usage_hint_text = "Custom delegation guidance."
 root_agent_usage_hint_text = "Root guidance."
 subagent_usage_hint_text = "Subagent guidance."
 subagent_developer_instructions = "  Delegate carefully.  "
+preserve_fork_prefix = true
 multi_agent_mode_hint_text = "Custom mode guidance."
 tool_namespace = "agents"
 hide_spawn_agent_metadata = true
@@ -12153,6 +12204,7 @@ max_concurrent_threads_per_session = 9
         Some("agents")
     );
     assert!(config.multi_agent_v2.hide_spawn_agent_metadata);
+    assert!(config.multi_agent_v2.preserve_fork_prefix);
     assert!(!config.multi_agent_v2.expose_spawn_agent_model_overrides);
     assert!(!config.multi_agent_v2.wait_agent_enabled);
     assert!(config.multi_agent_v2.disable_direct_message);

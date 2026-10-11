@@ -14,6 +14,9 @@ pub use compaction_resume_metadata::resume_multi_agent_version;
 mod compaction_checkpoint;
 pub use compaction_checkpoint::CompactionCheckpoint;
 
+mod initialization;
+pub use initialization::HistoryInitialization;
+
 use std::borrow::Borrow;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -82,7 +85,7 @@ pub struct CodexHarnessMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_source: Option<RetainedSource>,
 
-    /// Whether a developer message was supplied by an app-server client.
+    /// Whether a developer message was supplied by a client or a client requested tool-output retention.
     #[serde(default)]
     pub client_authored: bool,
 

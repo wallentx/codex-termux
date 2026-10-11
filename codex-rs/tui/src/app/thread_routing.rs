@@ -828,7 +828,7 @@ impl App {
                     let enabled = self.chat_widget.daybreak_enabled
                         && !self.chat_widget.side_conversation_active()
                         && !self.side_threads.contains_key(&thread_id);
-                    let eligible_account = self.chat_widget.daybreak_turn_eligible(enabled);
+                    let eligible_account = self.chat_widget.daybreak_account_eligible();
                     let cyber_access_program = match crate::daybreak::program_for_turn(
                         &self.chat_widget.model_catalog().models,
                         model,
@@ -2175,12 +2175,9 @@ impl App {
             self.mark_agent_picker_thread_closed(closed_thread_id);
             if self.side_threads.contains_key(&closed_thread_id) {
                 self.discard_closed_side_thread(closed_thread_id).await;
-                self.select_agent_thread(tui, app_server, primary_thread_id)
-                    .await?;
-            } else {
-                self.select_agent_thread_and_discard_side(tui, app_server, primary_thread_id)
-                    .await?;
             }
+            self.select_agent_thread(tui, app_server, primary_thread_id)
+                .await?;
             if self.active_thread_id == Some(primary_thread_id) {
                 self.chat_widget.add_info_message(
                     format!(

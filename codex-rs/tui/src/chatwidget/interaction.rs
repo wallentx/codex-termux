@@ -15,6 +15,10 @@ pub(crate) enum KeyEventAction {
 }
 
 impl ChatWidget {
+    pub(crate) fn clear_composer_selection(&mut self) {
+        self.bottom_pane.clear_composer_selection();
+    }
+
     pub(crate) fn end_composer_drag(&mut self) {
         self.bottom_pane.end_composer_drag();
     }
@@ -55,6 +59,10 @@ impl ChatWidget {
 
     pub(crate) fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
         self.bottom_pane.keymap_contexts()
+    }
+
+    pub(crate) fn take_key_chord_reset(&mut self) -> bool {
+        std::mem::take(&mut self.bottom_pane.key_chord_reset_requested)
     }
 
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) -> KeyEventAction {

@@ -238,6 +238,7 @@ mod new_session;
 mod turn_tips;
 pub(crate) use new_session::has_launch_setting;
 mod clipboard;
+mod footer_selection;
 mod native_history;
 mod owned_transcript;
 mod pending_interactive_replay;
@@ -855,6 +856,9 @@ impl App {
         self.finish_clipboard(tui, &event);
         let event = self.finish_right_click_paste(tui, event);
         let idle_draw = matches!(event, TuiEvent::Draw);
+        if self.handle_rendered_selection_event(tui, &event)? {
+            return Ok(AppRunControl::Continue);
+        }
         if matches!(&event, TuiEvent::Key(_))
             && self.handle_composer_copy_event(tui, &event, |tui, text| {
                 tui.copy_transcript_selection(text, crate::clipboard_copy::CopyFormat::PlainText)
@@ -903,7 +907,9 @@ impl App {
             self.handle_draw_pre_render(tui, screen_size)?;
         }
 
-        if matches!(&event, TuiEvent::Paste(_) | TuiEvent::FocusLost) {
+        if matches!(&event, TuiEvent::Paste(_) | TuiEvent::FocusLost)
+            || matches!(&event, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+        {
             self.cancel_pending_key_chord();
         }
 

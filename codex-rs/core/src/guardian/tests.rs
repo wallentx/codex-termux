@@ -648,16 +648,6 @@ async fn approval_permissions_use_the_owning_environment() -> anyhow::Result<()>
             sandbox_permissions: SandboxPermissions::UseDefault,
             additional_permissions: None,
         },
-        #[cfg(unix)]
-        GuardianApprovalRequest::Execve {
-            id: "shell".to_string(),
-            environment_id: "secondary".to_string(),
-            source: codex_protocol::approvals::GuardianCommandSource::UnifiedExec,
-            program: "cat".to_string(),
-            argv: Vec::new(),
-            cwd,
-            additional_permissions: None,
-        },
     ];
     let mut missing_context = context.clone();
     missing_context.environments.environments.truncate(1);
@@ -1526,6 +1516,10 @@ fn guardian_write_stdin_preserves_input_and_foreign_cwd(
             guardian_request_turn_id(&action, "current-turn"),
         ),
         (Some("terminal-open"), "current-turn"),
+    );
+    assert_eq!(
+        ReviewAction::from(action).tool_call_id.as_deref(),
+        Some("terminal-write")
     );
     Ok(())
 }
@@ -3813,7 +3807,7 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         let refreshed_user_message = last_user_message_text_from_body(&refreshed_request_body);
         assert!(refreshed_user_message.contains("Now inspect whether pushing is safe."));
         assert!(refreshed_user_message.contains(&second_action));
-        let feedback = codex_feedback::guardian_review_failures(&[session.thread_id()])
+        let feedback = codex_feedback::guardian_review_failures(session.state_db().as_deref(), &[session.thread_id()]).await
             .attachment
             .expect("failed ephemeral review survives cleanup and subsequent allowed reviews");
         let record: serde_json::Value = serde_json::from_slice(&feedback.buffer)?;
