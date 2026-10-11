@@ -151,8 +151,9 @@ def merge_updater_additions(text, *, path=None):
 
 
 def merge_dependency_additions(text, *, path):
-    """Combine disjoint codex-utils dependencies added at the same position."""
-    if path.startswith("codex-rs/") and path.endswith("/Cargo.toml"):
+    """Preserve reviewed dependency additions without restoring upstream removals."""
+    manifest = path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
+    if manifest:
         addition = re.compile(r"codex-utils-[a-z0-9-]+ = \{ workspace = true \}\n")
     elif path == "codex-rs/Cargo.lock":
         addition = re.compile(r' "codex-utils-[a-z0-9-]+",\n')
@@ -162,6 +163,21 @@ def merge_dependency_additions(text, *, path):
 
     def resolve(match):
         ours, base, theirs = match.groups()
+        android_openssl = (
+            "# Build OpenSSL from source for Android builds.\n"
+            "[target.aarch64-linux-android.dependencies]\n"
+            'openssl-sys = { workspace = true, features = ["vendored"] }\n\n'
+        )
+        # Git can group our standalone target section with a neighboring
+        # section that upstream deleted. Retain only the downstream insertion.
+        if (
+            manifest
+            and base
+            and not ours
+            and android_openssl not in base
+            and theirs in (android_openssl + base, base + android_openssl)
+        ):
+            return android_openssl
         ours_lines = ours.splitlines(keepends=True)
         theirs_lines = theirs.splitlines(keepends=True)
         lines = ours_lines + theirs_lines

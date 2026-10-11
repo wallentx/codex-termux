@@ -512,6 +512,42 @@ class UpdaterAdaptationTests(unittest.TestCase):
 
 
 class DependencyAdditionTests(unittest.TestCase):
+    def test_android_openssl_survives_deletion_of_a_neighboring_section(self):
+        path = "codex-rs/core/Cargo.toml"
+        base = (
+            "[target.'cfg(unix)'.dependencies]\n"
+            "codex-shell-escalation = { workspace = true }\n\n"
+        )
+        android = (
+            "# Build OpenSSL from source for Android builds.\n"
+            "[target.aarch64-linux-android.dependencies]\n"
+            'openssl-sys = { workspace = true, features = ["vendored"] }\n\n'
+        )
+        for target in (android + base, base + android):
+            with self.subTest(target=target):
+                conflict = (
+                    f"<<<<<<< upstream\n||||||| baseline\n{base}"
+                    f"=======\n{target}>>>>>>> target\n"
+                )
+                self.assertEqual(
+                    module.merge_dependency_additions(conflict, path=path), android
+                )
+                for unsafe in (
+                    conflict.replace(
+                        "<<<<<<< upstream\n", "<<<<<<< upstream\nchanged\n"
+                    ),
+                    conflict.replace(target, target + "another-edit\n"),
+                    conflict.replace('features = ["vendored"]', 'features = ["other"]'),
+                ):
+                    self.assertEqual(
+                        module.merge_dependency_additions(unsafe, path=path), unsafe
+                    )
+                for wrong_path in ("codex-rs/Cargo.lock", "docs/Cargo.toml"):
+                    self.assertEqual(
+                        module.merge_dependency_additions(conflict, path=wrong_path),
+                        conflict,
+                    )
+
     def test_only_disjoint_codex_utils_insertions_are_combined(self):
         for path, upstream, target in (
             (
