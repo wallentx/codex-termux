@@ -1,0 +1,16 @@
+{
+  "upstream_repo": "openai/codex",
+  "upstream_tag": "rust-v0.163.0-alpha.9",
+  "upstream_name": "0.163.0-alpha.9",
+  "upstream_html_url": "https://github.com/openai/codex/releases/tag/rust-v0.163.0-alpha.9",
+  "upstream_target": "main",
+  "upstream_release_id": "411848624",
+  "upstream_prerelease": true,
+  "release_train": "0.163.0",
+  "release_branch": "release/0.163.0",
+  "work_branch": "upstream/rust-v0.163.0",
+  "patch_branch": "wallentx/termux-target",
+  "patch_source_sha": "84ca63bd032e8226cb5358e7ea28c4e62810e1ca",
+  "patch_upstream_ref": "refs/tags/rust-v0.163.0-alpha.5",
+  "termux_tag": "rust-v0.163.0-alpha.9-termux"
+}
