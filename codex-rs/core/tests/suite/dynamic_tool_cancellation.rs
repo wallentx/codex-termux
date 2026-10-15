@@ -61,29 +61,33 @@ async fn interrupt_completes_cancelled_dynamic_call(hook: Option<HookEventName>)
     let outcomes = Arc::new(ToolOutcomes::default());
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.tool_lifecycle_contributor(outcomes.clone());
-    let test =
-        test_codex()
-            .with_extensions(Arc::new(extensions.build()))
-            .with_pre_build_hook(move |home| {
-                if let Some(hook) = hook {
-                    let name = match hook {
-                        HookEventName::PreToolUse => "PreToolUse",
-                        HookEventName::PostToolUse => "PostToolUse",
-                        _ => unreachable!(),
-                    };
-                    std::fs::write(home.join("hooks.json"), json!({"hooks": {
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_pre_build_hook(move |home| {
+            if let Some(hook) = hook {
+                let name = match hook {
+                    HookEventName::PreToolUse => "PreToolUse",
+                    HookEventName::PostToolUse => "PostToolUse",
+                    _ => unreachable!(),
+                };
+                std::fs::write(home.join("hooks.json"), json!({"hooks": {
                     name: [{"matcher": "^gate$", "hooks": [{"type": "command",
-                        "command": "python3 -c 'import threading; threading.Event().wait()'"}]}]
+                        "command": r#"python3 -c "import threading; threading.Event().wait()""#}]}]
                 }}).to_string()).expect("write blocking hook fixture");
-                }
-            })
-            .with_config(move |config| {
-                if hook.is_some() {
-                    trust_discovered_hooks(config);
-                }
-            })
-            .build_with_auto_env(&server)
-            .await?;
+            }
+        })
+        .with_config(move |config| {
+            if hook.is_some() {
+                trust_discovered_hooks(config);
+            }
+        });
+    // Command hooks execute on the host. Keep their blocking fixture in a local
+    // environment so a remote Windows shell is not launched on a Linux host.
+    let test = if hook.is_some() {
+        builder.build(&server).await?
+    } else {
+        builder.build_with_auto_env(&server).await?
+    };
     let thread = test
         .thread_manager
         .start_thread(StartThreadOptions {

@@ -1,4 +1,4 @@
-//! Service-computed permissions and denials. Codex exposes these without evaluating ACLs.
+//! Backend-computed permissions and denials exposed by the board tools.
 
 use codex_protocol::error::CodexErr;
 use codex_tools::FunctionCallError;
@@ -25,7 +25,7 @@ pub struct ChannelPermissions {
     pub edit_metadata: bool,
 }
 
-/// A service denial retained through the board's existing error interface.
+/// A backend denial retained through the board's existing error interface.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "code", rename = "permission_denied")]
 pub struct PermissionDenied {

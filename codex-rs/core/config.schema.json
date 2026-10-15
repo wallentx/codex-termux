@@ -353,6 +353,23 @@
       ],
       "type": "string"
     },
+    "AsyncCompactionConfigToml": {
+      "additionalProperties": false,
+      "description": "Background compaction settings. A threshold alone does not enable the feature.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "model_async_compact_threshold_percent": {
+          "description": "Percentage of the model's full context window that starts background compaction. Defaults to 65; valid values are 1–100, including when disabled.",
+          "format": "uint8",
+          "maximum": 100.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "AuthCredentialsStoreMode": {
       "description": "Determine where Codex should store CLI auth credentials.",
       "oneOf": [
@@ -767,6 +784,9 @@
                 }
               ]
             },
+            "async_compaction": {
+              "$ref": "#/definitions/FeatureToml_for_AsyncCompactionConfigToml"
+            },
             "auth_elicitation": {
               "type": "boolean"
             },
@@ -802,6 +822,9 @@
             },
             "code_mode_host": {
               "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
+            },
+            "code_mode_host_grpc": {
+              "type": "boolean"
             },
             "code_mode_interrupt": {
               "type": "boolean"
@@ -1049,6 +1072,9 @@
             "omit_app_server_notification_media": {
               "type": "boolean"
             },
+            "output_token_replay": {
+              "type": "boolean"
+            },
             "personality": {
               "type": "boolean"
             },
@@ -1116,6 +1142,9 @@
               "type": "boolean"
             },
             "retain_client_developer_messages": {
+              "type": "boolean"
+            },
+            "retain_client_tool_outputs": {
               "type": "boolean"
             },
             "rollout_budget": {
@@ -1571,6 +1600,16 @@
         }
       },
       "type": "object"
+    },
+    "FeatureToml_for_AsyncCompactionConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/AsyncCompactionConfigToml"
+        }
+      ]
     },
     "FeatureToml_for_CodeModeConfigToml": {
       "anyOf": [
@@ -2906,6 +2945,10 @@
         },
         "disable_direct_message": {
           "description": "Disable the model's direct-message tools; spawning and automatic child results remain available.",
+          "type": "boolean"
+        },
+        "disable_native_tools": {
+          "description": "Hide native multi-agent tools while retaining the V2 runtime for host-provided tools.",
           "type": "boolean"
         },
         "enabled": {
@@ -4638,6 +4681,11 @@
           ],
           "default": "auto",
           "description": "Copy selected transcript or footer text when the mouse button is released. Defaults to `auto`: enabled except in direct terminals known to forward their native copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows). Unknown terminals, Ghostty without a recognized version, and tmux/Zellij default to copying."
+        },
+        "copy_on_select_clear_selection": {
+          "default": false,
+          "description": "Deselect transcript text after Copy on select confirms clipboard delivery. Defaults to `false` and has no effect when Copy on select is off.",
+          "type": "boolean"
         },
         "disable_paste_burst": {
           "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts. Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.",
@@ -7064,6 +7112,9 @@
             }
           ]
         },
+        "async_compaction": {
+          "$ref": "#/definitions/FeatureToml_for_AsyncCompactionConfigToml"
+        },
         "auth_elicitation": {
           "type": "boolean"
         },
@@ -7099,6 +7150,9 @@
         },
         "code_mode_host": {
           "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
+        },
+        "code_mode_host_grpc": {
+          "type": "boolean"
         },
         "code_mode_interrupt": {
           "type": "boolean"
@@ -7346,6 +7400,9 @@
         "omit_app_server_notification_media": {
           "type": "boolean"
         },
+        "output_token_replay": {
+          "type": "boolean"
+        },
         "personality": {
           "type": "boolean"
         },
@@ -7413,6 +7470,9 @@
           "type": "boolean"
         },
         "retain_client_developer_messages": {
+          "type": "boolean"
+        },
+        "retain_client_tool_outputs": {
           "type": "boolean"
         },
         "rollout_budget": {

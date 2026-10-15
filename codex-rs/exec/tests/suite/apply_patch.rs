@@ -4,6 +4,7 @@ use anyhow::Context;
 use assert_cmd::prelude::*;
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_exec_command_call_with_args;
 use core_test_support::responses::mount_sse_sequence;
@@ -91,6 +92,112 @@ async fn test_apply_patch_tool() -> anyhow::Result<()> {
     let final_path = tmp_path.join("test.md");
     let contents = std::fs::read_to_string(&final_path).expect("final file should be readable");
     assert_eq!(contents, "Final text\n");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn human_output_prints_unchanged_turn_diff_once() -> anyhow::Result<()> {
+    use core_test_support::skip_if_no_network;
+    use core_test_support::test_codex_exec::test_codex_exec;
+
+    skip_if_no_network!(Ok(()));
+
+    let test = test_codex_exec();
+    let run_dir = test.cwd_path();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(run_dir)
+        .assert()
+        .success();
+    fs::write(run_dir.join("probe.txt"), "value=1\n")?;
+    Command::new("git")
+        .args(["add", "probe.txt"])
+        .current_dir(run_dir)
+        .assert()
+        .success();
+    Command::new("git")
+        .args([
+            "-c",
+            "user.name=Reproducer",
+            "-c",
+            "user.email=reproducer@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ])
+        .current_dir(run_dir)
+        .assert()
+        .success();
+
+    // Replay the reported single edit, unrelated command, and final response.
+    let server = start_mock_server().await;
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_apply_patch_custom_tool_call(
+                    "patch",
+                    "*** Begin Patch\n*** Update File: probe.txt\n@@\n-value=1\n+value=2\n*** End Patch",
+                ),
+                ev_completed("response-1"),
+            ]),
+            sse(vec![
+                ev_exec_command_call_with_args(
+                    "command",
+                    &serde_json::json!({
+                        "cmd": "printf 'DIAG_CMD_OK\\n'",
+                        "shell": "/bin/sh",
+                        "login": false,
+                        "yield_time_ms": 10_000,
+                    }),
+                ),
+                ev_completed("response-2"),
+            ]),
+            sse(vec![
+                ev_assistant_message("message", "DIAG_DONE"),
+                ev_completed("response-3"),
+            ]),
+        ],
+    )
+    .await;
+    let result = test
+        .cmd_with_server(&server)
+        .args([
+            "--ephemeral",
+            "--color",
+            "never",
+            "-s",
+            "danger-full-access",
+            "-c",
+            "features.hooks=false",
+            "-c",
+            "features.shell_snapshot=false",
+            "-c",
+            "features.shell_snapshot_v2=false",
+            "Replace value=1 with value=2 once, print DIAG_CMD_OK, then finish with DIAG_DONE.",
+        ])
+        .assert()
+        .success()
+        .stdout("DIAG_DONE\n");
+    let stderr = String::from_utf8_lossy(&result.get_output().stderr);
+    assert_eq!(fs::read_to_string(run_dir.join("probe.txt"))?, "value=2\n");
+    assert_eq!(mock.requests().len(), 3);
+    assert_eq!(stderr.matches("patch: completed").count(), 1, "{stderr}");
+    assert_eq!(
+        stderr.lines().filter(|line| *line == "DIAG_CMD_OK").count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| *line == "diff --git a/probe.txt b/probe.txt")
+            .count(),
+        1,
+        "{stderr}"
+    );
     Ok(())
 }
 

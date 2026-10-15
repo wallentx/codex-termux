@@ -641,7 +641,7 @@ async fn managed_shutdown_records_interrupted_turn(outcome: &str) -> Result<()> 
         daemon_recovery::write_snapshot(&path, &snapshot)?;
     }
     let mut successor = spawn_server(home.path(), &socket)?;
-    if !matches!(outcome, "running" | "plan") {
+    if !matches!(outcome, "running" | "plan" | "read_only") {
         let mut client = connect_default_daemon_client(&socket).await?;
         timeout(DEFAULT_READ_TIMEOUT, async {
             loop {

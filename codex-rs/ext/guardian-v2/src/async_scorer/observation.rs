@@ -270,11 +270,20 @@ impl GuardianV2Extension {
         ) {
             Ok(compaction) => compaction,
             Err(error) => {
-                let (outcome, failure_reason) = if error == ParentCompactionError::RequiresSync {
-                    score_progress.invalidate(tool_call_index);
-                    ("skipped", None)
-                } else {
-                    ("failure", Some("parent_compaction_error"))
+                let (outcome, failure_reason) = match error {
+                    ParentCompactionError::RequiresSync => {
+                        score_progress.invalidate(tool_call_index);
+                        ("skipped", None)
+                    }
+                    ParentCompactionError::Serialization => {
+                        ("failure", Some("parent_compaction_serialization"))
+                    }
+                    ParentCompactionError::Oversized => {
+                        ("failure", Some("parent_compaction_oversized"))
+                    }
+                    ParentCompactionError::Unusable => {
+                        ("failure", Some("parent_compaction_unusable"))
+                    }
                 };
                 score_progress.fail_closed(sampled_at);
                 record_classification(

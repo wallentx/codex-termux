@@ -2438,6 +2438,7 @@ fn websocket_error_detail(err: &ApiError) -> String {
         }
         ApiError::Stream(message) => format!("handshake stream error: {message}"),
         ApiError::ContentFilter
+        | ApiError::ResponseIncomplete(_)
         | ApiError::ContextWindowExceeded
         | ApiError::QuotaExceeded
         | ApiError::UsageNotIncluded

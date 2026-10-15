@@ -104,6 +104,7 @@ pub(crate) use codex_app_server_client::legacy_core;
 
 pub(crate) use worktree_startup::ManagedTuiWorktree;
 
+mod activation_key_guard;
 mod additional_dirs;
 mod analytics;
 mod app;
@@ -128,6 +129,7 @@ mod clipboard_paste;
 mod clock_format;
 mod collaboration_modes;
 mod color;
+mod config_panel;
 mod config_update;
 mod copy_input_guard;
 pub(crate) mod custom_terminal;
@@ -162,9 +164,9 @@ mod hooks_rpc;
 mod ide_context;
 mod inline_visualization;
 pub(crate) mod insert_history;
-mod iterm_session_status;
 mod managed_worktree_tool_specs;
 mod managed_worktree_tools;
+mod terminal_program_status;
 pub use insert_history::insert_history_lines;
 mod footer_hint;
 mod key_hint;
@@ -1157,6 +1159,7 @@ async fn run_ratatui_app(
     embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
     managed_worktree: Option<ManagedTuiWorktree>,
     daemon_startup_warning: Option<String>,
+    managed_daemon: bool,
     launch_telemetry: daemon_telemetry::Launch<impl FnOnce(&AppServerTarget, bool)>,
     startup_draft: startup_draft::StartupDraft,
 ) -> color_eyre::Result<AppExitInfo> {
@@ -2109,6 +2112,7 @@ async fn run_ratatui_app(
         startup_bootstrap,
         startup_hooks_browser,
         daemon_startup_warning,
+        managed_daemon,
         startup_draft,
         managed_worktree,
         daemon_cli_executable,

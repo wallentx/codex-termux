@@ -95,8 +95,6 @@ async fn run_verification_rpc_scenario(scenario: RpcScenario) -> color_eyre::Res
         unreachable!()
     };
     let thread_id = ThreadId::from_string(&params.thread_id)?;
-    app.pending_app_server_requests
-        .note_server_request(&request);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?;
     let expected_params = serde_json::json!({ "title": "Approve deployment?", "description": "Deploy the reviewed change.", "challenge": "AQID" });
@@ -219,6 +217,12 @@ async fn run_verification_rpc_scenario(scenario: RpcScenario) -> color_eyre::Res
         crate::app_server_session::ThreadParamsMode::Embedded
     };
     let mut session = AppServerSession::new(client, mode);
+    let buffered = crate::app::app_server_requests::BufferedServerRequest::new(
+        request.clone(),
+        &session.request_handle(),
+    );
+    app.pending_app_server_requests
+        .note_buffered_request(&buffered);
     let approval = if scenario == RpcScenario::RemoteWorkspace {
         event_rx.recv().await.expect("approval event")
     } else {

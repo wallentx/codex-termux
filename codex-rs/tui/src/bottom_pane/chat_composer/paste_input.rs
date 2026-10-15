@@ -38,20 +38,45 @@ impl ChatComposer {
     /// Include accepted but unflushed keys without changing live paste detection.
     pub(crate) fn recovery_snapshot(&self) -> ComposerDraftSnapshot {
         let mut snapshot = self.draft_snapshot();
-        if let Some(pending) = self.draft.paste_burst.clone().flush_before_modified_input() {
-            let mut textarea = TextArea::new();
-            textarea.set_text_with_elements(&snapshot.text, &snapshot.text_elements);
-            textarea.insert_str_at(snapshot.cursor, &pending);
-            snapshot.text = textarea.text().to_owned();
-            snapshot.text_elements = textarea.text_elements();
+        let pending = self.draft.paste_burst.clone().flush_pending();
+        if matches!(pending, FlushResult::None) {
+            return snapshot;
         }
+        let mut textarea = TextArea::new();
+        textarea.set_text_with_elements(&snapshot.text, &snapshot.text_elements);
+        match pending {
+            FlushResult::Typed(ch) if self.draft.textarea.is_vim_replace_mode() => {
+                textarea.set_cursor(snapshot.cursor);
+                if let Some(selection) = self.draft.textarea.mouse_selection_range() {
+                    let offset = usize::from(self.draft.is_bash_mode);
+                    textarea.replace_range(
+                        selection.start + offset..selection.end + offset,
+                        &ch.to_string(),
+                    );
+                } else {
+                    textarea.replace_vim_text(&ch.to_string());
+                }
+            }
+            FlushResult::Typed(ch) => textarea.insert_str_at(snapshot.cursor, &ch.to_string()),
+            FlushResult::Paste(pasted) => textarea.insert_str_at(snapshot.cursor, &pasted),
+            FlushResult::None => {}
+        }
+        snapshot.text = textarea.text().to_owned();
+        snapshot.text_elements = textarea.text_elements();
         snapshot
     }
 
     /// Classify an explicit paste before integrating text shared with the buffered key path.
     pub fn handle_paste(&mut self, pasted: String) -> bool {
+        self.flush_pending_paste_burst();
         self.note_sparkle_paste(&pasted);
         self.apply_paste(pasted)
+    }
+
+    pub(crate) fn flush_pending_paste_burst(&mut self) {
+        if let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() {
+            self.apply_paste(pasted);
+        }
     }
 
     /// Enable or disable paste-burst handling.
@@ -76,9 +101,7 @@ impl ChatComposer {
         let was_disabled = self.draft.disable_paste_burst;
         self.draft.disable_paste_burst = disabled;
         if disabled && !was_disabled {
-            if let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() {
-                self.apply_paste(pasted);
-            }
+            self.flush_pending_paste_burst();
             self.draft.paste_burst.clear_after_explicit_paste();
         }
     }

@@ -22,19 +22,32 @@ use tempfile::TempDir;
 #[test]
 fn active_arg0_helper_dir_selects_only_the_first_session_alias_directory() -> anyhow::Result<()> {
     let home = TempDir::new()?;
-    let arg0_root = home.path().join("tmp/arg0");
-    let active = arg0_root.join("codex-arg0-active");
-    let paths = std::env::join_paths([
-        home.path().join("bin"),
-        arg0_root.clone(),
-        arg0_root.join("unrelated"),
-        active.clone(),
-        arg0_root.join("codex-arg0-parent"),
-    ])?;
-    assert_eq!(
-        active_arg0_helper_dir(home.path(), &paths),
-        Some(AbsolutePathBuf::from_absolute_path(active)?)
-    );
+    let platform_root = home
+        .path()
+        .join("tmp")
+        .join(format!("arg0-{}", std::env::consts::OS));
+    let legacy_root = home.path().join("tmp/arg0");
+    let foreign_os = if cfg!(windows) { "linux" } else { "windows" };
+    let foreign_alias = home
+        .path()
+        .join("tmp")
+        .join(format!("arg0-{foreign_os}"))
+        .join("codex-arg0-foreign");
+    for arg0_root in [&platform_root, &legacy_root] {
+        let active = arg0_root.join("codex-arg0-active");
+        let paths = std::env::join_paths([
+            home.path().join("bin"),
+            foreign_alias.clone(),
+            arg0_root.clone(),
+            arg0_root.join("unrelated"),
+            active.clone(),
+            arg0_root.join("codex-arg0-parent"),
+        ])?;
+        assert_eq!(
+            active_arg0_helper_dir(home.path(), &paths),
+            Some(AbsolutePathBuf::from_absolute_path(active)?)
+        );
+    }
     Ok(())
 }
 

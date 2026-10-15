@@ -4827,3 +4827,55 @@ prefix_rules = []
         Ok(())
     }
 }
+
+#[tokio::test]
+async fn async_compaction_config() {
+    use std::io::ErrorKind::InvalidInput;
+
+    for (settings, expected) in [
+        ("[features]\nasync_compaction = true", Ok((true, 65))),
+        ("[features]\nasync_compaction = false", Ok((false, 65))),
+        ("[features.async_compaction]", Ok((false, 65))),
+        (
+            "[features.async_compaction]\nenabled = true",
+            Ok((true, 65)),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 80",
+            Ok((false, 80)),
+        ),
+        (
+            "[features.async_compaction]\nenabled = false\nmodel_async_compact_threshold_percent = 80",
+            Ok((false, 80)),
+        ),
+        (
+            "[features.async_compaction]\nenabled = true\nmodel_async_compact_threshold_percent = 75",
+            Ok((true, 75)),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 0",
+            Err(InvalidInput),
+        ),
+        (
+            "[features.async_compaction]\nmodel_async_compact_threshold_percent = 101",
+            Err(InvalidInput),
+        ),
+    ] {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(CONFIG_TOML_FILE), settings).expect("write config");
+        let actual = ConfigBuilder::default()
+            .codex_home(tmp.path().to_path_buf())
+            .fallback_cwd(Some(tmp.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .build()
+            .await
+            .map(|config| {
+                (
+                    config.features.enabled(Feature::AsyncCompaction),
+                    config.async_compaction_threshold_percent,
+                )
+            })
+            .map_err(|error| error.kind());
+        assert_eq!(actual, expected, "{settings}");
+    }
+}
