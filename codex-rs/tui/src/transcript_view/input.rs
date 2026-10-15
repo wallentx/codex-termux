@@ -20,6 +20,7 @@ use super::*;
 
 pub(crate) enum ViewAction {
     Changed,
+    ExitSelectMode,
     Copy(String),
     CopyOnSelect(String),
     PrimarySelection(String),
@@ -96,6 +97,7 @@ impl TranscriptView {
                 clear_selection: self.copy_on_select_clear_selection,
             },
             ViewAction::Changed
+            | ViewAction::ExitSelectMode
             | ViewAction::PrimarySelection(_)
             | ViewAction::Copy(_)
             | ViewAction::CopyAndFollow(_)
@@ -159,6 +161,9 @@ impl TranscriptView {
         if self.copy_mode.is_some() {
             return true;
         }
+        if self.select_mode.is_some() {
+            return true;
+        }
         if self.selection.is_some() {
             return crate::text_selection::is_copy_key(key)
                 || code == KeyCode::Esc
@@ -192,6 +197,11 @@ impl TranscriptView {
         if let Some(action) = self.handle_copy_mode_key(key, cells) {
             return Some(action);
         }
+        if self.select_mode.is_some() {
+            return self
+                .handle_select_mode_key(key, cells)
+                .or(Some(ViewAction::Changed));
+        }
         if let Some(action) = self.handle_disclosure_key(key, cells) {
             return Some(action);
         }
@@ -221,6 +231,9 @@ impl TranscriptView {
         event: MouseEvent,
         cells: &[Arc<dyn HistoryCell>],
     ) -> Option<ViewAction> {
+        if self.select_mode.is_some() {
+            return self.handle_selection_mouse(event, cells);
+        }
         self.handle_mouse_with_mode(event, cells, MouseMode::Interactive)
     }
 

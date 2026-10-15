@@ -1,7 +1,8 @@
 //! Executes one prepared classifier request with the existing retry and streaming rules.
-//! Snapshot output returns immediately with a detached drain. Retained requests publish
-//! the same early result but keep ownership until completion to capture reusable output.
+//! Snapshot output returns immediately with a detached drain that retains cancellation.
+//! Retained requests publish the same early result but keep ownership through completion.
 //! Requests and retries stop when the account owner that started the classification changes.
+//! Dropped responses interrupt and drain before their transport can return to the pool.
 
 use super::CLASSIFICATION_TOKEN_USAGE_METRIC;
 use super::ConnectionPool;
@@ -9,6 +10,7 @@ use super::LunaSamplerConfig;
 use super::LunaSamplerError;
 use super::MAX_OUTPUT_BYTES;
 use super::connection_pool::RequestMode;
+use super::response::PendingResponse;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
 use codex_api::ResponsesApiRequest;
@@ -23,6 +25,8 @@ use codex_protocol::turn_input::CyberAccessProgram;
 use http::StatusCode;
 use serde_json::json;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -55,7 +59,7 @@ pub(super) struct RetainedCompletion {
 /// Snapshot admission owns supersession; retained admission owns the response through completion.
 pub(super) enum SamplingMode<'a> {
     Snapshot {
-        superseded: oneshot::Receiver<()>,
+        superseded: Pin<Box<dyn Future<Output = ()> + Send>>,
         scored: Arc<AtomicBool>,
     },
     Retained(&'a mut RetainedCompletion),
@@ -65,7 +69,7 @@ impl SamplingMode<'_> {
     async fn superseded(&mut self) {
         match self {
             Self::Snapshot { superseded, .. } => {
-                let _ = superseded.await;
+                superseded.await;
             }
             Self::Retained(_) => std::future::pending().await,
         }
@@ -316,7 +320,7 @@ impl SamplingExecution {
                 client_metadata.insert("parent_response_id".to_owned(), parent_response_id.clone());
             }
             self.request.client_metadata = Some(client_metadata);
-            let mut stream = match tokio::select! {
+            let stream = match tokio::select! {
                 biased;
                 _ = &mut owner_changed => return Err(account_changed_error()),
                 _ = mode.superseded() => return Err(LunaSamplerError::Superseded),
@@ -335,6 +339,7 @@ impl SamplingExecution {
                 }
             };
 
+            let mut response = PendingResponse::new(stream, lease, self.config.metrics.clone());
             let mut output = String::new();
             while let Some(event) = tokio::select! {
                 biased;
@@ -347,7 +352,7 @@ impl SamplingExecution {
                         Err(LunaSamplerError::Superseded)
                     };
                 }
-                event = stream.rx_event.recv() => event,
+                event = response.next() => event,
             } {
                 ensure_account_owner()?;
                 let event = match event {
@@ -391,21 +396,15 @@ impl SamplingExecution {
                             }
                         };
                         scored.store(true, Ordering::Relaxed);
-                        let mut remaining_events = stream.rx_event;
-                        let metrics = self.config.metrics.clone();
                         tokio::spawn(async move {
                             while let Some(event) = tokio::select! {
                                 biased;
                                 _ = &mut superseded => None,
-                                event = remaining_events.recv() => event,
+                                event = response.next() => event,
                             } {
                                 match event {
                                     Ok(ResponseEvent::Completed { token_usage, .. }) => {
-                                        record_token_usage(
-                                            metrics.as_deref(),
-                                            token_usage.as_ref(),
-                                        );
-                                        lease.reuse();
+                                        response.reuse(token_usage.as_ref()).await;
                                         break;
                                     }
                                     Err(_) => break,
@@ -430,8 +429,7 @@ impl SamplingExecution {
                         }
                     }
                     ResponseEvent::Completed { token_usage, .. } => {
-                        record_token_usage(self.config.metrics.as_deref(), token_usage.as_ref());
-                        lease.reuse();
+                        response.reuse(token_usage.as_ref()).await;
                         if !output.is_empty() {
                             return Ok(output);
                         }
@@ -453,7 +451,10 @@ impl SamplingExecution {
     }
 }
 
-fn record_token_usage(metrics: Option<&dyn ExtensionMetrics>, token_usage: Option<&TokenUsage>) {
+pub(super) fn record_token_usage(
+    metrics: Option<&dyn ExtensionMetrics>,
+    token_usage: Option<&TokenUsage>,
+) {
     let (Some(metrics), Some(token_usage)) = (metrics, token_usage) else {
         return;
     };

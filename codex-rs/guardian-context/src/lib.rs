@@ -72,6 +72,7 @@ pub use budget::SECTION_COST_METRIC;
 pub use budget::SectionCost;
 pub use budget::effective_input_token_limit;
 pub use budget::estimate_input_tokens;
+pub use budget::estimate_input_tokens_from_serialized_len;
 pub use cursor::TranscriptCursor;
 pub use cursor::TranscriptMode;
 pub use cursor::TranscriptSelection;

@@ -259,6 +259,20 @@ impl PreparedMcpCall {
         permission_profile
     }
 
+    /// Attach policy aliases and the server-host launcher, replacing stale authority.
+    /// Callers negotiate the state capability before requesting this metadata.
+    pub async fn augment_sandbox_metadata(
+        &self,
+        meta: &mut Option<JsonValue>,
+        state: crate::SandboxState,
+    ) -> Result<()> {
+        crate::sandbox_metadata::augment_metadata(
+            meta,
+            state,
+            self.sandbox_codex_executable().await,
+        )
+    }
+
     /// Full CLI path usable by a local stdio server. An HTTP endpoint (even on
     /// loopback) or remote executor does not establish a shared filesystem.
     /// Capability probes are cached process-wide by absolute executable path.

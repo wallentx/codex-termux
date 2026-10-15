@@ -1215,6 +1215,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 Some(program) => Some(program),
                 None if config.features.enabled(Feature::CliDaybreak) => {
                     daybreak::program_for_turn(
+                        &config.features,
                         &client,
                         &mut request_ids,
                         &session_configured.model,

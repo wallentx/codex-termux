@@ -142,7 +142,9 @@ pub(in crate::async_scorer) enum ProxyPrewarmLimit {
     StopAfter { ready_connections: usize },
 }
 
-async fn proxy_websocket_servers(servers: &[&responses::WebSocketTestServer]) -> Result<String> {
+pub(super) async fn proxy_websocket_servers(
+    servers: &[&responses::WebSocketTestServer],
+) -> Result<String> {
     proxy_websocket_servers_with_prewarm_limit(servers, ProxyPrewarmLimit::AllConnections).await
 }
 
@@ -230,7 +232,7 @@ pub(in crate::async_scorer) fn sampler_config(base_url: String) -> LunaSamplerCo
     }
 }
 
-async fn connect_sampler(config: LunaSamplerConfig) -> Result<LunaSampler> {
+pub(super) async fn connect_sampler(config: LunaSamplerConfig) -> Result<LunaSampler> {
     let sampler = LunaSampler::new(config);
     sampler.prewarm().await;
     Ok(sampler)
@@ -279,6 +281,7 @@ pub(in crate::async_scorer) fn sample_request(parent_turn_id: &str) -> LunaSampl
         reasoning_effort: ReasoningEffort::None,
         parent_turn_id: parent_turn_id.to_owned(),
         root_turn_id: None,
+        pending_score: None,
     }
 }
 
@@ -339,7 +342,7 @@ async fn classifier_preserves_api_key_cyber_program_policy() -> Result<()> {
 type RecordedMetric = (String, i64, Vec<(String, String)>);
 
 #[derive(Default)]
-struct RecordingMetrics(Mutex<Vec<RecordedMetric>>);
+pub(super) struct RecordingMetrics(pub(super) Mutex<Vec<RecordedMetric>>);
 
 impl ExtensionMetrics for RecordingMetrics {
     fn histogram_with_boundaries(
@@ -647,6 +650,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
             reasoning_effort: ReasoningEffort::None,
             parent_turn_id: "turn-1".to_owned(),
             root_turn_id: Some("turn-1".to_owned()),
+            pending_score: None,
         })
         .await?;
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -680,6 +684,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
             reasoning_effort: ReasoningEffort::Medium,
             parent_turn_id: "turn-2".to_owned(),
             root_turn_id: Some("root-2".to_owned()),
+            pending_score: None,
         })
         .await?;
 
@@ -875,6 +880,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
             reasoning_effort: ReasoningEffort::None,
             parent_turn_id: "turn-1".to_owned(),
             root_turn_id: Some("turn-1".to_owned()),
+            pending_score: None,
         }),
     )
     .await??;
@@ -1154,8 +1160,9 @@ async fn sampler_uses_http_with_a_fresh_identity_when_warm_connections_expire() 
         ev_assistant_message("response-1", "low"),
         ev_completed("response-1"),
     ];
-    let first = responses::start_websocket_server(vec![vec![response.clone()]]).await;
-    let second = responses::start_websocket_server(vec![vec![response.clone()]]).await;
+    // Keep the sockets open until the test expires their pooled connections.
+    let first = responses::start_websocket_server(vec![vec![response.clone(), Vec::new()]]).await;
+    let second = responses::start_websocket_server(vec![vec![response.clone(), Vec::new()]]).await;
     let http = responses::start_mock_server().await;
     let http_mock = responses::mount_sse_once(&http, responses::sse(response)).await;
     let sampler = connect_sampler(sampler_config(

@@ -6,6 +6,7 @@
 //! Oversized retained requests rebuild from fresh evidence before the model's hard limit.
 //! Each request owns its fork; failed or cancelled requests leave committed history intact.
 //! Host-only instruction delivery metadata is committed with its completed input messages.
+//! Expired classifications release their transport without committing partial history.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -25,6 +26,7 @@ use super::authorization::ScoreAuthorization;
 use super::sampler::LunaSampler;
 use super::sampler::LunaSamplerError;
 use super::sampler::LunaSamplingRequest;
+use super::score::PendingScore;
 use super::transcript::CollectedTranscript;
 
 const MAX_OUTSTANDING: usize = 16;
@@ -58,6 +60,7 @@ pub(super) struct ConversationRequest {
     pub(super) thread: Arc<CodexThread>,
     pub(super) ready: oneshot::Sender<Result<String, LunaSamplerError>>,
     pub(super) metrics: Option<Arc<dyn ExtensionMetrics>>,
+    pub(super) pending_score: PendingScore,
 }
 
 // Authorization covers model settings; local config changes replace the backend.
@@ -108,6 +111,7 @@ impl Reservation {
     pub(super) async fn run(self, request: ConversationRequest) {
         if self.generation.strong_count() == 0
             || !request.authorization.is_current(&request.thread).await
+            || request.pending_score.is_expired()
         {
             let _ = request.ready.send(Err(LunaSamplerError::Superseded));
             return;
@@ -171,7 +175,11 @@ impl Reservation {
         drop(request.evidence);
         let cursor = prepared.cursor;
         let pending_truncations = std::mem::take(&mut prepared.truncations);
-        let history = self.sampler.sample_retained(prepared, request.ready).await;
+        let history = tokio::select! {
+            biased;
+            () = request.pending_score.expired() => None,
+            history = self.sampler.sample_retained(prepared, request.ready) => history,
+        };
         if let Some(history) = history
             && self.generation.strong_count() > 0
             && request.authorization.is_current(&request.thread).await

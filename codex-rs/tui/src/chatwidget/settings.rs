@@ -260,6 +260,8 @@ impl ChatWidget {
         // Account-update notifications are the identity boundary. The visible account fields can
         // be identical across two accounts, so always invalidate account-scoped requests and data.
         self.model_popup_request_id = None;
+        let api_key_changed = self.status_account_display == Some(StatusAccountDisplay::ApiKey)
+            || status_account_display == Some(StatusAccountDisplay::ApiKey);
         self.invalidate_permission_discovery();
         self.permission_discovery = None;
         self.invalidate_connector_scope();
@@ -292,6 +294,9 @@ impl ChatWidget {
         self.status_account_display = status_account_display;
         self.plan_type = plan_type;
         self.has_chatgpt_account = has_chatgpt_account;
+        if api_key_changed {
+            self.refresh_account_scoped_models();
+        }
         self.set_daybreak_enabled(self.daybreak_enabled);
         self.has_codex_backend_auth = has_codex_backend_auth;
         self.bottom_pane

@@ -47,7 +47,7 @@ struct TestToolServer {
 
 const MEMO_URI: &str = "memo://codex/example-note";
 const MEMO_CONTENT: &str = "This is a sample MCP resource served by the rmcp test server.";
-const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
+const SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
 const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 const APP_ONLY_CWD_MARKER_FILE_ENV: &str = "MCP_TEST_APP_ONLY_CWD_MARKER_FILE";
 const DYNAMIC_SERVER_METADATA_ENV: &str = "MCP_TEST_DYNAMIC_SERVER_METADATA";
@@ -534,7 +534,7 @@ impl ServerHandler for TestToolServer {
             .enable_resources()
             .build();
         capabilities.experimental = Some(BTreeMap::from([(
-            SANDBOX_STATE_META_CAPABILITY.to_string(),
+            SANDBOX_STATE_CAPABILITY.to_string(),
             JsonObject::new(),
         )]));
 

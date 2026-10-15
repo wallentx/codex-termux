@@ -17,6 +17,7 @@ mod layout;
 mod mutations;
 mod prompt_header;
 mod search;
+mod select_mode;
 mod selection;
 mod snapshot;
 mod text;
@@ -38,6 +39,7 @@ use ratatui::widgets::Widget;
 
 use layout::LayoutCache;
 use search::Search;
+use select_mode::SelectMode;
 use selection::Selection;
 use snapshot::ViewSnapshot;
 use text::TextLayout;
@@ -126,6 +128,7 @@ pub(crate) struct TranscriptView {
     suppressed_prompt_header: Option<prompt_header::SuppressedHeader>,
     visible: Vec<VisibleRow>,
     selection: Option<Selection>,
+    select_mode: Option<SelectMode>,
     copy_mode: Option<copy_mode::CopyMode>,
     held_reading: Option<ViewSnapshot>,
     search: Search,
@@ -164,6 +167,7 @@ impl Default for TranscriptView {
             suppressed_prompt_header: None,
             visible: Vec::new(),
             selection: None,
+            select_mode: None,
             copy_mode: None,
             held_reading: None,
             search: Search::default(),
@@ -313,6 +317,7 @@ impl TranscriptView {
             self.unseen_activity = false;
         }
         self.render_selection(buf);
+        self.render_select_cursor(buf);
         if self.history == TranscriptHistoryState::LoadingBeginning && self.is_following() {
             self.scroll(current_cells, /*rows*/ 0);
         }
@@ -380,6 +385,7 @@ impl TranscriptView {
             return;
         }
         self.selection = None;
+        self.select_mode = None;
         self.copy_mode = None;
         self.release_live_reading();
         self.cache.clear();
@@ -397,7 +403,10 @@ impl TranscriptView {
     }
 
     pub(crate) fn has_active_interaction(&self) -> bool {
-        self.selection.is_some() || self.search.is_active() || self.is_activity_focused()
+        self.select_mode.is_some()
+            || self.selection.is_some()
+            || self.search.is_active()
+            || self.is_activity_focused()
     }
 
     pub(crate) fn is_detailed(&self) -> bool {
@@ -405,7 +414,7 @@ impl TranscriptView {
     }
 
     pub(crate) fn is_following(&self) -> bool {
-        self.selection.is_none() && self.position == Position::Latest
+        self.select_mode.is_none() && self.selection.is_none() && self.position == Position::Latest
     }
 
     /// Hold the current reading position until every older page has arrived.
@@ -426,6 +435,7 @@ impl TranscriptView {
         self.cancel_beginning();
         self.position = Position::Latest;
         self.selection = None;
+        self.select_mode = None;
         self.copy_mode = None;
         self.release_live_reading();
         self.unseen_activity = false;

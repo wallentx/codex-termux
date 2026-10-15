@@ -3,8 +3,10 @@
 
 mod connection_pool;
 mod execution;
+mod response;
 
 use super::request::PreparedRequest;
+use super::score::PendingScore;
 use connection_pool::ConnectionPool;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -92,6 +94,8 @@ pub struct LunaSamplingRequest {
     pub parent_turn_id: String,
     /// Trusted causal root of the owning turn, absent when unknown or ambiguous.
     pub root_turn_id: Option<String>,
+    /// Snapshot expiry remains active until its response finishes draining.
+    pub(super) pending_score: Option<PendingScore>,
 }
 
 /// Failures returned while connecting or sampling the Luna model.
@@ -112,7 +116,7 @@ pub enum LunaSamplerError {
     /// The response exceeded the bounded output limit.
     #[error("Luna response exceeded the output limit")]
     OutputTooLarge,
-    /// A newer classification replaced this request when the pool was full.
+    /// The classification expired, lost its owning generation, or was replaced at capacity.
     #[error("Luna request was superseded by a newer classification")]
     Superseded,
     /// The supplied parent checkpoint cannot be consumed by this Luna configuration.
@@ -271,6 +275,14 @@ impl LunaSampler {
         &self,
         mut request: LunaSamplingRequest,
     ) -> Result<String, LunaSamplerError> {
+        if request
+            .pending_score
+            .as_ref()
+            .is_some_and(PendingScore::is_expired)
+        {
+            return Err(LunaSamplerError::Superseded);
+        }
+        let pending_score = request.pending_score.take();
         let auth_owner_generation = self.auth_owner_generation();
         if request.parent_compaction.is_some()
             && !self.supports_parent_compaction(request.parent_compaction_hash.as_deref())
@@ -317,6 +329,18 @@ impl LunaSampler {
                 scored: Arc::clone(&scored),
             });
         }
+        // The same cancellation future moves into the detached drain after an early score.
+        let superseded = Box::pin(async move {
+            tokio::select! {
+                _ = superseded => {},
+                () = async {
+                    match pending_score {
+                        Some(pending) => pending.expired().await,
+                        None => std::future::pending().await,
+                    }
+                } => {},
+            }
+        });
         self.execution(&request, input, auth_owner_generation)
             .run(execution::SamplingMode::Snapshot { superseded, scored })
             .await
