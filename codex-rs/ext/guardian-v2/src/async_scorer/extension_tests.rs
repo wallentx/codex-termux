@@ -74,6 +74,8 @@ use crate::async_scorer::authorization::ScoreAuthorization;
 
 #[path = "conversation_tests.rs"]
 mod conversation;
+#[path = "pending_score_tests.rs"]
+mod pending_score;
 use crate::async_scorer::config::CLASSIFICATION_OUTPUT_INSTRUCTIONS;
 use crate::async_scorer::config::DEFAULT_PARENT_COMPACTION_TOKENS;
 use crate::async_scorer::config::GuardianV2Config;
@@ -2477,7 +2479,7 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
     let oversized_compaction = ResponseItem::Compaction {
         id: Some(ResponseItemId::from_server("cmp_oversized".to_owned())),
         encrypted_content: "a"
-            .repeat(TruncationPolicy::Tokens(DEFAULT_PARENT_COMPACTION_TOKENS).byte_budget()),
+            .repeat(3 * TruncationPolicy::Tokens(DEFAULT_PARENT_COMPACTION_TOKENS).byte_budget()),
         internal_chat_message_metadata_passthrough: None,
     };
     registry.tool_lifecycle_contributors()[0]
@@ -3386,7 +3388,7 @@ async fn assert_parent_compaction_reuse(parent_context_for_review: bool) -> Resu
 
     let oversized_compaction = ResponseItem::Compaction {
         id: Some(ResponseItemId::from_server("cmp_oversized".to_owned())),
-        encrypted_content: "a".repeat(TruncationPolicy::Tokens(/*limit*/ 256).byte_budget()),
+        encrypted_content: "a".repeat(3 * TruncationPolicy::Tokens(/*limit*/ 256).byte_budget()),
         internal_chat_message_metadata_passthrough: None,
     };
     let mut rejected_compactions = vec![(oversized_compaction, "parent_compaction_oversized")];
@@ -3543,6 +3545,11 @@ async fn cached_approval_respects_action_order_and_wrapper_lag() -> Result<()> {
     };
     let origin = ResponseItemId::from_server("wrapper".to_owned());
     let wrapper = start("wrapper", &origin, ToolCallSource::Direct);
+    let pending = crate::async_scorer::score::PendingScore {
+        progress: Arc::clone(&progress),
+        index: wrapper - 1,
+        max_lag: 2,
+    };
     for (call_id, expected) in [
         ("first", Some(ReviewDecision::Approved)),
         ("second", Some(ReviewDecision::Approved)),
@@ -3550,6 +3557,27 @@ async fn cached_approval_respects_action_order_and_wrapper_lag() -> Result<()> {
     ] {
         start(call_id, &origin, nested.clone());
         assert_eq!(approve(call_id).await, expected);
+        let expiration = pending.expired();
+        tokio::pin!(expiration);
+        if expected.is_some() {
+            tokio::select! {
+                biased;
+                () = &mut expiration => panic!("a usable wrapper-discounted score expired"),
+                () = std::future::ready(()) => {},
+            }
+        } else {
+            tokio::time::timeout(ASYNC_TEST_TIMEOUT, &mut expiration).await?;
+        }
+        if call_id == "second" {
+            progress.finish("first");
+            tokio::select! {
+                biased;
+                () = &mut expiration => panic!("the second nested action can still reuse the score"),
+                () = std::future::ready(()) => {},
+            }
+            progress.finish("second");
+            tokio::time::timeout(ASYNC_TEST_TIMEOUT, &mut expiration).await?;
+        }
     }
     // A score covering the wrapper must not receive another discount.
     seed_cached_score(

@@ -82,10 +82,11 @@ async fn misalignment_continuation_requires_current_review_and_submits_once() ->
             );
             app.chat_widget.open_model_popup();
             let request_id = std::iter::from_fn(|| rx.try_recv().ok())
-                .find_map(|event| match event {
+                .filter_map(|event| match event {
                     AppEvent::FetchModels { request_id } => Some(request_id),
                     _ => None,
                 })
+                .last()
                 .expect("model catalog request");
             let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
             model.model = app.chat_widget.current_model().to_string();

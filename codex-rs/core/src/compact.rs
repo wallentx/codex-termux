@@ -62,6 +62,10 @@ pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
+/// Thread-local policy that preserves inherited context without changing model or skill budgets.
+/// Insert into `StartThreadOptions::thread_extension_init` to disable automatic compaction.
+pub struct AutoCompactionDisabled;
+
 /// Metadata for a new compaction checkpoint, kept separate from its replacement history.
 ///
 /// `Session::replace_compacted_history` assigns missing item IDs before constructing the persisted

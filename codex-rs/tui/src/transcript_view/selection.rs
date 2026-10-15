@@ -41,6 +41,51 @@ pub(super) struct Selection {
     preferred_column: Option<u16>,
 }
 
+impl Selection {
+    pub(super) fn keyboard(snapshot: ViewSnapshot, cursor: Anchor) -> Self {
+        Self {
+            pending_copy: None,
+            primary_owner: None,
+            snapshot,
+            start: cursor,
+            end: cursor,
+            dragging: false,
+            moved: true,
+            moved_vertically: false,
+            pointer_origin_row: 0,
+            resume_on_empty: false,
+            pointer: None,
+            pressed_link: None,
+            origin: (cursor, cursor),
+            unit: SelectionUnit::Character,
+            preferred_column: None,
+        }
+    }
+
+    pub(super) fn set_keyboard_range(&mut self, start: Anchor, end: Anchor) {
+        if (self.start, self.end) != (start, end) {
+            self.primary_owner = None;
+            self.pending_copy = None;
+        }
+        self.start = start;
+        self.end = end;
+        self.origin = (start, end);
+        self.preferred_column = None;
+    }
+
+    pub(super) fn set_keyboard_marked_range(
+        &mut self,
+        start: Anchor,
+        end: Anchor,
+        origin: (Anchor, Anchor),
+        unit: SelectionUnit,
+    ) {
+        self.set_keyboard_range(start, end);
+        self.origin = origin;
+        self.unit = unit;
+    }
+}
+
 impl TranscriptView {
     pub(super) fn select_copy_range(
         &mut self,
@@ -139,6 +184,14 @@ impl TranscriptView {
         let Some(selection) = self.selection.take() else {
             return;
         };
+        if let Some(mode) = &mut self.select_mode {
+            let cursor = mode.cursor(&selection);
+            mode.mark = None;
+            let mut selection = selection;
+            selection.set_keyboard_range(cursor, cursor);
+            self.selection = Some(selection);
+            return;
+        }
         let empty = (selection.start.key, selection.start.offset)
             == (selection.end.key, selection.end.offset);
         if empty && selection.resume_on_empty {
@@ -394,7 +447,9 @@ impl TranscriptView {
                 self.publish_primary(tui, text);
                 return None;
             }
-            ViewAction::Changed | ViewAction::OpenLink(_) => return None,
+            ViewAction::Changed | ViewAction::ExitSelectMode | ViewAction::OpenLink(_) => {
+                return None;
+            }
         };
         let selection_copy = self.selection_copy(action);
         let clear_selection = selection_copy.clear_selection();
@@ -695,7 +750,11 @@ impl TranscriptView {
         }
     }
 
-    fn pin_selection_range(&mut self, cells: &[Arc<dyn HistoryCell>], selection: &mut Selection) {
+    pub(super) fn pin_selection_range(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        selection: &mut Selection,
+    ) {
         selection.start.index = self.resolve(cells, selection.start);
         selection.end.index = self.resolve(cells, selection.end);
         for index in selection.start.index.min(selection.end.index)
@@ -710,7 +769,7 @@ impl TranscriptView {
         }
     }
 
-    fn move_selection_endpoint(
+    pub(super) fn move_selection_endpoint(
         &mut self,
         cells: &[Arc<dyn HistoryCell>],
         end: Anchor,

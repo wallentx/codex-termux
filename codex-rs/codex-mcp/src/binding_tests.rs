@@ -488,6 +488,34 @@ async fn sandbox_executable_requires_local_stdio_and_a_full_cli() -> anyhow::Res
         config.mcp_server_catalog = catalog.build();
         call.server_metadata.environment_id = runtime_environment.to_owned();
         assert_eq!(call.sandbox_codex_executable().await, expected);
+
+        let state = crate::SandboxState {
+            permission_profile: PermissionProfile::default(),
+            codex_linux_sandbox_exe: None,
+            sandbox_cwd: codex_utils_path_uri::PathUri::from_host_native_path(
+                std::env::current_dir()?,
+            )?,
+            use_legacy_landlock: false,
+            use_mxc: false,
+        };
+        let expected_state = serde_json::to_value(&state)?;
+        let mut metadata = Some(serde_json::json!({
+            "unrelated": "retained",
+            "codex/sandbox-state": {"stale": true},
+            "codex/sandbox-state-meta": {"different": true},
+            "codex/sandbox-launcher": {"codexExecutable": "must-not-survive"},
+        }));
+        call.augment_sandbox_metadata(&mut metadata, state).await?;
+        let mut expected_metadata = serde_json::json!({
+            "unrelated": "retained",
+            "codex/sandbox-state": expected_state,
+            "codex/sandbox-state-meta": expected_state,
+        });
+        if let Some(executable) = expected {
+            expected_metadata["codex/sandbox-launcher"] =
+                serde_json::json!({"codexExecutable": executable});
+        }
+        assert_eq!(metadata, Some(expected_metadata));
     }
     Ok(())
 }

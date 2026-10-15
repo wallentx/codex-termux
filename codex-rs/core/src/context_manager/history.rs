@@ -1132,15 +1132,18 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
         ResponseItem::Reasoning {
             encrypted_content: Some(content),
             ..
-        }
-        | ResponseItem::Compaction {
+        } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
+        ResponseItem::Compaction {
             encrypted_content: content,
             ..
         }
         | ResponseItem::ContextCompaction {
             encrypted_content: Some(content),
             ..
-        } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
+        } => i64::try_from(
+            codex_protocol::protocol::estimate_compaction_content_length(content.len()),
+        )
+        .unwrap_or(i64::MAX),
         ResponseItem::FunctionCall {
             name,
             namespace,

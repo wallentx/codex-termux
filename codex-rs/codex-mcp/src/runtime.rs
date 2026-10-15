@@ -34,18 +34,14 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::McpResourceOriginCheckpoint;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::with_http_headers_helper;
-use codex_utils_path_uri::PathUri;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -784,44 +780,6 @@ impl McpRuntime {
     }
 }
 
-/// Opaque sandbox state forwarded unchanged to `codex sandbox --sandbox-state-json`.
-/// Servers advertise `codex/sandbox-state-meta` to receive it on tool calls.
-///
-/// `codexExecutable` is the one field servers may interpret: invoke that absolute
-/// path with `sandbox --sandbox-state-json <the original JSON object> -- <command>`.
-/// Do not deserialize and reconstruct the opaque state in a consumer: doing so
-/// can discard future policy fields. The state describes the issuing call, so a
-/// long-lived subprocess must retain its launch state and must not be reused for
-/// a different policy without an explicit lifecycle decision.
-///
-/// MCP probes the host's existing re-exec binary once to verify this contract.
-/// Standalone binaries without the capability omit it; HTTP and remote-executor
-/// servers receive no host-local path even when the host has a full CLI.
-/// Older clients omit the field and older CLI consumers ignore it when decoding.
-/// Servers that require it must fail closed or require an explicit operator
-/// opt-out, never silently search PATH or execute an unsandboxed command.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SandboxState {
-    /// Absolute path to a full Codex CLI on the MCP server's host, supporting
-    /// `sandbox --sandbox-state-json`. Consumers may read this field to launch
-    /// the CLI, but must forward the entire state unchanged.
-    ///
-    /// Absent for older clients, embeddings without a full CLI, and transports
-    /// or remote environments where a usable server-host executable is unknown.
-    /// Also omitted when the OS path cannot be represented as a JSON string.
-    /// Absence does not authorize an unsandboxed fallback or a PATH lookup.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_executable: Option<PathBuf>,
-    pub permission_profile: PermissionProfile,
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-    pub sandbox_cwd: PathUri,
-    #[serde(default)]
-    pub use_legacy_landlock: bool,
-    #[serde(default)]
-    pub use_mxc: bool,
-}
-
 /// Runtime context used when resolving per-server MCP environments.
 ///
 /// `McpConfig` describes what servers exist. This value carries the canonical
@@ -966,6 +924,8 @@ pub(crate) fn emit_duration(metric: &str, duration: Duration, tags: &[(&str, &st
 
 #[cfg(test)]
 mod tests {
+    use codex_protocol::models::PermissionProfile;
+    use codex_utils_path_uri::PathUri;
     use std::collections::HashMap;
 
     use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
@@ -975,7 +935,6 @@ mod tests {
     use codex_exec_server_test_support::environment_manager_without_environments;
     use codex_utils_path_uri::LegacyAppPathString;
     use pretty_assertions::assert_eq;
-    use serde_json::Value;
 
     use super::*;
 
@@ -1178,74 +1137,6 @@ mod tests {
             environment_id: environment_id.to_string(),
             ..stdio_server(environment_id)
         }
-    }
-
-    #[test]
-    fn sandbox_state_serializes_skip_missing_entries_as_missing_path_behavior() {
-        let sandbox_cwd = PathUri::from_host_native_path(
-            std::env::current_dir().expect("current directory should be available"),
-        )
-        .expect("current directory should convert to a URI");
-        let sandbox_state = SandboxState {
-            codex_executable: None,
-            permission_profile: PermissionProfile::workspace_write(),
-            codex_linux_sandbox_exe: None,
-            sandbox_cwd,
-            use_legacy_landlock: false,
-            use_mxc: false,
-        };
-
-        let serialized = serde_json::to_value(&sandbox_state).expect("serialize sandbox state");
-        let serialized_text = serde_json::to_string(&serialized).expect("serialize JSON text");
-        assert!(
-            !serialized_text.contains("generated_default_path"),
-            "MCP sandbox metadata must preserve FileSystemPath's stable wire variants"
-        );
-        assert!(
-            !serialized_text.contains("generated_default_special"),
-            "MCP sandbox metadata must preserve FileSystemPath's stable wire variants"
-        );
-
-        let entries = serialized
-            .pointer("/permissionProfile/file_system/entries")
-            .and_then(Value::as_array)
-            .expect("workspace-write profile should contain filesystem entries");
-        let skip_missing_entries = entries
-            .iter()
-            .filter(|entry| {
-                entry.get("missing_path_behavior").and_then(Value::as_str) == Some("skip")
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            !skip_missing_entries.is_empty(),
-            "skip-missing entries should be represented as optional missing_path_behavior"
-        );
-        assert!(
-            skip_missing_entries.iter().all(|entry| {
-                matches!(
-                    entry.pointer("/path/type").and_then(Value::as_str),
-                    Some("path" | "special")
-                )
-            }),
-            "skip-missing entries should use the stable path/special variants"
-        );
-
-        let deserialized: SandboxState =
-            serde_json::from_value(serialized.clone()).expect("deserialize legacy sandbox state");
-        assert_eq!(deserialized, sandbox_state);
-
-        let executable = std::env::current_exe().expect("absolute executable path");
-        let mut extended = serialized;
-        extended["codexExecutable"] = serde_json::json!(executable);
-        extended["futureField"] = serde_json::json!({"preservedByOpaqueConsumers": true});
-        let deserialized: SandboxState = serde_json::from_value(extended).expect("extended state");
-        assert_eq!(
-            deserialized,
-            SandboxState {
-                codex_executable: Some(executable),
-                ..sandbox_state
-            }
-        );
     }
 
     #[test]

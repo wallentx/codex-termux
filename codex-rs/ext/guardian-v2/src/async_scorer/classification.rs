@@ -1,5 +1,7 @@
 //! Builds context and samples a captured observation in the background.
 //! Successful results require current authorization and review context and a newer sample timestamp.
+//! Requests outside every active action's lag allowance stop as superseded, not failed.
+//! Expiry also cancels metadata waits before transcript preparation, releasing reservations.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -49,6 +51,7 @@ use super::sampler::LunaSampler;
 use super::sampler::LunaSamplerError;
 use super::sampler::LunaSamplingRequest;
 use super::score::GuardianV2ScoreProgress;
+use super::score::PendingScore;
 use super::transcript::CollectedTranscript;
 use super::transcript::ContextInput;
 use super::truncation::ClassificationTruncations;
@@ -162,18 +165,44 @@ impl Classification {
         let generation = reservation
             .as_ref()
             .map(|reservation| reservation.generation.clone());
+        let pending_score = PendingScore {
+            progress: Arc::clone(&score_progress),
+            index: tool_call_index,
+            max_lag: guardian_config.max_tool_call_lag,
+        };
+        let metadata = tokio::select! {
+            biased;
+            () = pending_score.expired() => None,
+            metadata = async {
+                let trusted_tool_context = match mcp_tool.as_ref() {
+                    Some(tool) => {
+                        trusted_tool_context(tool.tool_info(), tool.source(), &manager, &config).await
+                    }
+                    None => None,
+                };
+                let root_snapshot = if context_mode != GuardianContextMode::Legacy {
+                    root_snapshot
+                } else {
+                    thread.guardian_root_snapshot().await
+                };
+                (trusted_tool_context, root_snapshot)
+            } => Some(metadata),
+        };
+        // Metadata can become ready in the same poll as expiry. Do not start
+        // synchronous transcript preparation for an observation that is already stale.
+        let Some((trusted_tool_context, root_snapshot)) =
+            metadata.filter(|_| !pending_score.is_expired())
+        else {
+            record_classification(
+                metrics.as_deref(),
+                context_mode,
+                classification_started_at.elapsed(),
+                "superseded",
+                /*failure_reason*/ None,
+            );
+            return;
+        };
         let mut truncations = ClassificationTruncations::default();
-        let trusted_tool_context = match mcp_tool.as_ref() {
-            Some(tool) => {
-                trusted_tool_context(tool.tool_info(), tool.source(), &manager, &config).await
-            }
-            None => None,
-        };
-        let root_snapshot = if context_mode != GuardianContextMode::Legacy {
-            root_snapshot
-        } else {
-            thread.guardian_root_snapshot().await
-        };
         let mut trusted_skills = TrustedSkillInvocations::default();
         for path in local_trusted_skill_paths.iter().chain(
             root_snapshot
@@ -324,9 +353,11 @@ impl Classification {
                 reasoning_effort: guardian_config.reasoning_effort.clone(),
                 parent_turn_id: turn_id.clone(),
                 root_turn_id,
+                pending_score: None,
             };
             let result = match transcript {
                 ClassificationContext::Snapshot(context) => {
+                    sampling.pending_score = Some(pending_score.clone());
                     sampling.input = context.into_messages();
                     if let Some(decisions_sampler) = decisions_sampler.as_ref() {
                         decisions_task =
@@ -342,7 +373,11 @@ impl Classification {
                         );
                     }
                     let sampling_started = Instant::now();
-                    let result = sampler.sample(sampling).await;
+                    let result = tokio::select! {
+                        biased;
+                        () = pending_score.expired() => Err(LunaSamplerError::Superseded),
+                        result = sampler.sample(sampling) => result,
+                    };
                     responses_duration = Some(sampling_started.elapsed());
                     result
                 }
@@ -372,8 +407,13 @@ impl Classification {
                         authorization: score_authorization.clone(),
                         thread: Arc::clone(&thread),
                         metrics: metrics.clone(),
+                        pending_score: pending_score.clone(),
                     }));
-                    score.await.unwrap_or(Err(LunaSamplerError::Superseded))
+                    tokio::select! {
+                        biased;
+                        () = pending_score.expired() => Err(LunaSamplerError::Superseded),
+                        result = score => result.unwrap_or(Err(LunaSamplerError::Superseded)),
+                    }
                 }
             };
             let output = match result {

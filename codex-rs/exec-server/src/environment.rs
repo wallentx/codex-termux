@@ -1,4 +1,6 @@
 mod connect_options;
+mod discovery_recovery;
+mod discovery_v2;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1063,7 +1065,7 @@ impl Environment {
     ) -> Result<CapabilityRootsDiscoverResponse, ExecServerError> {
         match &self.remote_client {
             Some(client) => {
-                let mut connection_state = client.subscribe_connection_state();
+                let connection_state = client.subscribe_connection_state();
                 let client = client.get().await?;
                 let discover = || async {
                     if params.roots.iter().any(|root| {
@@ -1083,37 +1085,8 @@ impl Environment {
                     }
                     client.discover_capability_roots(params.clone()).await
                 };
-                match discover().await {
-                    Err(error) if crate::client::is_retryable_recovery_error(&error) => {
-                        tracing::warn!(%error, "replaying capability discovery after executor recovery");
-                        let recovered =
-                            tokio::time::timeout(std::time::Duration::from_secs(8), async {
-                                loop {
-                                    match self.readiness_result() {
-                                        Some(Ok(())) => return Some(Ok(())),
-                                        Some(Err(error))
-                                            if !crate::client::is_retryable_recovery_error(
-                                                &error,
-                                            ) =>
-                                        {
-                                            return Some(Err(error));
-                                        }
-                                        Some(Err(_)) | None => {}
-                                    }
-                                    if connection_state.changed().await.is_err() {
-                                        return None;
-                                    }
-                                }
-                            })
-                            .await;
-                        match recovered {
-                            Ok(Some(Ok(()))) => discover().await,
-                            Ok(Some(Err(error))) => Err(error),
-                            Ok(None) | Err(_) => Err(error),
-                        }
-                    }
-                    response => response,
-                }
+                self.discover_with_recovery(connection_state, discover)
+                    .await
             }
             None => crate::discover_capability_roots(self.filesystem.as_ref(), params)
                 .await
