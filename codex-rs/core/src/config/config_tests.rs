@@ -1271,6 +1271,7 @@ fn config_toml_deserializes_model_availability_nux() {
             fullscreen_transcript: true,
             mouse_scroll_speed: None,
             copy_on_select: Default::default(),
+            copy_on_select_clear_selection: false,
             right_click_paste: Default::default(),
             alternate_screen: AltScreenMode::default(),
             status_line: None,
@@ -2610,6 +2611,71 @@ async fn permission_profile_override_populates_runtime_permissions() -> std::io:
     assert_eq!(
         &config.legacy_sandbox_policy(),
         &SandboxPolicy::DangerFullAccess
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_permissions_initialize_proxy_with_expandable_managed_allowlist()
+-> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "default_permissions = \":danger-full-access\"\n",
+    )?;
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .harness_overrides(ConfigOverrides {
+            persisted_permission_profile: Some(PermissionProfile::read_only()),
+            ..Default::default()
+        })
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                "[experimental_network]\nenabled = true\n[experimental_network.domains]\n'managed.example' = 'allow'\n",
+            ),
+        )
+        .build()
+        .await?;
+    assert_eq!(
+        (
+            config.permissions.permission_profile(),
+            config.permissions.active_permission_profile()
+        ),
+        (&PermissionProfile::read_only(), None),
+    );
+
+    let mut rules = codex_execpolicy::Policy::empty();
+    rules.add_network_rule(
+        "remembered.example",
+        codex_execpolicy::NetworkRuleProtocol::Https,
+        codex_execpolicy::Decision::Allow,
+        /*justification*/ None,
+    )?;
+    let spec = config
+        .permissions
+        .network
+        .as_ref()
+        .expect("managed proxy")
+        .with_exec_policy_network_rules(&rules)?;
+    let state = spec.build_state_with_audit_metadata(
+        Default::default(),
+        codex_utils_path_uri::Platform::native(),
+        codex_network_proxy::LocalBindingPolicy::DefaultFalse,
+    )?;
+    let proxy = codex_network_proxy::NetworkProxy::builder()
+        .state(Arc::new(state))
+        .managed_by_codex(/*managed_by_codex*/ false)
+        .build()
+        .await?;
+    proxy.add_allowed_domain("newly-approved.example").await?;
+    assert_eq!(
+        proxy.current_cfg().await?.allowed_domains(),
+        Some(vec![
+            "managed.example".to_string(),
+            "remembered.example".to_string(),
+            "newly-approved.example".to_string(),
+        ]),
     );
     Ok(())
 }
@@ -4417,6 +4483,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             fullscreen_transcript: true,
             mouse_scroll_speed: None,
             copy_on_select: Default::default(),
+            copy_on_select_clear_selection: false,
             right_click_paste: Default::default(),
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
@@ -12149,6 +12216,7 @@ tool_namespace = "agents"
 hide_spawn_agent_metadata = true
 expose_spawn_agent_model_overrides = false
 wait_agent_enabled = false
+disable_native_tools = true
 disable_direct_message = true
 message_board_in_memory = true
 non_code_mode_only = true
@@ -12207,6 +12275,7 @@ max_concurrent_threads_per_session = 9
     assert!(config.multi_agent_v2.preserve_fork_prefix);
     assert!(!config.multi_agent_v2.expose_spawn_agent_model_overrides);
     assert!(!config.multi_agent_v2.wait_agent_enabled);
+    assert!(config.multi_agent_v2.disable_native_tools);
     assert!(config.multi_agent_v2.disable_direct_message);
     assert!(config.multi_agent_v2.message_board_in_memory);
     assert!(config.multi_agent_v2.non_code_mode_only);

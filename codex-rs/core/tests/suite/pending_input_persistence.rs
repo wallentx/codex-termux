@@ -595,8 +595,16 @@ async fn local_preparation_is_durable_before_first_input_and_survives_restart(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum SpawnCaller {
+    NativeV1,
+    NativeV2,
+}
+
+#[test_case(SpawnCaller::NativeV1; "native_v1")]
+#[test_case(SpawnCaller::NativeV2; "native_v2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelled_spawn_discards_provisional_child() -> anyhow::Result<()> {
+async fn cancelled_spawn_discards_provisional_child(caller: SpawnCaller) -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let (checkpoints, mut checkpoint_requests) = mpsc::unbounded_channel();
     let store = Arc::new(GatedCheckpointStore {
@@ -610,8 +618,14 @@ async fn cancelled_spawn_discards_provisional_child() -> anyhow::Result<()> {
     let test = test_codex()
         .with_thread_store(store)
         .with_history_mode(ThreadHistoryMode::Legacy)
-        .with_config(|config| {
+        .with_config(move |config| {
             config.agent_max_depth = 1;
+            if matches!(caller, SpawnCaller::NativeV2) {
+                config
+                    .features
+                    .enable(Feature::MultiAgentV2)
+                    .expect("enable V2");
+            }
             config
                 .features
                 .enable(Feature::Collab)
@@ -619,15 +633,24 @@ async fn cancelled_spawn_discards_provisional_child() -> anyhow::Result<()> {
         })
         .build_with_auto_env(&server)
         .await?;
+    let (namespace, arguments) = match caller {
+        SpawnCaller::NativeV1 => (
+            "multi_agent_v1",
+            json!({"message":"child startup task", "task_name":"worker", "fork_context":true}),
+        ),
+        SpawnCaller::NativeV2 => (
+            "collaboration",
+            json!({"message":"child startup task", "task_name":"worker", "fork_turns":"all"}),
+        ),
+    };
     responses::mount_sse_once(
         &server,
         responses::sse(vec![
             responses::ev_function_call_with_namespace(
                 "spawn-checkpoint",
-                "multi_agent_v1",
+                namespace,
                 "spawn_agent",
-                &json!({"message":"child startup task", "task_name":"worker", "fork_context":true})
-                    .to_string(),
+                &arguments.to_string(),
             ),
             responses::ev_completed("parent-spawn"),
         ]),

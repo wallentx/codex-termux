@@ -326,9 +326,21 @@ fn prepare_path_entry_for_codex_aliases(
         }
     }
 
-    std::fs::create_dir_all(&codex_home)?;
-    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
-    let temp_root = codex_home.join("tmp").join("arg0");
+    prepare_aliases_in_home(&codex_home, existing_path)
+}
+
+// The production entry point validates the home before reaching this filesystem seam.
+fn prepare_aliases_in_home(
+    codex_home: &Path,
+    existing_path: Option<OsString>,
+) -> std::io::Result<(Arg0PathEntryGuard, OsString)> {
+    std::fs::create_dir_all(codex_home)?;
+    // Windows and WSL can share CODEX_HOME without sharing a lock namespace.
+    // Keep each OS outside the legacy `tmp/arg0` root so older clients cannot
+    // delete these helpers while their owning process is still running.
+    let temp_root = codex_home
+        .join("tmp")
+        .join(format!("arg0-{}", std::env::consts::OS));
     std::fs::create_dir_all(&temp_root)?;
     #[cfg(unix)]
     {
@@ -730,6 +742,49 @@ mod tests {
                 Ok(())
             },
         ))
+    }
+
+    #[test]
+    fn helper_cleanup_is_isolated_from_other_platforms_and_legacy_clients() -> std::io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let temporary = home.path().join("tmp");
+        let own_root = temporary.join(format!("arg0-{}", std::env::consts::OS));
+        let foreign_os = if cfg!(windows) { "linux" } else { "windows" };
+        let foreign_root = temporary.join(format!("arg0-{foreign_os}"));
+        let legacy_root = temporary.join("arg0");
+        // Unlocked foreign directories model a live peer whose lock is invisible
+        // to this kernel. Only stale directories in our own namespace may go.
+        for root in [&own_root, &foreign_root, &legacy_root] {
+            let stale = root.join("codex-arg0-existing");
+            fs::create_dir_all(&stale)?;
+            create_lock(&stale)?;
+            fs::write(stale.join("helper"), b"keep foreign helpers")?;
+        }
+
+        let (guard, _) = super::prepare_aliases_in_home(home.path(), /*existing_path*/ None)?;
+        assert!(!own_root.join("codex-arg0-existing").exists());
+        assert_eq!(
+            [&foreign_root, &legacy_root]
+                .map(|root| fs::read(root.join("codex-arg0-existing/helper")))
+                .into_iter()
+                .collect::<std::io::Result<Vec<_>>>()?,
+            vec![b"keep foreign helpers".to_vec(); 2],
+        );
+
+        // Older versions clean only this root. Run that cleanup while a new
+        // helper is live, then confirm the advertised helper remains usable.
+        janitor_cleanup(&legacy_root)?;
+        let helper = guard._temp_dir.path().join(if cfg!(windows) {
+            "apply_patch.bat"
+        } else {
+            "apply_patch"
+        });
+        assert!(helper.is_file());
+        assert_eq!(
+            fs::read(foreign_root.join("codex-arg0-existing/helper"))?,
+            b"keep foreign helpers",
+        );
+        Ok(())
     }
 
     #[test]

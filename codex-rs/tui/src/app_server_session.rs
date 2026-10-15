@@ -1778,14 +1778,6 @@ impl AppServerSession {
         Ok(())
     }
 
-    pub(crate) async fn reject_server_request(
-        &self,
-        request_id: RequestId,
-        error: JSONRPCErrorError,
-    ) -> std::io::Result<()> {
-        self.client.reject_server_request(request_id, error).await
-    }
-
     pub(crate) async fn resolve_server_request(
         &self,
         request_id: RequestId,

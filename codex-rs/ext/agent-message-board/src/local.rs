@@ -1,12 +1,15 @@
-//! SQLite-backed boards. The tree ID scopes every read and write.
+//! SQLite-backed boards. The board ID scopes every read and write.
 //!
 //! Immediate transactions serialize mutations across independently opened handles.
 //! Live handles in this process share one connection pool per database path.
 //! Accepted posts survive runtime unload and process restart, but cannot recreate
 //! a board after its root has been permanently deleted.
 //! Opening storage adds optional channel metadata without invalidating older readers.
+//! Explicit connections can restrict writes; default handles retain legacy access.
 
+use self::connection::Access;
 use crate::ChannelDescription;
+use crate::ChannelPermissions;
 use crate::ChannelSummary;
 use crate::CreateChannelRequest;
 use crate::MessageBoardHost;
@@ -38,6 +41,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub(crate) mod connection;
 mod lifecycle;
 mod paging;
 mod pool;
@@ -57,6 +61,7 @@ pub struct LocalAgentMessageBoard {
     identity: SessionId,
     pool: Arc<SqlitePool>,
     host: Arc<dyn MessageBoardHost>,
+    access: Option<Access>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -77,6 +82,7 @@ impl LocalAgentMessageBoard {
             identity,
             pool: pool::open(sqlite).await?,
             host,
+            access: None,
         })
     }
 
@@ -85,6 +91,9 @@ impl LocalAgentMessageBoard {
         caller: ThreadId,
         request: CreateChannelRequest,
     ) -> Result<ChannelSummary> {
+        if let Some(access) = self.access {
+            access.require_write(self.identity, "board.create_channel")?;
+        }
         validate_channel(&request.channel_name)?;
         let author = self.host.agent_path(caller).await?;
         let now = self.host.current_time(caller).await?;
@@ -116,6 +125,15 @@ impl LocalAgentMessageBoard {
     /// into a recipient's later turn. Once committed, notification failures are
     /// logged without failing the post; the persisted content remains readable.
     pub async fn post(&self, caller: ThreadId, request: PostRequest) -> Result<PostMetadata> {
+        if let Some(access) = self.access {
+            access.require_write(
+                self.identity,
+                match &request.destination {
+                    PostDestination::Thread(_) => "channel.reply",
+                    PostDestination::Channel(_) | PostDestination::NewChannel(_) => "channel.post",
+                },
+            )?;
+        }
         let board = self.clone();
         tokio::spawn(async move { board.post_inner(caller, request).await })
             .await
@@ -269,6 +287,11 @@ impl LocalAgentMessageBoard {
         let caller_path = self.host.agent_path(caller).await?;
         let target_path = request.target_agent.unwrap_or(caller_path);
         let target_agent = self.host.resolve_agent(target_path.clone()).await?;
+        if target_agent != caller
+            && let Some(access) = self.access
+        {
+            access.require_write(self.identity, "board.manage_subscriptions")?;
+        }
         let mut tx = self.begin_write().await?;
         let (channel, root, last) = match &request.target {
             SubscriptionTarget::Channel(name) => {
@@ -413,7 +436,15 @@ impl LocalAgentMessageBoard {
         .map_err(storage_error)?
         .ok_or_else(|| invalid("channel not found in this board"))?;
         Ok(ChannelSummary {
-            permissions: None,
+            permissions: self.access.map(|access| {
+                let write = matches!(access, Access::ReadWrite);
+                ChannelPermissions {
+                    read: true,
+                    post: write,
+                    reply: write,
+                    edit_metadata: false,
+                }
+            }),
             channel_name: name.to_string(),
             description: row.get("description"),
             created_at: DateTime::parse_from_rfc3339(row.get("created_at"))

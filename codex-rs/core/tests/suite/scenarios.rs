@@ -89,6 +89,9 @@ use tokio::sync::oneshot;
 
 const ONE_PIXEL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
+#[path = "scenarios_retained_tool_outputs.rs"]
+mod retained_tool_outputs;
+
 #[path = "scenarios_incremental_tools.rs"]
 mod incremental_tools;
 #[path = "scenarios_incremental_tools_resume.rs"]
@@ -1094,14 +1097,17 @@ async fn astra_omits_disabled_executor_and_plugin_skills_from_model_context(
     Ok(())
 }
 
+#[test_case::test_case(false; "native_tools")]
+#[test_case::test_case(true; "host_tools")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multi_agent_catalog_parameters() -> Result<()> {
+async fn multi_agent_catalog_parameters(disable_native_tools: bool) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
     let test = test_codex()
-        .with_config(|config| {
+        .with_config(move |config| {
             configure_scenario_catalog(config);
+            config.multi_agent_v2.disable_native_tools = disable_native_tools;
             config.workspace_roots = vec![config.cwd.clone()];
         })
         .with_model_info_override("gpt-6-astra", |model| {
@@ -1146,10 +1152,25 @@ async fn multi_agent_catalog_parameters() -> Result<()> {
     .await;
     test.submit_turn("Check which agents are working under /root before delegating more work.")
         .await?;
-    insta::assert_snapshot!(
-        "multi_agent_catalog_parameters",
-        context_snapshot::format_request_history_snapshot(
+    assert_eq!(
+        test.codex.multi_agent_version(),
+        Some(codex_protocol::protocol::MultiAgentVersion::V2)
+    );
+    let (name, description) = if disable_native_tools {
+        (
+            "multi_agent_native_tools_hidden",
+            "Native tools are unavailable while the V2 runtime and its instructions remain enabled.",
+        )
+    } else {
+        (
+            "multi_agent_catalog_parameters",
             "Astra calls list_agents using the selected catalog parameter schema.",
+        )
+    };
+    insta::assert_snapshot!(
+        name,
+        context_snapshot::format_request_history_snapshot(
+            description,
             &mock.requests(),
             &ContextSnapshotOptions::default().include_request_settings(),
         )

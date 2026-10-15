@@ -54,10 +54,14 @@ pub(super) fn active_arg0_helper_dir(
     codex_home: &Path,
     path_env: &OsStr,
 ) -> Option<AbsolutePathBuf> {
-    let arg0_root = codex_home.join("tmp").join("arg0");
+    let arg0_root = codex_home
+        .join("tmp")
+        .join(format!("arg0-{}", std::env::consts::OS));
+    let legacy_root = codex_home.join("tmp").join("arg0");
     std::env::split_paths(path_env)
         .find(|path| {
-            path.parent() == Some(arg0_root.as_path())
+            (path.parent() == Some(arg0_root.as_path())
+                || path.parent() == Some(legacy_root.as_path()))
                 && path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().starts_with("codex-arg0"))

@@ -172,6 +172,7 @@ impl SamplingExecution {
                     | TransportError::Policy(_),
                 )
                 | ApiError::ContextWindowExceeded
+                | ApiError::ResponseIncomplete(_)
                 | ApiError::QuotaExceeded
                 | ApiError::UsageNotIncluded
                 | ApiError::RateLimit(_)
@@ -422,7 +423,7 @@ impl SamplingExecution {
                             && role == "assistant"
                         {
                             for item in content {
-                                if let ContentItem::OutputText { text } = item {
+                                if let ContentItem::OutputText { text, .. } = item {
                                     output.push_str(&text);
                                 }
                             }

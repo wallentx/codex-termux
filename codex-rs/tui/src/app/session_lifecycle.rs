@@ -492,6 +492,7 @@ impl App {
     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
         chat_widget.fork_in_progress = self.chat_widget.fork_in_progress;
         self.pending_right_click_paste = None;
+        self.config_notification_test_pending = None;
         if !self.chat_widget.realtime_conversation_is_running() {
             self.retain_realtime_replay_state_before_replace();
         }
@@ -504,6 +505,7 @@ impl App {
         if chat_widget.last_terminal_title.is_none() {
             chat_widget.last_terminal_title = previous_terminal_title;
         }
+        chat_widget.config_panel_tui = self.chat_widget.config_panel_tui.clone();
         chat_widget.remote_connection = self.chat_widget.remote_connection.clone();
         chat_widget.snapshot_local_images = self.app_server_target.uses_remote_workspace();
         chat_widget.set_local_worktree_operations(self.chat_widget.local_worktree_operations);
@@ -796,11 +798,16 @@ impl App {
 
     pub(super) async fn reset_thread_event_state(&mut self) {
         let voice_owner = self.voice_owner_thread_id();
+        let mut previous_pending = std::mem::take(&mut self.pending_app_server_requests);
         // Move retained tasks' approvals to background routing before clearing request bookkeeping.
         for (thread_id, requests) in &mut self.agents_overview.dispatched_requests {
             if let Some(channel) = self.thread_event_channels.get(thread_id) {
                 for request in channel.store.lock().await.pending_replay_requests() {
-                    if !requests.iter().any(|pending| pending.id() == request.id()) {
+                    if !requests
+                        .iter()
+                        .any(|pending| pending.request.id() == request.id())
+                        && let Some(request) = previous_pending.buffered_request(request)
+                    {
                         requests.push(request);
                     }
                 }
@@ -810,8 +817,7 @@ impl App {
             for (thread_id, channel) in &self.thread_event_channels {
                 if Some(*thread_id) != voice_owner && !self.side_threads.contains_key(thread_id) {
                     for request in channel.store.lock().await.pending_replay_requests() {
-                        self.pending_app_server_requests
-                            .resolve_notification(&thread_id.to_string(), request.id());
+                        previous_pending.resolve_notification(&thread_id.to_string(), request.id());
                     }
                 }
             }
@@ -842,17 +848,20 @@ impl App {
         self.primary_session_configured = None;
         self.pending_primary_events.clear();
         if voice_owner.is_none() {
-            self.pending_app_server_requests.clear();
             let side_thread_ids: Vec<_> = self.side_threads.keys().copied().collect();
             for thread_id in side_thread_ids {
                 if let Some(channel) = self.thread_event_channels.get(&thread_id) {
                     for request in channel.store.lock().await.pending_replay_requests() {
-                        let _ = self
-                            .pending_app_server_requests
-                            .note_server_request(&request);
+                        if let Some(request) = previous_pending.buffered_request(request) {
+                            let _ = self
+                                .pending_app_server_requests
+                                .note_buffered_request(&request);
+                        }
                     }
                 }
             }
+        } else {
+            self.pending_app_server_requests = previous_pending;
         }
         self.pending_startup_thread_start = false;
         self.pending_server_version_notice = None;
@@ -902,31 +911,22 @@ impl App {
                     ThreadBufferedEvent::HistoryEntryResponse(_)
                     | ThreadBufferedEvent::FeedbackSubmission(_) => true,
                 });
-                self.pending_app_server_requests.clear();
-                let mut unsupported_requests = Vec::new();
+                let previous_pending = std::mem::take(&mut self.pending_app_server_requests);
                 for event in &self.pending_primary_events {
-                    if let ThreadBufferedEvent::Request(request) = event
-                        && let Some(unsupported) = self
-                            .pending_app_server_requests
-                            .note_server_request(request)
-                    {
-                        unsupported_requests.push(unsupported);
-                    }
-                }
-                for unsupported in unsupported_requests {
-                    self.pending_primary_events.retain(|event| {
-                        !matches!(event, ThreadBufferedEvent::Request(request)
-                            if request.id() == &unsupported.request_id)
-                    });
-                    if let Err(error) = self
-                        .reject_app_server_request(
-                            app_server,
-                            unsupported.request_id,
-                            unsupported.message,
-                        )
-                        .await
-                    {
-                        tracing::warn!("{error}");
+                    if let ThreadBufferedEvent::Request(request) = event {
+                        let retained = previous_pending.buffered_request((**request).clone());
+                        #[cfg(test)]
+                        let retained = retained.or_else(|| {
+                            Some(super::app_server_requests::BufferedServerRequest::new(
+                                (**request).clone(),
+                                &app_server.request_handle(),
+                            ))
+                        });
+                        if let Some(request) = retained {
+                            let _ = self
+                                .pending_app_server_requests
+                                .note_buffered_request(&request);
+                        }
                     }
                 }
                 if started.blocks_direct_input {

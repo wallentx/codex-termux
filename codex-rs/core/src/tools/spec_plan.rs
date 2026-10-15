@@ -542,33 +542,14 @@ pub(crate) fn finalize_tool_router(
         .filter(|info| !info.is_empty());
     let child_management_tools = required_child_management_tool_names(turn_context, model_info);
 
-    let router = ToolRouter::from_parts(
+    Ok(ToolRouter::from_parts(
         registry,
         model_visible_specs,
         tool_mode,
         code_mode_tool_names,
         tool_namespaces_info,
         &child_management_tools,
-    );
-    // Internal workers can inherit MAv2 configuration without using the board.
-    if multi_agent_v2_enabled(turn_context)
-        && collab_tools_enabled(turn_context, model_info)
-        && turn_context.config.multi_agent_v2.disable_direct_message
-        && !turn_context.session_source.is_internal()
-    {
-        let post_tool = ToolName::new(
-            turn_context.config.multi_agent_v2.tool_namespace.clone(),
-            "post",
-        );
-        if !router.exposes_tool(&post_tool) {
-            return Err(CodexErrorDetails::InvalidRequest(
-                "disable_direct_message requires an available agent message board in this session"
-                    .to_owned(),
-            )
-            .into());
-        }
-    }
-    Ok(router)
+    ))
 }
 
 fn apply_direct_model_only_namespace_overrides(
@@ -752,8 +733,9 @@ fn collab_tools_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> b
             turn_context.config.agent_max_depth,
         ),
         MultiAgentVersion::V2 => {
-            turn_context.session_source.get_agent_path().is_none()
-                || model_info.multi_agent_version == Some(MultiAgentVersion::V2)
+            !turn_context.config.multi_agent_v2.disable_native_tools
+                && (turn_context.session_source.get_agent_path().is_none()
+                    || model_info.multi_agent_version == Some(MultiAgentVersion::V2))
         }
     }
 }

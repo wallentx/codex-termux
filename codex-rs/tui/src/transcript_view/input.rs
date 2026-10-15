@@ -2,7 +2,8 @@
 //! Stationary link clicks open on release; dragging or scrolling keeps the gesture in selection.
 //! Shift-click extends the existing selection from its original text unit.
 //! Optional automatic copying happens only when a nonempty mouse selection is released.
-//! Automatic copies retain the selection; explicit copies clear it after confirmed delivery.
+//! Automatic copies optionally clear the selection; explicit copies always clear it after
+//! confirmed delivery.
 //! Wheel input accumulates fractional rows and discards the remainder when direction reverses.
 
 use crate::key_hint::KeyBindingListExt;
@@ -88,6 +89,20 @@ impl JumpTarget {
 }
 
 impl TranscriptView {
+    /// Automatic copies may deselect but still publish PRIMARY, so retain their source.
+    pub(crate) fn selection_copy(&self, action: &ViewAction) -> SelectionCopy {
+        match action {
+            ViewAction::CopyOnSelect(_) => SelectionCopy::OnSelect {
+                clear_selection: self.copy_on_select_clear_selection,
+            },
+            ViewAction::Changed
+            | ViewAction::PrimarySelection(_)
+            | ViewAction::Copy(_)
+            | ViewAction::CopyAndFollow(_)
+            | ViewAction::OpenLink(_) => SelectionCopy::Explicit,
+        }
+    }
+
     /// Resolve links in the last rendered transcript, sharing geometry with click activation.
     pub(crate) fn link_at(&self, column: u16, row: u16) -> Option<String> {
         if !self.area.contains(ScreenPosition::new(column, row)) {
@@ -229,13 +244,29 @@ impl TranscriptView {
         {
             return Some(action);
         }
+        let point = ScreenPosition::new(event.column, event.row);
+        if mode == MouseMode::Interactive
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
+            && event.modifiers.is_empty()
+            && let Some((area, key)) = self.prompt_header_target
+            && area.contains(point)
+        {
+            self.last_click = None;
+            if let Some(index) = cells.iter().position(|cell| EntryKey::cell(cell) == key) {
+                self.end_selection(cells);
+                self.cancel_search();
+                self.clear_activity_focus();
+                self.jump_to_entry(cells, index);
+            }
+            return Some(ViewAction::Changed);
+        }
         if mode == MouseMode::Interactive
             && event.kind == MouseEventKind::Down(MouseButton::Left)
             && event
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
             && let Some((area, tip)) = &self.composer_tip
-            && area.contains(ScreenPosition::new(event.column, event.row))
+            && area.contains(point)
         {
             let column = usize::from(event.column - area.x);
             return tip
@@ -245,9 +276,7 @@ impl TranscriptView {
                 .terminal_destination()
                 .map(ViewAction::OpenLink);
         }
-        let inside = self
-            .area
-            .contains(ScreenPosition::new(event.column, event.row));
+        let inside = self.area.contains(point);
         let dragging = self
             .selection
             .as_ref()

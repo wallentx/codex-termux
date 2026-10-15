@@ -954,6 +954,13 @@ impl LocalAgentControl {
             }
         }
         let input_admission = input_admission_started_at.elapsed();
+        // Keep provisional ownership through the final awaits. Commit and return to the
+        // backend caller in one poll; later tool-result publication is outside this boundary.
+        let status = self.get_status(new_thread.thread_id).await;
+        let config = match spawn_config {
+            Some(config) => config,
+            None => new_thread.thread.config_snapshot().await,
+        };
         reservation.commit(agent_metadata.clone());
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
@@ -981,11 +988,7 @@ impl LocalAgentControl {
         let agent = LiveAgent {
             thread_id: new_thread.thread_id,
             metadata: agent_metadata,
-            status: self.get_status(new_thread.thread_id).await,
-        };
-        let config = match spawn_config {
-            Some(config) => config,
-            None => new_thread.thread.config_snapshot().await,
+            status,
         };
         let session_telemetry = new_thread
             .thread

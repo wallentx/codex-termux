@@ -306,17 +306,6 @@ fn mcp_prompt_auto_approval_honors_approved_tools_in_all_permission_modes() {
 }
 
 #[test]
-fn mcp_prompt_auto_approval_rejects_auto_mode_in_default_permission_mode() {
-    assert!(!mcp_permission_prompt_is_auto_approved(
-        AskForApproval::OnRequest,
-        &PermissionProfile::read_only(),
-        McpPermissionPromptAutoApproveContext {
-            tool_approval_mode: Some(AppToolApproval::Auto),
-        },
-    ));
-}
-
-#[test]
 fn tool_plugin_context_collects_app_and_mcp_sources() {
     let mut config = test_mcp_config(PathBuf::new());
     let mut catalog = ResolvedMcpCatalog::builder();

@@ -3,6 +3,7 @@
 use super::LocalAgentMessageBoard;
 use super::MAX_READ_CHARS;
 use super::StoredPost;
+use super::connection::Access;
 use super::invalid;
 use super::paging::Window;
 use super::paging::decode_posts;
@@ -10,6 +11,7 @@ use super::paging::direction;
 use super::paging::preview;
 use super::storage_error;
 use crate::AgentMessageBoard;
+use crate::BoardPermissions;
 use crate::ChannelPage;
 use crate::ChannelQuery;
 use crate::ChannelSummary;
@@ -109,7 +111,11 @@ impl AgentMessageBoard for LocalAgentMessageBoard {
             }
             Ok(ChannelPage {
                 channels: window.finish(channels)?,
-                board_permissions: None,
+                board_permissions: self.access.map(|access| BoardPermissions {
+                    create_channel: matches!(access, Access::ReadWrite),
+                    edit_metadata: false,
+                    manage_permissions: false,
+                }),
             })
         })
     }

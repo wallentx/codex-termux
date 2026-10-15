@@ -58,11 +58,11 @@ impl App {
             );
             return Ok(());
         }
-        let Some(attempt) = self
-            .pending_app_server_requests
-            .user_verification
-            .begin(&server_name, &request_id)
-        else {
+        let Some(attempt) = self.pending_app_server_requests.user_verification.begin(
+            &thread_id.to_string(),
+            &server_name,
+            &request_id,
+        ) else {
             return Ok(());
         };
         let handle = app_server.request_handle();
@@ -107,7 +107,12 @@ impl App {
             || !self
                 .pending_app_server_requests
                 .user_verification
-                .is_pending(&server_name, &request_id, attempt_id)
+                .is_pending(
+                    &thread_id.to_string(),
+                    &server_name,
+                    &request_id,
+                    attempt_id,
+                )
         {
             return Ok(());
         }
