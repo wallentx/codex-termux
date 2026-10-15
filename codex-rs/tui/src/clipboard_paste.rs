@@ -7,14 +7,13 @@ use std::path::PathBuf;
 #[cfg(not(target_os = "android"))]
 use tempfile::Builder;
 
+/// Shared clipboard dispatch uses these errors on every platform.
 #[derive(Debug, Clone)]
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub enum PasteImageError {
     ClipboardUnavailable(String),
-    #[cfg(not(target_os = "android"))]
     NoImage(String),
-    #[cfg(not(target_os = "android"))]
     EncodeFailed(String),
-    #[cfg(not(target_os = "android"))]
     IoError(String),
 }
 
@@ -22,11 +21,8 @@ impl std::fmt::Display for PasteImageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PasteImageError::ClipboardUnavailable(msg) => write!(f, "clipboard unavailable: {msg}"),
-            #[cfg(not(target_os = "android"))]
             PasteImageError::NoImage(msg) => write!(f, "no image on clipboard: {msg}"),
-            #[cfg(not(target_os = "android"))]
             PasteImageError::EncodeFailed(msg) => write!(f, "could not encode image: {msg}"),
-            #[cfg(not(target_os = "android"))]
             PasteImageError::IoError(msg) => write!(f, "io error: {msg}"),
         }
     }
