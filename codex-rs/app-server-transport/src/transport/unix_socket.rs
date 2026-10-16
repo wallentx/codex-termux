@@ -10,6 +10,18 @@ use crate::transport::websocket::run_websocket_connection;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_file_lock::FileLockOutcome;
+use codex_utils_file_lock::LockDirGuard;
+#[cfg(unix)]
+use codex_utils_file_lock::TryFileLockOutcome;
+#[cfg(unix)]
+use codex_utils_file_lock::TryLockDirOutcome;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
+use codex_utils_file_lock::lock_exclusive_optional;
+#[cfg(unix)]
+use codex_utils_file_lock::try_acquire_sibling_lock_dir;
+#[cfg(unix)]
+use codex_utils_file_lock::try_lock_exclusive_optional;
 use futures::SinkExt;
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -115,7 +127,13 @@ pub async fn start_control_socket_acceptor(
         socket_guard.rendezvous_path.as_path(),
     )?;
     #[cfg(unix)]
-    socket_guard._startup_lock._file.unlock()?;
+    let socket_guard = {
+        let mut socket_guard = socket_guard;
+        if socket_guard._startup_lock._lock_dir_guard.take().is_none() {
+            socket_guard._startup_lock._file.unlock()?;
+        }
+        socket_guard
+    };
     info!(
         socket_path = %socket_guard.socket_path.display(),
         "app-server control socket listening"
@@ -305,6 +323,7 @@ fn protected_socket_path(rendezvous_path: &Path) -> IoResult<std::path::PathBuf>
 
 pub struct AppServerStartupLock {
     _file: std::fs::File,
+    _lock_dir_guard: Option<LockDirGuard>,
     #[cfg(unix)]
     removable_path: Option<AbsolutePathBuf>,
     #[cfg(unix)]
@@ -324,9 +343,15 @@ pub async fn acquire_app_server_startup_lock(
             .read(true)
             .write(true)
             .open(startup_lock_path.as_path())?;
-        file.lock()?;
+        let lock_dir_guard = match lock_exclusive_optional(&file)? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => {
+                Some(acquire_sibling_lock_dir(startup_lock_path.as_path())?)
+            }
+        };
         Ok(AppServerStartupLock {
             _file: file,
+            _lock_dir_guard: lock_dir_guard,
             #[cfg(unix)]
             removable_path: None,
             #[cfg(unix)]
@@ -368,11 +393,20 @@ impl AppServerStartupLock {
         let Some(path) = self.removable_path.as_ref() else {
             return Ok(());
         };
-        match self._file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
-            Err(std::fs::TryLockError::Error(err)) => return Err(err),
-        }
+        let _cleanup_lock_dir_guard = if self._lock_dir_guard.is_some() {
+            None
+        } else {
+            match try_lock_exclusive_optional(&self._file)? {
+                TryFileLockOutcome::Acquired => None,
+                TryFileLockOutcome::WouldBlock => return Ok(()),
+                TryFileLockOutcome::Unsupported => {
+                    match try_acquire_sibling_lock_dir(path.as_path())? {
+                        TryLockDirOutcome::Acquired(guard) => Some(guard),
+                        TryLockDirOutcome::WouldBlock => return Ok(()),
+                    }
+                }
+            }
+        };
         startup_lock_file_matches_path(&self._file, path.as_path())?
             .then(|| std::fs::remove_file(path.as_path()))
             .transpose()
@@ -390,12 +424,22 @@ pub(super) fn try_acquire_removable_app_server_startup_lock(
         .read(true)
         .write(true)
         .open(startup_lock_path.as_path())?;
-    file.try_lock()?;
+    let lock_dir_guard = match try_lock_exclusive_optional(&file)? {
+        TryFileLockOutcome::Acquired => None,
+        TryFileLockOutcome::WouldBlock => return Err(ErrorKind::WouldBlock.into()),
+        TryFileLockOutcome::Unsupported => {
+            match try_acquire_sibling_lock_dir(startup_lock_path.as_path())? {
+                TryLockDirOutcome::Acquired(guard) => Some(guard),
+                TryLockDirOutcome::WouldBlock => return Err(ErrorKind::WouldBlock.into()),
+            }
+        }
+    };
     if !startup_lock_file_matches_path(&file, startup_lock_path.as_path())? {
         return Err(ErrorKind::WouldBlock.into());
     }
     Ok(AppServerStartupLock {
         _file: file,
+        _lock_dir_guard: lock_dir_guard,
         removable_path: Some(startup_lock_path),
         remove_on_drop: false,
     })
