@@ -33,7 +33,9 @@ struct WorkspaceFsmonitorProbeRunner<'a> {
 
 impl FsmonitorProbeRunner for WorkspaceFsmonitorProbeRunner<'_> {
     async fn run_probe(&mut self, args: &[&str]) -> Option<Vec<u8>> {
-        let argv = ["git"].into_iter().chain(args.iter().copied());
+        let argv = ["git", "-c", codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG]
+            .into_iter()
+            .chain(args.iter().copied());
         let command = WorkspaceCommand::new(argv).cwd(self.cwd.to_path_buf());
         match self.runner.run(command).await {
             Ok(output) if output.success() => Some(output.stdout.into_bytes()),
@@ -232,6 +234,8 @@ async fn run_git_command(
     let argv = [
         "git",
         "-c",
+        codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG,
+        "-c",
         fsmonitor.git_config_arg(),
         "-c",
         DISABLE_HOOKS_CONFIG,
@@ -263,8 +267,6 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
     use std::future::Future;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::pin::Pin;
     #[cfg(unix)]
@@ -745,6 +747,8 @@ mod tests {
         [
             "git",
             "-c",
+            codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG,
+            "-c",
             fsmonitor.git_config_arg(),
             "-c",
             DISABLE_HOOKS_CONFIG,
@@ -756,7 +760,7 @@ mod tests {
     }
 
     fn git_probe_command(args: &[&str]) -> Vec<String> {
-        ["git"]
+        ["git", "-c", codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG]
             .into_iter()
             .chain(args.iter().copied())
             .map(str::to_string)
@@ -817,25 +821,22 @@ mod tests {
 
     #[cfg(unix)]
     fn write_marker_helper(path: &Path) {
-        fs::write(path, "#!/bin/sh\nprintf ran >> \"$0.ran\"\nexit 1\n")
-            .expect("write helper script");
-        let mut permissions = fs::metadata(path)
-            .expect("read helper metadata")
-            .permissions();
-        permissions.set_mode(/*mode*/ 0o755);
-        fs::set_permissions(path, permissions).expect("make helper executable");
+        codex_utils_cargo_bin::write_executable(
+            path,
+            "#!/bin/sh\nprintf ran >> \"$0.ran\"\nexit 1\n",
+        )
+        .expect("write helper script");
     }
 
     fn assert_command_metadata(commands: &[WorkspaceCommand], cwd: &Path) {
         for command in commands {
             assert_eq!(command.cwd.as_deref(), Some(cwd));
             if matches!(
-                command.argv.get(1).map(String::as_str),
+                command.argv.get(3).map(String::as_str),
                 Some("config" | "version")
             ) {
                 assert_eq!(command.env, HashMap::new());
                 assert_eq!(command.timeout, Duration::from_secs(/*secs*/ 5));
-                assert_eq!(command.output_bytes_cap, 64 * 1024);
                 assert_eq!(command.disable_output_cap, false);
             } else {
                 assert_eq!(command.timeout, DIFF_COMMAND_TIMEOUT);

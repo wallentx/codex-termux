@@ -1,3 +1,6 @@
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_otel::EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::OtelExporter;
@@ -8,6 +11,7 @@ use codex_otel::Result;
 use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::W3cTraceContext;
+use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -140,7 +144,34 @@ fn write_http_response(stream: &mut TcpStream, status: &str) -> std::io::Result<
 }
 
 #[test]
-fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
+fn otlp_http_exporter_honors_cumulative_temporality_env() -> Result<()> {
+    // Isolate the environment setting from other tests, including under Bazel/libtest.
+    const CHILD_ENV: &str = "CODEX_OTEL_TEMPORALITY_TEST_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let current_thread = thread::current();
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                current_thread.name().expect("test name"),
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(
+                "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+                "cumulative",
+            )
+            .env("OTEL_METRIC_EXPORT_INTERVAL", "60000")
+            .output()
+            .expect("run test with cumulative temporality configured");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return Ok(());
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     listener.set_nonblocking(true).expect("set_nonblocking");
@@ -186,6 +217,45 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     ))?;
 
     metrics.counter("codex.turns", /*inc*/ 1, &[("source", "test")])?;
+    metrics.counter("codex.api_request", /*inc*/ 1, &[("status", "200")])?;
+    metrics.counter_with_description(
+        EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC,
+        "Client-side exec-server RPC attempts.",
+        /*inc*/ 1,
+        &[("method", "fs/readFile")],
+    )?;
+    metrics.record_duration(
+        "codex.api_request.duration_ms",
+        Duration::from_millis(100),
+        &[("status", "200")],
+    )?;
+    metrics.counter("codex.conversation.turn.count", /*inc*/ 1, &[])?;
+    metrics.record_duration(
+        "codex.responses_api_engine_iapi_ttft.duration_ms",
+        Duration::from_millis(100),
+        &[],
+    )?;
+    metrics.record_duration(
+        "codex.responses_api_engine_service_tbt.duration_ms",
+        Duration::from_millis(100),
+        &[],
+    )?;
+    metrics.record_duration(
+        "codex.responses_api_engine_service_ttft.duration_ms",
+        Duration::from_millis(100),
+        &[],
+    )?;
+    metrics.counter("codex.tool.call", /*inc*/ 1, &[("tool", "test")])?;
+    metrics.record_duration(
+        "codex.tool.call.duration_ms",
+        Duration::from_millis(42),
+        &[("tool", "test")],
+    )?;
+    metrics.histogram(
+        "codex.turn.token_usage",
+        /*value*/ 100,
+        &[("token_type", "total")],
+    )?;
     metrics.gauge_with_description(
         "codex.active",
         "Number of active Codex operations.",
@@ -210,6 +280,18 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
         "unexpected content-type: {content_type}"
     );
 
+    let payload: serde_json::Value = serde_json::from_slice(&request.body).expect("OTLP JSON");
+    let counter = payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array()
+        .expect("exported metrics")
+        .iter()
+        .find(|metric| metric["name"] == "codex.turns")
+        .expect("exported counter");
+    assert_eq!(
+        counter["sum"]["aggregationTemporality"],
+        serde_json::json!(2)
+    );
+
     let body = String::from_utf8_lossy(&request.body);
     assert!(
         body.contains("codex.turns"),
@@ -219,6 +301,55 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     assert!(
         body.contains("codex.active"),
         "expected gauge not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("\"codex.api_request\""),
+        "expected API-request counter not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains(EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC),
+        "custom OTLP must retain the exec-server client counter excluded from built-in Statsig"
+    );
+    assert!(
+        body.contains("\"codex.api_request.duration_ms\""),
+        "expected API-request duration not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("\"codex.conversation.turn.count\""),
+        "expected conversation turn count not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("\"codex.responses_api_engine_iapi_ttft.duration_ms\""),
+        "expected engine IAPI TTFT duration not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("\"codex.responses_api_engine_service_tbt.duration_ms\""),
+        "expected engine service TBT duration not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("\"codex.responses_api_engine_service_ttft.duration_ms\""),
+        "expected engine service TTFT duration not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("\"codex.tool.call\""),
+        "expected tool-call counter not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("\"codex.turn.token_usage\""),
+        "expected turn-token histogram not found; body prefix: {}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains("\"codex.tool.call.duration_ms\""),
+        "expected tool-call duration not found; body prefix: {}",
         &body.chars().take(2000).collect::<String>()
     );
     assert!(
@@ -265,7 +396,8 @@ fn otlp_http_exporter_sends_logs_to_collector()
         let _ = tx.send(captured);
     });
 
-    let otel = OtelProvider::from(&OtelSettings {
+    let otel = OtelProvider::try_new(&OtelSettings {
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -324,7 +456,8 @@ fn otlp_http_exporter_sends_logs_to_collector()
 
 #[test]
 fn otel_provider_rejects_header_unsafe_configured_tracestate() {
-    let result = OtelProvider::from(&OtelSettings {
+    let result = OtelProvider::try_new(&OtelSettings {
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -389,7 +522,8 @@ fn otlp_http_exporter_sends_traces_to_collector()
         let _ = tx.send(captured);
     });
 
-    let otel = OtelProvider::from(&OtelSettings {
+    let otel = OtelProvider::try_new(&OtelSettings {
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -497,7 +631,7 @@ fn otlp_http_exporter_sends_traces_to_collector()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
+async fn otlp_http_exporter_sends_traces_to_collector_with_bounded_shutdown_in_tokio_runtime()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _trace_context_config_guard = TRACE_CONTEXT_CONFIG_LOCK
         .lock()
@@ -534,7 +668,8 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
         let _ = tx.send(captured);
     });
 
-    let otel = OtelProvider::from(&OtelSettings {
+    let otel = OtelProvider::try_new(&OtelSettings {
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -566,7 +701,10 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
         let _guard = span.enter();
         tracing::info!("trace loopback event from tokio runtime");
     });
-    otel.shutdown();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(otel.shutdown_with_timeout(Duration::from_secs(/*secs*/ 2)))
+    })?;
 
     server.join().expect("server join");
     let captured = rx.recv_timeout(Duration::from_secs(1)).expect("captured");
@@ -597,6 +735,85 @@ async fn otlp_http_exporter_sends_traces_to_collector_in_tokio_runtime()
     );
 
     Ok(())
+}
+
+#[test]
+fn otlp_http_exporter_times_out_when_collector_stalls_during_bounded_shutdown() {
+    let _trace_context_config_guard = TRACE_CONTEXT_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let (request_started_tx, request_started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept trace request");
+        let (path, _, _) = read_http_request(&mut stream).expect("read trace request");
+        request_started_tx.send(path).expect("request started");
+        release_rx
+            .recv_timeout(Duration::from_secs(/*secs*/ 2))
+            .expect("collector released");
+        write_http_response(&mut stream, "202 Accepted").expect("write trace response");
+    });
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let (result, elapsed) = runtime.block_on(async move {
+        let otel = OtelProvider::try_new(&OtelSettings {
+            http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            environment: "test".to_string(),
+            service_name: "codex-cli".to_string(),
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_home: PathBuf::from("."),
+            exporter: OtelExporter::None,
+            trace_exporter: OtelExporter::OtlpHttp {
+                endpoint: format!("http://{addr}/v1/traces"),
+                headers: HashMap::new(),
+                protocol: OtelHttpProtocol::Json,
+                tls: None,
+            },
+            metrics_exporter: OtelExporter::None,
+            runtime_metrics: false,
+            span_attributes: BTreeMap::new(),
+            tracestate: BTreeMap::new(),
+        })
+        .expect("build otel provider")
+        .expect("otel provider");
+        let tracing_layer = otel.tracing_layer().expect("tracing layer");
+        let subscriber = tracing_subscriber::registry().with(tracing_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("trace-loopback-stalled");
+            let _guard = span.enter();
+            tracing::info!("trace loopback event for stalled collector");
+        });
+
+        let started = Instant::now();
+        let result = otel
+            .shutdown_with_timeout(Duration::from_millis(/*millis*/ 50))
+            .await;
+        (result, started.elapsed())
+    });
+
+    let path = request_started_rx
+        .recv_timeout(Duration::from_secs(/*secs*/ 1))
+        .expect("trace request reached collector");
+    release_tx.send(()).expect("release collector");
+    server.join().expect("server join");
+    runtime.shutdown_timeout(Duration::from_secs(/*secs*/ 1));
+
+    assert_eq!(path, "/v1/traces");
+    assert_eq!(
+        result.as_ref().map_err(std::io::Error::kind),
+        Err(std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        elapsed < Duration::from_secs(/*secs*/ 1),
+        "bounded shutdown blocked for {elapsed:?}"
+    );
 }
 
 #[test]
@@ -645,7 +862,8 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
             .expect("current-thread runtime");
 
         let result = runtime.block_on(async move {
-            let otel = OtelProvider::from(&OtelSettings {
+            let otel = OtelProvider::try_new(&OtelSettings {
+                http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
                 environment: "test".to_string(),
                 service_name: "codex-cli".to_string(),
                 service_version: env!("CARGO_PKG_VERSION").to_string(),

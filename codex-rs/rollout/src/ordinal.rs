@@ -6,10 +6,10 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::Path;
 
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
 
+use crate::RolloutItem;
 use crate::reverse_jsonl_scanner::ReverseJsonlScanner;
 use crate::reverse_jsonl_scanner::ScanOutcome;
 
@@ -20,10 +20,15 @@ pub(crate) enum RolloutOrdinalState {
 }
 
 impl RolloutOrdinalState {
-    pub(crate) fn for_new_rollout(history_mode: ThreadHistoryMode) -> Self {
+    pub(crate) fn for_new_rollout(
+        history_mode: ThreadHistoryMode,
+        history_base: Option<HistoryPosition>,
+    ) -> Self {
         match history_mode {
             ThreadHistoryMode::Legacy => Self::Legacy,
-            ThreadHistoryMode::Paginated => Self::Paginated { next: Some(0) },
+            ThreadHistoryMode::Paginated => Self::Paginated {
+                next: Some(history_base.map_or(0, |base| base.end_ordinal_exclusive)),
+            },
         }
     }
 
@@ -61,7 +66,7 @@ pub(crate) fn ordinal_state_for_rollout(
 
     let mut scanner = ReverseJsonlScanner::new(file)?;
     let record = loop {
-        match scanner.scan_next::<RolloutLine>()? {
+        match scanner.scan_next_rollout_line()? {
             Some(ScanOutcome::Parsed(record)) => break record,
             Some(ScanOutcome::Rejected(_)) => continue,
             None => {
@@ -78,8 +83,9 @@ pub(crate) fn ordinal_state_for_rollout(
             path.display()
         ))
     })?;
-    // The child metadata is written before its inherited prefix. Never resume a
-    // partial initialization: later child records would otherwise stay below the boundary.
+    // Child records must start at `subagent_history_start_ordinal`. If initialization died while
+    // copying the inherited parent records, resuming would append child records before that
+    // boundary.
     if let Some(prefix_end) = subagent_history_start_ordinal.and_then(|start| start.checked_sub(1))
         && ordinal < prefix_end
     {
@@ -104,7 +110,7 @@ fn read_history_metadata(
         if line.trim().is_empty() {
             continue;
         }
-        let record: RolloutLine = serde_json::from_str(line.as_str()).map_err(|error| {
+        let record = crate::parse_rollout_line(line.as_str()).map_err(|error| {
             io::Error::other(format!(
                 "failed to parse first rollout record at {}: {error}",
                 path.display()

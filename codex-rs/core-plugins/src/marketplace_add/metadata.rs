@@ -5,12 +5,11 @@ use crate::marketplace::validate_marketplace_root;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::MarketplaceConfigUpdate;
 use codex_config::record_user_marketplace;
+use codex_utils_path::paths_match_after_normalization;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MarketplaceInstallMetadata {
@@ -35,10 +34,7 @@ pub(super) fn record_added_marketplace_entry(
     install_metadata: &MarketplaceInstallMetadata,
 ) -> Result<(), MarketplaceAddError> {
     let source = install_metadata.config_source();
-    let timestamp = utc_timestamp_now()?;
     let update = MarketplaceConfigUpdate {
-        last_updated: &timestamp,
-        last_revision: None,
         source_type: install_metadata.config_source_type(),
         source: &source,
         ref_name: install_metadata.ref_name(),
@@ -82,10 +78,10 @@ pub(super) fn installed_marketplace_root_for_source(
         if !install_metadata.matches_config(marketplace) {
             continue;
         }
-        let Some(root) =
-            resolve_configured_marketplace_root(marketplace_name, marketplace, install_root)
-        else {
-            continue;
+        let root = match &install_metadata.source {
+            // Keep using the resolved request path if the configured alias is retargeted.
+            InstalledMarketplaceSource::Local { path } => PathBuf::from(path),
+            InstalledMarketplaceSource::Git { .. } => install_root.join(marketplace_name),
         };
         if validate_marketplace_root(&root).is_ok() {
             return Ok(Some(root));
@@ -183,8 +179,15 @@ impl MarketplaceInstallMetadata {
     fn matches_config(&self, marketplace: &toml::Value) -> bool {
         marketplace.get("source_type").and_then(toml::Value::as_str)
             == Some(self.config_source_type())
-            && marketplace.get("source").and_then(toml::Value::as_str)
-                == Some(self.config_source().as_str())
+            && marketplace
+                .get("source")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|source| match &self.source {
+                    InstalledMarketplaceSource::Local { path } => {
+                        paths_match_after_normalization(source, path)
+                    }
+                    InstalledMarketplaceSource::Git { url, .. } => source == url,
+                })
             && marketplace.get("ref").and_then(toml::Value::as_str) == self.ref_name()
             && config_sparse_paths(marketplace) == self.sparse_paths()
     }
@@ -204,58 +207,11 @@ fn config_sparse_paths(marketplace: &toml::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn utc_timestamp_now() -> Result<String, MarketplaceAddError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| {
-            MarketplaceAddError::Internal(format!("system clock is before Unix epoch: {err}"))
-        })?;
-    Ok(format_utc_timestamp(duration.as_secs() as i64))
-}
-
-fn format_utc_timestamp(seconds_since_epoch: i64) -> String {
-    const SECONDS_PER_DAY: i64 = 86_400;
-    let days = seconds_since_epoch.div_euclid(SECONDS_PER_DAY);
-    let seconds_of_day = seconds_since_epoch.rem_euclid(SECONDS_PER_DAY);
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    let second = seconds_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
-    let days = days_since_epoch + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += if month <= 2 { 1 } else { 0 };
-    (year, month, day)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
-
-    #[test]
-    fn utc_timestamp_formats_unix_epoch_as_rfc3339_utc() {
-        assert_eq!(
-            format_utc_timestamp(/*seconds_since_epoch*/ 0),
-            "1970-01-01T00:00:00Z"
-        );
-        assert_eq!(
-            format_utc_timestamp(/*seconds_since_epoch*/ 1_775_779_200),
-            "2026-04-10T00:00:00Z"
-        );
-    }
 
     #[test]
     fn installed_marketplace_root_for_source_propagates_config_read_errors() {
@@ -311,5 +267,82 @@ mod tests {
         .unwrap();
 
         assert_eq!(root, Some(source_root));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_marketplace_matches_canonical_and_legacy_windows_sources() {
+        let source = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let metadata = MarketplaceInstallMetadata::from_source(
+            &MarketplaceSource::Local {
+                path: source.path().canonicalize().unwrap(),
+            },
+            &[],
+        );
+        let canonical = source.path().canonicalize().unwrap();
+        let legacy =
+            codex_utils_absolute_path::normalize_windows_device_path(&canonical.to_string_lossy())
+                .unwrap();
+        for spelling in [
+            canonical.to_string_lossy().into_owned(),
+            legacy.replace('\\', "/"),
+        ] {
+            let config: toml::Value =
+                toml::from_str(&format!("source_type = \"local\"\nsource = {spelling:?}\n"))
+                    .unwrap();
+            assert!(metadata.matches_config(&config));
+        }
+        let different = other.path().to_string_lossy();
+        let config: toml::Value = toml::from_str(&format!(
+            "source_type = \"local\"\nsource = {different:?}\n"
+        ))
+        .unwrap();
+        assert!(!metadata.matches_config(&config));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_local_root_does_not_follow_retargeted_configured_junction() {
+        let codex_home = TempDir::new().unwrap();
+        let source_root = codex_home.path().join("source");
+        let other_root = codex_home.path().join("other");
+        for (root, name) in [(&source_root, "source"), (&other_root, "other")] {
+            fs::create_dir_all(root.join(".agents/plugins")).unwrap();
+            fs::write(
+                root.join(".agents/plugins/marketplace.json"),
+                format!(r#"{{"name":"{name}","plugins":[]}}"#),
+            )
+            .unwrap();
+        }
+        let alias = codex_home.path().join("configured-source");
+        crate::test_support::create_directory_junction(&source_root, &alias);
+        let configured_metadata = MarketplaceInstallMetadata::from_source(
+            &MarketplaceSource::Local {
+                path: alias.clone(),
+            },
+            &[],
+        );
+        record_added_marketplace_entry(codex_home.path(), "source", &configured_metadata).unwrap();
+        let canonical_source = source_root.canonicalize().unwrap();
+        let request_metadata = MarketplaceInstallMetadata::from_source(
+            &MarketplaceSource::Local {
+                path: canonical_source.clone(),
+            },
+            &[],
+        );
+        let root = installed_marketplace_root_for_source(
+            codex_home.path(),
+            &codex_home.path().join("marketplaces"),
+            &request_metadata,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Model an updater switching the alias before the caller validates the returned root.
+        fs::remove_dir(&alias).unwrap();
+        crate::test_support::create_directory_junction(&other_root, &alias);
+        assert_eq!(root, canonical_source);
+        assert_eq!(validate_marketplace_root(&root).unwrap(), "source");
     }
 }

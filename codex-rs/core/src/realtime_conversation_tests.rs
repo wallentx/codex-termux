@@ -1,21 +1,156 @@
 use super::AGENT_FINAL_MESSAGE_PREFIX;
 use super::HANDOFF_STREAM_TRUNCATION_MARKER;
 use super::RealtimeHandoffState;
+use super::RealtimeInputTaskExit;
+use super::RealtimeOutbound;
+use super::RealtimePendingOutbound;
 use super::RealtimeSessionKind;
 use super::RealtimeStreamedItem;
+use super::classify_realtime_input_error;
+use super::classify_realtime_input_error_with_pending;
 use super::realtime_delegation_from_handoff;
 use super::realtime_request_headers;
 use super::realtime_text_from_handoff_request;
 use super::wrap_realtime_delegation_input;
 use crate::context::RealtimeDelegationSource;
 use async_channel::bounded;
+use codex_api::ApiError;
 use codex_api::RealtimeEventParser;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::CodexResponseHandoffMode;
+use codex_protocol::protocol::ConversationTextParams;
+use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
+use test_case::test_case;
+use tokio::sync::Mutex;
+
+/// Hold old input cleanup open while a successor tries to claim the connection.
+#[tokio::test]
+async fn natural_close_finishes_before_successor_and_ignores_old_identity() {
+    use super::ConversationState;
+    use super::RealtimeConversationEnd;
+    use super::RealtimeHandoffAdmission;
+    use codex_protocol::protocol::Event;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::RealtimeConversationStartedEvent;
+    use codex_protocol::protocol::RealtimeConversationVersion;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    let (sess, _turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let old_identity = Arc::new(AtomicBool::new(true));
+    let stop_token = CancellationToken::new();
+    let input_stop = stop_token.clone();
+    let (entered, cleaning_up) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let input_task = tokio::spawn(async move {
+        input_stop.cancelled().await;
+        entered.send(()).unwrap();
+        released.await.unwrap();
+    });
+    let handoff = RealtimeHandoffState {
+        output_tx: bounded(1).0,
+        last_output: Arc::new(Mutex::new(None)),
+        stream: Arc::new(Mutex::new(Default::default())),
+        client_managed_handoffs: false,
+        codex_responses_as_items: false,
+        codex_response_item_prefix: None,
+        backend_reasoning_status: false,
+        codex_response_handoff_mode: CodexResponseHandoffMode::Thinking,
+        codex_response_handoff_channel_prefixes: Arc::new(BTreeMap::new()),
+        session_kind: RealtimeSessionKind::V1,
+        event_parser: RealtimeEventParser::V1,
+    };
+    let connection = |identity, input_task, stop_token, session: &str| ConversationState {
+        session_id: Some(session.to_owned()),
+        sub_id: session.to_owned(),
+        audio_tx: bounded(1).0,
+        text_tx: bounded(1).0,
+        session_kind: RealtimeSessionKind::V1,
+        handoff: handoff.clone(),
+        input_task,
+        fanout_task: None,
+        realtime_active: identity,
+        route_handoffs: Arc::new(RealtimeHandoffAdmission::new()),
+        stop_token,
+    };
+    sess.conversation.state.lock().await.conversation = Some(connection(
+        Arc::clone(&old_identity),
+        input_task,
+        stop_token,
+        "A",
+    ));
+    let close = sess.conversation.finish_if_active(
+        &sess,
+        &old_identity,
+        "A".to_owned(),
+        RealtimeConversationEnd::TransportClosed,
+    );
+    tokio::pin!(close);
+    assert!(futures::poll!(&mut close).is_pending());
+    cleaning_up.await.unwrap();
+
+    // This is the same state publication boundary used by start_inner.
+    let successor = async {
+        sess.conversation.state.lock().await.conversation = Some(connection(
+            Arc::new(AtomicBool::new(true)),
+            tokio::spawn(async {}),
+            CancellationToken::new(),
+            "B",
+        ));
+        sess.send_event_raw(Event {
+            id: "B".to_owned(),
+            msg: EventMsg::RealtimeConversationStarted(RealtimeConversationStartedEvent {
+                realtime_session_id: Some("B".to_owned()),
+                version: RealtimeConversationVersion::V3,
+            }),
+        })
+        .await;
+    };
+    tokio::pin!(successor);
+    assert!(futures::poll!(&mut successor).is_pending());
+    release.send(()).unwrap();
+    close.await;
+    successor.await;
+    sess.conversation
+        .finish_if_active(
+            &sess,
+            &old_identity,
+            "A".to_owned(),
+            RealtimeConversationEnd::TransportClosed,
+        )
+        .await;
+    let observed = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event.msg {
+            EventMsg::RealtimeConversationClosed(_) => Some((event.id, "closed")),
+            EventMsg::RealtimeConversationStarted(_) => Some((event.id, "started")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![("A".to_owned(), "closed"), ("B".to_owned(), "started")]
+    );
+    assert_eq!(
+        sess.conversation
+            .state
+            .lock()
+            .await
+            .conversation
+            .as_ref()
+            .unwrap()
+            .session_id
+            .as_deref(),
+        Some("B")
+    );
+    sess.conversation.shutdown().await.unwrap();
+}
 
 #[test]
 fn prefers_handoff_input_transcript_over_active_transcript() {
@@ -144,18 +279,71 @@ fn wraps_realtime_delegation_input_with_xml_escaping_without_transcript() {
     );
 }
 
+#[test]
+fn bounds_realtime_delegation_fields_and_keeps_latest_transcript() {
+    let input = format!("start{}input-end", "x".repeat(8 * 1024));
+    let transcript = format!("transcript-start{}latest", "y".repeat(8 * 1024));
+    let rendered = wrap_realtime_delegation_input(
+        &input,
+        Some(&transcript),
+        RealtimeDelegationSource::Handoff,
+    );
+
+    assert!(rendered.len() < 9 * 1024);
+    assert!(rendered.contains("<input>start"));
+    assert!(!rendered.contains("input-end"));
+    assert!(!rendered.contains("transcript-start"));
+    assert!(rendered.contains("latest</transcript_delta>"));
+}
+
+#[test]
+fn classifies_outbound_api_failures_as_transport_loss() {
+    for pending_outbound in [
+        RealtimePendingOutbound::Text(ConversationTextParams {
+            text: "retry me".to_string(),
+            role: ConversationTextRole::User,
+        }),
+        RealtimePendingOutbound::Handoff(RealtimeOutbound::StandaloneHandoff {
+            text: "retry this handoff".to_string(),
+            phase: Some(MessagePhase::FinalAnswer),
+        }),
+    ] {
+        let exit = classify_realtime_input_error_with_pending(
+            ApiError::Stream("failed to send realtime request".to_string()).into(),
+            Some(Box::new(pending_outbound.clone())),
+        );
+        let RealtimeInputTaskExit::TransportLost {
+            err: ApiError::Stream(_),
+            pending_outbound: Some(actual_pending_outbound),
+        } = exit
+        else {
+            panic!("outbound API failure should preserve pending output for reconnect");
+        };
+        assert_eq!(*actual_pending_outbound, pending_outbound);
+    }
+
+    assert!(matches!(
+        classify_realtime_input_error(anyhow::anyhow!("input channel closed")),
+        RealtimeInputTaskExit::Terminal
+    ));
+}
+
 #[tokio::test]
 async fn clears_active_handoff_explicitly() {
     let (tx, _rx) = bounded(1);
-    let state = RealtimeHandoffState::new(
-        tx,
-        /*client_managed_handoffs*/ false,
-        /*codex_responses_as_items*/ false,
-        /*codex_response_item_prefix*/ None,
-        CodexResponseHandoffMode::Thinking,
-        RealtimeSessionKind::V1,
-        /*event_parser*/ RealtimeEventParser::V1,
-    );
+    let state = RealtimeHandoffState {
+        output_tx: tx,
+        last_output: Arc::new(Mutex::new(None)),
+        stream: Arc::new(Mutex::new(Default::default())),
+        client_managed_handoffs: false,
+        codex_responses_as_items: false,
+        codex_response_item_prefix: None,
+        backend_reasoning_status: false,
+        codex_response_handoff_mode: CodexResponseHandoffMode::Thinking,
+        codex_response_handoff_channel_prefixes: Arc::new(BTreeMap::new()),
+        session_kind: RealtimeSessionKind::V1,
+        event_parser: RealtimeEventParser::V1,
+    };
 
     state.stream.lock().await.active_handoff = Some("handoff_1".to_string());
     assert_eq!(
@@ -167,11 +355,17 @@ async fn clears_active_handoff_explicitly() {
     assert_eq!(state.stream.lock().await.active_handoff.clone(), None);
 }
 
-#[test]
-fn streamed_handoff_preserves_a_bounded_final_tail() {
+#[test_case(None, true; "legacy")]
+#[test_case(Some(MessagePhase::FinalAnswer), true; "final_answer")]
+#[test_case(Some(MessagePhase::Commentary), false; "commentary")]
+#[test_case(Some(MessagePhase::PartialAnswer), false; "partial_answer")]
+fn streamed_handoff_preserves_a_bounded_final_tail(
+    phase: Option<MessagePhase>,
+    expect_final_prefix: bool,
+) {
     let mut item = RealtimeStreamedItem {
         handoff_id: "handoff_1".to_string(),
-        phase: Some(MessagePhase::FinalAnswer),
+        phase,
         bem_channel_parser: None,
         prefix_final_message: true,
         sent_bytes: 0,
@@ -192,7 +386,12 @@ fn streamed_handoff_preserves_a_bounded_final_tail() {
     let output = format!("{first}{final_chunk}");
 
     assert!(output.len() <= 4_000);
-    assert!(output.starts_with(&format!("{AGENT_FINAL_MESSAGE_PREFIX}HEAD")));
+    let prefix = if expect_final_prefix {
+        AGENT_FINAL_MESSAGE_PREFIX
+    } else {
+        ""
+    };
+    assert!(output.starts_with(&format!("{prefix}HEAD")));
     assert!(output.contains(HANDOFF_STREAM_TRUNCATION_MARKER));
     assert!(output.ends_with("TAIL"));
 }

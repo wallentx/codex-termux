@@ -85,21 +85,21 @@ async fn drop_kills_wrapper_process_group() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let child_pid_file = temp_dir.path().join("child.pid");
     let child_pid_file_str = child_pid_file.to_string_lossy().into_owned();
+    let wrapper = temp_dir.path().join("wrapper");
+    codex_utils_cargo_bin::write_executable(
+        &wrapper,
+        "#!/bin/sh\nsleep 300 & child_pid=$!; echo \"$child_pid\" > \"$CHILD_PID_FILE\"; cat >/dev/null\n",
+    )?;
 
     let client = RmcpClient::new_stdio_client(
-        OsString::from("/bin/sh"),
-        vec![
-            OsString::from("-c"),
-            OsString::from(
-                "sleep 300 & child_pid=$!; echo \"$child_pid\" > \"$CHILD_PID_FILE\"; cat >/dev/null",
-            ),
-        ],
+        OsString::from("./wrapper"),
+        vec![],
         Some(HashMap::from([(
             OsString::from("CHILD_PID_FILE"),
             OsString::from(child_pid_file_str),
         )])),
         &[],
-        /*cwd*/ None,
+        Some(temp_dir.path().to_string_lossy().into_owned()),
         Arc::new(LocalStdioServerLauncher::new(std::env::current_dir()?)),
     )
     .await?;

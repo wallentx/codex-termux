@@ -1,3 +1,4 @@
+use crate::compact::AutoCompactionDisabled;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -24,11 +25,26 @@ impl ToolExecutor<ToolInvocation> for NewContextWindowHandler {
         create_new_context_window_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             if !matches!(invocation.payload, ToolPayload::Function { .. }) {
                 return Err(FunctionCallError::RespondToModel(
                     "new_context handler received unsupported payload".to_string(),
+                ));
+            }
+
+            if invocation
+                .session
+                .services
+                .thread_extension_data
+                .get::<AutoCompactionDisabled>()
+                .is_some()
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "Context resets are disabled for this thread.".to_string(),
                 ));
             }
 
