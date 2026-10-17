@@ -1,0 +1,40 @@
+name: termux-repair-dispatch
+
+on:
+  workflow_run:
+    workflows: [termux-release-watch, rust-release]
+    types: [completed]
+    branches: [dev, "upstream/rust-v*"]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dispatch:
+    if: >-
+      github.repository == 'wallentx/codex-termux' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.repository.id == github.repository_id &&
+      github.event.workflow_run.head_repository.id == github.repository_id
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            let workflow;
+            if (run.path === '.github/workflows/termux-release-watch.yml' && run.head_branch === 'dev') {
+              workflow = 'termux-watch-repair.lock.yml';
+            } else if (run.path === '.github/workflows/rust-release.yml' &&
+                       run.event === 'pull_request' && /^upstream\/rust-v\d+\.\d+\.\d+$/.test(run.head_branch)) {
+              workflow = 'termux-build-repair.lock.yml';
+            } else {
+              core.notice('Failure is outside the supported release workflows');
+              return;
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              ...context.repo, workflow_id: workflow, ref: 'dev',
+              inputs: {run_id: String(run.id), retry: 'false'}
+            });

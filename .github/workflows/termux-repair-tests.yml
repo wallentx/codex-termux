@@ -1,0 +1,44 @@
+name: termux-repair-tests
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - .github/scripts/*termux*repair*
+      - .github/workflows/termux-*-repair*
+      - .github/workflows/termux-repair-*.yml
+      - .github/aw/**
+      - .gitattributes
+  pull_request:
+    paths:
+      - .github/scripts/*termux*repair*
+      - .github/workflows/termux-*-repair*
+      - .github/workflows/termux-repair-*.yml
+      - .github/aw/**
+      - .gitattributes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test repair authorization and attempt budgets
+        run: python3 -B .github/scripts/test_termux_repair.py
+      - name: Install pinned agentic workflow compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.92.0 --repo github/gh-aw --pattern linux-amd64 --dir "$RUNNER_TEMP/gh-aw-cli"
+          echo "4f1753b20416024b15ff2cbea3f5a8745d7473bd8c73d99b4e8a79d69bb0fe83  $RUNNER_TEMP/gh-aw-cli/linux-amd64" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/gh-aw-cli/linux-amd64"
+      - name: Verify compiled workflows are current
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          "$RUNNER_TEMP/gh-aw-cli/linux-amd64" compile termux-watch-repair termux-build-repair --no-check-update
+          git diff --exit-code -- .github/workflows/termux-watch-repair.lock.yml .github/workflows/termux-build-repair.lock.yml .github/aw .gitattributes

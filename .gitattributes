@@ -1,2 +1,4 @@
 scripts/termux-release-self-update.patch -whitespace
 scripts/termux-release-rollout-locks.patch -whitespace
+
+.github/workflows/*.lock.yml linguist-generated=true
