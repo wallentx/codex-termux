@@ -70,7 +70,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPAIR_RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
           REPAIR_RETRY: ${{ inputs.retry || false }}
-          REPAIR_build: build
+          REPAIR_MODE: build
         run: python3 .github/scripts/termux-repair.py prepare
       - uses: actions/upload-artifact@v7.0.2
         if: steps.context.outputs.eligible == 'true'

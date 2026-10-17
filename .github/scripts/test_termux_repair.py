@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -52,6 +53,14 @@ def pr_fixture():
 
 
 class PolicyTests(unittest.TestCase):
+    def test_workflows_supply_the_preparation_script_environment(self):
+        root = Path(__file__).resolve().parents[2]
+        for mode in ("watch", "build"):
+            text = (root / f".github/workflows/termux-{mode}-repair.md").read_text()
+            keys = set(re.findall(r"^\s+(REPAIR_[A-Za-z_]+):", text, re.MULTILINE))
+            self.assertEqual(keys, {"REPAIR_MODE", "REPAIR_RUN_ID", "REPAIR_RETRY"})
+            self.assertRegex(text, rf"(?m)^\s+REPAIR_MODE: {mode}$")
+
     def test_own_fork_is_supported_but_foreign_heads_are_rejected(self):
         run = run_fixture()
         self.assertTrue(repair.validate_run(run, "watch"))
