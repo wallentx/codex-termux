@@ -461,7 +461,8 @@ jobs:
           binding_path="${binding_dir}/src_binding_release_${TARGET}.rs"
           checksums_path="${binding_dir}/rusty_v8_release_${TARGET}.sha256"
           artifact_repository="wallentx/codex-termux"
-          release_tag="rusty-v8-v147.4.0"
+          v8_version="$(python3 ../.github/scripts/rusty_v8_android_release.py resolved-v8-crate-version --repo-root ..)"
+          release_tag="rusty-v8-v${v8_version}"
           mkdir -p "${binding_dir}"
           echo "Downloading Android rusty_v8 artifacts from ${artifact_repository}@${release_tag}"
           gh release download "${release_tag}" \

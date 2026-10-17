@@ -14,6 +14,7 @@ readonly -a TERMUX_RELEASE_WORKFLOW_PATHS=(
 )
 
 readonly -a TERMUX_RELEASE_GITHUB_SCRIPT_PATHS=(
+  .github/scripts/rusty_v8_android_release.py
   .github/scripts/termux-download-codex-artifact.sh
   .github/scripts/termux-package.py
 )
