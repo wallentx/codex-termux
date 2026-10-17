@@ -251,10 +251,17 @@ def prepare(*, dry_run=False):
         ).splitlines()
         if not tags:
             raise ValueError("downstream has no paired tested baseline")
+
         # Use the generator's older-line fallback when target has moved ahead.
-        line = lambda tag: tuple(map(int, tag.removeprefix("rust-v").split(".")[:2]))
-        if line(tags[0]) > line(context["upstream_tag"]):
-            tags = [t for t in tags if line(t) <= line(context["upstream_tag"])]
+        def release_line(tag):
+            return tuple(map(int, tag.removeprefix("rust-v").split(".")[:2]))
+
+        if release_line(tags[0]) > release_line(context["upstream_tag"]):
+            tags = [
+                t
+                for t in tags
+                if release_line(t) <= release_line(context["upstream_tag"])
+            ]
             if not tags:
                 raise ValueError(
                     "no tested downstream baseline at or before upstream line"
