@@ -22,9 +22,10 @@ credentials.
 The agent workflows use `permissions: copilot-requests: write`, as requested.
 GitHub must provide organization-backed Copilot inference access to the Actions
 token. This is a GitHub account/billing capability, not something the workflow
-can grant itself. A personal repository may be rejected at activation/inference;
-check the actual run before considering the automation operational. No PAT is
-configured or uploaded by this setup.
+can grant itself. The keyless path was verified in this repository on 2026-10-17:
+[run 39052563860](https://github.com/wallentx/codex-termux/actions/runs/39052563860)
+completed inference, validation, threat detection, and publication of PR #522.
+No PAT is configured or uploaded by this setup.
 
 The existing `APP_CLIENT_ID` variable and `APP_PRIVATE_KEY` secret are used by
 deterministic preparation and publication jobs only. The App needs contents,
@@ -53,6 +54,9 @@ threat detection remains enabled. The only new inference permission is
   Cargo manifests/lockfile, on the validated current release PR.
 - Patch limits are 20 files and 256 KiB. Workflows, agent instructions, and
   other protected files cannot be changed through either publishing capability.
+- Publication requires successful post-agent checks, including changed-file
+  formatting, the exact release preflight, and the existing executable
+  startup-lock regressions for watcher repairs.
 - Agents cannot merge, approve, deploy, or bypass failed checks. A watcher fix
   still needs PR review; the normal scheduled watcher resumes after it is merged.
 

@@ -91,6 +91,8 @@ steps:
       name: repair-context
       path: /tmp/gh-aw/agent/termux-repair-context
 pre-agent-steps:
+  - name: Install the release Rust formatter
+    run: rustup toolchain install 1.93 --profile minimal --component rustfmt
   - name: Prepare pinned repair sources
     run: python3 /tmp/gh-aw/agent/termux-repair-context/control.py bootstrap /tmp/gh-aw/agent/termux-repair-context
 post-steps:
@@ -103,6 +105,14 @@ post-steps:
       git diff --check
       current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_BRANCH" --jq .object.sha)"
       test "$current" = "$BASE_SHA"
+  - name: Check changed Rust formatting
+    env:
+      BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+    run: |
+      mapfile -d '' files < <(git diff --name-only --diff-filter=ACMR -z "$BASE_SHA" -- '*.rs')
+      if (( ${#files[@]} )); then
+        rustup run 1.93 rustfmt --check --edition 2024 --config-path codex-rs/rustfmt.toml "${files[@]}"
+      fi
 safe-outputs:
   max-patch-files: 20
   github-app:

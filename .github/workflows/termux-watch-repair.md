@@ -91,6 +91,9 @@ steps:
       name: repair-context
       path: /tmp/gh-aw/agent/termux-repair-context
 pre-agent-steps:
+  - name: Install pinned Python formatter for focused checks
+    run: |
+      python3 -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --target /tmp/gh-aw/agent/repair-lint ruff==0.15.13
   - name: Prepare pinned repair sources
     run: python3 /tmp/gh-aw/agent/termux-repair-context/control.py bootstrap /tmp/gh-aw/agent/termux-repair-context
 post-steps:
@@ -103,6 +106,16 @@ post-steps:
       git diff --check
       current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_BRANCH" --jq .object.sha)"
       test "$current" = "$BASE_SHA"
+  - name: Check changed Python files
+    env:
+      BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+    run: |
+      python3 -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --target "$RUNNER_TEMP/repair-lint" ruff==0.15.13
+      mapfile -d '' files < <(git diff --name-only --diff-filter=ACMR -z "$BASE_SHA" -- '*.py')
+      if (( ${#files[@]} )); then
+        "$RUNNER_TEMP/repair-lint/bin/ruff" check --target-version py311 -- "${files[@]}"
+        "$RUNNER_TEMP/repair-lint/bin/ruff" format --check --target-version py311 -- "${files[@]}"
+      fi
   - name: Validate release generation
     env:
       UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
@@ -110,6 +123,8 @@ post-steps:
       BASELINE_TAG: ${{ needs.prepare.outputs.baseline_tag }}
     run: |
       python3 -B scripts/test-termux-release-tree.py
+      git fetch --no-tags https://github.com/openai/codex.git refs/tags/rust-v0.162.0-alpha.16:refs/tags/rust-v0.162.0-alpha.16 refs/tags/rust-v0.162.1:refs/tags/rust-v0.162.1
+      python3 -B scripts/test-termux-startup-lock.py
       source scripts/termux-release-paths.sh
       python3 scripts/termux-release-tree.py "$UPSTREAM_TAG" "$PATCH_SOURCE_SHA" "$BASELINE_TAG" "${TERMUX_RELEASE_BRANCH_SCRIPT_PATHS[@]}"
 safe-outputs:
@@ -171,6 +186,10 @@ unrelated upstream changes are preserved. For lock/lifecycle changes, run an
 executable focused test for supported and unsupported locking, contention,
 release, cleanup, and replacement-file safety.
 
+Before publishing, run `/tmp/gh-aw/agent/repair-lint/bin/ruff check --target-version py311`
+and `/tmp/gh-aw/agent/repair-lint/bin/ruff format --target-version py311` on changed
+Python files. Keep adapters inactive once their upstream redesign is already in
+the paired baseline; add an unchanged/checkpointed-baseline regression case.
 Run the focused release-generation tests and exact-ref preflight before calling
 `create_pull_request`. Use a branch named `wallentx/repair-KEY`, replacing KEY with
 the context key. Target `dev`. In the PR body include the failure URL, root cause,

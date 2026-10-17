@@ -29,6 +29,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test repair authorization and attempt budgets
         run: python3 -B .github/scripts/test_termux_repair.py
+      - name: Verify the agent's pinned Python formatter
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --target "$RUNNER_TEMP/repair-lint" ruff==0.15.13
+          "$RUNNER_TEMP/repair-lint/bin/ruff" check --target-version py311 .github/scripts/termux-repair.py .github/scripts/test_termux_repair.py scripts/termux-release-tree.py scripts/test-termux-release-tree.py
+          "$RUNNER_TEMP/repair-lint/bin/ruff" format --check --target-version py311 .github/scripts/termux-repair.py .github/scripts/test_termux_repair.py scripts/termux-release-tree.py scripts/test-termux-release-tree.py
       - name: Install pinned agentic workflow compiler
         env:
           GH_TOKEN: ${{ github.token }}
