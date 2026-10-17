@@ -881,12 +881,14 @@ struct FallbackTokenEntry {
 fn load_oauth_tokens_from_file(server_name: &str, url: &str) -> Result<Option<StoredOAuthTokens>> {
     let _store_lock = OAuthStoreLock::acquire_for_read(OAuthStore::File)?;
     load_oauth_tokens_from_file_with_lock_held(server_name, url)
+        .map(|entry| entry.map(|(_, tokens)| tokens))
 }
 
+/// Retains the matched entry's key. The caller must hold the File aggregate-store lock.
 fn load_oauth_tokens_from_file_with_lock_held(
     server_name: &str,
     url: &str,
-) -> Result<Option<StoredOAuthTokens>> {
+) -> Result<Option<(String, StoredOAuthTokens)>> {
     let Some(store) = read_fallback_file_unlocked()? else {
         return Ok(None);
     };
@@ -939,7 +941,7 @@ fn load_oauth_tokens_from_file_with_lock_held(
         };
         refresh_expires_in_from_timestamp(&mut stored);
 
-        return Ok(Some(stored));
+        return Ok(Some((stored_key.clone(), stored)));
     }
 
     Ok(None)

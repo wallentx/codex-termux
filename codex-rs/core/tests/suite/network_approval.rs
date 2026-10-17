@@ -14,6 +14,10 @@ use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_exec_server::RemoveOptions;
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::ToolFinishInput;
+use codex_extension_api::ToolLifecycleContributor;
+use codex_extension_api::ToolLifecycleFuture;
 use codex_features::Feature;
 use codex_history::RolloutItem;
 #[cfg(unix)]
@@ -665,10 +669,34 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
-    let server = start_mock_server().await;
-    let test = managed_network_unified_exec_test(&server).await?;
+    struct HoldExecResult {
+        call_id: &'static str,
+        release: tokio::sync::Notify,
+    }
+
+    impl ToolLifecycleContributor for HoldExecResult {
+        fn on_tool_finish<'a>(&'a self, input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
+            Box::pin(async move {
+                if input.call_id == self.call_id {
+                    self.release.notified().await;
+                }
+            })
+        }
+    }
+
     let call_id = "guardian-network-timeout";
     let poll_call_id = "guardian-network-timeout-poll";
+    let hold_result = Arc::new(HoldExecResult {
+        call_id,
+        release: tokio::sync::Notify::new(),
+    });
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.tool_lifecycle_contributor(hold_result.clone());
+    let server = start_mock_server().await;
+    let test = managed_network_unified_exec_builder(&[])?
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_remote_and_local_env(&server)
+        .await?;
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
@@ -700,7 +728,9 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
-            !is_guardian_request(request) && request_body_contains(request, call_id)
+            !is_guardian_request(request)
+                && request_body_contains(request, call_id)
+                && request_body_contains(request, "Process running with session ID 1000")
         },
         sse(vec![
             ev_response_created("resp-guardian-timeout-parent-followup"),
@@ -720,7 +750,7 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
     let parent_final = mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
-            !is_guardian_request(request) && request_body_contains(request, poll_call_id)
+            !is_guardian_request(request) && request_body_contains(request, call_id)
         },
         sse(vec![
             ev_response_created("resp-guardian-timeout-parent-final"),
@@ -742,12 +772,33 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(91)).await;
     tokio::time::resume();
+
+    // The clock jump expires the review, but cancellation and output drainage
+    // still run asynchronously. Hold the tool result until its terminal event
+    // so the model cannot poll before the final failure is available.
+    let completion = tokio::time::timeout(
+        Duration::from_secs(/*secs*/ 10),
+        wait_for_event(&test.codex, |event| match event {
+            EventMsg::ExecCommandEnd(event) => event.call_id == call_id,
+            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_) => true,
+            _ => false,
+        }),
+    )
+    .await;
+    // notify_one retains a permit if the tool-finish callback has not run yet.
+    hold_result.release.notify_one();
+    let completion = completion.context("timed out waiting for the network command to finish")?;
+    assert!(
+        matches!(completion, EventMsg::ExecCommandEnd(_)),
+        "unexpected event before command completion: {completion:?}"
+    );
     wait_for_completion_without_network_prompt(&test).await;
 
-    let tool_output = parent_final
-        .requests()
-        .iter()
-        .find_map(|request| request.function_call_output_text(poll_call_id))
+    let request = parent_final.single_request();
+    // If the initial exec call already returned its final error, no poll is needed.
+    let tool_output = request
+        .function_call_output_text(poll_call_id)
+        .or_else(|| request.function_call_output_text(call_id))
         .context("expected timed-out Guardian tool output")?;
     assert!(
         tool_output.contains(concat!(

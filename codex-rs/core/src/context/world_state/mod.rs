@@ -1,6 +1,5 @@
 mod agents_md;
 mod apps_instructions;
-mod base_instructions;
 mod collaboration_mode;
 mod compact_permissions;
 mod context_window_guidance;
@@ -40,7 +39,6 @@ use std::fmt;
 
 pub(crate) use agents_md::AgentsMdState;
 pub(crate) use apps_instructions::AppsInstructionsState;
-pub(crate) use base_instructions::BaseInstructionsState;
 pub(crate) use collaboration_mode::CollaborationModeState;
 pub(crate) use compact_permissions::CompactPermissionsState;
 pub(crate) use context_window_guidance::ContextWindowGuidanceState;
@@ -105,18 +103,6 @@ impl WorldStateUpdate {
             .into_iter()
             .map(Self::boxed_fragment)
             .map(Self::standalone)
-            .collect()
-    }
-
-    pub(crate) fn optional_prefix_boxed_fragment(
-        fragment: Option<Box<dyn ContextualUserFragment>>,
-    ) -> Vec<Self> {
-        fragment
-            .into_iter()
-            .map(|fragment| Self {
-                placement: Placement::Prefix,
-                content: WorldStateUpdateContent::Fragment(fragment),
-            })
             .collect()
     }
 
@@ -195,7 +181,7 @@ impl<S: WorldStateSection> ErasedWorldStateSection for S {
     }
 
     fn has_retained_fragment_matcher(&self) -> bool {
-        S::has_retained_fragment_matcher()
+        WorldStateSection::has_current_retained_fragment_matcher(self)
     }
 
     fn matches_retained_fragment(&self, role: &str, text: &str) -> bool {
@@ -278,6 +264,10 @@ struct WorldStateContextFragment {
 }
 
 impl ContextualUserFragment for WorldStateContextFragment {
+    fn content_metadata(&self) -> codex_protocol::models::ContentItemMetadata {
+        self.fragment.metadata().clone()
+    }
+
     fn content_kind(&self) -> ContentItemKind {
         self.content_kind.clone()
     }
@@ -339,6 +329,11 @@ pub(crate) trait WorldStateSection: Send + Sync + 'static {
     /// Whether retained history must still contain this section's rendered fragment.
     fn has_retained_fragment_matcher() -> bool {
         false
+    }
+
+    /// Whether this instance requires its rendered fragment to survive in history.
+    fn has_current_retained_fragment_matcher(&self) -> bool {
+        Self::has_retained_fragment_matcher()
     }
 
     /// Recognizes this section's rendered fragment in retained model history.

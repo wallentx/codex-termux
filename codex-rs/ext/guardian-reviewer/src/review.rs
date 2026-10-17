@@ -1,5 +1,6 @@
 //! Owns synchronous review orchestration, reporting and outcome accounting.
 //! The host binds the original action, captures evidence and enforces authorization.
+//! Async approvals can return while cancelled attempts finish under the parent's task tracker.
 
 use crate::GuardianReviewError;
 use crate::GuardianReviewOutcome;
@@ -21,16 +22,20 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::WarningEvent;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// Operations bound to one immutable action and its issuing context.
 /// Hosts validate authority, publish supplied events and interrupt only the selected turn;
 /// they do not select Guardian outcomes, retry policy or reporting effects.
-pub trait ReviewHost: Send + Sync {
-    type Prepared: Send + Sync;
+/// Clones retain the same action and context. A cancelled attempt may keep its host and
+/// prepared state alive under the parent's task tracker after approval returns.
+pub trait ReviewHost: Clone + Send + Sync + 'static {
+    type Prepared: Send + Sync + 'static;
     /// Evidence captured for one completed assessment, never reused by another attempt.
-    type Evidence: Send;
+    type Evidence: Send + 'static;
     /// Returns the target's rules, or no evidence when they cannot be resolved.
     fn permissions(&self) -> Option<codex_guardian_context::PermissionContext>;
     /// Captures the turn currently servicing reviews, which may differ from a yielded cell's origin.
@@ -106,24 +111,49 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
             self.host
                 .emit(EventMsg::GuardianAssessment(report.started_event()))
                 .await;
+            let prepared = Arc::new(prepared);
             let cancellation = self.cancellation.child_token();
-            let mut review = Box::pin(crate::run_with_retry(
-                GuardianReviewSessionLimits {
-                    max_attempts: crate::MAX_REVIEW_ATTEMPTS,
-                    deadline,
-                },
-                Some(&cancellation),
-                |deadline| self.host.attempt(&prepared, deadline, &cancellation),
-            ));
+            let attempts = Arc::new(AtomicI64::new(/*v*/ 0));
+            let mut review = Box::pin({
+                let host = self.host.clone();
+                let prepared = Arc::clone(&prepared);
+                let cancellation = cancellation.clone();
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    crate::run_with_retry(
+                        GuardianReviewSessionLimits {
+                            max_attempts: crate::MAX_REVIEW_ATTEMPTS,
+                            deadline,
+                        },
+                        Some(&cancellation),
+                        |deadline| {
+                            attempts.fetch_add(/*val*/ 1, Ordering::Relaxed);
+                            host.attempt(&prepared, deadline, &cancellation)
+                        },
+                    )
+                    .await
+                }
+            });
             let (outcome, analytics, evidence) = if let Some(async_approval) = async_approval {
                 tokio::select! {
                     biased;
                     result = &mut review => result,
                     () = async_approval => {
-                        // The async approval won. Finish cancellation through the existing
-                        // reviewer cleanup; the retry loop is never restarted.
                         cancellation.cancel();
-                        let (_, analytics, _) = review.await;
+                        let analytics = if let Some(runtime) = self.thread_store.get::<crate::ReviewerTasks>() {
+                            // Keep driving the same attempt: its pool reservation stays held
+                            // until it drains, and parent shutdown joins the tracked cleanup.
+                            runtime.tasks.spawn(async move { let _ = review.await; });
+                            // Final session and usage metadata are not available yet.
+                            GuardianReviewAnalyticsResult {
+                                attempt_count: attempts.load(Ordering::Relaxed),
+                                ..GuardianReviewAnalyticsResult::without_session()
+                            }
+                        } else {
+                            // Hosts without a lifetime tracker must finish cleanup here.
+                            let (_, analytics, _) = review.await;
+                            analytics
+                        };
                         let outcome = if !self.host.cached_approval_is_current(&prepared).await
                             || self.cancellation.is_cancelled() {
                             GuardianReviewOutcome::Error(GuardianReviewError::Cancelled)
@@ -207,3 +237,7 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "review_tests.rs"]
+mod tests;

@@ -2050,6 +2050,7 @@ async fn overridden_voice_save_keeps_effective_voice() -> Result<()> {
         )
         .await?;
         let server = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             codex_app_server_client::AppServerClient::InProcess(client),
             crate::app_server_session::ThreadParamsMode::Embedded,
         );

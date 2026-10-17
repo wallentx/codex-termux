@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 
 use base64::Engine;
@@ -6,6 +7,8 @@ use codex_api::ImageBackground;
 use codex_api::ImageEditRequest;
 use codex_api::ImageGenerationRequest;
 use codex_api::ImageQuality;
+use codex_attachment_store::UploadRequest;
+use codex_attachment_store::UploadResult;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ExtensionTurnItem;
@@ -19,7 +22,9 @@ use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
 use codex_extension_api::parse_tool_input_schema;
 use codex_extension_items::ExtensionItem;
+use codex_extension_items::image_generation::GeneratedImageRef;
 use codex_extension_items::image_generation::ImageGenerationFailure;
+use codex_extension_items::image_generation::ImageGenerationInputImage;
 use codex_extension_items::image_generation::ImageGenerationItem;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
@@ -48,6 +53,8 @@ use schemars::r#gen::SchemaSettings;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::IMAGE_GEN_NAMESPACE;
 use crate::IMAGEGEN_TOOL_NAME;
@@ -102,10 +109,11 @@ fn legacy_end_event(item: &ImageGenerationItem) -> EventMsg {
         call_id: item.id.clone(),
         status: item.status.clone(),
         revised_prompt: item.revised_prompt.clone(),
-        result: item.result.clone(),
+        image: item.image.clone(),
         transparent_background: item.transparent_background,
         failure: item.failure.clone(),
         saved_path: item.saved_path.clone(),
+        input_images: item.input_images.clone(),
     })
 }
 
@@ -147,19 +155,24 @@ impl ImageGenerationTool {
         call: ToolCall<'_>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args = parse_args(&call)?;
-        let request =
-            request_for_call_args(&args, call.conversation_history.items(), &call.environments)
-                .await?;
+        let PreparedImageRequest {
+            request,
+            input_images,
+        } = request_for_call_args(&args, call.conversation_history.items(), &call.environments)
+            .await?;
         call.turn_item_emitter
             .emit_started(extension_turn_item(
                 ImageGenerationItem {
                     id: call.call_id.clone(),
                     status: "in_progress".to_string(),
                     revised_prompt: None,
-                    result: String::new(),
+                    image: GeneratedImageRef::Inline {
+                        result: String::new(),
+                    },
                     transparent_background: None,
                     failure: None,
                     saved_path: None,
+                    input_images: Vec::new(),
                     imagegen_request_id: None,
                     generation_id: None,
                 },
@@ -169,8 +182,16 @@ impl ImageGenerationTool {
             ))
             .await;
         let result = match request {
-            ImageRequest::Generate(request) => self.backend.generate(request, &call.turn_id).await,
-            ImageRequest::Edit(request) => self.backend.edit(request, &call.turn_id).await,
+            ImageRequest::Generate(request) => {
+                self.backend
+                    .generate(request, &call.turn_id, call.codex_turn_metadata.as_deref())
+                    .await
+            }
+            ImageRequest::Edit(request) => {
+                self.backend
+                    .edit(request, &call.turn_id, call.codex_turn_metadata.as_deref())
+                    .await
+            }
         }
         .map_err(|error| {
             (
@@ -206,10 +227,13 @@ impl ImageGenerationTool {
                     id: call.call_id.clone(),
                     status: "failed".to_string(),
                     revised_prompt: Some(args.prompt),
-                    result: String::new(),
+                    image: GeneratedImageRef::Inline {
+                        result: String::new(),
+                    },
                     transparent_background: None,
                     failure,
                     saved_path: None,
+                    input_images: Vec::new(),
                     imagegen_request_id,
                     generation_id: None,
                 };
@@ -232,14 +256,49 @@ impl ImageGenerationTool {
             &result,
         )
         .await;
+        // The UI item retains its attachment-store reference, while the model-facing output keeps
+        // the original image so Core can prepare and upload it separately.
+        let image = match BASE64_STANDARD.decode(result.trim().as_bytes()) {
+            Ok(data) => {
+                let request = UploadRequest {
+                    thread_id: self.thread_id.clone(),
+                    ephemeral: call.ephemeral,
+                    file_name: None,
+                    tags: HashMap::from([("usage".to_string(), "image_gen".to_string())]),
+                    data,
+                };
+                match call.attachment_store.upload(request).await {
+                    Ok(UploadResult::File { file_id }) => GeneratedImageRef::File { file_id },
+                    Ok(UploadResult::Inline { bytes }) => GeneratedImageRef::Inline {
+                        result: BASE64_STANDARD.encode(bytes),
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            "failed to upload generated image"
+                        );
+                        GeneratedImageRef::Inline {
+                            result: result.clone(),
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!("failed to decode generated image for upload: {error}");
+                GeneratedImageRef::Inline {
+                    result: result.clone(),
+                }
+            }
+        };
         let item = ImageGenerationItem {
             id: call.call_id.clone(),
             status: "completed".to_string(),
             revised_prompt: Some(args.prompt),
-            result: result.clone(),
+            image,
             transparent_background,
             failure: None,
             saved_path: saved_path.clone(),
+            input_images,
             imagegen_request_id,
             generation_id,
         };
@@ -411,11 +470,22 @@ enum ImageRequest {
     Edit(ImageEditRequest),
 }
 
+#[derive(Debug, PartialEq)]
+struct PreparedImageRequest {
+    request: ImageRequest,
+    input_images: Vec<ImageGenerationInputImage>,
+}
+
+struct LoadedInputImage {
+    image: ImageReference,
+    identity: ImageGenerationInputImage,
+}
+
 async fn request_for_call_args(
     args: &ImagegenArgs,
     history: &[ResponseItem],
     environments: &[ToolEnvironment<'_>],
-) -> Result<ImageRequest, FunctionCallError> {
+) -> Result<PreparedImageRequest, FunctionCallError> {
     let background = if args.transparent_background {
         ImageBackground::Transparent
     } else {
@@ -427,16 +497,20 @@ async fn request_for_call_args(
             "`referenced_image_paths` must contain at most {MAX_EDIT_IMAGES} paths"
         )));
     }
+    let mut input_images = Vec::with_capacity(paths.len());
     let images = match (paths.is_empty(), args.num_last_images_to_include) {
         (true, None) => {
-            return Ok(ImageRequest::Generate(ImageGenerationRequest {
-                prompt: args.prompt.clone(),
-                background: Some(background),
-                model: IMAGE_MODEL.to_string(),
-                n: None,
-                quality: Some(ImageQuality::Auto),
-                size: Some("auto".to_string()),
-            }));
+            return Ok(PreparedImageRequest {
+                request: ImageRequest::Generate(ImageGenerationRequest {
+                    prompt: args.prompt.clone(),
+                    background: Some(background),
+                    model: IMAGE_MODEL.to_string(),
+                    n: None,
+                    quality: Some(ImageQuality::Auto),
+                    size: Some("auto".to_string()),
+                }),
+                input_images,
+            });
         }
         (false, None) => {
             let Some(environment) = environments
@@ -449,7 +523,9 @@ async fn request_for_call_args(
             };
             let mut images = Vec::with_capacity(paths.len());
             for path in paths {
-                images.push(image_url(path, environment).await?);
+                let input = load_input_image(path, environment).await?;
+                images.push(input.image);
+                input_images.push(input.identity);
             }
             images
         }
@@ -472,15 +548,18 @@ async fn request_for_call_args(
         }
     };
 
-    Ok(ImageRequest::Edit(ImageEditRequest {
-        images,
-        prompt: args.prompt.clone(),
-        background: Some(background),
-        model: IMAGE_MODEL.to_string(),
-        n: None,
-        quality: Some(ImageQuality::Auto),
-        size: Some("auto".to_string()),
-    }))
+    Ok(PreparedImageRequest {
+        request: ImageRequest::Edit(ImageEditRequest {
+            images,
+            prompt: args.prompt.clone(),
+            background: Some(background),
+            model: IMAGE_MODEL.to_string(),
+            n: None,
+            quality: Some(ImageQuality::Auto),
+            size: Some("auto".to_string()),
+        }),
+        input_images,
+    })
 }
 
 fn recent_images(
@@ -556,10 +635,10 @@ fn output_images(output: &FunctionCallOutputPayload) -> impl Iterator<Item = &Im
         })
 }
 
-async fn image_url(
+async fn load_input_image(
     path: &AbsolutePathBuf,
     environment: &ToolEnvironment<'_>,
-) -> Result<ImageReference, FunctionCallError> {
+) -> Result<LoadedInputImage, FunctionCallError> {
     let path_uri = PathUri::from_abs_path(path);
     let bytes = environment
         .fs()
@@ -571,6 +650,7 @@ async fn image_url(
                 path.display()
             ))
         })?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let image = load_for_prompt_bytes(path.as_path(), bytes, PromptImageMode::Original).map_err(
         |error| {
             FunctionCallError::RespondToModel(format!(
@@ -579,8 +659,14 @@ async fn image_url(
             ))
         },
     )?;
-    Ok(ImageReference::Inline {
-        image_url: image.into_data_url(),
+    Ok(LoadedInputImage {
+        image: ImageReference::Inline {
+            image_url: image.into_data_url(),
+        },
+        identity: ImageGenerationInputImage {
+            path: path.clone(),
+            sha256,
+        },
     })
 }
 

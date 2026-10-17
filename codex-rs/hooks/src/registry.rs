@@ -311,6 +311,7 @@ pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
         config.plugin_hook_sources,
         config.plugin_hook_load_warnings,
         config.bypass_hook_trust,
+        crate::engine::discovery::DiscoveryMode::Listing,
     );
     HookListOutcome {
         hooks: discovered.hook_entries,

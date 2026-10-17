@@ -29,6 +29,7 @@ fn realtime_start_debug_redacts_text_and_transport() {
         realtime_end_instructions: Some(secret.to_owned()),
         prompt: Some(Some(secret.to_owned())),
         realtime_session_id: Some(secret.to_owned()),
+        voice_session_id: Some(secret.to_owned()),
         transport: None,
         version: Some(RealtimeConversationVersion::V3),
         voice: None,

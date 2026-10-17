@@ -8,6 +8,7 @@ mod host;
 use crate::HostSkillsSnapshot;
 use codex_exec_server::EnvironmentAccess;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::McpResourceClient;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -38,6 +39,8 @@ pub struct SkillListQuery {
     pub mcp_resources: Option<Arc<McpResourceClient>>,
     /// Present only when the opt-in high-level executor discovery path is selected.
     pub executor_capability_discovery: Option<ExecutorCapabilityDiscoverySnapshot>,
+    /// Inert V2 inventories; empty when none were supplied. Existing discovery is unchanged.
+    pub executor_capability_discovery_v2: Vec<ExecutorCapabilityDiscoveryV2Snapshot>,
 }
 
 /// A skill read with the source access supplied by its callback.

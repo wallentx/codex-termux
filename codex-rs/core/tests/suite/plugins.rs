@@ -1227,15 +1227,19 @@ async fn legacy_plugin_skill_prompt_remains_complete() -> Result<()> {
     Ok(())
 }
 
-#[test_case(None, true, true, (true, false); "enabled remote supersedes bundled")]
-#[test_case(Some("tpp"), true, true, (true, false); "configured work sku")]
-#[test_case(None, false, true, (false, false); "disabled remote does not reactivate bundled")]
-#[test_case(None, true, false, (false, true); "missing remote bundle preserves bundled")]
+#[test_case("sites", None, true, true, (true, false); "sites enabled remote supersedes bundled")]
+#[test_case("sites", Some("tpp"), true, true, (true, false); "sites configured work sku")]
+#[test_case("sites", None, false, true, (false, false); "sites disabled remote does not reactivate bundled")]
+#[test_case("sites", None, true, false, (false, true); "sites missing remote bundle preserves bundled")]
+#[test_case("visualize", None, true, true, (true, false); "visualize enabled remote supersedes bundled")]
+#[test_case("visualize", None, false, true, (false, false); "visualize disabled remote does not reactivate bundled")]
+#[test_case("visualize", None, true, false, (false, true); "visualize missing remote bundle preserves bundled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sites_compatibility_guard_in_agent_turn(
+async fn bundled_plugin_compatibility_guard_in_agent_turn(
+    plugin_name: &str,
     product_sku: Option<&str>,
     remote_enabled: bool,
-    cache_remote_sites: bool,
+    cache_remote_plugin: bool,
     expected_skills: (bool, bool),
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1250,16 +1254,16 @@ async fn sites_compatibility_guard_in_agent_turn(
         .and(header("OAI-Product-Sku", product_sku.unwrap_or("codex")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "plugins": [{
-                "id": "plugins~plugin_connector_1p_689987207de08191979cf68eca2941c6",
-                "name": "sites",
+                "id": format!("plugins~Plugin_{plugin_name}"),
+                "name": plugin_name,
                 "scope": "GLOBAL",
                 "status": "ENABLED",
                 "installation_policy": "AVAILABLE",
                 "authentication_policy": "ON_USE",
                 "release": {
                     "version": "local",
-                    "display_name": "Sites",
-                    "description": "Sites",
+                    "display_name": plugin_name,
+                    "description": plugin_name,
                     "interface": {},
                 },
                 "enabled": remote_enabled,
@@ -1272,28 +1276,30 @@ async fn sites_compatibility_guard_in_agent_turn(
     let codex_home = Arc::new(TempDir::new()?);
     std::fs::write(
         codex_home.path().join("config.toml"),
-        r#"[features]
+        format!(
+            r#"[features]
 plugins = true
 remote_plugin = true
 
-[plugins."sites@openai-bundled"]
+[plugins."{plugin_name}@openai-bundled"]
 enabled = true
-"#,
+"#
+        ),
     )?;
     for (marketplace, skill) in [
-        ("openai-bundled", "bundled-sites"),
-        ("openai-curated-remote", "remote-sites"),
+        ("openai-bundled", "bundled-skill"),
+        ("openai-curated-remote", "remote-skill"),
     ] {
-        if marketplace == "openai-curated-remote" && !cache_remote_sites {
+        if marketplace == "openai-curated-remote" && !cache_remote_plugin {
             continue;
         }
         let root = codex_home
             .path()
-            .join(format!("plugins/cache/{marketplace}/sites/local"));
+            .join(format!("plugins/cache/{marketplace}/{plugin_name}/local"));
         std::fs::create_dir_all(root.join(".codex-plugin"))?;
         std::fs::write(
             root.join(".codex-plugin/plugin.json"),
-            r#"{"name":"sites"}"#,
+            format!(r#"{{"name":"{plugin_name}"}}"#),
         )?;
         let skill_dir = root.join("skills").join(skill);
         std::fs::create_dir_all(&skill_dir)?;
@@ -1323,7 +1329,7 @@ enabled = true
 
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "Inspect the available Sites skills.".to_string(),
+            text: format!("Inspect the available {plugin_name} skills."),
             text_elements: Vec::new(),
         }]))
         .await?;
@@ -1336,11 +1342,11 @@ enabled = true
     let developer_text = requests[0].message_input_texts("developer").join("\n");
     assert_eq!(
         (
-            developer_text.contains("sites:remote-sites"),
-            developer_text.contains("sites:bundled-sites"),
+            developer_text.contains(&format!("{plugin_name}:remote-skill")),
+            developer_text.contains(&format!("{plugin_name}:bundled-skill")),
         ),
         expected_skills,
-        "unexpected Sites skills in developer prompt: {developer_text:?}"
+        "unexpected {plugin_name} skills in developer prompt: {developer_text:?}"
     );
     Ok(())
 }

@@ -6,9 +6,8 @@ use std::ops::Range;
 use super::*;
 use crate::app_server_session::HISTORY_ITEM_PAGE_LIMIT;
 use crate::app_server_session::thread_items_page_params;
-use crate::history_cell::SessionHeaderHistoryCell;
-use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
+use crate::history_cell::is_session_history_prefix_cell;
 use crate::pager_overlay::TranscriptHistoryState;
 use crate::thread_transcript::RawReasoningVisibility;
 use crate::thread_transcript::thread_items_to_transcript_cells;
@@ -265,10 +264,7 @@ impl App {
         } else {
             self.transcript_cells
                 .iter()
-                .rposition(|cell| {
-                    cell.as_any().is::<SessionInfoCell>()
-                        || cell.as_any().is::<SessionHeaderHistoryCell>()
-                })
+                .rposition(|cell| is_session_history_prefix_cell(cell.as_ref()))
                 .map_or(/*default*/ 0, |index| index.saturating_add(/*rhs*/ 1))
         };
         let inserted = index..index + cells.len();

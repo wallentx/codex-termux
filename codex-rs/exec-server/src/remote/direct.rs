@@ -17,6 +17,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::EnvironmentRegistryClient;
+use super::RegistryAuthMode;
 use super::RemoteEnvironmentConfig;
 use crate::ExecServerError;
 use crate::client::is_retryable_recovery_error;
@@ -80,6 +81,11 @@ impl EnvironmentRegistryClient {
     ) -> Result<DirectRegistrationResponse, ExecServerError> {
         let started_at = Instant::now();
         let response = async {
+            if self.auth_mode == RegistryAuthMode::ExecutorCredential {
+                return Err(ExecServerError::EnvironmentRegistryConfig(
+                    "direct transport does not support scoped executor credentials".to_string(),
+                ));
+            }
             let url = super::endpoint_url(
                 &self.base_url,
                 &format!("/cloud/environment/{environment_id}/direct/register"),
@@ -154,6 +160,7 @@ pub(super) async fn run_direct_environment(
         match connect_direct(
             &registration.url,
             config.auth_provider.as_ref(),
+            config.auth_mode,
             &config.http_client_factory,
         )
         .await
@@ -167,7 +174,7 @@ pub(super) async fn run_direct_environment(
                 );
                 processor
                     .run_connection(
-                        JsonRpcConnection::from_websocket(
+                        JsonRpcConnection::from_direct_websocket(
                             websocket,
                             format!(
                                 "direct exec-server websocket {}",
@@ -252,8 +259,14 @@ fn is_policy_recoverable(
 async fn connect_direct(
     url: &str,
     auth_provider: &dyn AuthProvider,
+    auth_mode: RegistryAuthMode,
     http_client_factory: &codex_http_client::HttpClientFactory,
 ) -> Result<WebSocketConnection, ExecServerError> {
+    if auth_mode == RegistryAuthMode::ExecutorCredential {
+        return Err(ExecServerError::EnvironmentRegistryConfig(
+            "direct transport does not support scoped executor credentials".to_string(),
+        ));
+    }
     let mut request =
         url.into_client_request()
             .map_err(|source| ExecServerError::WebSocketConnect {

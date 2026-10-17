@@ -224,6 +224,11 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     /// Returns copy-friendly plain logical lines for raw scrollback mode.
     fn raw_lines(&self) -> Vec<Line<'static>>;
 
+    /// A local artifact the owned fullscreen viewport may preview. Text surfaces ignore it.
+    fn image_path(&self) -> Option<AbsolutePathBuf> {
+        None
+    }
+
     /// Raw live presentation may omit transcript-only diagnostics without losing their source.
     fn live_raw_lines(&self) -> Vec<Line<'static>> {
         self.raw_lines()

@@ -1,10 +1,9 @@
-//! Emits coarse Codex lifecycle state through terminal status protocols.
+//! Emits Codex lifecycle state through terminal status protocols.
 //!
-//! OSC 7501 is safe to send to any terminal and reports only the lifecycle
-//! state and app name. Direct iTerm2 sessions also receive the existing OSC
-//! 21337 status, including bounded activity text. A process-wide cache matches
-//! the terminal session's ownership and prevents stale state when the active
-//! chat changes.
+//! OSC 7501 reports lifecycle state and blocking reasons to terminal sessions.
+//! Direct iTerm2 sessions also receive OSC 21337 status, including bounded
+//! activity text. The process-wide cache is used for exit, panic, and terminal
+//! handoff cleanup.
 
 use std::fmt;
 use std::io;
@@ -19,8 +18,6 @@ use codex_terminal_detection::terminal_info;
 use crossterm::Command;
 use ratatui::crossterm::execute;
 
-const NO_EMITTED_STATUS: u8 = 0;
-const INVALIDATED_EMITTED_STATUS: u8 = u8::MAX;
 static SESSION_STATUS_STATE: SessionStatusState = SessionStatusState::new();
 static TERMINAL_PROGRAM_STATUS_SUPPORT: OnceLock<TerminalProgramStatusSupport> = OnceLock::new();
 
@@ -29,15 +26,22 @@ struct SessionStatusState {
 }
 
 struct EmittedSessionStatus {
-    status: u8,
+    status: CachedStatus,
     detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CachedStatus {
+    Cleared,
+    Reported(ProgramStatus),
+    Invalidated,
 }
 
 impl SessionStatusState {
     const fn new() -> Self {
         Self {
             last_emitted: Mutex::new(EmittedSessionStatus {
-                status: NO_EMITTED_STATUS,
+                status: CachedStatus::Cleared,
                 detail: String::new(),
             }),
         }
@@ -45,7 +49,7 @@ impl SessionStatusState {
 
     fn update(
         &self,
-        status: u8,
+        status: CachedStatus,
         detail: &str,
         emit: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
@@ -69,8 +73,8 @@ impl SessionStatusState {
             .last_emitted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last_emitted.status != NO_EMITTED_STATUS {
-            last_emitted.status = INVALIDATED_EMITTED_STATUS;
+        if last_emitted.status != CachedStatus::Cleared {
+            last_emitted.status = CachedStatus::Invalidated;
         }
     }
 }
@@ -82,27 +86,35 @@ struct TerminalProgramStatusSupport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
 pub(crate) enum ProgramStatus {
-    Idle = 1,
-    Working = 2,
-    Blocked = 3,
+    Idle,
+    Working,
+    Blocked(ProgramStatusKind),
+    Done,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProgramStatusKind {
+    Permission,
+    Question,
+    Auth,
 }
 
 impl ProgramStatus {
     fn iterm_label(self) -> &'static str {
         match self {
-            Self::Idle => "Idle",
+            Self::Idle | Self::Done | Self::Error => "Idle",
             Self::Working => "Working",
-            Self::Blocked => "Waiting",
+            Self::Blocked(_) => "Waiting",
         }
     }
 
     fn iterm_indicator(self) -> &'static str {
         match self {
-            Self::Idle => "#00d75f",
+            Self::Idle | Self::Done | Self::Error => "#00d75f",
             Self::Working => "#ff9500",
-            Self::Blocked => "#5f87ff",
+            Self::Blocked(_) => "#5f87ff",
         }
     }
 
@@ -110,7 +122,9 @@ impl ProgramStatus {
         match self {
             Self::Idle => "idle",
             Self::Working => "working",
-            Self::Blocked => "blocked",
+            Self::Blocked(_) => "blocked",
+            Self::Done => "done",
+            Self::Error => "error",
         }
     }
 }
@@ -133,7 +147,7 @@ pub(crate) fn set_terminal_program_status(
     } else {
         String::new()
     };
-    SESSION_STATUS_STATE.update(status as u8, &detail, || {
+    SESSION_STATUS_STATE.update(CachedStatus::Reported(status), &detail, || {
         execute!(
             stdout(),
             SetTerminalProgramStatus {
@@ -155,7 +169,7 @@ pub(crate) fn clear_terminal_program_status() -> io::Result<()> {
         return Ok(());
     }
 
-    SESSION_STATUS_STATE.update(NO_EMITTED_STATUS, "", || {
+    SESSION_STATUS_STATE.update(CachedStatus::Cleared, "", || {
         execute!(
             stdout(),
             ClearTerminalProgramStatus {
@@ -233,9 +247,18 @@ impl Command for SetTerminalProgramStatus<'_> {
         }
         write!(
             f,
-            "\x1b]7501;state={}:app=codex\x1b\\",
-            self.status.protocol_state(),
-        )
+            "\x1b]7501;state={}:app=codex",
+            self.status.protocol_state()
+        )?;
+        if let ProgramStatus::Blocked(kind) = self.status {
+            let kind = match kind {
+                ProgramStatusKind::Permission => "permission",
+                ProgramStatusKind::Question => "question",
+                ProgramStatusKind::Auth => "auth",
+            };
+            write!(f, ":kind={kind}")?;
+        }
+        write!(f, "\x1b\\")
     }
 
     #[cfg(windows)]

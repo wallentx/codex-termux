@@ -337,8 +337,7 @@ impl ChatWidget {
                 Self::permission_profile_selection_actions,
             )
         };
-        let requires_confirmation =
-            approvals_reviewer == ApprovalsReviewer::User && preset.id == "full-access";
+        let requires_confirmation = preset.id == "full-access";
         #[cfg(target_os = "windows")]
         if preset.id == "auto"
             && matches!(

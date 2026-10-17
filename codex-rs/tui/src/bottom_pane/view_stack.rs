@@ -70,7 +70,7 @@ impl Renderable for ViewStack<'_> {
 }
 
 /// A dialog placed within the supplied viewport, without taking over its backdrop.
-pub(crate) struct CenteredView<'a>(pub(super) &'a dyn BottomPaneView);
+pub(crate) struct CenteredView<'a>(pub(crate) &'a dyn BottomPaneView);
 
 impl Renderable for CenteredView<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {

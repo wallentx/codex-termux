@@ -1267,8 +1267,26 @@ if [ "$DAEMON_ONLY" = "1" ] && [ "${CODEX_INSTALL_DEFER_SELECTION:-0}" != "1" ];
     echo "The production release does not support daemon-owned packages; the current selection was left unchanged." >&2
     exit 1
   fi
+  # A no-op must not replace the selection link: history is bound to it.
+  selected_dir="$(cd -P "$release_dir" && pwd)"
+  previous_dir="$(cd -P "$CURRENT_LINK" 2>/dev/null && pwd)" || previous_dir=""
+  if [ "$previous_dir" != "$selected_dir" ]; then
+    update_current_link "$release_dir"
+    if ! (
+      history="$STANDALONE_ROOT/selection-history"
+      # GNU and BSD stat both inspect the link itself by default.
+      selection_id="$(LC_ALL=C stat -c '%d %i %.9Z' "$CURRENT_LINK" 2>/dev/null ||
+        LC_ALL=C stat -f '%d %i %Fc' "$CURRENT_LINK")"
+      printf '%s\n%s\n%s\n' "$release_name" "${previous_dir##*/}" "$selection_id" > "$history.tmp.$$"
+      mv -f "$history.tmp.$$" "$history"
+    ); then
+      warn "Could not record daemon selection; pruning will be skipped."
+    fi
+  fi
+else
+  # Do not publish history for a migration until Rust has committed the cutover.
+  update_current_link "$release_dir"
 fi
-update_current_link "$release_dir"
 if [ "$RELEASE" = "latest" ]; then
   printf '%s' "$release_name" > "$AUTO_UPDATE_VERSION.tmp.$$"
   mv -f "$AUTO_UPDATE_VERSION.tmp.$$" "$AUTO_UPDATE_VERSION"

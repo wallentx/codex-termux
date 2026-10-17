@@ -5,8 +5,7 @@
 
 use super::*;
 use crate::history_cell::HistoryRenderMode;
-use crate::history_cell::SessionHeaderHistoryCell;
-use crate::history_cell::SessionInfoCell;
+use crate::history_cell::is_session_history_prefix_cell;
 use crate::keymap::RuntimeKeymap;
 use crate::motion::MotionMode;
 use crate::transcript_view::TranscriptBookmark;
@@ -313,10 +312,7 @@ impl TranscriptOverlay {
         let index = self
             .cells
             .iter()
-            .rposition(|cell| {
-                cell.as_any().is::<SessionInfoCell>()
-                    || cell.as_any().is::<SessionHeaderHistoryCell>()
-            })
+            .rposition(|cell| is_session_history_prefix_cell(cell.as_ref()))
             .map_or(/*default*/ 0, |index| index + 1);
         let added = cells.len();
         self.cells.splice(index..index, cells);

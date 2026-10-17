@@ -120,10 +120,6 @@ function extractLatestModelInfo(markdown) {
   return undefined;
 }
 
-function modelToSkillSlug(model) {
-  return model.trim().replace(/\./g, "p");
-}
-
 function absoluteUrl(baseUrl, value) {
   return new URL(value, baseUrl).toString();
 }
@@ -141,7 +137,6 @@ function normalizeInfo(info, baseUrl) {
 
   return {
     model,
-    modelSlug: modelToSkillSlug(model),
     migrationGuideUrl: absoluteUrl(baseUrl, migrationGuide),
     promptingGuideUrl: absoluteUrl(baseUrl, promptingGuide),
   };

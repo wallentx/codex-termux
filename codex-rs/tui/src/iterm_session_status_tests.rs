@@ -6,9 +6,10 @@ use codex_terminal_detection::TerminalName;
 use crossterm::Command;
 use pretty_assertions::assert_eq;
 
+use super::CachedStatus;
 use super::ClearTerminalProgramStatus;
-use super::NO_EMITTED_STATUS;
 use super::ProgramStatus;
+use super::ProgramStatusKind;
 use super::SessionStatusState;
 use super::SetTerminalProgramStatus;
 use super::TerminalProgramStatusSupport;
@@ -21,7 +22,11 @@ fn encodes_iterm_session_status_fields() {
     for (status, detail) in [
         (ProgramStatus::Idle, ""),
         (ProgramStatus::Working, "Reading source"),
-        (ProgramStatus::Blocked, ""),
+        (ProgramStatus::Blocked(ProgramStatusKind::Permission), ""),
+        (ProgramStatus::Blocked(ProgramStatusKind::Question), ""),
+        (ProgramStatus::Blocked(ProgramStatusKind::Auth), ""),
+        (ProgramStatus::Done, ""),
+        (ProgramStatus::Error, ""),
     ] {
         let mut value = String::new();
         SetTerminalProgramStatus {
@@ -94,53 +99,48 @@ fn clear_empties_every_owned_field() {
 fn cache_changes_only_after_a_successful_write() {
     let state = SessionStatusState::new();
     let mut emitted = Vec::new();
+    let working = CachedStatus::Reported(ProgramStatus::Working);
     state
-        .update(ProgramStatus::Working as u8, "Thinking", || {
+        .update(working, "Thinking", || {
             Err(io::Error::other("write failed"))
         })
         .expect_err("failed write should be returned");
 
     state
-        .update(ProgramStatus::Working as u8, "Thinking", || {
-            emitted.push(ProgramStatus::Working as u8);
+        .update(working, "Thinking", || {
+            emitted.push(working);
             Ok(())
         })
         .expect("retry status write");
     state
-        .update(ProgramStatus::Working as u8, "Thinking", || {
-            emitted.push(ProgramStatus::Blocked as u8);
+        .update(working, "Thinking", || {
+            emitted.push(CachedStatus::Reported(ProgramStatus::Blocked(
+                ProgramStatusKind::Question,
+            )));
             Ok(())
         })
         .expect("deduplicate status write");
     state
-        .update(ProgramStatus::Working as u8, "Reading", || {
-            emitted.push(ProgramStatus::Working as u8);
+        .update(working, "Reading", || {
+            emitted.push(working);
             Ok(())
         })
         .expect("emit changed detail");
     state.invalidate();
     state
-        .update(ProgramStatus::Working as u8, "Thinking", || {
-            emitted.push(ProgramStatus::Working as u8);
+        .update(working, "Thinking", || {
+            emitted.push(working);
             Ok(())
         })
         .expect("re-emit status after terminal handoff");
     state
-        .update(NO_EMITTED_STATUS, "", || {
-            emitted.push(NO_EMITTED_STATUS);
+        .update(CachedStatus::Cleared, "", || {
+            emitted.push(CachedStatus::Cleared);
             Ok(())
         })
         .expect("clear status");
 
-    assert_eq!(
-        emitted,
-        [
-            ProgramStatus::Working as u8,
-            ProgramStatus::Working as u8,
-            ProgramStatus::Working as u8,
-            NO_EMITTED_STATUS,
-        ]
-    );
+    assert_eq!(emitted, [working, working, working, CachedStatus::Cleared,]);
 }
 
 #[test]

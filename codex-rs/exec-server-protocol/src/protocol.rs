@@ -13,6 +13,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_shell_command::shell_detect::DetectedShell;
+use codex_shell_command::shell_detect::ShellType;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
@@ -151,6 +152,9 @@ pub struct EnvironmentCapabilities {
     /// Whether `exec` accepts instructions for launching an executor-local network proxy.
     #[serde(default)]
     pub network_proxy_launch: bool,
+    /// Whether the selected shell can mask executor environment credentials.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credential_masking: bool,
     /// Whether capability discovery applies the filesystem sandbox sent with each root.
     #[serde(default)]
     pub capability_discovery_sandbox: bool,
@@ -260,8 +264,11 @@ impl EnvironmentInfo {
         };
         let temp_dir = normalize_temp_path(std::env::temp_dir().into_os_string());
 
+        let shell = codex_shell_command::shell_detect::default_user_shell();
+        let credential_masking = cfg!(any(target_os = "linux", target_os = "macos"))
+            && matches!(shell.shell_type, ShellType::Bash | ShellType::Zsh);
         Self {
-            shell: codex_shell_command::shell_detect::default_user_shell().into(),
+            shell: shell.into(),
             executor_version: unknown_executor_version(),
             provider_id: None,
             cwd: cwd.and_then(|cwd| PathUri::from_host_native_path(cwd).ok()),
@@ -278,6 +285,7 @@ impl EnvironmentInfo {
             temp_dir,
             capabilities: EnvironmentCapabilities {
                 network_proxy_launch: true,
+                credential_masking,
                 capability_discovery_sandbox: true,
                 capability_discovery_v2: true,
                 environment_config_read: true,
@@ -966,7 +974,8 @@ pub struct CapabilityRootsDiscoverResponse {
     pub roots: Vec<CapabilityRootDiscovery>,
 }
 
-/// Recognized UTF-8 capability file materialized by the exec-server.
+/// UTF-8 capability contents materialized by the exec-server.
+/// `path` identifies the source file; V2 inline MCP contents are extracted from its manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityTextFile {
@@ -979,7 +988,9 @@ pub struct CapabilityTextFile {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredPluginFiles {
     pub manifest: CapabilityTextFile,
-    /// File-backed MCP declarations, including the conventional `.mcp.json` fallback.
+    /// MCP declarations from a selected file, including the conventional `.mcp.json` fallback.
+    /// V2 also materializes inline declarations, using the manifest as the source path.
+    /// V1 leaves inline declarations only in `manifest`.
     #[serde(default)]
     pub mcp_config: Option<CapabilityTextFile>,
     /// File-backed connector declarations.
@@ -1496,6 +1507,7 @@ mod tests {
             capabilities,
             EnvironmentCapabilities {
                 network_proxy_launch: true,
+                credential_masking: false,
                 capability_discovery_sandbox: true,
                 capability_discovery_v2: false,
                 environment_config_read: false,

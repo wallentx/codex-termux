@@ -898,7 +898,7 @@ impl PlanStreamController {
         let plan_style = proposed_plan_style();
         let plan_lines = prefix_hyperlink_lines(plan_lines, "  ".into(), "  ".into())
             .into_iter()
-            .map(|line| line.style(plan_style))
+            .map(|line| history_cell::style_proposed_plan_line(line, plan_style))
             .collect::<Vec<_>>();
         out_lines.extend(plan_lines);
         out_lines
@@ -1952,30 +1952,41 @@ mod tests {
 
     #[test]
     fn finalized_plan_stream_preserves_semantic_url_fragments() {
-        let destination = "https://example.com/a/very/long/path/to/a/table/artifact";
-        let source = format!("| Step | URL |\n| --- | --- |\n| Verify | {destination} |\n");
-        let mut ctrl = PlanStreamController::new(
-            /*width*/ Some(32),
-            &test_cwd(),
-            HistoryRenderMode::Rich,
+        crate::terminal_palette::with_test_default_colors(
+            crate::terminal_probe::DefaultColors {
+                fg: (30, 30, 30),
+                bg: (255, 255, 255),
+            },
+            || {
+                let destination = "https://example.com/a/very/long/path/to/a/table/artifact";
+                let source = format!(
+                    "# Plan\n\n> Quote\n\n| Step | URL |\n| --- | --- |\n| Verify | {destination} |\n"
+                );
+                let mut ctrl = PlanStreamController::new(
+                    /*width*/ Some(32),
+                    &test_cwd(),
+                    HistoryRenderMode::Rich,
+                );
+                ctrl.push(&source);
+
+                let (cell, _) = ctrl.finalize();
+                let lines = cell
+                    .expect("final plan stream table cell")
+                    .display_hyperlink_lines(/*width*/ 32);
+                insta::assert_debug_snapshot!(lines);
+                let linked_rows = lines
+                    .iter()
+                    .filter(|line| !line.hyperlinks.is_empty())
+                    .collect::<Vec<_>>();
+
+                assert!(linked_rows.len() > 1);
+                assert!(linked_rows.iter().all(|line| {
+                    line.hyperlinks
+                        .iter()
+                        .all(|link| link.destination == destination)
+                }));
+            },
         );
-        ctrl.push(&source);
-
-        let (cell, _) = ctrl.finalize();
-        let lines = cell
-            .expect("final plan stream table cell")
-            .display_hyperlink_lines(/*width*/ 32);
-        let linked_rows = lines
-            .iter()
-            .filter(|line| !line.hyperlinks.is_empty())
-            .collect::<Vec<_>>();
-
-        assert!(linked_rows.len() > 1);
-        assert!(linked_rows.iter().all(|line| {
-            line.hyperlinks
-                .iter()
-                .all(|link| link.destination == destination)
-        }));
     }
 
     #[test]

@@ -143,6 +143,7 @@ async fn check_discovery(mixed_sources: bool) -> Result<()> {
         Ok::<_, color_eyre::Report>(cursors)
     });
     let session = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
         crate::connect_remote_app_server(endpoint).await?,
         ThreadParamsMode::Remote,
     );

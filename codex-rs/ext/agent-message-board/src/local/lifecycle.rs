@@ -13,6 +13,7 @@ use super::storage_error;
 use codex_protocol::SessionId;
 use codex_protocol::error::Result;
 use codex_state::SqliteConfig;
+use codex_state::SqlitePoolWriteExt;
 use sqlx::Sqlite;
 use sqlx::Transaction;
 use std::sync::Weak;
@@ -62,10 +63,7 @@ impl LocalAgentMessageBoard {
             .execute(&pool)
             .await
             .map_err(storage_error)?;
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(storage_error)?;
+        let mut tx = pool.begin_immediate().await.map_err(storage_error)?;
         for root in roots {
             sqlx::query("INSERT OR IGNORE INTO deleted_boards (board) VALUES (?)")
                 .bind(root.to_string())
@@ -92,11 +90,7 @@ impl LocalAgentMessageBoard {
     }
 
     pub(super) async fn begin_write(&self) -> Result<Transaction<'_, Sqlite>> {
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(storage_error)?;
+        let mut tx = self.pool.begin_immediate().await.map_err(storage_error)?;
         let deleted: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM deleted_boards WHERE board=?)")
                 .bind(self.identity.to_string())

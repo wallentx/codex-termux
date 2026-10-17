@@ -103,6 +103,7 @@ async fn history_fixture(
         .join("\n");
     std::fs::write(&path, format!("{contents}\n"))?;
     let target = SessionTarget {
+        backend_id: crate::backend_id::BackendId::new(),
         path: Some(path),
         thread_id,
         cwd: None,
@@ -292,6 +293,7 @@ async fn history_hydration_archived_retry_uses_first_attempt_runtime_settings() 
                 }
             };
             assert!(initial.is_err());
+            target.backend_id = server.backend_id();
             let outcome = complete_session_start(
                 &mut server,
                 SessionStartConfig {

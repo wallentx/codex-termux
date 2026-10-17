@@ -171,7 +171,7 @@ fn tool_catalog_cache_does_not_reuse_catalogs_across_credential_policies() {
             .expect("explicit authorization permits catalog caching")
     };
     let host_context = context(&host_identity);
-    host_context.publish_if_newest(host_context.begin_fetch(), &[]);
+    host_context.publish_if_newest(host_context.begin_fetch(), &[], /*meta*/ None);
 
     assert_eq!(context(&host_identity).current_tools(), Some(Vec::new()));
     assert_eq!(context(&executor_identity).current_tools(), None);

@@ -169,6 +169,7 @@ async fn disabling_plugins_clears_cloud_catalog_and_skips_discovery() -> anyhow:
                 "test",
                 &[],
                 /*executor_capability_discovery*/ None,
+                /*executor_capability_discovery_v2*/ None,
             ))
             .await;
         if let Some(state) = thread.get::<PluginsThreadState>() {
@@ -235,6 +236,7 @@ async fn account_change_clears_hosted_plugins_before_waiting_for_executor() -> a
     let init = codex_extension_api::ExtensionDataInit::default();
     let context = McpServerContributionContext::for_step(
         &config, &init, &thread, "test", &roots, /*executor_capability_discovery*/ None,
+        /*executor_capability_discovery_v2*/ None,
     )
     .with_auth_changed(/*auth_changed*/ true);
     let mut loading = std::pin::pin!(contributor.selected_plugins(context, &config.plugins));

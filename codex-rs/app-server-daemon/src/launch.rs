@@ -39,9 +39,20 @@ pub async fn restart_with_features(features: &BTreeMap<String, bool>) -> Result<
 }
 
 impl Daemon {
-    pub(super) async fn restart(&self) -> Result<LifecycleOutput> {
-        self.restart_with_settings(self.load_settings().await?)
-            .await
+    pub(super) async fn restart(
+        &self,
+        features: &BTreeMap<String, bool>,
+    ) -> Result<LifecycleOutput> {
+        let mut settings = self.load_settings().await?;
+        // Explicit requests replace saved aliases as well as canonical keys.
+        settings.feature_overrides.retain(|name, _| {
+            let canonical = codex_features::feature_for_key(name)
+                .map(codex_features::Feature::key)
+                .unwrap_or(name);
+            !features.contains_key(canonical)
+        });
+        settings.feature_overrides.extend(features.clone());
+        self.restart_with_settings(settings).await
     }
 
     pub(super) async fn restart_with_features_locked(

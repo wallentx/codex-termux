@@ -25,10 +25,15 @@ pub struct ExecServerProcess {
 
 impl ExecServerProcess {
     pub async fn start() -> Result<Self> {
+        Self::start_with_env(&[]).await
+    }
+
+    pub async fn start_with_env(env: &[(&str, &str)]) -> Result<Self> {
         let codex_home = TempDir::new()?;
         let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
             .args(["exec-server", "--listen", "ws://127.0.0.1:0"])
             .env("CODEX_HOME", codex_home.path())
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

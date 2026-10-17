@@ -67,6 +67,7 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
         outgoing,
         analytics_events_client,
         arg0_paths: Arg0DispatchPaths::default(),
+        startup_cwd: Some(config.cwd.to_path_buf()),
         config,
         config_manager,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),

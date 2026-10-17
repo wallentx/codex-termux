@@ -322,13 +322,33 @@ impl ChatWidget {
         self.bottom_pane.terminal_title_requires_action()
     }
 
-    pub(super) fn desired_program_status(&self) -> ProgramStatus {
-        if self.terminal_title_requires_action() {
-            ProgramStatus::Blocked
-        } else if self.bottom_pane.is_task_running() || !self.unified_exec_processes.is_empty() {
+    /// Reports the displayed thread's actual state independently of terminal
+    /// title/notification settings. Replays never produce an unseen result.
+    pub(crate) fn desired_program_status(&self) -> ProgramStatus {
+        if let Some(kind) = self.bottom_pane.program_status_blocked_kind() {
+            ProgramStatus::Blocked(kind)
+        } else if self.bottom_pane.is_task_running()
+            || self.is_user_turn_pending_or_running()
+            || !self.unified_exec_processes.is_empty()
+            || (self.status_state.program_status_after_turn == ProgramStatus::Done
+                && self
+                    .current_goal_status
+                    .as_ref()
+                    .is_some_and(GoalStatusState::is_active))
+        {
             ProgramStatus::Working
         } else {
-            ProgramStatus::Idle
+            self.status_state.program_status_after_turn
+        }
+    }
+
+    pub(crate) fn acknowledge_program_status(&mut self) {
+        if matches!(
+            self.desired_program_status(),
+            ProgramStatus::Done | ProgramStatus::Error
+        ) {
+            self.status_state.program_status_after_turn = ProgramStatus::Idle;
+            self.request_redraw();
         }
     }
 

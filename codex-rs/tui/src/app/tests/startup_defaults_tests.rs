@@ -15,7 +15,7 @@ fn remote_target() -> AppServerTarget {
     }
 }
 
-async fn run_startup_for_test(
+pub(super) async fn run_startup_for_test(
     tui: &mut crate::tui::Tui,
     server: AppServerSession,
     config: Config,
@@ -139,6 +139,7 @@ async fn cli_fork_omits_implicit_model_and_effort() -> Result<()> {
         .expect("create source rollout"),
     )?;
     let (mut server, requests, proxy) = start_recording_remote_app_server(&config).await?;
+    let backend_id = server.backend_id();
     let mut bootstrap = server.bootstrap(&config).await?;
     let mut target_preset = bootstrap
         .available_models
@@ -182,6 +183,7 @@ async fn cli_fork_omits_implicit_model_and_effort() -> Result<()> {
         config,
         bootstrap,
         SessionSelection::Fork(crate::resume_picker::SessionTarget {
+            backend_id,
             path: None,
             thread_id: source,
             cwd: None,

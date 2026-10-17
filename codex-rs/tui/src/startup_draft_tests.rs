@@ -619,19 +619,22 @@ fn startup_draft_allows_local_editor_shortcuts_without_startup_actions() {
 }
 
 #[cfg(target_os = "windows")]
-#[test]
-fn startup_draft_preserves_windows_altgr_text_input() {
+#[tokio::test]
+async fn startup_draft_preserves_windows_altgr_text_input() {
     let mut pump = startup_test_pump(std::iter::empty());
-    handle_startup_draft_key(
-        &mut pump.bottom_pane,
-        KeyEvent::new(
+    pump.bottom_pane.insert_str("first");
+    pump.pending_paste_newline = Some((tokio::time::Instant::now(), "\n".to_string()));
+    let mut tui = crate::tui::test_support::make_test_tui().expect("create test terminal");
+    pump.handle_event(
+        &mut tui,
+        TuiEvent::Key(KeyEvent::new(
             KeyCode::Char('@'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
-        ),
+        )),
     )
     .expect("preserve printable AltGr input");
     pump.bottom_pane.flush_composer_paste_burst();
-    assert_eq!(pump.bottom_pane.composer_text(), "@");
+    assert_eq!(pump.bottom_pane.composer_text(), "first\n@");
 }
 
 #[tokio::test]
@@ -684,7 +687,7 @@ async fn startup_draft_applies_paste_burst_preferences_without_losing_buffered_i
 }
 
 #[tokio::test]
-async fn startup_draft_applies_editor_keymap_without_enabling_vim() {
+async fn startup_draft_applies_super_editor_keymap_without_inserting_pending_newline() {
     let codex_home = tempfile::tempdir().expect("create temporary Codex home");
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
@@ -694,7 +697,7 @@ async fn startup_draft_applies_editor_keymap_without_enabling_vim() {
     let mut settings = crate::local_settings::LocalSettings::from(&config);
     settings.tui.vim_mode_default = true;
     settings.tui.keymap.editor.move_line_start = Some(codex_config::types::KeybindingsSpec::One(
-        codex_config::types::KeybindingSpec("ctrl-z".to_string()),
+        codex_config::types::KeybindingSpec("super-z".to_string()),
     ));
     let mut pump = startup_test_pump(std::iter::empty());
     pump.bottom_pane.insert_str("draft");
@@ -707,13 +710,16 @@ async fn startup_draft_applies_editor_keymap_without_enabling_vim() {
     .expect("insert ordinary text despite the configured Vim mode");
     pump.bottom_pane.flush_composer_paste_burst();
     assert_eq!(pump.bottom_pane.composer_text(), "draftx");
-    handle_startup_draft_key(
-        &mut pump.bottom_pane,
-        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+    pump.pending_paste_newline = Some((tokio::time::Instant::now(), "\n".to_string()));
+    let mut tui = crate::tui::test_support::make_test_tui().expect("create test terminal");
+    pump.handle_event(
+        &mut tui,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::SUPER)),
     )
     .expect("honor a configured safe editor shortcut");
+    pump.bottom_pane.flush_composer_paste_burst();
     assert_eq!(pump.bottom_pane.composer_cursor(), 0);
-    let mut tui = crate::tui::test_support::make_test_tui().expect("create test terminal");
+    assert_eq!(pump.bottom_pane.composer_text(), "draftx");
     pump.handle_event(&mut tui, TuiEvent::Key(KeyEvent::from(KeyCode::Enter)))
         .expect("confirm draft");
     pump.apply_settings(&settings, config.cwd.as_path());

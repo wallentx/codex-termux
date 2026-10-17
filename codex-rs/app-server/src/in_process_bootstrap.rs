@@ -105,7 +105,8 @@ pub(super) async fn configure(
 ) -> IoResult<Arc<AuthManager>> {
     let bootstrap_config = config_manager
         .load_startup_config(Some(config.cwd.to_path_buf()))
-        .await?;
+        .await?
+        .config;
     let caller_auth = config.auth_config();
     let bootstrap_auth = codex_login::AuthConfig {
         chatgpt_base_url: Some(bootstrap_config.chatgpt_base_url.clone()),
@@ -132,7 +133,8 @@ pub(super) async fn configure(
     );
     let policy_config = config_manager
         .load_startup_config(Some(config.cwd.to_path_buf()))
-        .await?;
+        .await?
+        .config;
     config.validate_windows_mxc_requirement_from(&policy_config)?;
     let auth_config = codex_login::AuthConfig {
         chatgpt_base_url: Some(policy_config.chatgpt_base_url.clone()),

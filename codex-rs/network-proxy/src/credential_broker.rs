@@ -45,6 +45,17 @@ pub(crate) const BROKERED_CREDENTIALS_ENV_KEY: &str = "CODEX_NETWORK_PROXY_BROKE
 const MIN_EMBEDDED_CREDENTIAL_LENGTH: usize = 16;
 const BROKERED_CREDENTIAL_ALIAS_MARKER_PREFIX: &str = "@alias:";
 
+/// How to handle recognized credentials left raw in a prepared command environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialMaskingFailureMode {
+    /// Warn and keep the unmasked values.
+    Warn,
+    /// Remove variables containing unmasked values, including copied aliases.
+    Deny,
+    /// Reject the command environment.
+    Error,
+}
+
 #[derive(Clone)]
 pub(crate) struct CredentialBroker {
     state: Arc<RwLock<CredentialBrokerState>>,
@@ -1118,6 +1129,59 @@ impl CredentialBroker {
     pub(crate) fn virtualize_text(&self, text: &mut String, env: &HashMap<String, String>) -> bool {
         let state = self.read_state();
         matching::virtualize_text(&state, text, env)
+    }
+
+    pub(crate) fn handle_unmasked_credentials(
+        &self,
+        env: &mut HashMap<String, String>,
+        mode: CredentialMaskingFailureMode,
+    ) -> anyhow::Result<()> {
+        let state = self.read_state();
+        anyhow::ensure!(
+            state.enabled,
+            "credential masking requires an enabled credential broker"
+        );
+        let mut unmasked_keys = Vec::new();
+        for (key, value) in env.iter() {
+            let value = value.trim();
+            let known = matching::known_credential_matches(&state, value, env);
+            let contains_real_credential = known
+                .iter()
+                .any(|matched| matched.value == matched.real_value);
+            let remainder = matching::mask_known_credentials(value, &known);
+            let mut masked = remainder.clone();
+            if contains_real_credential
+                || !matching::virtualize_text(&state, &mut masked, env)
+                || masked != remainder
+            {
+                unmasked_keys.push(key.clone());
+            }
+        }
+        drop(state);
+        if unmasked_keys.is_empty() {
+            return Ok(());
+        }
+        match mode {
+            CredentialMaskingFailureMode::Warn => {
+                tracing::warn!(
+                    "Credential masking could not protect some environment credentials; continuing with those values unmasked."
+                );
+            }
+            CredentialMaskingFailureMode::Deny => {
+                for key in unmasked_keys {
+                    env.remove(&key);
+                }
+                tracing::warn!(
+                    "Credential masking could not protect some environment credentials; removed those variables before execution."
+                );
+            }
+            CredentialMaskingFailureMode::Error => {
+                anyhow::bail!(
+                    "credential masking left an unmasked credential in the command environment"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn restore_text(&self, text: &mut String) -> bool {

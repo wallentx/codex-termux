@@ -257,6 +257,9 @@ fn merge_configured_plugins_with_remote_installed(
         if extra_plugins.contains_key("sites@openai-curated-remote") {
             configured_plugins.remove("sites@openai-bundled");
         }
+        if extra_plugins.contains_key("visualize@openai-curated-remote") {
+            configured_plugins.remove("visualize@openai-bundled");
+        }
         configured_plugins.retain(|plugin_key, _| match PluginId::parse(plugin_key) {
             Ok(plugin_id) => plugin_id.marketplace_name != crate::OPENAI_CURATED_MARKETPLACE_NAME,
             Err(_) => true,
@@ -379,6 +382,9 @@ pub fn remote_installed_plugins_to_config(
                 plugin_id.as_key(),
                 PluginConfig {
                     enabled: Some(plugin.enabled),
+                    remote_plugin_id: None,
+                    release_id: None,
+                    auto_provision: None,
                     mcp_servers: HashMap::new(),
                 },
             ))

@@ -56,6 +56,7 @@ struct UserInstallation {
 
 pub(crate) struct PackageLifecycle {
     package_name: HSTRING,
+    preinstalled: bool,
     uninstalling: Arc<AtomicBool>,
     installation: RefCell<Option<UserInstallation>>,
 }
@@ -64,8 +65,20 @@ impl PackageLifecycle {
     pub(crate) fn new(uninstalling: Arc<AtomicBool>) -> Result<Self> {
         unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
             .context("initialize the sandbox service Windows Runtime apartment")?;
+        let package = Package::Current()?;
+        // Windows removes OEM metadata on uninstall; capture it while the package is installed.
+        let preinstalled = package
+            .InstalledLocation()
+            .and_then(|location| location.Path())
+            .is_ok_and(|path| {
+                PathBuf::from(path.to_os_string())
+                    .join("microsoft.system.package.metadata")
+                    .join("Custom.data")
+                    .is_file()
+            });
         Ok(Self {
-            package_name: Package::Current()?.Id()?.FullName()?,
+            package_name: package.Id()?.FullName()?,
+            preinstalled,
             uninstalling,
             installation: RefCell::default(),
         })
@@ -265,7 +278,13 @@ impl PackageLifecycle {
         let installation = installation
             .as_mut()
             .context("the authenticated package installation was not recorded")?;
-        cleanup::clean_up(installation, prepared, runtime, &self.uninstalling)
+        cleanup::clean_up(
+            installation,
+            prepared,
+            runtime,
+            &self.uninstalling,
+            /*preinstalled*/ self.preinstalled,
+        )
     }
 }
 

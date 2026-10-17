@@ -17,7 +17,9 @@ use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
 use crate::context::CurrentTimeUnavailable;
 use crate::context::DeveloperInstructions;
+use crate::context::GuardianApprovedAction;
 use crate::context::ManagedDeveloperInstructions;
+use crate::context::ModelInstructions;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::MultiAgentUsageHint;
@@ -133,10 +135,16 @@ fn retain_forked_developer_message(item: &mut ResponseItem, usage_hint_texts: &[
         return false;
     };
     content.retain(|content_item| {
+        // Leave base instructions for the later context-baseline retention check.
+        if content_item.kind().as_str() == BaseInstructionsFragment::KIND {
+            return true;
+        }
         // Persisted role hints can predate the current bundled wording and lack markers.
         if matches!(
             content_item.kind().as_str(),
-            "guardian.approved_action" | "multi_agent.role_instructions" | "multi_agent.usage_hint"
+            GuardianApprovedAction::KIND
+                | MultiAgentRoleInstructions::KIND
+                | MultiAgentUsageHint::KIND
         ) {
             return false;
         }
@@ -1181,6 +1189,7 @@ impl LocalAgentControl {
                         return true;
                     };
                     if ManagedDeveloperInstructions::matches_text(text)
+                        || ModelInstructions::matches_text(text)
                         || PersistentModeState::matches_text(text)
                     {
                         // If the child will rebuild its initial context, drop the inherited

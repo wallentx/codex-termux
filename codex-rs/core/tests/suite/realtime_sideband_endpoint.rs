@@ -87,6 +87,7 @@ async fn existing_call_uses_selected_endpoint_and_runtime_auth(
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
+            voice_session_id: None,
             transport: Some(ConversationStartTransport::ExistingCall {
                 call_id: "rtc_existing".to_string(),
                 sideband_base_url: match selection {

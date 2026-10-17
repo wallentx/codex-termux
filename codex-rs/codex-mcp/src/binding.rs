@@ -410,7 +410,7 @@ impl PreparedMcpCall {
                         tokio::time::timeout_at(deadline, add_trusted_access_context)
                             .await
                             .map_err(|_| {
-                                anyhow::anyhow!("timed out awaiting tools/call after {timeout:.0?}")
+                                codex_rmcp_client::request_timeout_error("tools/call", timeout)
                             })?
                     }
                     None => add_trusted_access_context.await,
@@ -419,9 +419,7 @@ impl PreparedMcpCall {
                     Some((timeout, deadline)) => {
                         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                         if remaining.is_zero() {
-                            return Err(anyhow::anyhow!(
-                                "timed out awaiting tools/call after {timeout:.0?}"
-                            ));
+                            return Err(codex_rmcp_client::request_timeout_error("tools/call", timeout));
                         }
                         Some(remaining)
                     }

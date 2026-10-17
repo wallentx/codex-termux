@@ -267,9 +267,46 @@ pub struct RealtimeTranscriptState {
 
 #[derive(Default)]
 struct ActiveTranscriptState {
-    entries: Vec<RealtimeTranscriptEntry>,
+    entries: Vec<ActiveTranscriptEntry>,
+    last_frame: Option<TranscriptFrame>,
+    frame_sequence: u64,
+    input_last_raw_frame: Option<u64>,
+    output_last_raw_frame: Option<u64>,
     new_input_entry: bool,
     new_output_entry: bool,
+}
+
+impl ActiveTranscriptState {
+    fn take_entries(&mut self) -> Vec<RealtimeTranscriptEntry> {
+        self.input_last_raw_frame = None;
+        self.output_last_raw_frame = None;
+        self.entries
+            .drain(..)
+            .map(|entry| entry.transcript)
+            .collect()
+    }
+}
+
+struct ActiveTranscriptEntry {
+    transcript: RealtimeTranscriptEntry,
+    last_raw_frame: Option<u64>,
+    truncated_prefix_bytes: usize,
+}
+
+impl ActiveTranscriptEntry {
+    fn retained_text(&self) -> &str {
+        if self.truncated_prefix_bytes > 0 {
+            &self.transcript.text[TRUNCATED_TRANSCRIPT_PREFIX.len()..]
+        } else {
+            &self.transcript.text
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+struct TranscriptFrame {
+    start_ms: u64,
+    end_ms: u64,
 }
 
 impl RealtimeWebsocketConnection {
@@ -567,7 +604,17 @@ impl RealtimeWebsocketEvents {
                 Message::Text(text) => {
                     trace!(target: REALTIME_WIRE_LOG_TARGET, "realtime websocket event: {text}");
                     if let Some(mut event) = parse_realtime_event(&text, self.event_parser) {
-                        self.update_active_transcript(&mut event).await;
+                        let frame = if self.event_parser == RealtimeEventParser::FramelessBidi
+                            && matches!(
+                                event,
+                                RealtimeEvent::InputTranscriptDelta(_)
+                                    | RealtimeEvent::OutputTranscriptDelta(_)
+                            ) {
+                            serde_json::from_str::<TranscriptFrame>(&text).ok()
+                        } else {
+                            None
+                        };
+                        self.update_active_transcript(&mut event, frame).await;
                         debug!(?event, "realtime websocket parsed event");
                         return Ok(Some(event));
                     }
@@ -623,11 +670,26 @@ impl RealtimeWebsocketEvents {
         }
     }
 
-    async fn update_active_transcript(&self, event: &mut RealtimeEvent) {
+    async fn update_active_transcript(
+        &self,
+        event: &mut RealtimeEvent,
+        frame: Option<TranscriptFrame>,
+    ) {
         let mut active_transcript = self.transcript_state.active.lock().await;
+        let frame_sequence = frame.map(|frame| {
+            // Both speakers in one frame have equal recency, regardless of wire event order.
+            // Count observed frames so reconnects do not depend on an absolute timestamp origin.
+            if active_transcript.last_frame != Some(frame) {
+                truncate_active_transcript(&mut active_transcript.entries);
+                active_transcript.frame_sequence += 1;
+                active_transcript.last_frame = Some(frame);
+            }
+            active_transcript.frame_sequence
+        });
         match event {
             RealtimeEvent::InputAudioSpeechStarted(_) => {
                 active_transcript.new_input_entry = true;
+                active_transcript.input_last_raw_frame = None;
             }
             RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta { delta, .. }) => {
                 let force_new = active_transcript.new_input_entry;
@@ -637,9 +699,11 @@ impl RealtimeWebsocketEvents {
                     delta,
                     force_new,
                     self.event_parser,
+                    frame_sequence,
                 );
                 if !delta.is_empty() || self.event_parser != RealtimeEventParser::FramelessBidi {
                     active_transcript.new_input_entry = false;
+                    active_transcript.input_last_raw_frame = frame_sequence;
                 }
             }
             RealtimeEvent::OutputTranscriptDelta(RealtimeTranscriptDelta { delta, .. }) => {
@@ -650,43 +714,53 @@ impl RealtimeWebsocketEvents {
                     delta,
                     force_new,
                     self.event_parser,
+                    frame_sequence,
                 );
                 if !delta.is_empty() || self.event_parser != RealtimeEventParser::FramelessBidi {
                     active_transcript.new_output_entry = false;
+                    active_transcript.output_last_raw_frame = frame_sequence;
                 }
             }
             RealtimeEvent::InputTranscriptDone(done) => {
                 let force_new = active_transcript.new_input_entry;
+                let last_raw_frame = active_transcript.input_last_raw_frame;
                 apply_transcript_done(
                     &mut active_transcript.entries,
                     "user",
                     &done.text,
                     force_new,
                     self.event_parser,
+                    last_raw_frame,
                 );
                 active_transcript.new_input_entry =
                     self.event_parser == RealtimeEventParser::FramelessBidi;
+                active_transcript.input_last_raw_frame = None;
             }
             RealtimeEvent::OutputTranscriptDone(done) => {
                 let force_new = active_transcript.new_output_entry;
+                let last_raw_frame = active_transcript.output_last_raw_frame;
                 apply_transcript_done(
                     &mut active_transcript.entries,
                     "assistant",
                     &done.text,
                     force_new,
                     self.event_parser,
+                    last_raw_frame,
                 );
                 active_transcript.new_output_entry =
                     self.event_parser == RealtimeEventParser::FramelessBidi;
+                active_transcript.output_last_raw_frame = None;
             }
             RealtimeEvent::HandoffRequested(handoff) => {
+                truncate_active_transcript(&mut active_transcript.entries);
                 append_handoff_input(&mut active_transcript.entries, &handoff.input_transcript);
-                handoff.active_transcript = std::mem::take(&mut active_transcript.entries);
+                handoff.active_transcript = active_transcript.take_entries();
                 active_transcript.new_input_entry = true;
                 active_transcript.new_output_entry = true;
             }
             RealtimeEvent::ResponseCreated(_) => {
                 active_transcript.new_output_entry = true;
+                active_transcript.output_last_raw_frame = None;
             }
             RealtimeEvent::SessionUpdated { .. }
             | RealtimeEvent::AudioOut(_)
@@ -700,42 +774,100 @@ impl RealtimeWebsocketEvents {
             | RealtimeEvent::HistoryTranscriptDelta { .. }
             | RealtimeEvent::HistoryItemCompleted(_) => {}
         }
-        truncate_active_transcript(&mut active_transcript.entries);
+        if let Some(frame_sequence) = frame_sequence {
+            // Wait for both speakers before evicting utterances from this frame. Each updated
+            // utterance is bounded independently, so pending transcript text is at most the previous
+            // 8 KiB transcript plus 8 KiB per speaker, even if no further event arrives.
+            for entry in &mut active_transcript.entries {
+                if entry.last_raw_frame == Some(frame_sequence) {
+                    truncate_transcript_entry(entry, MAX_ACTIVE_TRANSCRIPT_BYTES);
+                }
+            }
+        } else {
+            truncate_active_transcript(&mut active_transcript.entries);
+        }
     }
 }
 
 impl RealtimeTranscriptState {
     pub async fn take_transcript_tail(&self) -> Vec<RealtimeTranscriptEntry> {
-        std::mem::take(&mut self.active.lock().await.entries)
+        let mut active = self.active.lock().await;
+        truncate_active_transcript(&mut active.entries);
+        active.take_entries()
     }
 }
 
-fn truncate_active_transcript(entries: &mut Vec<RealtimeTranscriptEntry>) {
-    let mut total_bytes = transcript_entries_bytes(entries);
+fn truncate_active_transcript(entries: &mut Vec<ActiveTranscriptEntry>) {
+    let mut total_bytes = transcript_entries_bytes(entries.iter().map(|entry| &entry.transcript));
     while total_bytes > MAX_ACTIVE_TRANSCRIPT_BYTES && entries.len() > 1 {
-        total_bytes = total_bytes.saturating_sub(transcript_entry_bytes(&entries[0]));
-        entries.remove(0);
+        // An earlier utterance can contain the newest speech. Evict by raw frame recency,
+        // preserving the legacy FIFO policy without timing.
+        let oldest = if entries.iter().all(|entry| entry.last_raw_frame.is_some()) {
+            entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_raw_frame)
+                .map(|(index, _)| index)
+                .unwrap_or_default()
+        } else {
+            0
+        };
+        if let Some(frame) = entries[oldest].last_raw_frame
+            && entries
+                .iter()
+                .all(|entry| entry.last_raw_frame == Some(frame))
+        {
+            // Both speakers have equally recent speech. Keep their suffixes in conversation
+            // order, letting short entries keep their text before dividing the remaining budget.
+            let mut remaining_bytes = MAX_ACTIVE_TRANSCRIPT_BYTES;
+            let mut remaining_entries = entries.len();
+            let mut by_size: Vec<_> = entries.iter_mut().collect();
+            by_size.sort_unstable_by_key(|entry| transcript_entry_bytes(&entry.transcript));
+            for entry in by_size {
+                let entry_budget = remaining_bytes / remaining_entries;
+                truncate_transcript_entry(entry, entry_budget);
+                remaining_bytes -= transcript_entry_bytes(&entry.transcript);
+                remaining_entries -= 1;
+            }
+            return;
+        }
+        total_bytes -= transcript_entry_bytes(&entries.remove(oldest).transcript);
     }
-    let Some(entry) = entries.first_mut() else {
-        return;
-    };
-    let entry_overhead = entry.role.len() + 3;
-    let max_text_bytes = MAX_ACTIVE_TRANSCRIPT_BYTES.saturating_sub(entry_overhead);
-    if entry.text.len() <= max_text_bytes {
+    if let Some(entry) = entries.first_mut() {
+        truncate_transcript_entry(entry, MAX_ACTIVE_TRANSCRIPT_BYTES);
+    }
+}
+
+fn truncate_transcript_entry(entry: &mut ActiveTranscriptEntry, max_bytes: usize) {
+    let entry_overhead = entry.transcript.role.len() + 3;
+    let max_text_bytes = max_bytes.saturating_sub(entry_overhead);
+    if entry.transcript.text.len() <= max_text_bytes {
         return;
     }
     let mut start = entry
+        .transcript
         .text
         .len()
         .saturating_sub(max_text_bytes.saturating_sub(TRUNCATED_TRANSCRIPT_PREFIX.len()));
-    while !entry.text.is_char_boundary(start) {
+    while !entry.transcript.text.is_char_boundary(start) {
         start += 1;
     }
-    entry.text = format!("{TRUNCATED_TRANSCRIPT_PREFIX}{}", &entry.text[start..]);
+    let previous_marker_bytes = if entry.truncated_prefix_bytes > 0 {
+        TRUNCATED_TRANSCRIPT_PREFIX.len()
+    } else {
+        0
+    };
+    entry.truncated_prefix_bytes += start - previous_marker_bytes;
+    entry.transcript.text = format!(
+        "{TRUNCATED_TRANSCRIPT_PREFIX}{}",
+        &entry.transcript.text[start..]
+    );
 }
 
-fn transcript_entries_bytes(entries: &[RealtimeTranscriptEntry]) -> usize {
-    entries.iter().map(transcript_entry_bytes).sum()
+fn transcript_entries_bytes<'a>(
+    entries: impl IntoIterator<Item = &'a RealtimeTranscriptEntry>,
+) -> usize {
+    entries.into_iter().map(transcript_entry_bytes).sum()
 }
 
 fn transcript_entry_bytes(entry: &RealtimeTranscriptEntry) -> usize {
@@ -743,11 +875,12 @@ fn transcript_entry_bytes(entry: &RealtimeTranscriptEntry) -> usize {
 }
 
 fn append_transcript_delta(
-    entries: &mut Vec<RealtimeTranscriptEntry>,
+    entries: &mut Vec<ActiveTranscriptEntry>,
     role: &str,
     delta: &str,
     force_new: bool,
     event_parser: RealtimeEventParser,
+    frame_sequence: Option<u64>,
 ) {
     if delta.is_empty() {
         return;
@@ -756,30 +889,37 @@ fn append_transcript_delta(
     // V3 interleaves the two speakers' transcripts. Legacy protocols retain
     // adjacent speaker runs and their existing response lifecycle semantics.
     let entry = match event_parser {
-        RealtimeEventParser::FramelessBidi => {
-            entries.iter_mut().rev().find(|entry| entry.role == role)
-        }
-        RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => {
-            entries.last_mut().filter(|entry| entry.role == role)
-        }
+        RealtimeEventParser::FramelessBidi => entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.transcript.role == role),
+        RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => entries
+            .last_mut()
+            .filter(|entry| entry.transcript.role == role),
     };
     if !force_new && let Some(last_entry) = entry {
-        last_entry.text.push_str(delta);
+        last_entry.transcript.text.push_str(delta);
+        last_entry.last_raw_frame = frame_sequence;
         return;
     }
 
-    entries.push(RealtimeTranscriptEntry {
-        role: role.to_string(),
-        text: delta.to_string(),
+    entries.push(ActiveTranscriptEntry {
+        transcript: RealtimeTranscriptEntry {
+            role: role.to_string(),
+            text: delta.to_string(),
+        },
+        last_raw_frame: frame_sequence,
+        truncated_prefix_bytes: 0,
     });
 }
 
 fn apply_transcript_done(
-    entries: &mut Vec<RealtimeTranscriptEntry>,
+    entries: &mut Vec<ActiveTranscriptEntry>,
     role: &str,
     text: &str,
     force_new: bool,
     event_parser: RealtimeEventParser,
+    last_raw_frame: Option<u64>,
 ) {
     if text.is_empty() {
         return;
@@ -788,45 +928,59 @@ fn apply_transcript_done(
     // V3 interleaves the two speakers' transcripts. Legacy protocols retain
     // adjacent speaker runs and their existing response lifecycle semantics.
     let entry = match event_parser {
-        RealtimeEventParser::FramelessBidi => {
-            entries.iter_mut().rev().find(|entry| entry.role == role)
-        }
-        RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => {
-            entries.last_mut().filter(|entry| entry.role == role)
-        }
+        RealtimeEventParser::FramelessBidi => entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.transcript.role == role),
+        RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => entries
+            .last_mut()
+            .filter(|entry| entry.transcript.role == role),
     };
     if !force_new && let Some(last_entry) = entry {
         // A delayed V3 final can arrive after deltas from the next utterance.
         // Preserve accumulated speech unless the final extends it.
-        if event_parser != RealtimeEventParser::FramelessBidi || text.starts_with(&last_entry.text)
+        if event_parser != RealtimeEventParser::FramelessBidi
+            || text
+                .get(last_entry.truncated_prefix_bytes..)
+                .is_some_and(|text| text.starts_with(last_entry.retained_text()))
         {
-            last_entry.text = text.to_string();
+            last_entry.transcript.text = text.to_string();
+            last_entry.truncated_prefix_bytes = 0;
         }
         return;
     }
 
-    entries.push(RealtimeTranscriptEntry {
-        role: role.to_string(),
-        text: text.to_string(),
+    entries.push(ActiveTranscriptEntry {
+        transcript: RealtimeTranscriptEntry {
+            role: role.to_string(),
+            text: text.to_string(),
+        },
+        // A final for an evicted current utterance must not become newer than retained speech.
+        last_raw_frame: if force_new { None } else { last_raw_frame },
+        truncated_prefix_bytes: 0,
     });
 }
 
-fn append_handoff_input(entries: &mut Vec<RealtimeTranscriptEntry>, input: &str) {
+fn append_handoff_input(entries: &mut Vec<ActiveTranscriptEntry>, input: &str) {
     let input = input.trim();
     if input.is_empty() || contains_transcript_entry(entries, "user", input) {
         return;
     }
 
-    entries.push(RealtimeTranscriptEntry {
-        role: "user".to_string(),
-        text: input.to_string(),
+    entries.push(ActiveTranscriptEntry {
+        transcript: RealtimeTranscriptEntry {
+            role: "user".to_string(),
+            text: input.to_string(),
+        },
+        last_raw_frame: None,
+        truncated_prefix_bytes: 0,
     });
 }
 
-fn contains_transcript_entry(entries: &[RealtimeTranscriptEntry], role: &str, text: &str) -> bool {
+fn contains_transcript_entry(entries: &[ActiveTranscriptEntry], role: &str, text: &str) -> bool {
     entries
         .iter()
-        .any(|entry| entry.role == role && entry.text.trim() == text.trim())
+        .any(|entry| entry.transcript.role == role && entry.transcript.text.trim() == text.trim())
 }
 
 pub struct RealtimeWebsocketClient {
@@ -1439,14 +1593,18 @@ mod tests {
         let mut covered = RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta {
             delta: "already handed off".to_string(),
         });
-        events.update_active_transcript(&mut covered).await;
+        events
+            .update_active_transcript(&mut covered, /*frame*/ None)
+            .await;
         let mut handoff = RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
             handoff_id: "handoff_1".to_string(),
             item_id: "item_1".to_string(),
             input_transcript: "already handed off".to_string(),
             active_transcript: vec![],
         });
-        events.update_active_transcript(&mut handoff).await;
+        events
+            .update_active_transcript(&mut handoff, /*frame*/ None)
+            .await;
         assert_eq!(
             handoff,
             RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
@@ -1463,7 +1621,9 @@ mod tests {
         let mut tail = RealtimeEvent::OutputTranscriptDelta(RealtimeTranscriptDelta {
             delta: "tail".to_string(),
         });
-        events.update_active_transcript(&mut tail).await;
+        events
+            .update_active_transcript(&mut tail, /*frame*/ None)
+            .await;
         assert_eq!(
             events.take_transcript_tail().await,
             vec![RealtimeTranscriptEntry {
@@ -1488,7 +1648,9 @@ mod tests {
         let mut partial = RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta {
             delta: "hello wor".to_string(),
         });
-        first_events.update_active_transcript(&mut partial).await;
+        first_events
+            .update_active_transcript(&mut partial, /*frame*/ None)
+            .await;
 
         let (_second_tx, second_rx) = async_channel::unbounded();
         let second_events = RealtimeWebsocketEvents {
@@ -1501,7 +1663,9 @@ mod tests {
         let mut done = RealtimeEvent::InputTranscriptDone(RealtimeTranscriptDone {
             text: "hello world".to_string(),
         });
-        second_events.update_active_transcript(&mut done).await;
+        second_events
+            .update_active_transcript(&mut done, /*frame*/ None)
+            .await;
 
         assert_eq!(
             second_events.take_transcript_tail().await,
@@ -1526,12 +1690,20 @@ mod tests {
         let mut oversized = RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta {
             delta: format!("old{}new", "x".repeat(MAX_ACTIVE_TRANSCRIPT_BYTES)),
         });
-        events.update_active_transcript(&mut oversized).await;
+        for frame in [
+            None,
+            Some(TranscriptFrame {
+                start_ms: 0,
+                end_ms: 200,
+            }),
+        ] {
+            events.update_active_transcript(&mut oversized, frame).await;
 
-        let tail = events.take_transcript_tail().await;
-        assert!(transcript_entries_bytes(&tail) <= MAX_ACTIVE_TRANSCRIPT_BYTES);
-        assert!(tail[0].text.starts_with(TRUNCATED_TRANSCRIPT_PREFIX));
-        assert!(tail[0].text.ends_with("new"));
+            let tail = events.take_transcript_tail().await;
+            assert!(transcript_entries_bytes(&tail) <= MAX_ACTIVE_TRANSCRIPT_BYTES);
+            assert!(tail[0].text.starts_with(TRUNCATED_TRANSCRIPT_PREFIX));
+            assert!(tail[0].text.ends_with("new"));
+        }
     }
 
     #[test]

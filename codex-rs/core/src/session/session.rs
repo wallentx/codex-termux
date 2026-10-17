@@ -646,11 +646,13 @@ async fn warm_plugins_and_skills_for_session_init(
         return Vec::new();
     }
 
-    let fs = turn_environments.primary_filesystem();
     let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
-    let plugin_skill_snapshots = plugins_manager.plugin_skill_snapshots_for_config(&plugins_input);
-    let skills_input = skills_load_input_from_config(config.as_ref(), effective_skill_roots)
-        .with_plugin_skill_snapshots(plugin_skill_snapshots);
+    let (skills_input, fs) = crate::skills::skills_load_input_for_environments(
+        &config,
+        &plugins_manager,
+        effective_skill_roots,
+        turn_environments,
+    );
     skills_service
         .snapshot_for_config(&skills_input, fs)
         .await
@@ -805,6 +807,7 @@ impl Session {
         analytics_events_client: Option<AnalyticsEventsClient>,
         image_store: Arc<dyn AttachmentStore>,
         thread_store: Arc<dyn ThreadStore>,
+        resume_preparation: Option<ThreadStoreResumePreparation>,
         parent_rollout_thread_trace: ThreadTraceContext,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
@@ -1128,8 +1131,13 @@ impl Session {
                         let (context_tx, context_rx) = tokio::sync::oneshot::channel();
                         let live_thread = guard
                             .acquire(async move {
-                                let (live_thread, history) =
-                                    LiveThread::resume(store, history_mode, params).await?;
+                                let (live_thread, history) = LiveThread::resume(
+                                    store,
+                                    history_mode,
+                                    params,
+                                    resume_preparation,
+                                )
+                                .await?;
                                 // Cancellation still leaves the writer with the acquisition guard.
                                 let _ = context_tx.send(history);
                                 Ok(live_thread)
@@ -1173,11 +1181,6 @@ impl Session {
         let mcp_originator = session_configuration.originator.clone();
         let mcp_session_source = session_configuration.session_source.clone();
         let mcp_disabled_plugin_ids = session_configuration.disabled_plugin_ids.clone();
-        let mcp_runtime_cwd = environment_selections
-            .first()
-            .and_then(|environment| environment.cwd.to_abs_path().ok())
-            .map(|cwd| cwd.to_path_buf())
-            .unwrap_or_else(|| session_configuration.cwd().to_path_buf());
         let auth_and_mcp_fut = async move {
             let auth = mcp_auth.await;
             if config_for_mcp.features.plugin_recommendations_enabled() {
@@ -1208,6 +1211,7 @@ impl Session {
                     },
                     /*ready_selected_capability_roots*/ &[],
                     /*executor_capability_discovery*/ None,
+                    /*executor_capability_discovery_v2*/ None,
                 )
                 .await;
             (auth, mcp_projection)
@@ -1479,14 +1483,15 @@ impl Session {
             session_configuration.environments = turn_environments.selections();
             let resolved_environments = turn_environments.snapshot().await;
             let agents_md_manager = Arc::new(AgentsMdManager::new(instructions));
-            let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
+            // Keep discovery's future out of the large embedded startup/resume frame.
+            let plugin_skill_warmup = Box::pin(warm_plugins_and_skills_for_session_init(
                 Arc::clone(&config),
                 Arc::clone(&plugins_manager),
                 Arc::clone(&skills_service),
                 &resolved_environments,
                 extensions.as_ref(),
                 &session_configuration.session_source,
-            )
+            ))
             .instrument(info_span!(
                 "session_init.plugin_skill_warmup",
                 otel.name = "session_init.plugin_skill_warmup",
@@ -1931,6 +1936,7 @@ impl Session {
                         },
                         /*ready_selected_capability_roots*/ &[],
                         /*executor_capability_discovery*/ None,
+                        /*executor_capability_discovery_v2*/ None,
                     )
                     .await
             } else {
@@ -1941,7 +1947,6 @@ impl Session {
                 latest_auth,
                 mcp_projection,
                 &resolved_environments,
-                mcp_runtime_cwd,
             )
             .await?;
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);

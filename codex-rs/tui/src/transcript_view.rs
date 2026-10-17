@@ -30,6 +30,7 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::HistoryRenderMode;
 use crate::pager_overlay::TranscriptHistoryState;
 use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::tui::SelectionCopy;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
@@ -48,26 +49,6 @@ pub(crate) use bookmark::TranscriptBookmark;
 pub(crate) use input::JumpTarget;
 pub(crate) use input::ViewAction;
 pub(crate) use layout::ActivityTranscriptLines;
-
-/// Copy origin plus the deselection policy applied after confirmed delivery.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SelectionCopy {
-    Explicit,
-    OnSelect { clear_selection: bool },
-}
-
-impl SelectionCopy {
-    fn clear_selection(self) -> bool {
-        match self {
-            Self::Explicit => true,
-            Self::OnSelect { clear_selection } => clear_selection,
-        }
-    }
-
-    fn publishes_primary(self) -> bool {
-        matches!(self, Self::OnSelect { .. })
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum EntryKey {
@@ -108,6 +89,7 @@ struct VisibleRow {
 
 /// Shared scrolling and interaction state for compact and detailed transcript presentations.
 pub(crate) struct TranscriptView {
+    pub(crate) image_protocol: Option<crate::pets::ImageProtocol>,
     pub(crate) mouse_scroll_speed: f64,
     pending_mouse_scroll: f64,
     pub(crate) copy_on_select: bool,
@@ -147,6 +129,7 @@ pub(crate) struct TranscriptView {
 impl Default for TranscriptView {
     fn default() -> Self {
         Self {
+            image_protocol: None,
             mouse_scroll_speed: 1.0,
             pending_mouse_scroll: 0.0,
             copy_on_select: false,
@@ -322,6 +305,37 @@ impl TranscriptView {
             self.scroll(current_cells, /*rows*/ 0);
         }
         self.render_search(buf);
+    }
+
+    pub(crate) fn image_placements(&self) -> Vec<crate::transcript_image::ImagePlacement> {
+        let mut placements = Vec::new();
+        let mut y = self.area.y;
+        for rows in self.visible.chunk_by(|a, b| a.index == b.index) {
+            let entry_y = y;
+            y += rows.len() as u16;
+            let visible = &rows[0];
+            let Some(image) = visible.layout.visible_image() else {
+                continue;
+            };
+            let image_start = visible.layout.text_row_count();
+            let skip = image_start.saturating_sub(visible.row);
+            if skip >= rows.len() {
+                continue;
+            }
+            let area = Rect::new(
+                self.area.x + self.area.width.saturating_sub(image.columns) / 2,
+                entry_y + skip as u16,
+                image.columns,
+                (rows.len() - skip) as u16,
+            );
+            placements.push(crate::transcript_image::ImagePlacement {
+                image: Arc::clone(image),
+                area,
+                first_row: visible.row.saturating_sub(image_start),
+                file: None,
+            });
+        }
+        placements
     }
 
     pub(crate) fn sync_live_tail(

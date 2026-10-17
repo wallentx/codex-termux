@@ -6,6 +6,14 @@ use crate::DiscoverV2CapabilitiesResponse;
 use crate::ExecServerError;
 
 impl Environment {
+    /// Identifies the initialized executor session; transport recovery preserves this ID.
+    pub(crate) async fn executor_session_id(&self) -> Result<Option<String>, ExecServerError> {
+        match &self.remote_client {
+            Some(client) => Ok(client.get().await?.session_id()),
+            None => Ok(None),
+        }
+    }
+
     /// Returns metadata for the caller's cwd from the remote session's V2 lifecycle.
     /// Local environments and older executors retain the V1 selected-root API.
     pub async fn discover_capabilities_v2(

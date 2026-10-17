@@ -409,6 +409,11 @@ async fn replacement_preserves_remote_launch_paths_and_older_servers() -> Result
             home.path().join("config.toml"),
             "model = \"configured-model\"\n",
         )?;
+        app.enqueue_primary_thread_session(
+            test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf()),
+            Vec::new(),
+        )
+        .await?;
         let (server, requests, proxy) = start_recording_app_server_with_history(
             &app.config,
             capabilities,

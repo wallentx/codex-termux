@@ -242,13 +242,6 @@ const usableCacheDir = async (cacheDir) => {
   if (!cacheDir) return null;
   const resolved = path.resolve(cacheDir);
 
-  try {
-    const info = await stat(resolved);
-    if (!info.isDirectory()) return null;
-  } catch (error) {
-    if (error?.code !== "ENOENT") return null;
-  }
-
   const parent = await nearestExistingParent(resolved);
   if (!parent) return null;
 

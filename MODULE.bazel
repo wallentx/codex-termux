@@ -175,12 +175,29 @@ single_version_override(
     version = "0.15.1",
 )
 
-bazel_dep(name = "rules_python", version = "1.7.0")
+bazel_dep(name = "rules_python", version = "2.4.2")
 
 voice_python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 voice_python.defaults(python_version = "3.11")
 voice_python.toolchain(python_version = "3.12")
 use_repo(voice_python, "python_3_12")
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    download_only = True,
+    hub_name = "schema_python",
+    python_version = "3.12",
+    target_platforms = [
+        "linux_aarch64",
+        "linux_x86_64",
+        "osx_aarch64",
+        "osx_x86_64",
+        "windows_aarch64",
+        "windows_x86_64",
+    ],
+    uv_lock = "//sdk/python:uv.lock",
+)
+use_repo(pip, "schema_python")
 
 # Use the existing pinned Make build for foreign_cc consumers, including the
 # native voice pkg-config bootstrap, instead of a PATH-provided Make.
@@ -511,22 +528,16 @@ crate.annotation(
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
-codex_release_archive = use_extension(
-    "//bazel/extensions:codex_release_archive.bzl",
-    "codex_release_archive",
+codex_release_archive = use_repo_rule("//bazel/extensions:codex_release_archive.bzl", "codex_release_archive")
+
+codex_release_archive(
+    name = "codex_release_latest_stable",
+    release = "latest",
 )
-codex_release_archive.release(
-    sha256 = "a676f5722aae0d86cbe3764332f08eab1fdd89dc0a300b3ad4ffbf48611fa3e3",
-    version = "0.162.1",
-)
-codex_release_archive.release(
-    sha256 = "71a28d362c96ac9829bf8203a2c71be451aeb726adb843167fdaf0eae8fe7dd9",
-    version = "0.145.0",
-)
-use_repo(
-    codex_release_archive,
-    "codex_release_0.145.0_linux_x86_64",
-    "codex_release_0.162.1_linux_x86_64",
+
+codex_release_archive(
+    name = "codex_release_historical_stable",
+    release = "historical",
 )
 
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
@@ -578,8 +589,7 @@ crate.annotation(
         "RUSTY_V8_SRC_BINDING_PATH": "$(execpath @v8_targets//:rusty_v8_binding_for_target)",
     },
     crate = "v8",
-    # Keep the Rust feature aligned with the source-built Bazel artifacts.
-    # Windows MSVC still consumes upstream non-sandboxed prebuilts.
+    # Keep the Rust feature aligned with the sandbox archive/binding pairs.
     crate_features_select = {
         "aarch64-apple-darwin": ["v8_enable_sandbox"],
         "aarch64-pc-windows-gnullvm": ["v8_enable_sandbox"],
@@ -799,27 +809,28 @@ inject_repo(crate, "alsa_lib")
     ]
 ]
 
-bazel_dep(name = "v8", version = "15.0.245.2")
+bazel_dep(name = "v8", version = "15.2.124.1")
 archive_override(
     module_name = "v8",
-    integrity = "sha256-Fk89PgqLTAKjhtOojRsRM9N+XCC+Ajn+zc3eQUpDQNU=",
+    integrity = "sha256-aNN5G427qQbP/5o+NXONgXR8ZvS6mjf6mfAI6jtxyzI=",
     patch_strip = 3,
     patches = [
         "//patches:v8_module_deps.patch",
         "//patches:v8_bazel_rules.patch",
         "//patches:v8_source_portability.patch",
+        "//patches:v8_array_sort_elements_kind.patch",
     ],
-    strip_prefix = "v8-15.0.245.2",
-    urls = ["https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz"],
+    strip_prefix = "v8-15.2.124.1",
+    urls = ["https://github.com/v8/v8/archive/refs/tags/15.2.124.1.tar.gz"],
 )
 
 http_archive(
-    name = "v8_crate_150_4_0",
+    name = "v8_crate_152_2_0",
     build_file = "//third_party/v8:v8_crate.BUILD.bazel",
-    sha256 = "42a978ff11f15b24e5c05a7123cf2b68f41e763546699781a924ef4e2cf43a49",
-    strip_prefix = "v8-150.4.0",
+    sha256 = "a10fe1a92da5c32c7c7f838ce36c0ccfcfd5edf0865b58bdde820aa64cea9888",
+    strip_prefix = "v8-152.2.0",
     type = "tar.gz",
-    urls = ["https://static.crates.io/crates/v8/v8-150.4.0.crate"],
+    urls = ["https://static.crates.io/crates/v8/v8-152.2.0.crate"],
 )
 
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
@@ -827,7 +838,7 @@ git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "g
 git_repository(
     name = "rusty_v8_libcxx",
     build_file = "//third_party/v8:libcxx.BUILD.bazel",
-    commit = "5abc7f839700f0f17338434e1c1c6a8c87c00c11",
+    commit = "b16984ce99c702355a5b2b4c52574e82cec41fb9",
     remote = "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxx.git",
 )
 
@@ -841,97 +852,151 @@ git_repository(
 git_repository(
     name = "rusty_v8_llvm_libc",
     build_file = "//third_party/v8:llvm_libc.BUILD.bazel",
-    commit = "9309c117ebae84dd2f9df1ef99de4782162527d5",
+    commit = "75ae50cd48c8a9d70f552ccff040029968778da9",
     remote = "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libc.git",
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_aarch64_pc_windows_msvc_archive",
-    downloaded_file_path = "rusty_v8_release_aarch64-pc-windows-msvc.lib.gz",
-    sha256 = "54722842af36b74248c403ff531254efac6ff65d281198bab0c6350fc1188ad4",
-    urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/rusty_v8_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.lib.gz",
-    ],
-)
-
-http_file(
-    name = "rusty_v8_150_4_0_x86_64_pc_windows_msvc_archive",
-    downloaded_file_path = "rusty_v8_release_x86_64-pc-windows-msvc.lib.gz",
-    sha256 = "732ec5da4243aa166799780c8519a5eea6f32f6e47657a323342794dc3c239d6",
-    urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz",
-    ],
-)
-
-http_file(
-    name = "rusty_v8_150_4_0_aarch64_apple_darwin_archive",
+    name = "rusty_v8_152_2_0_aarch64_apple_darwin_archive",
     downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz",
-    sha256 = "00adbb48798848c77550441c68673a5e8529b8e1b73eabcdee232cb39b40f4a1",
+    sha256 = "feab9ae0384bebaa99c1d000654462c9d42123d587185c7876aaeef7d76ff749",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz",
     ],
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_aarch64_apple_darwin_binding",
+    name = "rusty_v8_152_2_0_aarch64_apple_darwin_binding",
     downloaded_file_path = "src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs",
-    sha256 = "ca5adf0cf89c9a70ad460ae73648b2fe89b74aa113b3cb7f757b6a02b758394f",
+    sha256 = "b9d5652ebca515eb2bf4c2ee4a6551b2567117b5aa720f430d2032616dd7e3b5",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs",
     ],
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_aarch64_unknown_linux_gnu_archive",
+    name = "rusty_v8_152_2_0_aarch64_pc_windows_msvc_archive",
+    downloaded_file_path = "rusty_v8_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.lib.gz",
+    sha256 = "daf327876f7753a94b3b05d6d64776258def3ae67503ac75db9c35c6deaa28a5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/rusty_v8_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.lib.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_pc_windows_msvc_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.rs",
+    sha256 = "572ed16ff09bb7944f4b35c659ff62dcd3faf43a0351e3f94f011e01b2f92a62",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_unknown_linux_gnu_archive",
     downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.a.gz",
-    sha256 = "d1517eed405468537029b005d5fe997ec74d5c8d351f916b3a6df20b7d2811ba",
+    sha256 = "1054464a623006cdf5e25ae20877002bf3edb9a2c2f3e64f44a8714742b15e87",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.a.gz",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.a.gz",
     ],
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_aarch64_unknown_linux_gnu_binding",
+    name = "rusty_v8_152_2_0_aarch64_unknown_linux_gnu_binding",
     downloaded_file_path = "src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.rs",
-    sha256 = "7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506",
+    sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.rs",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.rs",
     ],
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_x86_64_apple_darwin_archive",
+    name = "rusty_v8_152_2_0_aarch64_unknown_linux_musl_archive",
+    downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-musl.a.gz",
+    sha256 = "1a60f36a3dd8778802e6980668c4d65a3c7305d85a5d2debf466d9aa0daadd75",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-musl.a.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_unknown_linux_musl_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-musl.rs",
+    sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-musl.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_apple_darwin_archive",
     downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_x86_64-apple-darwin.a.gz",
-    sha256 = "e0d9bb64e8b3a034c2930c83972f3f35760211148342fa0407b38250ef330856",
+    sha256 = "bfe19d9b633b61d99780ece89690427fef4b985c6b4196536eaf94571166fc24",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/librusty_v8_ptrcomp_sandbox_release_x86_64-apple-darwin.a.gz",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_x86_64-apple-darwin.a.gz",
     ],
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_x86_64_apple_darwin_binding",
+    name = "rusty_v8_152_2_0_x86_64_apple_darwin_binding",
     downloaded_file_path = "src_binding_ptrcomp_sandbox_release_x86_64-apple-darwin.rs",
-    sha256 = "ca5adf0cf89c9a70ad460ae73648b2fe89b74aa113b3cb7f757b6a02b758394f",
+    sha256 = "b9d5652ebca515eb2bf4c2ee4a6551b2567117b5aa720f430d2032616dd7e3b5",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_x86_64-apple-darwin.rs",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_x86_64-apple-darwin.rs",
     ],
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_x86_64_unknown_linux_gnu_archive",
+    name = "rusty_v8_152_2_0_x86_64_pc_windows_msvc_archive",
+    downloaded_file_path = "rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz",
+    sha256 = "cd829415695b30ad61b306b23a381e11276f14bb0b46815ac5ed8b96711d002d",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_pc_windows_msvc_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.rs",
+    sha256 = "572ed16ff09bb7944f4b35c659ff62dcd3faf43a0351e3f94f011e01b2f92a62",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_unknown_linux_gnu_archive",
     downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz",
-    sha256 = "a35c75d1f26e6a983885a45b33490a4ebe54f05050568b32b89cfb421b30b583",
+    sha256 = "b3b490f2aa809eda7f6ac727f851fb00ce8355be72827577cfaac28c7137dbcd",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz",
     ],
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_x86_64_unknown_linux_gnu_binding",
+    name = "rusty_v8_152_2_0_x86_64_unknown_linux_gnu_binding",
     downloaded_file_path = "src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs",
-    sha256 = "7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506",
+    sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_unknown_linux_musl_archive",
+    downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-musl.a.gz",
+    sha256 = "2f2679773a12576dc6b89b0f7d70e8190e5aea8a57f8f6364efaffdd1497d0e7",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-musl.a.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_unknown_linux_musl_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-musl.rs",
+    sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-musl.rs",
     ],
 )
 

@@ -145,6 +145,7 @@ fn params(session: &str, url: &str) -> ConversationStartParams {
         realtime_end_instructions: None,
         prompt: None,
         realtime_session_id: Some(session.to_owned()),
+        voice_session_id: None,
         transport: Some(ConversationStartTransport::ExistingCall {
             call_id: format!("rtc_{session}"),
             sideband_base_url: Some(url.to_owned()),

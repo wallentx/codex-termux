@@ -1,4 +1,5 @@
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+use codex_app_server_protocol::GeneratedImageRef;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::UserInput;
@@ -190,7 +191,11 @@ fn without_thread_item_media(mut item: ThreadItem) -> ThreadItem {
                     .is_none()
             });
         }
-        ThreadItem::ImageGeneration(item) => item.result.clear(),
+        ThreadItem::ImageGeneration(item) => {
+            item.image = GeneratedImageRef::Inline {
+                result: String::new(),
+            };
+        }
         ThreadItem::HookPrompt { .. }
         | ThreadItem::AgentMessage { .. }
         | ThreadItem::Plan { .. }

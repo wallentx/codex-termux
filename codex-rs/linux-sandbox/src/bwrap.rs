@@ -128,7 +128,6 @@ pub(crate) struct BwrapArgs {
     pub args: Vec<String>,
     pub preserved_files: Vec<File>,
     pub synthetic_mount_targets: Vec<SyntheticMountTarget>,
-    pub protected_create_targets: Vec<ProtectedCreateTarget>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,23 +158,6 @@ pub(crate) struct SyntheticMountTarget {
     // If an empty metadata path was already present, remember its inode so
     // cleanup does not delete a real pre-existing file or directory.
     pre_existing_path: Option<FileIdentity>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProtectedCreateTarget {
-    path: PathBuf,
-}
-
-impl ProtectedCreateTarget {
-    pub(crate) fn missing(path: &Path) -> Self {
-        Self {
-            path: path.to_path_buf(),
-        }
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl SyntheticMountTarget {
@@ -268,7 +250,6 @@ pub(crate) fn create_bwrap_command_args(
                 args: command,
                 preserved_files: Vec::new(),
                 synthetic_mount_targets: Vec::new(),
-                protected_create_targets: Vec::new(),
             })
         } else {
             Ok(create_bwrap_flags_full_filesystem(command, options))
@@ -321,7 +302,6 @@ fn create_bwrap_flags_full_filesystem(command: Vec<String>, options: BwrapOption
         args,
         preserved_files: Vec::new(),
         synthetic_mount_targets: Vec::new(),
-        protected_create_targets: Vec::new(),
     }
 }
 
@@ -354,7 +334,6 @@ fn create_bwrap_flags(
         args: filesystem_args,
         preserved_files,
         synthetic_mount_targets,
-        protected_create_targets,
     } = create_filesystem_args(file_system_sandbox_policy, sandbox_policy_cwd, options)?;
     let normalized_command_cwd = normalize_command_cwd_for_bwrap(command_cwd);
     let mut args = Vec::new();
@@ -407,7 +386,6 @@ fn create_bwrap_flags(
         args,
         preserved_files,
         synthetic_mount_targets,
-        protected_create_targets,
     })
 }
 
@@ -608,7 +586,6 @@ fn create_filesystem_args(
         args,
         preserved_files: Vec::new(),
         synthetic_mount_targets: Vec::new(),
-        protected_create_targets: Vec::new(),
     };
     let mut allowed_write_paths = Vec::with_capacity(writable_roots.len());
     for writable_root in &writable_roots {
@@ -719,13 +696,6 @@ fn create_filesystem_args(
             deferred_read_only_subpaths =
                 remap_paths_for_symlink_target(deferred_read_only_subpaths, root, target);
         }
-        append_protected_create_targets_for_writable_root(
-            &mut bwrap_args,
-            protected_metadata_names,
-            root,
-            symlink_target.as_deref(),
-            &read_only_subpaths,
-        );
         read_only_subpaths.sort_by_key(|path| path_depth(path));
         for subpath in read_only_subpaths {
             if let Some(symlink) =
@@ -826,29 +796,6 @@ fn create_filesystem_args(
     }
 
     Ok(bwrap_args)
-}
-
-fn append_protected_create_targets_for_writable_root(
-    bwrap_args: &mut BwrapArgs,
-    protected_metadata_names: &[String],
-    root: &Path,
-    symlink_target: Option<&Path>,
-    read_only_subpaths: &[PathBuf],
-) {
-    for name in protected_metadata_names {
-        let mut path = root.join(name);
-        if let Some(target) = symlink_target
-            && let Ok(relative_path) = path.strip_prefix(root)
-        {
-            path = target.join(relative_path);
-        }
-        if read_only_subpaths.iter().any(|subpath| subpath == &path) || path.exists() {
-            continue;
-        }
-        bwrap_args
-            .protected_create_targets
-            .push(ProtectedCreateTarget::missing(&path));
-    }
 }
 
 fn append_metadata_path_masks_for_writable_root(
@@ -2197,10 +2144,6 @@ mod tests {
                 workspace.join(".aws"),
             ],
         );
-        assert!(
-            protected_create_target_paths(&args).is_empty(),
-            "missing child .git should be mount protected before command execution",
-        );
     }
 
     #[cfg(unix)]
@@ -2238,10 +2181,6 @@ mod tests {
                 workspace.join(".agents"),
                 workspace.join(".aws"),
             ],
-        );
-        assert!(
-            protected_create_target_paths(&args).is_empty(),
-            "symlinked missing child .git should be mount protected before command execution",
         );
     }
 
@@ -2333,11 +2272,6 @@ mod tests {
         assert!(synthetic_targets.contains(&PathBuf::from(&dot_git)));
         assert!(synthetic_targets.contains(&PathBuf::from(&dot_agents)));
         assert!(synthetic_targets.contains(&PathBuf::from(&dot_codex)));
-        assert_eq!(
-            protected_create_target_paths(&args),
-            Vec::<PathBuf>::new(),
-            "missing protected metadata paths should fail at creation time through read-only mounts",
-        );
     }
 
     #[test]
@@ -3136,13 +3070,6 @@ mod tests {
 
     fn synthetic_mount_target_paths(args: &BwrapArgs) -> Vec<PathBuf> {
         args.synthetic_mount_targets
-            .iter()
-            .map(|target| target.path().to_path_buf())
-            .collect()
-    }
-
-    fn protected_create_target_paths(args: &BwrapArgs) -> Vec<PathBuf> {
-        args.protected_create_targets
             .iter()
             .map(|target| target.path().to_path_buf())
             .collect()

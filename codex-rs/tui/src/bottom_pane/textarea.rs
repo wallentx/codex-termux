@@ -793,13 +793,17 @@ impl TextArea {
         }
         if self.is_vim_replace_mode()
             && self.mouse_selection_range().is_none()
-            && self.editor_keymap.delete_backward.is_pressed(event)
+            && self.is_delete_backward_key(event)
             && self.apply_vim_insert_action(VimAction::RestoreReplacedCharacter)
         {
             return;
         }
         let keymap = self.editor_keymap.clone();
         self.input_with_keymap(event, &keymap);
+    }
+
+    pub(in crate::bottom_pane) fn is_delete_backward_key(&self, event: KeyEvent) -> bool {
+        self.editor_keymap.delete_backward.is_pressed(event)
     }
 
     fn leave_vim_insert_mode(&mut self) {
@@ -1680,6 +1684,13 @@ impl TextArea {
             .map(|element| element.id)
     }
 
+    pub(crate) fn element_range(&self, id: u64) -> Option<Range<usize>> {
+        self.elements
+            .iter()
+            .find(|element| element.id == id)
+            .map(|element| element.range.clone())
+    }
+
     /// Renames a single text element in-place, keeping it atomic.
     ///
     /// Use this when the element payload is an identifier (e.g. a placeholder) that must be
@@ -1797,6 +1808,10 @@ impl TextArea {
         self.elements
             .retain(|elem| elem.range.start != start || elem.range.end != end);
         len_before != self.elements.len()
+    }
+
+    pub(crate) fn remove_element(&mut self, id: u64) {
+        self.elements.retain(|element| element.id != id);
     }
 
     fn next_element_id(&mut self) -> u64 {
@@ -3156,6 +3171,22 @@ mod tests {
         t.kill_to_beginning_of_line();
         assert_eq!(t.text(), "abcdef");
         assert_eq!(t.cursor(), 3);
+    }
+
+    #[test]
+    fn super_line_editing_defaults_follow_macos_conventions() {
+        let mut textarea = ta_with("first\nsecond third");
+        textarea.set_cursor("first\nsecond".len());
+
+        textarea.input(KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER));
+        assert_eq!(textarea.cursor(), "first\n".len());
+
+        textarea.input(KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER));
+        assert_eq!(textarea.cursor(), textarea.text().len());
+
+        textarea.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(textarea.text(), "first\n");
+        assert_eq!(textarea.cursor(), "first\n".len());
     }
 
     #[test]

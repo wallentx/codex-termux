@@ -69,9 +69,8 @@ impl RequestPermissionsHandler {
 
         let environment_args: RequestPermissionsEnvironmentArgs = parse_arguments(&arguments)?;
         let turn_environment = resolve_tool_environment(
-            &step_context,
+            &step_context.environments,
             environment_args.environment_id.as_deref(),
-            "request_permissions requires a primary environment",
         )?;
         let sandbox_context =
             turn_environment.sandbox_context(/*additional_permissions*/ None);

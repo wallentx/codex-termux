@@ -17,6 +17,7 @@ async fn later_page_error_preserves_loaded_sessions() {
                 }
             });
             let mut state = PickerState::new(
+                crate::backend_id::BackendId::new(),
                 FrameRequester::test_dummy(),
                 loader,
                 ProviderFilter::Any,

@@ -4,6 +4,7 @@ use pretty_assertions::assert_eq;
 use crate::terminal_program_status::ProgramStatus::Blocked;
 use crate::terminal_program_status::ProgramStatus::Idle;
 use crate::terminal_program_status::ProgramStatus::Working;
+use crate::terminal_program_status::ProgramStatusKind;
 
 #[tokio::test]
 async fn session_status_follows_existing_lifecycle_state() {
@@ -52,7 +53,15 @@ async fn session_status_follows_existing_lifecycle_state() {
 
     assert_eq!(
         states,
-        [Idle, Working, Blocked, Working, Idle, Working, Idle]
+        [
+            Idle,
+            Working,
+            Blocked(ProgramStatusKind::Permission),
+            Working,
+            Idle,
+            Working,
+            Idle
+        ]
     );
 }
 
@@ -66,7 +75,7 @@ async fn session_status_detail_uses_only_foreground_activity() {
     let generic = detail(&chat, Working);
     chat.set_status_header("Reading source".to_string());
     let working = detail(&chat, Working);
-    let waiting = detail(&chat, Blocked);
+    let waiting = detail(&chat, Blocked(ProgramStatusKind::Question));
     chat.bottom_pane.set_task_running(/*running*/ false);
     let idle = detail(&chat, Idle);
     let background = detail(&chat, Working);

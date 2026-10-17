@@ -3,7 +3,6 @@
 //! This wraps the raw channel so call sites can submit typed `AppCommand`s
 //! without duplicating event construction or session logging behavior.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -84,13 +83,6 @@ impl AppEventSender {
 
     pub(crate) fn review(&self, target: ReviewTarget) {
         self.send(AppEvent::CodexOp(AppCommand::review(target)));
-    }
-
-    pub(crate) fn list_skills(&self, cwds: Vec<PathBuf>, force_reload: bool) {
-        self.send(AppEvent::CodexOp(AppCommand::list_skills(
-            cwds,
-            force_reload,
-        )));
     }
 
     pub(crate) fn user_input_answer(

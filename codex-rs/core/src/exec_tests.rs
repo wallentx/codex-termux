@@ -1526,16 +1526,12 @@ while :; do sleep 1; done"#
     );
     let cancel_token = CancellationToken::new();
     let cancel_tx = cancel_token.clone();
-    tokio::spawn(async move {
-        for _ in 0..50 {
-            if ready_marker.exists() {
-                cancel_tx.cancel();
-                return;
-            }
+    let cancel_when_ready = async {
+        while !ready_marker.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         cancel_tx.cancel();
-    });
+    };
     let params = ExecParams {
         command,
         cwd: cwd.clone(),
@@ -1550,8 +1546,7 @@ while :; do sleep 1; done"#
         arg0: None,
     };
 
-    let result = timeout(
-        Duration::from_secs(5),
+    let execution = async {
         process_exec_tool_call(
             params,
             &PermissionProfile::Disabled,
@@ -1561,10 +1556,22 @@ while :; do sleep 1; done"#
             /*codex_self_exe*/ &None,
             /*use_legacy_landlock*/ false,
             /*stdout_stream*/ None,
-        ),
-    )
-    .await
-    .expect("cancellation should stop the process promptly");
+        )
+        .await
+    };
+    tokio::pin!(execution);
+    let result = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut execution => result,
+            () = cancel_when_ready => (&mut execution).await,
+        }
+    })
+    .await;
+    if result.is_err() {
+        cancel_tx.cancel();
+        let _ = execution.await;
+    }
+    let result = result.expect("cancellation should stop the process promptly");
     let output = result.expect("cancellation should return a non-timeout exec result");
     assert!(!output.timed_out);
     assert_eq!(

@@ -1284,6 +1284,7 @@ fn config_toml_deserializes_model_availability_nux() {
             agents_overview_grouping: Default::default(),
             resume_cwd: None,
             keymap: TuiKeymap::default(),
+            quick_dials: BTreeMap::new(),
             model_availability_nux: ModelAvailabilityNuxConfig {
                 shown_count: HashMap::from([
                     ("gpt-bar".to_string(), 4),
@@ -1364,6 +1365,13 @@ async fn runtime_config_uses_tui_raw_output_mode() {
     let toml = r#"
         [tui]
         raw_output_mode = true
+
+        [tui.presets.1]
+        input = "/model gpt-5.6-sol high fast"
+        label = "fast coding"
+
+        [tui.presets.2]
+        input = "Review the current changes"
     "#;
     let cfg_toml: ConfigToml = toml::from_str(toml).expect("deserialize raw_output_mode=true");
     let cfg = Config::load_from_base_config_with_overrides(
@@ -1375,6 +1383,26 @@ async fn runtime_config_uses_tui_raw_output_mode() {
     .expect("load config");
 
     assert!(cfg.tui_raw_output_mode);
+    assert_eq!(
+        cfg.tui_quick_dials,
+        [
+            (
+                "1".into(),
+                QuickDial {
+                    input: "/model gpt-5.6-sol high fast".into(),
+                    label: Some("fast coding".into()),
+                },
+            ),
+            (
+                "2".into(),
+                QuickDial {
+                    input: "Review the current changes".into(),
+                    label: None,
+                },
+            ),
+        ]
+        .into(),
+    );
 }
 
 #[tokio::test]
@@ -4496,6 +4524,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             agents_overview_grouping: Default::default(),
             resume_cwd: None,
             keymap: TuiKeymap::default(),
+            quick_dials: BTreeMap::new(),
             model_availability_nux: ModelAvailabilityNuxConfig::default(),
             terminal_resize_reflow_max_rows: None,
         }
@@ -11909,6 +11938,8 @@ shell_tool = false
 
 #[test_case::test_case(Feature::Personality; "personality")]
 #[test_case::test_case(Feature::GuardianThreadContext; "guardian thread context")]
+#[test_case::test_case(Feature::Worktrees; "worktrees")]
+#[test_case::test_case(Feature::RealtimeConversation; "realtime conversation")]
 #[test_case::test_case(Feature::ShellZshFork; "shell zsh fork")]
 #[test_case::test_case(Feature::UnifiedExecZshFork; "unified exec zsh fork")]
 fn retired_feature_requirements_do_not_pin_configured_values(
@@ -11960,6 +11991,13 @@ fn retired_feature_requirements_do_not_pin_configured_values(
                 usize::from(feature != Feature::Personality),
             ),
         );
+        if matches!(feature, Feature::Worktrees | Feature::RealtimeConversation) {
+            assert!(
+                warnings[0].contains(&format!("Ignoring removed `features` requirement `{key}`"))
+            );
+            assert!(warnings[0].contains("enterprise"));
+            assert!(warnings[0].contains("availability no longer depends on this feature flag"));
+        }
     }
 
     Ok(())

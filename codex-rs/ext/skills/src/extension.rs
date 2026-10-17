@@ -4,6 +4,7 @@ use crate::HostSkillsSnapshot;
 use crate::InjectedHostSkillPrompts;
 use codex_analytics::InvocationType;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_extension_api::ConfigContributor;
@@ -16,6 +17,7 @@ use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
 use codex_extension_api::PromptFragment;
+use codex_extension_api::PromptSlot;
 use codex_extension_api::SelectedPluginSnapshot;
 use codex_extension_api::SkillInvocationContributor;
 use codex_extension_api::SkillInvocationInput;
@@ -210,6 +212,7 @@ where
                             .get::<SkillsSessionState>()
                             .and_then(|state| state.mcp_resources.clone()),
                         executor_capability_discovery: None,
+                        executor_capability_discovery_v2: Vec::new(),
                     },
                     &thread_state,
                 )
@@ -237,7 +240,7 @@ where
             rendered
                 .fragment
                 .map(|fragment| {
-                    PromptFragment::developer_capability(fragment.render(), fragment.content_kind())
+                    PromptFragment::from_fragment(PromptSlot::DeveloperCapabilities, &fragment)
                 })
                 .into_iter()
                 .collect()
@@ -308,6 +311,10 @@ where
             executor_capability_discovery: step_store
                 .get::<ExecutorCapabilityDiscoverySnapshot>()
                 .map(|discovery| discovery.as_ref().clone()),
+            executor_capability_discovery_v2: step_store
+                .get::<Vec<ExecutorCapabilityDiscoveryV2Snapshot>>()
+                .map(|discovery| discovery.as_ref().clone())
+                .unwrap_or_default(),
         });
         self.build_skill_tools(
             session_store,
@@ -382,6 +389,7 @@ where
                 include_cloud_skills: thread_state.cloud_skill_enabled(),
                 mcp_resources: mcp_resources.clone(),
                 executor_capability_discovery: None,
+                executor_capability_discovery_v2: Vec::new(),
             };
             let mut catalog = turn_store
                 .get::<ExecutorSkillsStepState>()

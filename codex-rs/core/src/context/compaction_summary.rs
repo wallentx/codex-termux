@@ -7,6 +7,8 @@ pub(crate) struct CompactionSummary {
 }
 
 impl CompactionSummary {
+    pub(crate) const KIND: &str = codex_context_fragments::COMPACTION_SUMMARY_KIND;
+
     pub(crate) fn new(summary: impl Into<String>) -> Self {
         Self {
             summary: summary.into(),
@@ -16,7 +18,7 @@ impl CompactionSummary {
 
 impl ContextualUserFragment for CompactionSummary {
     fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("compaction.summary".to_string())
+        ContentItemKind(Self::KIND.to_string())
     }
 
     fn role(&self) -> &'static str {

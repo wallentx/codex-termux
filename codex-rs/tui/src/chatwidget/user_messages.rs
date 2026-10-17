@@ -27,6 +27,7 @@ use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
 use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
 
 use super::ChatWidget;
+use super::StatusSurfaceOverrides;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserMessage {
@@ -162,6 +163,7 @@ pub(crate) struct ThreadInputState {
     pub(super) current_collaboration_mode: CollaborationMode,
     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
     pub(super) plan_mode_reasoning_effort: Option<ReasoningEffortConfig>,
+    pub(super) status_surface_overrides: StatusSurfaceOverrides,
     pub(super) task_running: bool,
     pub(super) agent_turn_running: bool,
 }

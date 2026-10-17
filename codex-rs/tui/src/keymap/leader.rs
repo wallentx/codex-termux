@@ -9,6 +9,7 @@ use super::resolve_bindings;
 use crate::key_hint;
 use codex_config::types::TuiKeymap;
 use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
 use itertools::Itertools;
 
 pub(super) fn resolve(config: &TuiKeymap, chords: &mut RuntimeChordKeymap) -> Result<(), String> {
@@ -42,11 +43,13 @@ pub(super) fn resolve(config: &TuiKeymap, chords: &mut RuntimeChordKeymap) -> Re
         let (key, modifiers) = prefix.parts();
         let label = prefix.display_label();
         if matches!(key, KeyCode::Char(_))
-            && (!key_hint::has_ctrl_or_alt(modifiers) || key_hint::is_altgr(modifiers))
+            && (key_hint::is_plain_text_key_event(KeyEvent::new(key, modifiers))
+                || key_hint::is_altgr(modifiers))
         {
             return Err(format!(
-                "Invalid `tui.keymap.global.leader` = `{label}`: use ctrl, alt, or a non-character \
-key so ordinary text input is not intercepted. Ctrl-alt characters may be AltGr input on Windows."
+                "Invalid `tui.keymap.global.leader` = `{label}`: use ctrl, alt, super, or a \
+non-character key so ordinary text input is not intercepted. Ctrl-alt characters may be AltGr \
+input on Windows."
             ));
         }
         #[cfg(unix)]

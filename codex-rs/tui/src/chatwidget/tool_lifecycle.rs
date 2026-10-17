@@ -12,9 +12,9 @@ impl ChatWidget {
         self.add_to_history(history_cell::new_patch_event(changes, &self.config.cwd));
     }
 
-    pub(super) fn on_view_image_tool_call(&mut self, path: LegacyAppPathString) {
+    pub(super) fn on_view_image_tool_call(&mut self, id: String, path: LegacyAppPathString) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_view_image_tool_call(path));
+        self.add_to_history(history_cell::new_view_image_tool_call(id, path));
         self.request_redraw();
     }
 

@@ -257,6 +257,10 @@ pub struct ThreadRealtimeStartParams {
     pub prompt: Option<Option<String>>,
     #[ts(optional = nullable)]
     pub realtime_session_id: Option<String>,
+    /// Client-generated identifier for the product voice session. This is distinct from
+    /// `realtimeSessionId`.
+    #[ts(optional = nullable)]
+    pub voice_session_id: Option<String>,
     #[ts(optional = nullable)]
     pub transport: Option<ThreadRealtimeStartTransport>,
     /// Overrides the configured realtime protocol version for this session only.

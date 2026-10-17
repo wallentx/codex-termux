@@ -227,12 +227,17 @@ async fn filesystem_lookup_distinguishes_thread_ids_from_rollout_ids() {
         "sessions/2025/01/04/rollout-{reverted_ts}-{thread_uuid}_{rollout_uuid}.jsonl"
     ));
     fs::rename(reverted_source, reverted_path.as_path()).unwrap();
+    let subsequent_rollout_uuid = Uuid::from_u128(403);
+    let subsequent_path = home.join(format!(
+        "sessions/2025/01/04/rollout-{reverted_ts}-{thread_uuid}_{subsequent_rollout_uuid}.jsonl"
+    ));
+    fs::copy(&reverted_path, &subsequent_path).unwrap();
 
     assert_eq!(
         find_thread_path_by_id_str(home, &thread_uuid.to_string(), /*state_db_ctx*/ None)
             .await
             .unwrap(),
-        Some(reverted_path.clone())
+        Some(subsequent_path)
     );
     assert_eq!(
         find_rollout_path_by_rollout_id(home, thread_id_from_uuid(rollout_uuid))

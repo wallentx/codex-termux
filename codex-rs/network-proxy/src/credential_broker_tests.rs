@@ -47,6 +47,62 @@ fn assert_credential_shape(real_value: &str, dummy_value: &str, prefix: &str) {
 }
 
 #[test]
+fn unmasked_credentials_follow_the_selected_failure_mode() {
+    for (enabled, source, base_url, expected) in [
+        (true, "GH_TOKEN", None, true),
+        (true, "GH_ENTERPRISE_TOKEN", None, false),
+        (
+            true,
+            "OPENAI_API_KEY",
+            Some("https://localhost:1234/v1"),
+            false,
+        ),
+        (false, "GH_TOKEN", None, false),
+    ] {
+        let broker = CredentialBroker::new(enabled);
+        broker.configure(&NetworkProxyConfig {
+            credential_broker: enabled,
+            allow_local_binding: Some(true),
+            ..NetworkProxyConfig::default()
+        });
+        let mut env = env_map([
+            (source, "opaque-executor-credential"),
+            ("AUTH_HEADER", "Bearer opaque-executor-credential"),
+        ]);
+        if let Some(base_url) = base_url {
+            env.insert("OPENAI_BASE_URL".to_string(), base_url.to_string());
+        }
+        broker.virtualize_child_env(&mut env);
+        for alias_only in [false, true] {
+            let mut input = env.clone();
+            if alias_only {
+                input.remove(source);
+            }
+            for mode in [
+                CredentialMaskingFailureMode::Warn,
+                CredentialMaskingFailureMode::Deny,
+                CredentialMaskingFailureMode::Error,
+            ] {
+                let mut output = input.clone();
+                assert_eq!(
+                    broker
+                        .handle_unmasked_credentials(&mut output, mode)
+                        .is_ok(),
+                    enabled && (expected || mode != CredentialMaskingFailureMode::Error),
+                    "{source} {mode:?} (alias_only={alias_only})"
+                );
+                let mut expected_env = input.clone();
+                if enabled && !expected && mode == CredentialMaskingFailureMode::Deny {
+                    expected_env.remove(source);
+                    expected_env.remove("AUTH_HEADER");
+                }
+                assert_eq!(output, expected_env);
+            }
+        }
+    }
+}
+
+#[test]
 fn virtualize_child_env_replaces_supported_credentials() {
     let broker = CredentialBroker::new(/*enabled*/ true);
     let github_token = "github_pat_11AA0bbCC_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH";

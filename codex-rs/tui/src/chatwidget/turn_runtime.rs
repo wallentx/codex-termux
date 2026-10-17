@@ -75,6 +75,8 @@ impl ChatWidget {
     // Raw reasoning uses the same flow as summarized reasoning
 
     pub(super) fn on_task_started(&mut self) {
+        self.status_state.program_status_after_turn =
+            crate::terminal_program_status::ProgramStatus::Idle;
         self.bottom_pane.dismiss_composer_sparkle();
         self.clear_context_compaction();
         self.input_queue.user_turn_pending_start = false;
@@ -112,6 +114,16 @@ impl ChatWidget {
             /*body*/ None,
         );
         self.request_redraw();
+    }
+
+    pub(super) fn on_replayed_task_started(&mut self, started_at: Option<i64>) {
+        self.on_task_started();
+        if let Some(started_at) = started_at {
+            let elapsed_secs = chrono::Utc::now().timestamp().saturating_sub(started_at);
+            self.bottom_pane.reset_status_timer(Duration::from_secs(
+                elapsed_secs.try_into().unwrap_or_default(),
+            ));
+        }
     }
 
     pub(super) fn on_task_complete(
@@ -177,6 +189,11 @@ impl ChatWidget {
         self.clear_active_hook_cell();
         self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
+        self.status_state.program_status_after_turn = if from_replay {
+            crate::terminal_program_status::ProgramStatus::Idle
+        } else {
+            crate::terminal_program_status::ProgramStatus::Done
+        };
         self.clear_safety_buffering();
         self.update_task_running_state();
         self.running_commands.clear();
@@ -337,6 +354,12 @@ impl ChatWidget {
         self.input_queue.user_turn_pending_start = false;
         self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
+        self.status_state.program_status_after_turn = if self.thread_usage.replaying_turn_completion
+        {
+            crate::terminal_program_status::ProgramStatus::Idle
+        } else {
+            crate::terminal_program_status::ProgramStatus::Error
+        };
         self.update_task_running_state();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();

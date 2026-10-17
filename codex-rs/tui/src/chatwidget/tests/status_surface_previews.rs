@@ -100,7 +100,7 @@ fn cache_project_root(chat: &mut ChatWidget, root_name: &str) {
     });
 }
 
-fn cache_rate_limit_snapshot(chat: &mut ChatWidget) {
+pub(super) fn cache_rate_limit_snapshot(chat: &mut ChatWidget) {
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
         limit_name: None,

@@ -58,8 +58,11 @@ async fn external_agent_config_migration_over_shared_transport() -> Result<()> {
             }
             Ok::<_, color_eyre::Report>(requests)
         });
-        let mut session =
-            AppServerSession::new(crate::connect_remote_app_server(endpoint).await?, mode);
+        let mut session = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            crate::connect_remote_app_server(endpoint).await?,
+            mode,
+        );
         let workspace = tempfile::tempdir()?;
         let cwd = workspace.path();
         let mut tui = crate::tui::test_support::make_test_tui()?;

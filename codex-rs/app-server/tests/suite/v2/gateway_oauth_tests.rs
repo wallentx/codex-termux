@@ -136,6 +136,42 @@ async fn model_list_requests_restart_after_gateway_provider_changes() -> Result<
     Ok(())
 }
 
+/// Account changes reload the catalog before validating a retained OAuth gateway.
+#[tokio::test]
+async fn model_list_leaves_oauth_gateway_after_account_change() -> Result<()> {
+    let oauth = MockServer::start().await;
+    let home = TempDir::new()?;
+    std::fs::write(home.path().join("config.toml"), gateway_config(&oauth))?;
+    let mut server = gateway_server(home.path()).await?;
+    std::fs::write(home.path().join("config.toml"), "")?;
+    std::fs::write(
+        home.path().join("requirements.toml"),
+        "model_provider = 'openai'",
+    )?;
+    let id = server
+        .send_login_account_api_key_request("sk-catalog-test")
+        .await?;
+    let _: codex_app_server_protocol::LoginAccountResponse = server.read_response(id).await?;
+    server
+        .read_stream_until_notification_message("account/updated")
+        .await?;
+    let models: codex_app_server_protocol::ModelListResponse = server
+        .request(|request_id| ClientRequest::ModelList {
+            request_id,
+            params: codex_app_server_protocol::ModelListParams::default(),
+        })
+        .await?;
+    assert!(!models.data.is_empty());
+    assert!(
+        oauth
+            .received_requests()
+            .await
+            .expect("gateway requests")
+            .is_empty()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn token_exchange_failure_completes_login_and_updates_readiness() -> Result<()> {
     let home = TempDir::new()?;

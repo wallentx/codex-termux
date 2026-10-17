@@ -10,8 +10,8 @@ use super::ReasoningEffort;
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
 pub enum AsyncClassifierMode {
-    #[default]
     Snapshot,
+    #[default]
     Conversation,
 }
 

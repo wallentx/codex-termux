@@ -601,20 +601,43 @@ pub(crate) fn active_binding_specs(
     let bindings = bindings_for_action(runtime_keymap, context, action).ok_or_else(|| {
         format!("Unknown keymap action `{context}.{action}`. Reopen /keymap and choose an action.")
     })?;
-    if let Some(action_id) = action_id
-        && let Some(crate::key_hint::ShortcutHint::Chord { prefix, completion }) =
-            runtime_keymap.chords.primary_hint(action_id, bindings)
-    {
-        return Ok(vec![format!(
-            "{} {}",
-            binding_to_config_key_spec(prefix)?,
-            binding_to_config_key_spec(completion)?
-        )]);
-    }
-    bindings
+    let mut specs = bindings
         .iter()
+        .filter(|binding| !crate::keymap::is_dispatch_token(**binding))
         .map(|binding| binding_to_config_key_spec(*binding))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(action_id) = action_id {
+        let chords: Vec<_> = runtime_keymap
+            .chords
+            .bindings
+            .iter()
+            .filter(|binding| binding.action == action_id)
+            .collect();
+        let available: std::collections::HashSet<_> = chords
+            .iter()
+            .map(|binding| (binding.chord.prefix, binding.chord.completion))
+            .collect();
+        for binding in &chords {
+            // An implicit default can yield to a different action on some leader aliases.
+            // Only persist the symbolic form when all aliases remain available.
+            let partial_leader = binding.spec.starts_with("leader ")
+                && runtime_keymap
+                    .chords
+                    .leader
+                    .iter()
+                    .any(|prefix| !available.contains(&(*prefix, binding.chord.completion)));
+            specs.push(if partial_leader {
+                format!(
+                    "{} {}",
+                    binding_to_config_key_spec(binding.chord.prefix)?,
+                    binding_to_config_key_spec(binding.chord.completion)?
+                )
+            } else {
+                binding.spec.clone()
+            });
+        }
+    }
+    Ok(dedup_bindings(specs))
 }
 
 fn dedup_bindings(bindings: Vec<String>) -> Vec<String> {
@@ -668,10 +691,11 @@ fn key_parts_to_config_key_spec(
     let (code, normalized_modifiers) = crate::key_hint::normalize_key_parts(code, modifiers);
     modifiers = normalized_modifiers;
 
-    let supported_modifiers = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+    let supported_modifiers =
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::SUPER;
     if !modifiers.difference(supported_modifiers).is_empty() {
         return Err(
-            "Only ctrl, alt, and shift modifiers can be stored in `tui.keymap`.".to_string(),
+            "Only ctrl, alt, shift, and super modifiers can be stored in `tui.keymap`.".to_string(),
         );
     }
 
@@ -731,6 +755,9 @@ fn format_key_spec(modifiers: KeyModifiers, key: &str) -> String {
     }
     if modifiers.contains(KeyModifiers::SHIFT) {
         parts.push("shift");
+    }
+    if modifiers.contains(KeyModifiers::SUPER) {
+        parts.push("super");
     }
     parts.push(key);
     parts.join("-")
@@ -1283,6 +1310,15 @@ mod tests {
     }
 
     #[test]
+    fn picker_editor_render_snapshot() {
+        let runtime = RuntimeKeymap::defaults();
+        let mut params = build_keymap_picker_params(&runtime, &TuiKeymap::default());
+        params.initial_tab_id = Some("editor-shortcuts".to_string());
+
+        assert_snapshot!("keymap_picker_editor", render_picker(params, /*width*/ 120));
+    }
+
+    #[test]
     fn picker_custom_render_snapshot() {
         let keymap =
             keymap_with_replacement(&TuiKeymap::default(), "composer", "submit", "ctrl-enter")
@@ -1758,12 +1794,12 @@ mod tests {
     fn key_capture_serializes_modifier_order_for_config() {
         let event = KeyEvent::new(
             KeyCode::Char('K'),
-            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
         );
 
         assert_eq!(
             key_event_to_config_key_spec(event),
-            Ok("ctrl-alt-shift-k".to_string())
+            Ok("ctrl-alt-shift-super-k".to_string())
         );
     }
 
@@ -1955,6 +1991,25 @@ mod tests {
                 KeybindingSpec("ctrl-shift-b".to_string())
             ]))
         );
+    }
+
+    #[test]
+    fn add_alternate_preserves_super_default_binding() {
+        let runtime = RuntimeKeymap::defaults();
+        let outcome = keymap_with_edit(
+            &TuiKeymap::default(),
+            &runtime,
+            "editor",
+            "move_line_start",
+            "f12",
+            &KeymapEditIntent::AddAlternate,
+        )
+        .expect("add alternate");
+
+        let KeymapEditOutcome::Updated { bindings, .. } = outcome else {
+            panic!("expected updated keymap");
+        };
+        assert_eq!(bindings, vec!["home", "ctrl-a", "super-left", "f12"]);
     }
 
     #[test]

@@ -30,7 +30,7 @@ pub(super) fn multi_agent_v2_handler(
             && let Some(properties) = tool.parameters.properties
         {
             // Argument transport requires these markers even without server encryption config.
-            for (name, schema) in properties {
+            for (name, schema) in *properties {
                 if schema.encrypted == Some(true) {
                     let property = parameters
                         .properties

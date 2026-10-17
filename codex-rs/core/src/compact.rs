@@ -34,6 +34,9 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
+use codex_context_fragments::AnnotatedContent;
+use codex_context_fragments::set_annotated_content;
+use codex_context_fragments::truncate_annotated_text;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
@@ -52,9 +55,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
-use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
 use tracing::error;
 
@@ -279,6 +280,16 @@ async fn run_compact_task_inner_impl(
         &[initial_input_for_turn.into()],
         turn_context.model_info().truncation_policy.into(),
     );
+    let mut fallback_instructions = sess.get_prompt_base_instructions().await;
+    if let Some(text) = history
+        .raw_items()
+        .find_map(BaseInstructionsFragment::text_from_item)
+    {
+        fallback_instructions.text = text.to_owned();
+    } else if history.has_tool_declarations() {
+        // An incremental window has no recorded base item when its instructions are empty.
+        fallback_instructions.text.clear();
+    }
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
@@ -296,14 +307,14 @@ async fn run_compact_task_inner_impl(
         let turn_input_len = turn_input.len();
         let base_instructions = if turn_input
             .iter()
-            .any(BaseInstructionsFragment::matches_item)
+            .any(|item| BaseInstructionsFragment::text_from_item(item).is_some())
         {
             BaseInstructions {
                 text: String::new(),
                 provenance: None,
             }
         } else {
-            sess.get_prompt_base_instructions().await
+            fallback_instructions.clone()
         };
         let prompt = Prompt {
             input: turn_input,
@@ -565,8 +576,8 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CompactedUserMessage<'a> {
-    // Flattened text is only for the existing budget and truncation policy.
-    // Whole text messages retain their exact content parts and annotations.
+    // Flattened text is only for budgeting and recognizing summaries. The
+    // output is built from original parts, never reconstructed from this text.
     // Borrow from the history snapshot until selected output is materialized.
     message: String,
     original: &'a ResponseItem,
@@ -724,41 +735,65 @@ fn build_compacted_history_with_limit(
             else {
                 continue;
             };
-            let mut passthrough = internal_chat_message_metadata_passthrough.clone();
             let mut harness_metadata = message.harness_metadata.cloned();
-            let content = if tokens <= remaining
+            let preserve_content = tokens <= remaining
                 && content
                     .iter()
-                    .all(|part| matches!(part, ContentItem::InputText { .. }))
-            {
-                content.clone()
-            } else {
-                // Rebuild only the text fallback; never clone discarded media.
-                if let Some(kinds) = passthrough
-                    .as_mut()
-                    .and_then(|metadata| metadata.content_item_kinds.as_mut())
-                {
-                    *kinds = vec![ContentItemKind("user.text".to_owned())];
-                }
-                vec![ContentItem::InputText {
-                    text: truncate_text(&message.message, TruncationPolicy::Tokens(remaining)),
-                }]
+                    .all(|part| matches!(part, ContentItem::InputText { .. }));
+            let mut item = ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
+                id: id.clone(),
+                role: "user".to_owned(),
+                content: if preserve_content {
+                    content.clone()
+                } else {
+                    Vec::new()
+                },
+                phase: None,
+                internal_chat_message_metadata_passthrough:
+                    internal_chat_message_metadata_passthrough.clone(),
             };
+            if !preserve_content {
+                // Select text and its annotations by the same source index.
+                // Do not clone discarded images/audio or infer their text's source.
+                let metadata = internal_chat_message_metadata_passthrough.as_ref();
+                let mut parts: Vec<_> = crate::event_mapping::user_input_parts(content)
+                    .filter_map(|(index, part)| {
+                        let ContentItem::InputText { text } = part else {
+                            return None;
+                        };
+                        let kind = metadata
+                            .and_then(|metadata| metadata.content_item_kinds.as_ref())
+                            .and_then(|kinds| kinds.get(index))
+                            .cloned()
+                            .unwrap_or_else(|| ContentItemKind("unknown".to_string()));
+                        let source = metadata
+                            .and_then(|metadata| metadata.content_item_metadata.as_ref())
+                            .and_then(|sources| sources.get(index))
+                            .cloned()
+                            .unwrap_or_default();
+                        Some(AnnotatedContent::text(text, kind, source))
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    // Preserve the existing empty-text fallback for media-only input.
+                    parts.push(AnnotatedContent::new(
+                        ContentItem::InputText {
+                            text: String::new(),
+                        },
+                        ContentItemKind("unknown".to_string()),
+                    ));
+                }
+                set_annotated_content(&mut item, truncate_annotated_text(parts, remaining));
+            }
             if tokens > remaining
                 && let Some(metadata) = &mut harness_metadata
             {
                 metadata.mark_retained_sources_incomplete();
             }
             selected_messages.push(ResponseItemEnvelope {
-                item: ResponseItem::Message {
-                    status: None,
-                    encrypted_content: None,
-                    id: id.clone(),
-                    role: "user".to_owned(),
-                    content,
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: passthrough,
-                },
+                item,
                 metadata: harness_metadata,
             });
             if tokens > remaining {
@@ -823,26 +858,8 @@ async fn drain_to_completed(
             ));
         };
         match event {
-            Ok(ResponseEvent::OutputItemDone(item)) => {
-                if matches!(phase, CompactionPhase::PostTurn) {
-                    // Commit post-turn summaries only after success; failures must leave both
-                    // the live history and persisted rollout intact.
-                    output.push(item);
-                } else {
-                    sess.record_annotated_conversation_items(
-                        turn_context,
-                        turn_context.model_info(),
-                        vec![ResponseItemEnvelope {
-                            item,
-                            metadata: Some(CodexHarnessMetadata {
-                                compaction_output: true,
-                                ..Default::default()
-                            }),
-                        }],
-                    )
-                    .await;
-                }
-            }
+            // Keep each attempt isolated until the response completes successfully.
+            Ok(ResponseEvent::OutputItemDone(item)) => output.push(item),
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;
             }
@@ -855,6 +872,22 @@ async fn drain_to_completed(
                 usage_metadata,
                 ..
             }) => {
+                if !matches!(phase, CompactionPhase::PostTurn) {
+                    for item in std::mem::take(&mut output) {
+                        sess.record_annotated_conversation_items(
+                            turn_context,
+                            turn_context.model_info(),
+                            vec![ResponseItemEnvelope {
+                                item,
+                                metadata: Some(CodexHarnessMetadata {
+                                    compaction_output: true,
+                                    ..Default::default()
+                                }),
+                            }],
+                        )
+                        .await;
+                    }
+                }
                 sess.record_observed_response_completed(
                     turn_context,
                     &response_id,

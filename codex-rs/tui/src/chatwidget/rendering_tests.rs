@@ -367,7 +367,9 @@ fn active_transcript_preserves_clipped_markdown_hyperlinks() {
         size.height,
     ));
     terminal
-        .draw_with_size(size, |frame| renderable.render(area, frame.buffer_mut()))
+        .draw_with_size(size, &mut Vec::new(), |frame| {
+            renderable.render(area, frame.buffer_mut())
+        })
         .expect("render terminal frame");
     let output = String::from_utf8(terminal.backend().writer().clone()).expect("UTF-8 output");
     assert!(output.contains("\x1b]8;;https://example.com/\x07OSC8 label\x1b]8;;\x07"));

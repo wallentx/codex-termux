@@ -1,6 +1,7 @@
 mod environment_accessor;
 mod exec_permission_profile_serde;
 mod find_up;
+mod nfs;
 
 use bytes::Bytes;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -28,6 +29,8 @@ pub use find_up::FindUpErrorPolicy;
 pub use find_up::find_nearest_ancestor_with_markers;
 pub use find_up::find_nearest_native_ancestor_with_markers;
 use futures::Stream;
+use futures::stream::BoxStream;
+pub use nfs::is_nfs;
 use serde::Deserialize;
 use serde::Serialize;
 use std::future::Future;
@@ -657,6 +660,36 @@ pub trait ExecutorFileSystem: Send + Sync {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>;
+
+    /// Replaces a regular file from a stream of bounded chunks.
+    ///
+    /// Accepts any sendable byte stream, boxed to keep this trait object-safe.
+    /// Input chunks must be nonempty and no larger than [`FILE_WRITE_CHUNK_SIZE`].
+    /// Returns the number of bytes written after closing the target. Parents must already exist.
+    /// Failure or cancellation may leave a truncated or partial target.
+    ///
+    /// Cancellation is best effort: dropping the future stops consuming input and issuing new
+    /// blocks, but an in-flight open or write may still truncate or modify the target. Dropping
+    /// does not wait for that I/O or remote handle cleanup, so a subsequent replacement may overlap
+    /// with the abandoned operation.
+    ///
+    /// Local and streaming-capable remote filesystems write one chunk at a time. For compatibility,
+    /// a remote filesystem may buffer the entire input and send one write to an older executor.
+    /// The default implementation returns `Unsupported` without consuming the input.
+    fn write_file_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: BoxStream<'a, FileSystemResult<Bytes>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, u64> {
+        Box::pin(async move {
+            let _ = (path, contents, sandbox);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem does not support streaming writes",
+            ))
+        })
+    }
 
     /// Reads a file and decodes it as UTF-8 text.
     fn read_file_text<'a>(

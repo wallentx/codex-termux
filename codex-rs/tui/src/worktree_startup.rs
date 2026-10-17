@@ -95,8 +95,10 @@ impl ManagedTuiWorktree {
 
 async fn latest_thread_cwd(path: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
     let Some(path) = path else { return fallback };
-    tokio::task::spawn_blocking(move || {
-        let reader = codex_rollout::open_rollout_seekable_reader(&path).ok()?;
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+    let result = tokio::task::spawn_blocking(move || {
+        let reader =
+            codex_rollout::open_rollout_seekable_reader(&path, || stop.is_closed()).ok()?;
         let mut scanner = codex_rollout::ReverseJsonlScanner::new(reader).ok()?;
         while let Some(outcome) = scanner.scan_next_rollout_line().ok()? {
             if let codex_rollout::ScanOutcome::Parsed(codex_rollout::RolloutLine {
@@ -112,7 +114,9 @@ async fn latest_thread_cwd(path: Option<PathBuf>, fallback: PathBuf) -> PathBuf 
     .await
     .ok()
     .flatten()
-    .unwrap_or(fallback)
+    .unwrap_or(fallback);
+    drop(keep_running);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -164,6 +168,7 @@ pub(super) async fn prepare(
         )
         .await?;
         let mut lookup = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             AppServerClient::InProcess(client),
             crate::app_server_session::ThreadParamsMode::Embedded,
         );
@@ -209,11 +214,6 @@ pub(super) async fn prepare(
             )
             .await;
         }
-    }
-    if !source.features.enabled(codex_features::Feature::Worktrees) {
-        color_eyre::eyre::bail!(
-            "`--worktree` requires the worktrees feature; enable it with `--enable worktrees`"
-        );
     }
     if source.active_project.is_untrusted() {
         color_eyre::eyre::bail!(

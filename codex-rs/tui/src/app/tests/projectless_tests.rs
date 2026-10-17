@@ -110,10 +110,12 @@ sandbox = "unelevated"
         .await?;
     tui.pause_events();
     app.launch_cwd = source.path().to_path_buf();
+    let backend_id = server.backend_id();
     app.resume_target_session(
         &mut tui,
         &mut server,
         SessionTarget {
+            backend_id,
             path: None,
             thread_id: saved.session.thread_id,
             cwd: Some(source.path().to_path_buf()),

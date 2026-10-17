@@ -70,7 +70,12 @@ async fn resumed_initial_messages_render_history() {
     );
 
     // Session hydration can precede the account update on ChatGPT sign-in.
-    chat.status_account_display = None;
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::CliDaybreak, /*enabled*/ true);
+    chat.show_welcome_banner = false;
+    chat.local_settings.tui.show_tooltips = false;
+    chat.config.cwd = configured.cwd.clone();
+    chat.transcript.active_cell = Some(ChatWidget::placeholder_session_header_cell(&chat.config));
     configured.thread_id = ThreadId::new();
     chat.handle_thread_session(configured);
     assert!(chat.daybreak_enabled);
@@ -92,27 +97,18 @@ async fn resumed_initial_messages_render_history() {
         ReplayKind::ResumeInitialMessages,
     );
 
-    let cells = drain_insert_history(&mut rx);
-    let mut merged_lines = Vec::new();
-    for lines in cells {
-        let text = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.clone())
-            .collect::<String>();
-        merged_lines.push(text);
-    }
-
-    let text_blob = merged_lines.join("\n");
-    assert!(
-        text_blob.contains("hello from user"),
-        "expected replayed user message",
-    );
-    assert!(
-        text_blob.contains("assistant reply"),
-        "expected replayed agent message",
-    );
-    insta::assert_snapshot!("resumed_daybreak_banner", merged_lines[0]);
+    let history = drain_insert_history(&mut rx)
+        .iter()
+        .flatten()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(CODEX_CLI_VERSION, "<VERSION>")
+        .replace(
+            &test_path_display("/home/user/project"),
+            "/home/user/project",
+        );
+    insta::assert_snapshot!("resumed_daybreak_banner", history);
 }
 
 #[tokio::test]
@@ -597,7 +593,7 @@ async fn replayed_user_message_preserves_remote_image_urls() {
 
 #[tokio::test]
 async fn session_configured_syncs_widget_config_permissions_and_cwd() {
-    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.config
         .permissions
@@ -675,6 +671,13 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
         expected_app_server_permission_profile
     );
     assert_eq!(&chat.config_ref().cwd, &expected_cwd);
+    while ops.try_recv().is_ok() {}
+    chat.handle_manage_skills_closed();
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::ListSkills { cwds, force_reload: true })
+            if cwds == vec![expected_cwd.to_path_buf()]
+    ));
 
     let updated_profile = PermissionProfile::workspace_write();
     chat.set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::legacy(
@@ -1631,15 +1634,38 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
 async fn thread_snapshot_replayed_turn_started_marks_task_running() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    replay_turn_started(&mut chat, ReplayKind::ThreadSnapshot);
+    let started_at = chrono::Utc::now().timestamp() - 125;
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                started_at: Some(started_at),
+                ..app_server_turn(
+                    "turn-1",
+                    AppServerTurnStatus::InProgress,
+                    /*duration_ms*/ None,
+                    /*error*/ None,
+                )
+            },
+        }),
+        Some(ReplayKind::ThreadSnapshot),
+    );
 
     drain_insert_history(&mut rx);
     assert!(chat.bottom_pane.is_task_running());
-    let status = chat
-        .bottom_pane
-        .status_widget()
-        .expect("status indicator should be visible");
-    assert_eq!(status.header(), "Working");
+    let before = chrono::Utc::now().timestamp() - started_at;
+    let elapsed = chat.bottom_pane.status_elapsed().unwrap().as_secs() as i64;
+    let after = chrono::Utc::now().timestamp() - started_at;
+    // The wire timestamp has second precision; reads may be separated by any CI delay.
+    assert!(
+        (before - 1..=after).contains(&elapsed),
+        "{elapsed} not in {before}..={after}"
+    );
+    let timer = regex_lite::Regex::new(r"\(\d+(?:h \d+m \d+s|m \d+s|s) •").unwrap();
+    insta::assert_snapshot!(
+        timer.replace_all(render_bottom_first_row(&chat, /*width*/ 80).trim(), "(<elapsed> •"),
+        @"• Working (<elapsed> • esc to interrupt)"
+    );
 }
 
 #[tokio::test]
@@ -1655,9 +1681,11 @@ async fn replayed_in_progress_turn_marks_task_running() {
             let (mut chat, mut rx, mut op_rx) =
                 make_chatwidget_manual(/*model_override*/ None).await;
             chat.thread_id = Some(ThreadId::new());
+            let started_at = chrono::Utc::now().timestamp() - 125;
             chat.replay_thread_turns(
                 vec![AppServerTurn {
                     items_view,
+                    started_at: Some(started_at),
                     ..app_server_turn(
                         "turn-1",
                         AppServerTurnStatus::InProgress,
@@ -1676,9 +1704,20 @@ async fn replayed_in_progress_turn_marks_task_running() {
                 ),
                 (true, Some("turn-1")),
             );
+            let before = chrono::Utc::now().timestamp() - started_at;
+            let elapsed = chat.bottom_pane.status_elapsed().unwrap().as_secs() as i64;
+            let after = chrono::Utc::now().timestamp() - started_at;
+            assert!(
+                (before - 1..=after).contains(&elapsed),
+                "{elapsed} not in {before}..={after}"
+            );
+            let timer = regex_lite::Regex::new(r"\(\d+(?:h \d+m \d+s|m \d+s|s) •").unwrap();
             assert_chatwidget_snapshot!(
                 "replayed_in_progress_turn",
-                normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80)),
+                timer.replace_all(
+                    &normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80)),
+                    "(<elapsed> •"
+                ),
             );
 
             chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));

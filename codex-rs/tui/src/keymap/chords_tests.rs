@@ -190,6 +190,17 @@ fn allows_shared_prefixes_with_distinct_completions() {
 }
 
 #[test]
+fn allows_super_modified_character_prefixes_and_leaders() {
+    let mut config = TuiKeymap::default();
+    config.global.leader = Some(binding("super-k"));
+    config.global.open_transcript = Some(binding("leader super-t"));
+    config.global.copy = Some(binding("super-o super-c"));
+
+    RuntimeKeymap::from_config(&config)
+        .expect("Super-modified characters do not intercept ordinary text input");
+}
+
+#[test]
 fn allows_plain_prefixes_in_vim_and_repeated_chords_in_all_contexts() {
     let mut config = TuiKeymap::default();
     config.vim_normal.move_line_start = Some(binding("g g"));

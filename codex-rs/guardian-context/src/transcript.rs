@@ -1,7 +1,8 @@
 //! Collects bounded conversation evidence before consumer-specific rendering.
 //!
 //! Both Guardian consumers receive the same role and tool-source attribution,
-//! with complete user messages and capped non-user entries. Resolved context profiles
+//! with generated compaction summaries attributed to the assistant, complete user
+//! messages and capped non-user entries. Resolved context profiles
 //! apply aggregate retention after the host selects its full/delta slice. Tool outputs with a
 //! call ID retain their generic label when the call is unavailable. Outputs
 //! without a call ID require an explicit name.
@@ -145,6 +146,7 @@ pub fn collect_transcript(
                 role,
                 content,
                 phase,
+                internal_chat_message_metadata_passthrough,
                 ..
             } => {
                 let text = content
@@ -163,6 +165,18 @@ pub fn collect_transcript(
                     .collect::<Vec<_>>()
                     .join("\n");
                 let kind = match role.as_str() {
+                    // Local compaction uses the user wire role for model context, but
+                    // its generated summary is not user authorization.
+                    "user"
+                        if internal_chat_message_metadata_passthrough
+                            .as_ref()
+                            .and_then(|metadata| metadata.content_item_kinds.as_ref())
+                            .is_some_and(|kinds| {
+                                kinds.iter().any(|kind| kind.0 == "compaction.summary")
+                            }) =>
+                    {
+                        ConversationTranscriptEntryKind::Assistant
+                    }
                     "user" => ConversationTranscriptEntryKind::User,
                     "developer" if text.starts_with(MANUAL_APPROVAL_DEVELOPER_PREFIX) => {
                         ConversationTranscriptEntryKind::Developer

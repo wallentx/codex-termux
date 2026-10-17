@@ -328,6 +328,7 @@ async fn backend_banner_fallback_handles_settings_failure_and_queued_manual_sele
         })
         .await?;
         let mut server = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             client,
             crate::app_server_session::ThreadParamsMode::Embedded,
         );

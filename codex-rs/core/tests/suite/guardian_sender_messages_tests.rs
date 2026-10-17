@@ -16,6 +16,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test_case::test_case(None, "codex_app", "send_message_to_thread", 0; "default")]
+#[test_case::test_case(None, "codex_app", "create_thread", 0; "desktop create thread")]
 #[test_case::test_case(Some(false), "codex_app", "send_message_to_thread", 0; "retired opt out")]
 #[test_case::test_case(None, "codex_tui", "send_message_to_thread", 0; "tui")]
 #[test_case::test_case(None, "cloud_threads", "send_message", 0; "cloud threads")]

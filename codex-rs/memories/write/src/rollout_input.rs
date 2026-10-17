@@ -1,4 +1,4 @@
-//! Selects v2 extraction evidence by provenance, then restores chronological order.
+//! Reads recent rollout evidence and selects v2 input by provenance in chronological order.
 //! Human replies retain their questions; message media is replaced with placeholders.
 //! Budgets use the same token estimate as the rest of the memory pipeline.
 //! Extraction chunks preserve selected evidence in order within bounded messages.
@@ -11,13 +11,80 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::RolloutItem;
+use codex_rollout::ScanOutcome;
+use codex_rollout::open_rollout_seekable_reader;
 use codex_rollout::should_persist_response_item_for_memories;
 use codex_secrets::redact_secrets;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::truncate_text;
 use std::collections::HashMap;
+use std::io::BufRead;
+use std::io::Read;
+use std::path::Path;
+
+const MAX_ROLLOUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RECORD_BYTES: usize = 1024 * 1024;
+
+/// Keeps the newest sanitized evidence that fits the byte budget, then restores source order.
+/// Compressed rollouts use the existing temporary-file reader. Older evidence and records over
+/// the per-record limit are intentionally omitted; this is not a complete history for resume.
+/// The first line must contain valid session metadata within the same record limit.
+pub(crate) async fn read_recent_rollout_items(path: &Path) -> anyhow::Result<Vec<RolloutItem>> {
+    let path = path.to_owned();
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RolloutItem>> {
+        let mut reader = open_rollout_seekable_reader(&path, || stop.is_closed())?;
+        // Validate this session's format from its header, not metadata copied into fork history.
+        // Bound the header read too: session metadata may contain large instructions or schemas.
+        let mut header = String::new();
+        std::io::BufReader::new((&mut reader).take(MAX_RECORD_BYTES as u64))
+            .read_line(&mut header)?;
+        anyhow::ensure!(
+            matches!(
+                codex_rollout::parse_rollout_line(&header)?.item,
+                RolloutItem::SessionMeta(_)
+            ),
+            "memory extraction requires valid session metadata within the record limit"
+        );
+        let mut scanner = ReverseJsonlScanner::new(reader)?.with_max_record_bytes(MAX_RECORD_BYTES);
+        let mut remaining = MAX_ROLLOUT_BYTES;
+        let mut items = Vec::new();
+        while !stop.is_closed() {
+            let Some(outcome) = scanner.scan_next_rollout_line()? else {
+                break;
+            };
+            let ScanOutcome::Parsed(mut line) = outcome else {
+                continue;
+            };
+            if !matches!(
+                &line.item,
+                RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_)
+            ) {
+                continue;
+            }
+            if let RolloutItem::ResponseItem(item) = &mut line.item {
+                let Some(sanitized) = sanitize_response_item_for_memories(&item.item) else {
+                    continue;
+                };
+                item.item = sanitized;
+            }
+            let Some(next_remaining) = remaining.checked_sub(serde_json::to_vec(&line.item)?.len())
+            else {
+                break;
+            };
+            remaining = next_remaining;
+            items.push(line.item);
+        }
+        items.reverse();
+        Ok(items)
+    });
+    let result = task.await?;
+    drop(keep_running);
+    result
+}
 
 const OMITTED: &str = "[... response items omitted ...]\n";
 const TRUNCATION_RESERVE_BYTES: usize = 96;

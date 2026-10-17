@@ -32,13 +32,13 @@ futures = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
+codex-attachment-store = { workspace = true }
 codex-models-manager = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 dunce = { workspace = true }

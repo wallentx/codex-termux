@@ -24,6 +24,7 @@ use codex_config::merge_toml_values;
 use codex_config::shell_environment_filter_entry;
 use codex_config::validate_shell_environment_policy_filter_config;
 use codex_core::config::deserialize_config_toml_with_base;
+use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::validate_feature_requirements_for_config_toml;
 use codex_core::path_utils;
@@ -359,6 +360,38 @@ impl ConfigManager {
             parsed_segments.push(segments);
         }
         config_edits.extend(credential_provider_edits.remapping_edits(&user_config)?);
+
+        // hooks/list returns an opaque declaration/content approval value. Split it
+        // on persistence so older clients still recognize the declaration approval.
+        if let Some(states) = user_config
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut("state"))
+            .and_then(TomlValue::as_table_mut)
+        {
+            for (key, state) in states {
+                let Some(state) = state.as_table_mut() else {
+                    continue;
+                };
+                let Some((declaration, content)) = state
+                    .get("trusted_hash")
+                    .and_then(TomlValue::as_str)
+                    .and_then(|hash| hash.split_once('/'))
+                else {
+                    continue;
+                };
+                let hashes = [
+                    ("trusted_hash", declaration.to_owned()),
+                    ("trusted_content_hash", content.to_owned()),
+                ];
+                for (field, hash) in hashes {
+                    state.insert(field.to_string(), TomlValue::String(hash.clone()));
+                    config_edits.push(ConfigEdit::SetPath {
+                        segments: vec!["hooks".into(), "state".into(), key.clone(), field.into()],
+                        value: toml_edit::value(hash),
+                    });
+                }
+            }
+        }
 
         validate_config(&user_config).map_err(|err| {
             ConfigManagerError::write(

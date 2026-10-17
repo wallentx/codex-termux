@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -2203,6 +2204,7 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
     assert_eq!(status, "sentinel");
 }
 
+/// Large records keep their byte positions and remain pending until their newline is durable.
 #[tokio::test]
 async fn catch_up_preserves_trailing_partial_line_boundaries() {
     let home = TempDir::new().expect("temp dir");
@@ -2220,8 +2222,12 @@ async fn catch_up_preserves_trailing_partial_line_boundaries() {
     .await
     .expect("open thread history db");
     let before = projection_state(&pool, thread_id).await;
-    let complete_line = rollout_line(Some(1), turn_started("turn-1"));
-    let partial_line = rollout_line(Some(2), turn_completed("turn-1"));
+    let padding = " ".repeat(64 * 1024);
+    let complete_line = format!("{}{padding}", rollout_line(Some(1), turn_started("turn-1")));
+    let partial_line = format!(
+        "{}{padding}",
+        rollout_line(Some(2), turn_completed("turn-1"))
+    );
     let complete_suffix = format!("{complete_line}\n");
     let rollout_path = store
         .live_rollout_path(thread_id)
@@ -2469,6 +2475,20 @@ async fn blank_and_rejected_rollout_lines_advance_projection() {
         .await
         .expect("queue valid retry");
     recorder.flush().await.expect("flush valid retry");
+
+    // Replay this small file, cancelling between records.
+    let checks = Cell::new(0);
+    assert!(
+        super::read_projection_steps_sync(
+            rollout_path.as_path(),
+            /*start_offset*/ 0,
+            /*expected_ordinal*/ 0,
+            thread_id,
+            /*subagent_history_start_ordinal*/ None,
+            || checks.replace(checks.get() + 1) >= 6,
+        )
+        .is_err()
+    );
 
     super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
         .await

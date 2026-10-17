@@ -122,6 +122,18 @@ pub(crate) struct McpElicitationApprovalRequest {
 }
 
 impl ApprovalRequest {
+    pub(super) fn program_status_blocked_kind(
+        &self,
+    ) -> crate::terminal_program_status::ProgramStatusKind {
+        use crate::terminal_program_status::ProgramStatusKind;
+        match self {
+            Self::Exec(_) | Self::Permissions(_) | Self::ApplyPatch(_) => {
+                ProgramStatusKind::Permission
+            }
+            Self::McpElicitation(_) => ProgramStatusKind::Question,
+        }
+    }
+
     pub(super) fn thread_id(&self) -> ThreadId {
         match self {
             ApprovalRequest::Exec(request) => request.thread_id,
@@ -619,6 +631,14 @@ impl BottomPaneView for ApprovalOverlay {
 
     fn terminal_title_requires_action(&self) -> bool {
         true
+    }
+
+    fn program_status_blocked_kind(
+        &self,
+    ) -> Option<crate::terminal_program_status::ProgramStatusKind> {
+        self.current_request
+            .as_ref()
+            .map(ApprovalRequest::program_status_blocked_kind)
     }
 }
 

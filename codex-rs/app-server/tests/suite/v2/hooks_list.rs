@@ -289,6 +289,7 @@ async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
             .path()
             .join("plugins/cache/test/demo/local/hooks/hooks.json"),
     )?)?;
+    let current_hash = data[0].hooks[0].current_hash.clone();
     assert_eq!(
         data,
         vec![HooksListEntry {
@@ -310,15 +311,7 @@ async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
                 display_order: 0,
                 enabled: true,
                 is_managed: false,
-                current_hash: command_hook_hash(
-                    "pre_tool_use",
-                    Some("Bash"),
-                    "echo plugin hook",
-                    /*timeout_sec*/ 7,
-                    /*async*/ false,
-                    Some("running plugin hook"),
-                    /*additional_context_limit*/ None,
-                ),
+                current_hash,
                 trust_status: HookTrustStatus::Untrusted,
             }],
             warnings: Vec::new(),
@@ -419,6 +412,11 @@ async fn plugin_upgrade_refreshes_hook_runtime_for_loaded_session() -> Result<()
     let thread_start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
+            // Keep this refresh/disablement test independent of approval changes.
+            config: Some(std::collections::HashMap::from([(
+                "bypass_hook_trust".to_string(),
+                serde_json::json!(true),
+            )])),
             ..Default::default()
         })
         .await?;
@@ -559,7 +557,9 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()
 
     let server = create_mock_responses_server_sequence_unchecked(vec![
         create_final_assistant_message_sse_response("Version 1")?,
+        create_final_assistant_message_sse_response("Version 2 needs approval")?,
         create_final_assistant_message_sse_response("Version 2")?,
+        create_final_assistant_message_sse_response("Rollback needs approval")?,
         create_final_assistant_message_sse_response("Rollback")?,
     ])
     .await;
@@ -622,7 +622,13 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()
         timeout(DEFAULT_TIMEOUT, mcp.read_response(start_id)).await??;
 
     let mut expected_versions = String::new();
-    for version in ["1.0.0", "2.0.0", "0.9.0"] {
+    for (version, expected_trust) in [
+        ("1.0.0", HookTrustStatus::Trusted),
+        ("2.0.0", HookTrustStatus::Modified),
+        ("2.0.0", HookTrustStatus::Trusted),
+        ("0.9.0", HookTrustStatus::Modified),
+        ("0.9.0", HookTrustStatus::Trusted),
+    ] {
         // This test process updates the shared store without notifying app-server.
         write_versioned_plugin_hook(source.path(), version, &hook_log_path)?;
         store.install(AbsolutePathBuf::try_from(source.path())?, plugin_id.clone())?;
@@ -642,8 +648,66 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()
             mcp.read_stream_until_notification_message("turn/completed"),
         )
         .await??;
-        expected_versions.push_str(&format!("{version}\n"));
+        if expected_trust == HookTrustStatus::Trusted {
+            expected_versions.push_str(&format!("{version}\n"));
+        }
         assert_eq!(std::fs::read_to_string(&hook_log_path)?, expected_versions);
+        let list_id = mcp
+            .send_hooks_list_request(HooksListParams {
+                cwds: vec![codex_home.path().to_path_buf()],
+            })
+            .await?;
+        let HooksListResponse { data } =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(list_id)).await??;
+        let hook = data[0]
+            .hooks
+            .iter()
+            .find(|hook| hook.event_name == HookEventName::UserPromptSubmit)
+            .expect("plugin should register a user-prompt hook");
+        assert_eq!(hook.trust_status, expected_trust);
+        if expected_trust == HookTrustStatus::Trusted {
+            let saved: toml::Value = toml::from_str(&std::fs::read_to_string(
+                codex_home.path().join("config.toml"),
+            )?)?;
+            // Older clients compare only the declaration hash; keep that approval valid.
+            let declaration_hash = command_hook_hash(
+                "user_prompt_submit",
+                /*matcher*/ None,
+                "python3 ${PLUGIN_ROOT}/hooks/log_version.py",
+                hook.timeout_sec,
+                /*async*/ false,
+                /*status_message*/ None,
+                /*additional_context_limit*/ None,
+            );
+            assert_eq!(
+                saved["hooks"]["state"][&hook.key]
+                    .clone()
+                    .try_into::<codex_config::HookStateToml>()?,
+                codex_config::HookStateToml {
+                    enabled: None,
+                    trusted_hash: Some(declaration_hash),
+                    trusted_content_hash: Some(
+                        hook.current_hash.split_once('/').unwrap().1.to_string()
+                    ),
+                },
+            );
+        }
+        if expected_trust == HookTrustStatus::Modified {
+            let trust_id = mcp
+                .send_config_batch_write_request(ConfigBatchWriteParams {
+                    edits: vec![ConfigEdit {
+                        key_path: format!("hooks.state.\"{}\".trusted_hash", hook.key),
+                        value: serde_json::json!(hook.current_hash),
+                        merge_strategy: MergeStrategy::Upsert,
+                    }],
+                    file_path: None,
+                    expected_version: None,
+                    reload_user_config: true,
+                })
+                .await?;
+            let _: codex_app_server_protocol::ConfigWriteResponse =
+                timeout(DEFAULT_TIMEOUT, mcp.read_response(trust_id)).await??;
+        }
     }
     Ok(())
 }
@@ -861,22 +925,7 @@ async fn hooks_list_shows_discovered_plugin_mcp_tool_hook() -> Result<()> {
             .path()
             .join("plugins/cache/test/demo/local/hooks/hooks.json"),
     )?)?;
-    let identity = NormalizedHookIdentity {
-        event_name: "pre_tool_use",
-        group: codex_config::MatcherGroup {
-            matcher: Some("Bash".to_string()),
-            hooks: vec![codex_config::HookHandlerConfig::McpTool {
-                server: "security".to_string(),
-                tool: "inspect".to_string(),
-                input: serde_json::from_value(serde_json::json!({
-                    "path": "${tool_input.path}",
-                }))?,
-                timeout_sec: Some(9),
-                status_message: Some("checking security policy".to_string()),
-            }],
-        },
-    };
-    let identity = codex_config::TomlValue::try_from(identity)?;
+    let current_hash = data[0].hooks[0].current_hash.clone();
 
     assert_eq!(
         data,
@@ -899,7 +948,7 @@ async fn hooks_list_shows_discovered_plugin_mcp_tool_hook() -> Result<()> {
                 display_order: 0,
                 enabled: true,
                 is_managed: false,
-                current_hash: codex_config::version_for_toml(&identity),
+                current_hash,
                 trust_status: HookTrustStatus::Untrusted,
             }],
             warnings: Vec::new(),
@@ -969,6 +1018,7 @@ enabled = false
     let source_path = AbsolutePathBuf::from_absolute_path(std::fs::canonicalize(
         plugin_root.join("hooks/hooks.json"),
     )?)?;
+    let current_hash = data[0].hooks[0].current_hash.clone();
     assert_eq!(
         data,
         vec![HooksListEntry {
@@ -990,15 +1040,7 @@ enabled = false
                 display_order: 1,
                 enabled: false,
                 is_managed: false,
-                current_hash: command_hook_hash(
-                    "stop",
-                    /*matcher*/ None,
-                    ordinary_command,
-                    /*timeout_sec*/ 5,
-                    /*async*/ false,
-                    /*status_message*/ None,
-                    /*additional_context_limit*/ None,
-                ),
+                current_hash,
                 trust_status: HookTrustStatus::Untrusted,
             }],
             warnings: Vec::new(),

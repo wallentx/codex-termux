@@ -165,10 +165,11 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
         .await;
     assert_eq!(
         hints,
-        vec![PromptFragment::new(
+        vec![PromptFragment::tool(
             PromptSlot::ContextWindow,
             THREAD_HINT,
             ContentItemKind("notes.thread_hint".to_string()),
+            "notes".to_string(),
         )]
     );
 
@@ -461,6 +462,8 @@ fn tool_call(tool_name: ToolName, arguments: serde_json::Value) -> ToolCall<'sta
         source: ToolCallSource::Direct,
         conversation_history: ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        attachment_store: codex_core::passthrough_image_store(),
+        ephemeral: false,
         environments: Vec::new(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),

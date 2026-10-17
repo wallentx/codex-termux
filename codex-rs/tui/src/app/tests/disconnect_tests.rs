@@ -35,6 +35,7 @@ async fn lost_mutation_reply_preserves_work_without_resubmitting() -> Result<()>
         .await
     });
     let mut session = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
         crate::connect_remote_app_server(endpoint).await?,
         ThreadParamsMode::Remote,
     );
@@ -429,6 +430,7 @@ async fn lost_initial_thread_reply_keeps_startup_draft_offline() -> Result<()> {
             .await
         });
         let mut session = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             crate::connect_remote_app_server(endpoint).await?,
             ThreadParamsMode::Remote,
         );

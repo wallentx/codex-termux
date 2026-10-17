@@ -93,15 +93,19 @@ impl TranscriptView {
     /// Automatic copies may deselect but still publish PRIMARY, so retain their source.
     pub(crate) fn selection_copy(&self, action: &ViewAction) -> SelectionCopy {
         match action {
-            ViewAction::CopyOnSelect(_) => SelectionCopy::OnSelect {
-                clear_selection: self.copy_on_select_clear_selection,
-            },
+            ViewAction::CopyOnSelect(_) => SelectionCopy::on_select(
+                /*clipboard*/ true,
+                self.primary_selection,
+                self.copy_on_select_clear_selection,
+            ),
+            ViewAction::PrimarySelection(_) => SelectionCopy::on_select(
+                /*clipboard*/ false, /*primary*/ true, /*clear_selection*/ false,
+            ),
             ViewAction::Changed
             | ViewAction::ExitSelectMode
-            | ViewAction::PrimarySelection(_)
             | ViewAction::Copy(_)
             | ViewAction::CopyAndFollow(_)
-            | ViewAction::OpenLink(_) => SelectionCopy::Explicit,
+            | ViewAction::OpenLink(_) => SelectionCopy::EXPLICIT,
         }
     }
 

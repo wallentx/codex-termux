@@ -156,6 +156,8 @@ pub(super) struct AgentsOverviewViewState {
     pub(super) has_more: bool,
     show_more_selected: bool,
     pub(super) connection_notice: Option<&'static str>,
+    /// Browse only while the server holds its lifecycle lock.
+    pub(super) removal: Option<AgentsOverviewAction>,
     pub(super) server_version_notice: Option<String>,
     search: String,
     searching: bool,
@@ -588,6 +590,9 @@ impl BottomPaneView for AgentsOverviewView {
             self.reconcile_command_center_selection();
             return CancellationEvent::Handled;
         }
+        if state.removal.is_some() {
+            return CancellationEvent::Handled;
+        }
         CancellationEvent::NotHandled
     }
 
@@ -647,7 +652,9 @@ impl BottomPaneView for AgentsOverviewView {
             return;
         }
 
-        if (self.state().connection_notice.is_some() || self.state().creating_worktree)
+        if (self.state().connection_notice.is_some()
+            || self.state().creating_worktree
+            || self.state().removal.is_some())
             && self.keymap.action_for(key) != Some(ListAction::Cancel)
         {
             match self.keymap.action_for(key) {
@@ -655,6 +662,12 @@ impl BottomPaneView for AgentsOverviewView {
                 Some(ListAction::MoveDown) => self.move_selection(/*forward*/ true),
                 Some(action @ (ListAction::PageUp | ListAction::PageDown)) => {
                     self.page_selection(action)
+                }
+                Some(ListAction::JumpTop) => {
+                    self.selected = self.visible_indices().first().copied().unwrap_or(0);
+                }
+                Some(ListAction::JumpBottom) => {
+                    self.selected = self.visible_indices().last().copied().unwrap_or(0);
                 }
                 _ => {}
             }

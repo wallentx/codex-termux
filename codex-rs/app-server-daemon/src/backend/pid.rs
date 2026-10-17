@@ -93,6 +93,15 @@ impl PidBackend {
     pub(crate) async fn running_executable_identity(&self) -> Result<Option<ExecutableIdentity>> {
         match self.read_pid_file_state().await? {
             PidFileState::Running(record) if self.record_is_active(&record).await? => {
+                // Updaters can exec a different release without changing PID. Only the
+                // updater itself can reliably identify its executable after a handoff.
+                if matches!(self.command_kind, PidCommandKind::UpdateLoop { .. })
+                    && record.pid == std::process::id()
+                {
+                    return crate::managed_install::executable_identity(&std::env::current_exe()?)
+                        .await
+                        .map(Some);
+                }
                 Ok(record.executable_identity)
             }
             _ => Ok(None),

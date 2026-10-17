@@ -11,7 +11,6 @@ use codex_core::StartThreadOptions;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
 use codex_core::TurnStartOptions;
-use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ThreadStoreConfig;
 use codex_features::Feature;
@@ -20,8 +19,6 @@ use codex_history::RolloutItem;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
-use codex_plugin::PluginHookSource;
-use codex_plugin::PluginId;
 use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ContentItem;
@@ -47,11 +44,9 @@ use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::InMemoryThreadStore;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::TestTargetOs;
 use core_test_support::fs_wait;
 use core_test_support::hooks::trust_discovered_hooks;
-use core_test_support::hooks::trust_hooks;
 use core_test_support::managed_network_requirements_loader;
 use core_test_support::responses;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
@@ -168,24 +163,6 @@ fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo
     provider.base_url = Some(format!("{}/v1", server.uri()));
     provider.supports_websockets = false;
     provider
-}
-
-fn trust_plugin_hooks(config: &mut Config, plugin_hook_sources: Vec<PluginHookSource>) {
-    config
-        .features
-        .enable(Feature::CodexHooks)
-        .expect("test config should allow feature update");
-    let listed = codex_hooks::list_hooks(codex_hooks::HooksConfig {
-        feature_enabled: true,
-        config_layer_stack: Some(config.config_layer_stack.clone()),
-        plugin_hook_sources,
-        ..codex_hooks::HooksConfig::default()
-    });
-    assert!(
-        !listed.hooks.is_empty(),
-        "trusted plugin hook fixture should discover at least one hook"
-    );
-    trust_hooks(config, listed.hooks);
 }
 
 fn write_stop_hook(home: &Path, block_prompts: &[&str]) -> Result<()> {
@@ -4569,6 +4546,7 @@ async fn local_bundled_cleanup_hook_runs_without_saved_trust(
         HookStateToml {
             enabled: Some(false),
             trusted_hash: None,
+            trusted_content_hash: None,
         },
     )]);
     if !hooks_enabled {
@@ -4584,6 +4562,7 @@ async fn local_bundled_cleanup_hook_runs_without_saved_trust(
                 HookStateToml {
                     enabled: None,
                     trusted_hash: Some(hook.current_hash),
+                    trusted_content_hash: None,
                 },
             );
         }
@@ -4651,8 +4630,11 @@ async fn plugin_pre_tool_use_blocks_exec_command_before_execution() -> Result<()
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
     let call_id = "plugin-pretooluse-exec-command";
-    let marker = std::env::temp_dir().join("plugin-pretooluse-exec-command-marker");
+    let same_turn_call_id = "plugin-pretooluse-exec-command-same-turn";
+    let changed_call_id = "plugin-pretooluse-changed-script";
+    let marker = home.path().join("plugin-pretooluse-exec-command-marker");
     let command = format!("printf blocked > {}", marker.display());
     let args = serde_json::json!({ "cmd": command });
     let responses = mount_sse_sequence(
@@ -4668,6 +4650,24 @@ async fn plugin_pre_tool_use_blocks_exec_command_before_execution() -> Result<()
                 ev_completed("resp-1"),
             ]),
             sse(vec![
+                ev_response_created("resp-same-turn"),
+                ev_function_call(
+                    same_turn_call_id,
+                    "exec_command",
+                    &serde_json::to_string(&args)?,
+                ),
+                ev_completed("resp-same-turn"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-changed"),
+                ev_function_call(
+                    changed_call_id,
+                    "exec_command",
+                    &serde_json::to_string(&args)?,
+                ),
+                ev_completed("resp-changed"),
+            ]),
+            sse(vec![
                 ev_response_created("resp-2"),
                 ev_assistant_message("msg-1", "plugin hook blocked it"),
                 ev_completed("resp-2"),
@@ -4676,7 +4676,6 @@ async fn plugin_pre_tool_use_blocks_exec_command_before_execution() -> Result<()
     )
     .await;
 
-    let home = Arc::new(TempDir::new()?);
     let plugin_root = home.path().join("plugins/cache/test/sample/local");
     let hooks_dir = plugin_root.join("hooks");
     fs::create_dir_all(plugin_root.join(".codex-plugin"))
@@ -4691,18 +4690,40 @@ async fn plugin_pre_tool_use_blocks_exec_command_before_execution() -> Result<()
         home.path().join("config.toml"),
         r#"[plugins."sample@test"]
 enabled = true
+
+# Declaration-only approvals from before content fingerprinting.
+[hooks.state."sample@test:hooks/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "sha256:c9ee1aca1b5d8c72b99df6571c87d61350b09f7f4594ae30e7250a2027e9d76b"
+[hooks.state."sample@test:hooks/hooks.json:post_tool_use:0:0"]
+trusted_hash = "sha256:9eef43ad6f26b1f9b94f318a50445f8bb62c363da08152a2966b73d308bf42ba"
 "#,
     )
     .context("write plugin config")?;
 
     let script_path = hooks_dir.join("pre_tool_use_hook.py");
-    let log_path = hooks_dir.join("pre_tool_use_hook_log.jsonl");
+    let log_path = home.path().join("pre_tool_use_hook_log.jsonl");
+    fs::write(
+        hooks_dir.join("hook_support.py"),
+        "DENIAL_REASON = 'blocked by plugin hook'\n",
+    )
+    .context("write bundled hook module")?;
     fs::write(
         &script_path,
         format!(
             r#"import json
 from pathlib import Path
 import sys
+sys.path.insert(0, str(Path(__file__).parent))
+from hook_support import DENIAL_REASON
+
+root = Path(__file__).parents[1]
+for relative in (".venv/pyvenv.cfg", "sample.egg-info/PKG-INFO"):
+    artifact = root / relative
+    artifact.parent.mkdir(exist_ok=True)
+    artifact.write_text("generated")
+python_link = root / ".venv/python"
+if sys.platform != "win32" and not python_link.exists():
+    python_link.symlink_to(sys.executable)
 
 payload = json.load(sys.stdin)
 with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
@@ -4712,9 +4733,12 @@ print(json.dumps({{
     "hookSpecificOutput": {{
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "blocked by plugin hook"
+        "permissionDecisionReason": DENIAL_REASON
     }}
 }}))
+if len(Path(r"{log_path}").read_text().splitlines()) == 2:
+    with Path(__file__).open("a", encoding="utf-8") as script:
+        script.write("\n# updated plugin bundle\n")
 "#,
             log_path = log_path.display(),
         ),
@@ -4726,30 +4750,20 @@ print(json.dumps({{
       "matcher": "^Bash$",
       "hooks": [{
         "type": "command",
-        "command": "python3 ${PLUGIN_ROOT}/hooks/pre_tool_use_hook.py"
+        "command": "python3 -I -S ${PLUGIN_ROOT}/hooks/pre_tool_use_hook.py"
+      }]
+    }],
+    "PostToolUse": [{
+      "matcher": "^Bash$",
+      "hooks": [{
+        "type": "command",
+        "command": "python3 -I -S ${PLUGIN_ROOT}/hooks/pre_tool_use_hook.py"
       }]
     }]
   }
 }"#;
     let plugin_hooks_path = hooks_dir.join("hooks.json");
     fs::write(&plugin_hooks_path, plugin_hooks_json).context("write plugin hooks config")?;
-    let plugin_root_abs =
-        AbsolutePathBuf::try_from(plugin_root.clone()).context("absolute plugin root")?;
-    let plugin_hooks_path_abs =
-        AbsolutePathBuf::try_from(plugin_hooks_path).context("absolute plugin hooks path")?;
-    let plugin_data_root =
-        AbsolutePathBuf::try_from(plugin_root.join("data")).context("absolute plugin data root")?;
-    let plugin_hook_sources = vec![PluginHookSource {
-        plugin_id: PluginId::parse("sample@test").context("plugin id")?,
-        plugin_root: plugin_root_abs,
-        plugin_data_root,
-        source_path: plugin_hooks_path_abs,
-        source_relative_path: "hooks/hooks.json".to_string(),
-        hooks: serde_json::from_str::<codex_config::HooksFile>(plugin_hooks_json)
-            .context("parse plugin hooks")?
-            .hooks,
-    }];
-
     let mut builder = test_codex()
         .with_home(Arc::clone(&home))
         .with_config(move |config| {
@@ -4757,13 +4771,11 @@ print(json.dumps({{
                 .features
                 .enable(Feature::Plugins)
                 .expect("test config should allow feature update");
-            trust_plugin_hooks(config, plugin_hook_sources);
+            config.features.enable(Feature::CodexHooks).unwrap();
         });
     let test = builder.build(&server).await?;
-
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover plugin pre tool use marker")?;
-    }
+    assert!(!home.path().join(".hook-trust").exists());
+    let legacy_config = fs::read_to_string(home.path().join("config.toml"))?;
 
     test.submit_turn_with_policy(
         "run the shell command blocked by a plugin hook",
@@ -4772,7 +4784,7 @@ print(json.dumps({{
     .await?;
 
     let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
     let output_item = requests[1].function_call_output(call_id);
     let output = output_item
         .get("output")
@@ -4782,17 +4794,32 @@ print(json.dumps({{
         output.contains("Command blocked by PreToolUse hook: blocked by plugin hook"),
         "blocked tool output should surface the plugin hook reason",
     );
+    assert!(marker.exists(), "the modified hook must not execute again");
     assert!(
-        !marker.exists(),
-        "plugin hook should block shell command execution"
+        requests[2].function_call_output(same_turn_call_id)["output"]
+            .as_str()
+            .unwrap()
+            .contains("Command blocked by PreToolUse hook")
     );
 
     let hook_inputs = read_hook_inputs_from_log(&log_path)?;
-    assert_eq!(hook_inputs.len(), 1);
+    // A legacy hook first used after a bundle change must share the earlier baseline.
+    assert_eq!(hook_inputs.len(), 2);
     assert_eq!(hook_inputs[0]["hook_event_name"], "PreToolUse");
     assert_eq!(hook_inputs[0]["tool_name"], "Bash");
     assert_eq!(hook_inputs[0]["tool_use_id"], call_id);
     assert_eq!(hook_inputs[0]["tool_input"]["command"], command);
+    assert!(
+        hooks_dir.join("__pycache__").exists(),
+        "isolated Python should create bytecode without invalidating hook trust"
+    );
+    assert_eq!(hook_inputs[1]["tool_use_id"], same_turn_call_id);
+    // Migration keeps declaration-only approvals readable by older clients.
+    assert_eq!(
+        fs::read_to_string(home.path().join("config.toml"))?,
+        legacy_config
+    );
+    assert_eq!(fs::read_dir(home.path().join(".hook-trust"))?.count(), 1);
 
     Ok(())
 }

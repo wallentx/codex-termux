@@ -47,6 +47,7 @@ impl AppServerSession {
                     realtime_end_instructions: None,
                     prompt: None,
                     realtime_session_id: None,
+                    voice_session_id: None,
                     transport: Some(ThreadRealtimeStartTransport::Webrtc { sdp: offer_sdp }),
                     version: Some(RealtimeConversationVersion::V3),
                     voice,

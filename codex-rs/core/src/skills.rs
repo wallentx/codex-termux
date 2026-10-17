@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_analytics::InvocationType;
@@ -6,6 +7,8 @@ use codex_analytics::SkillInvocation;
 use codex_analytics::SkillInvocationLocation;
 use codex_analytics::TrackEventsContext;
 use codex_analytics::build_track_events_context;
+use codex_core_plugins::PluginsManager;
+use codex_exec_server::ExecutorFileSystem;
 use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::SkillInvocationKind;
 use codex_otel::SkillInvocationEvent;
@@ -21,11 +24,13 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::PluginSkillRoot;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Default)]
 struct ImplicitSkillInvocations(Mutex<HashSet<String>>);
 
+#[cfg(test)]
 pub(crate) fn skills_load_input_from_config(
     config: &Config,
     effective_skill_roots: Vec<PluginSkillRoot>,
@@ -35,6 +40,37 @@ pub(crate) fn skills_load_input_from_config(
         effective_skill_roots,
         config.config_layer_stack.clone(),
     )
+}
+
+/// Pair repository discovery inputs with their captured filesystem owner.
+/// Keep preparation synchronous so it adds no nested startup or resume future.
+pub(crate) fn skills_load_input_for_environments(
+    config: &Config,
+    plugins_manager: &PluginsManager,
+    effective_skill_roots: Vec<PluginSkillRoot>,
+    environments: &TurnEnvironmentSnapshot,
+) -> (HostSkillsLoadInput, Option<Arc<dyn ExecutorFileSystem>>) {
+    // Preserve primary-repository discovery independently of the host config cwd.
+    let workspace = environments.primary().and_then(|environment| {
+        environment
+            .cwd()
+            .to_abs_path()
+            .ok()
+            .map(|cwd| (cwd, environment.environment.get_filesystem()))
+    });
+    let (cwd, fs) = match workspace {
+        Some((cwd, fs)) => (cwd, Some(fs)),
+        None => (config.cwd.clone(), None),
+    };
+    let input = HostSkillsLoadInput::new(
+        cwd,
+        effective_skill_roots,
+        config.config_layer_stack.clone(),
+    )
+    .with_plugin_skill_snapshots(
+        plugins_manager.plugin_skill_snapshots_for_config(&config.plugins_config_input()),
+    );
+    (input, fs)
 }
 
 pub(crate) async fn emit_explicit_skill_invocations(

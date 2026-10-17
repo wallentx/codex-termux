@@ -295,7 +295,9 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
             .unwrap()
             .creating_worktree = true;
         let old_sender = app.app_event_tx.clone();
+        let backend_id = session.backend_id();
         let connected = reconnect(
+            session.backend_id(),
             app.app_server_target.clone(),
             app.config.clone(),
             app.local_settings.clone(),
@@ -312,6 +314,7 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
         );
         app.finish_reconnect(&mut tui, &mut session, &mut events, connected, "2.1.0")
             .await?;
+        assert_eq!(session.backend_id(), backend_id);
         if edit_offline {
             assert!(!app.chat_widget.has_active_view());
             assert!(
@@ -568,6 +571,7 @@ async fn reconnect_reconciles_offscreen_pending_profile_before_restoring_permiss
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.begin_reconnect();
     let connected = reconnect(
+        session.backend_id(),
         app.app_server_target.clone(),
         app.config.clone(),
         app.local_settings.clone(),
@@ -641,6 +645,7 @@ async fn reconnect_exhaustion_and_unknown_initial_thread_stay_offline() -> Resul
     for id in [Some(ThreadId::new()), None] {
         assert!(
             reconnect(
+                crate::backend_id::BackendId::new(),
                 app.app_server_target.clone(),
                 app.config.clone(),
                 app.local_settings.clone(),
@@ -691,6 +696,7 @@ async fn reconnect_allows_slow_hydration_but_bounds_a_stalled_server() -> Result
         });
         let start = tokio::time::Instant::now();
         let result = reconnect(
+            crate::backend_id::BackendId::new(),
             AppServerTarget::Remote {
                 endpoint: endpoint.clone(),
             },

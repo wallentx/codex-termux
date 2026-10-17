@@ -17,6 +17,8 @@ pub(crate) fn thread_store_error_kind(error: &ThreadStoreError) -> &'static str 
         ThreadStoreError::InvalidRequest { .. } => "thread_store_invalid_request",
         ThreadStoreError::Conflict { .. } => "thread_store_conflict",
         ThreadStoreError::Unsupported { .. } => "thread_store_unsupported",
+        ThreadStoreError::Retryable { .. } => "thread_store_retryable",
+        ThreadStoreError::OutcomeUnknown { .. } => "thread_store_outcome_unknown",
         ThreadStoreError::Internal { .. } => "thread_store_internal",
     }
 }

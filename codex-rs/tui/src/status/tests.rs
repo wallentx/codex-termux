@@ -383,6 +383,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         .await
         .expect("write models cache");
     let mut app_server = crate::start_app_server_for_picker(
+        crate::backend_id::BackendId::new(),
         &config,
         &crate::AppServerTarget::Embedded,
         Vec::new(),

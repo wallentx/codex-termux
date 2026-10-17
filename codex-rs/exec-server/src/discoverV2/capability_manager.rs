@@ -9,6 +9,7 @@ use crate::discover_v2::capability_discoveries::load_capability_discoveries;
 use crate::discover_v2::capability_locations::CapabilityLocationRequest;
 use crate::discover_v2::capability_locations::CapabilityLocations;
 use crate::discover_v2::capability_locations::prewarm_locations;
+use codex_config::loader::system_config_toml_file;
 use codex_file_watcher::WatchRegistration;
 use codex_utils_path_uri::PathUri;
 use std::io;
@@ -55,7 +56,7 @@ impl CapabilityManager {
         })
     }
 
-    /// Resolves home paths on first initialization and reuses the prewarmed locations.
+    /// Resolves fixed paths on first initialization and reuses the prewarmed locations.
     pub(crate) async fn prewarm_locations(
         self: &Arc<Self>,
     ) -> io::Result<&(CapabilityLocationRequest, CapabilityLocations)> {
@@ -66,6 +67,9 @@ impl CapabilityManager {
                     codex_home: PathUri::from_abs_path(&codex_utils_home_dir::find_codex_home()?),
                     user_home: dirs::home_dir()
                         .and_then(|home| PathUri::from_host_native_path(home).ok()),
+                    system_skills_root: system_config_toml_file()?
+                        .parent()
+                        .map(|root| PathUri::from_abs_path(&root.join("skills"))),
                 };
                 let locations = prewarm_locations(&self.file_system, &request).await?;
                 Ok::<_, io::Error>((request, locations))

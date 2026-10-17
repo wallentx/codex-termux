@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
@@ -969,21 +970,32 @@ impl ExecServerClient {
             .await
     }
 
-    pub async fn fs_open(&self, params: FsOpenParams) -> Result<FsOpenResponse, ExecServerError> {
-        // Older executors ignore the mode field and could silently return a read-only handle.
-        if params.mode == FsOpenMode::Replace
-            && !self
-                .environment_info()
-                .await?
-                .capabilities
-                .file_write_streaming
-        {
-            return Err(ExecServerError::Protocol(
-                "exec-server does not support writable file streams".to_string(),
-            ));
+    pub(crate) async fn supports_file_write_streaming(&self) -> Result<bool, ExecServerError> {
+        Ok(self
+            .environment_info()
+            .await?
+            .capabilities
+            .file_write_streaming)
+    }
+
+    /// Returns an owned future so callers can finish an open after they stop waiting for it.
+    pub fn fs_open(
+        &self,
+        params: FsOpenParams,
+    ) -> impl Future<Output = Result<FsOpenResponse, ExecServerError>> + Send + 'static {
+        let client = self.clone();
+        async move {
+            // Older executors ignore the mode field and could silently return a read-only handle.
+            if params.mode == FsOpenMode::Replace && !client.supports_file_write_streaming().await?
+            {
+                return Err(ExecServerError::Protocol(
+                    "exec-server does not support writable file streams".to_string(),
+                ));
+            }
+            client
+                .call(FS_OPEN_METHOD, &WireFsOpenParams::from(params))
+                .await
         }
-        self.call(FS_OPEN_METHOD, &WireFsOpenParams::from(params))
-            .await
     }
 
     pub async fn fs_read_block(
@@ -997,12 +1009,7 @@ impl ExecServerClient {
         &self,
         params: FsWriteBlockParams,
     ) -> Result<FsWriteBlockResponse, ExecServerError> {
-        if !self
-            .environment_info()
-            .await?
-            .capabilities
-            .file_write_streaming
-        {
+        if !self.supports_file_write_streaming().await? {
             return Err(ExecServerError::Protocol(
                 "exec-server does not support writable file streams".to_string(),
             ));
@@ -1958,6 +1965,7 @@ mod tests {
     use codex_exec_server_protocol::JSONRPCResponse;
     use codex_http_client::HttpClientFactory;
     use codex_http_client::OutboundProxyPolicy;
+    use codex_protocol::models::PermissionProfile;
     use codex_utils_path_uri::PathUri;
     use futures::SinkExt;
     use futures::StreamExt;
@@ -1996,8 +2004,12 @@ mod tests {
     use super::ExecServerClientConnectOptions;
     use super::ExecServerError;
     use super::LazyRemoteExecServerClient;
+    use crate::Environment;
     use crate::EnvironmentObservedStatus;
+    use crate::ExecutorFileSystem;
+    use crate::FileSystemSandboxContext;
     use crate::ProcessId;
+    use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
     #[cfg(not(windows))]
     use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT;
     use crate::client_api::ExecServerTransportParams;
@@ -2019,19 +2031,24 @@ mod tests {
     use crate::protocol::ExecOutputStream;
     use crate::protocol::ExecParams;
     use crate::protocol::ExecResponse;
+    use crate::protocol::FS_CLOSE_METHOD;
     use crate::protocol::FS_OPEN_METHOD;
+    use crate::protocol::FS_WRITE_FILE_METHOD;
     use crate::protocol::FsOpenMode;
     use crate::protocol::FsOpenParams;
     use crate::protocol::FsWriteBlockParams;
+    use crate::protocol::FsWriteFileParams;
     use crate::protocol::INITIALIZE_METHOD;
     use crate::protocol::INITIALIZED_METHOD;
     use crate::protocol::InitializeResponse;
     use crate::protocol::ProcessOutputChunk;
     use crate::protocol::ProcessSandboxType;
     use crate::protocol::ReadResponse;
+    use crate::protocol::WireFsWriteFileParams;
     use crate::protocol::WriteParams;
     use crate::protocol::WriteResponse;
     use crate::protocol::WriteStatus;
+    use crate::remote_file_system::RemoteFileSystem;
 
     async fn read_jsonrpc_line<R>(lines: &mut tokio::io::Lines<BufReader<R>>) -> JSONRPCMessage
     where
@@ -2758,9 +2775,10 @@ mod tests {
         Ok(())
     }
 
-    /// Old executors must never receive writable opens they would silently treat as reads.
+    /// Old executors receive one sandboxed writeFile, never an open they would mistake for a read.
     #[tokio::test]
-    async fn writable_file_streams_require_executor_capability() -> anyhow::Result<()> {
+    async fn old_executor_receives_buffered_replacement_and_keeps_read_only_opens()
+    -> anyhow::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let websocket_url = format!("ws://{}", listener.local_addr()?);
         let read_open = FsOpenParams {
@@ -2769,6 +2787,16 @@ mod tests {
             mode: FsOpenMode::Read,
             sandbox: None,
         };
+        let sandbox = FileSystemSandboxContext::from_permission_profile(
+            PermissionProfile::workspace_write(),
+            PathUri::parse("file:///tmp")?,
+        );
+        let expected_write = WireFsWriteFileParams::from(FsWriteFileParams {
+            path: read_open.path.clone(),
+            data_base64: "AP9oaQ==".to_string(),
+            follow_symlinks: None,
+            sandbox: Some(sandbox.clone()),
+        });
         let server = tokio::spawn(async move {
             let mut websocket = accept_websocket(&listener).await;
             let mut info = EnvironmentInfo::local();
@@ -2778,6 +2806,23 @@ mod tests {
                 "session-1",
                 /*expected_resume_session_id*/ None,
                 Some(info),
+            )
+            .await;
+            let JSONRPCMessage::Request(write) = read_jsonrpc_websocket(&mut websocket).await
+            else {
+                panic!("expected buffered write");
+            };
+            assert_eq!(write.method, FS_WRITE_FILE_METHOD);
+            assert_eq!(
+                write.params,
+                Some(serde_json::to_value(expected_write).expect("serialize legacy write"))
+            );
+            write_jsonrpc_websocket(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: write.id,
+                    result: serde_json::json!({}),
+                }),
             )
             .await;
             let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut websocket).await
@@ -2803,12 +2848,32 @@ mod tests {
             )
             .await;
         });
-        let client = ExecServerClient::connect_websocket(RemoteExecServerConnectArgs::new(
-            websocket_url,
-            "file-stream-test".to_string(),
+        let remote = LazyRemoteExecServerClient::new(
+            ExecServerTransportParams::websocket_url(
+                websocket_url,
+                DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
+            ),
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-        ))
-        .await?;
+        );
+        let client = remote.get().await?;
+        let fs = RemoteFileSystem::new(remote);
+        // A source error precedes any legacy write, so the server must see only the complete file.
+        let broken = futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"partial")),
+            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+        ]);
+        let error = fs
+            .write_file_stream(&read_open.path, broken.boxed(), Some(&sandbox))
+            .await
+            .expect_err("source error");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        let contents = futures::stream::iter([b"\x00\xff", b"hi"])
+            .map(|chunk| Ok(bytes::Bytes::from_static(chunk)));
+        let written = fs
+            .write_file_stream(&read_open.path, contents.boxed(), Some(&sandbox))
+            .await?;
+        assert_eq!(written, 4);
         let error = client
             .fs_open(FsOpenParams {
                 mode: FsOpenMode::Replace,
@@ -2826,8 +2891,67 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ExecServerError::Protocol(_)));
+        // This read-only open must be the next request; there is no stream handle to close.
         client.fs_open(read_open).await?;
         server.await?;
+        Ok(())
+    }
+
+    /// An open that completes after cancellation must close that exact handle.
+    #[tokio::test]
+    async fn cancelled_streaming_replacement_closes_pending_open() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let websocket_url = format!("ws://{}", listener.local_addr()?);
+        let fs = Environment::create_for_tests(Some(websocket_url))?.get_filesystem();
+        let path = PathUri::parse("file:///tmp/cancelled.bin")?;
+        let contents = futures::stream::poll_fn(|_| panic!("cancelled write polled its source"));
+        let mut write = fs.write_file_stream(&path, contents.boxed(), /*sandbox*/ None);
+
+        let receive_open = async {
+            let mut ws = accept_websocket(&listener).await;
+            complete_websocket_initialize_with_environment_info(
+                &mut ws,
+                "session-1",
+                /*expected_resume_session_id*/ None,
+                Some(EnvironmentInfo::local()),
+            )
+            .await;
+            let JSONRPCMessage::Request(open) = read_jsonrpc_websocket(&mut ws).await else {
+                panic!("expected fs/open");
+            };
+            assert_eq!(open.method, FS_OPEN_METHOD);
+            (ws, open)
+        };
+        let (mut ws, open) = tokio::select! {
+            open = receive_open => open,
+            result = &mut write => panic!("write must wait for open: {result:?}"),
+        };
+        drop(write);
+
+        let params = open.params.expect("fs/open params");
+        let handle = params["handleId"].as_str().expect("handleId");
+        let handle = serde_json::json!({"handleId": handle});
+        write_jsonrpc_websocket(
+            &mut ws,
+            JSONRPCMessage::Response(JSONRPCResponse {
+                id: open.id,
+                result: handle.clone(),
+            }),
+        )
+        .await;
+        let JSONRPCMessage::Request(close) = read_jsonrpc_websocket(&mut ws).await else {
+            panic!("expected fs/close");
+        };
+        assert_eq!(close.method, FS_CLOSE_METHOD);
+        assert_eq!(close.params, Some(handle));
+        write_jsonrpc_websocket(
+            &mut ws,
+            JSONRPCMessage::Response(JSONRPCResponse {
+                id: close.id,
+                result: serde_json::json!({}),
+            }),
+        )
+        .await;
         Ok(())
     }
 

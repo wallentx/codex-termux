@@ -5,30 +5,6 @@ use crate::app_event::RealtimeWebrtcStartupFailure;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-async fn enabling_voice_on_an_open_thread_snapshots_the_new_thread_notice() {
-    let (mut chat, _sender, mut events, _ops) = make_chatwidget_manual_with_sender().await;
-    chat.set_feature_enabled(
-        codex_features::Feature::RealtimeConversation,
-        /*enabled*/ true,
-    );
-    commit_realtime_history_events(&mut chat, &mut events);
-    let rendered = std::iter::from_fn(|| events.try_recv().ok())
-        .filter_map(|event| match event {
-            AppEvent::InsertHistoryCell(cell) => Some(
-                cell.display_lines(/*width*/ 80)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    insta::assert_snapshot!(rendered, @"• Voice conversations will be available in new threads.");
-}
-
-#[tokio::test]
 async fn voice_cannot_start_in_a_side_conversation() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     chat.set_side_conversation_active(/*active*/ true);

@@ -87,6 +87,8 @@ pub struct McpServerStatus {
     pub server_info: Option<McpServerInfo>,
     /// Capabilities advertised by the initialized MCP server; null when unavailable.
     pub server_capabilities: Option<serde_json::Value>,
+    /// Opaque `_meta` from the first page of the corresponding MCP tool catalog. Null when unavailable.
+    pub tool_list_meta: Option<serde_json::Value>,
     pub tools: std::collections::HashMap<String, McpTool>,
     /// Tool discovery failed and no catalog was returned.
     /// Null when a catalog is returned, including cached or empty catalogs.

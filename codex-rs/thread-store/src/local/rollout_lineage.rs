@@ -284,8 +284,9 @@ async fn validate_cutoff_bounds(
     }
     let path = rollout_path.to_path_buf();
     let end_byte_offset = end.end_byte_offset;
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
     let contains_prefix = tokio::task::spawn_blocking(move || {
-        codex_rollout::rollout_contains_prefix(&path, end_byte_offset)
+        codex_rollout::rollout_contains_prefix(&path, end_byte_offset, || stop.is_closed())
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
@@ -297,6 +298,7 @@ async fn validate_cutoff_bounds(
             rollout_path.display()
         ),
     })?;
+    drop(keep_running);
     if !contains_prefix {
         return Err(malformed_lineage(
             requested_thread_id,

@@ -435,6 +435,9 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
         args.thread_config_loader,
     )
     .with_embedded_network_policy(args.embedded_network_policy);
+    // Keep the caller's project context independent of any fallback policy config.
+    let startup_cwd =
+        (!args.config.config_layer_stack.is_projectless()).then(|| args.config.cwd.to_path_buf());
     let auth_manager = bootstrap::configure(
         &config_manager,
         &mut args.config,
@@ -499,6 +502,7 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                 analytics_events_client,
                 arg0_paths: args.arg0_paths,
                 config: args.config,
+                startup_cwd,
                 config_manager,
                 environment_manager: args.environment_manager,
                 feedback: args.feedback,

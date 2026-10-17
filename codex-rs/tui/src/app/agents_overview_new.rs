@@ -260,12 +260,10 @@ impl App {
         {
             return;
         }
-        if !self.config.features.enabled(Feature::Worktrees)
-            || crate::uses_remote_workspace_or_environment(
-                &self.app_server_target,
-                self.environment_manager.as_ref(),
-            )
-        {
+        if crate::uses_remote_workspace_or_environment(
+            &self.app_server_target,
+            self.environment_manager.as_ref(),
+        ) {
             self.add_agents_overview_error(
                 "Managed worktrees require local worktree support.".to_string(),
             );

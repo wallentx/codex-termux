@@ -241,7 +241,7 @@ impl HistoryCell for ExecCell {
         if self.is_exploring_cell() {
             let mut lines = self.exploring_display_lines(width);
             lines.truncate(1 + crate::history_cell::activity_preview::DETAIL_PREVIEW_LINES);
-            let failures = self
+            let nonzero_exits = self
                 .group
                 .calls
                 .iter()
@@ -251,12 +251,17 @@ impl HistoryCell for ExecCell {
                         .is_some_and(|output| output.exit_code != 0)
                 })
                 .count();
-            if failures > 0
+            if nonzero_exits > 0
                 && let Some(header) = lines.first_mut()
             {
+                let exit_label = if nonzero_exits == 1 {
+                    "nonzero exit"
+                } else {
+                    "nonzero exits"
+                };
                 header
                     .line
-                    .push_span(format!(" · {failures} failed").red().bold());
+                    .push_span(format!(" · {nonzero_exits} {exit_label}").bold());
             }
             lines
                 .into_iter()

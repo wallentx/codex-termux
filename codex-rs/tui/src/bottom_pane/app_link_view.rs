@@ -813,6 +813,22 @@ impl BottomPaneView for AppLinkView {
     fn terminal_title_requires_action(&self) -> bool {
         self.is_tool_suggestion()
     }
+
+    fn program_status_blocked_kind(
+        &self,
+    ) -> Option<crate::terminal_program_status::ProgramStatusKind> {
+        use crate::terminal_program_status::ProgramStatusKind;
+        if !self.is_tool_suggestion() {
+            return None;
+        }
+        Some(match self.suggestion_type {
+            Some(AppLinkSuggestionType::Auth) => ProgramStatusKind::Auth,
+            Some(AppLinkSuggestionType::Install | AppLinkSuggestionType::Enable) => {
+                ProgramStatusKind::Permission
+            }
+            Some(AppLinkSuggestionType::ExternalAction) | None => ProgramStatusKind::Question,
+        })
+    }
 }
 
 impl crate::render::renderable::Renderable for AppLinkView {

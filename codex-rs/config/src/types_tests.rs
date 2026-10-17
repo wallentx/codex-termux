@@ -18,6 +18,10 @@ default_tools_approval_mode = "approve"
 enabled = true
 ["disabled@market"]
 enabled = false
+["remote@market"]
+remote_plugin_id = "remote-plugin-123"
+release_id = "plugin-release-123"
+auto_provision = true
 "#
         ))
         .expect("plugin activation config");
@@ -27,10 +31,11 @@ enabled = false
                 "mcp@market",
                 "approval@market",
                 "enabled@market",
-                "disabled@market"
+                "disabled@market",
+                "remote@market"
             ]
             .map(|plugin_id| config.plugins[plugin_id].enabled),
-            [None, None, None, Some(true), Some(false)],
+            [None, None, None, Some(true), Some(false), None],
         );
         assert_eq!(
             [
@@ -39,13 +44,14 @@ enabled = false
                 "mcp@market",
                 "approval@market",
                 "enabled@market",
-                "disabled@market"
+                "disabled@market",
+                "remote@market"
             ]
             .map(|plugin_id| config.allows_plugin(plugin_id)),
             match default_enabled {
-                None => [true, true, true, true, true, true],
-                Some(false) => [false, false, false, false, true, false],
-                Some(true) => [true, true, true, true, true, false],
+                None => [true, true, true, true, true, true, true],
+                Some(false) => [false, false, false, false, true, false, false],
+                Some(true) => [true, true, true, true, true, false, true],
             },
         );
         let round_trip: PluginsConfigToml =

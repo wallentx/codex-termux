@@ -91,13 +91,22 @@ async fn report_display_includes_safe_cause_without_raw_error_payload() {
         .expect("teardown should be admitted")
         .into_teardown_guard("session_startup", Some(thread_id));
     let raw_payload = "sensitive thread-store error payload";
-    let error = ThreadStoreError::Internal {
-        message: raw_payload.to_owned(),
-    };
-    teardown.record_shutdown_failure(
-        "discard_persistence",
-        crate::thread_manager::thread_store_error_kind(&error),
-    );
+    for error in [
+        ThreadStoreError::Internal {
+            message: raw_payload.to_owned(),
+        },
+        ThreadStoreError::Retryable {
+            message: raw_payload.to_owned(),
+        },
+        ThreadStoreError::OutcomeUnknown {
+            message: raw_payload.to_owned(),
+        },
+    ] {
+        teardown.record_shutdown_failure(
+            "discard_persistence",
+            crate::thread_manager::thread_store_error_kind(&error),
+        );
+    }
     let shutdown = runtime.request_shutdown();
     teardown.complete();
 
@@ -109,7 +118,7 @@ async fn report_display_includes_safe_cause_without_raw_error_payload() {
     assert_eq!(
         displayed,
         format!(
-            "agent tree shutdown did not complete cleanly: tree_id={}, failures=[{{operation=session_startup, phase=discard_persistence, thread_id={thread_id}, reason=operation_failed, error_kind=thread_store_internal}}]; omitted_failures=0",
+            "agent tree shutdown did not complete cleanly: tree_id={}, failures=[{{operation=session_startup, phase=discard_persistence, thread_id={thread_id}, reason=operation_failed, error_kind=thread_store_internal}}, {{operation=session_startup, phase=discard_persistence, thread_id={thread_id}, reason=operation_failed, error_kind=thread_store_retryable}}, {{operation=session_startup, phase=discard_persistence, thread_id={thread_id}, reason=operation_failed, error_kind=thread_store_outcome_unknown}}]; omitted_failures=0",
             report.tree_id,
         )
     );

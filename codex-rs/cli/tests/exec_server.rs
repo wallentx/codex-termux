@@ -47,6 +47,9 @@ use tokio::io::BufReader;
 use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::Request;
+use tokio_tungstenite::tungstenite::handshake::server::Response;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -446,6 +449,294 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
         Some(1),
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_exec_server_scoped_credentials_authenticate_only_register_and_validate()
+-> Result<()> {
+    const ENVIRONMENT: &str = "environment-scoped-credentials";
+    const CREDENTIAL: &str = "synthetic-scoped-credential-never-log-1234";
+    const ROTATED_CREDENTIAL: &str = "rotated-scoped-credential";
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let rendezvous = format!("ws://{}", listener.local_addr()?);
+    let registry = MockServer::start().await;
+    let (registration_tx, mut registration_rx) = tokio::sync::mpsc::unbounded_channel();
+    // A confirmed pre-write auth outage must retry with the same scoped credential.
+    Mock::given(method("POST"))
+        .and(path(format!("/cloud/environment/{ENVIRONMENT}/register")))
+        .respond_with(ResponseTemplate::new(502).set_body_json(serde_json::json!({
+            "detail": {"code": "authentication_service_unavailable", "message": CREDENTIAL},
+        })))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&registry)
+        .await;
+    let registration_response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "environment_id": ENVIRONMENT,
+        "url": format!("{rendezvous}/relay?role=environment"),
+        "security_profile": "noise_hybrid_ik_v1",
+        "executor_registration_id": "registration-scoped",
+    }));
+    Mock::given(method("POST"))
+        .and(path(format!("/cloud/environment/{ENVIRONMENT}/register")))
+        .respond_with(move |request: &wiremock::Request| {
+            let credential = request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .unwrap_or_default()
+                .to_string();
+            let _ = registration_tx.send(credential);
+            registration_response.clone()
+        })
+        .mount(&registry)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/cloud/environment/{ENVIRONMENT}/validate")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .mount(&registry)
+        .await;
+
+    let collector = MockServer::start().await;
+    let home = TempDir::new()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            r#"
+[analytics]
+enabled = true
+[otel]
+metrics_exporter = {{ otlp-http = {{ endpoint = "{}/v1/metrics", protocol = "json", headers = {{ Authorization = "general-telemetry-token" }} }} }}
+"#,
+            collector.uri()
+        ),
+    )?;
+    std::fs::write(
+        home.path().join("auth.json"),
+        r#"{"OPENAI_API_KEY":"general-file-token"}"#,
+    )?;
+    let mut command = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+    command
+        .env("CODEX_HOME", home.path())
+        .env_remove(codex_exec_server::CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR)
+        .env("CODEX_API_KEY", "general-api-key")
+        .env("OPENAI_API_KEY", "general-openai-key")
+        .env("CODEX_ACCESS_TOKEN", "general-agent-identity")
+        .env(
+            "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+            "invalid-general-workload-identity",
+        )
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "exec-server",
+            "--remote",
+            &registry.uri(),
+            "--environment-id",
+            ENVIRONMENT,
+            "--executor-credential-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("credential stdin was not piped")?;
+    send_json_line(&mut stdin, &serde_json::json!({
+        "version": 1, "environment_id": ENVIRONMENT, "token": CREDENTIAL,
+        "expires_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 120,
+    })).await?;
+
+    let (socket, _) = tokio::time::timeout(TIMEOUT, listener.accept())
+        .await
+        .context("executor did not reach rendezvous")??;
+    let environment_websocket = tokio::time::timeout(
+        TIMEOUT,
+        accept_hdr_async(socket, |request: &Request, response: Response| {
+            for name in ["authorization", "chatgpt-account-id"] {
+                assert!(
+                    !request.headers().contains_key(name),
+                    "registry authentication must not be sent in the WebSocket handshake"
+                );
+            }
+            Ok(response)
+        }),
+    )
+    .await
+    .context("executor WebSocket handshake did not complete")??;
+    let executor_public_key = registered_parent_lifetime_executor_public_key(&registry).await?;
+    let args = NoiseRendezvousConnectArgs {
+        bundle: NoiseRendezvousConnectBundle {
+            websocket_url: format!("{rendezvous}/relay?role=harness"),
+            environment_id: ENVIRONMENT.to_string(),
+            executor_registration_id: "registration-scoped".to_string(),
+            executor_public_key,
+            harness_key_authorization: "synthetic-harness-authorization".to_string(),
+        },
+        harness_identity: NoiseChannelIdentity::generate()?,
+        client_name: "scoped-credential-test".to_string(),
+        connect_timeout: TIMEOUT,
+        initialize_timeout: TIMEOUT,
+        resume_session_id: None,
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    };
+    let connect =
+        tokio::spawn(async move { ExecServerClient::connect_noise_rendezvous(args).await });
+    let harness_websocket = accept_parent_lifetime_websocket(&listener, TIMEOUT).await?;
+    let relay = tokio::spawn(proxy_parent_lifetime_relay(
+        environment_websocket,
+        harness_websocket,
+    ));
+    let client = tokio::time::timeout(TIMEOUT, connect)
+        .await
+        .context("harness timed out")???;
+    let before_rotation = client.environment_info().await?;
+    send_json_line(&mut stdin, &serde_json::json!({
+        "version": 1, "environment_id": ENVIRONMENT, "token": ROTATED_CREDENTIAL,
+        "expires_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 120,
+    })).await?;
+    assert_eq!(
+        &client.force_environment_info().await?,
+        before_rotation.as_ref()
+    );
+    let requests = registry
+        .received_requests()
+        .await
+        .context("registry requests")?;
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        [
+            format!("/cloud/environment/{ENVIRONMENT}/register"),
+            format!("/cloud/environment/{ENVIRONMENT}/register"),
+            format!("/cloud/environment/{ENVIRONMENT}/validate"),
+        ]
+    );
+    for request in requests {
+        assert_eq!(
+            request.headers["authorization"],
+            format!("Bearer {CREDENTIAL}")
+        );
+        assert_eq!(request.headers.get_all("authorization").iter().count(), 1);
+        for name in [
+            "chatgpt-account-id",
+            "x-openai-biscuit",
+            "biscuit",
+            "x-openai-access-token",
+        ] {
+            assert!(
+                !request.headers.contains_key(name),
+                "unexpected registry credential header {name}"
+            );
+        }
+    }
+
+    assert_eq!(registration_rx.try_recv()?, CREDENTIAL);
+    drop(client);
+    relay.abort();
+    let _ = relay.await;
+
+    // Reject reconnects to trigger re-registration while the parent update is processed.
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (socket, _) = listener.accept().await?;
+            let rejected = http::Response::builder()
+                .status(http::StatusCode::UNAUTHORIZED)
+                .body(Some("expired registration".to_string()))?;
+            let result = accept_hdr_async(socket, |_: &Request, _: Response| Err(rejected)).await;
+            assert!(result.is_err());
+
+            let credential = registration_rx
+                .recv()
+                .await
+                .context("missing re-registration")?;
+            if credential == ROTATED_CREDENTIAL {
+                break Ok::<(), anyhow::Error>(());
+            }
+            assert_eq!(credential, CREDENTIAL);
+        }
+    })
+    .await
+    .context("executor did not re-register with the rotated parent credential")??;
+
+    drop(stdin);
+    let output = tokio::time::timeout(TIMEOUT, child.wait_with_output())
+        .await
+        .context("stdin EOF did not stop executor")??;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::ensure!(output.status.success(), "scoped executor failed: {stderr}");
+    assert!(!stderr.contains(CREDENTIAL));
+    assert!(!stderr.contains(ROTATED_CREDENTIAL));
+    assert!(
+        collector
+            .received_requests()
+            .await
+            .context("telemetry requests")?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_exec_server_scoped_credentials_never_fall_back_for_another_environment()
+-> Result<()> {
+    let registry = MockServer::start().await;
+    let home = TempDir::new()?;
+    std::fs::write(
+        home.path().join("auth.json"),
+        r#"{"OPENAI_API_KEY":"general-file-token"}"#,
+    )?;
+    let mut command = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+    let mut child = command
+        .env("CODEX_HOME", home.path())
+        .env("CODEX_API_KEY", "general-api-key")
+        .env("CODEX_ACCESS_TOKEN", "general-agent-identity")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "exec-server",
+            "--remote",
+            &registry.uri(),
+            "--environment-id",
+            "configured-environment",
+            "--executor-credential-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("credential stdin was not piped")?;
+    send_json_line(&mut stdin, &serde_json::json!({
+        "version": 1, "environment_id": "another-environment", "token": "never-print-this-scoped-token",
+        "expires_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() + 120,
+    })).await?;
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .context("invalid scoped frame did not stop executor")??;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("different environment"));
+    assert!(!stderr.contains("never-print-this-scoped-token"));
+    assert!(
+        registry
+            .received_requests()
+            .await
+            .context("registry requests")?
+            .is_empty()
+    );
+    drop(stdin);
     Ok(())
 }
 

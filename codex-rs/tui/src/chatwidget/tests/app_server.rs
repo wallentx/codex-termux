@@ -1749,6 +1749,47 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
 }
 
 #[tokio::test]
+async fn live_app_server_interleaved_flush_repairs_mismatched_completion() {
+    for (completed_item_id, completed) in [
+        ("msg-1", "The transport kept this.\nAnd dropped this."),
+        ("msg-2", "The transport kept this."),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+        handle_turn_started(&mut chat, "turn-1");
+        while rx.try_recv().is_ok() {}
+        handle_agent_message_delta(&mut chat, "The transport kept this.");
+        chat.flush_answer_stream_with_separator();
+        while rx.try_recv().is_ok() {}
+
+        complete_assistant_message(
+            &mut chat,
+            completed_item_id,
+            completed,
+            Some(MessagePhase::FinalAnswer),
+        );
+
+        let consolidations = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::ConsolidateAgentMessage {
+                    source,
+                    scrollback_reflow,
+                    ..
+                } => Some((source, scrollback_reflow)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            consolidations,
+            vec![(
+                completed.to_string(),
+                crate::app_event::ConsolidationScrollbackReflow::IfResizeReflowRan,
+            )]
+        );
+    }
+}
+
+#[tokio::test]
 async fn live_app_server_stream_recovery_restores_previous_status_header() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

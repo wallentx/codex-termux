@@ -400,6 +400,45 @@ fn activity_metadata_is_retained_without_including_outputs() -> color_eyre::Resu
     Ok(())
 }
 
+/// File-backed generated images retain their reference when task output is requested without
+/// exposing that output when the caller asks for metadata only.
+#[test]
+fn file_backed_image_generation_is_retained_as_a_reference() -> color_eyre::Result<()> {
+    let turn: Turn = serde_json::from_value(json!({
+        "id": "turn-1",
+        "status": "completed",
+        "items": [{
+            "type": "imageGeneration",
+            "id": "image-1",
+            "status": "completed",
+            "fileId": "file-generated-image"
+        }]
+    }))?;
+
+    assert_eq!(
+        turn_summary(&turn, /*include_outputs*/ true, DEFAULT_OUTPUT_CHARS)["items"][0],
+        json!({
+            "type": "imageGeneration",
+            "id": "image-1",
+            "status": "completed",
+            "revisedPrompt": null,
+            "savedPath": null,
+            "fileId": "file-generated-image"
+        })
+    );
+    assert_eq!(
+        turn_summary(&turn, /*include_outputs*/ false, DEFAULT_OUTPUT_CHARS)["items"][0],
+        json!({
+            "type": "imageGeneration",
+            "id": "image-1",
+            "status": "completed",
+            "revisedPrompt": null,
+            "savedPath": null
+        })
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn task_management_tools_use_existing_app_server_operations() -> color_eyre::Result<()> {
     let (codex_home, server, source, target) = test_server(json!({})).await?;

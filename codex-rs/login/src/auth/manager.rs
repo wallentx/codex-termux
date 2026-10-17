@@ -62,6 +62,7 @@ use crate::default_client::create_default_auth_client;
 use crate::oauth::ErrorBodyLimit;
 use crate::oauth::OAuthClient;
 use crate::oauth::OAuthError;
+use crate::oauth::RefreshReason;
 use crate::oauth::RefreshTokenGrant;
 use crate::oauth::TokenEncoding;
 use crate::oauth::TokenEndpoint;
@@ -1627,6 +1628,7 @@ fn persist_tokens(
 async fn request_chatgpt_token_refresh(
     refresh_token: String,
     client: &HttpClient,
+    refresh_reason: RefreshReason,
 ) -> Result<RefreshResponse, RefreshTokenError> {
     let client_id = oauth_client_id();
     let endpoint = refresh_token_endpoint();
@@ -1644,6 +1646,7 @@ async fn request_chatgpt_token_refresh(
         .refresh(RefreshTokenGrant {
             refresh_token: &refresh_token,
             resource: None,
+            refresh_reason: Some(refresh_reason),
         })
         .await
     {
@@ -2011,14 +2014,18 @@ impl UnauthorizedRecovery {
                 }
             }
             UnauthorizedRecoveryStep::RefreshToken => {
-                self.manager.refresh_token_from_authority().await?;
+                self.manager
+                    .refresh_token_from_authority_with_reason(RefreshReason::UnauthorizedRecovery)
+                    .await?;
                 self.step = UnauthorizedRecoveryStep::Done;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
                 });
             }
             UnauthorizedRecoveryStep::ExternalRefresh => {
-                self.manager.refresh_token_from_authority().await?;
+                self.manager
+                    .refresh_token_from_authority_with_reason(RefreshReason::UnauthorizedRecovery)
+                    .await?;
                 self.step = UnauthorizedRecoveryStep::Done;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
@@ -2395,8 +2402,8 @@ impl AuthManager {
         }
 
         let auth = self.auth_cached()?;
-        if Self::should_refresh_proactively(&auth)
-            && let Err(err) = self.refresh_token().await
+        if let Some(reason) = Self::proactive_refresh_reason(&auth)
+            && let Err(err) = self.refresh_token_with_reason(reason).await
         {
             tracing::error!("Failed to refresh token: {}", err);
             return Some(auth);
@@ -2843,6 +2850,13 @@ impl AuthManager {
     /// we can assume that the source already refreshed it. Otherwise, ask the
     /// token authority to refresh.
     pub async fn refresh_token(&self) -> Result<(), RefreshTokenError> {
+        self.refresh_token_with_reason(RefreshReason::Forced).await
+    }
+
+    async fn refresh_token_with_reason(
+        &self,
+        reason: RefreshReason,
+    ) -> Result<(), RefreshTokenError> {
         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
@@ -2868,7 +2882,7 @@ impl AuthManager {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
                 Ok(())
             }
-            ReloadOutcome::ReloadedNoChange => self.refresh_token_from_authority_impl().await,
+            ReloadOutcome::ReloadedNoChange => self.refresh_token_from_authority_impl(reason).await,
             ReloadOutcome::Skipped => {
                 Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                     RefreshTokenFailedReason::Other,
@@ -2882,16 +2896,27 @@ impl AuthManager {
     /// it and update the shared cache. If the token refresh fails, returns the
     /// error to the caller.
     pub async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError> {
+        self.refresh_token_from_authority_with_reason(RefreshReason::Forced)
+            .await
+    }
+
+    async fn refresh_token_from_authority_with_reason(
+        &self,
+        reason: RefreshReason,
+    ) -> Result<(), RefreshTokenError> {
         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
-        self.refresh_token_from_authority_impl().await
+        self.refresh_token_from_authority_impl(reason).await
     }
 
-    async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
+    async fn refresh_token_from_authority_impl(
+        &self,
+        reason: RefreshReason,
+    ) -> Result<(), RefreshTokenError> {
         tracing::info!("Refreshing token");
 
         let attempted_auth = self.auth_cached();
@@ -2913,8 +2938,12 @@ impl AuthManager {
                             "Token data is not available.",
                         ))
                     })?;
-                    self.refresh_and_persist_chatgpt_token(chatgpt_auth, token_data.refresh_token)
-                        .await
+                    self.refresh_and_persist_chatgpt_token(
+                        chatgpt_auth,
+                        token_data.refresh_token,
+                        reason,
+                    )
+                    .await
                 }
                 Some(
                     CodexAuth::ApiKey(_)
@@ -2998,28 +3027,24 @@ impl AuthManager {
             .is_some_and(AuthMode::uses_codex_backend)
     }
 
-    fn should_refresh_proactively(auth: &CodexAuth) -> bool {
+    fn proactive_refresh_reason(auth: &CodexAuth) -> Option<RefreshReason> {
         let chatgpt_auth = match auth {
             CodexAuth::Chatgpt(chatgpt_auth) => chatgpt_auth,
-            _ => return false,
+            _ => return None,
         };
 
-        let auth_dot_json = match chatgpt_auth.current_auth_json() {
-            Some(auth_dot_json) => auth_dot_json,
-            None => return false,
-        };
+        let auth_dot_json = chatgpt_auth.current_auth_json()?;
         if let Some(tokens) = auth_dot_json.tokens.as_ref()
             && let Ok(Some(expires_at)) = parse_jwt_expiration(&tokens.access_token)
         {
-            return expires_at
+            return (expires_at
                 <= Utc::now()
-                    + chrono::Duration::minutes(CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES);
+                    + chrono::Duration::minutes(CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES))
+            .then_some(RefreshReason::ProactiveExpiry);
         }
-        let last_refresh = match auth_dot_json.last_refresh {
-            Some(last_refresh) => last_refresh,
-            None => return false,
-        };
-        last_refresh < Utc::now() - chrono::Duration::days(TOKEN_REFRESH_INTERVAL)
+        let last_refresh = auth_dot_json.last_refresh?;
+        (last_refresh < Utc::now() - chrono::Duration::days(TOKEN_REFRESH_INTERVAL))
+            .then_some(RefreshReason::Scheduled)
     }
 
     async fn refresh_external_auth(
@@ -3090,8 +3115,10 @@ impl AuthManager {
         &self,
         auth: &ChatgptAuth,
         refresh_token: String,
+        reason: RefreshReason,
     ) -> Result<(), RefreshTokenError> {
-        let refresh_response = request_chatgpt_token_refresh(refresh_token, auth.client()).await?;
+        let refresh_response =
+            request_chatgpt_token_refresh(refresh_token, auth.client(), reason).await?;
 
         persist_tokens(
             auth.storage(),

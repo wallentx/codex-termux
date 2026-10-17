@@ -4,6 +4,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_protocol::ThreadId;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::realtime::RealtimeItem;
+use codex_state::SqlitePoolWriteExt;
 
 use super::LocalThreadStore;
 use crate::ThreadStoreError;
@@ -112,10 +113,7 @@ pub(super) async fn apply_projection(
     // Write the projected rows and advance the JSONL offset and ordinal in one transaction. If
     // SQLite fails, it stays behind the durable rollout instead of claiming data it did not
     // materialize.
-    let mut transaction = pool
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .map_err(thread_history_error)?;
+    let mut transaction = pool.begin_immediate().await.map_err(thread_history_error)?;
     let thread_id = thread_id.to_string();
     let projection_state = sqlx::query_as::<_, (i64, i64)>(
         r#"
@@ -255,7 +253,7 @@ pub(super) async fn delete_thread(
 
     let pool = store.thread_history_db().await?;
     let mut transaction = pool
-        .begin_with("BEGIN IMMEDIATE")
+        .begin_immediate()
         .await
         .map_err(thread_history_delete_error)?;
     let thread_id = thread_id.to_string();

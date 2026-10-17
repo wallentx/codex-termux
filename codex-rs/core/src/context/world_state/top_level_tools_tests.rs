@@ -198,19 +198,59 @@ async fn snapshots_namespace_transitions() {
                 .attributes()
                 .map(|attribute| (attribute.key.as_str(), attribute.value.as_str().to_string()))
                 .collect::<BTreeMap<_, _>>();
-            assert_eq!(tags.len(), 1);
-            (tags["action"].clone(), point.value())
+            assert_eq!(tags.len(), 2);
+            (
+                (tags["action"].clone(), tags["tool"].clone()),
+                point.value(),
+            )
         })
         .collect::<BTreeMap<_, _>>();
     // Initial/full snapshots and unchanged catalogs contribute nothing; namespace
     // headers do not count, and removing a whole namespace counts each member.
     assert_eq!(
         counts,
-        BTreeMap::from([
-            ("added".to_string(), 6),
-            ("removed".to_string(), 11),
-            ("schema_changed".to_string(), 1),
-        ])
+        [
+            ("added", "functions.added", 1),
+            ("added", "functions.changed", 1),
+            ("added", "functions.removed", 1),
+            ("added", "functions.restored", 1),
+            ("added", "functions.unchanged", 2),
+            ("removed", "functions.added", 3),
+            ("removed", "functions.changed", 3),
+            ("removed", "functions.removed", 1),
+            ("removed", "functions.unchanged", 2),
+            ("removed", "other.lookup", 2),
+            ("schema_changed", "functions.changed", 1),
+        ]
+        .into_iter()
+        .map(|(action, tool, count)| ((action.to_string(), tool.to_string()), count))
+        .collect()
+    );
+    let histogram = snapshot
+        .scope_metrics()
+        .flat_map(ScopeMetrics::metrics)
+        .find(|metric| metric.name() == TOOL_SPEC_DESCRIPTION_BYTES_METRIC)
+        .expect("tool description byte histogram");
+    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = histogram.data() else {
+        panic!("tool description bytes must be a histogram");
+    };
+    assert_eq!(
+        histogram
+            .data_points()
+            .map(|point| (
+                point
+                    .attributes()
+                    .map(|tag| (tag.key.as_str(), tag.value.to_string()))
+                    .collect::<Vec<_>>(),
+                point.count(),
+                point.sum(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            vec![("tool", "functions.changed".to_string())],
+            1,
+            "Look up a value.".len() as f64
+        )],
     );
     metrics.shutdown().unwrap();
 }
@@ -458,9 +498,13 @@ fn namespace_description_change_does_not_repeat_unchanged_tools(
         if expected.is_empty() {
             Vec::new()
         } else {
-            vec![ContextualUserFragment::into(DeveloperInstructions::new(
-                expected,
-            ))]
+            vec![ContextualUserFragment::into(
+                DeveloperInstructions::new(expected).with_metadata(
+                    codex_protocol::models::ContentItemMetadata::tool(Some(
+                        codex_protocol::models::ContentItemNamespace::Functions,
+                    )),
+                ),
+            )]
         }
     );
     assert!(

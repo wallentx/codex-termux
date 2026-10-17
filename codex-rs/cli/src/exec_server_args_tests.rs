@@ -65,6 +65,7 @@ fn exec_server_defaults_preserve_local_and_noise_modes() {
         let command = exec_server_from_args(&args);
         assert_eq!(command.remote_transport, ExecServerRemoteTransport::Noise);
         assert!(!command.aws_sigv4);
+        assert!(!command.executor_credential_stdin);
         command
             .validate_remote_transport()
             .expect("valid existing mode");
@@ -121,6 +122,27 @@ fn exec_server_parses_direct_aws_options() {
 }
 
 #[test]
+fn exec_server_parses_executor_credential_options() {
+    let args = [
+        "--remote",
+        "https://registry.example.com",
+        "--environment-id",
+        "env-1",
+    ];
+    for options in [
+        vec!["--executor-credential-stdin"],
+        vec!["--executor-credential-stdin", "--exit-on-stdin-close"],
+    ] {
+        let options: Vec<_> = args.iter().copied().chain(options).collect();
+        let command = exec_server_from_args(&options);
+        assert!(command.executor_credential_stdin);
+        command
+            .validate_remote_transport()
+            .expect("valid scoped mode");
+    }
+}
+
+#[test]
 fn exec_server_rejects_missing_or_conflicting_remote_options() {
     for (options, expected) in [
         (
@@ -145,6 +167,19 @@ fn exec_server_rejects_missing_or_conflicting_remote_options() {
                 "direct",
                 "--aws-sigv4",
                 "--use-agent-identity-auth",
+            ],
+            ErrorKind::ArgumentConflict,
+        ),
+        (
+            vec!["--executor-credential-stdin", "--use-agent-identity-auth"],
+            ErrorKind::ArgumentConflict,
+        ),
+        (
+            vec![
+                "--executor-credential-stdin",
+                "--remote-transport",
+                "direct",
+                "--aws-sigv4",
             ],
             ErrorKind::ArgumentConflict,
         ),
@@ -176,6 +211,7 @@ fn exec_server_transport_and_aws_options_require_registration_arguments() {
         vec!["--remote-transport", "noise"],
         vec!["--remote-transport", "direct", "--aws-sigv4"],
         vec!["--aws-sigv4"],
+        vec!["--executor-credential-stdin"],
         vec![
             "--remote",
             "https://registry.example.com",

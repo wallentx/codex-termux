@@ -462,7 +462,14 @@ fn should_backfill_turn_completed_items_backfills_persisted_summaries_only() {
 
 #[test]
 fn canceled_mcp_server_elicitation_response_uses_cancel_action() {
-    let value = canceled_mcp_server_elicitation_response()
+    let request = serde_json::from_value(serde_json::json!({
+        "mode": "form",
+        "message": "Allow the tool call?",
+        "requestedSchema": { "type": "object", "properties": {} },
+        "_meta": { APPROVAL_KIND_KEY: APPROVAL_KIND_MCP_TOOL_CALL },
+    }))
+    .expect("valid MCP tool approval request");
+    let value = canceled_mcp_server_elicitation_response(&request)
         .expect("mcp elicitation cancel response should serialize");
     let response: McpServerElicitationRequestResponse =
         serde_json::from_value(value).expect("cancel response should deserialize");
@@ -472,7 +479,9 @@ fn canceled_mcp_server_elicitation_response_uses_cancel_action() {
         McpServerElicitationRequestResponse {
             action: McpServerElicitationAction::Cancel,
             content: None,
-            meta: None,
+            meta: Some(serde_json::json!({
+                CANCELLATION_REASON_KEY: McpApprovalCancellationReason::NonInteractive,
+            })),
         }
     );
 }

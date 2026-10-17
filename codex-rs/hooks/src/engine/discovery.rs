@@ -28,6 +28,7 @@ use super::ConfiguredHandlerKind;
 use super::HookListEntry;
 use super::HookListEntryHandler;
 use super::dispatcher::hook_event_name_label;
+use super::plugin_trust::PluginHookTrust;
 use crate::config_rules::hook_states_from_stack;
 use crate::engine::HookMatcher;
 use crate::events::common::matcher_pattern_for_event;
@@ -55,6 +56,9 @@ struct HookHandlerSource<'a> {
     hook_states: &'a HashMap<String, HookStateToml>,
     env: HashMap<String, String>,
     plugin_id: Option<String>,
+    plugin_content_hash: Option<&'a std::io::Result<String>>,
+    config_layer_stack: Option<&'a ConfigLayerStack>,
+    plugin_root: Option<&'a AbsolutePathBuf>,
 }
 
 enum HookRequirement<'a> {
@@ -79,13 +83,21 @@ struct NormalizedHandler {
     additional_context_limit: Option<usize>,
 }
 
-#[derive(Clone, Copy)]
-struct HookDiscoveryPolicy {
-    allow_managed_hooks_only: bool,
-    bypass_hook_trust: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscoveryMode {
+    Runtime,
+    Listing,
 }
 
-impl HookDiscoveryPolicy {
+#[derive(Clone, Copy)]
+struct HookDiscoveryPolicy<'a> {
+    config_layer_stack: Option<&'a ConfigLayerStack>,
+    allow_managed_hooks_only: bool,
+    bypass_hook_trust: bool,
+    mode: DiscoveryMode,
+}
+
+impl HookDiscoveryPolicy<'_> {
     fn allows(self, source: &HookHandlerSource<'_>) -> bool {
         !self.allow_managed_hooks_only || source.is_managed
     }
@@ -96,6 +108,7 @@ pub(crate) fn discover_handlers(
     plugin_hook_sources: Vec<PluginHookSource>,
     plugin_hook_load_warnings: Vec<String>,
     bypass_hook_trust: bool,
+    mode: DiscoveryMode,
 ) -> DiscoveryResult {
     let mut handlers = Vec::new();
     let mut hook_entries = Vec::new();
@@ -105,6 +118,7 @@ pub(crate) fn discover_handlers(
     let mut visited_json_hook_folders = HashSet::new();
     let hook_states = hook_states_from_stack(config_layer_stack);
     let policy = HookDiscoveryPolicy {
+        config_layer_stack,
         allow_managed_hooks_only: config_layer_stack.is_some_and(|config_layer_stack| {
             config_layer_stack
                 .requirements()
@@ -113,6 +127,7 @@ pub(crate) fn discover_handlers(
                 .is_some_and(|requirement| requirement.value)
         }),
         bypass_hook_trust,
+        mode,
     };
 
     if let Some(config_layer_stack) = config_layer_stack {
@@ -139,6 +154,9 @@ pub(crate) fn discover_handlers(
                 hook_states: &hook_states,
                 env: HashMap::new(),
                 plugin_id: None,
+                plugin_content_hash: None,
+                config_layer_stack: None,
+                plugin_root: None,
             };
             if !policy.allows(&policy_source) {
                 continue;
@@ -179,6 +197,9 @@ pub(crate) fn discover_handlers(
                         hook_states: &hook_states,
                         env: HashMap::new(),
                         plugin_id: None,
+                        plugin_content_hash: None,
+                        config_layer_stack: None,
+                        plugin_root: None,
                     },
                     hook_events,
                     policy,
@@ -212,7 +233,7 @@ fn append_managed_requirement_handlers(
     display_order: &mut i64,
     config_layer_stack: &ConfigLayerStack,
     hook_states: &HashMap<String, HookStateToml>,
-    policy: HookDiscoveryPolicy,
+    policy: HookDiscoveryPolicy<'_>,
 ) -> Vec<String> {
     let Some(managed_hooks) = config_layer_stack.requirements().managed_hooks.as_ref() else {
         return Vec::new();
@@ -234,6 +255,9 @@ fn append_managed_requirement_handlers(
             hook_states,
             env: HashMap::new(),
             plugin_id: None,
+            plugin_content_hash: None,
+            config_layer_stack: None,
+            plugin_root: None,
         },
         managed_hooks.get().hooks.clone(),
         policy,
@@ -248,8 +272,13 @@ fn append_plugin_hook_sources(
     display_order: &mut i64,
     plugin_hook_sources: Vec<PluginHookSource>,
     hook_states: &HashMap<String, HookStateToml>,
-    policy: HookDiscoveryPolicy,
+    policy: HookDiscoveryPolicy<'_>,
 ) {
+    if policy.allow_managed_hooks_only {
+        return;
+    }
+    // Listing inspects current contents; runtime discovery defers hashing until execution.
+    let mut content_hashes = HashMap::new();
     for source in plugin_hook_sources {
         let PluginHookSource {
             plugin_root,
@@ -259,6 +288,14 @@ fn append_plugin_hook_sources(
             source_relative_path,
             hooks,
         } = source;
+        let plugin_id = plugin_id.as_key();
+        let content_hash = (policy.mode == DiscoveryMode::Listing).then(|| {
+            content_hashes
+                .entry(plugin_root.clone())
+                .or_insert_with(|| {
+                    super::plugin_fingerprint::plugin_content_hash(&plugin_root, &|| false)
+                })
+        });
         let mut env = HashMap::new();
         let plugin_root_value = plugin_root.display().to_string();
         let plugin_data_root_value = plugin_data_root.display().to_string();
@@ -268,7 +305,6 @@ fn append_plugin_hook_sources(
         env.insert("PLUGIN_DATA".to_string(), plugin_data_root_value.clone());
         // For OOTB compat with existing plugins that use this env var.
         env.insert("CLAUDE_PLUGIN_DATA".to_string(), plugin_data_root_value);
-        let plugin_id = plugin_id.as_key();
         append_hook_events(
             handlers,
             hook_entries,
@@ -287,6 +323,9 @@ fn append_plugin_hook_sources(
                 hook_states,
                 env,
                 plugin_id: Some(plugin_id),
+                plugin_content_hash: content_hash.as_deref(),
+                config_layer_stack: policy.config_layer_stack,
+                plugin_root: Some(&plugin_root),
             },
             hooks,
             policy,
@@ -456,7 +495,7 @@ fn append_hook_events(
     display_order: &mut i64,
     mut source: HookHandlerSource<'_>,
     hook_events: HookEventsToml,
-    policy: HookDiscoveryPolicy,
+    policy: HookDiscoveryPolicy<'_>,
 ) {
     if !policy.allows(&source) {
         return;
@@ -663,7 +702,6 @@ fn append_matcher_groups(
                 status_message,
                 additional_context_limit,
             } = normalized;
-            let current_hash = hook_hash(event_name, matcher, &group, &config);
             let key = crate::hook_key(&source.key_source, event_name, group_index, handler_index);
             let state = source.hook_states.get(&key);
             let builtin = source.plugin_id.as_deref().is_some_and(|plugin_id| {
@@ -675,10 +713,67 @@ fn append_matcher_groups(
                     /*app_connector_id*/ None,
                 )
             });
+            let plugin_content_hash = match source.plugin_content_hash {
+                Some(Ok(hash)) => Some(hash.as_str()),
+                Some(Err(err)) if !builtin && !source.bypass_hook_trust => {
+                    source.record_load_failure(
+                        format!(
+                            "skipping plugin hook in {}: failed to fingerprint plugin contents: {err}",
+                            source.path.display()
+                        ),
+                        warnings,
+                    );
+                    continue;
+                }
+                Some(Err(_)) | None => None,
+            };
+            let declaration_hash = hook_hash(event_name, matcher, &group, &config);
+            // The config writer persists these two approval hashes separately.
+            let current_hash = plugin_content_hash.map_or_else(
+                || declaration_hash.clone(),
+                |hash| format!("{declaration_hash}/{hash}"),
+            );
             let enabled = hook_enabled(source.is_managed, builtin, state);
             let trusted_hash = hook_trusted_hash(source.is_managed, state);
-            let trust_status =
-                hook_trust_status(source.is_managed, builtin, &current_hash, trusted_hash);
+            let plugin_trust = if !builtin
+                && (!source.bypass_hook_trust || source.plugin_content_hash.is_some())
+                && let Some(root) = source.plugin_root
+                && let Some(plugin_id) = source.plugin_id.as_deref()
+                && let Some(trusted_hash) = trusted_hash
+            {
+                Some(PluginHookTrust {
+                    root: root.clone(),
+                    legacy_path: source
+                        .config_layer_stack
+                        .and_then(|stack| super::plugin_trust::legacy_trust_path(stack, plugin_id)),
+                    declaration_hash,
+                    trusted_hash: trusted_hash.to_owned(),
+                    trusted_content_hash: state
+                        .and_then(|state| state.trusted_content_hash.clone()),
+                })
+            } else {
+                None
+            };
+            let trust_status = if let Some(content_hash) = plugin_content_hash
+                && let Some(trust) = plugin_trust.as_ref()
+            {
+                match trust.matches_hash(content_hash) {
+                    Ok(true) => HookTrustStatus::Trusted,
+                    Ok(false) => HookTrustStatus::Modified,
+                    Err(err) => {
+                        source.record_load_failure(
+                            format!(
+                                "skipping plugin hook in {}: failed to migrate hook trust: {err}",
+                                source.path.display()
+                            ),
+                            warnings,
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                hook_trust_status(source.is_managed, builtin, &current_hash, trusted_hash)
+            };
             let handler = match &kind {
                 ConfiguredHandlerKind::Command {
                     command, r#async, ..
@@ -714,6 +809,7 @@ fn append_matcher_groups(
             });
             if enabled
                 && (source.bypass_hook_trust
+                    || (source.plugin_content_hash.is_none() && plugin_trust.is_some())
                     || matches!(
                         trust_status,
                         HookTrustStatus::Managed | HookTrustStatus::Trusted
@@ -721,6 +817,7 @@ fn append_matcher_groups(
             {
                 handlers.push(ConfiguredHandler {
                     builtin,
+                    plugin_trust,
                     event_name,
                     matcher: compiled_matcher.clone(),
                     timeout_sec,
@@ -913,6 +1010,9 @@ mod tests {
             hook_states,
             env: std::collections::HashMap::new(),
             plugin_id: None,
+            plugin_content_hash: None,
+            config_layer_stack: None,
+            plugin_root: None,
         }
     }
 
@@ -931,6 +1031,9 @@ mod tests {
             hook_states,
             env: std::collections::HashMap::new(),
             plugin_id: None,
+            plugin_content_hash: None,
+            config_layer_stack: None,
+            plugin_root: None,
         }
     }
 
@@ -1258,6 +1361,7 @@ mod tests {
             handlers,
             vec![ConfiguredHandler {
                 builtin: false,
+                plugin_trust: None,
                 event_name: HookEventName::UserPromptSubmit,
                 matcher: None,
                 timeout_sec: 600,
@@ -1298,6 +1402,7 @@ mod tests {
             handlers,
             vec![ConfiguredHandler {
                 builtin: false,
+                plugin_trust: None,
                 event_name: HookEventName::PreToolUse,
                 matcher: Some(HookMatcher::new("^Bash$").expect("valid matcher")),
                 timeout_sec: 600,
@@ -1517,6 +1622,7 @@ mod tests {
             HookStateToml {
                 enabled: Some(false),
                 trusted_hash: None,
+                trusted_content_hash: None,
             },
         )]);
 

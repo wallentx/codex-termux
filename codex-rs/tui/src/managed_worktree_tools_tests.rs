@@ -106,7 +106,7 @@ async fn creation_attaches_to_original_task_and_survives_service_restart_scenari
     git(&repository, &["add", "."]);
     git(&repository, &["commit", "-m", "base"]);
     fs::write(repository.join("tracked.txt"), "source edits\n")?;
-    let mut config = ConfigBuilder::default()
+    let config = ConfigBuilder::default()
         .codex_home(home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(home.path().to_path_buf()),
@@ -115,7 +115,6 @@ async fn creation_attaches_to_original_task_and_survives_service_restart_scenari
         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .build()
         .await?;
-    config.features.enable(codex_features::Feature::Worktrees)?;
     let mut server = Box::pin(start_server(&config)).await?;
     let mut conflicting = config.clone();
     let raw: codex_config::RawMcpServerConfig =

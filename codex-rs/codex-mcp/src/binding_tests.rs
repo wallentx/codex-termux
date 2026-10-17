@@ -80,6 +80,7 @@ async fn test_step(
     );
     let tool_catalog = Arc::new(ClientToolCatalog::new(
         vec![tool.clone()],
+        /*meta*/ None,
         /*updates*/ None,
     ));
     let managed_client = Arc::new(ManagedClient {
@@ -313,8 +314,8 @@ async fn prepared_call_is_rejected_after_catalog_refresh() {
 
     step.tool_catalog
         .refresh(
-            || async { Ok((step.step.tools().to_vec(), ())) },
-            |_, ()| {},
+            || async { Ok((step.step.tools().to_vec(), None, ())) },
+            |_, _, ()| {},
         )
         .await
         .expect("refresh tool catalog");
@@ -347,8 +348,8 @@ async fn stale_prepared_call_does_not_run_preparation() {
         .expect("step should prepare the advertised tool");
     step.tool_catalog
         .refresh(
-            || async { Ok((step.step.tools().to_vec(), ())) },
-            |_, ()| {},
+            || async { Ok((step.step.tools().to_vec(), None, ())) },
+            |_, _, ()| {},
         )
         .await
         .expect("refresh tool catalog");
@@ -394,8 +395,8 @@ async fn preparation_holds_catalog_authority_until_it_finishes() {
 
     preparation_started.notified().await;
     let refresh = step.tool_catalog.refresh(
-        || async { Ok((step.step.tools().to_vec(), ())) },
-        |_, ()| {},
+        || async { Ok((step.step.tools().to_vec(), None, ())) },
+        |_, _, ()| {},
     );
     tokio::pin!(refresh);
     assert!(

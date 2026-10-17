@@ -419,6 +419,7 @@ fn streamed_v3_handoff_omits_the_final_message_prefix() {
 fn uses_quicksilver_alpha_header_for_realtime_v1() {
     let headers = realtime_request_headers(
         Some("session_1"),
+        /*voice_session_id*/ None,
         Some("sk-test"),
         RealtimeEventParser::V1,
         "codex_work_desktop",
@@ -438,6 +439,7 @@ fn uses_quicksilver_alpha_header_for_realtime_v1() {
 fn omits_quicksilver_alpha_header_for_realtime_v2() {
     let headers = realtime_request_headers(
         Some("session_1"),
+        /*voice_session_id*/ None,
         Some("sk-test"),
         RealtimeEventParser::RealtimeV2,
         "codex_work_desktop",
@@ -452,6 +454,7 @@ fn omits_quicksilver_alpha_header_for_realtime_v2() {
 fn uses_frameless_alpha_header_for_realtime_v3() {
     let headers = realtime_request_headers(
         Some("session_1"),
+        /*voice_session_id*/ None,
         Some("sk-test"),
         RealtimeEventParser::FramelessBidi,
         "codex_work_desktop",
@@ -476,6 +479,7 @@ fn realtime_headers_include_only_non_default_originator() {
     ] {
         let headers = realtime_request_headers(
             Some("session_1"),
+            /*voice_session_id*/ None,
             Some("sk-test"),
             RealtimeEventParser::RealtimeV2,
             originator,
@@ -490,4 +494,30 @@ fn realtime_headers_include_only_non_default_originator() {
             expected_header
         );
     }
+}
+
+#[test]
+fn realtime_headers_keep_realtime_and_voice_session_ids_distinct() {
+    let headers = realtime_request_headers(
+        Some("realtime_session_1"),
+        Some("voice_session_1"),
+        /*api_key*/ None,
+        RealtimeEventParser::RealtimeV2,
+        "codex_work_desktop",
+    )
+    .expect("headers")
+    .expect("headers");
+
+    assert_eq!(
+        headers
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("realtime_session_1")
+    );
+    assert_eq!(
+        headers
+            .get("voice-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("voice_session_1")
+    );
 }

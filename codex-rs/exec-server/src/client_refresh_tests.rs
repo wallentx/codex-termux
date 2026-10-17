@@ -20,6 +20,7 @@ use super::*;
 use crate::ExecServerRuntimeOptions;
 use crate::NoiseChannelIdentity;
 use crate::ProcessId;
+use crate::discover_v2::capability_locations::tests as location_fixtures;
 use crate::noise_relay::stream_handler::NoiseOutboundMessage;
 use crate::noise_relay::stream_handler::NoiseStreamConnection;
 use crate::noise_relay::stream_handler::NoiseStreamHandler;
@@ -285,14 +286,57 @@ async fn refresh_cancels_old_recovery_and_connects_without_resuming_old_session(
 #[tokio::test]
 async fn refresh_retires_a_still_connected_old_executor() -> Result<()> {
     let _clock = freeze_clock();
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    for name in ["old", "new"] {
+        location_fixtures::write(
+            &root.join(name),
+            &format!("codex/skills/{name}/SKILL.md"),
+            &format!("---\nname: {name}\ndescription: {name} executor\n---\n"),
+        )?;
+    }
     let old = Executor::start(Validator::default()).await?;
     let new = Executor::start(Validator::default()).await?;
+    old.processor
+        .seed_capability_locations(location_fixtures::request(&root.join("old"))?)
+        .await?;
+    new.processor
+        .seed_capability_locations(location_fixtures::request(&root.join("new"))?)
+        .await?;
     let (client, registry) = old.client()?;
     let original = client.get().await?;
+    let environment = Arc::new(crate::Environment::remote_with_client(
+        client.clone(),
+        /*local_runtime_paths*/ None,
+        ScopedSkillsConfig::default(),
+    ));
+    let cache = crate::ExecutorCapabilityDiscoveryV2Cache::default();
+    let request = crate::DiscoverV2CapabilitiesRequest {
+        cwd: codex_utils_path_uri::PathUri::from_host_native_path(&root)?,
+        sandbox: None,
+    };
+    let inventory = cache
+        .discover("environment", &environment, request.clone())
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(inventory.skills.iter().any(|skill| skill.name == "old"));
+    environment.refresh_connection().await?;
+    let reused = cache
+        .discover("environment", &environment, request.clone())
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(Arc::ptr_eq(&inventory, &reused));
     *registry.target.lock().unwrap() = new.target.clone();
-    client.refresh_connection().await?;
+    environment.refresh_connection().await?;
     assert!(original.is_disconnected());
     assert_ne!(original.session_id(), client.get().await?.session_id());
+    let refreshed = cache
+        .discover("environment", &environment, request)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(!Arc::ptr_eq(&inventory, &refreshed));
+    assert!(refreshed.skills.iter().any(|skill| skill.name == "new"));
+    assert!(!refreshed.skills.iter().any(|skill| skill.name == "old"));
     Ok(())
 }
 
@@ -375,6 +419,7 @@ async fn registration_renewal_recovers_the_session_and_running_process() -> Resu
     );
     let original = client.get().await?;
     let session_id = original.session_id();
+    assert_eq!(environment.executor_session_id().await?, session_id);
     let process =
         original
             .start_process(
@@ -421,6 +466,7 @@ async fn registration_renewal_recovers_the_session_and_running_process() -> Resu
     let recovered = client.get().await?;
     assert!(Arc::ptr_eq(&original.inner, &recovered.inner));
     assert_eq!(recovered.session_id(), session_id);
+    assert_eq!(environment.executor_session_id().await?, session_id);
     assert_eq!(
         process.write(b"after-renewal\n".to_vec()).await?.status,
         crate::protocol::WriteStatus::Accepted

@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::stream;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -39,6 +40,7 @@ pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
 /// Timeout for git commands to prevent freezing on large repositories
 const GIT_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
 const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+const MAX_CONCURRENT_UNTRACKED_DIFFS: usize = 8;
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct GitInfo {
@@ -359,7 +361,7 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
     let remotes = get_git_remotes(cwd).await?;
     let branches = branch_ancestry(cwd).await?;
     let base_sha = find_closest_sha(cwd, &branches, &remotes).await?;
-    let diff = diff_against_sha(cwd, &base_sha).await?;
+    let diff = diff_against_sha(Path::new("git"), cwd, &base_sha).await?;
 
     Some(GitDiffToRemote {
         sha: base_sha,
@@ -704,8 +706,7 @@ async fn find_closest_sha(cwd: &Path, branches: &[String], remotes: &[String]) -
     closest_sha.map(|(sha, _)| sha)
 }
 
-async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
-    let git = Path::new("git");
+async fn diff_against_sha(git: &Path, cwd: &Path, sha: &GitSha) -> Option<String> {
     let fsmonitor = detect_local_fsmonitor_override(git, cwd).await;
     let output = run_git_command_with_timeout_from(
         git,
@@ -756,9 +757,12 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
                 ];
                 run_git_command_with_timeout_from(git, &args_vec, cwd, fsmonitor).await
             });
-            let results = join_all(futures_iter).await;
-            for extra in results.into_iter().flatten() {
-                if extra.status.code().is_some_and(|c| c == 0 || c == 1)
+            // Keep earlier children reading and finishing while more paths remain.
+            let results = stream::iter(futures_iter).buffered(MAX_CONCURRENT_UNTRACKED_DIFFS);
+            futures::pin_mut!(results);
+            while let Some(extra) = results.next().await {
+                if let Some(extra) = extra
+                    && extra.status.code().is_some_and(|c| c == 0 || c == 1)
                     && let Ok(s) = String::from_utf8(extra.stdout)
                 {
                     diff.push_str(&s);
@@ -769,6 +773,10 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
 
     Some(diff)
 }
+
+#[cfg(test)]
+#[path = "diff_tests.rs"]
+mod diff_tests;
 
 fn find_ancestor_git_entry(base_dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut dir = base_dir.to_path_buf();

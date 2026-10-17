@@ -130,10 +130,17 @@ async fn run_with_http(
             .context("updater socket has no parent")?,
     )
     .await?;
-    if socket_path.exists() {
-        tokio::fs::remove_file(&socket_path).await?;
-    }
-    let mut listener = Some(codex_uds::UnixListener::bind(&socket_path).await?);
+    #[cfg(unix)]
+    let (listener, _socket_guard) =
+        codex_app_server_transport::bind_private_daemon_socket(&socket_path).await?;
+    #[cfg(windows)]
+    let listener = {
+        if socket_path.exists() {
+            tokio::fs::remove_file(&socket_path).await?;
+        }
+        codex_uds::UnixListener::bind(&socket_path).await?
+    };
+    let mut listener = Some(listener);
     #[cfg(windows)]
     updater.mark_ready().await?;
     let needs_managed_handoff =
@@ -446,7 +453,7 @@ async fn update_once(
             return Ok((UpdateLoopControl::Stop, None));
         }
         match daemon
-            .try_restart_if_running(restart_mode, &managed_codex_bin)
+            .try_restart_if_running(restart_mode, &managed_codex_bin, &package_root)
             .await?
         {
             RestartIfRunningOutcome::Busy => {

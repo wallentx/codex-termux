@@ -519,7 +519,7 @@ async fn worker_compresses_archived_fork_chain() -> anyhow::Result<()> {
     ] {
         assert!(!path.exists(), "compression should replace {path:?}");
         let mut restored = Vec::new();
-        crate::open_rollout_seekable_reader(path)?.read_to_end(&mut restored)?;
+        crate::open_rollout_seekable_reader(path, || false)?.read_to_end(&mut restored)?;
         assert_eq!(restored, original);
     }
     Ok(())
@@ -777,6 +777,14 @@ async fn find_thread_path_by_id_handles_compressed_rollout_filenames() -> anyhow
     compress_now(&rollout_path)?;
     let compressed_path = compressed_rollout_path(&rollout_path);
 
+    for id in 1000..1064 {
+        let unrelated_path = compressed_rollout_path(&rollout_path.with_file_name(format!(
+            "rollout-2025-01-03T12-00-00-{}.jsonl",
+            Uuid::from_u128(id)
+        )));
+        fs::write(unrelated_path, zstd::stream::encode_all(&b""[..], 0)?)?;
+    }
+
     assert_eq!(
         crate::find_thread_path_by_id_str(
             home.path(),
@@ -784,7 +792,31 @@ async fn find_thread_path_by_id_handles_compressed_rollout_filenames() -> anyhow
             /*state_db_ctx*/ None
         )
         .await?,
+        Some(compressed_path.clone())
+    );
+    assert_eq!(
+        crate::find_rollout_path_by_rollout_id(home.path(), thread_id).await?,
         Some(compressed_path)
+    );
+
+    write_rollout(&rollout_path, thread_id, "plain filename lookup")?;
+    assert_eq!(
+        crate::find_thread_path_by_id_str(
+            home.path(),
+            &uuid.to_string(),
+            /*state_db_ctx*/ None
+        )
+        .await?,
+        Some(rollout_path.clone())
+    );
+    assert_eq!(
+        crate::find_rollout_path_by_rollout_id(home.path(), thread_id).await?,
+        Some(rollout_path)
+    );
+    let missing_rollout_id = ThreadId::from_string(&Uuid::from_u128(2000).to_string())?;
+    assert_eq!(
+        crate::find_rollout_path_by_rollout_id(home.path(), missing_rollout_id).await?,
+        None
     );
     assert_eq!(
         crate::find_thread_path_by_id_str(home.path(), "not-a-uuid", /*state_db_ctx*/ None).await?,

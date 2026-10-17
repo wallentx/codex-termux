@@ -14,6 +14,7 @@ fn approval_resolution_rejects_denied_network_policy_amendment() {
             },
         },
         source: ApprovalResolutionSource::User,
+        cancellation_reason: None,
     };
 
     assert!(matches!(
@@ -27,6 +28,7 @@ fn approval_resolution_rejects_mcp_policy_amendment() {
     let resolution = ApprovalResolution {
         decision: ReviewDecision::ApprovedMcpPolicyAmendment,
         source: ApprovalResolutionSource::User,
+        cancellation_reason: None,
     };
 
     assert!(matches!(
@@ -40,6 +42,7 @@ fn approval_resolution_aborts_turn_when_approval_is_aborted() {
     let resolution = ApprovalResolution {
         decision: ReviewDecision::Abort,
         source: ApprovalResolutionSource::User,
+        cancellation_reason: None,
     };
 
     assert!(matches!(
@@ -67,6 +70,7 @@ fn approval_resolution_uses_acting_model_timeout_instructions() {
         let resolution = ApprovalResolution {
             decision: ReviewDecision::TimedOut,
             source: ApprovalResolutionSource::Guardian,
+            cancellation_reason: None,
         };
 
         assert!(matches!(
@@ -167,11 +171,13 @@ async fn non_utf8_cwd_preserves_approval_routing(
         ApprovalResolution {
             decision: ReviewDecision::Approved,
             source: ApprovalResolutionSource::User,
+            cancellation_reason: None,
         }
     } else {
         ApprovalResolution {
             decision: ReviewDecision::Approved,
             source: ApprovalResolutionSource::Guardian,
+            cancellation_reason: None,
         }
     };
     assert_eq!(approval.await, expected);

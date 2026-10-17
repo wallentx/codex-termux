@@ -95,6 +95,36 @@ fn is_contextual_dev_fragment(content_item: &ContentItem) -> bool {
     })
 }
 
+/// User-input parts with their original indices. Media wrapper labels are not
+/// user text; retain the indices so history edits can carry the right annotations.
+pub(crate) fn user_input_parts(
+    message: &[ContentItem],
+) -> impl Iterator<Item = (usize, &ContentItem)> {
+    message
+        .iter()
+        .enumerate()
+        .filter(|(idx, content_item)| match content_item {
+            ContentItem::InputText { text } => {
+                let is_image_label = ((is_local_image_open_tag_text(text)
+                    || is_image_open_tag_text(text))
+                    && matches!(message.get(idx + 1), Some(ContentItem::InputImage { .. })))
+                    || (*idx > 0
+                        && (is_local_image_close_tag_text(text) || is_image_close_tag_text(text))
+                        && matches!(message.get(idx - 1), Some(ContentItem::InputImage { .. })));
+                let is_audio_label = ((is_local_audio_open_tag_text(text)
+                    || is_audio_open_tag_text(text))
+                    && matches!(message.get(idx + 1), Some(ContentItem::InputAudio { .. })))
+                    || (*idx > 0
+                        && (is_local_audio_close_tag_text(text) || is_audio_close_tag_text(text))
+                        && matches!(message.get(idx - 1), Some(ContentItem::InputAudio { .. })));
+                !is_image_label && !is_audio_label
+            }
+            ContentItem::InputImage { .. }
+            | ContentItem::InputAudio { .. }
+            | ContentItem::OutputText { .. } => true,
+        })
+}
+
 fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
     if is_contextual_user_message_content(message) {
         return None;
@@ -102,24 +132,9 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
 
     let mut content: Vec<UserInput> = Vec::new();
 
-    for (idx, content_item) in message.iter().enumerate() {
+    for (_, content_item) in user_input_parts(message) {
         match content_item {
             ContentItem::InputText { text } => {
-                let is_image_label = ((is_local_image_open_tag_text(text)
-                    || is_image_open_tag_text(text))
-                    && matches!(message.get(idx + 1), Some(ContentItem::InputImage { .. })))
-                    || (idx > 0
-                        && (is_local_image_close_tag_text(text) || is_image_close_tag_text(text))
-                        && matches!(message.get(idx - 1), Some(ContentItem::InputImage { .. })));
-                let is_audio_label = ((is_local_audio_open_tag_text(text)
-                    || is_audio_open_tag_text(text))
-                    && matches!(message.get(idx + 1), Some(ContentItem::InputAudio { .. })))
-                    || (idx > 0
-                        && (is_local_audio_close_tag_text(text) || is_audio_close_tag_text(text))
-                        && matches!(message.get(idx - 1), Some(ContentItem::InputAudio { .. })));
-                if is_image_label || is_audio_label {
-                    continue;
-                }
                 content.push(UserInput::Text {
                     text: text.clone(),
                     // Model input content does not carry UI element ranges.

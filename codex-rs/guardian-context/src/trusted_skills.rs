@@ -20,9 +20,14 @@ pub struct TrustedSkills {
     pub paths: Vec<String>,
 }
 
+impl TrustedSkills {
+    /// Classification attached to this fragment's rendered text.
+    pub const KIND: &str = "guardian.trusted_skills";
+}
+
 impl ContextualUserFragment for TrustedSkills {
     fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("guardian.trusted_skills".to_owned())
+        ContentItemKind(Self::KIND.to_owned())
     }
 
     fn role(&self) -> &'static str {
