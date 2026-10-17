@@ -53,6 +53,25 @@ def pr_fixture():
 
 
 class PolicyTests(unittest.TestCase):
+    def test_build_publication_does_not_require_app_administration_access(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / ".github/workflows/termux-build-repair.md").read_text()
+        compiled = (root / ".github/workflows/termux-build-repair.lock.yml").read_text()
+        self.assertIn("check-branch-protection: false", source)
+        configs = [
+            json.loads(json.loads(line.split(":", 1)[1].strip()))
+            for line in compiled.splitlines()
+            if line.strip().startswith("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG:")
+        ]
+        self.assertTrue(configs)
+        for config in configs:
+            self.assertFalse(
+                config["push_to_pull_request_branch"]["check_branch_protection"]
+            )
+        self.assertFalse("permission-administration:" in compiled)
+        self.assertFalse("permission-workflows:" in compiled)
+        self.assertIn("permission-contents: write", compiled)
+
     def test_workflows_supply_the_preparation_script_environment(self):
         root = Path(__file__).resolve().parents[2]
         for mode in ("watch", "build"):

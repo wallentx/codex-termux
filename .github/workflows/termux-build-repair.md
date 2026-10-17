@@ -119,6 +119,8 @@ safe-outputs:
     client-id: ${{ vars.APP_CLIENT_ID }}
     private-key: ${{ secrets.APP_PRIVATE_KEY }}
   push-to-pull-request-branch:
+    # GitHub enforces protection on push; avoid the optional admin-only lookup.
+    check-branch-protection: false
     target: ${{ needs.prepare.outputs.pr_number }}
     max: 1
     allowed-files: ["codex-rs/**/*.rs", "codex-rs/**/Cargo.toml", "codex-rs/Cargo.lock"]

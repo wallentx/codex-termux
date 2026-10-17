@@ -9,6 +9,7 @@ on:
       - .github/scripts/termux-package.py
       - .github/workflows/termux-release-tests.yml
       - .github/workflows/rusty-v8-release.yml
+      - .github/workflows/rust-release.yml
       - .github/scripts/rusty_v8_android_release.py
   pull_request:
     paths:
@@ -17,6 +18,7 @@ on:
       - .github/scripts/termux-package.py
       - .github/workflows/termux-release-tests.yml
       - .github/workflows/rusty-v8-release.yml
+      - .github/workflows/rust-release.yml
       - .github/scripts/rusty_v8_android_release.py
   workflow_dispatch:
 

@@ -17,6 +17,11 @@ script checks the repository, workflow path, event, branch, PR ownership, and
 current PR head again. No untrusted fork checkout is executed with write
 credentials.
 
+The Android build selects its `rusty-v8-v<version>` release using the same
+resolved-version helper as the V8 artifact producer. It downloads the archive,
+bindings, and checksums together and verifies both files before exporting their
+paths. An upstream V8 bump therefore cannot silently reuse an older artifact.
+
 ## Authentication
 
 The agent workflows use `permissions: copilot-requests: write`, as requested.
@@ -29,9 +34,11 @@ No PAT is configured or uploaded by this setup.
 
 The existing `APP_CLIENT_ID` variable and `APP_PRIVATE_KEY` secret are used by
 deterministic preparation and publication jobs only. The App needs contents,
-issues, and pull requests write access, actions read access, and administration
-read access (requested by gh-aw's publication policy checks). Its installation
-token is scoped to this repository and revoked by the token action. Copilot
+issues, and pull requests write access, and actions read access. The build repair
+disables gh-aw's optional branch-protection API lookup so it does not request
+administration access; GitHub still enforces branch protection when pushing.
+Its installation token is scoped to this repository and revoked by the token
+action. Copilot
 receives a read-only repository token; the framework's separate safe-output job
 is the only part that can publish its proposed patch.
 
