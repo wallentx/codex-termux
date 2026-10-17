@@ -397,6 +397,7 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         self.assertIn(
             "    _lock_file: Option<File>,\n    _temp_dir: TempDir,\n", adapted
         )
+        self.assertEqual(module.adapt_arg0_lock(upstream, adapted, upstream), adapted)
         for unsafe in (source + "extra\n", source.replace("Some(lock_file)", "None")):
             with self.subTest(source=unsafe), self.assertRaises(ValueError):
                 module.adapt_arg0_lock(baseline, unsafe, upstream)
@@ -429,7 +430,9 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         try:
             baseline, source = (
                 subprocess.check_output(
-                    ["git", "show", f"{ref}:{path}"], cwd=ROOT, stderr=subprocess.DEVNULL
+                    ["git", "show", f"{ref}:{path}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
                 ).decode()
                 for ref in refs
             )

@@ -9,9 +9,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 
 def git(*args, data=None, env=None):
@@ -380,9 +379,11 @@ _RG_ANDROID_PATH = """    ];
 ARG0_LOCK_EDITS = (
     (
         "use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;\n",
-        "use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;\n"
-        "use codex_utils_file_lock::TryFileLockOutcome;\n"
-        "use codex_utils_file_lock::try_lock_exclusive_optional;\n",
+        (
+            "use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;\n"
+            "use codex_utils_file_lock::TryFileLockOutcome;\n"
+            "use codex_utils_file_lock::try_lock_exclusive_optional;\n"
+        ),
         1,
     ),
     ("    _lock_file: File,\n", "    _lock_file: Option<File>,\n", 1),
@@ -441,8 +442,10 @@ ANDROID_PACKAGE_EDITS = (
     (_RG_REQUIRED, _RG_ANDROID_PATH, 1),
     (
         '        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),\n',
-        '        ("android", "aarch64") => Ok("aarch64-linux-android"),\n'
-        '        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),\n',
+        (
+            '        ("android", "aarch64") => Ok("aarch64-linux-android"),\n'
+            '        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),\n'
+        ),
         1,
     ),
 )
@@ -466,13 +469,12 @@ def adapt_arg0_lock(baseline, source, upstream):
     """Carry the unsupported-lock fallback through upstream's lock-before-directory drop order."""
     if (
         "    _lock_file: File,\n    _temp_dir: TempDir,\n" not in upstream
+        or "    _lock_file: File,\n    _temp_dir: TempDir,\n" in baseline
         or source == baseline
         or "try_lock_exclusive_optional" not in source
     ):
         return source
-    return port_exact_edits(
-        baseline, source, upstream, ARG0_LOCK_EDITS, "arg0 lock"
-    )
+    return port_exact_edits(baseline, source, upstream, ARG0_LOCK_EDITS, "arg0 lock")
 
 
 def adapt_android_package_validation(baseline, source, upstream):
@@ -481,7 +483,7 @@ def adapt_android_package_validation(baseline, source, upstream):
         "fn validate_package(root: &Path, entrypoint: &str)" not in upstream
         or "fn validate_package(root: &Path, entrypoint: &str)" in baseline
         or source == baseline
-        or "target_os = \"android\"" not in source
+        or 'target_os = "android"' not in source
     ):
         return source
     return port_exact_edits(
@@ -531,13 +533,21 @@ def release_tree(upstream, source, baseline, excluded):
             (ARG0_PATH, adapt_arg0_lock),
             (DAEMON_PREPARE_PATH, adapt_android_package_validation),
         ):
-            if not all(git("ls-tree", ref, "--", path) for ref in (baseline, source, upstream)):
+            if not all(
+                git("ls-tree", ref, "--", path) for ref in (baseline, source, upstream)
+            ):
                 continue
-            texts = [git("show", f"{ref}:{path}").decode() for ref in (baseline, source, upstream)]
+            texts = [
+                git("show", f"{ref}:{path}").decode()
+                for ref in (baseline, source, upstream)
+            ]
             adapted = adapter(*texts)
             if adapted != texts[1]:
                 adapted_files[path] = (adapted, texts[2])
-                print(f"Adapted Termux delta in {path} to the new upstream API.", file=sys.stderr)
+                print(
+                    f"Adapted Termux delta in {path} to the new upstream API.",
+                    file=sys.stderr,
+                )
 
         def put_blob(path, content):
             blob = git("hash-object", "-w", "--stdin", data=content).decode().strip()
