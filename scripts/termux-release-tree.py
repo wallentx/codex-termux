@@ -9,9 +9,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 
 def git(*args, data=None, env=None):
@@ -194,22 +193,7 @@ def merge_dependency_additions(text, *, path):
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
 
 
-def adapt_removable_startup_lock(baseline, source, upstream):
-    """Carry the reviewed lock fallback through upstream's removable-lock redesign."""
-    removable = "pub(super) fn try_acquire_removable_app_server_startup_lock("
-    if (
-        removable not in upstream
-        or removable in baseline
-        or source == baseline
-        or "use codex_utils_file_lock::" not in source
-    ):
-        return source
-
-    imports = """use codex_utils_file_lock::FileLockOutcome;
-use codex_utils_file_lock::LockDirGuard;
-use codex_utils_file_lock::acquire_sibling_lock_dir;
-use codex_utils_file_lock::lock_exclusive_optional;
-"""
+def port_startup_lock_edits(upstream):
     import_anchor = "use codex_utils_absolute_path::AbsolutePathBuf;\n"
     field = "    _file: std::fs::File,\n"
     guard_field = "    _lock_dir_guard: Option<LockDirGuard>,\n"
@@ -220,26 +204,6 @@ use codex_utils_file_lock::lock_exclusive_optional;
             }
         };
 """
-    expected = baseline
-    for before, after in (
-        (import_anchor, import_anchor + imports),
-        (field, field + guard_field),
-        (
-            "        file.lock()?;\n        Ok(AppServerStartupLock { _file: file })\n",
-            blocking_lock
-            + """        Ok(AppServerStartupLock {
-            _file: file,
-            _lock_dir_guard: lock_dir_guard,
-        })
-""",
-        ),
-    ):
-        if expected.count(before) != 1:
-            raise ValueError("unrecognized startup-lock baseline; refusing adaptation")
-        expected = expected.replace(before, after, 1)
-    if source != expected:
-        raise ValueError("unrecognized Termux startup-lock delta; refusing adaptation")
-
     adapted = upstream
     for before, after in (
         (
@@ -329,6 +293,204 @@ use codex_utils_file_lock::try_lock_exclusive_optional;
     return adapted
 
 
+def adapt_split_daemon_socket(baseline, source, upstream):
+    """Carry the lock fallback to upstream's reusable private-socket binder."""
+    split = "pub async fn bind_private_daemon_socket("
+    if split not in upstream or split in baseline or source == baseline:
+        return source
+    if "use codex_utils_file_lock::" not in source:
+        return source
+    if port_startup_lock_edits(baseline) != source:
+        raise ValueError("unrecognized Termux startup-lock delta; refusing adaptation")
+    return port_startup_lock_edits(upstream)
+
+
+def adapt_removable_startup_lock(baseline, source, upstream):
+    """Carry the reviewed lock fallback through upstream's removable-lock redesign."""
+    removable = "pub(super) fn try_acquire_removable_app_server_startup_lock("
+    if (
+        removable not in upstream
+        or removable in baseline
+        or source == baseline
+        or "use codex_utils_file_lock::" not in source
+    ):
+        return source
+
+    imports = """use codex_utils_file_lock::FileLockOutcome;
+use codex_utils_file_lock::LockDirGuard;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
+use codex_utils_file_lock::lock_exclusive_optional;
+"""
+    import_anchor = "use codex_utils_absolute_path::AbsolutePathBuf;\n"
+    field = "    _file: std::fs::File,\n"
+    guard_field = "    _lock_dir_guard: Option<LockDirGuard>,\n"
+    blocking_lock = """        let lock_dir_guard = match lock_exclusive_optional(&file)? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => {
+                Some(acquire_sibling_lock_dir(startup_lock_path.as_path())?)
+            }
+        };
+"""
+    expected = baseline
+    for before, after in (
+        (import_anchor, import_anchor + imports),
+        (field, field + guard_field),
+        (
+            "        file.lock()?;\n        Ok(AppServerStartupLock { _file: file })\n",
+            blocking_lock
+            + """        Ok(AppServerStartupLock {
+            _file: file,
+            _lock_dir_guard: lock_dir_guard,
+        })
+""",
+        ),
+    ):
+        if expected.count(before) != 1:
+            raise ValueError("unrecognized startup-lock baseline; refusing adaptation")
+        expected = expected.replace(before, after, 1)
+    if source != expected:
+        raise ValueError("unrecognized Termux startup-lock delta; refusing adaptation")
+
+    return port_startup_lock_edits(upstream)
+
+
+ARG0_PATH = "codex-rs/arg0/src/lib.rs"
+DAEMON_PREPARE_PATH = "codex-rs/app-server-daemon/src/prepare_install.rs"
+
+_RG_REQUIRED = """        if cfg!(windows) {
+            "codex-path/rg.exe"
+        } else {
+            "codex-path/rg"
+        },
+    ];
+"""
+_RG_ANDROID_PATH = """    ];
+    // Android uses the ripgrep installed by Termux, resolved through PATH.
+    if !cfg!(target_os = "android") {
+        names.push(if cfg!(windows) {
+            "codex-path/rg.exe"
+        } else {
+            "codex-path/rg"
+        });
+    }
+"""
+
+# (before, after, occurrences) edits that make up the reviewed downstream deltas.
+ARG0_LOCK_EDITS = (
+    (
+        "use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;\n",
+        (
+            "use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;\n"
+            "use codex_utils_file_lock::TryFileLockOutcome;\n"
+            "use codex_utils_file_lock::try_lock_exclusive_optional;\n"
+        ),
+        1,
+    ),
+    ("    _lock_file: File,\n", "    _lock_file: Option<File>,\n", 1),
+    (
+        "fn new(temp_dir: TempDir, lock_file: File, paths",
+        "fn new(temp_dir: TempDir, lock_file: Option<File>, paths",
+        1,
+    ),
+    (
+        "\n    lock_file.try_lock()?;\n",
+        """
+    let lock_file = match try_lock_exclusive_optional(&lock_file)? {
+        TryFileLockOutcome::Acquired => Some(lock_file),
+        TryFileLockOutcome::Unsupported => None,
+        TryFileLockOutcome::WouldBlock => {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+    };
+""",
+        1,
+    ),
+    (
+        """    match lock_file.try_lock() {
+        Ok(()) => Ok(Some(lock_file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+""",
+        """    match try_lock_exclusive_optional(&lock_file)? {
+        TryFileLockOutcome::Acquired => Ok(Some(lock_file)),
+        TryFileLockOutcome::WouldBlock | TryFileLockOutcome::Unsupported => Ok(None),
+    }
+""",
+        1,
+    ),
+    (
+        "            lock_file,\n            Arg0DispatchPaths {",
+        "            Some(lock_file),\n            Arg0DispatchPaths {",
+        2,
+    ),
+    (
+        "        lock_file.try_lock()?;\n",
+        """        match try_lock_exclusive_optional(&lock_file)? {
+            TryFileLockOutcome::Acquired => {}
+            TryFileLockOutcome::Unsupported => return Ok(()),
+            TryFileLockOutcome::WouldBlock => {
+                panic!("newly created lock file should not be locked");
+            }
+        }
+""",
+        1,
+    ),
+)
+
+ANDROID_PACKAGE_EDITS = (
+    (_RG_REQUIRED, _RG_ANDROID_PATH, 1),
+    (
+        '        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),\n',
+        (
+            '        ("android", "aarch64") => Ok("aarch64-linux-android"),\n'
+            '        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),\n'
+        ),
+        1,
+    ),
+)
+
+
+def port_exact_edits(baseline, source, upstream, edits, label):
+    """Port a downstream delta made only of known edits onto a redesigned upstream file."""
+    expected = baseline
+    adapted = upstream
+    for before, after, count in edits:
+        if expected.count(before) != count or adapted.count(before) != count:
+            raise ValueError(f"unrecognized {label} code; refusing adaptation")
+        expected = expected.replace(before, after)
+        adapted = adapted.replace(before, after)
+    if source != expected:
+        raise ValueError(f"unrecognized Termux {label} delta; refusing adaptation")
+    return adapted
+
+
+def adapt_arg0_lock(baseline, source, upstream):
+    """Carry the unsupported-lock fallback through upstream's lock-before-directory drop order."""
+    if (
+        "    _lock_file: File,\n    _temp_dir: TempDir,\n" not in upstream
+        or "    _lock_file: File,\n    _temp_dir: TempDir,\n" in baseline
+        or source == baseline
+        or "try_lock_exclusive_optional" not in source
+    ):
+        return source
+    return port_exact_edits(baseline, source, upstream, ARG0_LOCK_EDITS, "arg0 lock")
+
+
+def adapt_android_package_validation(baseline, source, upstream):
+    """Carry Android package checks through upstream's entrypoint-aware validation."""
+    if (
+        "fn validate_package(root: &Path, entrypoint: &str)" not in upstream
+        or "fn validate_package(root: &Path, entrypoint: &str)" in baseline
+        or source == baseline
+        or 'target_os = "android"' not in source
+    ):
+        return source
+    return port_exact_edits(
+        baseline, source, upstream, ANDROID_PACKAGE_EDITS, "Android package validation"
+    )
+
+
 def release_tree(upstream, source, baseline, excluded):
     upstream, source, baseline = (
         git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip()
@@ -351,15 +513,39 @@ def release_tree(upstream, source, baseline, excluded):
         ):
             source_socket = git("show", f"{source}:{socket_path}").decode()
             upstream_socket = git("show", f"{upstream}:{socket_path}").decode()
+            baseline_socket = git("show", f"{baseline}:{socket_path}").decode()
             adapted = adapt_removable_startup_lock(
-                git("show", f"{baseline}:{socket_path}").decode(),
-                source_socket,
-                upstream_socket,
+                baseline_socket, source_socket, upstream_socket
             )
+            if adapted == source_socket:
+                adapted = adapt_split_daemon_socket(
+                    baseline_socket, source_socket, upstream_socket
+                )
             if adapted != source_socket:
                 adapted_socket = adapted
                 print(
                     "Adapted Termux fallback to removable startup locks.",
+                    file=sys.stderr,
+                )
+
+        adapted_files = {}
+        for path, adapter in (
+            (ARG0_PATH, adapt_arg0_lock),
+            (DAEMON_PREPARE_PATH, adapt_android_package_validation),
+        ):
+            if not all(
+                git("ls-tree", ref, "--", path) for ref in (baseline, source, upstream)
+            ):
+                continue
+            texts = [
+                git("show", f"{ref}:{path}").decode()
+                for ref in (baseline, source, upstream)
+            ]
+            adapted = adapter(*texts)
+            if adapted != texts[1]:
+                adapted_files[path] = (adapted, texts[2])
+                print(
+                    f"Adapted Termux delta in {path} to the new upstream API.",
                     file=sys.stderr,
                 )
 
@@ -429,6 +615,8 @@ def release_tree(upstream, source, baseline, excluded):
                     socket_path,
                     (adapted_socket if ref == source else upstream_socket).encode(),
                 )
+            for path, (adapted, upstream_text) in adapted_files.items():
+                put_blob(path, (adapted if ref == source else upstream_text).encode())
             if has_termux_updater:
                 put_blob(
                     cli, async_updater(git("show", f"{ref}:{cli}").decode()).encode()
