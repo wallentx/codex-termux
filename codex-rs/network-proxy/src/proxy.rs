@@ -927,19 +927,45 @@ impl NetworkProxy {
         self.state.current_cfg().await
     }
 
+    /// Selects cached credentials for the startup environment without changing listeners or policy.
+    /// Restore any existing placeholders before binding, then prepare the environment for execution.
+    pub async fn bind_credential_broker_environment(
+        &self,
+        credential_brokers: &crate::RemoteCredentialBrokerCache,
+        environment: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.state
+            .bind_credential_broker_environment(credential_brokers, environment)
+            .await
+    }
+
     /// Revision of credential configuration, excluding ordinary network policy changes.
     pub fn credential_broker_config_revision(&self) -> u64 {
         self.state.credential_broker_config_revision()
     }
 
     /// Captures the static inputs needed to launch a matching executor-local proxy.
+    /// Credential masking requires an explicit caller opt-in and a capable executor.
     pub async fn remote_launch_config(
         &self,
         local_binding_policy: crate::LocalBindingPolicy,
+        credential_masking: bool,
     ) -> Result<crate::RemoteNetworkProxyLaunchConfig> {
         let (mut config, brokerage_created_default_allowlist, _) =
             self.state.current_cfg_with_brokerage_provenance().await?;
-        // Proxy enablement and credential brokerage remain controller-owned.
+        // Configured providers are not transported yet, so these commands run unmasked.
+        let credential_masking = credential_masking
+            && config.enabled
+            && config.credential_broker
+            && config.credential_providers.is_empty();
+        anyhow::ensure!(
+            !credential_masking
+                || (!config.dangerously_allow_plaintext_credential_injection
+                    && config.mitm_hooks.is_empty()
+                    && config.mitm_ca.is_none()),
+            "executor credential masking does not support plaintext injection, MITM hooks, or external CAs"
+        );
+        // Legacy controller-only brokerage must not enable a remote proxy by itself.
         let mut broker_only_config = config::NetworkProxyConfig {
             enabled: config.enabled,
             allow_local_binding: config.allow_local_binding.filter(|binding| !binding),
@@ -973,7 +999,7 @@ impl NetworkProxy {
             .as_ref()
             .and_then(|scope| scope.environment_policy.as_ref());
         if config.credential_broker {
-            config.enabled &= !broker_only;
+            config.enabled &= !broker_only || credential_masking;
             config.credential_broker = false;
             config.dangerously_allow_plaintext_credential_injection = false;
             if config.mitm && config.mitm_hooks.is_empty() && config.mitm_ca.is_none() {
@@ -994,7 +1020,8 @@ impl NetworkProxy {
                 || config.allow_local_binding(),
             "MXC cannot enforce allow_local_binding=false: native host-loopback access is bidirectional; use true or a different sandbox backend"
         );
-        let proxy = crate::RemoteNetworkProxyConfig::from_effective_config(&config)?;
+        let mut proxy = crate::RemoteNetworkProxyConfig::from_effective_config(&config)?;
+        proxy.credential_masking = credential_masking;
         tracing::debug!(network_config = ?proxy, "resolved remote execution network configuration");
         let (environment_id, execution_id) = self
             .execution_scope
@@ -1149,11 +1176,13 @@ impl NetworkProxy {
             runtime_settings.allow_local_binding,
             runtime_settings.mitm_ca_trust_bundle.as_ref(),
         );
-        let credential_environment_id = environment_id.or_else(|| {
-            self.execution_scope
-                .as_ref()
-                .map(|scope| scope.environment_id.as_str())
-        });
+        let credential_environment_id = environment_id
+            .or_else(|| {
+                self.execution_scope
+                    .as_ref()
+                    .map(|scope| scope.environment_id.as_str())
+            })
+            .or(self.state.environment_id());
         self.state
             .virtualize_child_credentials_for_environment(&mut env, credential_environment_id);
         if let Some(execution_scope) = self.execution_scope.as_ref() {
@@ -1236,7 +1265,8 @@ impl NetworkProxy {
         let environment_id = self
             .execution_scope
             .as_ref()
-            .map(|scope| scope.environment_id.as_str());
+            .map(|scope| scope.environment_id.as_str())
+            .or(self.state.environment_id());
         self.state
             .virtualize_snapshot_credentials(env, environment_id);
     }
@@ -1286,6 +1316,15 @@ impl NetworkProxy {
         env: &HashMap<String, String>,
     ) -> bool {
         self.state.virtualize_brokered_text(text, env)
+    }
+
+    /// Applies the selected failure mode to recognized credentials left unmasked after preparation.
+    pub fn handle_unmasked_credentials(
+        &self,
+        env: &mut HashMap<String, String>,
+        mode: crate::CredentialMaskingFailureMode,
+    ) -> anyhow::Result<()> {
+        self.state.handle_unmasked_credentials(env, mode)
     }
 
     /// Returns trusted provider metadata and active bindings for a child environment.
@@ -1620,6 +1659,7 @@ impl NetworkProxy {
             *active_route = Some(Arc::clone(&route));
             drop(active_route);
             return Ok(NetworkProxyHandle::windows_shared(
+                self.clone(),
                 route,
                 Arc::clone(&windows_runtime.active_route),
                 Arc::clone(&self.environment_proxies),
@@ -1694,6 +1734,7 @@ impl NetworkProxy {
 
         Ok(NetworkProxyHandle {
             runtime: Some(ProxyRuntime::Listeners(listeners)),
+            proxy: Some(self.clone()),
             environment_proxies: Some(Arc::clone(&self.environment_proxies)),
             #[cfg(target_os = "windows")]
             windows_active_route: None,
@@ -1703,6 +1744,7 @@ impl NetworkProxy {
 
 pub struct NetworkProxyHandle {
     runtime: Option<ProxyRuntime>,
+    proxy: Option<NetworkProxy>,
     environment_proxies: Option<Arc<Mutex<HashMap<String, EnvironmentProxy>>>>,
     #[cfg(target_os = "windows")]
     windows_active_route: Option<Arc<Mutex<Option<Arc<WindowsProxyRoute>>>>>,
@@ -1712,6 +1754,7 @@ impl NetworkProxyHandle {
     fn noop() -> Self {
         Self {
             runtime: None,
+            proxy: None,
             environment_proxies: None,
             #[cfg(target_os = "windows")]
             windows_active_route: None,
@@ -1720,15 +1763,22 @@ impl NetworkProxyHandle {
 
     #[cfg(target_os = "windows")]
     fn windows_shared(
+        proxy: NetworkProxy,
         route: Arc<WindowsProxyRoute>,
         active_route: Arc<Mutex<Option<Arc<WindowsProxyRoute>>>>,
         environment_proxies: Arc<Mutex<HashMap<String, EnvironmentProxy>>>,
     ) -> Self {
         Self {
             runtime: Some(ProxyRuntime::SharedIngress { route }),
+            proxy: Some(proxy),
             environment_proxies: Some(environment_proxies),
             windows_active_route: Some(active_route),
         }
+    }
+
+    /// Returns the running proxy. Disabled proxy handles return `None`.
+    pub fn proxy(&self) -> Option<&NetworkProxy> {
+        self.proxy.as_ref()
     }
 
     pub async fn wait(mut self) -> Result<()> {
@@ -1831,6 +1881,7 @@ mod tests {
             });
             let handle = NetworkProxyHandle {
                 runtime: Some(ProxyRuntime::Listeners(listeners)),
+                proxy: None,
                 environment_proxies: Some(Arc::new(Mutex::new(HashMap::new()))),
                 #[cfg(target_os = "windows")]
                 windows_active_route: None,
@@ -1918,7 +1969,9 @@ mod tests {
         );
         assert_eq!(proxy.current_cfg().await?, config);
 
-        let remote = proxy.remote_launch_config(DefaultFalse).await?;
+        let remote = proxy
+            .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
+            .await?;
         assert_eq!(
             (
                 remote.proxy.unix_sockets,
@@ -2015,7 +2068,7 @@ mod tests {
         owner_config.set_denied_domains(vec!["denied.example".to_string()]);
         assert_eq!(
             scoped
-                .remote_launch_config(DefaultFalse)
+                .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
                 .await?
                 .proxy
                 .domains,
@@ -2432,7 +2485,7 @@ mod tests {
             "GH_HOST".to_string(),
             "local-github.example".to_string(),
         )]));
-        let state = Arc::new(network_proxy_state_for_policy(config));
+        let state = Arc::new(network_proxy_state_for_policy(config.clone()));
         let proxy = match NetworkProxy::builder().state(state).build().await {
             Ok(proxy) => proxy,
             Err(err) => {
@@ -2453,7 +2506,9 @@ mod tests {
             /*environment_policy*/ None,
             /*fallback_policy_decider*/ None,
         )?;
-        let launch = scoped.remote_launch_config(RequireTrue).await?;
+        let launch = scoped
+            .remote_launch_config(RequireTrue, /*credential_masking*/ false)
+            .await?;
         let prepared = scoped.prepare_for_optional_environment(
             HashMap::from([(
                 PROXY_ATTRIBUTION_TOKEN_ENV_KEY.to_string(),
@@ -2465,6 +2520,34 @@ mod tests {
         assert_eq!(launch.environment_id.as_deref(), Some("remote-env"));
         assert_eq!(launch.execution_id.as_deref(), Some("execution-1"));
         assert!(!launch.proxy.enabled);
+        assert!(
+            scoped
+                .remote_launch_config(DefaultFalse, /*credential_masking*/ true)
+                .await
+                .is_err()
+        );
+
+        config.credential_providers.insert(
+            "vendor".to_string(),
+            crate::CredentialProviderConfig {
+                env: vec!["VENDOR_TOKEN".to_string()],
+                patterns: vec!["vendor_[a-z]{8}".to_string()],
+                url_prefixes: vec!["https://api.vendor.example".to_string()],
+                auth: vec![crate::CredentialAuthMethod::Bearer],
+                ..crate::CredentialProviderConfig::default()
+            },
+        );
+        let custom_provider_proxy = NetworkProxy::builder()
+            .state(Arc::new(network_proxy_state_for_policy(config)))
+            .build()
+            .await?;
+        assert_eq!(
+            custom_provider_proxy
+                .remote_launch_config(DefaultFalse, /*credential_masking*/ true)
+                .await?
+                .proxy,
+            launch.proxy
+        );
 
         let mut owner_config = NetworkProxyConfig::default();
         owner_config.set_allowed_domains(vec!["owner.example".to_string()]);
@@ -2480,7 +2563,7 @@ mod tests {
         )?;
         assert!(
             owner_scoped
-                .remote_launch_config(DefaultFalse)
+                .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
                 .await
                 .is_err()
         );
@@ -2512,9 +2595,14 @@ mod tests {
                 .state(Arc::new(network_proxy_state_for_policy(config)))
                 .build()
                 .await?;
-            let launch = proxy.remote_launch_config(DefaultFalse).await?;
-            assert!(launch.proxy.enabled);
-            assert_eq!(launch.proxy.mode, mode);
+            for credential_masking in [false, true] {
+                let launch = proxy
+                    .remote_launch_config(DefaultFalse, credential_masking)
+                    .await?;
+                assert!(launch.proxy.enabled);
+                assert_eq!(launch.proxy.mode, mode);
+                assert_eq!(launch.proxy.credential_masking, credential_masking);
+            }
         }
         assert_eq!(
             prepared

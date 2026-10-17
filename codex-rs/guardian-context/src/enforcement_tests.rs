@@ -7,6 +7,7 @@ use crate::composition::user_message;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
+use std::borrow::Cow;
 
 fn text(value: &str) -> ContentItem {
     ContentItem::InputText {
@@ -355,7 +356,36 @@ fn image_accounting_preserves_later_eviction_policy() {
             text("evidence omitted")
         ])]
     );
-    context.retain_images(|image, _| matches!(image, ImageReference::File { .. }));
+    let delivered = [user_message(vec![ContentItem::InputImage {
+        image: ImageReference::Inline {
+            image_url: "prepared-image".to_owned(),
+        },
+        detail: Some(codex_protocol::models::ImageDetail::High),
+    }])];
+    // A host-prepared reference matches delivered history even when source detail differs.
+    context.retain_new_images(&delivered, |image, _| match image {
+        ImageReference::Inline { .. } => Some(Cow::Owned(ImageReference::Inline {
+            image_url: "prepared-image".to_owned(),
+        })),
+        ImageReference::File { .. } => Some(Cow::Borrowed(image)),
+    });
+    let mut continued = context.clone();
+    let completed = context.clone().into_messages();
+    continued.retain_new_images(&completed, |image, _| Some(Cow::Borrowed(image)));
+    // Once all images were delivered, deduplication must not inspect retained history.
+    continued.retain_new_images(
+        completed
+            .iter()
+            .inspect(|_| panic!("image-free context must not scan retained history")),
+        |image, _| Some(Cow::Borrowed(image)),
+    );
+    assert_eq!(
+        continued.into_messages(),
+        vec![user_message(vec![
+            evidence.clone(),
+            text("user restriction")
+        ])]
+    );
     let available = context.estimated_tokens();
     let retained = context
         .clone()

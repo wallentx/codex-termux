@@ -172,7 +172,7 @@ pub(crate) fn copy_on_select(
     SelectionViewParams {
         title: Some("Copy on select".to_string()),
         subtitle: Some(
-            "Copy transcript selections on release, with Auto following terminal defaults"
+            "Copy transcript, footer, and composer selections on release; Auto follows terminal defaults"
                 .to_string(),
         ),
         footer_hint: Some(picker_hint_line_for_keymap(keymap)),

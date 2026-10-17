@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "logs_client"
 path = "src/bin/logs_client.rs"
 
+[[test]]
+name = "app_server_daemon_package"
+path = "tests/app_server_daemon/package.rs"
+
 [lib]
 name = "codex_cli"
 path = "src/lib.rs"
@@ -51,6 +55,7 @@ codex-exec-server = { workspace = true }
 codex-execpolicy = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-features = { workspace = true }
+codex-multi-env-copy-file = { workspace = true }
 codex-git-attribution = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-install-context = { workspace = true }

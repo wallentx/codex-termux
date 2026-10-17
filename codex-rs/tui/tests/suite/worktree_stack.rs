@@ -184,7 +184,7 @@ async fn picker_side_worktree_fork_and_cd_run_on_the_production_stack() -> Resul
 
 fn submit(terminal: &mut PtyCodex, input: &str) -> Result<()> {
     terminal.write_input(input.as_bytes())?;
-    terminal.wait_for_screen(input)?;
+    terminal.wait_for_screen(&input.replacen('/', "/ ", 1))?;
     // Bulk PTY writes resemble a paste; wait out the Enter suppression window.
     std::thread::sleep(Duration::from_millis(/*millis*/ 250));
     terminal.write_input(b"\r")?;

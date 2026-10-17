@@ -23,6 +23,7 @@ pub enum UserGoalUpdate {
 }
 
 impl UserGoalUpdate {
+    pub(crate) const KIND: &str = "user.goal";
     pub(crate) const OMITTED_OBJECTIVE_KIND: &str = "user.goal.omitted";
 
     /// Captures accepted goal instructions at a compaction input boundary.
@@ -53,7 +54,7 @@ impl UserGoalUpdate {
         let [ContentItem::InputText { text }] = content.as_slice() else {
             return None;
         };
-        (role == "user" && matches!(kind.0.as_str(), "user.goal" | Self::OMITTED_OBJECTIVE_KIND))
+        (role == "user" && matches!(kind.0.as_str(), Self::KIND | Self::OMITTED_OBJECTIVE_KIND))
             .then_some(text)
     }
 }
@@ -71,7 +72,7 @@ impl ContextualUserFragment for UserGoalUpdate {
             } if serde_json::json!(objective).to_string().len() > MAX_OBJECTIVE_BYTES => {
                 Self::OMITTED_OBJECTIVE_KIND
             }
-            Self::Set { .. } | Self::Clear => "user.goal",
+            Self::Set { .. } | Self::Clear => Self::KIND,
         };
         ContentItemKind(kind.to_owned())
     }

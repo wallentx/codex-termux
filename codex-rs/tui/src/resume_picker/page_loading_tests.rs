@@ -21,7 +21,6 @@ fn linked_checkout_changes_only_affect_the_next_listing_cycle() {
             /*cursor*/ None,
             Some(&primary),
             /*uses_remote_filesystem*/ false,
-            /*worktrees_enabled*/ true,
         ),
         single
     );
@@ -43,7 +42,6 @@ fn linked_checkout_changes_only_affect_the_next_listing_cycle() {
             Some(&cursor),
             Some(&primary),
             /*uses_remote_filesystem*/ false,
-            /*worktrees_enabled*/ true,
         ),
         single
     );
@@ -56,7 +54,6 @@ fn linked_checkout_changes_only_affect_the_next_listing_cycle() {
             /*cursor*/ None,
             Some(&primary),
             /*uses_remote_filesystem*/ false,
-            /*worktrees_enabled*/ true,
         ),
         both
     );
@@ -66,7 +63,6 @@ fn linked_checkout_changes_only_affect_the_next_listing_cycle() {
             Some(&cursor),
             Some(&primary),
             /*uses_remote_filesystem*/ false,
-            /*worktrees_enabled*/ true,
         ),
         both
     );
@@ -75,7 +71,6 @@ fn linked_checkout_changes_only_affect_the_next_listing_cycle() {
             /*cursor*/ None,
             Some(&primary),
             /*uses_remote_filesystem*/ false,
-            /*worktrees_enabled*/ true,
         ),
         single
     );

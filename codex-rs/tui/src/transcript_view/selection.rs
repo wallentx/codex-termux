@@ -7,7 +7,6 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::*;
 use crate::clipboard_copy::CopyFormat;
-use crate::clipboard_copy::worker::CopyDestination;
 use crate::clipboard_copy::worker::CopyResult;
 use crate::text_selection::SelectionUnit;
 use crate::tui::Tui;
@@ -326,14 +325,16 @@ impl TranscriptView {
 
     /// A PRIMARY write is silent: it neither claims CLIPBOARD was copied nor ends selection.
     pub(crate) fn publish_primary(&mut self, tui: &mut Tui, text: &str) {
-        let (_, owner) = tui.clipboard.select(
-            text.into(),
+        let (_, owner) = tui.copy_selection(
+            text,
             CopyFormat::PlainText,
-            CopyDestination::Primary,
-            tui.frame_requester(),
+            SelectionCopy::on_select(
+                /*clipboard*/ false, /*primary*/ true, /*clear_selection*/ false,
+            ),
+            text,
         );
         if let Some(selection) = &mut self.selection {
-            selection.primary_owner = Some(owner);
+            selection.primary_owner = owner;
         }
     }
 
@@ -442,18 +443,20 @@ impl TranscriptView {
         let text = match action {
             ViewAction::Copy(text)
             | ViewAction::CopyOnSelect(text)
+            | ViewAction::PrimarySelection(text)
             | ViewAction::CopyAndFollow(text) => text.as_str(),
-            ViewAction::PrimarySelection(text) => {
-                self.publish_primary(tui, text);
-                return None;
-            }
             ViewAction::Changed | ViewAction::ExitSelectMode | ViewAction::OpenLink(_) => {
                 return None;
             }
         };
         let selection_copy = self.selection_copy(action);
+        if !selection_copy.copies_clipboard() {
+            if selection_copy.publishes_primary() {
+                self.publish_primary(tui, text);
+            }
+            return None;
+        }
         let clear_selection = selection_copy.clear_selection();
-        let publish_primary = selection_copy.publishes_primary() && self.primary_selection;
         let mut primary_owner = None;
         let result =
             self.copy_selected_text_with(cells, text, clear_selection, |rich, rich_format| {
@@ -464,21 +467,13 @@ impl TranscriptView {
                         (text, CopyFormat::MarkdownSelection(source))
                     }
                 };
-                if publish_primary {
-                    let (result, owner) = tui.clipboard.select(
-                        copy_text.into(),
-                        format,
-                        CopyDestination::ClipboardAndPrimary(text.into()),
-                        tui.frame_requester(),
-                    );
-                    primary_owner = Some(owner);
-                    result
-                } else {
-                    tui.clipboard
-                        .copy(copy_text.into(), format, tui.frame_requester())
-                }
+                let (result, owner) = tui.copy_selection(copy_text, format, selection_copy, text);
+                primary_owner = owner;
+                result
             });
-        if publish_primary && let Some(selection) = &mut self.selection {
+        if selection_copy.publishes_primary()
+            && let Some(selection) = &mut self.selection
+        {
             selection.primary_owner = primary_owner;
         }
         if matches!(action, ViewAction::CopyAndFollow(_))

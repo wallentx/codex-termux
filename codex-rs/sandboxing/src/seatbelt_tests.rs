@@ -2630,6 +2630,91 @@ fn seatbelt_protects_aws_in_extra_writable_home() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn seatbelt_protects_case_variants_of_metadata() {
+    let mut results = Vec::new();
+    let mut expected = Vec::new();
+    for name in PROTECTED_METADATA_PATH_NAMES {
+        let uppercase = name.to_ascii_uppercase();
+        for existing_name in [None, Some(*name), Some(uppercase.as_str())] {
+            for root_name in ["workspace", "WORKSPACE"] {
+                let tmp = TempDir::new().expect("tempdir");
+                let workspace = tmp.path().join("workspace");
+                let variant = workspace.join(&uppercase);
+                let probe = workspace.join("probe");
+                fs::create_dir(&workspace).expect("create workspace");
+                if !tmp.path().join("WORKSPACE").is_dir() {
+                    // The reported aliases require a case-insensitive filesystem.
+                    return;
+                }
+                if let Some(existing_name) = existing_name {
+                    let existing = workspace.join(existing_name);
+                    fs::create_dir(&existing).expect("create metadata");
+                    fs::write(existing.join("config"), "original").expect("write config");
+                }
+                let policy_root = tmp.path().join(root_name);
+                let policy = restricted_write_policy(&[policy_root.as_path()]);
+                let command = if existing_name.is_some() {
+                    "printf ran > \"$2\" && printf changed > \"$1/config\""
+                } else {
+                    "printf ran > \"$2\" && mkdir -p \"$1\" && printf changed > \"$1/config\""
+                };
+                let args = create_seatbelt_command_args(CreateSeatbeltCommandArgsParams {
+                    command: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        command.to_string(),
+                        "sh".to_string(),
+                        variant.display().to_string(),
+                        probe.display().to_string(),
+                    ],
+                    file_system_sandbox_policy: &policy,
+                    network_sandbox_policy: NetworkSandboxPolicy::Restricted,
+                    sandbox_policy_cwd: &workspace,
+                    enforce_managed_network: false,
+                    managed_network: None,
+                    environment_id: None,
+                    network: None,
+                    extra_allow_unix_sockets: &[],
+                })
+                .expect("build seatbelt command");
+                let output = Command::new(MACOS_PATH_TO_SEATBELT_EXECUTABLE)
+                    .args(args)
+                    .current_dir(&workspace)
+                    .output()
+                    .expect("execute seatbelt command");
+                assert_eq!(
+                    fs::read_to_string(&probe).expect("read sibling probe"),
+                    "ran"
+                );
+                results.push((
+                    *name,
+                    existing_name.map(str::to_owned),
+                    root_name,
+                    output.status.success(),
+                    variant.exists(),
+                    fs::read_to_string(
+                        workspace
+                            .join(existing_name.unwrap_or(&uppercase))
+                            .join("config"),
+                    )
+                    .ok(),
+                ));
+                expected.push((
+                    *name,
+                    existing_name.map(str::to_owned),
+                    root_name,
+                    false,
+                    existing_name.is_some(),
+                    existing_name.map(|_| "original".to_string()),
+                ));
+            }
+        }
+    }
+    assert_eq!(results, expected);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn seatbelt_protects_resolved_target_of_symlinked_metadata_directory() {
     use std::os::unix::fs::symlink;
 

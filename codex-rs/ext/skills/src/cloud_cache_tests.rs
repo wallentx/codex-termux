@@ -89,6 +89,7 @@ fn query(client: Option<Arc<McpResourceClient>>) -> SkillListQuery {
         include_cloud_skills: true,
         mcp_resources: client,
         executor_capability_discovery: None,
+        executor_capability_discovery_v2: Vec::new(),
     }
 }
 

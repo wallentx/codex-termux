@@ -218,6 +218,12 @@ impl BottomPaneView for UserVerificationView {
     fn terminal_title_requires_action(&self) -> bool {
         !self.is_complete()
     }
+
+    fn program_status_blocked_kind(
+        &self,
+    ) -> Option<crate::terminal_program_status::ProgramStatusKind> {
+        (!self.is_complete()).then_some(crate::terminal_program_status::ProgramStatusKind::Auth)
+    }
 }
 
 impl Renderable for UserVerificationView {

@@ -27,6 +27,9 @@ use crate::protocol::v2::UserInput;
 use crate::protocol::v2::WebSearchAction;
 use crate::protocol::v2::WebSearchItem;
 use crate::protocol::v2::web_search_action_from_core;
+use codex_extension_items::image_generation::GeneratedImageRef;
+#[cfg(test)]
+use codex_extension_items::image_generation::ImageGenerationInputImage;
 use codex_extension_items::image_generation::ImageGenerationItem;
 use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::protocol::AgentMessageEvent;
@@ -899,10 +902,13 @@ impl ThreadHistoryBuilder {
             id: payload.call_id.clone(),
             status: String::new(),
             revised_prompt: None,
-            result: String::new(),
+            image: GeneratedImageRef::Inline {
+                result: String::new(),
+            },
             transparent_background: None,
             failure: None,
             saved_path: None,
+            input_images: Vec::new(),
             imagegen_request_id: None,
             generation_id: None,
         });
@@ -914,10 +920,11 @@ impl ThreadHistoryBuilder {
             id: payload.call_id.clone(),
             status: payload.status.clone(),
             revised_prompt: payload.revised_prompt.clone(),
-            result: payload.result.clone(),
+            image: payload.image.clone(),
             transparent_background: payload.transparent_background,
             failure: payload.failure.clone(),
             saved_path: payload.saved_path.clone(),
+            input_images: payload.input_images.clone(),
             imagegen_request_id: None,
             generation_id: None,
         });
@@ -2330,6 +2337,10 @@ mod tests {
         let turn_id = "turn-1";
         let thread_id = ThreadId::new();
         let saved_path = test_path_buf("/tmp/image-1.png").abs();
+        let input_images = vec![ImageGenerationInputImage {
+            path: test_path_buf("/tmp/reference.png").abs(),
+            sha256: "ab".repeat(32),
+        }];
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_attribution: None,
@@ -2348,10 +2359,13 @@ mod tests {
                         id: "image-1".to_string(),
                         status: "completed".to_string(),
                         revised_prompt: Some("A blue square".to_string()),
-                        result: "cG5n".to_string(),
+                        image: GeneratedImageRef::Inline {
+                            result: "cG5n".to_string(),
+                        },
                         transparent_background: Some(true),
                         failure: None,
                         saved_path: Some(saved_path.clone()),
+                        input_images: input_images.clone(),
                         imagegen_request_id: None,
                         generation_id: None,
                     },
@@ -2373,6 +2387,10 @@ mod tests {
         let items = events
             .into_iter()
             .map(RolloutItem::EventMsg)
+            .map(|item| {
+                serde_json::from_value(serde_json::to_value(item).expect("serialize rollout"))
+                    .expect("deserialize rollout")
+            })
             .collect::<Vec<_>>();
 
         let turns = build_turns_from_rollout_items(&items);
@@ -2383,10 +2401,13 @@ mod tests {
                 id: "image-1".to_string(),
                 status: "completed".to_string(),
                 revised_prompt: Some("A blue square".to_string()),
-                result: "cG5n".to_string(),
+                image: GeneratedImageRef::Inline {
+                    result: "cG5n".to_string(),
+                },
                 transparent_background: Some(true),
                 failure: None,
                 saved_path: Some(saved_path),
+                input_images,
                 imagegen_request_id: None,
                 generation_id: None,
             })]
@@ -2648,7 +2669,7 @@ mod tests {
     }
 
     #[test]
-    fn replays_image_generation_end_events_into_turn_history() {
+    fn replays_file_backed_image_generation_end_events_into_turn_history() {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_attribution: None,
@@ -2671,7 +2692,9 @@ mod tests {
                 call_id: "ig_123".into(),
                 status: "completed".into(),
                 revised_prompt: Some("final prompt".into()),
-                result: "Zm9v".into(),
+                image: GeneratedImageRef::File {
+                    file_id: "file_123".into(),
+                },
                 transparent_background: Some(true),
                 failure: Some(
                     codex_extension_items::image_generation::ImageGenerationFailure::UsageLimitExceeded {
@@ -2680,6 +2703,10 @@ mod tests {
                     },
                 ),
                 saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
+                input_images: vec![ImageGenerationInputImage {
+                    path: test_path_buf("/tmp/reference.png").abs(),
+                    sha256: "ab".repeat(32),
+                }],
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 root_turn_id: None,
@@ -2719,7 +2746,9 @@ mod tests {
                         id: "ig_123".into(),
                         status: "completed".into(),
                         revised_prompt: Some("final prompt".into()),
-                        result: "Zm9v".into(),
+                        image: GeneratedImageRef::File {
+                            file_id: "file_123".into(),
+                        },
                         transparent_background: Some(true),
                         failure: Some(
                             codex_extension_items::image_generation::ImageGenerationFailure::UsageLimitExceeded {
@@ -2728,6 +2757,10 @@ mod tests {
                             },
                         ),
                         saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
+                        input_images: vec![ImageGenerationInputImage {
+                    path: test_path_buf("/tmp/reference.png").abs(),
+                    sha256: "ab".repeat(32),
+                }],
                         imagegen_request_id: None,
                         generation_id: None,
                     }),

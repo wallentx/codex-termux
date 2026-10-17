@@ -104,6 +104,15 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
         "exact action ".repeat(/*n*/ 1_000)
     );
     let history = vec![
+        serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Inspect the workspace."}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["compaction.summary"]
+            }
+        }))
+        .unwrap(),
         ResponseItem::Message {
             status: None,
             encrypted_content: None,
@@ -207,6 +216,10 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
         sections,
         vec![ContextSection::ConversationTranscript {
             items: vec![
+                entry(
+                    ConversationTranscriptEntryKind::Assistant,
+                    "Inspect the workspace."
+                ),
                 entry(
                     ConversationTranscriptEntryKind::User,
                     "Inspect the workspace."

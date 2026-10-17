@@ -4,7 +4,7 @@ expression: "render(&picker, 100)"
 ---
 
   Copy on select
-  Copy transcript selections on release, with Auto following terminal defaults
+  Copy transcript, footer, and composer selections on release; Auto follows terminal defaults
 
 
 › 1. Auto (default) (current)

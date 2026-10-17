@@ -19,9 +19,11 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
@@ -32,6 +34,8 @@ use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -1171,6 +1175,17 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
         let server = start_mock_server().await;
         let previous_model = "gpt-5.4";
         let selected_model = "gpt-5.2";
+        let incomplete = sse(vec![
+            ev_assistant_message("discarded", "DISCARDED_INCOMPLETE_SUMMARY"),
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "incomplete-compaction",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": reported_usage
+                }
+            }),
+        ]);
         let response_mock = mount_sse_sequence(
             &server,
             vec![
@@ -1178,14 +1193,8 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
                     ev_assistant_message("initial", "Initial reply."),
                     ev_completed_with_tokens("initial", /*total_tokens*/ 120_000),
                 ]),
-                sse(vec![json!({
-                    "type": "response.incomplete",
-                    "response": {
-                        "id": "incomplete-compaction",
-                        "incomplete_details": {"reason": "max_output_tokens"},
-                        "usage": reported_usage
-                    }
-                })]),
+                incomplete.clone(),
+                incomplete,
             ],
         )
         .await;
@@ -1212,7 +1221,9 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
             })
             .build_with_auto_env(&server)
             .await?;
-        test.submit_turn("hello").await?;
+        // A real large history remains installed after failure. Server usage also
+        // includes request overhead that the local history estimate does not count.
+        test.submit_turn(&"x".repeat(440_000)).await?;
         // A smaller selected model forces compaction with the previous model.
         // An incomplete result must stop both retries and fallback to the selected model.
         test.codex
@@ -1269,6 +1280,138 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
                 .collect::<Vec<_>>(),
             vec![json!(previous_model), json!(previous_model)],
         );
+        // Failure has not made the original oversized history fit the smaller model.
+        // The next turn must attempt compaction again without retaining partial output.
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "continue after the failed compaction".into(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        let requests = response_mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].body_json()["model"], json!(previous_model));
+        assert!(
+            body_contains_text(&requests[2].body_json().to_string(), SUMMARIZATION_PROMPT)
+                || !requests[2].inputs_of_type("compaction_trigger").is_empty()
+        );
+        assert!(!body_contains_text(
+            &requests[2].body_json().to_string(),
+            "DISCARDED_INCOMPLETE_SUMMARY",
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_compaction_preserves_history_after_restart() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let initial = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("before-tool", "Checking the original state."),
+                ev_exec_command_call("original-tool", "echo ORIGINAL_TOOL_RESULT"),
+                ev_completed_with_tokens("tool-response", /*total_tokens*/ 1_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("after-tool", FIRST_REPLY),
+                ev_completed_with_tokens("initial-response", /*total_tokens*/ 2_000),
+            ]),
+        ],
+    )
+    .await;
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_pre_build_hook(allow_echo_commands)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            config.model_provider.stream_max_retries = Some(0);
+            set_test_compact_prompt(config);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    test.submit_turn("inspect the original state").await?;
+    assert_eq!(initial.requests().len(), 2);
+    let original_usage = test.codex.token_usage_info().await.expect("original usage");
+
+    let failed_compaction = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_reasoning_item("discarded-reasoning", &["Summarizing"], &[]),
+            ev_assistant_message("discarded-summary", "DISCARDED_PARTIAL_SUMMARY"),
+        ]),
+    )
+    .await;
+    test.codex.submit(Op::Compact).await?;
+    let mut errors = Vec::new();
+    wait_for_event(&test.codex, |event| {
+        if let EventMsg::Error(error) = event {
+            errors.push(error.message.clone());
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(
+        errors,
+        vec!["stream disconnected before completion: stream closed before response.completed"]
+    );
+    assert_eq!(test.codex.token_usage_info().await, Some(original_usage));
+
+    let original_request = failed_compaction.single_request();
+    let original_items = original_request
+        .input()
+        .into_iter()
+        .filter(|item| {
+            item["role"] == "assistant"
+                || item["type"] == "reasoning"
+                || item["call_id"] == "original-tool"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(original_items.len(), 4);
+    assert!(
+        original_request
+            .function_call_output("original-tool")
+            .to_string()
+            .contains("ORIGINAL_TOOL_RESULT")
+    );
+
+    // A live follow-up and a compaction retry after restart must both see the original evidence.
+    let follow_up = mount_sse_once(&server, sse(vec![ev_completed("follow-up")])).await;
+    test.submit_text_turn("continue after the failed compaction")
+        .await?;
+    let model_provider = test.config.model_provider.clone();
+    builder = builder.with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+    });
+    let resumed = builder.restart_with_auto_env(&server, &test).await?;
+    let retry = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("valid-summary", SUMMARY_TEXT),
+            ev_completed("successful-compaction"),
+        ]),
+    )
+    .await;
+    resumed.codex.submit(Op::Compact).await?;
+    assert_compaction_uses_turn_lifecycle_id(&resumed.codex).await;
+    for request in [follow_up.single_request(), retry.single_request()] {
+        let retained_items = request
+            .input()
+            .into_iter()
+            .filter(|item| {
+                item["role"] == "assistant"
+                    || item["type"] == "reasoning"
+                    || item["call_id"] == "original-tool"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained_items, original_items);
     }
     Ok(())
 }
@@ -1286,19 +1429,34 @@ async fn manual_compact_records_durable_and_local_token_usage() {
         ev_assistant_message("m1", SUMMARY_TEXT),
         ev_completed_with_tokens("r1", /*total_tokens*/ 0),
     ]);
-    mount_sse_once(&server, sse_compact).await;
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("initial", FIRST_REPLY),
+                ev_completed_with_tokens("initial", /*total_tokens*/ 1_000),
+            ]),
+            sse_compact,
+        ],
+    )
+    .await;
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
     });
-    let test = builder.build(&server).await.unwrap();
+    let test = builder.build_with_auto_env(&server).await.unwrap();
+    test.submit_turn("hello").await.unwrap();
     let rollout_path = test.codex.rollout_path().expect("rollout path");
     let codex = test.codex;
 
     // Trigger manual compact and collect TokenCount events for the compact turn.
     codex.submit(Op::Compact).await.unwrap();
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::RawResponseCompleted(response) if response.response_id == "r1")
+    })
+    .await;
 
     // First TokenCount: from the compact API call (usage.total_tokens = 0).
     let first = wait_for_event_match(&codex, |ev| match ev {
@@ -1344,9 +1502,9 @@ async fn manual_compact_records_durable_and_local_token_usage() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].response_id, "r1");
-    assert_eq!(records[0].usage.total_tokens, 0);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].response_id, "r1");
+    assert_eq!(records[1].usage.total_tokens, 0);
     let compacted = rollout_items
         .iter()
         .find_map(|item| match item {
@@ -1359,7 +1517,7 @@ async fn manual_compact_records_durable_and_local_token_usage() {
             compacted.compaction_response_id.as_deref(),
             compacted.latest_token_usage_record.as_ref(),
         ),
-        (Some("r1"), records.first().copied())
+        (Some("r1"), records.last().copied())
     );
 }
 
@@ -1373,10 +1531,15 @@ async fn manual_compact_emits_context_compaction_items() {
         ev_assistant_message("m1", FIRST_REPLY),
         ev_completed("r1"),
     ]);
-    let sse2 = sse(vec![
-        ev_assistant_message("m2", SUMMARY_TEXT),
-        ev_completed("r2"),
-    ]);
+    let reasoning = ev_reasoning_item("compact-reasoning", &["Summarizing the conversation"], &[]);
+    let summary = ev_assistant_message("m2", SUMMARY_TEXT);
+    let mut expected_summary = summary["item"].clone();
+    expected_summary["internal_chat_message_metadata_passthrough"] =
+        json!({ "content_item_kinds": ["unknown"] });
+    let mut expected_raw_items = [reasoning["item"].clone(), expected_summary]
+        .map(|item| serde_json::from_value::<ResponseItem>(item).unwrap())
+        .to_vec();
+    let sse2 = sse(vec![reasoning, summary, ev_completed("r2")]);
     mount_sse_sequence(&server, vec![sse1, sse2]).await;
 
     let model_provider = non_openai_model_provider(&server);
@@ -1384,7 +1547,8 @@ async fn manual_compact_emits_context_compaction_items() {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build_with_auto_env(&server).await.unwrap();
+    let codex = &test.codex;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1393,14 +1557,19 @@ async fn manual_compact_emits_context_compaction_items() {
         }]))
         .await
         .unwrap();
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    codex.submit(Op::Compact).await.unwrap();
+    let compact_turn_id = codex.submit(Op::Compact).await.unwrap();
+    for item in &mut expected_raw_items {
+        item.set_turn_id_if_missing(&compact_turn_id);
+    }
 
     let mut started_item = None;
     let mut completed_item = None;
     let mut legacy_event = false;
     let mut saw_turn_complete = false;
+    let mut raw_items = Vec::new();
+    let mut raw_items_at_response_completion = None;
 
     while !saw_turn_complete || started_item.is_none() || completed_item.is_none() || !legacy_event
     {
@@ -1424,6 +1593,10 @@ async fn manual_compact_emits_context_compaction_items() {
             EventMsg::TurnComplete(_) => {
                 saw_turn_complete = true;
             }
+            EventMsg::RawResponseItem(event) => raw_items.push(event.item),
+            EventMsg::RawResponseCompleted(_) => {
+                raw_items_at_response_completion = Some(raw_items.clone());
+            }
             _ => {}
         }
     }
@@ -1432,6 +1605,35 @@ async fn manual_compact_emits_context_compaction_items() {
     let completed_item = completed_item.expect("context compaction item completed");
     assert_eq!(started_item.id, completed_item.id);
     assert!(legacy_event);
+    // Raw output remains observable before the terminal response notification,
+    // independently of when the summary is installed into conversation history.
+    assert_eq!(
+        raw_items_at_response_completion,
+        Some(expected_raw_items.clone())
+    );
+
+    let rollout =
+        fs::read_to_string(test.codex.rollout_path().expect("rollout path")).expect("read rollout");
+    let persisted_output = rollout
+        .lines()
+        .map(|line| {
+            codex_rollout::parse_rollout_line(line)
+                .expect("rollout item")
+                .item
+        })
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(envelope)
+                if envelope
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.compaction_output) =>
+            {
+                Some(envelope.item)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(persisted_output, expected_raw_items);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4690,7 +4892,18 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
         &server,
         vec![
             sse(vec![
-                ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+                ev_function_call(
+                    DUMMY_CALL_ID,
+                    "request_user_input",
+                    &json!({"questions": [{
+                        "id": "next", "header": "Next", "question": "Continue?",
+                        "options": [
+                            {"label": "Yes", "description": "Continue."},
+                            {"label": "No", "description": "Stop."}
+                        ]
+                    }]})
+                    .to_string(),
+                ),
                 ev_completed_with_tokens("before-compact", /*total_tokens*/ 96),
             ]),
             sse(vec![
@@ -4744,6 +4957,8 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
         },
     )
     .await?;
+    // The resumed turn retains its frozen settings, even after an in-flight update.
+    let expected_settings = test.codex.thread_settings_snapshot().await;
     let codex_core::TurnInputSubmission::Started { turn_id, .. } = test
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -4754,11 +4969,38 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
     else {
         panic!("initial turn did not start");
     };
+    // Change settings while the turn is blocked, before compaction checkpoints its lineage.
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RequestUserInput(_))
+    })
+    .await;
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            effort: Some(Some(ReasoningEffort::High)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.codex.checkpoint_thread_settings().await?;
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: turn_id.clone(),
+            response: RequestUserInputResponse {
+                answers: [(
+                    "next".into(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Yes".into()],
+                    },
+                )]
+                .into(),
+            },
+        })
+        .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    let expected_settings = test.codex.thread_settings_snapshot().await;
     let path = test.codex.rollout_path().expect("rollout path");
     test.codex.shutdown_and_wait().await?;
     test.thread_manager
@@ -5909,6 +6151,7 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     )?;
     let mut builder = test_codex()
         .with_home(Arc::clone(&home))
+        .with_model_info_override("gpt-5.5", |model| model.use_responses_lite = true)
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let test = builder.build(&server).await?;
 
@@ -5968,6 +6211,7 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     let resumed_cwd = test.config.cwd.clone();
     let mut resume_builder = test_codex()
         .with_home(Arc::clone(&home))
+        .with_model_info_override("gpt-5.5", |model| model.use_responses_lite = true)
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| config.cwd = resumed_cwd);
     let resumed = resume_builder
@@ -5983,7 +6227,7 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     assert_single_instruction_fragment(&requests[3], &new_fragment);
     let resumed_input = requests[3].input();
     assert_eq!(
-        resumed_input.get(1..=replacement_history.len()),
+        resumed_input.get(2..=replacement_history.len() + 1),
         Some(replacement_history.as_slice()),
         "remote-v2 cold resume should replay persisted replacement history verbatim"
     );

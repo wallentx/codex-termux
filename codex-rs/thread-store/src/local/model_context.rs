@@ -115,10 +115,13 @@ pub(super) async fn load_for_fork(
         // Recover only the runtime version before applying the fork cutoff. Stop at the
         // newest version-bearing context instead of retaining the source's full replay.
         let source_lineage = lineage.clone();
+        let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
         session_meta.meta.multi_agent_version = tokio::task::spawn_blocking(move || {
             for segment in source_lineage.segments().iter().rev() {
-                let file =
-                    codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
+                let file = codex_rollout::open_rollout_seekable_reader(
+                    segment.rollout_path.as_path(),
+                    || stop.is_closed(),
+                )?;
                 let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
                     Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
                     None => ReverseJsonlScanner::new(file)?,
@@ -145,6 +148,7 @@ pub(super) async fn load_for_fork(
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to read fork runtime version: {err}"),
         })?;
+        drop(keep_running);
     }
     match history_base {
         Some(history_base) => {
@@ -159,13 +163,15 @@ async fn scan_model_context_from_lineage(
     lineage: RolloutLineage,
     session_meta: SessionMetaLine,
 ) -> ThreadStoreResult<Vec<RolloutItem>> {
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
     let scan = tokio::task::spawn_blocking(move || {
-        scan_model_context_from_lineage_blocking(&lineage, session_meta)
+        scan_model_context_from_lineage_blocking(&lineage, session_meta, || stop.is_closed())
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to join model context scan: {err}"),
     })?;
+    drop(keep_running);
     match scan {
         Ok(items) => Ok(items),
         Err(err) => Err(ThreadStoreError::Internal {
@@ -177,10 +183,14 @@ async fn scan_model_context_from_lineage(
 fn scan_model_context_from_lineage_blocking(
     lineage: &RolloutLineage,
     session_meta: SessionMetaLine,
+    is_cancelled: impl Fn() -> bool,
 ) -> io::Result<Vec<RolloutItem>> {
     let mut scan = ModelContextScan::default();
     'segments: for segment in lineage.segments().iter().rev() {
-        let file = codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
+        let file = codex_rollout::open_rollout_seekable_reader(
+            segment.rollout_path.as_path(),
+            &is_cancelled,
+        )?;
         let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
             Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
             None => ReverseJsonlScanner::new(file)?,

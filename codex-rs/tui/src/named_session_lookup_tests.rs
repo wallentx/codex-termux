@@ -57,6 +57,7 @@ async fn lookup_name(
     model_provider: Option<&str>,
 ) -> color_eyre::Result<Option<codex_app_server_protocol::Thread>> {
     let mut app_server = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
         codex_app_server_client::AppServerClient::InProcess(
             start_test_embedded_app_server(config.clone()).await?,
         ),
@@ -304,6 +305,7 @@ async fn rejects_duplicate_labels_across_server_pages() -> color_eyre::Result<()
     }
 
     let mut app_server = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
         codex_app_server_client::AppServerClient::InProcess(
             start_test_embedded_app_server(config.clone()).await?,
         ),
@@ -433,6 +435,7 @@ async fn uses_listed_thread_when_older_server_cannot_read_it() -> color_eyre::Re
     )
     .await?;
     let mut embedded = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
         codex_app_server_client::AppServerClient::InProcess(
             start_test_embedded_app_server(config.clone()).await?,
         ),
@@ -527,6 +530,7 @@ async fn uses_listed_thread_when_older_server_cannot_read_it() -> color_eyre::Re
         })
         .await?;
         let mut remote = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             codex_app_server_client::AppServerClient::Remote(client),
             mode,
         );

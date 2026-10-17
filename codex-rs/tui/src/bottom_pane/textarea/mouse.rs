@@ -6,10 +6,12 @@ use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use ratatui::layout::Position;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(super) struct MouseSelection {
     pending_copy: Option<(u64, Range<usize>)>,
+    primary_owner: Option<Arc<()>>,
     origin: Range<usize>,
     unit: SelectionUnit,
     dragging: bool,
@@ -23,6 +25,16 @@ impl TextArea {
         {
             selection.pending_copy = Some((id, range));
         }
+    }
+
+    pub(in crate::bottom_pane) fn retain_primary(&mut self, owner: Option<Arc<()>>) {
+        if let Some(selection) = &mut self.mouse_selection {
+            selection.primary_owner = owner;
+        }
+    }
+
+    pub(in crate::bottom_pane) fn cancel_primary(&mut self) {
+        self.retain_primary(/*owner*/ None);
     }
 
     pub(in crate::bottom_pane) fn finish_copy(
@@ -136,6 +148,7 @@ impl TextArea {
                 crate::text_selection::click_count(&mut self.last_click, event.column, event.row);
             MouseSelection {
                 pending_copy: None,
+                primary_owner: None,
                 origin: pos..pos,
                 // Padding remains an insertion target on repeated clicks.
                 unit: SelectionUnit::from_clicks(if pos == line.end - 1 { 1 } else { clicks }),

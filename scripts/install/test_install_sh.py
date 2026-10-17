@@ -183,6 +183,12 @@ class InstallShTest(unittest.TestCase):
                 (daemon / "current").resolve(), daemon / "releases" / release_name
             )
             self.assertEqual((daemon / "auto-update-version").read_text(), release_name)
+            history = daemon / "selection-history"
+            original_history = history.read_bytes()
+            self.assertEqual(history.read_text().splitlines()[:2], [release_name, ""])
+            repeated, _ = run_installer_in(root, "latest", daemon_only=True, **options)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertEqual(history.read_bytes(), original_history)
             options["daemon_only"] = True
             local = daemon / "releases/local-development"
             local.mkdir()

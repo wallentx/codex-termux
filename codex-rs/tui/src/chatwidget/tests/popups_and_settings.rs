@@ -3106,7 +3106,7 @@ async fn experimental_features_popup_snapshot() {
             enabled: true,
         },
         ExperimentalFeatureItem {
-            key: Feature::RealtimeConversation.key().to_string(),
+            key: "voice_conversations".to_string(),
             writable: true,
             name: "Voice conversations".to_string(),
             description: "Talk with Codex using /voice.".to_string(),

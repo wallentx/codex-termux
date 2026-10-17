@@ -38,6 +38,7 @@ impl SessionStartAction {
         local_settings: &LocalSettings,
         target: &SessionTarget,
     ) -> Result<AppServerStartedThread> {
+        target.ensure_backend(app_server.backend_id())?;
         match self {
             Self::Resume(settings, permissions) => {
                 app_server
@@ -87,6 +88,7 @@ pub(crate) async fn complete_session_start(
     initial_result: Result<AppServerStartedThread>,
     confirm: impl AsyncFnOnce() -> Result<UnarchiveChoice>,
 ) -> Result<SessionStartOutcome> {
+    target.ensure_backend(app_server.backend_id())?;
     match initial_result {
         Ok(started) => return Ok(SessionStartOutcome::Started(Box::new(started))),
         Err(err) => {

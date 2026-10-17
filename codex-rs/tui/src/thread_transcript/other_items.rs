@@ -55,8 +55,8 @@ pub(super) fn cells(item: ThreadItem, cwd: &AbsolutePathBuf) -> TranscriptCells 
             item.query,
             item.action.unwrap_or(WebSearchAction::Other),
         ))),
-        ThreadItem::ImageView { path, .. } => {
-            cells.push(Arc::new(history_cell::new_view_image_tool_call(path)))
+        ThreadItem::ImageView { id, path } => {
+            cells.push(Arc::new(history_cell::new_view_image_tool_call(id, path)))
         }
         ThreadItem::ImageGeneration(item)
             if !matches!(item.status.as_str(), "completed" | "failed") =>

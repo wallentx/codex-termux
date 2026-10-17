@@ -26,6 +26,7 @@ use unicode_width::UnicodeWidthStr;
 use super::ChatComposer;
 use super::FooterMode;
 use super::InputResult;
+use super::draft_state::PromptPrefix;
 use crate::bottom_pane::BottomPane;
 use crate::terminal_palette::StdoutColorLevel;
 use crate::terminal_palette::default_fg;
@@ -315,7 +316,9 @@ impl ChatComposer {
         let Some(body) = text.strip_prefix('/') else {
             return false;
         };
-        if !self.slash_commands_enabled() || self.draft.is_bash_mode || text.contains(['\n', '\r'])
+        if !self.slash_commands_enabled()
+            || self.draft.prompt_prefix == PromptPrefix::Shell
+            || text.contains(['\n', '\r'])
         {
             return false;
         }

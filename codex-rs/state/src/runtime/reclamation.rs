@@ -1,4 +1,5 @@
 //! Reclaims unused SQLite pages in opted-in databases, reducing batches after stalled passes.
+//! NFS on Linux skips opening a maintenance connection.
 use crate::RuntimeDbPath;
 use crate::SqliteConfig;
 use log::LevelFilter;
@@ -64,7 +65,7 @@ impl SqliteReclamationWorker {
                 if owner.is_none() {
                     continue;
                 }
-                delay = visit(&mut scheduled, &receiver).await;
+                delay = visit(&sqlite, &mut scheduled, &receiver).await;
             }
         });
 
@@ -79,6 +80,7 @@ impl SqliteReclamationWorker {
 }
 
 async fn visit(
+    sqlite: &SqliteConfig,
     scheduled: &mut [(RuntimeDbPath, Instant, ReclamationState)],
     shutdown: &watch::Receiver<()>,
 ) -> Duration {
@@ -91,6 +93,7 @@ async fn visit(
             continue;
         }
         let result = reclaim(
+            sqlite,
             &db.path,
             ReclamationOptions {
                 budget: Budget {
@@ -206,10 +209,18 @@ impl From<Budget> for ReclamationOptions {
 }
 
 async fn reclaim(
+    sqlite: &SqliteConfig,
     path: &Path,
     options: impl Into<ReclamationOptions>,
     shutdown: &watch::Receiver<()>,
 ) -> anyhow::Result<ReclamationPass> {
+    // do not perform autovacuum and cleanup on NFS as it creates a lot of load and contention on IO
+    if sqlite.is_nfs().await? {
+        return Ok(ReclamationPass {
+            pages: 0,
+            outcome: PassOutcome::Idle,
+        });
+    }
     if !tokio::fs::try_exists(path).await? {
         return Ok(ReclamationPass {
             pages: 0,
@@ -291,15 +302,16 @@ async fn reclaim_pages(
                         .is_none_or(|deadline| Instant::now() < deadline)
             });
 
-        let (mode, page_size, pages, free): (i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT auto_vacuum, page_size, page_count, freelist_count \
-         FROM pragma_auto_vacuum, pragma_page_size, pragma_page_count, pragma_freelist_count",
+        let (journal, mode, page_size, pages, free): (String, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT journal_mode, auto_vacuum, page_size, page_count, freelist_count \
+         FROM pragma_journal_mode, pragma_auto_vacuum, pragma_page_size, pragma_page_count, pragma_freelist_count",
         )
         .fetch_one(&mut *connection)
         .await?;
 
+        // This worker's checkpoint and contention rules apply only to WAL mode.
         // Require incremental auto-vacuum and at least 64 MiB and 25% free space.
-        if mode != 2 || free * page_size < MIN_FREE_BYTES || free < pages / 4 {
+        if journal != "wal" || mode != 2 || free * page_size < MIN_FREE_BYTES || free < pages / 4 {
             outcome = PassOutcome::Idle;
             return Ok(());
         }

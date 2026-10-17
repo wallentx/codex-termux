@@ -87,6 +87,31 @@ fn recovery_keeps_unselected_text_after_a_held_replace_key() {
 }
 
 #[test]
+fn backspace_deletes_a_body_selection_before_an_absorbed_prefix() {
+    for prefix in ["!", "/"] {
+        let (mut composer, _rx) = new_test_composer();
+        composer.insert_str(&format!("{prefix}review text"));
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 4,
+        );
+        composer.render(area, &mut Buffer::empty(area));
+        let (x, y) = composer.cursor_pos(area).unwrap();
+        for (kind, column) in [
+            (Down(Left), x),
+            (MouseEventKind::Drag(Left), x - "review text".len() as u16),
+            (Up(Left), x - "review text".len() as u16),
+        ] {
+            mouse(&mut composer, area, kind, column, y);
+        }
+
+        composer.handle_key_event(KeyCode::Backspace.into());
+
+        assert_eq!(composer.current_text(), prefix);
+        assert_eq!(composer.draft.textarea.mouse_selection_range(), None);
+    }
+}
+
+#[test]
 fn selected_text_navigation_does_not_recall_history_or_select_images() {
     for (key, remote) in [
         (KeyCode::Up, false),
@@ -213,4 +238,101 @@ fn right_click_copy_uses_the_refreshed_editor_bounds() {
         composer.clipboard_paste_target(Some(KeyCode::Insert)),
         paste_target
     );
+}
+
+#[test]
+fn selection_release_copies_and_keeps_the_editable_selection() {
+    let (mut composer, _rx) = new_test_composer();
+    composer.insert_str("hello world");
+    let area = Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 40, /*height*/ 4,
+    );
+    composer.render(area, &mut Buffer::empty(area));
+    let (x, y) = composer.cursor_pos(area).unwrap();
+    let release = MouseEvent {
+        kind: Up(Left),
+        column: x - 6,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    };
+    for (kind, column) in [
+        (Down(Left), x - 11),
+        (MouseEventKind::Drag(Left), x - 6),
+        (Up(Left), x - 6),
+    ] {
+        mouse(&mut composer, area, kind, column, y);
+    }
+
+    let selection_copy = crate::tui::SelectionCopy::on_select(
+        /*clipboard*/ true, /*primary*/ true, /*clear_selection*/ false,
+    );
+    let owner = std::sync::Arc::new(());
+    let retained = std::sync::Arc::downgrade(&owner);
+    assert_eq!(
+        composer.copy_selection_on_release(release, selection_copy, |text, policy| {
+            assert_eq!((text, policy), ("hello", selection_copy));
+            (Ok(CopyStatus::Confirmed), Some(owner))
+        }),
+        Some((5, Some(Ok(CopyStatus::Confirmed))))
+    );
+
+    let mut buffer = Buffer::empty(area);
+    composer.render(area, &mut buffer);
+    let highlight = (x - 11..x)
+        .map(|column| {
+            buffer[(column, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        highlight,
+        vec![
+            true, true, true, true, true, false, false, false, false, false, false
+        ]
+    );
+    assert!(retained.upgrade().is_some());
+
+    composer.insert_str("X");
+    assert_eq!(composer.current_text(), "X world");
+    assert!(retained.upgrade().is_none());
+}
+
+#[test]
+fn selection_release_reports_only_clipboard_result() {
+    for (clipboard, expected) in [(true, Some(Ok(CopyStatus::Pending(7)))), (false, None)] {
+        let (mut composer, _rx) = new_test_composer();
+        composer.insert_str("hello world");
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 40, /*height*/ 4,
+        );
+        composer.render(area, &mut Buffer::empty(area));
+        let (x, y) = composer.cursor_pos(area).unwrap();
+        let release = MouseEvent {
+            kind: Up(Left),
+            column: x - 6,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        for (kind, column) in [
+            (Down(Left), x - 11),
+            (MouseEventKind::Drag(Left), x - 6),
+            (Up(Left), x - 6),
+        ] {
+            mouse(&mut composer, area, kind, column, y);
+        }
+        let selection = composer.draft.textarea.mouse_selection_range();
+        let policy = crate::tui::SelectionCopy::on_select(
+            clipboard, /*primary*/ true, /*clear_selection*/ false,
+        );
+        assert_eq!(
+            composer.copy_selection_on_release(release, policy, |text, actual| {
+                assert_eq!((text, actual), ("hello", policy));
+                (Ok(CopyStatus::Pending(7)), Some(std::sync::Arc::new(())))
+            }),
+            Some((5, expected))
+        );
+        composer.finish_copy(&(7, Ok(CopyStatus::Confirmed)), /*current*/ true);
+        assert_eq!(composer.draft.textarea.mouse_selection_range(), selection);
+    }
 }

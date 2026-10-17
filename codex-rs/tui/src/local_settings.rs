@@ -84,6 +84,7 @@ impl LocalSettings {
                 agents_overview_grouping: config.tui_agents_overview_grouping,
                 resume_cwd: config.tui_resume_cwd,
                 keymap: config.tui_keymap.clone(),
+                quick_dials: config.tui_quick_dials.clone(),
                 model_availability_nux: config.model_availability_nux.clone(),
                 terminal_resize_reflow_max_rows: match config.terminal_resize_reflow.max_rows {
                     TerminalResizeReflowMaxRows::Auto => None,

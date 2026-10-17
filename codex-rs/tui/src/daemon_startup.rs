@@ -132,11 +132,12 @@ fn allowed_feature(name: &str) -> bool {
     matches!(
         name,
         // Client gates and per-thread settings already forwarded in thread requests.
-        "daemon_auto_start" | "worktrees" | "transcript_v2" | "realtime_conversation" | "standalone_web_search"
+        "daemon_auto_start" | "transcript_v2" | "standalone_web_search"
         // Shared services and threadless MCP operations need daemon compatibility checks.
         | "api_key_model_discovery" | "code_mode_host" | "auth_elicitation"
         | "mcp_oauth_refresh_coordination"
         // Removed flags still passed by older launch scripts.
+        | "worktrees" | "realtime_conversation"
         | "remote_models" | "request_rule" | "responses_websockets_v2"
         | "workspace_owner_usage_nudge" | "tool_search_always_defer_mcp_tools"
         | "remote_compaction_v2" | "multi_agent_mode"

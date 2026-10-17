@@ -165,47 +165,11 @@ impl HooksBrowserView {
             .and_then(|idx| self.entry.hooks.get(idx))
     }
 
-    fn move_up(&mut self) {
-        let len = self.page_len();
-        self.state.move_up_wrap(len);
-        self.state.ensure_visible(len, self.max_visible_rows());
-    }
-
-    fn move_down(&mut self) {
-        let len = self.page_len();
-        self.state.move_down_wrap(len);
-        self.state.ensure_visible(len, self.max_visible_rows());
-    }
-
-    fn page_up(&mut self) {
-        let len = self.page_len();
-        self.state.page_up_clamped(len, self.max_visible_rows());
-    }
-
-    fn page_down(&mut self) {
-        let len = self.page_len();
-        self.state.page_down_clamped(len, self.max_visible_rows());
-    }
-
-    fn jump_top(&mut self) {
-        let len = self.page_len();
-        self.state.jump_top(len, self.max_visible_rows());
-    }
-
-    fn jump_bottom(&mut self) {
-        let len = self.page_len();
-        self.state.jump_bottom(len, self.max_visible_rows());
-    }
-
     fn page_len(&self) -> usize {
         match self.page {
             HooksBrowserPage::Events => codex_protocol::protocol::HookEventName::iter().count(),
             HooksBrowserPage::Handlers(event_name) => self.handlers_for_event(event_name).count(),
         }
-    }
-
-    fn max_visible_rows(&self) -> usize {
-        MAX_POPUP_ROWS.min(self.page_len().max(1))
     }
 
     fn open_selected_event(&mut self) {
@@ -613,13 +577,14 @@ impl BottomPaneView for HooksBrowserView {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if let Some(action) = self.keymap.vertical_action_for(key_event) {
+            let len = self.page_len();
+            self.state
+                .apply_vertical_action(action, len, MAX_POPUP_ROWS.min(len.max(1)));
+            return;
+        }
+
         match key_event {
-            _ if self.keymap.move_up.is_pressed(key_event) => self.move_up(),
-            _ if self.keymap.move_down.is_pressed(key_event) => self.move_down(),
-            _ if self.keymap.page_up.is_pressed(key_event) => self.page_up(),
-            _ if self.keymap.page_down.is_pressed(key_event) => self.page_down(),
-            _ if self.keymap.jump_top.is_pressed(key_event) => self.jump_top(),
-            _ if self.keymap.jump_bottom.is_pressed(key_event) => self.jump_bottom(),
             _ if self.keymap.accept.is_pressed(key_event)
                 && self.page == HooksBrowserPage::Events =>
             {

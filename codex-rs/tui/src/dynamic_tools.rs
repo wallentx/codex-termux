@@ -13,6 +13,7 @@ use codex_app_server_protocol::DynamicToolFunctionSpec;
 use codex_app_server_protocol::DynamicToolNamespaceSpec;
 use codex_app_server_protocol::DynamicToolNamespaceTool;
 use codex_app_server_protocol::DynamicToolSpec;
+use codex_app_server_protocol::GeneratedImageRef;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::ImageReference;
@@ -1550,7 +1551,14 @@ fn turn_summary(turn: &Turn, include_outputs: bool, output_chars: usize) -> Valu
                     "savedPath": item.saved_path
                 });
                 if include_outputs {
-                    image["result"] = output_summary(&item.result, output_chars);
+                    match &item.image {
+                        GeneratedImageRef::Inline { result } => {
+                            image["result"] = output_summary(result, output_chars);
+                        }
+                        GeneratedImageRef::File { file_id } => {
+                            image["fileId"] = Value::String(file_id.clone());
+                        }
+                    }
                 }
                 image
             }

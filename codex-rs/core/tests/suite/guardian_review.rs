@@ -66,6 +66,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_failed;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::skip_if_no_network;
@@ -500,10 +501,14 @@ for (const phase of ["before", "after"]) {
     Ok(())
 }
 
-#[test_case(false; "without parent checkpoint")]
-#[test_case(true; "reuse parent checkpoint and newer authorization")]
+#[test_case(false, &[]; "without parent checkpoint")]
+#[test_case(true, &[]; "reuse parent checkpoint and newer authorization")]
+#[test_case(false, &["rate_limit_exceeded", "rate_limit_exceeded"]; "failed compaction preserves pending evidence")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_review_recovers_after_compaction(with_parent_checkpoint: bool) -> Result<()> {
+async fn guardian_review_recovers_after_compaction(
+    with_parent_checkpoint: bool,
+    compaction_errors: &[&str],
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
         Ok(()),
@@ -571,13 +576,15 @@ async fn guardian_review_recovers_after_compaction(with_parent_checkpoint: bool)
         "cmd": "true",
         "sandbox_permissions": "require_escalated",
         "justification": "Read the internal samples the user authorized.",
-    })
-    .to_string();
+    });
+    let mut first_command = command.clone();
+    first_command["cmd"] = json!("printf POST_REVIEW_DIAGNOSTIC");
+    let command = command.to_string();
     let approval = r#"{"risk_level":"low","user_authorization":"high","outcome":"allow"}"#;
     let mut response_events = vec![
         sse(vec![
             ev_response_created("resp-parent-first"),
-            ev_function_call("exec-first", "exec_command", &command),
+            ev_function_call("exec-first", "exec_command", &first_command.to_string()),
             ev_completed("resp-parent-first"),
         ]),
         sse(vec![
@@ -592,6 +599,13 @@ async fn guardian_review_recovers_after_compaction(with_parent_checkpoint: bool)
         ]),
     ];
     if !with_parent_checkpoint {
+        for error in compaction_errors {
+            response_events.push(sse_failed(
+                "failed-review-compaction",
+                error,
+                "temporary compaction failure before input admission",
+            ));
+        }
         response_events.push(sse(vec![
             json!({
                 "type": "response.output_item.done",
@@ -660,7 +674,10 @@ async fn guardian_review_recovers_after_compaction(with_parent_checkpoint: bool)
         .iter()
         .filter(|request| !request.inputs_of_type("compaction_trigger").is_empty())
         .collect::<Vec<_>>();
-    assert_eq!(compact_requests.len(), usize::from(!with_parent_checkpoint));
+    assert_eq!(
+        compact_requests.len(),
+        usize::from(!with_parent_checkpoint) + compaction_errors.len(),
+    );
     if let Some(compact_request) = compact_requests.first() {
         assert!(
             compact_request
@@ -690,6 +707,10 @@ async fn guardian_review_recovers_after_compaction(with_parent_checkpoint: bool)
         .pop()
         .expect("second review")
         .join("");
+    assert!(
+        latest_review.contains("POST_REVIEW_DIAGNOSTIC"),
+        "recovery must retain evidence not yet admitted to the reviewer"
+    );
     if with_parent_checkpoint {
         assert!(latest_review.contains(">>> TRANSCRIPT START\n"));
         assert!(

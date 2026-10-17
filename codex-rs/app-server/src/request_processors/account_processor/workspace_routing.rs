@@ -6,6 +6,8 @@
 use super::*;
 use codex_app_server_protocol::AccountRoutingOverride;
 use codex_backend_client::AccountEntry;
+use codex_config::ConfigLoadError;
+use codex_http_client::NetworkPolicyDenied;
 use codex_login::WorkspaceRouting;
 use codex_login::WorkspaceRoutingRequest;
 use codex_login::WorkspaceRoutingResolver;
@@ -54,11 +56,12 @@ pub(super) enum AccountReadError {
     Routing(#[from] WorkspaceRoutingError),
 }
 
-/// Routing failure categories carry no account, URL, or backend data.
+/// Routing failures carry no account, URL, or backend data. Config failures retain
+/// only a location or structured error category, never the raw config error.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(super) enum WorkspaceRoutingError {
-    #[error("failed to load workspace requirements")]
-    RequirementsLoad,
+    #[error("failed to load workspace requirements: {0}")]
+    RequirementsLoad(String),
     #[error("workspace routing requires a ChatGPT account id")]
     MissingAccountId,
     #[error("workspace routing discovery cancelled")]
@@ -73,8 +76,8 @@ pub(super) enum WorkspaceRoutingError {
     MissingWorkspace,
     #[error("duplicate workspace in routing discovery")]
     DuplicateWorkspace,
-    #[error("failed to reload workspace requirements")]
-    RequirementsReload,
+    #[error("failed to reload workspace requirements: {0}")]
+    RequirementsReload(String),
     #[error("configuration changed during workspace routing discovery; retry account/read")]
     ConfigurationChanged,
     #[error("invalid model provider URL")]
@@ -101,6 +104,77 @@ pub(super) enum WorkspaceRoutingError {
     InvalidBackendUrl,
     #[error("workspace backend must use an HTTPS origin without credentials")]
     InvalidBackendOrigin,
+}
+
+fn workspace_config_load_reason(error: &io::Error) -> String {
+    // Parser messages and cloud bundle errors can quote secrets, even without
+    // their source snippets. Retain only structured diagnostics before these
+    // errors reach JSON-RPC clients, login notifications, or tracing.
+    let mut current = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(source) = current {
+        if let Some(config) = source.downcast_ref::<ConfigLoadError>() {
+            let config = config.config_error();
+            let start = config.range.start;
+            // Non-file diagnostics store a display name, which can contain
+            // backend-supplied policy names and IDs, in this field.
+            if !config.path.is_absolute() {
+                return format!(
+                    "invalid non-file configuration at line {}, column {}",
+                    start.line, start.column
+                );
+            }
+            return format!(
+                "invalid configuration at {}:{}:{}",
+                config.path.display(),
+                start.line,
+                start.column
+            );
+        }
+        if let Some(cloud) = source.downcast_ref::<CloudConfigBundleLoadError>() {
+            let reason = match cloud.code() {
+                CloudConfigBundleLoadErrorCode::Timeout => "request timed out",
+                CloudConfigBundleLoadErrorCode::Auth
+                | CloudConfigBundleLoadErrorCode::RequestFailed => {
+                    // Cloud loading currently erases the typed denial. Match
+                    // only known safe policy messages, never forward raw text.
+                    let message = cloud.to_string();
+                    if let Some(policy) = [
+                        NetworkPolicyDenied::Unavailable,
+                        NetworkPolicyDenied::Destination,
+                        NetworkPolicyDenied::Revoked,
+                        NetworkPolicyDenied::UnsupportedTransport,
+                    ]
+                    .into_iter()
+                    .find(|policy| policy.to_string() == message)
+                    {
+                        return policy.to_string();
+                    }
+                    if cloud.code() == CloudConfigBundleLoadErrorCode::Auth {
+                        "authentication failed"
+                    } else {
+                        "request failed"
+                    }
+                }
+                CloudConfigBundleLoadErrorCode::InvalidBundle => "invalid bundle",
+                CloudConfigBundleLoadErrorCode::Internal => "internal error",
+            };
+            return match cloud.status_code() {
+                Some(status) => format!("cloud config: {reason} (HTTP {status})"),
+                None => format!("cloud config: {reason}"),
+            };
+        }
+        if let Some(policy) = source.downcast_ref::<NetworkPolicyDenied>() {
+            return policy.to_string();
+        }
+        current = source.source();
+    }
+    // Use the OS error or kind, never an untyped error's potentially secret message.
+    match error.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code).to_string(),
+        None => error.kind().to_string(),
+    }
 }
 
 impl WorkspaceRoutingResolver for AccountRequestProcessor {
@@ -237,7 +311,12 @@ impl AccountRequestProcessor {
                 {
                     self.config.as_ref().clone()
                 }
-                Err(_) => return Err(WorkspaceRoutingError::RequirementsLoad.into()),
+                Err(error) => {
+                    return Err(WorkspaceRoutingError::RequirementsLoad(
+                        workspace_config_load_reason(&error),
+                    )
+                    .into());
+                }
             };
             let auth = self.auth_manager.auth_cached();
             let provider = create_model_provider(
@@ -353,9 +432,11 @@ impl AccountRequestProcessor {
                     if accounts.next().is_some() {
                         return Err(WorkspaceRoutingError::DuplicateWorkspace.into());
                     }
-                    let latest_config = load_config()
-                        .await
-                        .map_err(|_| WorkspaceRoutingError::RequirementsReload)?;
+                    let latest_config = load_config().await.map_err(|error| {
+                        WorkspaceRoutingError::RequirementsReload(workspace_config_load_reason(
+                            &error,
+                        ))
+                    })?;
                     if latest_config.chatgpt_base_url != config.chatgpt_base_url
                         || latest_config.model_provider != config.model_provider
                         || latest_config

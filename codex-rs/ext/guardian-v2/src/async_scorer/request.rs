@@ -9,8 +9,7 @@ use codex_guardian_context::estimate_input_tokens;
 use codex_guardian_reviewer::ConversationCheckpoint;
 use codex_guardian_reviewer::ConversationState;
 use codex_history::ResponseItemEnvelope;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseItem;
+use std::borrow::Cow;
 
 use super::sampler::LunaSampler;
 use super::sampler::LunaSamplingRequest;
@@ -41,16 +40,9 @@ impl LunaSamplingRequest {
             .unwrap_or_default();
         let (mut context, _) = evidence.clone().compose(cursor, history).ok()?;
         context.retain_new_instructions(history);
-        if let Some(snapshot) = conversation.snapshot() {
-            context.retain_images(|image, _| {
-                !snapshot.history().iter().any(|item| match &item.item {
-                    ResponseItem::Message { content, .. } => content.iter().any(|item| {
-                        matches!(item, ContentItem::InputImage { image: retained, .. } if retained == image)
-                    }),
-                    _ => false,
-                })
-            });
-        }
+        context.retain_new_images(history.iter().map(|item| &item.item), |image, _| {
+            Some(Cow::Borrowed(image))
+        });
         let truncations = std::mem::take(&mut context.truncations);
         let section_costs = context.section_costs().collect();
         let history = conversation.snapshot().map(ConversationCheckpoint::history);

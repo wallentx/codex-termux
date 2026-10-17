@@ -831,7 +831,7 @@ fn arbitrary_commands_preserve_a_never_used_fresh_opportunity() {
             pane.select_sparkle_model("gpt-6-astra", &enabled());
             assert!(!dots(&draw(&pane.composer, /*width*/ 80, now).0).is_empty());
         }
-        for input in ["hello", "/model extra", "/other", "漢", "/tmp/file"] {
+        for input in ["hello", "/status extra", "/other", "漢", "/tmp/file"] {
             let mut pane = pane();
             pane.mark_fresh_task_for_sparkle("gpt-5.5", &enabled());
             type_text(&mut pane, input);

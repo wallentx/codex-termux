@@ -2,13 +2,16 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use codex_app_server_protocol::build_turns_from_rollout_items;
 use codex_extension_items::ExtensionItem;
+use codex_extension_items::image_generation::GeneratedImageRef;
 use codex_extension_items::image_generation::ImageGenerationFailure;
+use codex_extension_items::image_generation::ImageGenerationInputImage;
 use codex_extension_items::image_generation::ImageGenerationItem;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
@@ -48,18 +51,20 @@ use codex_rollout::RetainedContextEvent;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
 
 use super::LocalThreadStore;
+use super::MigrationLocks;
 use super::RolloutMigrationFailureReason;
 use super::RolloutMigrationMode;
 use super::RolloutMigrationOptions;
 use super::RolloutMigrationPaths;
 use super::RolloutMigrationProgress;
 use super::RolloutMigrationStatus;
-#[cfg(unix)]
+use super::compress_rollout_to_path;
 use super::decompress_rollout_to_path;
 use super::migration_journal_path;
 use super::telemetry::RolloutMigrationTrigger;
@@ -530,13 +535,16 @@ async fn migration_preserves_image_generation_failure_metadata() {
         id: "image-call".to_string(),
         status: "failed".to_string(),
         revised_prompt: Some("paint a blue whale".to_string()),
-        result: String::new(),
+        image: GeneratedImageRef::Inline {
+            result: String::new(),
+        },
         transparent_background: None,
         failure: Some(ImageGenerationFailure::UsageLimitExceeded {
             limit_id: "image_gen".to_string(),
             resets_at: Some(1_786_150_800),
         }),
         saved_path: None,
+        input_images: Vec::new(),
         imagegen_request_id: None,
         generation_id: None,
     };
@@ -545,10 +553,74 @@ async fn migration_preserves_image_generation_failure_metadata() {
             call_id: expected_item.id.clone(),
             status: expected_item.status.clone(),
             revised_prompt: expected_item.revised_prompt.clone(),
-            result: expected_item.result.clone(),
+            image: expected_item.image.clone(),
             transparent_background: expected_item.transparent_background,
             failure: expected_item.failure.clone(),
             saved_path: expected_item.saved_path.clone(),
+            input_images: Vec::new(),
+        }));
+    let path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![
+            started("image-turn"),
+            image_completion,
+            completed("image-turn"),
+        ],
+    );
+    let store = indexed_store(home.path()).await;
+
+    store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("migrate legacy image completion");
+
+    let migrated_item = read_rollout(&path)
+        .into_iter()
+        .find_map(|line| match line.item {
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => Some(event.item),
+            _ => None,
+        })
+        .expect("migrated image completion");
+    let TurnItem::Extension(ExtensionItem::ImageGeneration(migrated_item)) = migrated_item else {
+        panic!("expected migrated extension image-generation item");
+    };
+    assert_eq!(migrated_item, expected_item);
+}
+
+#[tokio::test]
+async fn migration_preserves_image_generation_input_observations() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let expected_item = ImageGenerationItem {
+        id: "image-call".to_string(),
+        status: "completed".to_string(),
+        revised_prompt: Some("paint a blue whale".to_string()),
+        image: GeneratedImageRef::Inline {
+            result: "cG5n".to_string(),
+        },
+        transparent_background: None,
+        failure: None,
+        saved_path: None,
+        input_images: vec![ImageGenerationInputImage {
+            path: AbsolutePathBuf::from_absolute_path(home.path().join("reference.png"))
+                .expect("absolute input path"),
+            sha256: "ab".repeat(32),
+        }],
+        imagegen_request_id: None,
+        generation_id: None,
+    };
+    let image_completion =
+        RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+            call_id: expected_item.id.clone(),
+            status: expected_item.status.clone(),
+            revised_prompt: expected_item.revised_prompt.clone(),
+            image: expected_item.image.clone(),
+            transparent_background: expected_item.transparent_background,
+            failure: expected_item.failure.clone(),
+            saved_path: expected_item.saved_path.clone(),
+            input_images: expected_item.input_images.clone(),
         }));
     let path = write_rollout(
         home.path(),
@@ -2672,31 +2744,116 @@ async fn migration_repairs_a_missing_paginated_name_when_rerun() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn decompression_temporaries_are_owner_only() {
-    let home = TempDir::new().expect("create Codex home");
-    let thread_id = ThreadId::new();
-    let compressed_path = compress_rollout(&write_rollout(
-        home.path(),
-        thread_id,
-        SessionSource::Cli,
-        vec![user_message("compressed question")],
-    ));
-    let plain_path = home.path().join("decompressed.tmp");
+#[test]
+fn cancelled_compression_workers_hold_migration_locks() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        for compress in [true, false] {
+            let home = TempDir::new().expect("create Codex home");
+            let thread_id = ThreadId::new();
+            let plain_path = home.path().join("rollout.jsonl");
+            let compressed_path = home.path().join("rollout.jsonl.zst");
+            let contents = b"rollout contents\n";
+            fs::write(&plain_path, contents).expect("write plain rollout");
+            if !compress {
+                compress_rollout(&plain_path);
+            }
+            let source_path = if compress {
+                &plain_path
+            } else {
+                &compressed_path
+            };
+            let permissions = fs::metadata(source_path)
+                .expect("source metadata")
+                .permissions();
+            let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+            let locks = Arc::new(MigrationLocks {
+                _maintenance: Some(Arc::new(
+                    codex_rollout::try_acquire_rollout_maintenance_lock(home.path())
+                        .expect("acquire maintenance lock")
+                        .expect("maintenance lock is available"),
+                )),
+                _writer: store
+                    .acquire_writer_lock(thread_id)
+                    .expect("acquire writer lock"),
+                _live_writer: store.live_writer_locks.lock(thread_id).await,
+            });
+            let coordination = store.live_writer_locks.coordination(thread_id).await;
 
-    decompress_rollout_to_path(&compressed_path, &plain_path)
-        .await
-        .expect("decompress rollout");
+            // Hold the only blocking thread so the real file worker stays queued across cancellation.
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = reached_tx.send(());
+                // Dropping the sender after a failed assertion also lets runtime teardown finish.
+                let _ = resume_rx.recv();
+            });
+            reached_rx.await.expect("blocking thread occupied");
+            let mut work = Box::pin(async {
+                if compress {
+                    compress_rollout_to_path(
+                        &plain_path,
+                        &compressed_path,
+                        permissions,
+                        /*modified_at*/ None,
+                        &locks,
+                    )
+                    .await
+                } else {
+                    decompress_rollout_to_path(&compressed_path, &plain_path, &locks).await
+                }
+            });
+            assert!(futures::poll!(&mut work).is_pending());
+            drop(work);
+            drop(locks);
 
-    assert_eq!(
-        fs::metadata(&plain_path)
-            .expect("read temporary metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
+            assert!(
+                codex_rollout::try_acquire_rollout_maintenance_lock(home.path())
+                    .expect("probe maintenance lock")
+                    .is_none()
+            );
+            assert!(matches!(
+                store.acquire_writer_lock(thread_id),
+                Err(ThreadStoreError::Conflict { .. })
+            ));
+            assert!(coordination.writer.try_lock().is_err());
+
+            drop(resume_tx);
+            blocker.await.expect("release blocking thread");
+            // This guard is released last, after the worker's file I/O and other locks.
+            let _live_writer_guard = coordination.writer.lock().await;
+            assert!(
+                codex_rollout::try_acquire_rollout_maintenance_lock(home.path())
+                    .expect("probe released maintenance lock")
+                    .is_some()
+            );
+            store
+                .acquire_writer_lock(thread_id)
+                .expect("writer lock released");
+            let decoded = if compress {
+                zstd::stream::decode_all(
+                    fs::File::open(&compressed_path).expect("open compressed rollout"),
+                )
+                .expect("decode complete rollout")
+            } else {
+                #[cfg(unix)]
+                assert_eq!(
+                    fs::metadata(&plain_path)
+                        .expect("temporary metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                fs::read(&plain_path).expect("read decompressed rollout")
+            };
+            assert_eq!(decoded, contents);
+        }
+    });
 }
 
 #[tokio::test]

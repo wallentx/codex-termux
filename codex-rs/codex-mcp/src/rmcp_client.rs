@@ -128,7 +128,7 @@ pub(crate) struct ManagedClient {
 }
 
 impl ManagedClient {
-    pub(crate) async fn listed_tools(&self) -> Vec<ToolInfo> {
+    pub(crate) async fn listed_catalog(&self) -> (Vec<ToolInfo>, Option<Arc<serde_json::Value>>) {
         let total_start = Instant::now();
         self.tool_catalog
             .read(|catalog| {
@@ -137,17 +137,17 @@ impl ManagedClient {
                 if catalog.revision == 0
                     && let Some(cache_context) = &self.codex_apps_tools_cache_context
                 {
-                    let tools = cache_context.current_tools();
+                    let tools = cache_context.current_catalog_snapshot();
                     emit_duration(
                         MCP_TOOLS_LIST_DURATION_METRIC,
                         total_start.elapsed(),
                         &[("cache", if tools.is_some() { "hit" } else { "miss" })],
                     );
                     if let Some(tools) = tools {
-                        return tools;
+                        return (tools.tools().to_vec(), tools.shared_tool_list_meta());
                     }
                 }
-                catalog.tools.to_vec()
+                (catalog.tools.to_vec(), catalog.meta)
             })
             .await
     }
@@ -598,10 +598,6 @@ impl AsyncManagedClient {
                 .is_some_and(McpToolCatalogCacheContext::has_tools)
     }
 
-    pub(crate) fn cached_tools(&self) -> Option<Vec<ToolInfo>> {
-        self.cached_tools_or(/*fallback*/ None)
-    }
-
     pub(crate) fn cached_tools_or(&self, fallback: Option<Vec<ToolInfo>>) -> Option<Vec<ToolInfo>> {
         self.codex_apps_tools_cache_context
             .as_ref()
@@ -613,16 +609,34 @@ impl AsyncManagedClient {
             })
     }
 
-    pub(crate) async fn listed_tools(&self) -> Result<Vec<ToolInfo>, StartupOutcomeError> {
-        // Plugin provenance is resolved per-session rather than stored in shared cache payloads.
+    pub(crate) fn cached_catalog(&self) -> Option<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>)> {
+        self.codex_apps_tools_cache_context
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .current_catalog_snapshot()
+                    .map(|snapshot| (snapshot.tools().to_vec(), snapshot.shared_tool_list_meta()))
+                    // Older caches still supply tools without discovery-scoped metadata.
+                    .or_else(|| context.current_tools().map(|tools| (tools, None)))
+            })
+            .or_else(|| {
+                self.tool_catalog_cache_context
+                    .as_ref()
+                    .and_then(|cache| cache.current_catalog_or(/*fallback*/ None))
+            })
+    }
+
+    pub(crate) async fn listed_catalog(
+        &self,
+    ) -> Result<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>), StartupOutcomeError> {
         if !self.startup_complete.load(Ordering::Acquire)
-            && let Some(startup_tools) = self.cached_tools()
+            && let Some(catalog) = self.cached_catalog()
         {
-            Ok(startup_tools)
+            Ok(catalog)
         } else {
             match self.client().await {
-                Ok(client) => Ok(client.listed_tools().await),
-                Err(error) if self.is_codex_apps_mcp_server => self.cached_tools().ok_or(error),
+                Ok(client) => Ok(client.listed_catalog().await),
+                Err(error) if self.is_codex_apps_mcp_server => self.cached_catalog().ok_or(error),
                 Err(error) => Err(error),
             }
         }
@@ -673,14 +687,23 @@ pub(crate) async fn list_tools_for_client_uncached(
     timeout: Option<Duration>,
     catalog_item_limit: usize,
     server_instructions: Option<&str>,
-) -> Result<Vec<ToolInfo>> {
+) -> Result<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>)> {
+    let meta = StdMutex::new(None);
     let fetch_start = Instant::now();
     let tools = collect_paginated_with_limit("tools/list", timeout, catalog_item_limit, |params| {
         let client = Arc::clone(client);
+        let meta = &meta;
+        let first_page = params.as_ref().is_none_or(|params| params.cursor.is_none());
         async move {
             let response = client
                 .list_tools_with_connector_ids(params, timeout)
                 .await?;
+            if first_page {
+                *meta
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    response.meta.map(Arc::new);
+            }
             Ok((response.tools, response.next_cursor))
         }
     })
@@ -708,7 +731,10 @@ pub(crate) async fn list_tools_for_client_uncached(
             &[],
         );
     }
-    Ok(tools)
+    let meta = meta
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok((tools, meta))
 }
 
 /// Filters disabled connectors, presents declared Codex Apps file parameters to the model as
@@ -1023,7 +1049,7 @@ async fn start_server_task(
     let fetch_ticket = codex_apps_tools_cache_context
         .as_ref()
         .map(|context| context.begin_fetch(ConnectorRuntimeFetchSource::Startup));
-    let tools = list_tools_for_client_uncached(
+    let (tools, meta) = list_tools_for_client_uncached(
         &server_name,
         is_codex_apps_mcp_server,
         /*codex_apps_refresh_trigger*/ "initial",
@@ -1037,20 +1063,30 @@ async fn start_server_task(
     let client_tools: Arc<[ToolInfo]> =
         match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
             (Some(context), Some(ticket)) if server_disables_tool_catalog_cache => {
-                context.publish_runtime_if_newest_accepted(ticket, &server_info, tools.clone());
+                context.publish_runtime_if_newest_accepted(
+                    ticket,
+                    &server_info,
+                    tools.clone(),
+                    meta.clone(),
+                );
                 tools.into()
             }
             (Some(context), Some(ticket)) => context
-                .publish_runtime_if_newest_accepted(ticket, &server_info, tools)
+                .publish_runtime_if_newest_accepted(ticket, &server_info, tools, meta.clone())
                 .shared_tools(),
             (None, None) => tools.into(),
             _ => unreachable!("Codex Apps fetch ticket requires cache context"),
         };
-    if let (Some(cache_context), Some(fetch_ticket)) = (
+    if let (Some(cache_context), Some(mut fetch_ticket)) = (
         tool_catalog_cache_context.as_ref(),
         tool_catalog_fetch_ticket,
     ) {
-        cache_context.publish_if_newest(fetch_ticket, &client_tools);
+        if cache_context.track_tool_list_changes {
+            // A notification makes this session's startup catalog ineligible for reuse.
+            // Discovery can be session-specific, so do not cache later live catalogs.
+            fetch_ticket.tool_list_revision = Some(client.tool_list_revision());
+        }
+        cache_context.publish_if_newest(fetch_ticket, &client_tools, meta.clone());
     }
     if is_codex_apps_mcp_server || tool_catalog_cache_context.is_some() {
         emit_duration(
@@ -1065,6 +1101,7 @@ async fn start_server_task(
         server_info,
         tool_catalog: Arc::new(ClientToolCatalog::new(
             client_tools,
+            meta,
             codex_apps_tools_cache_context
                 .as_ref()
                 .and_then(ConnectorRuntimeContext::subscribe),

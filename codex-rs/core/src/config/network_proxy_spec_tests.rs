@@ -104,7 +104,9 @@ async fn attachment_socket_grants_respect_configured_restrictions_at_remote_laun
             Some(composed.environment_policy()),
             /*fallback_policy_decider*/ None,
         )?;
-        let launch = scoped.remote_launch_config(DefaultFalse).await?;
+        let launch = scoped
+            .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
+            .await?;
         assert_eq!(
             launch.proxy.dangerously_allow_all_unix_sockets, expected,
             "{name}"
@@ -120,7 +122,7 @@ async fn attachment_socket_grants_respect_configured_restrictions_at_remote_laun
             // Inheritance must not grant sockets to ordinary controller-only commands.
             assert!(
                 !proxy
-                    .remote_launch_config(DefaultFalse)
+                    .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
                     .await?
                     .proxy
                     .dangerously_allow_all_unix_sockets
@@ -128,7 +130,7 @@ async fn attachment_socket_grants_respect_configured_restrictions_at_remote_laun
             state.add_allowed_domain("granted.example").await?;
             assert!(
                 scoped
-                    .remote_launch_config(DefaultFalse)
+                    .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
                     .await?
                     .proxy
                     .dangerously_allow_all_unix_sockets
@@ -149,7 +151,7 @@ async fn attachment_socket_grants_respect_configured_restrictions_at_remote_laun
                 .await?;
             assert!(
                 !scoped
-                    .remote_launch_config(DefaultFalse)
+                    .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
                     .await?
                     .proxy
                     .dangerously_allow_all_unix_sockets
@@ -890,7 +892,9 @@ async fn environment_local_binding_preserves_explicit_denials_and_inherits_omitt
                     Some(policy),
                     Some(Arc::new(|_request| async { NetworkDecision::Allow })),
                 )?;
-                let launch = scoped.remote_launch_config(local_binding_policy).await;
+                let launch = scoped
+                    .remote_launch_config(local_binding_policy, /*credential_masking*/ false)
+                    .await;
                 assert_eq!(proxy.current_cfg().await?, carrier.config, "{name}");
                 if local_binding_policy == RequireTrue && !expected {
                     assert!(

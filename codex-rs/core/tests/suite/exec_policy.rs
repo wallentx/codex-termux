@@ -514,6 +514,94 @@ async fn unified_exec_disabled_windows_sandbox_rejects_managed_read_only_command
 }
 
 #[tokio::test]
+#[cfg_attr(not(windows), ignore = "requires native Windows PowerShell execution")]
+async fn powershell_independent_literal_commands_preserve_url_launch_checks() -> Result<()> {
+    core_test_support::skip_if_remote!(Ok(()), "requires local Windows PowerShell execution");
+    let shell_path = codex_shell_command::powershell::try_find_powershell_executable_blocking()
+        .ok_or_else(|| anyhow::anyhow!("Windows PowerShell is unavailable"))?
+        .to_path_buf();
+
+    for (script, expected_output) in [
+        (
+            "Write-Output start 'https://example.invalid/diagnostic'",
+            Some("https://example.invalid/diagnostic"),
+        ),
+        (
+            "Start-Process cmd.exe -ArgumentList '/c exit 0' -Wait; Write-Output 'https://example.invalid/diagnostic'",
+            Some("https://example.invalid/diagnostic"),
+        ),
+        ("Start-Process 'https://example.invalid/diagnostic'", None),
+        (
+            "wt.exe cmd.exe /c start https://example.invalid/diagnostic",
+            None,
+        ),
+        (
+            "Write-Output start 'https://example.invalid/diagnostic' | Out-String",
+            None,
+        ),
+        (
+            "$target = 'https://example.invalid/diagnostic'; Start-Process $target",
+            None,
+        ),
+    ] {
+        let server = start_mock_server().await;
+        let user_shell = codex_shell_command::shell_detect::DetectedShell {
+            shell_type: codex_shell_command::shell_detect::ShellType::PowerShell,
+            shell_path: shell_path.clone(),
+        }
+        .into();
+        let mut builder = test_codex()
+            .with_user_shell(user_shell)
+            .with_config(|config| {
+                config
+                    .features
+                    .enable(Feature::UnifiedExec)
+                    .expect("test config should allow feature update");
+            });
+        let test = builder.build_with_auto_env(&server).await?;
+        let call_id = "powershell-policy";
+        let args = json!({ "cmd": script, "login": false, "yield_time_ms": 10_000 });
+        mount_sse_once(
+            &server,
+            sse(vec![
+                ev_response_created("powershell-command"),
+                ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+                ev_completed("powershell-command"),
+            ]),
+        )
+        .await;
+        let results_mock = mount_sse_once(
+            &server,
+            sse(vec![
+                ev_assistant_message("done", "done"),
+                ev_completed("powershell-result"),
+            ]),
+        )
+        .await;
+
+        test.submit_turn("run the PowerShell command").await?;
+        let output = results_mock
+            .single_request()
+            .function_call_output_text(call_id)
+            .expect("shell call should produce a tool response");
+        match expected_output {
+            Some(expected_output) => {
+                assert!(
+                    output.contains("Process exited with code 0"),
+                    "{script}: {output}"
+                );
+                assert!(output.contains(expected_output), "{script}: {output}");
+            }
+            None => assert!(
+                output.contains("rejected: blocked by policy"),
+                "{script}: {output}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn execpolicy_blocks_shell_invocation() -> Result<()> {
     let mut builder = test_codex().with_config(|config| {
         let policy_path = config.codex_home.join("rules").join("policy.rules");

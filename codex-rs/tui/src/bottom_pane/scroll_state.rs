@@ -1,3 +1,5 @@
+use crate::keymap::ListAction;
+
 /// Generic scroll/selection state for a vertical list menu.
 ///
 /// Encapsulates the common behavior of a selectable list that supports:
@@ -22,6 +24,28 @@ impl ScrollState {
         Self {
             selected_idx: None,
             scroll_top: 0,
+        }
+    }
+
+    /// Apply a vertical list action and keep the resulting selection visible.
+    pub fn apply_vertical_action(&mut self, action: ListAction, len: usize, visible_rows: usize) {
+        match action {
+            ListAction::MoveUp => {
+                self.move_up_wrap(len);
+                self.ensure_visible(len, visible_rows);
+            }
+            ListAction::MoveDown => {
+                self.move_down_wrap(len);
+                self.ensure_visible(len, visible_rows);
+            }
+            ListAction::PageUp => self.page_up_clamped(len, visible_rows),
+            ListAction::PageDown => self.page_down_clamped(len, visible_rows),
+            ListAction::JumpTop => self.jump_top(len, visible_rows),
+            ListAction::JumpBottom => self.jump_bottom(len, visible_rows),
+            ListAction::MoveLeft
+            | ListAction::MoveRight
+            | ListAction::Accept
+            | ListAction::Cancel => {}
         }
     }
 
@@ -144,6 +168,7 @@ impl ScrollState {
 #[cfg(test)]
 mod tests {
     use super::ScrollState;
+    use crate::keymap::ListAction;
 
     #[test]
     fn wrap_navigation_and_visibility() {
@@ -156,16 +181,14 @@ mod tests {
         s.ensure_visible(len, vis);
         assert_eq!(s.scroll_top, 0);
 
-        s.move_up_wrap(len);
-        s.ensure_visible(len, vis);
+        s.apply_vertical_action(ListAction::MoveUp, len, vis);
         assert_eq!(s.selected_idx, Some(len - 1));
         match s.selected_idx {
             Some(sel) => assert!(s.scroll_top <= sel),
             None => panic!("expected Some(selected_idx) after wrap"),
         }
 
-        s.move_down_wrap(len);
-        s.ensure_visible(len, vis);
+        s.apply_vertical_action(ListAction::MoveDown, len, vis);
         assert_eq!(s.selected_idx, Some(0));
         assert_eq!(s.scroll_top, 0);
     }
@@ -177,27 +200,27 @@ mod tests {
         let vis = 4;
 
         s.clamp_selection(len);
-        s.page_down_clamped(len, vis);
+        s.apply_vertical_action(ListAction::PageDown, len, vis);
         assert_eq!(s.selected_idx, Some(4));
         assert_eq!(s.scroll_top, 1);
 
-        s.page_down_clamped(len, vis);
+        s.apply_vertical_action(ListAction::PageDown, len, vis);
         assert_eq!(s.selected_idx, Some(8));
         assert_eq!(s.scroll_top, 5);
 
-        s.page_down_clamped(len, vis);
+        s.apply_vertical_action(ListAction::PageDown, len, vis);
         assert_eq!(s.selected_idx, Some(9));
         assert_eq!(s.scroll_top, 6);
 
-        s.page_up_clamped(len, vis);
+        s.apply_vertical_action(ListAction::PageUp, len, vis);
         assert_eq!(s.selected_idx, Some(5));
         assert_eq!(s.scroll_top, 5);
 
-        s.jump_top(len, vis);
+        s.apply_vertical_action(ListAction::JumpTop, len, vis);
         assert_eq!(s.selected_idx, Some(0));
         assert_eq!(s.scroll_top, 0);
 
-        s.jump_bottom(len, vis);
+        s.apply_vertical_action(ListAction::JumpBottom, len, vis);
         assert_eq!(s.selected_idx, Some(9));
         assert_eq!(s.scroll_top, 6);
     }

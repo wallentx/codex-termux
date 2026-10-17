@@ -43,7 +43,6 @@ use super::dispatcher::hook_handler_type_label;
 use super::dispatcher::hook_scope_label;
 use super::dispatcher::hook_source_label;
 use super::dispatcher::scope_for_event;
-use crate::output_spill::AdditionalContext;
 use crate::output_spill::HookOutputSpiller;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
@@ -141,21 +140,17 @@ impl CommandHookRuntime {
             for entry in std::mem::take(&mut hook_result.run.entries) {
                 match entry.kind {
                     HookOutputEntryKind::Context => {
-                        if let Some(text) = runtime
+                        let text = runtime
                             .output_spiller
-                            .maybe_spill_additional_contexts(vec![AdditionalContext {
-                                text: entry.text,
-                                limit: handler.additional_context_limit,
-                            }])
-                            .await
-                            .into_iter()
-                            .next()
-                        {
-                            entries.push(HookOutputEntry {
-                                kind: HookOutputEntryKind::Context,
-                                text,
-                            });
-                        }
+                            .maybe_spill_text_with_limit(
+                                entry.text,
+                                handler.additional_context_limit,
+                            )
+                            .await;
+                        entries.push(HookOutputEntry {
+                            kind: HookOutputEntryKind::Context,
+                            text,
+                        });
                     }
                     HookOutputEntryKind::Warning => warnings.push(entry),
                     HookOutputEntryKind::Error => entries.push(entry),
@@ -221,6 +216,28 @@ pub(crate) async fn run_command(
 ) -> HandlerRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
+    let timeout_started = tokio::time::Instant::now();
+    let duration = Duration::from_secs(handler.timeout_sec);
+    if let Some(trust) = &handler.plugin_trust {
+        let error = match timeout(duration, trust.verify()).await {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(err.to_string()),
+            Err(_) => Some(format!("hook timed out after {}s", handler.timeout_sec)),
+        };
+        if let Some(error) = error {
+            return finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(error),
+                    outcome: "trust_error",
+                },
+            );
+        }
+    }
 
     let mut command = build_command(&runtime.shell, command_line, &runtime.environment, env);
     command.current_dir(cwd);
@@ -273,10 +290,14 @@ pub(crate) async fn run_command(
             .map_err(|err| ("wait_error", err.to_string()))
     };
 
-    let timeout_duration = Duration::from_secs(handler.timeout_sec);
     // Drain output while sending input so neither pipe can block the other, and
     // include stdin writes in the deadline even when the hook never reads them.
-    match timeout(timeout_duration, try_join(write_stdin, wait_with_output)).await {
+    match timeout(
+        duration.saturating_sub(timeout_started.elapsed()),
+        try_join(write_stdin, wait_with_output),
+    )
+    .await
+    {
         Ok(Ok(((), output))) => {
             // Successfully completed hooks may intentionally leave detached helpers running.
             #[cfg(windows)]
@@ -371,6 +392,7 @@ fn finish_command_run(
 ) -> HandlerRunResult {
     Span::current().record("hook.command_outcome", completion.outcome);
     HandlerRunResult {
+        context_metadata: codex_protocol::models::ContentItemMetadata::command_hook(),
         started_at,
         completed_at: chrono::Utc::now().timestamp(),
         duration_ms: started.elapsed().as_millis().try_into().unwrap_or(i64::MAX),

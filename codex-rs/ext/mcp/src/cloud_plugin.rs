@@ -102,6 +102,7 @@ impl TurnLifecycleContributor for PluginContributor {
                     thread_id: input.thread_store.level_id().to_string(),
                     turn_id: input.turn_id.to_string(),
                     mcp_resources: resources.map(Arc::new),
+                    snapshots: Vec::new(),
                 })
                 .await
             {

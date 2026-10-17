@@ -395,7 +395,9 @@ impl App {
             Ok(keymap) => keymap,
             Err(error) => return self.chat_widget.add_error_message(error),
         };
-        config.service_tier = self.chat_widget.configured_service_tier();
+        if !is_new_worktree {
+            config.service_tier = self.chat_widget.configured_service_tier();
+        }
         if is_new_worktree {
             apply_managed_new_thread_defaults(
                 &mut config,

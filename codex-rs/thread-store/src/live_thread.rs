@@ -26,6 +26,7 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::ThreadStoreResumePreparation;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
 
@@ -182,6 +183,7 @@ impl LiveThread {
         thread_store: Arc<dyn ThreadStore>,
         history_mode: ThreadHistoryMode,
         mut params: ResumeThreadParams,
+        resume_preparation: Option<ThreadStoreResumePreparation>,
     ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
         let thread_id = params.thread_id;
         let metadata = if history_mode == ThreadHistoryMode::Paginated
@@ -197,7 +199,14 @@ impl LiveThread {
         } else {
             None
         };
-        let history = thread_store.resume_thread(params.clone()).await?;
+        let history = match resume_preparation {
+            Some(preparation) => {
+                thread_store
+                    .resume_thread_with_preparation(params.clone(), preparation)
+                    .await?
+            }
+            None => thread_store.resume_thread(params.clone()).await?,
+        };
         params.history = Some(Arc::clone(&history));
         let metadata_sync = ThreadMetadataSync::for_resume(&params, metadata.as_ref());
         Ok((

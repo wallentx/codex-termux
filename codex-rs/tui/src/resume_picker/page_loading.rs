@@ -18,11 +18,9 @@ impl PageCwdFilter {
         cursor: Option<&PageCursor>,
         cwd: Option<&Path>,
         uses_remote_filesystem: bool,
-        worktrees_enabled: bool,
     ) -> Option<ThreadListCwdFilter> {
         if cursor.is_none() {
-            self.current = cwd
-                .map(|cwd| repository_cwd_filter(cwd, uses_remote_filesystem, worktrees_enabled));
+            self.current = cwd.map(|cwd| repository_cwd_filter(cwd, uses_remote_filesystem));
         }
         self.current.clone()
     }

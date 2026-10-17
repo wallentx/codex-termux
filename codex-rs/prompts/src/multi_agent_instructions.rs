@@ -32,9 +32,14 @@ pub enum MultiAgentRoleInstructions {
     },
 }
 
+impl MultiAgentRoleInstructions {
+    /// Content classification shared by role producers and inherited-history filtering.
+    pub const KIND: &str = "multi_agent.role_instructions";
+}
+
 impl ContextualUserFragment for MultiAgentRoleInstructions {
     fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("multi_agent.role_instructions".to_string())
+        ContentItemKind(Self::KIND.to_string())
     }
 
     fn role(&self) -> &'static str {

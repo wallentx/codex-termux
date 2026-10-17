@@ -117,6 +117,7 @@ async fn failed_close_status_read_reconnects_remote_or_closes_embedded() -> Resu
             .await
         });
         let session = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             crate::connect_remote_app_server(endpoint).await?,
             ThreadParamsMode::Remote,
         );

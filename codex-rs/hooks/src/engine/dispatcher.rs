@@ -146,7 +146,8 @@ pub(crate) async fn execute_handlers_with_metadata<T: 'static>(
         pending.push(async move {
             let result =
                 execute_handler(engine, &handler, &input_json, cwd, /*metadata*/ None).await;
-            (configured_order, parse(&handler, result, turn_id))
+            let parsed = parse(&handler, result, turn_id);
+            (configured_order, parsed)
         });
     }
 
@@ -351,6 +352,7 @@ mod tests {
     ) -> ConfiguredHandler {
         ConfiguredHandler {
             builtin: false,
+            plugin_trust: None,
             event_name,
             matcher: matcher
                 .map(|pattern| crate::engine::HookMatcher::new(pattern).expect("valid matcher")),

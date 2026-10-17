@@ -9,6 +9,7 @@ use codex_connectors::ConnectorRuntimeManager;
 use codex_connectors::PluginConnectorSource;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
@@ -156,6 +157,7 @@ impl McpManager {
         .config
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "mcp.runtime_config.project_for_step", skip_all)]
     pub(crate) async fn runtime_config_for_step(
         &self,
@@ -165,6 +167,7 @@ impl McpManager {
         identity: McpThreadIdentity<'_>,
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         executor_capability_discovery: Option<&ExecutorCapabilityDiscoverySnapshot>,
+        executor_capability_discovery_v2: Option<&[ExecutorCapabilityDiscoveryV2Snapshot]>,
     ) -> McpRuntimeProjection {
         let mut context = McpServerContributionContext::for_step(
             config,
@@ -173,6 +176,7 @@ impl McpManager {
             identity.originator,
             ready_selected_capability_roots,
             executor_capability_discovery,
+            executor_capability_discovery_v2,
         )
         .with_session_source(identity.session_source)
         .with_auth_changed(identity.auth_changed);

@@ -3,10 +3,10 @@
 This directory wires the `v8` crate to exact-version Bazel inputs.
 Bazel consumer builds use:
 
-- Codex-published sandbox archive/binding pairs on Darwin and GNU Linux (x64
-  and arm64), with checksums pinned from the trusted release manifests
-- the existing Codex-published Windows MSVC archives
-- source-built V8 archives on musl Linux and Windows GNU
+- Codex-published sandbox archive/binding pairs on Darwin, GNU/musl Linux,
+  and Windows MSVC (x64 and arm64), with checksums pinned from the trusted
+  release manifests
+- source-built V8 archives on Windows GNU
 
 Local Cargo builds still use upstream prebuilt `rusty_v8` archives by default.
 Selected Cargo CI, release, and package builds override
@@ -16,7 +16,7 @@ for its consumers. All Bazel compilation modes use the same published V8
 release archive on supported platforms.
 
 The Bazel `v8` crate feature selection enables V8's in-process sandbox.
-Darwin/GNU consumers select prebuilts only when both the V8 sandbox and pointer
+Darwin/Linux consumers select prebuilts only when both the V8 sandbox and pointer
 compression settings match the published artifact. For source instrumentation
 or custom V8 C++ settings, use `--//:rusty_v8_from_source=true`; the archive
 and binding then both come from the source path. The published release archive
@@ -24,8 +24,8 @@ cannot incorporate local V8 C++ flags or native debug/sanitizer settings.
 
 Current pinned versions:
 
-- Rust crate: `v8 = =150.4.0`
-- Embedded upstream V8 source for Bazel-produced release builds: `15.0.245.2`
+- Rust crate: `v8 = =152.2.0`
+- Embedded upstream V8 source for Bazel-produced release builds: `15.2.124.1`
 
 ## Updating to a new `v8` release
 
@@ -50,7 +50,7 @@ python3 .github/scripts/rusty_v8_bazel.py update-module-bazel
 python3 .github/scripts/rusty_v8_bazel.py check-module-bazel
 ```
 
-For the Darwin/GNU pairs, verify each published
+For all eight published pairs, verify each published
 `rusty_v8_ptrcomp_sandbox_release_<target>.sha256` against the committed
 `rusty_v8_<version>_release_manifests.sha256` first. Copy the verified archive
 and binding checksums into `rusty_v8_<version>.sha256`, then run these
@@ -104,14 +104,14 @@ from upstream `rusty_v8` source. Those ABI-specific outputs cannot be produced
 by Codex's Bazel Windows GNU toolchain.
 
 The Bazel graph pins the same libc++, libc++abi, and llvm-libc source revisions
-used by `rusty_v8 v150.4.0`, compiles published artifact targets with
+used by `rusty_v8 v152.2.0`, compiles published artifact targets with
 `--config=rusty-v8-upstream-libcxx`, and folds the matching runtime objects into
 the final static archive so consumers can link it with the `v8` crate's default
 `use_custom_libcxx` feature. The config keeps the object files and the bundled
 runtime on Chromium's `std::__Cr` ABI namespace instead of mixing those objects
 with the toolchain libc++ default namespace. Bazel consumers use these
-published archives for supported Darwin/GNU platforms, as do Cargo release and
-package builds. On GNU Linux, Bazel decompresses to a private output and weakens
+published archives for supported Darwin/Linux platforms, as do Cargo release and
+package builds. On Linux, Bazel decompresses to a private output and weakens
 the ten shared `std::logic_error` and `std::runtime_error` constructors and
 assignment entry points listed in `gnu_libcxx_shared_exception_symbols.txt`.
 libc++ keeps these exception functions in `std::` across inline ABI namespaces;

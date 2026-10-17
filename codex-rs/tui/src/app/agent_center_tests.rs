@@ -513,8 +513,7 @@ async fn live_center_rename_retains_target_when_status_leaves_filter() -> Result
 
 #[tokio::test]
 async fn live_center_navigation_and_complete_hints() {
-    let mut app = make_test_app().await;
-    app.config.features.enable(Feature::Worktrees).unwrap();
+    let app = make_test_app().await;
     let ready = ThreadId::from_u128(/*value*/ 42);
     let needs_you = ThreadId::from_u128(/*value*/ 43);
     let unloaded = ThreadId::from_u128(/*value*/ 44);
@@ -665,7 +664,6 @@ async fn live_center_fixed_shortcuts_yield_to_configured_actions() {
 #[tokio::test]
 async fn live_center_hints_follow_configured_bindings() {
     let mut app = make_test_app().await;
-    app.config.features.disable(Feature::Worktrees).unwrap();
     let config: TuiKeymap = toml::from_str(
         r#"
 [list]

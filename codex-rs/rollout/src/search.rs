@@ -124,6 +124,7 @@ async fn scan_rollout_matches(
     let mut matches = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
     let json_search_term = case_insensitive_literal_regex(json_search_term)?;
+    let mut patterns = None;
 
     while let Some(dir) = dirs.pop() {
         let mut entries = match tokio::fs::read_dir(dir).await {
@@ -146,7 +147,7 @@ async fn scan_rollout_matches(
             };
             if rollout_file.is_compressed() {
                 if let Some(snippet) =
-                    first_rollout_content_match_snippet(rollout_file.path(), search_term)
+                    first_content_match_snippet(rollout_file.path(), search_term, &mut patterns)
                         .await
                         .unwrap_or_else(|err| {
                             tracing::warn!(
@@ -187,9 +188,25 @@ pub async fn first_rollout_content_match_snippet(
     path: &Path,
     search_term: &str,
 ) -> io::Result<Option<String>> {
+    first_content_match_snippet(path, search_term, &mut None).await
+}
+
+async fn first_content_match_snippet(
+    path: &Path,
+    search_term: &str,
+    patterns: &mut Option<(Regex, Regex)>,
+) -> io::Result<Option<String>> {
     let lines = compression::open_rollout_line_reader(path).await?;
-    let json_search_term = case_insensitive_literal_regex(json_escaped_search_term(search_term)?)?;
-    let search_term = case_insensitive_literal_regex(search_term)?;
+    // Keep compilation errors inside the caller's per-file error handler.
+    let (json_search_term, search_term) = match patterns {
+        Some(patterns) => patterns,
+        None => patterns.insert((
+            case_insensitive_literal_regex(json_escaped_search_term(search_term)?)?,
+            case_insensitive_literal_regex(search_term)?,
+        )),
+    };
+    let json_search_term = json_search_term.clone();
+    let search_term = search_term.clone();
     lines
         .find_map(move |line| {
             if json_search_term.is_match(line) {
@@ -207,6 +224,7 @@ async fn scan_compressed_rollout_matches(
 ) -> io::Result<RolloutSearchMatches> {
     let mut matches = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
+    let mut patterns = None;
 
     while let Some(dir) = dirs.pop() {
         let mut entries = match tokio::fs::read_dir(dir).await {
@@ -231,7 +249,7 @@ async fn scan_compressed_rollout_matches(
                 continue;
             }
             if let Some(snippet) =
-                first_rollout_content_match_snippet(rollout_file.path(), search_term)
+                first_content_match_snippet(rollout_file.path(), search_term, &mut patterns)
                     .await
                     .unwrap_or_else(|err| {
                         tracing::warn!(
@@ -371,3 +389,7 @@ fn char_end_after(text: &str, byte_index: usize, chars_after: usize) -> usize {
         .map(|(offset, _)| byte_index.saturating_add(offset))
         .unwrap_or(text.len())
 }
+
+#[cfg(test)]
+#[path = "search_tests.rs"]
+mod tests;

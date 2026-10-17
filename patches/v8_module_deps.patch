@@ -3,25 +3,14 @@
 # Scope: upstream MODULE.bazel only; affects external repo resolution and Bazel
 # module wiring, not V8 source files.
 
-diff --git a/orig/v8-15.0.245.2/MODULE.bazel b/mod/v8-15.0.245.2/MODULE.bazel
-index b8bf8bd..573f463 100644
---- a/orig/v8-15.0.245.2/MODULE.bazel
-+++ b/mod/v8-15.0.245.2/MODULE.bazel
-@@ -8,193 +8,67 @@ bazel_dep(name = "rules_cc", version = "0.2.0")
- bazel_dep(name = "rules_python", version = "1.0.0")
+diff --git a/orig/v8-15.2.124.1/MODULE.bazel b/mod/v8-15.2.124.1/MODULE.bazel
+--- a/orig/v8-15.2.124.1/MODULE.bazel
++++ b/mod/v8-15.2.124.1/MODULE.bazel
+@@ -8,12 +8,65 @@
+ bazel_dep(name = "rules_python", version = "1.7.0")
  bazel_dep(name = "platforms", version = "1.0.0")
- bazel_dep(name = "abseil-cpp", version = "20250814.0")
+ bazel_dep(name = "abseil-cpp", version = "20250814.1")
 -bazel_dep(name = "highway", version = "1.2.0")
--
--pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
--pip.parse(
--    hub_name = "v8_python_deps",
--    python_version = "3.11",
--    requirements_lock = "//:bazel/requirements.txt",
--    extra_pip_args = [
--        "--require-hashes",
--        "--index-url=https://pypi.org/simple",
--    ],
 +bazel_dep(name = "rules_license", version = "0.0.4")
 +
 +git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
@@ -31,11 +20,63 @@ index b8bf8bd..573f463 100644
 +    name = "highway",
 +    patch_args = ["-p1"],
 +    patches = ["@v8//:bazel/highway.patch"],
-+    sha256 = "7e0be78b8318e8bdbf6fa545d2ecb4c90f947df03f7aadc42c1967f019e63343",
-+    strip_prefix = "highway-1.2.0",
-+    urls = ["https://github.com/google/highway/archive/refs/tags/1.2.0.tar.gz"],
++    sha256 = "741d705781e0b3e406beda8f1f994fbae01321237ce8023a1ad90fbaf7940c25",
++    strip_prefix = "highway-2607d3b5b0113992fe84d3848859eae13b3b52c1",
++    urls = ["https://github.com/google/highway/archive/2607d3b5b0113992fe84d3848859eae13b3b52c1.tar.gz"],
++)
++
++git_repository(
++    name = "icu",
++    build_file = "@@//third_party/v8:icu.BUILD.bazel",
++    commit = "d578f2e8b7bd5938e21cfb6bf15c079e0aa5b738",
++    patch_cmds = ["find source -name BUILD.bazel | xargs rm"],
++    patch_cmds_win = ["Get-ChildItem -Path source -File -Include BUILD.bazel -Recurse | Remove-Item"],
++    remote = "https://chromium.googlesource.com/chromium/deps/icu.git",
++)
++
++http_archive(
++    name = "fast_float",
++    build_file_content = 'load("@rules_cc//cc:defs.bzl", "cc_library")\n\ncc_library(\n    name = "fast_float",\n    hdrs = glob(["include/fast_float/*.h"]),\n    include_prefix = "third_party/fast_float/src/include",\n    strip_include_prefix = "include",\n    visibility = ["//visibility:public"],\n)\n',
++    sha256 = "76f958dd97b1cf4d8862d1f0986a47d4bdfa8845252bae15ef0f40de3b95961f",
++    strip_prefix = "fast_float-8.2.10",
++    urls = ["https://github.com/fastfloat/fast_float/archive/refs/tags/v8.2.10.tar.gz"],
++)
++
++http_archive(
++    name = "simdutf",
++    build_file_content = 'load("@rules_cc//cc:defs.bzl", "cc_library")\n\ncc_library(\n    name = "simdutf",\n    srcs = ["src/simdutf.cpp"],\n    hdrs = glob(["include/**/*.h"]),\n    textual_hdrs = glob(["src/**/*.h", "src/**/*.cpp"], exclude = ["src/simdutf.cpp"]),\n    copts = ["-std=c++20"],\n    include_prefix = "third_party/simdutf",\n    includes = ["include", "src"],\n    strip_include_prefix = "include",\n    visibility = ["//visibility:public"],\n)\n',
++    sha256 = "0180de81a1dd48a87b8c0442ffa81734f3db91a7350914107a449935124e3c6f",
++    strip_prefix = "simdutf-7.7.0",
++    urls = ["https://github.com/simdutf/simdutf/archive/refs/tags/v7.7.0.tar.gz"],
++)
++
++git_repository(
++    name = "dragonbox",
++    build_file_content = 'load("@rules_cc//cc:defs.bzl", "cc_library")\n\ncc_library(\n    name = "dragonbox",\n    hdrs = ["include/dragonbox/dragonbox.h"],\n    include_prefix = "third_party/dragonbox/src/include",\n    strip_include_prefix = "include",\n    visibility = ["//visibility:public"],\n)\n',
++    commit = "beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44",
++    remote = "https://chromium.googlesource.com/external/github.com/jk-jeon/dragonbox.git",
++)
++
++git_repository(
++    name = "fp16",
++    build_file_content = 'load("@rules_cc//cc:defs.bzl", "cc_library")\n\ncc_library(\n    name = "fp16",\n    hdrs = glob(["include/**/*.h"]),\n    include_prefix = "third_party/fp16/src/include",\n    includes = ["include"],\n    strip_include_prefix = "include",\n    visibility = ["//visibility:public"],\n)\n',
++    commit = "782eea126dc5c755827be751a099eb01826175cf",
++    remote = "https://chromium.googlesource.com/external/github.com/Maratyszcza/FP16.git",
++)
+
+ pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+ pip.parse(
+     hub_name = "v8_python_deps",
+     python_version = "3.11",
++    # Use the pip resolver to preserve V8's hashes and repository names.
++    simpleapi_skip = ["jinja2", "markupsafe"],
+     requirements_lock = "//:bazel/requirements.txt",
+     extra_pip_args = [
+         "--require-hashes",
+@@ -21,180 +74,3 @@
+     ],
  )
--use_repo(pip, "v8_python_deps")
+ use_repo(pip, "v8_python_deps")
 -
 -# Define the local LLVM toolchain repository
 -llvm_toolchain_repository = use_repo_rule("//bazel/toolchain:llvm_repository.bzl", "llvm_toolchain_repository")
@@ -46,7 +87,7 @@ index b8bf8bd..573f463 100644
 -    config_file_content = """
 -load("@rules_cc//cc:defs.bzl", "CcToolchainConfigInfo", "cc_common")
 -load("@bazel_tools//tools/cpp:cc_toolchain_config_lib.bzl", "feature", "flag_group", "flag_set", "tool_path")
-
+-
 -def _impl(ctx):
 -    tool_paths = [
 -        tool_path(name = "gcc", path = "bin/clang"),
@@ -152,32 +193,19 @@ index b8bf8bd..573f463 100644
 -    implementation = _impl,
 -    attrs = {},
 -    provides = [CcToolchainConfigInfo],
-+git_repository(
-+    name = "icu",
-+    build_file = "@v8//:bazel/BUILD.icu",
-+    commit = "a86a32e67b8d1384b33f8fa48c83a6079b86f8cd",
-+    patch_cmds = ["find source -name BUILD.bazel | xargs rm"],
-+    patch_cmds_win = ["Get-ChildItem -Path source -File -Include BUILD.bazel -Recurse | Remove-Item"],
-+    remote = "https://chromium.googlesource.com/chromium/deps/icu.git",
- )
+-)
 -""",
 -    build_file_content = """
 -load("@rules_cc//cc:defs.bzl", "cc_toolchain")
 -load(":cc_toolchain_config.bzl", "cc_toolchain_config")
 -
 -package(default_visibility = ["//visibility:public"])
-
+-
 -filegroup(
 -    name = "all_files",
 -    srcs = glob(["**/*"]),
-+http_archive(
-+    name = "fast_float",
-+    build_file_content = 'load("@rules_cc//cc:defs.bzl", "cc_library")\n\ncc_library(\n    name = "fast_float",\n    hdrs = glob(["include/fast_float/*.h"]),\n    include_prefix = "third_party/fast_float/src/include",\n    strip_include_prefix = "include",\n    visibility = ["//visibility:public"],\n)\n',
-+    sha256 = "e14a33089712b681d74d94e2a11362643bd7d769ae8f7e7caefe955f57f7eacd",
-+    strip_prefix = "fast_float-8.0.2",
-+    urls = ["https://github.com/fastfloat/fast_float/archive/refs/tags/v8.0.2.tar.gz"],
- )
-
+-)
+-
 -filegroup(name = "empty")
 -
 -cc_toolchain_config(name = "k8_toolchain_config")
@@ -194,14 +222,8 @@ index b8bf8bd..573f463 100644
 -    supports_param_files = 0,
 -    toolchain_config = ":k8_toolchain_config",
 -    toolchain_identifier = "local_clang",
-+http_archive(
-+    name = "simdutf",
-+    build_file_content = 'load("@rules_cc//cc:defs.bzl", "cc_library")\n\ncc_library(\n    name = "simdutf",\n    srcs = ["src/simdutf.cpp"],\n    hdrs = glob(["include/**/*.h"]),\n    textual_hdrs = glob(["src/**/*.h", "src/**/*.cpp"], exclude = ["src/simdutf.cpp"]),\n    copts = ["-std=c++20"],\n    include_prefix = "third_party/simdutf",\n    includes = ["include", "src"],\n    strip_include_prefix = "include",\n    visibility = ["//visibility:public"],\n)\n',
-+    sha256 = "0180de81a1dd48a87b8c0442ffa81734f3db91a7350914107a449935124e3c6f",
-+    strip_prefix = "simdutf-7.7.0",
-+    urls = ["https://github.com/simdutf/simdutf/archive/refs/tags/v7.7.0.tar.gz"],
- )
-
+-)
+-
 -toolchain(
 -    name = "cc_toolchain_k8",
 -    exec_compatible_with = [
@@ -216,13 +238,8 @@ index b8bf8bd..573f463 100644
 -    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 -)
 -""",
-+git_repository(
-+    name = "dragonbox",
-+    build_file_content = 'load("@rules_cc//cc:defs.bzl", "cc_library")\n\ncc_library(\n    name = "dragonbox",\n    hdrs = ["include/dragonbox/dragonbox.h"],\n    include_prefix = "third_party/dragonbox/src/include",\n    strip_include_prefix = "include",\n    visibility = ["//visibility:public"],\n)\n',
-+    commit = "beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44",
-+    remote = "https://chromium.googlesource.com/external/github.com/jk-jeon/dragonbox.git",
- )
-
+-)
+-
 -register_toolchains("@llvm_toolchain//:cc_toolchain_k8")
 -
 -# Define local repository for libc++ from third_party sources
@@ -230,47 +247,22 @@ index b8bf8bd..573f463 100644
 -
 -libcxx_repository(
 -    name = "libcxx",
-+git_repository(
-+    name = "fp16",
-+    build_file_content = 'load("@rules_cc//cc:defs.bzl", "cc_library")\n\ncc_library(\n    name = "fp16",\n    hdrs = glob(["include/**/*.h"]),\n    include_prefix = "third_party/fp16/src/include",\n    includes = ["include"],\n    strip_include_prefix = "include",\n    visibility = ["//visibility:public"],\n)\n',
-+    commit = "3d2de1816307bac63c16a297e8c4dc501b4076df",
-+    remote = "https://chromium.googlesource.com/external/github.com/Maratyszcza/FP16.git",
- )
-
+-)
+-
 -single_version_override(
 -    module_name = "highway",
 -    patches = ["//bazel/patches:highway_rules_cc.patch"],
 -    patch_strip = 1,
-+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
-+pip.parse(
-+    hub_name = "v8_python_deps",
-+    python_version = "3.11",
-+    requirements_lock = "//:bazel/requirements.txt",
-+    extra_pip_args = [
-+        "--require-hashes",
-+        "--index-url=https://pypi.org/simple",
-+    ],
- )
-+use_repo(pip, "v8_python_deps")
-diff --git a/mod/v8-15.0.245.2/bazel/highway.patch b/mod/v8-15.0.245.2/bazel/highway.patch
+-)
+diff --git a/orig/v8-15.2.124.1/bazel/highway.patch b/mod/v8-15.2.124.1/bazel/highway.patch
 new file mode 100644
-index 0000000..5a13dd0
 --- /dev/null
-+++ b/mod/v8-15.0.245.2/bazel/highway.patch
-@@ -0,0 +1,25 @@
++++ b/mod/v8-15.2.124.1/bazel/highway.patch
+@@ -0,0 +1,16 @@
 +diff --git a/BUILD b/BUILD
 +--- a/BUILD
 ++++ b/BUILD
-+@@ -2,7 +2,7 @@
-+ load("@bazel_skylib//lib:selects.bzl", "selects")
-+ load("@rules_license//rules:license.bzl", "license")
-+
-+-load("@rules_cc//cc:defs.bzl", "cc_test")
-++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
-+ # Placeholder#2 for Guitar, do not remove
-+
-+ package(
-+@@ -134,11 +134,7 @@ COPTS = select({
++@@ -118,11 +118,7 @@
 +     ],
 + })
 +

@@ -39,8 +39,10 @@ pub struct Arg0DispatchPaths {
 
 /// Keeps the per-session PATH entry alive and locked for the process lifetime.
 pub struct Arg0PathEntryGuard {
-    _temp_dir: TempDir,
+    // Fields drop in declaration order. Close the lock before removing its
+    // directory so NFS does not retain the open file as a `.nfs*` entry.
     _lock_file: Option<File>,
+    _temp_dir: TempDir,
     paths: Arg0DispatchPaths,
 }
 
@@ -484,7 +486,23 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
             continue;
         };
 
-        match std::fs::remove_dir_all(&path) {
+        #[cfg(unix)]
+        let removal = {
+            // Rename while locked so initializers cannot publish at the old path,
+            // then close the lock before deletion to avoid NFS silly rename.
+            let retired_dir = TempDir::new_in(temp_root)?;
+            match std::fs::rename(&path, retired_dir.path()) {
+                Ok(()) => {
+                    drop(_lock_file);
+                    retired_dir.close()
+                }
+                Err(err) => Err(err),
+            }
+        };
+        #[cfg(not(unix))]
+        let removal = std::fs::remove_dir_all(&path);
+
+        match removal {
             Ok(()) => {}
             // Expected TOCTOU race: directory can disappear after read_dir/lock checks.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -516,9 +534,7 @@ mod tests {
     use super::LOCK_FILENAME;
     use super::janitor_cleanup;
     use super::linux_sandbox_exe_path;
-    #[cfg(unix)]
     use super::run_main_with_arg0_guard;
-    #[cfg(unix)]
     use anyhow::ensure;
     use codex_install_context::CodexPackageLayout;
     use codex_install_context::InstallContext;
@@ -705,10 +721,10 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn run_main_with_arg0_guard_keeps_aliases_alive_until_main_returns() -> anyhow::Result<()> {
         let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path().to_path_buf();
         let alias_path = temp_dir.path().join("codex-helper-alias");
         fs::write(&alias_path, b"")?;
         let lock_file = create_lock(temp_dir.path())?;
@@ -741,7 +757,9 @@ mod tests {
                 );
                 Ok(())
             },
-        ))
+        ))?;
+        assert!(!temp_path.exists());
+        Ok(())
     }
 
     #[test]
@@ -828,7 +846,7 @@ mod tests {
 
         janitor_cleanup(root.path())?;
 
-        assert!(!dir.exists());
+        assert_eq!(fs::read_dir(root.path())?.count(), 0);
         Ok(())
     }
 }

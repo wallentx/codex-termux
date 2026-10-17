@@ -103,6 +103,8 @@ fn experimental_features_discovery_preserves_server_order_and_accepts_new_keys()
         .send(Ok(vec![
             server_feature("network_proxy"),
             server_feature("future_feature"),
+            server_feature("worktrees"),
+            server_feature("realtime_conversation"),
             stable,
             server_feature("prevent_idle_sleep"),
         ]))
@@ -278,28 +280,4 @@ fn snapshot_view(name: &str, view: &ExperimentalFeaturesView) {
     let mut buffer = Buffer::empty(area);
     view.render(area, &mut buffer);
     insta::assert_snapshot!(name, buffer_text(&buffer));
-}
-
-#[test]
-fn voice_discovery_requires_the_client_runtime() {
-    for supported in [false, true] {
-        let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (catalog_tx, catalog_rx) = oneshot::channel();
-        let mut view = ExperimentalFeaturesView::new(
-            Vec::new(),
-            ThreadId::new(),
-            Some(catalog_rx),
-            AppEventSender::new(app_tx),
-            crate::keymap::RuntimeKeymap::defaults().list,
-        );
-        view.voice_supported = supported;
-        catalog_tx
-            .send(Ok(vec![server_feature("realtime_conversation")]))
-            .unwrap();
-        assert!(view.pre_draw_tick(Instant::now()));
-        assert_eq!(view.features.len(), usize::from(supported));
-        if supported {
-            snapshot_view("voice_runtime_available", &view);
-        }
-    }
 }

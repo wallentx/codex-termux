@@ -377,6 +377,9 @@ fn configured_plugins_from_stack_merges_enabled_effective_layers() {
                 "base".to_string(),
                 PluginConfig {
                     enabled: Some(true),
+                    remote_plugin_id: None,
+                    release_id: None,
+                    auto_provision: None,
                     mcp_servers: HashMap::new(),
                 },
             ),
@@ -384,6 +387,9 @@ fn configured_plugins_from_stack_merges_enabled_effective_layers() {
                 "profile".to_string(),
                 PluginConfig {
                     enabled: Some(true),
+                    remote_plugin_id: None,
+                    release_id: None,
+                    auto_provision: None,
                     mcp_servers: project_mcp_servers.clone(),
                 },
             ),
@@ -391,6 +397,9 @@ fn configured_plugins_from_stack_merges_enabled_effective_layers() {
                 "system".to_string(),
                 PluginConfig {
                     enabled: Some(true),
+                    remote_plugin_id: None,
+                    release_id: None,
+                    auto_provision: None,
                     mcp_servers: HashMap::new(),
                 },
             ),
@@ -619,6 +628,16 @@ enabled = true
         ),
         (
             "[plugins._default]\nenabled = false\n[plugins.\"valid@test\".mcp_servers.example]\ndefault_tools_approval_mode = 'approve'",
+            false,
+            HashMap::new(),
+        ),
+        (
+            "[plugins.\"valid@test\"]\nremote_plugin_id = 'remote-plugin-123'\nrelease_id = 'plugin-release-123'\nauto_provision = true",
+            true,
+            HashMap::new(),
+        ),
+        (
+            "[plugins._default]\nenabled = false\n[plugins.\"valid@test\"]\nremote_plugin_id = 'remote-plugin-123'\nrelease_id = 'plugin-release-123'\nauto_provision = true",
             false,
             HashMap::new(),
         ),

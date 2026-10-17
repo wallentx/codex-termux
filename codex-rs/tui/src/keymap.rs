@@ -62,6 +62,7 @@ pub(crate) use chords::KeyChordMatch;
 pub(crate) use chords::KeyChordMatcher;
 pub(crate) use chords::KeymapContextSet;
 pub(crate) use chords::RuntimeChordKeymap;
+pub(crate) use chords::is_dispatch_token;
 pub(crate) use chords::is_dispatch_token_event;
 
 /// Runtime keymap used by TUI input handlers.
@@ -129,11 +130,13 @@ pub(crate) struct AppKeymap {
 /// handler code, not here.
 #[derive(Clone, Debug)]
 pub(crate) struct ChatKeymap {
+    /// Open the preset submenu.
+    pub(crate) open_presets: Vec<KeyBinding>,
     /// Start or stop a voice conversation.
     pub(crate) toggle_voice: Vec<KeyBinding>,
     /// Toggle capture in the active voice session.
     pub(crate) toggle_voice_mute: Vec<KeyBinding>,
-    chord_hints: Arc<RuntimeChordKeymap>,
+    pub(crate) chord_hints: Arc<RuntimeChordKeymap>,
     /// Interrupt the active turn.
     pub(crate) interrupt_turn: Vec<KeyBinding>,
     /// Decrease the active reasoning effort.
@@ -408,6 +411,20 @@ impl ListKeymap {
             ListAction::JumpBottom,
             ListAction::Accept,
             ListAction::Cancel,
+        ]
+        .into_iter()
+        .find(|action| self.bindings_for(*action).is_pressed(event))
+    }
+
+    /// Resolve only vertical navigation, preserving its historical priority.
+    pub(crate) fn vertical_action_for(&self, event: KeyEvent) -> Option<ListAction> {
+        [
+            ListAction::MoveUp,
+            ListAction::MoveDown,
+            ListAction::PageUp,
+            ListAction::PageDown,
+            ListAction::JumpTop,
+            ListAction::JumpBottom,
         ]
         .into_iter()
         .find(|action| self.bindings_for(*action).is_pressed(event))
@@ -763,6 +780,7 @@ impl RuntimeKeymap {
                 }));
 
         let mut chat = ChatKeymap {
+            open_presets: resolve_local!(keymap, defaults, chat, open_presets),
             toggle_voice: if voice_toggle_default_is_shadowed {
                 Vec::new()
             } else {
@@ -1629,6 +1647,7 @@ impl RuntimeKeymap {
             }
         }
         resolved.configure_search(keymap)?;
+        chords::quick_dial_defaults::register(keymap, &mut resolved);
         resolved.validate_conflicts()?;
         chords::validate_chord_conflicts(&resolved)?;
         chords::install_dispatch_bindings(&mut resolved)?;
@@ -1669,6 +1688,7 @@ impl RuntimeKeymap {
             },
             chords: Arc::default(),
             chat: ChatKeymap {
+                open_presets: Vec::new(),
                 toggle_voice: default_bindings![plain(KeyCode::F(8))],
                 toggle_voice_mute: default_bindings![plain(KeyCode::F(9))],
                 chord_hints: Arc::default(),
@@ -1719,8 +1739,16 @@ impl RuntimeKeymap {
                     raw(KeyBinding::new(KeyCode::Right, KeyModifiers::ALT)),
                     raw(KeyBinding::new(KeyCode::Right, KeyModifiers::CONTROL))
                 ],
-                move_line_start: default_bindings![plain(KeyCode::Home), ctrl(KeyCode::Char('a'))],
-                move_line_end: default_bindings![plain(KeyCode::End), ctrl(KeyCode::Char('e'))],
+                move_line_start: default_bindings![
+                    plain(KeyCode::Home),
+                    ctrl(KeyCode::Char('a')),
+                    raw(KeyBinding::new(KeyCode::Left, KeyModifiers::SUPER))
+                ],
+                move_line_end: default_bindings![
+                    plain(KeyCode::End),
+                    ctrl(KeyCode::Char('e')),
+                    raw(KeyBinding::new(KeyCode::Right, KeyModifiers::SUPER))
+                ],
                 delete_backward: default_bindings![
                     plain(KeyCode::Backspace),
                     shift(KeyCode::Backspace),
@@ -1753,7 +1781,10 @@ impl RuntimeKeymap {
                     )),
                     alt(KeyCode::Char('d'))
                 ],
-                kill_line_start: default_bindings![ctrl(KeyCode::Char('u'))],
+                kill_line_start: default_bindings![
+                    ctrl(KeyCode::Char('u')),
+                    raw(KeyBinding::new(KeyCode::Backspace, KeyModifiers::SUPER))
+                ],
                 kill_whole_line: default_bindings![],
                 kill_line_end: default_bindings![ctrl(KeyCode::Char('k'))],
                 yank: default_bindings![ctrl(KeyCode::Char('y'))],
@@ -1967,6 +1998,7 @@ impl RuntimeKeymap {
     ///    backtracking, intentionally stay outside this configurable keymap.
     fn validate_conflicts(&self) -> Result<(), String> {
         for (action, bindings) in [
+            ("open_presets", &self.chat.open_presets),
             ("toggle_voice", &self.chat.toggle_voice),
             (
                 "previous_permission_mode",
@@ -1989,6 +2021,7 @@ impl RuntimeKeymap {
         #[cfg(unix)]
         for (action, bindings) in [
             ("global.open_agents", &self.app.open_agents),
+            ("chat.open_presets", &self.chat.open_presets),
             ("chat.toggle_voice", &self.chat.toggle_voice),
         ] {
             if bindings.contains(&key_hint::ctrl(KeyCode::Char('z'))) {
@@ -2031,6 +2064,7 @@ impl RuntimeKeymap {
             ("toggle_fast_mode", self.app.toggle_fast_mode.as_slice()),
             ("toggle_raw_output", self.app.toggle_raw_output.as_slice()),
             ("toggle_side_conversation", side_toggle_bindings.as_slice()),
+            ("chat.open_presets", self.chat.open_presets.as_slice()),
             ("chat.toggle_voice", self.chat.toggle_voice.as_slice()),
             (
                 "chat.toggle_voice_mute",
@@ -2192,6 +2226,7 @@ impl RuntimeKeymap {
                 ),
                 ("copy", self.app.copy.as_slice()),
                 ("clear_terminal", self.app.clear_terminal.as_slice()),
+                ("chat.open_presets", self.chat.open_presets.as_slice()),
                 ("chat.toggle_voice", self.chat.toggle_voice.as_slice()),
                 (
                     "chat.toggle_voice_mute",
@@ -2681,6 +2716,7 @@ fn parse_keybinding(spec: &str) -> Option<KeyBinding> {
             "ctrl" => modifiers |= KeyModifiers::CONTROL,
             "alt" => modifiers |= KeyModifiers::ALT,
             "shift" => modifiers |= KeyModifiers::SHIFT,
+            "super" => modifiers |= KeyModifiers::SUPER,
             other => {
                 key_name = Some(other.to_string());
                 break;
@@ -2742,11 +2778,11 @@ mod tests {
 
     #[test]
     fn parses_canonical_binding() {
-        let binding = parse_keybinding("ctrl-alt-shift-a").expect("binding should parse");
+        let binding = parse_keybinding("ctrl-alt-shift-super-a").expect("binding should parse");
         assert_eq!(binding.parts().0, KeyCode::Char('a'));
         assert_eq!(
             binding.parts().1,
-            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::SUPER
         );
     }
 
@@ -4096,5 +4132,35 @@ mod tests {
         RuntimeKeymap::defaults()
             .validate_conflicts()
             .expect("default keymap should be conflict free");
+
+        let mut keymap = TuiKeymap::default();
+        keymap.global.leader = Some(one("ctrl-r"));
+        let runtime = RuntimeKeymap::from_config(&keymap)
+            .expect("an unused leader must preserve single-key shortcuts");
+        assert_eq!(
+            (
+                runtime.composer.history_search_previous,
+                runtime.chat.open_presets
+            ),
+            (vec![key_hint::ctrl(KeyCode::Char('r'))], Vec::new())
+        );
+        let defaults = RuntimeKeymap::defaults();
+        for leader in ["page-up", "page-down"] {
+            keymap.global.leader = Some(one(leader));
+            let runtime = RuntimeKeymap::from_config(&keymap)
+                .expect("an unused leader must preserve transcript paging");
+            assert_eq!(
+                (
+                    runtime.pager.page_up,
+                    runtime.pager.page_down,
+                    runtime.chat.open_presets
+                ),
+                (
+                    defaults.pager.page_up.clone(),
+                    defaults.pager.page_down.clone(),
+                    Vec::new()
+                )
+            );
+        }
     }
 }

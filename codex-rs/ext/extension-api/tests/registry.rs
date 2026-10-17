@@ -59,6 +59,7 @@ fn mcp_contribution_context_identifies_the_running_thread() {
         "codex_work_cca",
         &[],
         /*executor_capability_discovery*/ None,
+        /*executor_capability_discovery_v2*/ None,
     )
     .with_session_source(&session_source);
 

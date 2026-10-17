@@ -412,6 +412,10 @@ async fn control_socket_file_is_private_after_bind() {
     );
     let physical_path = std::fs::read_link(socket_path.as_path()).expect("rendezvous symlink");
     assert_eq!(
+        super::verified_local_daemon_socket(socket_path.as_path()).unwrap(),
+        Some(AbsolutePathBuf::from_absolute_path(physical_path.clone()).unwrap())
+    );
+    assert_eq!(
         physical_path.parent(),
         Some(
             codex_uds::shared_daemon_socket_directory()
@@ -426,6 +430,15 @@ async fn control_socket_file_is_private_after_bind() {
     assert!(!physical_path.exists());
     assert!(!physical_path.with_extension("lock").exists());
     assert!(std::fs::symlink_metadata(socket_path.as_path()).is_err());
+
+    // SSH/socat may bind directly at the same advertised path.
+    let forwarded = tokio::net::UnixListener::bind(socket_path.as_path()).unwrap();
+    assert_eq!(
+        super::verified_local_daemon_socket(socket_path.as_path()).unwrap(),
+        None
+    );
+    drop(forwarded);
+    std::fs::remove_file(socket_path.as_path()).unwrap();
 
     // Simulate a dangling rendezvous left by an interrupted cleanup.
     std::os::unix::fs::symlink(&physical_path, socket_path.as_path()).unwrap();

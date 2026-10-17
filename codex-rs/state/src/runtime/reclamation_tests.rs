@@ -93,6 +93,7 @@ async fn interrupted_reclamation_releases_writer_and_resumes_without_data_loss()
         .await?;
     let (_shutdown, receiver) = watch::channel(());
     let resumed = reclaim(
+        &sqlite,
         &sqlite.logs_db_path(),
         Budget {
             deadline: Some(Instant::now() + Duration::from_secs(30)),
@@ -104,16 +105,21 @@ async fn interrupted_reclamation_releases_writer_and_resumes_without_data_loss()
     let free_after_retry: i64 = sqlx::query_scalar("PRAGMA freelist_count")
         .fetch_one(&pool)
         .await?;
-    assert!(resumed.pages > 0);
     assert_eq!(
         free_before_retry - free_after_retry,
         i64::from(resumed.pages)
     );
     let bytes_after_retry = tokio::fs::metadata(sqlite.logs_db_path()).await?.len();
-    assert!(
-        bytes_after_retry < bytes_before_retry,
-        "reclamation must shrink the SQLite file: {bytes_before_retry} -> {bytes_after_retry} bytes"
-    );
+    if sqlite.is_nfs().await? {
+        assert_eq!(resumed.pages, 0);
+        assert_eq!(bytes_after_retry, bytes_before_retry);
+    } else {
+        assert!(resumed.pages > 0);
+        assert!(
+            bytes_after_retry < bytes_before_retry,
+            "reclamation must shrink the SQLite file: {bytes_before_retry} -> {bytes_after_retry} bytes"
+        );
+    }
     assert_eq!(
         sqlx::query_as::<_, (i64, String)>(rows)
             .fetch_all(&pool)

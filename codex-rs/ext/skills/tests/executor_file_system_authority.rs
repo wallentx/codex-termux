@@ -417,6 +417,7 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
             include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
+            executor_capability_discovery_v2: Vec::new(),
         })
         .await
         .expect("list executor skills");
@@ -507,6 +508,7 @@ async fn executor_discovery_preserves_posix_and_windows_locator_alias_roots() {
                 include_cloud_skills: false,
                 mcp_resources: None,
                 executor_capability_discovery: Some(discovery),
+                executor_capability_discovery_v2: Vec::new(),
             })
             .await
             .expect("list executor skills");
@@ -624,6 +626,12 @@ async fn executor_discovery_routes_produce_equivalent_catalog_metadata() {
         include_cloud_skills: false,
         mcp_resources: None,
         executor_capability_discovery,
+        executor_capability_discovery_v2: vec![
+            codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot {
+                environment_id: "local".to_string(),
+                result: Err("V2 must not change V1 or direct discovery".to_string()),
+            },
+        ],
     };
 
     let direct = provider
@@ -776,6 +784,7 @@ async fn pre_discovered_executor_catalog_snapshot() {
             include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: Some(executor_capability_discovery),
+            executor_capability_discovery_v2: Vec::new(),
         })
         .await
         .expect("list pre-discovered executor skills");
@@ -893,6 +902,7 @@ async fn direct_executor_discovery_preserves_hidden_nested_and_probed_metadata()
             include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
+            executor_capability_discovery_v2: Vec::new(),
         })
         .await
         .expect("list directly discovered executor skills");
@@ -953,6 +963,7 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
             include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: Some(executor_capability_discovery),
+            executor_capability_discovery_v2: Vec::new(),
         })
         .await
         .expect("list executor skills");

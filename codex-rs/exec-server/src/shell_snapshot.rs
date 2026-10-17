@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
+use codex_network_proxy::RemoteCredentialBrokerCache;
 use codex_network_proxy::strip_managed_proxy_env;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_protocol::shell_environment;
@@ -53,6 +54,9 @@ const MAX_SNAPSHOT_SCOPE_BYTES: usize = 256;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
+
+#[path = "shell_snapshot_credentials.rs"]
+mod credentials;
 
 #[derive(Clone, Copy)]
 enum SnapshotReplay {
@@ -106,7 +110,9 @@ impl ShellSnapshotCache {
         prepared: &mut PreparedExecRequest,
         telemetry: &ExecServerTelemetry,
         purpose: CapturePurpose,
+        credential_brokers: &RemoteCredentialBrokerCache,
     ) -> Result<Option<File>, JSONRPCErrorError> {
+        let protected = prepared.credential_snapshot_proxy(params).is_some();
         let Some(request) = params.shell_snapshot.as_ref() else {
             return Ok(None);
         };
@@ -136,7 +142,10 @@ impl ShellSnapshotCache {
         };
 
         let wait_started_at = std::time::Instant::now();
-        let (snapshot, attempt) = {
+        let (snapshot, attempt) = if protected {
+            // Protected captures are prepared for this launch and never enter the cache.
+            (Arc::new(OnceCell::new()), 1)
+        } else {
             let mut entries = self.entries.lock().await;
             let position = entries.iter().position(|entry| {
                 &entry.request == request
@@ -195,13 +204,12 @@ impl ShellSnapshotCache {
                 CapturePurpose::Prewarm => "prewarm",
             };
             let started_at = std::time::Instant::now();
-            let result =
-                capture_snapshot(params, prepared, shell_type)
-                    .await
-                    .map(|mut snapshot| {
-                        snapshot.prewarmed = prewarmed;
-                        snapshot
-                    });
+            let result = capture_snapshot(params, prepared, shell_type, credential_brokers)
+                .await
+                .map(|mut snapshot| {
+                    snapshot.prewarmed = prewarmed;
+                    snapshot
+                });
             telemetry.shell_snapshot_captured(
                 started_at.elapsed(),
                 result.as_ref().map(|_| ()).map_err(|(reason, _)| *reason),
@@ -212,26 +220,37 @@ impl ShellSnapshotCache {
                     ("sandbox", prepared.sandbox.as_metric_tag()),
                 ],
             );
-            result.map_err(|(_, error)| error)
+            result
         };
-        let snapshot = match purpose {
-            CapturePurpose::Execution => {
-                snapshot
-                    .get_or_init(|| async {
-                        availability = "on_demand";
-                        capture.await.map_err(|err| {
-                            tracing::warn!("failed to capture shell snapshot: {err:?}");
-                            Instant::now() + SNAPSHOT_RETRY_BACKOFF
+        let uncached;
+        let snapshot = if protected {
+            uncached = match capture.await {
+                Err(("credential_proxy", error)) => return Err(error),
+                result => result.map_err(|_| Instant::now()),
+            };
+            &uncached
+        } else {
+            match purpose {
+                CapturePurpose::Execution => {
+                    snapshot
+                        .get_or_init(|| async {
+                            availability = "on_demand";
+                            capture.await.map_err(|(_, err)| {
+                                tracing::warn!("failed to capture shell snapshot: {err:?}");
+                                Instant::now() + SNAPSHOT_RETRY_BACKOFF
+                            })
                         })
-                    })
-                    .await
-            }
-            CapturePurpose::Prewarm => {
-                // Leave the cell uninitialized on failure: a waiting real command
-                // can capture immediately, without spending its retry budget.
-                snapshot
-                    .get_or_try_init(|| async { capture.await.map(Ok) })
-                    .await?
+                        .await
+                }
+                CapturePurpose::Prewarm => {
+                    // Leave the cell uninitialized on failure: a waiting real command
+                    // can capture immediately, without spending its retry budget.
+                    snapshot
+                        .get_or_try_init(|| async {
+                            capture.await.map(Ok).map_err(|(_, error)| error)
+                        })
+                        .await?
+                }
             }
         };
         let wait = wait_started_at.elapsed();
@@ -239,6 +258,9 @@ impl ShellSnapshotCache {
             return Ok(None);
         }
         let Ok(snapshot) = snapshot else {
+            if protected {
+                credentials::restore_fallback(prepared);
+            }
             telemetry.shell_snapshot_command(wait, availability, "fallback");
             return Ok(None);
         };
@@ -262,6 +284,9 @@ impl ShellSnapshotCache {
                         "cannot prepare shell snapshot transport; using normal startup"
                     );
                     telemetry.shell_snapshot_command(wait, availability, "fallback");
+                    if protected {
+                        credentials::restore_fallback(prepared);
+                    }
                     return Ok(None);
                 }
             }
@@ -279,13 +304,17 @@ impl ShellSnapshotCache {
                 )
             })
             .collect::<HashMap<_, _>>();
-        prepared.env.extend(
-            snapshot
-                .environment
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone())),
-        );
-        prepared.env.extend(request_overrides);
+        if protected {
+            prepared.env.clone_from(&snapshot.environment);
+        } else {
+            prepared.env.extend(
+                snapshot
+                    .environment
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+            prepared.env.extend(request_overrides);
+        }
         apply_exec_metadata(&mut prepared.env, params.metadata.as_ref());
         prepared
             .env
@@ -309,7 +338,13 @@ impl ShellSnapshotCache {
             }
             let state_expansion = state_variables
                 .iter()
-                .map(|name| format!("${{{name}}}"))
+                .map(|name| {
+                    if protected {
+                        format!("${{{name}:?missing shell snapshot chunk}}")
+                    } else {
+                        format!("${{{name}}}")
+                    }
+                })
                 .collect::<String>();
             let state_variables = state_variables.join(" ");
             format!("eval \"unset {state_variables}\n{state_expansion}\"")
@@ -324,10 +359,17 @@ impl ShellSnapshotCache {
             ShellType::PowerShell | ShellType::Cmd => unreachable!(),
         };
         prepared.command[shell_start + 1] = shell_flag.to_string();
-        prepared.command[shell_start + 2] = format!(
-            "{startup}if ! {restore} >/dev/null; then printf 'failed to restore shell snapshot\\n' >&2; fi\n{}",
-            params.argv[2]
-        );
+        prepared.command[shell_start + 2] = if protected {
+            format!(
+                "{startup}if ! {restore} >/dev/null 2>&1; then printf 'failed to restore shell snapshot\\n' >&2; exit 1; fi\n{}",
+                params.argv[2]
+            )
+        } else {
+            format!(
+                "{startup}if ! {restore} >/dev/null; then printf 'failed to restore shell snapshot\\n' >&2; fi\n{}",
+                params.argv[2]
+            )
+        };
 
         telemetry.shell_snapshot_command(wait, availability, "used");
         Ok(reader)
@@ -343,12 +385,14 @@ async fn capture_snapshot(
     params: &ExecParams,
     prepared: &PreparedExecRequest,
     shell_type: ShellType,
+    credential_brokers: &RemoteCredentialBrokerCache,
 ) -> CaptureResult {
+    let proxy = prepared.credential_snapshot_proxy(params);
     let mut script = snapshot_source_capture_script(
         shell_type,
         SnapshotCaptureOptions {
             startup: SnapshotStartup::Interactive,
-            declarations: false,
+            declarations: proxy.is_some(),
             environment: true,
         },
     )
@@ -358,6 +402,16 @@ async fn capture_snapshot(
             invalid_params("unsupported shell snapshot script".to_string()),
         )
     })?;
+    if proxy.is_some() {
+        // Readonly exports cannot be restored after the global zshenv runs again.
+        script.push_str(
+            r#"
+for __codex_snapshot_key in ${(f)"$(builtin typeset +x)"}; do
+  case "${(tP)__codex_snapshot_key}" in *readonly*) exit 74 ;; esac
+done
+"#,
+        );
+    }
     // Probe under the exact capture sandbox, including its /proc fallback and
     // read policy. Keep cached env replay when descriptor paths cannot be opened.
     let probe = if shell_type == ShellType::Sh {
@@ -506,7 +560,11 @@ async fn capture_snapshot(
         }
         SnapshotReplay::Environment
     };
-    let snapshot = parse_snapshot(shell_type, captured, params.env_policy.as_ref(), replay)?;
+    let snapshot = if let Some(proxy) = proxy {
+        credentials::prepare(params, captured, replay, proxy, credential_brokers).await?
+    } else {
+        parse_snapshot(shell_type, captured, params.env_policy.as_ref(), replay)?
+    };
     child.preserve_helpers();
     Ok(snapshot)
 }

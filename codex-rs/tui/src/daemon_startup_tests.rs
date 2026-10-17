@@ -125,6 +125,7 @@ fn daemon_launch_telemetry_records_once_on_connection_or_early_return() {
         let observations = std::cell::RefCell::new(Vec::new());
         let launch = daemon_telemetry::Launch(Some(|target: &AppServerTarget, actual: bool| {
             observations.borrow_mut().push((target.clone(), actual));
+            Vec::new()
         }));
         if connected {
             launch.record(&AppServerTarget::Embedded, connected);
@@ -363,7 +364,11 @@ async fn daemon_startup_falls_back_only_for_implicit_endpoints() -> color_eyre::
             assert_eq!(target, original_target);
             assert!(state_db.is_none());
         } else {
-            let server = AppServerSession::new(result?, target.thread_params_mode());
+            let server = AppServerSession::new(
+                crate::backend_id::BackendId::new(),
+                result?,
+                target.thread_params_mode(),
+            );
             assert!(server.uses_embedded_app_server());
             assert_eq!(target, AppServerTarget::Embedded);
             assert!(state_db.is_some());

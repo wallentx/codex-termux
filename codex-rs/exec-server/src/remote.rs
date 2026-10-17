@@ -13,6 +13,7 @@ use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
 use http::StatusCode;
+use http::header::AUTHORIZATION;
 use serde::Deserialize;
 use tokio::time::sleep;
 use tokio::time::timeout_at;
@@ -72,11 +73,19 @@ pub enum RemoteEnvironmentTransport {
     Direct,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryAuthMode {
+    Legacy,
+    ExecutorCredential,
+}
+
 #[derive(Clone)]
 struct EnvironmentRegistryClient {
     base_url: String,
     auth_provider: SharedAuthProvider,
+    auth_mode: RegistryAuthMode,
     http: RouteAwareClientPool,
+    http_direct: RouteAwareClientPool,
     connect_timeout: Duration,
     telemetry: ExecServerTelemetry,
 }
@@ -111,10 +120,16 @@ impl EnvironmentRegistryClient {
         Ok(Self {
             base_url,
             auth_provider,
+            auth_mode: RegistryAuthMode::Legacy,
             http: RouteAwareClientPool::new_without_redirects_or_request_logging(
-                http_client_factory,
+                http_client_factory.clone(),
                 ClientRouteClass::Api,
             ),
+            http_direct: RouteAwareClientPool::new_without_redirects_or_request_logging(
+                http_client_factory,
+                ClientRouteClass::Api,
+            )
+            .with_legacy_direct_proxy_and_custom_ca_fallback(),
             connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
             telemetry,
         })
@@ -161,15 +176,18 @@ impl EnvironmentRegistryClient {
             security_profile: NOISE_RELAY_SECURITY_PROFILE.to_string(),
             executor_public_key: executor_public_key.clone(),
         };
-        let response = timeout_at(deadline, async {
-            self.http
+        let (response, executor_credential) = timeout_at(deadline, async {
+            let (auth_headers, executor_credential) = self.resolve_auth().await?;
+            let response = self
+                .http_for_auth()
                 .post(url)
-                .headers(self.resolve_auth_headers().await?)
+                .headers(auth_headers)
                 .headers(current_trace_context_headers())
                 .json(&body)
                 .send()
                 .await
-                .map_err(ExecServerError::EnvironmentRegistryRequest)
+                .map_err(ExecServerError::EnvironmentRegistryRequest)?;
+            Ok((response, executor_credential))
         })
         .await
         .unwrap_or_else(|_| {
@@ -179,22 +197,30 @@ impl EnvironmentRegistryClient {
         })?;
         let status = response.status();
         // Read diagnostics within the same attempt budget, preserving a known error status.
-        let response: EnvironmentRegistryRegistrationResponse =
-            timeout_at(deadline, self.parse_json_response(response))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(match status {
-                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                            environment_registry_auth_error(status, "response body timed out")
-                        }
-                        status if !status.is_success() => {
-                            environment_registry_http_error(status, "response body timed out")
-                        }
-                        _ => ExecServerError::EnvironmentRegistryRequest(
-                            codex_http_client::RouteAwareRequestError::Timeout,
-                        ),
-                    })
-                })?;
+        let response: EnvironmentRegistryRegistrationResponse = timeout_at(deadline, async {
+            if let Some(credential) = executor_credential
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+            {
+                parse_executor_registration_response(response, credential).await
+            } else {
+                self.parse_json_response(response).await
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    environment_registry_auth_error(status, "response body timed out")
+                }
+                status if !status.is_success() => {
+                    environment_registry_http_error(status, "response body timed out")
+                }
+                _ => ExecServerError::EnvironmentRegistryRequest(
+                    codex_http_client::RouteAwareRequestError::Timeout,
+                ),
+            })
+        })?;
         if response.environment_id != environment_id {
             return Err(ExecServerError::Protocol(
                 "environment registry returned a different environment id".to_string(),
@@ -240,10 +266,11 @@ impl EnvironmentRegistryClient {
             &format!("/cloud/environment/{environment_id}/connect"),
         );
         let body = EnvironmentRegistryConnectRequest { harness_public_key };
+        let (auth_headers, _) = self.resolve_auth().await?;
         let response = self
-            .http
+            .http_for_auth()
             .post(url)
-            .headers(self.resolve_auth_headers().await?)
+            .headers(auth_headers)
             .headers(current_trace_context_headers())
             .json(&body)
             .timeout(self.connect_timeout)
@@ -279,15 +306,59 @@ impl EnvironmentRegistryClient {
         })
     }
 
-    async fn resolve_auth_headers(&self) -> Result<HeaderMap, ExecServerError> {
-        self.auth_provider
+    async fn resolve_auth(&self) -> Result<(HeaderMap, Option<HeaderValue>), ExecServerError> {
+        let mut headers = self
+            .auth_provider
             .resolve_auth_headers()
             .await
             .map_err(|error| {
                 ExecServerError::EnvironmentRegistryAuth(format!(
                     "failed to resolve environment registry authentication: {error}"
                 ))
-            })
+            })?;
+        let executor_credential = if self.auth_mode == RegistryAuthMode::ExecutorCredential {
+            // Scoped mode sends exactly one bearer and never accompanying account credentials.
+            let token = (headers.len() == 1)
+                .then(|| headers.get(AUTHORIZATION))
+                .flatten()
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .filter(|token| {
+                    !token.is_empty()
+                        && token.len() <= 16 * 1024
+                        && token.bytes().all(|byte| byte.is_ascii_graphic())
+                })
+                .ok_or_else(|| {
+                    ExecServerError::EnvironmentRegistryAuth(
+                        "invalid executor credential authorization".to_string(),
+                    )
+                })?;
+            let mut credential = HeaderValue::from_str(token).map_err(|_| {
+                ExecServerError::EnvironmentRegistryAuth(
+                    "invalid executor credential authorization".to_string(),
+                )
+            })?;
+            credential.set_sensitive(true);
+            if let Some(authorization) = headers.get_mut(AUTHORIZATION) {
+                authorization.set_sensitive(true);
+            }
+            direct::require_tls_or_loopback(&self.base_url, "https")?;
+            Some(credential)
+        } else {
+            None
+        };
+        Ok((headers, executor_credential))
+    }
+
+    fn http_for_auth(&self) -> &RouteAwareClientPool {
+        // A system proxy can otherwise receive a loopback HTTP credential in plaintext.
+        if self.auth_mode == RegistryAuthMode::ExecutorCredential
+            && url::Url::parse(&self.base_url).is_ok_and(|url| url.scheme() == "http")
+        {
+            &self.http_direct
+        } else {
+            &self.http
+        }
     }
 
     async fn parse_json_response<R>(&self, response: HttpResponse) -> Result<R, ExecServerError>
@@ -348,11 +419,12 @@ impl HarnessKeyValidator for RegistryHarnessKeyValidator {
             harness_public_key: harness_public_key.clone(),
             harness_key_authorization: authorization.to_string(),
         };
+        let (auth_headers, executor_credential) = self.client.resolve_auth().await?;
         let response = self
             .client
-            .http
+            .http_for_auth()
             .post(url)
-            .headers(self.client.resolve_auth_headers().await?)
+            .headers(auth_headers)
             .headers(current_trace_context_headers())
             .json(&body)
             .send()
@@ -375,7 +447,15 @@ impl HarnessKeyValidator for RegistryHarnessKeyValidator {
         let response = response
             .json::<EnvironmentRegistryHarnessKeyValidationResponse>()
             .await
-            .map_err(ExecServerError::EnvironmentRegistryRequest)?;
+            .map_err(|error| {
+                if executor_credential.is_some() {
+                    ExecServerError::Protocol(
+                        "invalid environment registry harness key validation response".to_string(),
+                    )
+                } else {
+                    ExecServerError::EnvironmentRegistryRequest(error)
+                }
+            })?;
         if !response.valid {
             return Err(ExecServerError::Protocol(
                 "environment registry rejected Noise relay harness key".to_string(),
@@ -526,6 +606,11 @@ fn static_bearer_auth_provider(
 }
 
 /// Configuration for registering an exec-server for remote use.
+///
+/// Scoped mode uses one `Authorization: Bearer <credential>` header with
+/// the Noise transport. It requires an HTTPS registry URL, except that HTTP is
+/// permitted for loopback. Scoped executor credentials are not supported by
+/// the Direct transport.
 #[derive(Clone)]
 pub struct RemoteEnvironmentConfig {
     pub base_url: String,
@@ -534,6 +619,7 @@ pub struct RemoteEnvironmentConfig {
     pub request_dispatch_mode: RequestDispatchMode,
     transport: RemoteEnvironmentTransport,
     auth_provider: SharedAuthProvider,
+    auth_mode: RegistryAuthMode,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
 }
@@ -547,6 +633,7 @@ impl std::fmt::Debug for RemoteEnvironmentConfig {
             .field("request_dispatch_mode", &self.request_dispatch_mode)
             .field("transport", &self.transport)
             .field("auth_provider", &"<redacted>")
+            .field("auth_mode", &self.auth_mode)
             .finish()
     }
 }
@@ -584,9 +671,22 @@ impl RemoteEnvironmentConfig {
             request_dispatch_mode: RequestDispatchMode::Inline,
             transport,
             auth_provider,
+            auth_mode: RegistryAuthMode::Legacy,
             telemetry: ExecServerTelemetry::default(),
             http_client_factory,
         })
+    }
+
+    /// Requires one environment-bound bearer from the auth provider, without account fallback.
+    pub fn with_executor_credential_auth(mut self) -> Result<Self, ExecServerError> {
+        if self.transport == RemoteEnvironmentTransport::Direct {
+            return Err(ExecServerError::EnvironmentRegistryConfig(
+                "direct transport does not support scoped executor credentials".to_string(),
+            ));
+        }
+        direct::require_tls_or_loopback(&self.base_url, "https")?;
+        self.auth_mode = RegistryAuthMode::ExecutorCredential;
+        Ok(self)
     }
 
     pub fn with_telemetry(mut self, telemetry: ExecServerTelemetry) -> Self {
@@ -687,12 +787,13 @@ where
     T: std::future::Future<Output = Result<(), ExecServerError>>,
 {
     ensure_rustls_crypto_provider();
-    let client = EnvironmentRegistryClient::new_with_telemetry(
+    let mut client = EnvironmentRegistryClient::new_with_telemetry(
         config.base_url.clone(),
         config.auth_provider.clone(),
         config.telemetry.clone(),
         config.http_client_factory.clone(),
     )?;
+    client.auth_mode = config.auth_mode;
     let run = run_loop(config, client);
     tokio::pin!(run, shutdown);
     tokio::select! {
@@ -892,6 +993,63 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
     format!("{base_url}/{}", path.trim_start_matches('/'))
 }
 
+async fn parse_executor_registration_response(
+    response: HttpResponse,
+    credential: &str,
+) -> Result<EnvironmentRegistryRegistrationResponse, ExecServerError> {
+    const SAFE_ERROR: &str = "invalid environment registry executor registration response";
+    let status = response.status();
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return Err(environment_registry_auth_error(
+            status,
+            "response body omitted",
+        ));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|_| ExecServerError::Protocol(SAFE_ERROR.to_string()))?;
+    if !status.is_success() {
+        // Only these fixed codes affect retry behavior. Registry diagnostics can echo the credential.
+        let code = serde_json::from_str::<RegistryErrorBody>(&body)
+            .ok()
+            .and_then(RegistryErrorBody::into_error)
+            .and_then(|error| error.code)
+            .filter(|code| {
+                matches!(
+                    code.as_str(),
+                    "registration_conflict" | "authentication_service_unavailable"
+                )
+            });
+        return Err(ExecServerError::EnvironmentRegistryHttp {
+            status,
+            code,
+            message: "environment registry executor registration failed".to_string(),
+        });
+    }
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| ExecServerError::Protocol(SAFE_ERROR.to_string()))?;
+    if body.contains(credential) || json_contains_executor_credential(&value, credential) {
+        return Err(ExecServerError::Protocol(SAFE_ERROR.to_string()));
+    }
+    serde_json::from_value(value).map_err(|_| ExecServerError::Protocol(SAFE_ERROR.to_string()))
+}
+
+fn json_contains_executor_credential(value: &serde_json::Value, credential: &str) -> bool {
+    match value {
+        serde_json::Value::String(value) => value.contains(credential),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_executor_credential(value, credential)),
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            key.contains(credential) || json_contains_executor_credential(value, credential)
+        }),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
 fn environment_registry_auth_error(status: StatusCode, body: &str) -> ExecServerError {
     let message = registry_error_message(body).unwrap_or_else(|| "empty error body".to_string());
     ExecServerError::EnvironmentRegistryAuth(format!(
@@ -992,6 +1150,349 @@ mod tests {
 
     fn static_registry_auth_provider() -> SharedAuthProvider {
         Arc::new(StaticRegistryAuthProvider)
+    }
+
+    struct ScopedExecutorAuth;
+
+    impl AuthProvider for ScopedExecutorAuth {
+        fn add_auth_headers(&self, headers: &mut HeaderMap) {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_static("Bearer synthetic-scoped-token"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_executor_credential_headers_are_never_sent() {
+        struct InvalidExecutorAuth(HeaderMap);
+
+        impl AuthProvider for InvalidExecutorAuth {
+            fn add_auth_headers(&self, headers: &mut HeaderMap) {
+                headers.extend(self.0.clone());
+            }
+        }
+
+        let server = MockServer::start().await;
+        let public_key = NoiseChannelIdentity::generate()
+            .expect("identity")
+            .public_key();
+        for credentials in [
+            vec![],
+            vec![(AUTHORIZATION, HeaderValue::from_static("Bearer "))],
+            vec![(
+                AUTHORIZATION,
+                HeaderValue::from_static("Basic synthetic-secret"),
+            )],
+            vec![(
+                AUTHORIZATION,
+                HeaderValue::from_bytes(b"Bearer synthetic-\xff-secret").expect("header value"),
+            )],
+            vec![
+                (
+                    AUTHORIZATION,
+                    HeaderValue::from_static("Bearer synthetic-first-secret"),
+                ),
+                (
+                    AUTHORIZATION,
+                    HeaderValue::from_static("Bearer synthetic-second-secret"),
+                ),
+            ],
+            vec![
+                (
+                    AUTHORIZATION,
+                    HeaderValue::from_static("Bearer synthetic-secret"),
+                ),
+                (
+                    HeaderName::from_static("chatgpt-account-id"),
+                    HeaderValue::from_static("account-id"),
+                ),
+            ],
+        ] {
+            let mut headers = HeaderMap::new();
+            for (name, value) in credentials {
+                headers.append(name, value);
+            }
+            let mut client = EnvironmentRegistryClient::new(
+                server.uri(),
+                Arc::new(InvalidExecutorAuth(headers)),
+            )
+            .expect("registry client");
+            client.auth_mode = RegistryAuthMode::ExecutorCredential;
+            let registration = client
+                .register_environment("environment-requested", &public_key)
+                .await
+                .expect_err("invalid credentials must be rejected");
+            assert!(matches!(
+                registration,
+                ExecServerError::EnvironmentRegistryAuth(_)
+            ));
+            assert!(!format!("{registration:?} {registration}").contains("synthetic"));
+
+            let validator = RegistryHarnessKeyValidator {
+                client,
+                environment_id: "environment-requested".to_string(),
+                executor_registration_id: "registration".to_string(),
+            };
+            let validation = validator
+                .validate_harness_key(&public_key, "harness-authorization")
+                .await
+                .expect_err("invalid credentials must be rejected");
+            assert!(matches!(
+                validation,
+                ExecServerError::EnvironmentRegistryAuth(_)
+            ));
+            assert!(!format!("{validation:?} {validation}").contains("synthetic"));
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_credentials_require_https_or_loopback() {
+        for (url, allowed) in [
+            ("https://registry.example", true),
+            ("http://localhost:8080", true),
+            ("http://127.0.0.1:8080", true),
+            ("http://[::1]:8080", true),
+            ("http://registry.example", false),
+            ("http://localhost.example", false),
+            ("not a url", false),
+        ] {
+            let mut client =
+                EnvironmentRegistryClient::new(url.to_string(), Arc::new(ScopedExecutorAuth))
+                    .expect("registry client");
+            client.auth_mode = RegistryAuthMode::ExecutorCredential;
+            assert_eq!(client.resolve_auth().await.is_ok(), allowed, "{url}");
+        }
+
+        let legacy = EnvironmentRegistryClient::new(
+            "http://registry.example".to_string(),
+            static_registry_auth_provider(),
+        )
+        .expect("registry client");
+        let (headers, credential) = legacy.resolve_auth().await.expect("legacy auth");
+        assert_eq!(headers[AUTHORIZATION], "Bearer registry-token");
+        assert_eq!(headers["ChatGPT-Account-ID"], "workspace-123");
+        assert!(credential.is_none());
+    }
+
+    #[tokio::test]
+    async fn insecure_registry_never_receives_executor_credentials() {
+        let proxy = MockServer::start().await;
+        let registry_url = "http://scoped-registry-proxy.invalid";
+        for endpoint in ["register", "validate"] {
+            let request_url =
+                format!("{registry_url}/cloud/environment/environment-requested/{endpoint}");
+            codex_http_client::cache_system_proxy_route_for_test(&request_url, proxy.uri());
+        }
+        let mut client = EnvironmentRegistryClient::new_with_telemetry(
+            registry_url.to_string(),
+            Arc::new(ScopedExecutorAuth),
+            ExecServerTelemetry::default(),
+            HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        )
+        .expect("registry client");
+        client.auth_mode = RegistryAuthMode::ExecutorCredential;
+        let public_key = NoiseChannelIdentity::generate()
+            .expect("identity")
+            .public_key();
+        let error = client
+            .register_environment("environment-requested", &public_key)
+            .await
+            .expect_err("registration must reject a non-loopback HTTP registry");
+        assert!(matches!(
+            error,
+            ExecServerError::EnvironmentRegistryConfig(_)
+        ));
+
+        let validator = RegistryHarnessKeyValidator {
+            client,
+            environment_id: "environment-requested".to_string(),
+            executor_registration_id: "registration".to_string(),
+        };
+        let error = validator
+            .validate_harness_key(&public_key, "harness-authorization")
+            .await
+            .expect_err("validation must reject a non-loopback HTTP registry");
+        assert!(matches!(
+            error,
+            ExecServerError::EnvironmentRegistryConfig(_)
+        ));
+        assert!(
+            proxy
+                .received_requests()
+                .await
+                .expect("proxy requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_loopback_registry_bypasses_a_configured_proxy() {
+        let registry = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        let public_key = NoiseChannelIdentity::generate()
+            .expect("identity")
+            .public_key();
+        for endpoint in ["register", "validate"] {
+            let request_url = format!(
+                "{}/cloud/environment/environment-requested/{endpoint}",
+                registry.uri()
+            );
+            codex_http_client::cache_system_proxy_route_for_test(&request_url, proxy.uri());
+        }
+        Mock::given(method("POST"))
+            .and(path("/cloud/environment/environment-requested/register"))
+            .and(header(AUTHORIZATION, "Bearer synthetic-scoped-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "environment_id": "environment-requested",
+                "url": "wss://rendezvous.test/",
+                "security_profile": NOISE_RELAY_SECURITY_PROFILE,
+                "executor_registration_id": "registration",
+            })))
+            .expect(1)
+            .mount(&registry)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/cloud/environment/environment-requested/validate"))
+            .and(header(AUTHORIZATION, "Bearer synthetic-scoped-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})),
+            )
+            .expect(1)
+            .mount(&registry)
+            .await;
+        let http_client_factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
+        assert!(matches!(
+            http_client_factory.resolve_proxy_route(&format!(
+                "{}/cloud/environment/environment-requested/register",
+                registry.uri()
+            )),
+            codex_http_client::OutboundProxyRoute::Proxy { .. }
+        ));
+        let mut client = EnvironmentRegistryClient::new_with_telemetry(
+            registry.uri(),
+            Arc::new(ScopedExecutorAuth),
+            ExecServerTelemetry::default(),
+            http_client_factory,
+        )
+        .expect("registry client");
+        client.auth_mode = RegistryAuthMode::ExecutorCredential;
+        let (headers, credential) = client.resolve_auth().await.expect("scoped auth");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[AUTHORIZATION], "Bearer synthetic-scoped-token");
+        assert!(headers[AUTHORIZATION].is_sensitive());
+        let credential = credential.expect("raw executor credential");
+        assert_eq!(credential, "synthetic-scoped-token");
+        assert!(credential.is_sensitive());
+        client
+            .register_environment("environment-requested", &public_key)
+            .await
+            .expect("register directly");
+        RegistryHarnessKeyValidator {
+            client,
+            environment_id: "environment-requested".to_string(),
+            executor_registration_id: "registration".to_string(),
+        }
+        .validate_harness_key(&public_key, "harness-authorization")
+        .await
+        .expect("validate directly");
+        registry.verify().await;
+        assert!(
+            proxy
+                .received_requests()
+                .await
+                .expect("proxy requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_credential_is_never_returned_in_registry_diagnostics() {
+        const TOKEN: &str = "synthetic-scoped-registry-secret";
+        struct ExecutorAuth;
+        impl AuthProvider for ExecutorAuth {
+            fn add_auth_headers(&self, headers: &mut HeaderMap) {
+                let mut credential =
+                    HeaderValue::from_str(&format!("Bearer {TOKEN}")).expect("bearer");
+                credential.set_sensitive(true);
+                headers.insert(AUTHORIZATION, credential);
+            }
+        }
+        let encoded_echo = serde_json::json!({
+            "environment_id": "environment-requested",
+            "url": "wss://rendezvous.test/",
+            "security_profile": NOISE_RELAY_SECURITY_PROFILE,
+            "executor_registration_id": TOKEN,
+        })
+        .to_string()
+        .replace("synthetic", "\\u0073ynthetic");
+        for (status, body) in [
+            (401, format!(r#"{{"error":{{"message":"{TOKEN}"}}}}"#)),
+            (
+                502,
+                format!(
+                    r#"{{"detail":{{"code":"authentication_service_unavailable","message":"{TOKEN}"}}}}"#
+                ),
+            ),
+            (
+                500,
+                format!(r#"{{"error":{{"code":"{TOKEN}","message":"{TOKEN}"}}}}"#),
+            ),
+            (200, format!(r#"{{"environment_id":"{TOKEN}"}}"#)),
+            (200, encoded_echo),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/cloud/environment/environment-requested/register"))
+                .and(header(AUTHORIZATION, format!("Bearer {TOKEN}")))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body.clone()))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/cloud/environment/environment-requested/validate"))
+                .and(header(AUTHORIZATION, format!("Bearer {TOKEN}")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_string(format!(r#"{{"valid":"{TOKEN}"}}"#)),
+                )
+                .mount(&server)
+                .await;
+            let mut client = EnvironmentRegistryClient::new(server.uri(), Arc::new(ExecutorAuth))
+                .expect("registry client");
+            client.auth_mode = RegistryAuthMode::ExecutorCredential;
+            let public_key = NoiseChannelIdentity::generate()
+                .expect("identity")
+                .public_key();
+            let registration = client
+                .register_environment("environment-requested", &public_key)
+                .await
+                .expect_err("registry echoes cannot enter diagnostics");
+            assert!(!format!("{registration:?} {registration}").contains(TOKEN));
+            if status == 502 {
+                assert!(matches!(
+                    &registration,
+                    ExecServerError::EnvironmentRegistryHttp { code: Some(code), .. }
+                        if code == "authentication_service_unavailable"
+                ));
+            }
+            let validator = RegistryHarnessKeyValidator {
+                client,
+                environment_id: "environment-requested".to_string(),
+                executor_registration_id: "registration".to_string(),
+            };
+            let validation = validator
+                .validate_harness_key(&public_key, "harness-authorization")
+                .await
+                .expect_err("invalid validation response");
+            assert!(!format!("{validation:?} {validation}").contains(TOKEN));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1333,6 +1834,10 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.transport, RemoteEnvironmentTransport::Direct);
+        assert!(matches!(
+            config.with_executor_credential_auth(),
+            Err(ExecServerError::EnvironmentRegistryConfig(_))
+        ));
     }
 
     #[test]

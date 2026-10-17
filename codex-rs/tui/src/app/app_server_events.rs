@@ -537,7 +537,8 @@ impl App {
 
         #[cfg(any(target_os = "windows", test))]
         if let ServerNotification::WindowsSandboxSetupCompleted(result) = notification {
-            let Some((mode, preset, profile_selection)) = self.windows_sandbox.pending_setup.take()
+            let Some((mode, preset, profile_selection)) =
+                self.windows_sandbox.pending_setup.clone()
             else {
                 return;
             };
@@ -550,7 +551,6 @@ impl App {
                 }
             };
             if result.mode != expected_mode {
-                self.windows_sandbox.pending_setup = Some((mode, preset, profile_selection));
                 return;
             }
             if result.success {
@@ -567,10 +567,18 @@ impl App {
                         profile_selection,
                     });
             } else {
+                self.windows_sandbox.pending_setup = None;
                 self.chat_widget.clear_windows_sandbox_setup_status();
                 self.windows_sandbox.setup_started_at = None;
-                self.chat_widget
-                    .retain_input_after_failed_permission_selection();
+                if self
+                    .chat_widget
+                    .recover_inline_permission_profile_selection()
+                {
+                    self.app_event_tx.send(AppEvent::SettingsSelectionClosed);
+                } else {
+                    self.chat_widget
+                        .retain_input_after_failed_permission_selection();
+                }
                 self.chat_widget.add_error_message(format!(
                     "Windows sandbox setup failed: {}",
                     result.error.unwrap_or_else(|| "unknown error".to_string())

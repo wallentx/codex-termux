@@ -38,6 +38,7 @@ impl LocalAgentRuntime {
         if !matches!(
             (namespace.as_str(), name.as_str()),
             ("codex_app" | "codex_tui", "send_message_to_thread")
+                | ("codex_app", "create_thread")
                 | ("cloud_threads", "send_message")
         ) {
             return None;

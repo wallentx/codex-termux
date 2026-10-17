@@ -50,6 +50,7 @@ pub(super) fn parse(header: &str, body: &[&str]) -> Result<Graph, RenderError> {
                 if let Some(after) = rest.strip_prefix('|') {
                     let (text, remaining) = delimited_label(after, "|")?;
                     label = flowchart_label(text)?.to_owned();
+                    check_label(&label)?;
                     rest = remaining;
                 }
                 (source, target, dashed)
@@ -71,6 +72,7 @@ pub(super) fn parse(header: &str, body: &[&str]) -> Result<Graph, RenderError> {
                     .strip_prefix('>')
                     .ok_or(RenderError::Unsupported)?;
                 label = flowchart_label(text.trim())?.to_owned();
+                check_label(&label)?;
                 ('─', '◄', dashed)
             };
             let to = nodes(&mut rest, &mut graph)?;
@@ -137,13 +139,22 @@ fn node(rest: &mut &str, graph: &mut Graph) -> Result<usize, RenderError> {
     let index = graph.node(id)?;
     if let Some((open, close, shape)) = declaration {
         let (label, remaining) = delimited_label(&rest[open.len()..], close)?;
-        let label = flowchart_label(label)?;
+        let label = flowchart_label(label)?
+            .replace("<br>", "\n")
+            .replace("<br/>", "\n")
+            .replace("<br />", "\n");
+        if label.trim().is_empty() {
+            return Err(RenderError::Unsupported);
+        }
+        for line in label.split('\n').filter(|line| !line.is_empty()) {
+            check_label(line)?;
+        }
         *rest = remaining;
         let node = &mut graph.nodes[index];
         if node.declared && (node.label != label || node.shape != shape) {
             return Err(RenderError::Unsupported);
         }
-        node.label = label.to_owned();
+        node.label = label;
         node.shape = shape;
         node.declared = true;
     }
@@ -166,7 +177,6 @@ fn flowchart_label(label: &str) -> Result<&str, RenderError> {
     if label.contains('"') {
         return Err(RenderError::Unsupported);
     }
-    check_label(label)?;
     Ok(label)
 }
 

@@ -30,6 +30,9 @@ pub struct HookStateToml {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_hash: Option<String>,
+    /// Approved plugin contents; kept separate for declaration-only clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_content_hash: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

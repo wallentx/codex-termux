@@ -662,9 +662,11 @@ impl ContextManager {
         &self,
         base_instructions: &BaseInstructions,
     ) -> Option<i64> {
-        // Incremental windows already account for their recorded base instructions below.
-        let has_recorded_instructions =
-            self.raw_items().any(BaseInstructionsFragment::matches_item);
+        // Incremental windows supply instructions through history, including an empty base.
+        let has_recorded_instructions = self.has_tool_declarations()
+            || self
+                .raw_items()
+                .any(|item| BaseInstructionsFragment::text_from_item(item).is_some());
         let base_tokens = if has_recorded_instructions {
             0
         } else {

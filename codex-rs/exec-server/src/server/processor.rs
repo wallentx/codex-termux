@@ -327,6 +327,16 @@ mod tests {
     use crate::server::session_registry::SessionRegistry;
 
     impl super::ConnectionProcessor {
+        // Discovery tests supply fixture homes without changing the process environment.
+        pub(crate) async fn seed_capability_locations(
+            &self,
+            request: crate::discover_v2::capability_locations::CapabilityLocationRequest,
+        ) -> std::io::Result<()> {
+            self.capability_manager
+                .seed_prewarmed_locations(request)
+                .await
+        }
+
         // Connection-only tests do not prewarm or scan the real user home.
         pub(crate) fn new(runtime_paths: ExecServerRuntimeOptions) -> Self {
             let telemetry = crate::ExecServerTelemetry::default();

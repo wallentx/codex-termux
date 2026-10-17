@@ -1460,6 +1460,12 @@ impl BottomPaneView for RequestUserInputOverlay {
         true
     }
 
+    fn program_status_blocked_kind(
+        &self,
+    ) -> Option<crate::terminal_program_status::ProgramStatusKind> {
+        Some(crate::terminal_program_status::ProgramStatusKind::Question)
+    }
+
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         if self.confirm_unanswered_active() {
             self.close_unanswered_confirmation();

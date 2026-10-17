@@ -119,6 +119,22 @@ impl TextArea {
         self.vim_commands.replace_steps.clear();
     }
 
+    /// Remove a newly typed prompt marker without losing its Vim Replace recovery step.
+    pub(in crate::bottom_pane) fn absorb_prompt_prefix(&mut self, prefix_len: usize) {
+        if self.is_vim_replace_mode()
+            && self.cursor_pos == prefix_len
+            && let Some(step) = self.vim_commands.replace_steps.last_mut()
+            && step.cursor_before == 0
+            && step.start == 0
+            && step.inserted_len == prefix_len
+        {
+            step.inserted_len = 0;
+            self.replace_range_preserving_recovery(0..prefix_len, "");
+        } else {
+            self.replace_range(0..prefix_len, "");
+        }
+    }
+
     pub(in crate::bottom_pane) fn replace_vim_text(&mut self, text: &str) {
         for grapheme in text.graphemes(/*is_extended*/ true) {
             let cursor_before = self.cursor_pos;

@@ -4,6 +4,8 @@ pub(crate) mod dispatcher;
 mod matcher;
 pub(crate) mod mcp_runner;
 pub(crate) mod output_parser;
+mod plugin_fingerprint;
+mod plugin_trust;
 pub(crate) mod schema_loader;
 
 pub(crate) use matcher::HookMatcher;
@@ -62,6 +64,7 @@ pub(crate) struct CommandShell {
 pub(crate) struct ConfiguredHandler {
     /// Internally admitted cleanup hook, enabled independently of per-hook state.
     pub builtin: bool,
+    pub plugin_trust: Option<plugin_trust::PluginHookTrust>,
     pub event_name: codex_protocol::protocol::HookEventName,
     pub matcher: Option<HookMatcher>,
     pub timeout_sec: u64,
@@ -131,6 +134,7 @@ pub(crate) enum ConfiguredHandlerKind {
 
 #[derive(Debug)]
 pub(crate) struct HandlerRunResult {
+    pub context_metadata: codex_protocol::models::ContentItemMetadata,
     pub started_at: i64,
     pub completed_at: i64,
     pub duration_ms: i64,
@@ -255,6 +259,7 @@ impl ClaudeHooksEngine {
             plugin_hook_sources,
             plugin_hook_load_warnings,
             bypass_hook_trust,
+            discovery::DiscoveryMode::Runtime,
         );
         if !enabled {
             discovered.handlers.retain(|handler| handler.builtin);
@@ -334,6 +339,7 @@ impl ClaudeHooksEngine {
                 }
                 handlers.push(ConfiguredHandler {
                     builtin: true,
+                    plugin_trust: None,
                     event_name,
                     matcher: None,
                     timeout_sec: timeout_sec.unwrap_or(5).max(1),

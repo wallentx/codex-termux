@@ -85,6 +85,10 @@ impl DynamicToolHandler {
 }
 
 impl ToolExecutor<ToolInvocation> for DynamicToolHandler {
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     fn tool_name(&self) -> ToolName {
         self.tool_name.clone()
     }

@@ -140,7 +140,7 @@ async fn windows_sandbox_setup_completion_requires_matching_pending_mode() -> Re
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
     app.chat_widget.windows_sandbox_local_server = true;
     while events.try_recv().is_ok() {}
-    let app_server =
+    let mut app_server =
         crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
     let preset = builtin_approval_presets()
         .into_iter()
@@ -148,6 +148,18 @@ async fn windows_sandbox_setup_completion_requires_matching_pending_mode() -> Re
         .expect("auto preset");
     app.windows_sandbox.pending_setup = Some((WindowsSandboxEnableMode::Elevated, preset, None));
     app.windows_sandbox.setup_started_at = Some(Instant::now());
+    app.chat_widget.select_permission_profile(":workspace");
+    let AppEvent::FetchPermissionProfiles { request_id, .. } = events.try_recv()? else {
+        panic!("expected profile discovery");
+    };
+    app.chat_widget.on_permission_profiles_loaded(
+        request_id,
+        Ok(crate::permission_discovery::PermissionDiscovery::local(
+            app.chat_widget.config_ref(),
+        )),
+    );
+    while events.try_recv().is_ok() {}
+    let mut tui = crate::tui::test_support::make_test_tui()?;
 
     for mode in [
         WindowsSandboxSetupMode::Unelevated,
@@ -166,10 +178,7 @@ async fn windows_sandbox_setup_completion_requires_matching_pending_mode() -> Re
             )),
         )
         .await;
-        assert_eq!(
-            app.windows_sandbox.pending_setup.is_some(),
-            mode == WindowsSandboxSetupMode::Unelevated
-        );
+        assert!(app.windows_sandbox.pending_setup.is_some());
     }
     assert!(!app.chat_widget.windows_sandbox_elevated_setup_complete);
     assert!(app.windows_sandbox_blocks_thread_switch());
@@ -181,6 +190,14 @@ async fn windows_sandbox_setup_completion_requires_matching_pending_mode() -> Re
         })
     ));
     assert!(events.try_recv().is_err());
+
+    // Completion can overtake this close event; selection still belongs to the queued handler.
+    app.handle_event(&mut tui, &mut app_server, AppEvent::SettingsSelectionClosed)
+        .await?;
+    assert!(
+        app.chat_widget
+            .inline_permission_profile_selection_pending()
+    );
 
     app_server.shutdown().await?;
     Ok(())
@@ -251,6 +268,7 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
     assert_eq!(
         App::should_wait_for_initial_session(&SessionSelection::Resume(
             crate::resume_picker::SessionTarget {
+                backend_id: crate::backend_id::BackendId::new(),
                 path: Some(PathBuf::from("/tmp/restore")),
                 thread_id: ThreadId::new(),
                 cwd: None,
@@ -262,6 +280,7 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
     assert_eq!(
         App::should_wait_for_initial_session(&SessionSelection::Fork(
             crate::resume_picker::SessionTarget {
+                backend_id: crate::backend_id::BackendId::new(),
                 path: Some(PathBuf::from("/tmp/fork")),
                 thread_id: ThreadId::new(),
                 cwd: None,
@@ -275,12 +294,14 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
 #[test]
 fn startup_paused_goal_prompt_gate_is_only_for_quiet_resume() {
     let resume = SessionSelection::Resume(crate::resume_picker::SessionTarget {
+        backend_id: crate::backend_id::BackendId::new(),
         path: Some(PathBuf::from("/tmp/restore")),
         thread_id: ThreadId::new(),
         cwd: None,
         history_mode: None,
     });
     let fork = SessionSelection::Fork(crate::resume_picker::SessionTarget {
+        backend_id: crate::backend_id::BackendId::new(),
         path: Some(PathBuf::from("/tmp/fork")),
         thread_id: ThreadId::new(),
         cwd: None,
@@ -351,6 +372,7 @@ fn startup_waiting_gate_holds_active_thread_events_until_primary_thread_configur
 fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
     let wait_for_resume = App::should_wait_for_initial_session(&SessionSelection::Resume(
         crate::resume_picker::SessionTarget {
+            backend_id: crate::backend_id::BackendId::new(),
             path: Some(PathBuf::from("/tmp/restore")),
             thread_id: ThreadId::new(),
             cwd: None,
@@ -366,6 +388,7 @@ fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
     );
     let wait_for_fork = App::should_wait_for_initial_session(&SessionSelection::Fork(
         crate::resume_picker::SessionTarget {
+            backend_id: crate::backend_id::BackendId::new(),
             path: Some(PathBuf::from("/tmp/fork")),
             thread_id: ThreadId::new(),
             cwd: None,
@@ -923,6 +946,7 @@ async fn unattended_modals_survive_unfinished_terminal_input() -> Result<()> {
     app.render_startup_frame(&mut tui, &app_event_rx)?;
     assert!(app.begin_reconnect());
     let connected = super::super::reconnect::reconnect(
+        app_server.backend_id(),
         app.app_server_target.clone(),
         app.config.clone(),
         app.local_settings.clone(),
@@ -1399,6 +1423,7 @@ async fn remote_overview_startup_hides_disabled_older_server_notice() -> Result<
         .await
     });
     let session = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
         crate::connect_remote_app_server(endpoint).await?,
         ThreadParamsMode::Remote,
     );
@@ -1779,6 +1804,7 @@ async fn ignore_same_thread_resume_reports_noop_for_current_thread() {
     while app_event_rx.try_recv().is_ok() {}
 
     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
+        backend_id: crate::backend_id::BackendId::new(),
         path: Some(test_path_buf("/tmp/project")),
         thread_id,
         cwd: None,
@@ -1805,6 +1831,7 @@ async fn ignore_same_thread_resume_allows_reattaching_displayed_inactive_thread(
     app.chat_widget.handle_thread_session(session);
 
     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
+        backend_id: crate::backend_id::BackendId::new(),
         path: Some(test_path_buf("/tmp/project")),
         thread_id,
         cwd: None,
@@ -1832,6 +1859,7 @@ async fn ignore_same_thread_resume_allows_retrying_read_only_view() -> Result<()
 
     assert!(
         !app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
+            backend_id: crate::backend_id::BackendId::new(),
             path: Some(test_path_buf("/tmp/project")),
             thread_id,
             cwd: None,
@@ -1932,9 +1960,21 @@ async fn windows_sandbox_config_refresh_uses_connected_server() -> Result<()> {
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.chat_widget.windows_sandbox_local_server = true;
     app.chat_widget.windows_sandbox_host = WindowsSandboxHost::Local;
-    Box::pin(app.handle_event(&mut tui, &mut recovered, AppEvent::OpenPermissionsPopup)).await?;
+    while events.try_recv().is_ok() {}
+    Box::pin(app.handle_event(
+        &mut tui,
+        &mut recovered,
+        AppEvent::ResolvePermissionProfile {
+            profile_id: codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string(),
+        },
+    ))
+    .await?;
     assert_eq!(app.chat_widget.windows_sandbox_config, loaded_config);
     assert!(app.chat_widget.has_active_view());
+    assert!(matches!(
+        events.try_recv(),
+        Ok(AppEvent::FetchPermissionProfiles { .. })
+    ));
     recovered.shutdown().await?;
     server.shutdown().await?;
     Ok(())

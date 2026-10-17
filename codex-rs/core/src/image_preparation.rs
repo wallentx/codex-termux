@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::config::ManagedFeatures;
 use crate::context::ContextualUserFragment;
 use crate::context::ImageResizeNotice;
@@ -107,6 +109,8 @@ pub(crate) enum ImagePreparationError {
 }
 
 impl ImagePreparationError {
+    pub(crate) const KIND: &str = "images.preparation_error";
+
     fn placeholder(&self) -> &'static str {
         match self {
             ImagePreparationError::RemoteUrlUnsupported => REMOTE_IMAGE_URL_PLACEHOLDER,
@@ -283,9 +287,10 @@ async fn prepare_message_content(
                 Ok(_) => {}
                 Err(error) => {
                     warn!(%error, "failed to prepare message image");
-                    *item = AnnotatedContent::input_text(
+                    *item = AnnotatedContent::text(
                         error.placeholder(),
-                        ContentItemKind("images.preparation_error".to_string()),
+                        ContentItemKind(ImagePreparationError::KIND.to_string()),
+                        codex_protocol::models::ContentItemMetadata::harness(),
                     );
                 }
             }
@@ -367,6 +372,7 @@ async fn prepare_image(
         thread_id: origin.thread_id.to_owned(),
         ephemeral: origin.ephemeral,
         file_name: None,
+        tags: HashMap::new(),
         data: prepared.encoded.bytes.to_vec(),
     };
     *image = match image_store.upload(request).await {

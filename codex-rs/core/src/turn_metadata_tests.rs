@@ -684,7 +684,7 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
         /*auto_review_enabled*/ false,
         &model_info_from_slug("gpt-5.4"),
     );
-    state.set_responsesapi_client_metadata(HashMap::from([
+    let client_metadata = HashMap::from([
         (
             LEGACY_CODE_MODE_TOOL_NAMES_KEY.to_string(),
             "client-supplied".to_string(),
@@ -722,7 +722,11 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
             "true".to_string(),
         ),
         (NODE_REPL_DISABLED_KEY.to_string(), "true".to_string()),
-    ]));
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
 
     let header = test_turn_metadata_header(&state);
     let json: Value = serde_json::from_str(&header).expect("json");
@@ -792,7 +796,7 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
     state.set_parent_turn_id("parent-turn-a".to_string());
     state.set_root_turn_id("root-turn-a".to_string());
     state.set_turn_trigger("goal".to_string());
-    state.set_responsesapi_client_metadata(HashMap::from([
+    let client_metadata = HashMap::from([
         (
             "codex_security_surface".to_string(),
             "client-supplied".to_string(),
@@ -861,7 +865,11 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
             "turn_started_at_unix_ms".to_string(),
             "client-supplied".to_string(),
         ),
-    ]));
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
     state.set_turn_started_at_unix_ms(/*turn_started_at_unix_ms*/ 1_700_000_000_123);
     let header = test_turn_metadata_header(&state);
     assert!(header.is_ascii());
@@ -964,6 +972,14 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
     assert!(meta.get(WINDOW_ID_KEY).is_none());
     assert!(meta.get("codex_security_surface").is_none());
     assert!(meta.get(ANALYTICS_ENABLED_KEY).is_none());
+    let extension_meta = state
+        .current_meta_value_for_extension_request(test_mcp_turn_metadata_context())
+        .expect("extension metadata should be present");
+    assert_eq!(extension_meta["codex_security_surface"], "sdk");
+    assert_eq!(extension_meta["source"], " Configured_Source ");
+    assert_eq!(extension_meta[TURN_TRIGGER_KEY], "goal");
+    assert_eq!(extension_meta["model"], "gpt-5.4");
+    assert!(extension_meta.get(TOOL_NAMESPACES_INFO_KEY).is_none());
     assert_eq!(state.workspace_kind().as_deref(), Some("projectless"));
     assert_eq!(
         (state.turn_trigger(), state.codex_turn_source()),
@@ -996,12 +1012,15 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
                 .into_iter()
                 .collect(),
         );
-        state.set_responsesapi_client_metadata(
-            client
-                .map(|source| ("source".to_string(), source))
-                .into_iter()
-                .collect(),
-        );
+        state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+            replacement: Some(
+                client
+                    .map(|source| ("source".to_string(), source))
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        });
         assert_eq!(state.codex_turn_source(), expected);
     }
 }
@@ -1071,13 +1090,17 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests(
         serde_json::from_str(&test_turn_responses_metadata_json(&state, "thread-a:1"))
             .expect("json");
     assert!(ordinary_json.get("misalignment_override").is_none());
-    state.set_responsesapi_client_metadata(HashMap::from([
+    let client_metadata = HashMap::from([
         ("compaction".to_string(), "client-supplied".to_string()),
         (
             "misalignment_override".to_string(),
             continuation.to_string(),
         ),
-    ]));
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
 
     let mcp_metadata = state
         .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())

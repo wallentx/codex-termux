@@ -107,12 +107,18 @@ pub fn connector_runtime_cache_path(codex_home: &Path, auth: Option<&CodexAuth>)
 #[derive(Debug, Clone)]
 pub struct ConnectorRuntimeSnapshot<T> {
     tools: Arc<[T]>,
+    tool_list_meta: Option<Arc<serde_json::Value>>,
+    discovery_scope: Vec<String>,
     refreshed_at: SystemTime,
     generation: u64,
     tools_version: u64,
 }
 
 impl<T> ConnectorRuntimeSnapshot<T> {
+    pub fn shared_tool_list_meta(&self) -> Option<Arc<serde_json::Value>> {
+        self.tool_list_meta.as_ref().map(Arc::clone)
+    }
+
     pub fn tools(&self) -> &[T] {
         &self.tools
     }
@@ -258,6 +264,19 @@ impl<T: ConnectorRuntimePayload> ConnectorRuntimeContext<T> {
         self.entry.current_snapshot.load_full()
     }
 
+    pub fn current_catalog_snapshot(&self) -> Option<Arc<ConnectorRuntimeSnapshot<T>>> {
+        let catalog = self.live_catalog.as_ref()?;
+        catalog.updates.borrow().clone().or_else(|| {
+            let scope: Vec<_> = catalog
+                .scope
+                .iter()
+                .map(|part| persistence::sha1_hex(part))
+                .collect();
+            self.current_snapshot()
+                .filter(|snapshot| snapshot.discovery_scope.starts_with(&scope))
+        })
+    }
+
     pub fn has_current_tools(&self) -> bool {
         self.current_snapshot().is_some()
     }
@@ -298,18 +317,21 @@ impl<T: ConnectorRuntimePayload> ConnectorRuntimeContext<T> {
         ticket: ConnectorRuntimeFetchTicket,
         server_info: &McpServerInfo,
         tools: Vec<T>,
+        tool_list_meta: Option<Arc<serde_json::Value>>,
     ) -> Arc<ConnectorRuntimeSnapshot<T>> {
         match self.entry.disk_cache {
             ConnectorRuntimeDiskCache::Enabled => self.publish_runtime_if_newest_accepted_with(
                 ticket,
                 server_info,
                 tools,
+                tool_list_meta,
                 persist_codex_apps_cache,
             ),
             ConnectorRuntimeDiskCache::Disabled => self.publish_runtime_if_newest_accepted_with(
                 ticket,
                 server_info,
                 tools,
+                tool_list_meta,
                 |_, _, _| {},
             ),
         }
@@ -320,6 +342,7 @@ impl<T: ConnectorRuntimePayload> ConnectorRuntimeContext<T> {
         ticket: ConnectorRuntimeFetchTicket,
         server_info: &McpServerInfo,
         tools: Vec<T>,
+        tool_list_meta: Option<Arc<serde_json::Value>>,
         persist: impl FnOnce(&ConnectorRuntimeContext<T>, &McpServerInfo, &ConnectorRuntimeSnapshot<T>),
     ) -> Arc<ConnectorRuntimeSnapshot<T>> {
         let publish_start = Instant::now();
@@ -337,6 +360,18 @@ impl<T: ConnectorRuntimePayload> ConnectorRuntimeContext<T> {
             _ => (tools.into(), ticket.generation),
         };
         let snapshot = Arc::new(ConnectorRuntimeSnapshot {
+            tool_list_meta,
+            discovery_scope: self
+                .live_catalog
+                .as_ref()
+                .map(|catalog| {
+                    catalog
+                        .scope
+                        .iter()
+                        .map(|part| persistence::sha1_hex(part))
+                        .collect()
+                })
+                .unwrap_or_default(),
             tools,
             tools_version,
             refreshed_at: SystemTime::now(),
@@ -380,17 +415,6 @@ impl<T: ConnectorRuntimePayload> ConnectorRuntimeContext<T> {
             &[("source", ticket.source.as_str()), ("result", "published")],
         );
         snapshot
-    }
-
-    pub fn publish_if_newest_accepted(
-        &self,
-        ticket: ConnectorRuntimeFetchTicket,
-        server_info: &McpServerInfo,
-        tools: Vec<T>,
-    ) -> Vec<T> {
-        self.publish_runtime_if_newest_accepted(ticket, server_info, tools)
-            .tools
-            .to_vec()
     }
 }
 

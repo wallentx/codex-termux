@@ -456,7 +456,7 @@ async fn queued_slash_menu_cancel_drains_next_input() {
     )
     .await;
     assert_cancelled_queued_menu_drains_next_input(
-        "/permissions",
+        "/permissions   ",
         "Update Model Permissions",
         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
     )
@@ -680,7 +680,6 @@ async fn queued_unknown_slash_reports_error_when_dequeued() {
     );
     assert!(chat.input_queue.queued_user_messages.is_empty());
 
-    chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ true);
     chat.set_local_worktree_operations(/*enabled*/ false);
     let drain = chat.submit_queued_slash_prompt(UserMessage::from("/worktree extra").into());
     assert_matches!(drain, QueueDrain::Continue);

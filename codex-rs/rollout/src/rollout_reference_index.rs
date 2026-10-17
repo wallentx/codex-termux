@@ -71,6 +71,22 @@ impl RolloutReferenceIndex {
         Self::scan_paths(vec![codex_home.join(SESSIONS_SUBDIR)], Some(&thread_ids)).await
     }
 
+    /// Scans archived files whose canonical filenames belong to the requested threads.
+    ///
+    /// Metadata still determines ownership among the candidates. Reference counts are partial
+    /// and must not be used to decide whether a rollout can be deleted or compressed.
+    pub async fn scan_archived_threads(
+        codex_home: &Path,
+        thread_ids: &[ThreadId],
+    ) -> io::Result<Self> {
+        let thread_ids = thread_ids.iter().copied().collect();
+        Self::scan_paths(
+            vec![codex_home.join(ARCHIVED_SESSIONS_SUBDIR)],
+            Some(&thread_ids),
+        )
+        .await
+    }
+
     async fn scan_paths(
         mut stack: Vec<PathBuf>,
         thread_ids: Option<&HashSet<ThreadId>>,

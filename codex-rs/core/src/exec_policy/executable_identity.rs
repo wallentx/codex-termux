@@ -3,6 +3,7 @@ use super::ExecPolicyCommandOrigin;
 use super::ExecPolicyCommands;
 use super::ExecPolicyManager;
 use super::commands_for_exec_policy_for_platform;
+use super::powershell_command_origin;
 use crate::shell::Shell;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use codex_shell_command::is_dangerous_command::DangerousCommandPlatform;
@@ -27,11 +28,18 @@ impl ExecPolicyManager {
 
         let mut policy_commands = if command_platform == DangerousCommandPlatform::Windows {
             match extract_powershell_command(command) {
-                Some((_, script)) => ExecPolicyCommands {
-                    commands: parse_powershell_script_into_plain_commands(script)
-                        .unwrap_or_else(|| vec![command.to_vec()]),
-                    command_origin: ExecPolicyCommandOrigin::PowerShell,
-                },
+                Some((_, script)) => {
+                    let commands = parse_powershell_script_into_plain_commands(script);
+                    let command_origin = commands
+                        .as_ref()
+                        .map_or(ExecPolicyCommandOrigin::PowerShell, |commands| {
+                            powershell_command_origin(script, commands)
+                        });
+                    ExecPolicyCommands {
+                        commands: commands.unwrap_or_else(|| vec![command.to_vec()]),
+                        command_origin,
+                    }
+                }
                 None => commands_for_exec_policy_for_platform(command, command_platform),
             }
         } else {

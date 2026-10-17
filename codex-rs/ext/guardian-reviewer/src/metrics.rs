@@ -46,6 +46,7 @@ pub(crate) fn emit_guardian_review_metrics(
     };
     let mut counter_tag_refs = tag_refs.clone();
     counter_tag_refs.extend(mcp_tags.iter().map(|(key, value)| (*key, value.as_str())));
+    counter_tag_refs.push(("context_changed", bool_tag(result.context_changed)));
     session_telemetry.counter(
         GUARDIAN_REVIEW_COUNT_METRIC,
         /*inc*/ 1,
@@ -463,6 +464,7 @@ mod tests {
         ]);
         let mut expected_counter_tags = expected_base_tags.clone();
         expected_counter_tags.extend(expected_mcp_tags);
+        expected_counter_tags.insert("context_changed".to_string(), "false".to_string());
         assert_eq!((attrs, value), (expected_counter_tags, 1));
 
         assert_eq!(

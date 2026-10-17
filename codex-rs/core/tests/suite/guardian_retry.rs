@@ -4,10 +4,13 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_core::config::Constrained;
 use codex_core::context::UserGoalUpdate;
+use codex_protocol::AgentPath;
 use codex_protocol::approvals::GuardianAssessmentStatus;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use core_test_support::responses::*;
 use core_test_support::skip_if_no_network;
@@ -38,6 +41,7 @@ async fn guardian_retry_executes_only_after_a_completed_approval() -> Result<()>
     });
     let test = builder.build_with_auto_env(&server).await?;
     let responses = vec![
+        sse(vec![ev_completed("waiting-for-parent")]),
         sse(vec![
             ev_function_call(
                 "write-marker",
@@ -71,13 +75,21 @@ async fn guardian_retry_executes_only_after_a_completed_approval() -> Result<()>
         sse(vec![ev_completed("parent-done")]),
     ];
     let requests = mount_sse_sequence(&server, responses).await;
+    test.submit_text_turn("Write the marker once after the parent confirms.")
+        .await?;
+    // Deliver encrypted evidence through the real mailbox before the action that
+    // needs review. A failed reviewer turn must not admit this native item again.
     test.codex
-        .start_or_steer_turn(codex_core::TurnInputRequest::user_input(vec![
-            codex_protocol::user_input::UserInput::Text {
-                text: "Write the marker once".into(),
-                text_elements: vec![],
-            },
-        ]))
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new_encrypted(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("worker path"),
+                Vec::new(),
+                "opaque-parent-approval".into(),
+                /*trigger_turn*/ true,
+            ),
+            start_options: Default::default(),
+        })
         .await?;
     let mut reviews = Vec::new();
     let mut warnings = Vec::new();
@@ -89,7 +101,27 @@ async fn guardian_retry_executes_only_after_a_completed_approval() -> Result<()>
             _ => {}
         }
     }
-    assert_eq!(requests.requests().len(), 5);
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 6);
+    let guardian_requests = &requests[2..5];
+    let expected_messages = guardian_requests[0].inputs_of_type("agent_message");
+    assert_eq!(expected_messages.len(), 1);
+    assert!(expected_messages[0]["id"].is_string());
+    assert_eq!(
+        expected_messages[0]["id"],
+        requests[1].inputs_of_type("agent_message")[0]["id"],
+    );
+    let reviewer_thread_id =
+        guardian_requests[0].body_json()["client_metadata"]["thread_id"].clone();
+    assert!(reviewer_thread_id.is_string());
+    for request in guardian_requests {
+        assert_eq!(
+            request.body_json()["client_metadata"]["thread_id"],
+            reviewer_thread_id,
+            "the failed review must reuse its Guardian session",
+        );
+        assert_eq!(request.inputs_of_type("agent_message"), expected_messages);
+    }
     assert_eq!(
         reviews,
         vec![

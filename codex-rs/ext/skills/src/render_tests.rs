@@ -547,6 +547,7 @@ async fn host_alias_roots_follow_core_discovery_order() -> Result<(), Box<dyn st
             include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
+            executor_capability_discovery_v2: Vec::new(),
         })
         .await?;
     let mut entries = catalog.entries.iter().collect::<Vec<_>>();
@@ -915,6 +916,7 @@ async fn singleton_plugin_versions_share_the_marketplace_alias_root()
             include_cloud_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
+            executor_capability_discovery_v2: Vec::new(),
         })
         .await?;
     let entries = catalog.entries.iter().collect::<Vec<_>>();

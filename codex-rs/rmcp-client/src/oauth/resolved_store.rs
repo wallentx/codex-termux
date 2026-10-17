@@ -24,8 +24,13 @@ use super::load_oauth_tokens_from_file;
 use super::load_oauth_tokens_from_file_with_lock_held;
 use super::load_oauth_tokens_from_keyring;
 use super::load_oauth_tokens_from_secrets_keyring_with_lock_held;
+use super::normalized_oauth_credentials;
+use super::read_fallback_file_unlocked;
+use super::save_oauth_tokens_to_direct_keyring;
 use super::save_oauth_tokens_to_file;
+use super::save_oauth_tokens_to_secrets_keyring_with_lock_held;
 use super::save_oauth_tokens_with_keyring;
+use super::write_fallback_file;
 
 /// Concrete credential store resolved for one MCP OAuth client lifecycle.
 ///
@@ -129,6 +134,7 @@ impl ResolvedOAuthCredentialStore {
             Backend::File => {
                 let _store_lock = OAuthStoreLock::try_acquire_for_read(OAuthStore::File)?;
                 load_oauth_tokens_from_file_with_lock_held(server_name, url)
+                    .map(|entry| entry.map(|(_, tokens)| tokens))
                     .context("failed to probe OAuth tokens from resolved file storage")
             }
             Backend::Keyring(AuthKeyringBackendKind::Direct) => {
@@ -183,6 +189,105 @@ impl ResolvedOAuthCredentialStore {
     ) -> Result<()> {
         let mut observation = telemetry::resolved(self, Operation::RefreshPersist);
         let result = self.save(keyring_store, server_name, tokens);
+        observation.record_save_attempt(telemetry::store(self), &result);
+        if matches!(self.backend, Backend::Keyring(_))
+            && let Err(error) = &result
+        {
+            telemetry::record_secure_error(&mut observation, error.as_ref());
+        }
+        result
+    }
+
+    /// Retires a rejected refresh token only while its durable snapshot still matches.
+    ///
+    /// File and Secrets keep one exclusive aggregate lock across the comparison and write,
+    /// including against legacy writers that do not take the caller's refresh guard. Direct
+    /// keyring callers must hold that guard and use a home-scoped enterprise credential.
+    pub(crate) fn retire_refresh_token_if_matches<K: KeyringStore + Clone + 'static>(
+        self,
+        keyring_store: &K,
+        server_name: &str,
+        url: &str,
+        expected: &StoredOAuthTokens,
+    ) -> Result<()> {
+        let mut observation = telemetry::resolved(self, Operation::Load);
+        let mut _store_lock = None;
+        let mut file_key = None;
+        let current = (|| -> Result<_> {
+            _store_lock = match self.backend {
+                Backend::File => Some(OAuthStoreLock::acquire_for_write(OAuthStore::File)?),
+                Backend::Keyring(AuthKeyringBackendKind::Secrets) => {
+                    Some(OAuthStoreLock::acquire_for_write(OAuthStore::Secrets)?)
+                }
+                Backend::Keyring(AuthKeyringBackendKind::Direct) => None,
+            };
+            match self.backend {
+                Backend::File => Ok(
+                    load_oauth_tokens_from_file_with_lock_held(server_name, url)?.map(
+                        |(key, tokens)| {
+                            file_key = Some(key);
+                            tokens
+                        },
+                    ),
+                ),
+                Backend::Keyring(AuthKeyringBackendKind::Secrets) => {
+                    load_oauth_tokens_from_secrets_keyring_with_lock_held(
+                        keyring_store,
+                        server_name,
+                        url,
+                    )
+                    .map_err(anyhow::Error::from)
+                }
+                Backend::Keyring(AuthKeyringBackendKind::Direct) => load_oauth_tokens_from_keyring(
+                    keyring_store,
+                    AuthKeyringBackendKind::Direct,
+                    server_name,
+                    url,
+                )
+                .map_err(anyhow::Error::from),
+            }
+        })();
+        observation.record_load_attempt(telemetry::store(self), &current);
+        if matches!(self.backend, Backend::Keyring(_))
+            && let Err(error) = &current
+        {
+            telemetry::record_secure_error(&mut observation, error.as_ref());
+        }
+        drop(observation);
+        let current = current?;
+        if normalized_oauth_credentials(current.as_ref())
+            != normalized_oauth_credentials(Some(expected))
+        {
+            return Ok(());
+        }
+        let mut retired = expected.clone();
+        retired.token_response.0.set_refresh_token(None);
+        let mut observation = telemetry::resolved(self, Operation::Save);
+        let result = match self.backend {
+            Backend::File => {
+                let mut store = read_fallback_file_unlocked()?.context("OAuth file disappeared")?;
+                // Reuse the key we compared: another binary may compute a different key.
+                let key = file_key.context("missing loaded OAuth file key")?;
+                store
+                    .get_mut(&key)
+                    .context("OAuth file entry disappeared")?
+                    .refresh_token = None;
+                write_fallback_file(&store)
+            }
+            Backend::Keyring(AuthKeyringBackendKind::Secrets) => {
+                let serialized =
+                    serde_json::to_string(&retired).context("failed to serialize OAuth tokens")?;
+                save_oauth_tokens_to_secrets_keyring_with_lock_held(
+                    keyring_store,
+                    server_name,
+                    &retired,
+                    &serialized,
+                )
+            }
+            Backend::Keyring(AuthKeyringBackendKind::Direct) => {
+                save_oauth_tokens_to_direct_keyring(keyring_store, server_name, &retired)
+            }
+        };
         observation.record_save_attempt(telemetry::store(self), &result);
         if matches!(self.backend, Backend::Keyring(_))
             && let Err(error) = &result

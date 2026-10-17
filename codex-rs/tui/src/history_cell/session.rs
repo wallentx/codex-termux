@@ -103,6 +103,20 @@ impl HistoryCell for SessionNoticeCell {
     }
 }
 
+/// Fork lineage that stays with the session header when older history is prepended.
+#[derive(Debug)]
+pub(crate) struct ForkedThreadHistoryCell(pub(crate) PlainHistoryCell);
+
+impl HistoryCell for ForkedThreadHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.0.display_lines(width)
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        self.0.raw_lines()
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionInfoCell(CompositeHistoryCell);
 
@@ -163,6 +177,13 @@ impl HistoryCell for SessionInfoCell {
     fn raw_lines(&self) -> Vec<Line<'static>> {
         self.0.raw_lines()
     }
+}
+
+/// Session-level cells that stay ahead of every loaded transcript page.
+pub(crate) fn is_session_history_prefix_cell(cell: &dyn HistoryCell) -> bool {
+    cell.as_any().is::<SessionInfoCell>()
+        || cell.as_any().is::<SessionHeaderHistoryCell>()
+        || cell.as_any().is::<ForkedThreadHistoryCell>()
 }
 
 #[expect(

@@ -32,6 +32,10 @@ impl App {
         app_server: &mut AppServerSession,
         target_session: &SessionTarget,
     ) -> std::result::Result<(Config, crate::local_settings::LocalSettings), AppRunControl> {
+        if let Err(error) = target_session.ensure_backend(app_server.backend_id()) {
+            self.add_session_picker_error(error.to_string());
+            return Err(AppRunControl::Continue);
+        }
         self.refresh_in_memory_config_from_disk_best_effort("resuming a thread")
             .await;
         let cwd_override = self
@@ -229,6 +233,10 @@ impl App {
                 ));
                 AppRunControl::Continue
             })?;
+            #[cfg(target_os = "windows")]
+            if result.directory_trust_persisted && self.current_displayed_thread_id().is_none() {
+                self.windows_sandbox.prompt_after_trust = true;
+            }
             // Directory changes review hooks once, after attaching the destination.
             if result.directory_trust_persisted
                 && options.resumed_thread.is_none()

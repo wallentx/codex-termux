@@ -2,10 +2,12 @@ use super::App;
 use super::AppServerSession;
 use super::Result;
 use super::RuntimeKeymap;
+use super::ThreadId;
 use super::TuiEvent;
 use super::make_test_app;
 use super::make_test_app_with_channels;
 use super::start_config_write_test_app_server;
+use super::test_thread_session;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::chatwidget::tests::helpers::render_bottom_popup;
@@ -832,6 +834,33 @@ async fn command_center_chords_do_not_capture_search_text() -> Result<()> {
         None
     );
     assert!(app.key_chord_matcher.is_pending());
+    Ok(())
+}
+
+#[tokio::test]
+async fn preset_menu_keys_take_precedence_over_transcript_find() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.chat_widget.handle_thread_session(test_thread_session(
+        ThreadId::new(),
+        app.config.cwd.to_path_buf(),
+    ));
+    app.transcript_view.begin_search();
+
+    app.chat_widget.open_quick_dial_menu();
+    assert_eq!(
+        app.route_key_chord_event(&mut tui, KeyCode::Esc.into()),
+        None
+    );
+    assert!(app.transcript_view.is_search_editing());
+
+    app.chat_widget.open_quick_dial_menu();
+    assert_eq!(
+        app.route_key_chord_event(&mut tui, KeyCode::Char('n').into()),
+        None
+    );
+    assert!(app.transcript_view.is_search_editing());
+    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("New preset"));
     Ok(())
 }
 

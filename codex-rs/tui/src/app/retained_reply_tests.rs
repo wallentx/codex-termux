@@ -60,7 +60,11 @@ async fn connection() -> color_eyre::Result<(
     });
     let client = crate::connect_remote_app_server(endpoint).await?;
     Ok((
-        AppServerSession::new(client, ThreadParamsMode::Remote),
+        AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            client,
+            ThreadParamsMode::Remote,
+        ),
         receiver,
         task,
     ))

@@ -282,3 +282,7 @@ fn persisted_item_completed_event<'a>(
         },
     }
 }
+
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod tests;

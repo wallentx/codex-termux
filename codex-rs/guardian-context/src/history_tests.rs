@@ -21,6 +21,23 @@ fn tool(text: &str) -> ResponseItem {
 }
 
 #[test]
+fn compaction_summary_is_excluded_without_dropping_user_messages() {
+    let before = message("Earlier user message");
+    let summary: ResponseItem = serde_json::from_value(json!({
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "Summary text"}],
+        "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": [COMPACTION_SUMMARY_KIND]
+        }
+    }))
+    .unwrap();
+    let after = message("Summary text");
+    let mut history = TranscriptHistory::default();
+    history.reset([before.clone().into(), summary.into(), after.clone().into()].iter());
+    assert_eq!(history.items().collect::<Vec<_>>(), vec![&before, &after]);
+}
+
+#[test]
 fn rollback_keeps_the_earlier_prefix_or_clears_an_evicted_boundary() {
     let items = [message("keep"), message("roll back"), tool("later")];
     let mut history = TranscriptHistory::default();

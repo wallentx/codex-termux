@@ -1,3 +1,5 @@
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -91,7 +93,8 @@ async fn read_projection_steps(
 ) -> ThreadStoreResult<(Vec<RolloutProjectionStep>, u64)> {
     let path = rollout_path.to_path_buf();
     let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+    let result = tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
         read_projection_steps_sync(
             &path,
@@ -99,12 +102,15 @@ async fn read_projection_steps(
             expected_ordinal,
             thread_id,
             subagent_history_start_ordinal,
+            || stop.is_closed(),
         )
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to join rollout projection read: {err}"),
-    })?
+    })?;
+    drop(keep_running);
+    result
 }
 
 /// Read and project the complete durable prefix in one blocking task.
@@ -114,40 +120,50 @@ fn read_projection_steps_sync(
     expected_ordinal: u64,
     thread_id: ThreadId,
     subagent_history_start_ordinal: Option<u64>,
+    is_cancelled: impl Fn() -> bool,
 ) -> ThreadStoreResult<(Vec<RolloutProjectionStep>, u64)> {
-    let mut file = match codex_rollout::open_rollout_seekable_reader(rollout_path) {
+    let mut file = match codex_rollout::open_rollout_seekable_reader(rollout_path, &is_cancelled) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && start_offset == 0 => {
             return Ok((Vec::new(), 0));
         }
         Err(err) => return Err(thread_store_io_error(err)),
     };
-    let file_end_offset = file.metadata().map_err(thread_store_io_error)?.len();
+    let file_end_offset = file.seek(SeekFrom::End(0)).map_err(thread_store_io_error)?;
     let byte_count =
         file_end_offset
             .checked_sub(start_offset)
             .ok_or_else(|| ThreadStoreError::Internal {
                 message: "durable rollout shrank before projection".to_string(),
             })?;
-    let byte_count = usize::try_from(byte_count).map_err(|_| ThreadStoreError::Internal {
-        message: "durable rollout append exceeds addressable memory".to_string(),
-    })?;
-    let mut bytes = vec![0; byte_count];
     file.seek(SeekFrom::Start(start_offset))
         .map_err(thread_store_io_error)?;
-    file.read_exact(bytes.as_mut_slice())
-        .map_err(thread_store_io_error)?;
+    // Freeze this pass at the captured end, without retaining the entire durable suffix.
+    let mut reader = BufReader::new(file.take(byte_count));
+    let mut line_bytes = Vec::new();
     // Only project the newline-terminated prefix; leave a trailing partial record for the next
     // pass.
-    let complete_byte_count = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
     let mut projections = Vec::new();
     let mut next_ordinal = expected_ordinal;
     let mut next_offset = start_offset;
     let mut line_start_offset = start_offset;
-    for line_bytes in bytes[..complete_byte_count].split_inclusive(|byte| *byte == b'\n') {
+    loop {
+        if is_cancelled() {
+            return Err(thread_store_io_error(std::io::Error::other(
+                "rollout read cancelled",
+            )));
+        }
+        line_bytes.clear();
+        if reader
+            .read_until(b'\n', &mut line_bytes)
+            .map_err(thread_store_io_error)?
+            == 0
+        {
+            break;
+        }
+        if !line_bytes.ends_with(b"\n") {
+            break;
+        }
         let line_end_offset = line_start_offset
             .checked_add(u64::try_from(line_bytes.len()).map_err(|_| {
                 ThreadStoreError::Internal {
@@ -162,7 +178,7 @@ fn read_projection_steps_sync(
             line_start_offset = line_end_offset;
             continue;
         }
-        let value = match serde_json::from_slice::<serde_json::Value>(line_bytes) {
+        let value = match serde_json::from_slice::<serde_json::Value>(&line_bytes) {
             Ok(value) => value,
             Err(err) => {
                 warn!(
@@ -322,6 +338,12 @@ fn read_projection_steps_sync(
         next_ordinal = next_line_ordinal;
         next_offset = line_end_offset;
         line_start_offset = line_end_offset;
+    }
+    if reader.get_ref().limit() != 0 {
+        return Err(thread_store_io_error(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "durable rollout shrank during projection",
+        )));
     }
     Ok((projections, next_offset))
 }

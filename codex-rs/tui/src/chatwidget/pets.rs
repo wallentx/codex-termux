@@ -210,7 +210,7 @@ impl ChatWidget {
         true
     }
 
-    fn pet_image_support(&self) -> crate::pets::PetImageSupport {
+    pub(crate) fn pet_image_support(&self) -> crate::pets::PetImageSupport {
         #[cfg(test)]
         if let Some(support) = self.pet_image_support_override {
             return support;

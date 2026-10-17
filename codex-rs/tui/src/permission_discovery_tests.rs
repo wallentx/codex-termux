@@ -114,7 +114,7 @@ async fn discovery_preserves_config_scope_and_bounds_server_requests() {
         })
         .await
         .unwrap();
-        let session = AppServerSession::new(client, mode)
+        let session = AppServerSession::new(crate::backend_id::BackendId::new(), client, mode)
             .with_remote_cwd_override(remote_cwd.map(std::path::PathBuf::from));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         if case == "timeout" {

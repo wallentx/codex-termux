@@ -263,6 +263,7 @@ pub(super) async fn start_app_server_for_session_command(
             .await
             .wrap_err("failed to load config.toml")?;
         return Ok(AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             super::connect_remote_app_server(endpoint).await?,
             ThreadParamsMode::Remote,
         )
@@ -405,10 +406,12 @@ pub(super) async fn start_app_server_for_session_command(
         embedded_network_policy,
     )
     .await?;
-    Ok(
-        AppServerSession::new(app_server, app_server_target.thread_params_mode())
-            .with_remote_cwd_override(remote_cwd_override),
+    Ok(AppServerSession::new(
+        crate::backend_id::BackendId::new(),
+        app_server,
+        app_server_target.thread_params_mode(),
     )
+    .with_remote_cwd_override(remote_cwd_override))
 }
 
 #[cfg(test)]

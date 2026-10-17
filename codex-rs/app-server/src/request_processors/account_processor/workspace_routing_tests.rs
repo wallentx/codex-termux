@@ -5,6 +5,27 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use test_case::test_case;
 
+#[test_case(CloudConfigBundleLoadErrorCode::RequestFailed, "cloud config: request failed"; "request")]
+#[test_case(CloudConfigBundleLoadErrorCode::Auth, "cloud config: authentication failed"; "refresh")]
+fn cloud_failures_preserve_policy_denials_but_redact_other_messages(
+    code: CloudConfigBundleLoadErrorCode,
+    redacted: &str,
+) {
+    let denied = NetworkPolicyDenied::Destination.to_string();
+    for (message, expected) in [
+        (denied.clone(), denied),
+        (
+            "destination denied by application network policy: sk-test-private-value".into(),
+            redacted.into(),
+        ),
+    ] {
+        let error = io::Error::other(CloudConfigBundleLoadError::new(
+            code, /*status_code*/ None, message,
+        ));
+        assert_eq!(workspace_config_load_reason(&error), expected);
+    }
+}
+
 #[test_case(None; "signed_out")]
 #[test_case(Some("dummy"); "api_key")]
 #[tokio::test]
@@ -77,12 +98,20 @@ async fn background_routing_skips_config_until_chatgpt_sign_in(
         sender,
         codex_analytics::AnalyticsEventsClient::disabled(),
     ));
+    let model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(
+        manager.clone(),
+        Some(config.cwd.to_path_buf()),
+        Arc::clone(&config),
+        threads.get_models_manager(),
+        Arc::clone(&auth_manager),
+    ));
     let processor = AccountRequestProcessor::new(
         Arc::clone(&auth_manager),
         threads,
         outgoing,
         config,
         manager,
+        model_catalog,
     );
     let initial_loads = loads.load(Ordering::SeqCst);
     for _ in 0..3 {
@@ -119,15 +148,23 @@ async fn background_routing_skips_config_until_chatgpt_sign_in(
     );
     assert!(loads.load(Ordering::SeqCst) > initial_loads);
 
-    std::fs::write(home.path().join("config.toml"), "invalid = [")?;
-    assert!(matches!(
-        processor
-            .read_account_for_background_workspace_routing()
-            .await,
-        Err(AccountReadError::Routing(
-            WorkspaceRoutingError::RequirementsLoad
-        ))
-    ));
+    let config_path = home.path().join("config.toml");
+    std::fs::write(&config_path, "invalid = [ 'sk-test-private-value',")?;
+    let Err(error) = processor
+        .read_account_for_background_workspace_routing()
+        .await
+    else {
+        panic!("invalid config must prevent workspace routing");
+    };
+    let message = error.to_string();
+    assert!(
+        message.starts_with(&format!(
+            "failed to load workspace requirements: invalid configuration at {}:1:",
+            config_path.display(),
+        )),
+        "{message}"
+    );
+    assert!(!message.contains("sk-test-private-value"), "{message}");
     Ok(())
 }
 

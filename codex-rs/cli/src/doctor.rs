@@ -2273,6 +2273,7 @@ fn collect_rollout_stats_inner(path: &Path, stats: &mut RolloutStats) {
 }
 
 fn is_rollout_file(path: &Path) -> bool {
+    let path = codex_rollout::plain_rollout_path(path);
     path.extension() == Some(OsStr::new("jsonl"))
         && path
             .file_name()
@@ -3846,7 +3847,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_rollout_stats_counts_nested_rollout_files() {
+    fn rollout_stats_details_count_plain_and_compressed_files() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let nested = temp
             .path()
@@ -3860,14 +3861,40 @@ mod tests {
             "12345",
         )
         .expect("write rollout file");
+        // Storage totals include both physical files if both representations exist.
+        std::fs::write(
+            nested.join("rollout-2026-05-13T00-00-00-test.jsonl.zst"),
+            "1234567",
+        )
+        .expect("write compressed sibling");
+        std::fs::write(
+            nested.join("rollout-2026-05-13T01-00-00-compressed.jsonl.zst"),
+            "123",
+        )
+        .expect("write compressed rollout");
         std::fs::write(nested.join("not-a-rollout.jsonl"), "ignored").expect("write ignored jsonl");
+        std::fs::write(nested.join("not-a-rollout.jsonl.zst"), "ignored")
+            .expect("write ignored compressed file");
+        std::fs::write(
+            nested.join("rollout-2026-05-13T01-00-00-compressed.jsonl.zst.tmp"),
+            "ignored",
+        )
+        .expect("write compression temp file");
 
-        let stats = collect_rollout_stats(&temp.path().join("sessions"));
+        let archived = temp.path().join("archived_sessions");
+        std::fs::create_dir(&archived).expect("create archived rollout dir");
+        std::fs::write(
+            archived.join("rollout-2026-05-13T02-00-00-archived.jsonl.zst"),
+            "1234",
+        )
+        .expect("write archived compressed rollout");
 
-        assert_eq!(stats.files, 1);
-        assert_eq!(stats.total_bytes, 5);
-        assert_eq!(stats.average_bytes(), 5);
-        assert_eq!(stats.error, None);
+        let mut details = Vec::new();
+        rollout_stats_details(&mut details, temp.path());
+        insta::assert_snapshot!(details.join("\n"), @r"
+        active rollout files: 3 files, 15 total bytes, 5 average bytes
+        archived rollout files: 1 files, 4 total bytes, 4 average bytes
+        ");
     }
 
     #[tokio::test]

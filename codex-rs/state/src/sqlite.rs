@@ -1,5 +1,6 @@
 //! Shared SQLite connection configuration.
-//! Writable pools preserve existing vacuum modes and report initialization errors to callers.
+//! Writable pools preserve the journal and vacuum modes of initialized databases.
+//! Startup retries SQLITE_BUSY and reports other errors to callers.
 
 #![expect(
     clippy::disallowed_methods,
@@ -22,11 +23,17 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteSynchronous;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::OnceCell;
 
+mod busy_retry;
 mod validation;
 
+pub use busy_retry::SqlitePoolWriteExt;
+pub(crate) use busy_retry::SqliteWriteQueryExt;
+pub(crate) use busy_retry::retry_on_busy;
 use validation::SqliteQuickCheckManager;
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -149,14 +156,16 @@ pub struct RuntimeDbPath {
 }
 
 /// Resolved configuration shared by all Codex SQLite connections.
-/// Clones share quick-check attempts; a newly constructed config checks independently.
+/// Clones share filesystem probes and quick-check attempts; a new config checks independently.
 #[derive(Clone, Debug)]
 pub struct SqliteConfig {
     sqlite_home: AbsolutePathBuf,
+    is_nfs: Arc<OnceCell<bool>>,
     quick_check_manager: SqliteQuickCheckManager,
 }
 
-// Validation history is operational state, not part of configuration equality.
+// Cached filesystem information and validation history are operational state,
+// not part of configuration equality.
 impl PartialEq for SqliteConfig {
     fn eq(&self, other: &Self) -> bool {
         self.sqlite_home == other.sqlite_home
@@ -169,6 +178,7 @@ impl SqliteConfig {
     pub fn from_sqlite_home(sqlite_home: AbsolutePathBuf) -> Self {
         Self {
             sqlite_home,
+            is_nfs: Arc::new(OnceCell::new()),
             quick_check_manager: SqliteQuickCheckManager::new(),
         }
     }
@@ -179,6 +189,20 @@ impl SqliteConfig {
 
     pub fn home(&self) -> &Path {
         self.sqlite_home.as_path()
+    }
+
+    /// Detects if the sqlite_home directory is under the NFS mount (once per the lifetime)
+    pub async fn is_nfs(&self) -> anyhow::Result<bool> {
+        self.is_nfs
+            .get_or_try_init(|| async {
+                let sqlite_home = self.home().to_path_buf();
+                Ok(
+                    tokio::task::spawn_blocking(move || codex_file_system::is_nfs(&sqlite_home))
+                        .await??,
+                )
+            })
+            .await
+            .copied()
     }
 
     /// Return the path to the primary state database.
@@ -359,57 +383,9 @@ impl SqliteConfig {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(DEFAULT_BUSY_TIMEOUT)
             .log_statements(LevelFilter::Off);
-        let connect = || async {
-            // SQLx retries after_connect errors, eventually replacing them with PoolTimedOut.
-            // Return the first initialization error directly while opening this pool.
-            let (init_error_tx, mut init_error_rx) = tokio::sync::mpsc::channel(/*buffer*/ 1);
-            let pool_options = SqlitePoolOptions::new().max_connections(5).after_connect(
-                move |connection, _metadata| {
-                    let init_error_tx = init_error_tx.clone();
-                    Box::pin(async move {
-                        let result = async {
-                            let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
-                                .fetch_one(&mut *connection)
-                                .await?;
-                            // The setter takes the writer lock even when the mode is unchanged.
-                            // Initialize before WAL creates the first database page; preserve
-                            // existing modes, including FULL, without taking the writer lock.
-                            let empty = if mode == 0 {
-                                sqlx::query_scalar::<_, bool>(
-                                    "SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)",
-                                )
-                                .fetch_one(&mut *connection)
-                                .await?
-                            } else {
-                                false
-                            };
-                            if empty {
-                                sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
-                                    .execute(&mut *connection)
-                                    .await?;
-                            }
-                            sqlx::query("PRAGMA journal_mode = WAL")
-                                .execute(connection)
-                                .await?;
-                            Ok(())
-                        }
-                        .await;
-                        result.map_err(|error| match init_error_tx.try_send(error) {
-                            // The opener owns the original error and cancels connection retries.
-                            Ok(()) => Error::PoolClosed,
-                            // After opening, lazy connections retain SQLx's normal error handling.
-                            Err(error) => error.into_inner(),
-                        })
-                    })
-                },
-            );
-            tokio::select! {
-                biased;
-                Some(error) = init_error_rx.recv() => Err(error),
-                result = pool_options.connect_with(options.clone()) => result,
-            }
-        };
-        let pool = connect().await?;
+        // Each failed attempt closes its pool before initialization is retried.
+        let connect = || async { connect_once(&options).await.map_err(anyhow::Error::from) };
+        let pool = retry_on_busy(connect).await?;
         let validation_result = self
             .quick_check_manager
             .quick_check_once(
@@ -439,7 +415,7 @@ impl SqliteConfig {
                     );
                 }
 
-                return connect().await.map_err(anyhow::Error::from);
+                return retry_on_busy(connect).await;
             }
         }
 
@@ -465,6 +441,90 @@ impl SqliteConfig {
             .connect_with(options)
             .await
     }
+}
+
+async fn connect_once(options: &SqliteConnectOptions) -> Result<SqlitePool, Error> {
+    // SQLx retries after_connect errors, eventually replacing them with PoolTimedOut.
+    // Return the first initialization error directly while opening this pool.
+    let (init_error_tx, mut init_error_rx) = tokio::sync::mpsc::channel(/*buffer*/ 1);
+    let pool_options =
+        SqlitePoolOptions::new()
+            .max_connections(5)
+            .after_connect(move |connection, _metadata| {
+                let init_error_tx = init_error_tx.clone();
+                Box::pin(async move {
+                    let result = async {
+                        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                            .fetch_one(&mut *connection)
+                            .await?;
+                        if journal == "delete" {
+                            // If the filesystem honors sync requests, EXTRA syncs the directory
+                            // after SQLite deletes a rollback journal.
+                            sqlx::query("PRAGMA synchronous = EXTRA")
+                                .execute(connection)
+                                .await?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    result.map_err(|error| match init_error_tx.try_send(error) {
+                        // The opener owns the original error and cancels connection retries.
+                        Ok(()) => Error::PoolClosed,
+                        // After opening, lazy connections retain SQLx's normal error handling.
+                        Err(error) => error.into_inner(),
+                    })
+                })
+            });
+    let pool = tokio::select! {
+        biased;
+        Some(error) = init_error_rx.recv() => Err(error),
+        result = pool_options.connect_with(options.clone()) => result,
+    }?;
+    // Database settings persist on disk.
+    // Initialize these settings once before callers can use the pool.
+    // Connections that open later need only settings that apply to each connection.
+    let initialized: Result<(), Error> = async {
+        let mut connection = pool.acquire().await?;
+        // Auto-vacuum alone can write a header to disk.
+        // If creation stops before the schema exists, startup must initialize the file.
+        let empty =
+            sqlx::query_scalar::<_, bool>("SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)")
+                .fetch_one(&mut *connection)
+                .await?;
+        if empty {
+            let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+                .fetch_one(&mut *connection)
+                .await?;
+            if mode == 0 {
+                sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+                    .execute(&mut *connection)
+                    .await?;
+            }
+            sqlx::query("PRAGMA journal_mode = WAL")
+                .execute(&mut *connection)
+                .await?;
+        }
+        // Another process can initialize WAL after this connection selects EXTRA.
+        // Apply NORMAL to WAL even if that process already created the schema.
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut *connection)
+            .await?;
+        if journal == "wal" {
+            sqlx::query("PRAGMA synchronous = NORMAL")
+                .execute(&mut *connection)
+                .await?;
+        }
+        // Wait for the connection to return to the pool before startup requests it again.
+        // An asynchronous drop can otherwise cause the pool to open a second connection.
+        connection.return_to_pool().await;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = initialized {
+        pool.close().await;
+        return Err(error);
+    }
+    Ok(pool)
 }
 
 #[cfg(test)]

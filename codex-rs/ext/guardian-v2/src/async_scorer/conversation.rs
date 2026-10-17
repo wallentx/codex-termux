@@ -130,11 +130,7 @@ impl Reservation {
             // Delayed preparation must never import a later action's evidence.
             .filter(|previous| previous.index < self.index && previous.key == key)
             .and_then(|previous| previous.state.snapshot().cloned())
-            .map(|checkpoint| {
-                let (mut state, history) = ConversationState::fork(checkpoint);
-                state.commit_snapshot(history);
-                state
-            })
+            .map(ConversationState::from)
             .unwrap_or_default();
         let had_history = state.snapshot().is_some();
         let prepared = request

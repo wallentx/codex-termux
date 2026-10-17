@@ -23,19 +23,21 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 
 #[cfg(any(test, target_os = "macos"))]
-const MODIFIER_LABELS: [(KeyModifiers, &str); 3] = [
+const MODIFIER_LABELS: [(KeyModifiers, &str); 4] = [
     (KeyModifiers::CONTROL, "⌃"),
     (KeyModifiers::SHIFT, "⇧"),
     (KeyModifiers::ALT, "⌥"),
+    (KeyModifiers::SUPER, "⌘"),
 ];
 #[cfg(not(any(test, target_os = "macos")))]
-const MODIFIER_LABELS: [(KeyModifiers, &str); 3] = [
+const MODIFIER_LABELS: [(KeyModifiers, &str); 4] = [
     #[cfg(target_os = "linux")]
     (KeyModifiers::CONTROL, "^"),
     #[cfg(not(target_os = "linux"))]
     (KeyModifiers::CONTROL, "ctrl"),
     (KeyModifiers::SHIFT, "shift"),
     (KeyModifiers::ALT, "alt"),
+    (KeyModifiers::SUPER, "super"),
 ];
 
 /// One concrete key event that can trigger a TUI action.
@@ -215,9 +217,9 @@ impl KeyBindingListExt for [KeyBinding] {
 /// Searchable pickers use this to avoid stealing plain printable characters for
 /// navigation when the same character might be a valid query. For example, a
 /// list may bind `j` and `k` for movement, but a searchable list must let
-/// plain `j` update the query while still allowing `Ctrl+J` to move. Calling
-/// this after normalizing keybindings would blur that distinction and cause
-/// printable search input to disappear.
+/// plain `j` update the query while still allowing `Ctrl+J` or `Cmd+J` to move.
+/// Calling this after normalizing keybindings would blur that distinction and
+/// cause printable search input to disappear.
 pub(crate) fn is_plain_text_key_event(event: KeyEvent) -> bool {
     matches!(
         event,
@@ -228,6 +230,7 @@ pub(crate) fn is_plain_text_key_event(event: KeyEvent) -> bool {
         } if !ch.is_ascii_control()
             && !modifiers.contains(KeyModifiers::CONTROL)
             && !modifiers.contains(KeyModifiers::ALT)
+            && !modifiers.contains(KeyModifiers::SUPER)
     )
 }
 
@@ -342,6 +345,14 @@ mod tests {
         assert!(bindings.is_pressed(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
         assert!(bindings.is_pressed(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)));
         assert!(!bindings.is_pressed(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn super_char_event_is_not_plain_text() {
+        assert!(!is_plain_text_key_event(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::SUPER,
+        )));
     }
 
     #[test]

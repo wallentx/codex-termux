@@ -210,3 +210,26 @@ async fn provider_requirement_load_errors_reject_input() -> Result<()> {
     }
     Ok(())
 }
+
+/// A managed startup selection must disappear when its policy is removed.
+#[tokio::test]
+async fn catalog_reload_uses_latest_model_provider() -> Result<()> {
+    let home = tempdir()?;
+    let manager = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            "model_provider = 'gateway'\n[model_providers.gateway]\nname = 'Gateway'\nbase_url = 'https://example.test'",
+        ),
+    );
+    let startup = manager.load_non_project_config().await?;
+    assert_eq!(startup.model_provider_id, "gateway");
+    manager.clear_cloud_config_bundle_loader();
+    let refreshed = manager
+        .load_startup_config(/*fallback_cwd*/ None)
+        .await?
+        .config;
+    assert_eq!(refreshed.model_provider_id, "openai");
+    Ok(())
+}

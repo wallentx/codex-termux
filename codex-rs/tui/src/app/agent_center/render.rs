@@ -218,6 +218,16 @@ impl Renderable for AgentsOverviewView {
                     .then(|| "Creating worktree…".to_owned())
             })
             .or_else(|| {
+                state.removal.map(|action| match action {
+                    AgentsOverviewAction::Archive => {
+                        "Archiving task…  You can still browse.".to_owned()
+                    }
+                    AgentsOverviewAction::Delete => {
+                        "Deleting task…  You can still browse.".to_owned()
+                    }
+                })
+            })
+            .or_else(|| {
                 (state.refresh_failed && !state.loading).then(|| "Error loading tasks".to_owned())
             })
             .or_else(|| state.server_version_notice.clone());

@@ -786,7 +786,7 @@ pub enum CopyOnSelect {
     /// Use the terminal-specific default.
     #[default]
     Auto,
-    /// Copy every nonempty transcript or footer mouse selection on release.
+    /// Copy every nonempty transcript, footer, or composer mouse selection on release.
     Always,
     /// Require an explicit copy action.
     Never,
@@ -821,6 +821,32 @@ pub struct ModelAvailabilityNuxConfig {
 
 /// Fallback resize-reflow row cap when Codex cannot identify a terminal-specific scrollback size.
 pub const DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS: usize = 1_000;
+
+/// One reusable prompt or slash command submitted through the TUI composer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields, rename = "Preset")]
+pub struct QuickDial {
+    /// Plain-text input, limited to 8,000 UTF-8 bytes.
+    pub input: String,
+    /// Optional short name for the picker and shortcut hints.
+    pub label: Option<String>,
+}
+
+impl QuickDial {
+    /// Keep stored inputs nonempty and below the context-item limit even with byte tokenization.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.input.trim().is_empty() {
+            return Err("Preset input cannot be empty.");
+        }
+        if self.input.trim_start().starts_with('!') {
+            return Err("Presets support prompts and slash commands, not shell commands.");
+        }
+        if self.input.len() > 8_000 {
+            return Err("Preset input cannot exceed 8,000 UTF-8 bytes.");
+        }
+        Ok(())
+    }
+}
 
 /// Collection of settings that are specific to the TUI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
@@ -891,15 +917,16 @@ pub struct Tui {
     #[schemars(schema_with = "crate::tui_mouse_scroll::schema")]
     pub mouse_scroll_speed: Option<f64>,
 
-    /// Copy selected transcript or footer text when the mouse button is released.
+    /// Copy selected transcript, footer, or composer text when the mouse button is released.
     /// Defaults to `auto`: enabled except in direct terminals known to forward their native
     /// copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows).
     /// Unknown terminals, Ghostty without a recognized version, and tmux/Zellij default to copying.
     #[serde(default)]
     pub copy_on_select: CopyOnSelect,
 
-    /// Deselect transcript text after Copy on select confirms clipboard delivery.
-    /// Defaults to `false` and has no effect when Copy on select is off.
+    /// Deselect read-only transcript or footer text after Copy on select confirms delivery.
+    /// Editable composer selections remain visible. Defaults to `false` and has no effect when
+    /// Copy on select is off.
     #[serde(default)]
     pub copy_on_select_clear_selection: bool,
 
@@ -976,6 +1003,10 @@ pub struct Tui {
     /// Context bindings take precedence over `global` bindings.
     #[serde(default)]
     pub keymap: TuiKeymap,
+
+    /// Saved inputs keyed by a single digit (`0` through `9`).
+    #[serde(default, rename = "presets")]
+    pub quick_dials: BTreeMap<String, QuickDial>,
 
     /// Startup tooltip availability NUX state persisted by the TUI.
     #[serde(default)]
@@ -1084,6 +1115,26 @@ pub struct PluginConfig {
     /// Explicit activation override. Omission inherits the installed-plugin default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+
+    /// Stable, unique identifier of a ChatGPT-hosted remote plugin.
+    /// Availability to the requesting user is determined by Plugin Service at
+    /// provisioning time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_plugin_id: Option<String>,
+
+    /// Release identifier used to pin the remote plugin to a specific release.
+    /// Omission leaves release selection unchanged.
+    /// Core stores this metadata without selecting or fetching a release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<String>,
+
+    /// Provisioning metadata. Omission does not request provisioning.
+    /// Only applies with `remote_plugin_id` and Plugin Service availability to the
+    /// requesting user at provisioning time. Effective enablement, trusted
+    /// provisioning policy, and authentication and authorization restrictions still apply.
+    /// This value is not trusted authorization and does not trigger provisioning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_provision: Option<bool>,
 
     /// Per-MCP-server policy overlays for MCP servers contributed by this plugin.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

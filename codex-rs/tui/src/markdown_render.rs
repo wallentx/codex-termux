@@ -38,6 +38,8 @@
 //! body rows, or even 3-char-wide columns cannot fit, body rows render as
 //! key/value records.
 //!
+//! Markdown prose uses foregrounds from the active syntax theme's markup scopes,
+//! retaining its usual modifiers and falling back when a scope has no foreground.
 //! Inline code and local file paths share the active syntax theme's raw-markup foreground.
 
 use crate::markdown_text_merge::DecodedTextMerge;
@@ -133,13 +135,25 @@ impl Default for MarkdownStyles {
 
 impl MarkdownStyles {
     fn for_theme(theme: &syntect::highlighting::Theme) -> Self {
+        let foreground = |scopes: &[&str]| {
+            let mut style =
+                foreground_style_for_scopes_with_theme(theme, scopes).unwrap_or_default();
+            style.fg = style.fg.map(|foreground| {
+                crate::style::readable_color_on(foreground, /*background*/ None)
+            });
+            style
+        };
         Self {
-            h1: Style::new().bold().underlined(),
-            h2: Style::new().bold(),
-            h3: Style::new().bold().italic(),
-            h4: Style::new().italic(),
-            h5: Style::new().italic(),
-            h6: Style::new().italic(),
+            h1: foreground(&["markup.heading.1.markdown", "markup.heading.markdown"])
+                .bold()
+                .underlined(),
+            h2: foreground(&["markup.heading.2.markdown", "markup.heading.markdown"]).bold(),
+            h3: foreground(&["markup.heading.3.markdown", "markup.heading.markdown"])
+                .bold()
+                .italic(),
+            h4: foreground(&["markup.heading.4.markdown", "markup.heading.markdown"]).italic(),
+            h5: foreground(&["markup.heading.5.markdown", "markup.heading.markdown"]).italic(),
+            h6: foreground(&["markup.heading.6.markdown", "markup.heading.markdown"]).italic(),
             code: foreground_style_for_scopes_with_theme(
                 theme,
                 &[
@@ -148,13 +162,23 @@ impl MarkdownStyles {
                 ],
             )
             .unwrap_or_else(|| Style::new().fg(accent_color())),
-            emphasis: Style::new().italic(),
-            strong: Style::new().bold(),
+            emphasis: foreground(&["markup.italic.markdown"]).italic(),
+            strong: foreground(&["markup.bold.markdown"]).bold(),
             strikethrough: Style::new().crossed_out(),
-            ordered_list_marker: Style::new().light_blue(),
-            unordered_list_marker: Style::new(),
-            link: Style::new().fg(accent_color()).underlined(),
-            blockquote: Style::new().green(),
+            ordered_list_marker: Style::new()
+                .light_blue()
+                .patch(foreground(&["markup.list.numbered.markdown"])),
+            unordered_list_marker: foreground(&[
+                "markup.list.unnumbered.markdown",
+                "markup.list.bullet.markdown",
+            ]),
+            link: Style::new()
+                .fg(accent_color())
+                .patch(foreground(&["markup.underline.link.markdown"]))
+                .underlined(),
+            blockquote: Style::new()
+                .green()
+                .patch(foreground(&["markup.quote.markdown"])),
         }
     }
 }
@@ -2575,7 +2599,6 @@ mod markdown_render_tests {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use ratatui::style::Stylize;
     use ratatui::text::Text;
 
     fn lines_to_strings(text: &Text<'_>) -> Vec<String> {
@@ -2657,12 +2680,13 @@ mod tests {
         let rendered =
             render_markdown_lines_with_width_and_cwd(markdown, Some(22), /*cwd*/ None);
         let source = rendered[0].source.as_ref().expect("blockquote source");
+        let styles = MarkdownStyles::default();
         assert_eq!(
             source.styled_range(0..source.text.len()),
             Line::from(vec![
-                "block quote with ".green(),
-                "content".green().bold(),
-                " that should wrap nicely".green(),
+                Span::styled("block quote with ", styles.blockquote),
+                Span::styled("content", styles.blockquote.patch(styles.strong)),
+                Span::styled(" that should wrap nicely", styles.blockquote),
             ])
         );
         let lines: Vec<_> = rendered.iter().map(|line| line.line.to_string()).collect();

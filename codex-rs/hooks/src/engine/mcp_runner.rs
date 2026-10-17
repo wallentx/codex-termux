@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_protocol::models::ContentItemMetadata;
 use regex::Regex;
 use serde_json::Map;
 use serde_json::Value;
@@ -36,7 +37,14 @@ pub(crate) async fn run_mcp_tool(
 ) -> HandlerRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
+    let timeout_started = tokio::time::Instant::now();
+    let duration = Duration::from_secs(handler.timeout_sec);
     let result = async {
+        if let Some(trust) = &handler.plugin_trust {
+            tokio::time::timeout(duration, trust.verify())
+                .await
+                .context("hook trust verification timed out")??;
+        }
         let hook_event: Value =
             serde_json::from_str(hook_event_json).context("failed to parse hook event input")?;
         let input = expand_mcp_argument_template(argument_template, &hook_event)?;
@@ -69,17 +77,22 @@ pub(crate) async fn run_mcp_tool(
                 environment_id,
                 metadata: call_metadata,
                 input,
-                timeout: Duration::from_secs(handler.timeout_sec),
+                timeout: if handler.plugin_trust.is_some() {
+                    duration.saturating_sub(timeout_started.elapsed())
+                } else {
+                    Duration::from_secs(handler.timeout_sec)
+                },
             })
             .await
     }
     .await;
 
-    let (exit_code, stdout, error) = match result {
-        Ok(output) => (Some(0), output, None),
-        Err(error) => (None, String::new(), Some(error.to_string())),
+    let (exit_code, stdout, error, source_tool_namespace) = match result {
+        Ok(output) => (Some(0), output.text, None, output.source_tool_namespace),
+        Err(error) => (None, String::new(), Some(error.to_string()), None),
     };
     HandlerRunResult {
+        context_metadata: ContentItemMetadata::tool(source_tool_namespace.map(Into::into)),
         started_at,
         completed_at: chrono::Utc::now().timestamp(),
         duration_ms: started.elapsed().as_millis().try_into().unwrap_or(i64::MAX),

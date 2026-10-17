@@ -2,12 +2,72 @@ use anyhow::Result;
 use anyhow::ensure;
 use serde::Deserialize;
 use serde::Serialize;
+use std::sync::Mutex;
 
 use crate::NetworkDomainPermissions;
 use crate::NetworkMode;
 use crate::NetworkProxyAuditMetadata;
 use crate::NetworkProxyConfig;
 use crate::NetworkUnixSocketPermissions;
+use crate::credential_broker::CredentialBroker;
+
+/// Credential mappings retained by one executor session across process launches.
+/// Only mappings are shared; proxy listeners, network policy, and approvals remain per command.
+#[derive(Default)]
+pub struct RemoteCredentialBrokerCache {
+    brokers: Mutex<Vec<CachedCredentialBroker>>,
+}
+
+struct CachedCredentialBroker {
+    environment_id: Option<String>,
+    conversation_id: Option<String>,
+    config: NetworkProxyConfig,
+    broker: CredentialBroker,
+}
+
+impl RemoteCredentialBrokerCache {
+    pub(crate) fn broker_if_enabled(
+        &self,
+        environment_id: Option<&str>,
+        conversation_id: Option<&str>,
+        config: &NetworkProxyConfig,
+    ) -> Option<CredentialBroker> {
+        if !config.credential_broker {
+            return None;
+        }
+        // Retain broker configuration and the command's destination context so ordinary
+        // network-policy changes preserve placeholders, while destination changes cannot
+        // invalidate another command's mappings.
+        let config = NetworkProxyConfig {
+            credential_broker: config.credential_broker,
+            allow_local_binding: Some(config.allow_local_binding()),
+            credential_broker_openai_host: config.credential_broker_openai_host.clone(),
+            credential_broker_context: config.credential_broker_context.clone(),
+            credential_providers: config.credential_providers.clone(),
+            ..NetworkProxyConfig::default()
+        };
+        let mut brokers = self
+            .brokers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = brokers.iter().find(|cached| {
+            cached.environment_id.as_deref() == environment_id
+                && cached.conversation_id.as_deref() == conversation_id
+                && cached.config == config
+        }) {
+            return Some(cached.broker.clone());
+        }
+        let broker = CredentialBroker::new(config.credential_broker);
+        broker.configure(&config);
+        brokers.push(CachedCredentialBroker {
+            environment_id: environment_id.map(str::to_owned),
+            conversation_id: conversation_id.map(str::to_owned),
+            config,
+            broker: broker.clone(),
+        });
+        Some(broker)
+    }
+}
 
 /// Executor-local proxy launch inputs transported with one process start.
 ///
@@ -55,13 +115,15 @@ impl RemoteNetworkProxyLaunchConfig {
 /// Effective network proxy settings that are safe to send to a remote executor.
 ///
 /// Listener addresses are deliberately omitted because the executor chooses its own loopback
-/// ports. MITM, credential injection, and hooks are not represented so their configuration cannot
-/// cross the exec-server boundary accidentally.
+/// ports. Masking carries only built-in broker activation; credentials, destination context, custom
+/// providers, CA configuration, and MITM hooks stay on their execution host.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct RemoteNetworkProxyConfig {
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credential_masking: bool,
     pub enable_socks5: bool,
     pub enable_socks5_udp: bool,
     pub allow_upstream_proxy: bool,
@@ -85,6 +147,7 @@ impl RemoteNetworkProxyConfig {
         );
         Ok(Self {
             enabled: config.enabled,
+            credential_masking: false,
             enable_socks5: config.enable_socks5,
             enable_socks5_udp: config.enable_socks5_udp,
             allow_upstream_proxy: config.allow_upstream_proxy,
@@ -99,7 +162,7 @@ impl RemoteNetworkProxyConfig {
     }
 
     pub(crate) fn into_network_proxy_config(self) -> NetworkProxyConfig {
-        NetworkProxyConfig {
+        let mut config = NetworkProxyConfig {
             enabled: self.enabled,
             enable_socks5: self.enable_socks5,
             enable_socks5_udp: self.enable_socks5_udp,
@@ -110,7 +173,9 @@ impl RemoteNetworkProxyConfig {
             unix_sockets: self.unix_sockets,
             allow_local_binding: Some(self.allow_local_binding),
             ..NetworkProxyConfig::default()
-        }
+        };
+        config.set_credential_broker_enabled(self.credential_masking);
+        config
     }
 }
 

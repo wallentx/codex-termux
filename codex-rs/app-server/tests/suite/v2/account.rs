@@ -2687,12 +2687,44 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
 #[serial(login_port)]
 async fn login_account_chatgpt_uses_oauth_overrides() -> Result<()> {
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
     let mock_server = MockServer::start().await;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            chatgpt_base_url: Some(format!("{}/backend-api", mock_server.uri())),
+            ..Default::default()
+        },
+    )?;
+    app_test_support::mount_workspace_routing(&mock_server).await;
+    let requirements = format!(
+        "model_provider = 'gateway'\n[model_providers.gateway]\nname = 'Gateway'\nrequires_openai_auth = true\nbase_url = '{0}/v1'\nmodel_catalog_url = '{0}/v1/models'",
+        mock_server.uri(),
+    );
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/config/bundle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "requirements_toml": {"enterprise_managed": [{
+                "id": "gateway", "name": "Gateway", "contents": requirements,
+            }]}
+        })))
+        .mount(&mock_server)
+        .await;
+    let mut model = codex_models_manager::bundled_models_response()?
+        .models
+        .remove(0);
+    model.slug = "workspace-gateway-model".into();
+    model.visibility = codex_protocol::openai_models::ModelVisibility::List;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer access-token-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": [model]})))
+        .expect(1..)
+        .mount(&mock_server)
+        .await;
     let id_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("staging@example.com")
-            .plan_type("pro")
+            .plan_type("enterprise")
             .chatgpt_account_id(WORKSPACE_ID_EMBEDDED),
     )?;
     mock_oauth_token(&mock_server, &id_token).await;
@@ -2710,6 +2742,15 @@ async fn login_account_chatgpt_uses_oauth_overrides() -> Result<()> {
         ])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
+
+    let request = mcp.send_list_models_request(Default::default()).await?;
+    let initial: codex_app_server_protocol::ModelListResponse = mcp.read_response(request).await?;
+    assert!(
+        !initial
+            .data
+            .iter()
+            .any(|model| model.id == "workspace-gateway-model")
+    );
 
     let request_id = mcp.send_login_account_chatgpt_request().await?;
     let login: LoginAccountResponse =
@@ -2789,6 +2830,18 @@ async fn login_account_chatgpt_uses_oauth_overrides() -> Result<()> {
             onboarding_entrypoint: None,
         }
     );
+    // Listing immediately after asynchronous login completion must use the new cloud provider.
+    let request = mcp.send_list_models_request(Default::default()).await?;
+    let models: codex_app_server_protocol::ModelListResponse = mcp.read_response(request).await?;
+    assert_eq!(
+        models
+            .data
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["workspace-gateway-model"]
+    );
+    mock_server.verify().await;
     Ok(())
 }
 

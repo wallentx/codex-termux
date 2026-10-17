@@ -13,7 +13,6 @@ use codex_exec_server::EnvironmentConnectionState;
 use codex_exec_server::EnvironmentInfo;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerError;
-use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::EnvironmentCapabilityRoots;
@@ -1152,14 +1151,6 @@ impl TurnEnvironmentSnapshot {
         self.turn_environments().next()
     }
 
-    /// Returns the first selected environment's host folders, even if setup is not ready yet.
-    pub(crate) fn primary_workspace_roots(&self) -> Vec<AbsolutePathBuf> {
-        self.primary_workspace_root_uris()
-            .iter()
-            .filter_map(|root| root.to_abs_path().ok())
-            .collect()
-    }
-
     /// Returns the first selection's executor paths, even when setup is not ready yet.
     pub(crate) fn primary_workspace_root_uris(&self) -> &[PathUri] {
         let selection = match self.environments.first() {
@@ -1187,20 +1178,26 @@ impl TurnEnvironmentSnapshot {
     }
 
     pub(crate) fn local_environment_cwd(&self) -> Option<AbsolutePathBuf> {
+        self.local_selection()
+            .and_then(|selection| selection.cwd.to_abs_path().ok())
+    }
+
+    /// The local workspace remains host-owned while its executor is still starting.
+    pub(crate) fn local_selection(&self) -> Option<&TurnEnvironmentSelection> {
         self.environments
             .iter()
             .find_map(|environment| match environment {
                 TurnEnvironmentState::Ready(environment)
                     if !environment.environment.is_remote() =>
                 {
-                    environment.cwd().to_abs_path().ok()
+                    Some(&environment.selection)
                 }
                 TurnEnvironmentState::Ready(_) => None,
                 TurnEnvironmentState::Starting(environment)
                     if environment.selection.environment_id
                         == codex_exec_server::LOCAL_ENVIRONMENT_ID =>
                 {
-                    environment.selection.cwd.to_abs_path().ok()
+                    Some(&environment.selection)
                 }
                 TurnEnvironmentState::Starting(_) | TurnEnvironmentState::Failed { .. } => None,
             })
@@ -1275,11 +1272,6 @@ impl TurnEnvironmentSnapshot {
                 TurnEnvironmentState::Failed { selection, .. } => selection.clone(),
             })
             .collect()
-    }
-
-    pub(crate) fn primary_filesystem(&self) -> Option<Arc<dyn ExecutorFileSystem>> {
-        self.primary()
-            .map(|environment| environment.environment.get_filesystem())
     }
 
     pub(crate) fn single_local_environment(&self) -> Option<&TurnEnvironment> {

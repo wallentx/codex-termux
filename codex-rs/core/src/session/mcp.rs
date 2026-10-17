@@ -3,8 +3,11 @@ use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::combine_selected_capability_roots;
 use crate::mcp_tool_call::McpToolApprovalContext;
+use codex_exec_server::DiscoverV2CapabilitiesRequest;
 use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Cache;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_exec_server::MAX_SELECTED_CAPABILITY_ROOTS;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -122,6 +125,9 @@ impl Session {
             .await;
         let ready_selected_capability_roots =
             Self::ready_selected_capability_roots(&selected_capability_roots);
+        let executor_capability_discovery_v2 = self
+            .executor_capability_discovery_for_step_v2(config, &environments)
+            .await;
         let executor_capability_discovery = self
             .executor_capability_discovery_for_step(
                 config,
@@ -147,6 +153,7 @@ impl Session {
                     },
                     &ready_selected_capability_roots,
                     executor_capability_discovery.as_deref(),
+                    executor_capability_discovery_v2.as_deref(),
                 )
                 .await;
         let mcp_config = self
@@ -229,6 +236,9 @@ impl Session {
                 .await;
             let ready_selected_capability_roots =
                 Self::ready_selected_capability_roots(&selected_capability_roots);
+            let executor_capability_discovery_v2 = self
+                .executor_capability_discovery_for_step_v2(&desired.config, &desired.environments)
+                .await;
             let executor_capability_discovery = self
                 .executor_capability_discovery_for_step(
                     &desired.config,
@@ -255,6 +265,7 @@ impl Session {
                     },
                     &ready_selected_capability_roots,
                     executor_capability_discovery.as_deref(),
+                    executor_capability_discovery_v2.as_deref(),
                 )
                 .await;
             self.publish_mcp_runtime(
@@ -302,6 +313,9 @@ impl Session {
             .await;
         let ready_selected_capability_roots =
             Self::ready_selected_capability_roots(&selected_capability_roots);
+        let executor_capability_discovery_v2 = self
+            .executor_capability_discovery_for_step_v2(&desired.config, &desired.environments)
+            .await;
         let executor_capability_discovery = self
             .executor_capability_discovery_for_step(
                 &desired.config,
@@ -328,6 +342,7 @@ impl Session {
                 },
                 &ready_selected_capability_roots,
                 executor_capability_discovery.as_deref(),
+                executor_capability_discovery_v2.as_deref(),
             )
             .await;
         let mcp_projection = self
@@ -497,6 +512,66 @@ impl Session {
             self.mark_mcp_runtime_dirty();
         }
         Some(Arc::new(discovery))
+    }
+
+    /// Acquires V2 inventories from the thread's current cache.
+    pub(super) async fn executor_capability_discovery_for_step_v2(
+        &self,
+        config: &Config,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> Option<Vec<ExecutorCapabilityDiscoveryV2Snapshot>> {
+        if !config
+            .features
+            .enabled(Feature::ExecutorCapabilityDiscoveryV2)
+        {
+            return None;
+        }
+        // Retain this cache if a new turn replaces the thread's current cache.
+        let cache = self
+            .services
+            .thread_extension_data
+            .get_or_init(ExecutorCapabilityDiscoveryV2Cache::default);
+        let remote_environment_count = environments
+            .turn_environments()
+            .filter(|selected| selected.environment.is_remote())
+            .count();
+        cache.ensure_capacity(remote_environment_count);
+        let mut snapshots = Vec::new();
+        for selected in environments.turn_environments() {
+            if !selected.environment.is_remote() {
+                continue;
+            }
+            let environment_id = &selected.selection.environment_id;
+            let info = match selected.environment.info().await {
+                Ok(info) => info,
+                Err(_) => {
+                    tracing::warn!(
+                        environment_id,
+                        "could not read executor discovery V2 support"
+                    );
+                    continue;
+                }
+            };
+            if !info.capabilities.capability_discovery_v2 {
+                continue;
+            }
+            let request = DiscoverV2CapabilitiesRequest {
+                cwd: selected.cwd().clone(),
+                sandbox: Some(selected.sandbox_context(/*additional_permissions*/ None)),
+            };
+            let result = cache
+                .discover(environment_id, &selected.environment, request)
+                .await;
+            snapshots.push(ExecutorCapabilityDiscoveryV2Snapshot {
+                environment_id: environment_id.clone(),
+                result,
+            });
+        }
+        if cache.take_recovered_discovery() {
+            // Refresh MCP after discovery recovers.
+            self.mark_mcp_runtime_dirty();
+        }
+        Some(snapshots)
     }
 
     pub(crate) async fn resolve_selected_capability_roots_for_step(
@@ -715,6 +790,9 @@ impl Session {
         let environments = self.services.turn_environments.snapshot().await;
         let environment_selections = environments.all_selections();
         let desired = self.latest_mcp_desired_state(auth, environments).await;
+        let executor_capability_discovery_v2 = self
+            .executor_capability_discovery_for_step_v2(&desired.config, &desired.environments)
+            .await;
         let executor_capability_discovery = self
             .executor_capability_discovery_for_step(
                 &desired.config,
@@ -741,6 +819,7 @@ impl Session {
                 },
                 &ready_selected_capability_roots,
                 executor_capability_discovery.as_deref(),
+                executor_capability_discovery_v2.as_deref(),
             )
             .await;
         self.publish_mcp_runtime(

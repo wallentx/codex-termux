@@ -6,7 +6,7 @@ use assert_matches::assert_matches;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn parent_owned_thread_allows_bare_navigation_commands() {
+fn parent_owned_thread_allows_local_commands() {
     for (command, expected) in [
         ("/agents", SlashCommand::Agents),
         ("/subagents", SlashCommand::MultiAgents),
@@ -23,6 +23,21 @@ fn parent_owned_thread_allows_bare_navigation_commands() {
         assert_eq!(
             composer.handle_submission(/*should_queue*/ false).0,
             InputResult::Command(expected)
+        );
+    }
+
+    for (command, args) in [
+        (SlashCommand::Title, "model"),
+        (SlashCommand::Statusline, "model --no-colors"),
+    ] {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_parent_owned_thread();
+        let name = command.command();
+        composer.set_text_content(format!("/{name} {args}"), Vec::new(), Vec::new());
+
+        assert_eq!(
+            composer.handle_key_event(KeyCode::Enter.into()).0,
+            InputResult::CommandWithArgs(command, args.into(), Vec::new())
         );
     }
 }

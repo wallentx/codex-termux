@@ -105,6 +105,9 @@ mod incremental_tools;
 #[path = "scenarios_incremental_tools_resume.rs"]
 mod incremental_tools_resume;
 
+#[path = "scenarios_model_instructions.rs"]
+mod model_instructions;
+
 #[path = "scenarios_code_mode_settled_helpers_tests.rs"]
 mod code_mode_settled_helpers;
 
@@ -156,6 +159,10 @@ mod preparation;
 
 #[path = "scenarios_content_filter.rs"]
 mod content_filter;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "scenarios_credential_masking.rs"]
+mod credential_masking;
 
 #[path = "scenarios_provider_capabilities.rs"]
 mod provider_capabilities;
@@ -313,6 +320,58 @@ async fn code_mode_mcp_schema_limits_preserve_explicit_overrides() -> Result<()>
         context_snapshot::format_request_history_snapshot(
             "Code Mode exposes explicit MCP schema limits in its prompt and runtime tool catalog.",
             &requests,
+            &ContextSnapshotOptions::default()
+                .rewrite_known_segments()
+                .include_request_settings(),
+        )
+    );
+    Ok(())
+}
+
+#[test_case::test_case(ToolMode::Direct; "direct")]
+#[test_case::test_case(ToolMode::CodeModeOnly; "code_mode")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_tool_discovery_in_same_turn(tool_mode: ToolMode) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(Ok(()), "requires a Windows test_stdio_server binary");
+    let requests = super::rmcp_client::mcp_tool_discovery_scenario(
+        tool_mode, /*invalidation*/ None, /*enabled*/ true,
+    )
+    .await?;
+    let mut bodies = requests
+        .iter()
+        .map(core_test_support::responses::ResponsesRequest::body_json)
+        .collect::<Vec<_>>();
+    // Cargo and Bazel can serialize embedded JSON in different key orders.
+    // Normalize each output text before snapshot truncation and hashing.
+    for body in &mut bodies {
+        for item in body["input"].as_array_mut().expect("request input") {
+            if item["type"] != "function_call_output" && item["type"] != "custom_tool_call_output" {
+                continue;
+            }
+            let parts = match &mut item["output"] {
+                serde_json::Value::Array(parts) => parts
+                    .iter_mut()
+                    .map(|part| &mut part["text"])
+                    .collect::<Vec<_>>(),
+                output => vec![output],
+            };
+            for part in parts {
+                let text = part.as_str().expect("text output");
+                let mut normalized = context_snapshot::normalize_json_lines(text);
+                if text.ends_with('\n') {
+                    normalized.push('\n');
+                }
+                *part = normalized.into();
+            }
+        }
+    }
+    let entries = bodies.iter().map(SnapshotEntry::body).collect::<Vec<_>>();
+    insta::assert_snapshot!(
+        format!("mcp_tool_discovery_{tool_mode:?}"),
+        context_snapshot::format_context_snapshot(
+            "An MCP discovery call announces a new tool, which is called in the same turn.",
+            &entries,
             &ContextSnapshotOptions::default()
                 .rewrite_known_segments()
                 .include_request_settings(),
@@ -1956,14 +2015,9 @@ async fn subagent_waits_for_its_inherited_environment_configuration() -> Result<
     use super::remote_env::spawn_tests::PendingSpawnCase;
     use super::remote_env::spawn_tests::pending_subagent_scenario;
 
-    let requests = pending_subagent_scenario(PendingSpawnCase::TurnSettings, |config| {
-        configure_scenario_catalog(config);
-        config
-            .features
-            .enable(Feature::StableEnvironmentTools)
-            .expect("enable stable environment tools");
-    })
-    .await?;
+    let requests =
+        pending_subagent_scenario(PendingSpawnCase::TurnSettings, configure_scenario_catalog)
+            .await?;
     let labels = [
         "parent delegates while the environment is starting",
         "parent waits for the worker",

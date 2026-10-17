@@ -8,6 +8,8 @@ pub(crate) struct GuardianApprovedAction {
 }
 
 impl GuardianApprovedAction {
+    pub(crate) const KIND: &str = "guardian.approved_action";
+
     pub(crate) fn new(approved_action_json: String) -> Self {
         Self {
             approved_action_json,
@@ -17,7 +19,7 @@ impl GuardianApprovedAction {
 
 impl ContextualUserFragment for GuardianApprovedAction {
     fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("guardian.approved_action".to_string())
+        ContentItemKind(Self::KIND.to_string())
     }
 
     fn role(&self) -> &'static str {

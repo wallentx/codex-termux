@@ -87,6 +87,9 @@ impl App {
         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
             overlay.set_keymap_bindings(&self.keymap);
         }
+        if self.overlay.is_none() && self.chat_widget.handle_quick_dial_menu(key_event) {
+            return None;
+        }
         if matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.owns_interaction_key(key_event))
             || (tui.is_owned_screen()
                 && self.overlay.is_none()
@@ -200,6 +203,7 @@ impl App {
     }
 
     pub(super) fn cancel_pending_key_chord(&mut self) {
+        self.chat_widget.cancel_quick_dial_menu();
         if self.key_chord_matcher.cancel() {
             self.set_key_chord_hint_override(/*items*/ None);
         }
@@ -431,6 +435,7 @@ impl App {
                 && let Some(thread_id) = self.current_displayed_thread_id()
             {
                 let target = SessionTarget {
+                    backend_id: app_server.backend_id(),
                     path: self
                         .primary_session_configured
                         .as_ref()

@@ -176,6 +176,66 @@ fn registry_error(status: http::StatusCode, code: &str) -> ExecServerError {
 }
 
 #[tokio::test]
+async fn noise_handshake_reports_disconnect_reason() -> Result<()> {
+    for (send_reset, expected_reason) in [
+        (
+            false,
+            "Noise relay transport expects binary protobuf frames",
+        ),
+        (true, "Noise relay stream reset"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let websocket_url = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let mut websocket = accept_async(socket).await?;
+            let Message::Binary(resume) = websocket.next().await.unwrap()? else {
+                anyhow::bail!("expected resume frame");
+            };
+            let stream_id = decode_relay_message_frame(&resume)?.stream_id;
+            let _handshake = websocket.next().await.unwrap()?;
+            let response = if send_reset {
+                let frame = RelayMessageFrame::reset(stream_id, "untrusted reason".to_string());
+                Message::Binary(encode_relay_message_frame(&frame).into())
+            } else {
+                Message::Text("untrusted text".into())
+            };
+            websocket.send(response).await?;
+            anyhow::Ok(())
+        });
+        let opened =
+            ExecServerClient::open_noise_rendezvous_connection(NoiseRendezvousConnectArgs {
+                bundle: test_bundle(websocket_url)?,
+                harness_identity: NoiseChannelIdentity::generate()?,
+                client_name: "test".to_string(),
+                connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
+                initialize_timeout: DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
+                resume_session_id: None,
+                http_client_factory: codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            })
+            .await?;
+
+        let error = ExecServerClient::finish_noise_rendezvous_connection(opened)
+            .await
+            .err()
+            .expect("invalid handshake response must fail");
+        let ExecServerError::Disconnected(reason) = error else {
+            anyhow::bail!("expected disconnect, got {error:?}");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "Noise harness handshake failed before connection became ready: {expected_reason}"
+            )
+        );
+        server.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn noise_handshake_uses_initialize_timeout() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let websocket_url = format!("ws://{}", listener.local_addr()?);

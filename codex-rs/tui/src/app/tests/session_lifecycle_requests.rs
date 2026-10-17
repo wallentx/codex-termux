@@ -322,6 +322,7 @@ async fn same_thread_retry_keeps_subscription_and_restores_draft() -> Result<()>
         /*failed_thread_name*/ None,
     )
     .await?;
+    let backend_id = app_server.backend_id();
     app.enqueue_primary_thread_session(
         test_thread_session(thread_id, test_path_buf("/tmp/project")),
         Vec::new(),
@@ -343,6 +344,7 @@ async fn same_thread_retry_keeps_subscription_and_restores_draft() -> Result<()>
         &mut tui,
         &mut app_server,
         crate::resume_picker::SessionTarget {
+            backend_id,
             path,
             thread_id,
             cwd: None,
@@ -377,6 +379,7 @@ pub(super) enum HistoryCapabilities {
     ThreadStartDuringLegacyShutdown,
     ConfigReadUnsupported(i64),
     ConfigReadFails,
+    SuperBindingsUnsupported,
     ConfigReadUnknownVoice,
     VoiceCatalogCustom,
     VoiceCatalogUnavailable,
@@ -655,6 +658,18 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                 message: "config temporarily unavailable".to_string(),
                             },
                         })
+                    } else if history_capabilities == HistoryCapabilities::SuperBindingsUnsupported
+                        && request.method == "config/value/write"
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32600,
+                                data: None,
+                                message: "Invalid configuration: unknown key `super-left`"
+                                    .to_string(),
+                            },
+                        })
                     } else if history_capabilities == HistoryCapabilities::VoiceCatalogUnavailable
                         && request.method == "thread/realtime/listVoices"
                     {
@@ -880,8 +895,12 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
     .await?;
 
     Ok((
-        AppServerSession::new(app_server, thread_params_mode)
-            .with_local_codex_home(&config.codex_home),
+        AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            app_server,
+            thread_params_mode,
+        )
+        .with_local_codex_home(&config.codex_home),
         requests,
         proxy,
     ))
@@ -924,6 +943,89 @@ async fn make_history_test_app() -> Result<(Box<App>, tempfile::TempDir)> {
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
     Ok((app, codex_home))
+}
+
+#[tokio::test]
+async fn in_app_remote_resume_picker_preserves_remote_cwd_filter() -> Result<()> {
+    let (mut app, _codex_home) = make_history_test_app().await?;
+    let remote_root = tempdir()?;
+    let remote_cwd = remote_root.path().join("project");
+    std::fs::create_dir(&remote_cwd)?;
+    let (app_server, _requests, active_proxy) =
+        start_recording_remote_app_server(&app.config).await?;
+    let mut app_server = app_server.with_remote_cwd_override(Some(remote_cwd.clone()));
+    app.harness_overrides.model_provider = Some(app.config.model_provider_id.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    app.app_server_target = AppServerTarget::Remote {
+        endpoint: crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?,
+    };
+    let (request_tx, request_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let codex_home = app.config.codex_home.display().to_string();
+    let recorder = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        let mut websocket = accept_async(socket).await?;
+        while let Some(frame) = websocket.next().await {
+            let Message::Text(text) = frame? else {
+                continue;
+            };
+            match serde_json::from_str::<JSONRPCMessage>(&text)? {
+                JSONRPCMessage::Request(request) if request.method == "initialize" => {
+                    let response = JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result: serde_json::json!({
+                            "userAgent": "codex-tui-test",
+                            "codexHome": codex_home,
+                        }),
+                    });
+                    websocket
+                        .send(Message::Text(serde_json::to_string(&response)?.into()))
+                        .await?;
+                }
+                JSONRPCMessage::Request(request) if request.method == "thread/list" => {
+                    let _ = request_tx.send(request.params.unwrap_or_default());
+                    let _ = release_rx.await;
+                    return Ok::<(), color_eyre::Report>(());
+                }
+                _ => {}
+            }
+        }
+        Err(color_eyre::eyre::eyre!(
+            "picker disconnected before requesting its thread list"
+        ))
+    });
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_alt_screen_enabled(/*enabled*/ false);
+    tui.pause_events();
+    let mut picker = Box::pin(app.open_resume_picker(&mut tui, &mut app_server));
+    let params = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+        tokio::select! {
+            biased;
+            params = request_rx => params.map_err(|_| {
+                color_eyre::eyre::eyre!("picker request recorder closed")
+            }),
+            result = &mut picker => {
+                result?;
+                Err(color_eyre::eyre::eyre!(
+                    "picker exited before requesting its thread list"
+                ))
+            }
+        }
+    })
+    .await??;
+    drop(picker);
+    let _ = release_tx.send(());
+    recorder.await??;
+    app_server.shutdown().await?;
+    active_proxy.await??;
+
+    assert_eq!(
+        params["cwd"],
+        serde_json::Value::String(remote_cwd.display().to_string())
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -1377,7 +1479,6 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
 -> Result<()> {
     let (mut app, events, _ops) = Box::pin(make_test_app_with_channels()).await;
     // Invalid optional worktree settings must preserve both daemon start paths.
-    app.config.features.enable(Feature::Worktrees)?;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
@@ -4493,6 +4594,16 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
     let source = codex_utils_path_uri::PathUri::from_abs_path(&agents.abs());
     assert!(configured.instruction_source_paths.contains(&source));
     assert_eq!(configured.approvals_reviewer, ApprovalsReviewer::AutoReview);
+    let earlier_skills_requests = recorded_params(&requests, "skills/list");
+    app.submit_active_thread_op(
+        &mut server,
+        AppCommand::list_skills(vec![current.clone()], /*force_reload*/ true),
+    )
+    .await?;
+    assert_eq!(
+        recorded_params(&requests, "skills/list"),
+        earlier_skills_requests
+    );
     let (cwd, result) = (current.clone(), Err("stale skills".into()));
     let skills = AppEvent::SkillsListLoaded { cwd, result };
     let (cwd, plugins) = (current.clone(), Some(vec![]));
@@ -4709,6 +4820,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     Some("Failed Fork"),
                 )
                 .await?;
+                let backend_id = app_server.backend_id();
                 let root = app_server
                     .resume_thread(
                         &app.local_settings,
@@ -4825,6 +4937,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                         &mut tui,
                         &mut app_server,
                         crate::resume_picker::SessionTarget {
+                            backend_id,
                             path: Some(root_rollout_path),
                             thread_id: root_thread_id,
                             cwd: None,
@@ -5267,3 +5380,6 @@ async fn command_center_read_only_open_requests_and_failure_preservation() -> Re
     }
     Ok(())
 }
+
+#[path = "backend_ownership_tests.rs"]
+mod backend_ownership_tests;

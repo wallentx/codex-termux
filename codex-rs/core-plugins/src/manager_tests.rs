@@ -3294,6 +3294,9 @@ fn loaded_plugins_cache_evicts_least_recently_used_configuration() {
                 format!("plugin-{index}@test"),
                 PluginConfig {
                     enabled: Some(true),
+                    remote_plugin_id: None,
+                    release_id: None,
+                    auto_provision: None,
                     mcp_servers: HashMap::new(),
                 },
             )]),

@@ -29,7 +29,6 @@ use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 #[cfg(unix)]
 use tempfile::tempdir;
-#[cfg(windows)]
 use test_case::test_case;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -59,6 +58,7 @@ async fn prepare_exec_request(
         runtime_paths,
         network_policy_decider,
         network_policy_audit_observer,
+        &codex_network_proxy::RemoteCredentialBrokerCache::default(),
         &ProcessTelemetry::default(),
     )
     .await
@@ -502,8 +502,16 @@ async fn native_request_preserves_native_launch_fields() {
     assert_eq!(prepared.arg0, params.arg0);
 }
 
+#[test_case(false, None, &["-c", "true"]; "unmasked")]
+#[test_case(true, Some("BASH_ENV"), &["-c", "true"]; "masking_with_startup_hook")]
+#[test_case(true, Some("SSH_CLIENT"), &["-c", "true"]; "masking_with_remote_shell_startup")]
+#[test_case(true, None, &["-c", "-l", "true"]; "masking_with_extra_login_option")]
 #[tokio::test]
-async fn native_request_handles_remote_proxy_config_for_platform() {
+async fn native_request_handles_remote_proxy_config_for_platform(
+    credential_masking: bool,
+    startup_env: Option<&str>,
+    shell_args: &[&str],
+) {
     let cwd: AbsolutePathBuf = std::env::current_dir()
         .expect("current directory")
         .try_into()
@@ -513,12 +521,16 @@ async fn native_request_handles_remote_proxy_config_for_platform() {
         ..NetworkProxyConfig::default()
     };
     config.set_allowed_domains(vec!["allowed.example".to_string()]);
-    let proxy_config = RemoteNetworkProxyConfig::from_effective_config(&config)
+    let mut proxy_config = RemoteNetworkProxyConfig::from_effective_config(&config)
         .expect("supported remote proxy config");
+    proxy_config.credential_masking = credential_masking;
     let params = ExecParams {
         metadata: Default::default(),
         process_id: ProcessId::from("process-remote-proxy"),
-        argv: vec!["echo".to_string(), "hello".to_string()],
+        argv: std::iter::once("/bin/bash")
+            .chain(shell_args.iter().copied())
+            .map(str::to_string)
+            .collect(),
         cwd: PathUri::from_abs_path(&cwd),
         shell_snapshot: None,
         env_policy: None,
@@ -535,21 +547,37 @@ async fn native_request_handles_remote_proxy_config_for_platform() {
         ),
     };
     let stale_proxy = "http://127.0.0.1:9".to_string();
-    let env = HashMap::from([
+    let mut env = HashMap::from([
         ("HTTP_PROXY".to_string(), stale_proxy.clone()),
         ("TEST_ENV".to_string(), "value".to_string()),
+        ("PATH".to_string(), "/devbox/bin:/usr/bin:/bin".to_string()),
+        (
+            "OPENAI_API_KEY".to_string(),
+            "sk-proj-executor-only-0000000000000000000000000000000000".to_string(),
+        ),
         (
             PROXY_ATTRIBUTION_TOKEN_ENV_KEY.to_string(),
             "foreign-token".to_string(),
         ),
     ]);
+    if let Some(key) = startup_env {
+        env.insert(key.to_string(), "startup-hook".to_string());
+    }
 
     let prepared = prepare_exec_request(
-        &params, env, /*runtime_paths*/ None, /*network_policy_decider*/ None,
+        &params,
+        env.clone(),
+        /*runtime_paths*/ None,
+        /*network_policy_decider*/ None,
         /*network_policy_audit_observer*/ None,
     )
     .await
     .expect("prepare request with executor-local proxy");
+
+    assert_eq!(prepared.command, params.argv);
+    for key in ["PATH", "OPENAI_API_KEY"].into_iter().chain(startup_env) {
+        assert_eq!(prepared.env.get(key), env.get(key), "{key}");
+    }
 
     if cfg!(target_os = "windows") {
         assert_eq!(prepared.env.get("HTTP_PROXY"), None);
@@ -596,13 +624,18 @@ async fn disabled_remote_proxy_config_is_rejected_before_exporting_ports() {
         .expect("current directory")
         .try_into()
         .expect("absolute cwd");
-    let proxy_config =
+    let mut proxy_config =
         RemoteNetworkProxyConfig::from_effective_config(&NetworkProxyConfig::default())
             .expect("serializable disabled proxy config");
+    proxy_config.credential_masking = true;
     let params = ExecParams {
         metadata: Default::default(),
         process_id: ProcessId::from("process-disabled-remote-proxy"),
-        argv: vec!["echo".to_string(), "hello".to_string()],
+        argv: vec![
+            "/bin/bash".to_string(),
+            "-lc".to_string(),
+            "true".to_string(),
+        ],
         cwd: PathUri::from_abs_path(&cwd),
         shell_snapshot: None,
         env_policy: None,

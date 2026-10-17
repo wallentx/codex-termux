@@ -308,6 +308,7 @@ async fn new_config(
         tui_pet_anchor: TuiPetAnchor::Composer,
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),
         tui_keymap: TuiKeymap::default(),
+        tui_quick_dials: BTreeMap::new(),
         tui_session_picker_view: SessionPickerViewMode::Dense,
         tui_agents_overview_grouping: Default::default(),
         tui_resume_cwd: None,

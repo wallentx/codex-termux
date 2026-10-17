@@ -271,6 +271,8 @@ impl App {
         mut selection: PermissionProfileSelection,
     ) {
         if self.reject_pending_permission_change() {
+            self.chat_widget
+                .retain_input_after_failed_permission_selection();
             return;
         }
         let Some(thread_id) = self.chat_widget.thread_id() else {
@@ -282,22 +284,21 @@ impl App {
             return;
         };
         let config = self.chat_widget.config_ref();
-        if !self
+        let already_selected = !self
             .agents_overview
             .requested_permission_profiles
             .contains_key(&thread_id)
-            && selection.profile_id.starts_with(':')
             && config
                 .permissions
                 .active_permission_profile()
                 .is_some_and(|profile| profile.id == selection.profile_id)
-            && selection
-                .approval_policy
-                .is_none_or(|policy| config.permissions.approval_policy.value() == policy.to_core())
+            && selection.approval_policy.is_none_or(|policy| {
+                config.permissions.approval_policy.value() == policy.to_core()
+            })
             && selection
                 .approvals_reviewer
-                .is_none_or(|reviewer| config.approvals_reviewer == reviewer)
-        {
+                .is_none_or(|reviewer| config.approvals_reviewer == reviewer);
+        if already_selected && selection.profile_id.starts_with(':') {
             self.agents_overview
                 .selected_permission_profiles
                 .insert(thread_id, selection.profile_id);
@@ -330,9 +331,13 @@ impl App {
                 self.agents_overview
                     .selected_permission_profiles
                     .insert(thread_id, selection.profile_id.clone());
-                self.agents_overview
-                    .requested_permission_profiles
-                    .insert(thread_id, selection.clone());
+                // Custom profiles still go to the server so edited definitions are reloaded.
+                // An unchanged selection may not emit a settings notification.
+                if !already_selected {
+                    self.agents_overview
+                        .requested_permission_profiles
+                        .insert(thread_id, selection.clone());
+                }
                 self.chat_widget.add_info_message(
                     format!(
                         "Permission selection requested: {}",

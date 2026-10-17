@@ -99,6 +99,10 @@ Options:
           Use Agent Identity auth from CODEX_ACCESS_TOKEN for remote
           registration
 
+      --executor-credential-stdin
+          Read rotating executor credentials from stdin; exit when the pipe
+          closes
+
       --aws-sigv4
           Sign Direct registration and WebSocket handshake requests with AWS
           SigV4

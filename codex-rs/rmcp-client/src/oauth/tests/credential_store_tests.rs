@@ -25,6 +25,7 @@ use crate::oauth::compute_store_key;
 use crate::oauth::load_oauth_tokens_from_file;
 use crate::oauth::normalized_oauth_credentials;
 use crate::oauth::save_oauth_tokens_to_file;
+use crate::oauth::save_oauth_tokens_to_file_with_lock_held;
 use crate::oauth::store_lock::OAuthStore;
 use crate::oauth::store_lock::OAuthStoreLock;
 
@@ -286,6 +287,101 @@ async fn storage_roundtrip_preserves_absolute_and_unknown_expiry() -> Result<()>
             store.stored_credentials().await,
             normalized_oauth_credentials(Some(&expected))
         );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_rejection_retains_guard_and_preserves_replacement() -> Result<()> {
+    let _env = TempCodexHome::new();
+    let initial = sample_tokens();
+    save_oauth_tokens_to_file(&initial)?;
+    let store = OAuthCredentialStore::new(
+        initial.clone(),
+        ResolvedOAuthCredentialStore::file(),
+        MockKeyringStore::default(),
+        /*oauth_config*/ None,
+    );
+    let credentials = store.load().await?.unwrap();
+    assert!(matches!(
+        store.on_refresh_token_rejected(&credentials).await,
+        Err(AuthError::CredentialStoreError(error)) if error.contains("active refresh guard")
+    ));
+    let guard = store.acquire_transaction_guard().await?;
+    let aggregate_lock = OAuthStoreLock::acquire_for_write(OAuthStore::File)?;
+    let mut mutation = store.on_refresh_token_rejected(&credentials);
+    assert!(futures::poll!(&mut mutation).is_pending());
+    drop(mutation);
+    drop(guard);
+    let mut contender = Box::pin(RefreshCredentialLock::acquire_for_server(
+        &initial.server_name,
+        &initial.url,
+    ));
+    assert!(futures::poll!(&mut contender).is_pending());
+    let mut replacement = initial.clone();
+    replacement
+        .token_response
+        .0
+        .set_refresh_token(Some(RefreshToken::new("replacement-refresh".into())));
+    // A legacy writer may finish while retirement is waiting for the aggregate lock.
+    save_oauth_tokens_to_file_with_lock_held(&replacement)?;
+    drop(aggregate_lock);
+    let _guard = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), contender).await??;
+    let mut expected = initial.clone();
+    expected.token_response.0.set_refresh_token(None);
+    let durable = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?.unwrap();
+    assert_tokens_match_without_expiry(&durable, &replacement);
+    assert_eq!(
+        store.stored_credentials().await,
+        normalized_oauth_credentials(Some(&expected))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn keyring_rejection_respects_credential_scope() -> Result<()> {
+    for kind in [
+        AuthKeyringBackendKind::Direct,
+        AuthKeyringBackendKind::Secrets,
+    ] {
+        let _env = TempCodexHome::new();
+        let initial = sample_tokens();
+        let keyring = MockKeyringStore::default();
+        let authority = ResolvedOAuthCredentialStore::keyring(kind);
+        authority.save(&keyring, &initial.server_name, &initial)?;
+        let store = OAuthCredentialStore::new(
+            initial.clone(),
+            authority,
+            keyring.clone(),
+            /*oauth_config*/ None,
+        );
+        let guard = store.acquire_transaction_guard().await?;
+        store
+            .on_refresh_token_rejected(&store.load().await?.unwrap())
+            .await?;
+        let mut retired = initial.clone();
+        retired.token_response.0.set_refresh_token(None);
+        let expected_durable = match kind {
+            AuthKeyringBackendKind::Direct => &initial,
+            AuthKeyringBackendKind::Secrets => &retired,
+        };
+        assert_tokens_match_without_expiry(
+            &authority
+                .load(&keyring, &initial.server_name, &initial.url)?
+                .unwrap(),
+            expected_durable,
+        );
+        assert_eq!(
+            store.stored_credentials().await,
+            normalized_oauth_credentials(Some(&retired))
+        );
+        drop(guard);
+        if kind == AuthKeyringBackendKind::Direct {
+            assert!(matches!(
+                store.acquire_transaction_guard().await,
+                Err(AuthError::AuthorizationRequired)
+            ));
+        }
     }
     Ok(())
 }

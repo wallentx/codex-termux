@@ -410,14 +410,14 @@ fn settings(tui: &Tui, status: ConfigPanelStatus) -> Vec<ConfigSetting> {
         ConfigSetting {
             section: ConfigSection::TextSelection,
             label: "Copy on select",
-            description: "Copy transcript selections on release, with Auto following terminal defaults",
+            description: "Copy transcript, footer, and composer selections on release; Auto follows terminal defaults",
             keywords: "clipboard mouse selection automatic drag",
             value: ConfigEditor::CopyOnSelect.value(tui, status),
         },
         ConfigSetting {
             section: ConfigSection::TextSelection,
             label: "Deselect after copy",
-            description: "Remove the selection highlight after Copy on select succeeds",
+            description: "Remove read-only transcript and footer highlights after automatic copy succeeds",
             keywords: "clipboard deselect clear highlight automatic mouse selection",
             value: ConfigSettingValue::DependentToggle {
                 setting: ConfigToggle::CopyOnSelectClearSelection,

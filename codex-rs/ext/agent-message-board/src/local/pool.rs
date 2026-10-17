@@ -4,6 +4,7 @@
 use super::storage_error;
 use codex_protocol::error::Result;
 use codex_state::SqliteConfig;
+use codex_state::SqlitePoolWriteExt;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -70,10 +71,7 @@ pub(super) async fn open(sqlite: &SqliteConfig) -> Result<Arc<SqlitePool>> {
             .open_read_write_pool(&path)
             .await
             .map_err(storage_error)?;
-        let mut tx = pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(storage_error)?;
+        let mut tx = pool.begin_immediate().await.map_err(storage_error)?;
         sqlx::raw_sql(SCHEMA)
             .execute(&mut *tx)
             .await

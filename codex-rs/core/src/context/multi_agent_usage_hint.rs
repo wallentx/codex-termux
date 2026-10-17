@@ -8,6 +8,8 @@ pub(crate) struct MultiAgentUsageHint {
 }
 
 impl MultiAgentUsageHint {
+    pub(crate) const KIND: &str = "multi_agent.usage_hint";
+
     pub(crate) fn new(text: &str) -> Self {
         Self {
             text: text.to_string(),
@@ -17,7 +19,7 @@ impl MultiAgentUsageHint {
 
 impl ContextualUserFragment for MultiAgentUsageHint {
     fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("multi_agent.usage_hint".to_string())
+        ContentItemKind(Self::KIND.to_string())
     }
 
     fn role(&self) -> &'static str {

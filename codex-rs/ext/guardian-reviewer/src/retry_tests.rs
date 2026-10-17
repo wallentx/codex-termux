@@ -163,32 +163,59 @@ async fn guardian_review_retry_wait_honors_deadline() {
     assert!(matches!(error, Some(GuardianReviewError::Timeout)));
 }
 
-#[tokio::test]
-async fn stale_authorization_uses_the_shared_attempt_budget() {
+#[test_case::test_case(2; "recovers with fresh evidence")]
+#[test_case::test_case(4; "exhausts the shared budget")]
+#[tokio::test(start_paused = true)]
+async fn stale_authorization_uses_the_shared_attempt_budget(success_on_attempt: i64) {
     let mut attempts = 0;
-    let (outcome, analytics, _) = run_with_retry(
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(/*secs*/ 90);
+    let (outcome, analytics, evidence) = run_with_retry(
         GuardianReviewSessionLimits {
             max_attempts: 3,
-            deadline: Instant::now() + Duration::from_secs(/*secs*/ 90),
+            deadline,
         },
         /*external_cancel*/ None,
-        |_deadline| {
+        |attempt_deadline| {
+            assert_eq!(attempt_deadline, deadline);
             attempts += 1;
-            async {
+            let attempt = attempts;
+            async move {
                 (
-                    GuardianReviewOutcome::Error(GuardianReviewError::StaleAuthorization),
+                    if attempt == success_on_attempt {
+                        GuardianReviewOutcome::CachedApproval
+                    } else {
+                        GuardianReviewOutcome::Error(GuardianReviewError::StaleAuthorization)
+                    },
                     GuardianReviewAnalyticsResult::without_session(),
-                    None::<()>,
+                    Some(attempt),
                 )
             }
         },
     )
     .await;
-    assert!(matches!(
-        outcome,
-        GuardianReviewOutcome::Error(GuardianReviewError::StaleAuthorization)
-    ));
-    assert_eq!((attempts, analytics.attempt_count), (3, 3));
+    assert_eq!(
+        started_at.elapsed(),
+        Duration::ZERO,
+        "stale authorization retries should not wait for service backoff"
+    );
+    if success_on_attempt <= 3 {
+        assert!(matches!(outcome, GuardianReviewOutcome::CachedApproval));
+    } else {
+        assert!(matches!(
+            outcome,
+            GuardianReviewOutcome::Error(GuardianReviewError::StaleAuthorization)
+        ));
+    }
+    let expected_attempts = success_on_attempt.min(3);
+    assert_eq!(
+        (attempts, analytics.attempt_count, evidence),
+        (
+            expected_attempts,
+            expected_attempts,
+            Some(expected_attempts)
+        )
+    );
 }
 
 #[tokio::test]

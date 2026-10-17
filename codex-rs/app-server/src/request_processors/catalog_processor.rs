@@ -178,10 +178,15 @@ impl CatalogRequestProcessor {
         &self,
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (config, models_manager) = self
+            .model_catalog
+            .current()
+            .await
+            .map_err(|err| config_load_error(&err))?;
         // Gate the same provider used by the catalog, including when its model cache is warm.
         // Resolving credentials may refresh them, but explicit host policy prevents browser login.
         if let Some(gateway) = codex_model_provider::create_model_provider(
-            self.config.model_provider.clone(),
+            config.model_provider.clone(),
             Some(self.thread_manager.auth_manager()),
         )
         .gateway_auth_manager()
@@ -189,7 +194,7 @@ impl CatalogRequestProcessor {
         {
             // Refreshing credentials can contact the gateway before the catalog's own check.
             self.config_manager
-                .check_thread_model_provider(&self.config)
+                .check_thread_model_provider(&config)
                 .await
                 .map_err(|err| config_load_error(&err))?;
             if gateway.resolve_access_token().await.is_err() {
@@ -198,9 +203,9 @@ impl CatalogRequestProcessor {
                     .load_latest_config(/*fallback_cwd*/ None)
                     .await
                     .map_err(|err| config_load_error(&err))?;
-                // Login RPCs use current config, while the catalog retains its startup provider.
-                if current.model_provider_id != self.config.model_provider_id
-                    || current.model_provider != self.config.model_provider
+                // Configuration edits without an account transition still require a restart to refresh the model catalog.
+                if current.model_provider_id != config.model_provider_id
+                    || current.model_provider != config.model_provider
                 {
                     return Err(invalid_request(
                         "Model provider settings changed. Restart Codex to apply them, then retry fetching the model list",
@@ -211,7 +216,7 @@ impl CatalogRequestProcessor {
                 ));
             }
         }
-        self.list_models(params)
+        self.list_models(params, config, models_manager)
             .await
             .map(|response| Some(response.into()))
     }
@@ -280,6 +285,8 @@ impl CatalogRequestProcessor {
     async fn list_models(
         &self,
         params: ModelListParams,
+        config: Arc<Config>,
+        models_manager: codex_models_manager::manager::SharedModelsManager,
     ) -> Result<ModelListResponse, JSONRPCErrorError> {
         let ModelListParams {
             limit,
@@ -288,7 +295,11 @@ impl CatalogRequestProcessor {
         } = params;
         let presets = self
             .model_catalog
-            .list_models(codex_models_manager::manager::RefreshStrategy::OnlineIfUncached)
+            .list_models_from_snapshot(
+                config,
+                models_manager,
+                codex_models_manager::manager::RefreshStrategy::OnlineIfUncached,
+            )
             .await
             .map_err(|err| config_load_error(&err))?;
         let models = supported_models(presets, include_hidden.unwrap_or(false));
@@ -660,14 +671,17 @@ impl CatalogRequestProcessor {
             } else {
                 codex_core_plugins::PluginHookLoadOutcome::default()
             };
-            let hooks = codex_hooks::list_hooks(codex_hooks::HooksConfig {
+            let hooks_config = codex_hooks::HooksConfig {
                 feature_enabled: hooks_enabled,
                 bypass_hook_trust: config.bypass_hook_trust,
                 config_layer_stack: Some(config.config_layer_stack),
                 plugin_hook_sources: plugin_hooks.hook_sources,
                 plugin_hook_load_warnings: plugin_hooks.hook_load_warnings,
                 ..Default::default()
-            });
+            };
+            let hooks = tokio::task::spawn_blocking(move || codex_hooks::list_hooks(hooks_config))
+                .await
+                .map_err(|err| internal_error(format!("hook discovery task failed: {err}")))?;
             data.push(codex_app_server_protocol::HooksListEntry {
                 cwd,
                 hooks: hooks_to_info(&hooks.hooks),

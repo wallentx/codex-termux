@@ -380,6 +380,7 @@ async fn selected_root_ownership_retries_errors_and_caches_success() -> TestResu
                     "test_originator",
                     &selected_roots,
                     discovery.as_ref(),
+                    /*executor_capability_discovery_v2*/ None,
                 ),
                 &config.plugins,
             )
@@ -661,6 +662,10 @@ async fn raw_selected_plugin_contributions(
         None
     };
 
+    let v2 = [codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot {
+        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+        result: Err("V2 must not change existing contributions".to_string()),
+    }];
     let selected = registry.mcp_server_contributors()[0]
         .selected_plugins(
             McpServerContributionContext::for_step(
@@ -670,6 +675,7 @@ async fn raw_selected_plugin_contributions(
                 "test_originator",
                 &selected_capability_roots,
                 executor_capability_discovery.as_ref(),
+                Some(&v2),
             ),
             &config.plugins,
         )

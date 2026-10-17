@@ -8,8 +8,8 @@ expression: "render(&panel, 140)"
 
    Appearance   Notifications   Input   Sessions   Text selection
 
-› Copy on select        Auto · On ›          Copy transcript selections on release, with Auto following terminal defaults
-  Deselect after copy   [ ] Off              Remove the selection highlight after Copy on select succeeds
+› Copy on select        Auto · On ›          Copy transcript, footer, and composer selections on release; Auto follows terminal defaults
+  Deselect after copy   [ ] Off              Remove read-only transcript and footer highlights after automatic copy succeeds
   Right-click paste     Auto · Off ›         Paste when nothing is selected, with Auto following platform defaults and On also enabling mac…
 
 

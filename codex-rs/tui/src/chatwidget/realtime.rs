@@ -23,7 +23,6 @@ use crate::history_cell;
 use crate::motion::MotionMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::UserInput;
-use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::models::MessagePhase;
 use codex_realtime_webrtc::RealtimeWebrtcSession;
@@ -290,11 +289,6 @@ impl ChatWidget {
 
         if self.blocks_direct_input {
             self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
-            return;
-        }
-
-        if !self.config.features.enabled(Feature::RealtimeConversation) {
-            self.add_error_message("Voice conversations are not enabled.".to_string());
             return;
         }
 

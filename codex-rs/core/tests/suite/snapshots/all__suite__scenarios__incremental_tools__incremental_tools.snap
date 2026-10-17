@@ -1,8 +1,8 @@
 ---
 source: core/tests/suite/scenarios_incremental_tools.rs
-expression: "context_snapshot::format_request_history_snapshot(\"Tool definitions enter history in one batch; a catalog change appends one developer notice before only the changed exec definition, without modifying namespace descriptions. The next unchanged turn appends only user input.\",\n&requests,\n&ContextSnapshotOptions::default().rewrite_known_segments().include_request_settings(),)"
+expression: "context_snapshot::format_request_history_snapshot(if use_responses_lite\n{\n    \"Tool definitions precede the initial base instructions. A model switch appends one developer notice, changed tools, and replacement instructions without rewriting the prefix; compaction starts a new window with the updated base.\"\n} else\n{\n    \"Regular Responses requests carry the full current tool catalog without an incremental notice; changed execution instructions replace the catalog on subsequent requests.\"\n}, &requests,\n&ContextSnapshotOptions::default().rewrite_known_segments().include_request_settings(),)"
 ---
-Scenario: Tool definitions enter history in one batch; a catalog change appends one developer notice before only the changed exec definition, without modifying namespace descriptions. The next unchanged turn appends only user input.
+Scenario: Tool definitions precede the initial base instructions. A model switch appends one developer notice, changed tools, and replacement instructions without rewriting the prefix; compaction starts a new window with the updated base.
 
 ## Window 1
 Settings:
@@ -68,9 +68,47 @@ Settings: relative to window 1
         - namespace/functions; hash=771cad2ff250d2f3
           - custom/exec
 08:message/developer:
-    <MODEL_SWITCH>
+    <model_instructions>
+    The current model is updated-tools-model.
+    The following instructions replace the previous base instructions:
+
+    Review results before responding.
+    </model_instructions>
 09:message/user:
     Continue with the updated execution instructions.
 -- request 4 (turn) --
 10:message/user:
     Continue with the same updated tools.
+-- request 5 (compaction) --
+11:compaction_trigger
+
+## Window 3 (after request 5: input diverged at item 00)
+Settings: same as window 2
+-- request 6 (turn) --
+00:additional_tools/developer (2; hash=1322c3a339378659):
+        - namespace/functions; hash=9d5d7a0adab05fef
+          - custom/exec
+          - function/wait
+          - function/exec_command
+          - function/write_stdin
+          - function/request_user_input
+          - custom/apply_patch
+          - function/view_image
+        - tool_search: # Tool discovery  Searches over deferred tool metadata with BM25 and exposes matching tools for t...; args=[limit, query]; hash=400cd6ac61d524a9
+01:message/developer:
+    <MODEL_INSTRUCTIONS>
+02:message/user:
+    Begin work.
+03:message/user:
+    Continue with the same tools.
+04:message/user:
+    Continue with the updated execution instructions.
+05:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+06:message/user:
+    <ENVIRONMENT_CONTEXT>
+07:message/user:
+    Continue with the same updated tools.
+08:compaction:encrypted=true; chars=28; hash=e4a73156e0a498bc
+09:message/user:
+    Continue after compaction.

@@ -4,6 +4,7 @@ use super::*;
 use crate::app::test_support::make_test_app;
 use crate::history_cell::ComputerActivityCell;
 use crate::history_cell::FinalMessageSeparator;
+use crate::history_cell::ForkedThreadHistoryCell;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::UserInput;
 use pretty_assertions::assert_eq;
@@ -58,6 +59,45 @@ fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
         local_image_paths: Vec::new(),
         remote_image_urls: Vec::new(),
     })
+}
+
+#[tokio::test]
+async fn fork_lineage_stays_before_repeated_older_history_pages() {
+    let mut app = make_test_app().await;
+    app.transcript_cells = vec![
+        Arc::new(ForkedThreadHistoryCell(
+            crate::history_cell::PlainHistoryCell::new(vec!["Thread forked from parent".into()]),
+        )),
+        Arc::new(crate::history_cell::PlainHistoryCell::new(vec![
+            "recent history".into(),
+        ])),
+    ];
+
+    app.prepend_older_transcript_cells(vec![Arc::new(crate::history_cell::PlainHistoryCell::new(
+        vec!["older history".into()],
+    ))]);
+    app.prepend_older_transcript_cells(vec![Arc::new(crate::history_cell::PlainHistoryCell::new(
+        vec!["oldest history".into()],
+    ))]);
+
+    let rendered = app
+        .transcript_cells
+        .iter()
+        .flat_map(|cell| cell.display_lines(/*width*/ 80))
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(rendered, @r###"
+    Thread forked from parent
+    oldest history
+    older history
+    recent history
+    "###);
 }
 
 #[test]

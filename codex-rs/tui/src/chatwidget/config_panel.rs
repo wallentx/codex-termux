@@ -99,11 +99,13 @@ impl ChatWidget {
             ConfigToggle::PasteDetection => self.bottom_pane.set_disable_paste_burst(
                 /*disabled*/ tui.disable_paste_burst.unwrap_or(/*default*/ false),
             ),
+            ConfigToggle::StatusLineColors => {
+                self.status_surface_overrides.status_line_use_colors = None;
+            }
             ConfigToggle::AutomaticRecaps
             | ConfigToggle::CopyOnSelectClearSelection
             | ConfigToggle::Notifications
             | ConfigToggle::StartInVimMode
-            | ConfigToggle::StatusLineColors
             | ConfigToggle::Tips => {}
         }
         if setting == ConfigToggle::Animations

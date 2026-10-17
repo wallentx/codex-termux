@@ -63,6 +63,7 @@ members = [
     "ext/agent-message-board",
     "ext/connectors",
     "ext/extension-api",
+    "ext/multi-env-copy-file",
     "ext/goal",
     "ext/git-attribution",
     "ext/guardian-reviewer",
@@ -160,7 +161,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.163.0"
+version = "0.164.0-alpha.3"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -225,6 +226,7 @@ codex-exec-server-test-support = { path = "exec-server/tests/support" }
 codex-execpolicy = { path = "execpolicy" }
 codex-extension-api = { path = "ext/extension-api" }
 codex-extension-items = { path = "ext/items" }
+codex-multi-env-copy-file = { path = "ext/multi-env-copy-file" }
 codex-goal-extension = { path = "ext/goal" }
 codex-git-attribution = { path = "ext/git-attribution" }
 codex-guardian-reviewer = { path = "ext/guardian-reviewer" }
@@ -366,7 +368,7 @@ crossbeam-channel = "0.5.15"
 crypto_box = { version = "0.9.1", features = ["seal"] }
 crossterm = "0.29.0"
 ctor = "0.6.3"
-deno_core_icudata = "0.77.0"
+deno_core_icudata = "0.78.0"
 derive_more = "2"
 diffy = "0.4.2"
 dirs = "6"
@@ -381,8 +383,8 @@ file-id = "0.2.3"
 flate2 = "1.1.8"
 futures = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
-gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
-gix-url = "0.35.2"
+gix = { version = "0.89.0", default-features = false, features = ["sha1"] }
+gix-url = "0.40.0"
 glob = "0.3"
 globset = "0.4"
 hmac = "0.12.1"
@@ -450,10 +452,10 @@ regex-automata = { version = "0.4.13", default-features = false, features = ["st
 regex-lite = "0.1.8"
 regex-syntax = "0.8.8"
 reqwest = { version = "0.12", features = ["cookies"] }
-rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "4048ac40e958fb1a7d614617a2ae8d26666ee2fa", version = "=3.5.1", default-features = false }
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "98a54789b80110ad210495c4ad845c89e1980471", version = "=3.5.1", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
 rustix = { version = "1.1.4", features = ["net"] }
-rustls = { version = "0.23.45", default-features = false, features = [
+rustls = { version = "0.23.46", default-features = false, features = [
     "aws_lc_rs",
     "std",
 ] }
@@ -542,7 +544,7 @@ unicode-width = "0.2"
 url = "2"
 urlencoding = "2.1"
 uuid = "1"
-v8 = "=150.4.0"
+v8 = "=152.2.0"
 vt100 = "0.16.2"
 walkdir = "2.5.0"
 webbrowser = "1.2.2"
@@ -551,7 +553,18 @@ whoami = "1.6.1"
 wildmatch = "2.6.1"
 winapi-util = "0.1.11"
 windows-sys = "0.61.2"
-zip = "2.4.2"
+# Keep the zip 2.x feature set. In zip 9, `bzip2-rs` selects the bzip2-sys
+# backend we already build; the default selects libbz2-rs-sys instead.
+zip = { version = "9.0.0", default-features = false, features = [
+    "aes-crypto",
+    "bzip2-rs",
+    "deflate",
+    "deflate64",
+    "lzma",
+    "time",
+    "xz",
+    "zstd",
+] }
 zstd = "0.13"
 
 wiremock = "0.6"
