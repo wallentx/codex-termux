@@ -364,6 +364,94 @@ esac
         self.assertEqual(self.git("ls-remote", "--heads", "origin"), before)
 
 
+class RedesignedUpstreamAdaptationTests(unittest.TestCase):
+    def apply(self, text, edits):
+        for before, after, _ in edits:
+            text = text.replace(before, after)
+        return text
+
+    def test_arg0_lock_fallback_follows_new_drop_order(self):
+        baseline = (
+            "use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;\n"
+            "    _temp_dir: TempDir,\n    _lock_file: File,\n"
+            "    fn new(temp_dir: TempDir, lock_file: File, paths: P) {}\n"
+            "    lock_file.try_lock()?;\n\n"
+            "    match lock_file.try_lock() {\n"
+            "        Ok(()) => Ok(Some(lock_file)),\n"
+            "        Err(std::fs::TryLockError::WouldBlock) => Ok(None),\n"
+            "        Err(err) => Err(err.into()),\n    }\n"
+            "            lock_file,\n            Arg0DispatchPaths {\n"
+            "            lock_file,\n            Arg0DispatchPaths {\n"
+            "        lock_file.try_lock()?;\n"
+        )
+        source = self.apply(baseline, module.ARG0_LOCK_EDITS)
+        upstream = baseline.replace(
+            "    _temp_dir: TempDir,\n    _lock_file: File,\n",
+            "    // drop order\n    _lock_file: File,\n    _temp_dir: TempDir,\n",
+        )
+        adapted = module.adapt_arg0_lock(baseline, source, upstream)
+        self.assertEqual(
+            adapted,
+            self.apply(upstream, module.ARG0_LOCK_EDITS),
+        )
+        self.assertIn(
+            "    _lock_file: Option<File>,\n    _temp_dir: TempDir,\n", adapted
+        )
+        for unsafe in (source + "extra\n", source.replace("Some(lock_file)", "None")):
+            with self.subTest(source=unsafe), self.assertRaises(ValueError):
+                module.adapt_arg0_lock(baseline, unsafe, upstream)
+
+    def test_android_package_validation_follows_entrypoint_signature(self):
+        old = "fn validate_package(root: &Path) {}\n"
+        new = "fn validate_package(root: &Path, entrypoint: &str) {}\n"
+        tail = module._RG_REQUIRED + (
+            '        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),\n'
+        )
+        baseline = old + tail
+        source = old + self.apply(tail, module.ANDROID_PACKAGE_EDITS)
+        upstream = new + tail
+        self.assertEqual(
+            module.adapt_android_package_validation(baseline, source, upstream),
+            new + self.apply(tail, module.ANDROID_PACKAGE_EDITS),
+        )
+        with self.assertRaises(ValueError):
+            module.adapt_android_package_validation(
+                baseline, source + "// extra\n", upstream
+            )
+        self.assertEqual(
+            module.adapt_android_package_validation(baseline, source, baseline),
+            source,
+        )
+
+    def test_exact_refs_preserve_lock_fallback_through_daemon_socket_split(self):
+        refs = ("rust-v0.163.0", "063d0b87de1bc4c9ba955355d4476d8f22982ba3")
+        path = "codex-rs/app-server-transport/src/transport/unix_socket.rs"
+        try:
+            baseline, source = (
+                subprocess.check_output(
+                    ["git", "show", f"{ref}:{path}"], cwd=ROOT, stderr=subprocess.DEVNULL
+                ).decode()
+                for ref in refs
+            )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        upstream = (
+            baseline.replace(
+                "pub async fn start_control_socket_acceptor(",
+                "pub async fn bind_private_daemon_socket(",
+            )
+            + "\n"
+        )
+        adapted = module.adapt_split_daemon_socket(baseline, source, upstream)
+        self.assertIn("_lock_dir_guard: lock_dir_guard", adapted)
+        self.assertIn("try_acquire_sibling_lock_dir", adapted)
+        with self.assertRaises(ValueError):
+            module.adapt_split_daemon_socket(baseline, source + "// edit\n", upstream)
+        self.assertEqual(
+            module.adapt_split_daemon_socket(baseline, source, baseline), source
+        )
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
