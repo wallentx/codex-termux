@@ -90,6 +90,24 @@ async fn long_control_socket_paths_connect_to_distinct_daemons() {
         std::fs::read_link(sockets[0].as_path()).expect("first socket target"),
         std::fs::read_link(sockets[1].as_path()).expect("second socket target")
     );
+    #[cfg(target_os = "android")]
+    for socket in &sockets {
+        use base64::Engine;
+        use sha2::Digest;
+        use std::os::unix::ffi::OsStrExt;
+
+        let physical = std::fs::read_link(socket.as_path()).expect("socket target");
+        let digest = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(physical.file_name().expect("socket filename").as_bytes())
+            .expect("compact Android socket hash");
+        let logical = std::fs::canonicalize(socket.as_path().parent().expect("socket parent"))
+            .expect("canonical socket parent")
+            .join(socket.as_path().file_name().expect("logical socket name"));
+        assert_eq!(
+            digest,
+            sha2::Sha256::digest(logical.as_os_str().as_bytes()).to_vec(),
+        );
+    }
     for socket in &sockets {
         connect_to_socket(socket.as_path())
             .await

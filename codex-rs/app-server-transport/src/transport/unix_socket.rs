@@ -358,7 +358,17 @@ fn protected_socket_path(rendezvous_path: &Path) -> IoResult<std::path::PathBuf>
     })?;
     let path = std::fs::canonicalize(parent)?.join(name);
     let hash = Sha256::digest(path.as_os_str().as_bytes());
-    Ok(codex_uds::shared_daemon_socket_directory()?.join(format!("{hash:x}")))
+    // Termux's longer private directory needs a compact filename to fit sun_path.
+    // Preserve the complete hash, and keep existing rendezvous names on other Unix hosts.
+    #[cfg(target_os = "android")]
+    let name = {
+        use base64::Engine;
+
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+    };
+    #[cfg(not(target_os = "android"))]
+    let name = format!("{hash:x}");
+    Ok(codex_uds::shared_daemon_socket_directory()?.join(name))
 }
 
 pub struct AppServerStartupLock {
