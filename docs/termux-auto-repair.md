@@ -17,6 +17,14 @@ script checks the repository, workflow path, event, branch, PR ownership, and
 current PR head again. No untrusted fork checkout is executed with write
 credentials.
 
+Repair evidence includes `failed-workflow.yml` from the failed run's recorded
+commit. For PR builds, the local reusable workflow references identify the merge
+commit that GitHub executed; the PR head is kept separately as the publication
+base. Missing or ambiguous merge provenance stops preparation before an issue or
+agent session is created. The agent reads the snapshot instead of the working
+tree's `.github`, which gh-aw restores from trusted `dev` configuration. That
+configuration stays in place; historical workflow files are evidence only.
+
 The Android build selects its `rusty-v8-v<version>` release using the same
 resolved-version helper as the V8 artifact producer. It downloads the archive,
 bindings, and checksums together and verifies both files before exporting their

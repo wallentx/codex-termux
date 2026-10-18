@@ -19,11 +19,12 @@ repair = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(repair)
 BASE = "a" * 40
 SOURCE = "b" * 40
+MERGE = "c" * 40
 
 
 def run_fixture(mode="watch"):
     name = "termux-release-watch" if mode == "watch" else "rust-release"
-    return {
+    run = {
         "id": 42,
         "run_attempt": 1,
         "name": name,
@@ -37,6 +38,15 @@ def run_fixture(mode="watch"):
         "event": "schedule" if mode == "watch" else "pull_request",
         "html_url": f"https://github.com/{repair.REPO}/actions/runs/42",
     }
+    if mode == "build":
+        run["referenced_workflows"] = [
+            {
+                "path": f"{repair.REPO}/.github/workflows/termux-artifact-smoke.yml@{MERGE}",
+                "ref": "refs/pull/515/merge",
+                "sha": MERGE,
+            }
+        ]
+    return run
 
 
 def pr_fixture():
@@ -173,6 +183,8 @@ class PrepareTests(unittest.TestCase):
         self.output = self.root / "output"
         self.issues = []
         self.posts = []
+        self.run = run_fixture()
+        self.checkout_sha = BASE
         self.env = {
             "GITHUB_OUTPUT": str(self.output),
             "GITHUB_REPOSITORY": repair.REPO,
@@ -200,14 +212,21 @@ class PrepareTests(unittest.TestCase):
             self.issues.append(issue)
             return issue
         if "/actions/runs/" in path:
-            return run_fixture()
+            return self.run
         if "/git/ref/" in path:
             return {"object": {"sha": SOURCE}}
         raise AssertionError(path)
 
     def pages(self, path, field=None):
         if path.endswith("/jobs"):
-            return [{"id": 10, "name": "create-release-pr", "conclusion": "failure"}]
+            name = (
+                "create-release-pr"
+                if self.run["name"] == "termux-release-watch"
+                else "Build - aarch64-linux-android"
+            )
+            return [{"id": 10, "name": name, "conclusion": "failure"}]
+        if "/commits/" in path and path.endswith("/pulls"):
+            return [pr_fixture()]
         if "/issues?" in path:
             return self.issues
         if "/pulls?" in path:
@@ -216,7 +235,7 @@ class PrepareTests(unittest.TestCase):
 
     def command(self, args, **kwargs):
         if args[:3] == ["git", "rev-parse", "HEAD"]:
-            return BASE
+            return self.checkout_sha
         if args[:2] == ["git", "tag"]:
             return "rust-v0.163.0-termux"
         if args[:2] == ["git", "fetch"]:
@@ -268,6 +287,124 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(self.execute(dry_run=True), {"eligible": "false"})
         self.assertEqual(self.posts, [])
         self.assertFalse((self.root / "termux-repair-context").exists())
+
+    def test_build_context_uses_the_recorded_merge_workflow_not_the_pr_head(self):
+        self.run = run_fixture("build")
+        self.run["referenced_workflows"].append(
+            {
+                "path": "other/repo/.github/workflows/remote.yml@main",
+                "ref": "refs/heads/main",
+                "sha": SOURCE,
+            }
+        )
+        with patch.dict(os.environ, REPAIR_MODE="build"):
+            self.assertEqual(self.execute()["eligible"], "true")
+        context = json.loads(
+            (self.root / "termux-repair-context/repair-context.json").read_text()
+        )
+        self.assertEqual(
+            {
+                name: context[name]
+                for name in (
+                    "base_sha",
+                    "failed_head_sha",
+                    "failed_workflow_sha",
+                    "failed_workflow_path",
+                )
+            },
+            {
+                "base_sha": BASE,
+                "failed_head_sha": BASE,
+                "failed_workflow_sha": MERGE,
+                "failed_workflow_path": ".github/workflows/rust-release.yml",
+            },
+        )
+
+    def test_watch_context_keeps_failed_source_separate_from_current_dev(self):
+        self.checkout_sha = SOURCE
+        self.execute()
+        context = json.loads(
+            (self.root / "termux-repair-context/repair-context.json").read_text()
+        )
+        self.assertEqual(
+            (context["base_sha"], context["failed_workflow_sha"]), (SOURCE, BASE)
+        )
+
+    def test_unverified_or_ambiguous_merge_sources_stop_before_claiming(self):
+        original = run_fixture("build")["referenced_workflows"][0]
+        for references in (
+            [],
+            [dict(original, sha="../dev")],
+            [dict(original, ref="refs/pull/999/merge")],
+            [dict(original, path=original["path"].replace(MERGE, SOURCE))],
+            [
+                original,
+                dict(
+                    original, sha=SOURCE, path=original["path"].replace(MERGE, SOURCE)
+                ),
+            ],
+        ):
+            self.run = run_fixture("build")
+            self.run["referenced_workflows"] = references
+            with (
+                self.subTest(references=references),
+                patch.dict(os.environ, REPAIR_MODE="build"),
+                self.assertRaisesRegex(ValueError, "workflow commit"),
+            ):
+                self.execute()
+            self.assertEqual(self.posts, [])
+
+
+class BootstrapTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.context = {
+            "mode": "build",
+            "base_sha": BASE,
+            "failed_workflow_sha": MERGE,
+            "failed_workflow_path": ".github/workflows/rust-release.yml",
+        }
+
+    def test_snapshot_uses_recorded_git_source_despite_restored_newer_workflow(self):
+        current = self.root / ".github/workflows/rust-release.yml"
+        current.parent.mkdir(parents=True)
+        current.write_text('release_tag="rusty-v8-v152.2.0"\n')
+        (self.root / "repair-context.json").write_text(json.dumps(self.context))
+
+        def git_command(args):
+            if args == ["git", "rev-parse", "HEAD"]:
+                return BASE
+            if args == ["git", "fetch", "--no-tags", "origin", MERGE]:
+                return ""
+            if args == ["git", "show", f"{MERGE}:.github/workflows/rust-release.yml"]:
+                return 'release_tag="rusty-v8-v147.4.0"'
+            raise AssertionError(args)
+
+        with patch.object(repair, "command", side_effect=git_command):
+            repair.bootstrap(self.root)
+        self.assertEqual(
+            ((self.root / "failed-workflow.yml").read_text(), current.read_text()),
+            ('release_tag="rusty-v8-v147.4.0"\n', 'release_tag="rusty-v8-v152.2.0"\n'),
+        )
+
+    def test_invalid_workflow_source_is_rejected_before_fetch(self):
+        for field, value in (
+            ("failed_workflow_sha", "../dev"),
+            ("failed_workflow_path", ".github/workflows/../../AGENTS.md"),
+            ("mode", "other"),
+        ):
+            context = dict(self.context, **{field: value})
+            (self.root / "repair-context.json").write_text(json.dumps(context))
+            with (
+                self.subTest(field=field),
+                patch.object(repair, "command", return_value=BASE) as command,
+                self.assertRaisesRegex(ValueError, "invalid failed workflow source"),
+            ):
+                repair.bootstrap(self.root)
+            command.assert_called_once_with(["git", "rev-parse", "HEAD"])
+            self.assertFalse((self.root / "failed-workflow.yml").exists())
 
 
 if __name__ == "__main__":

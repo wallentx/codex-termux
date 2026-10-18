@@ -203,12 +203,32 @@ def prepare(*, dry_run=False):
         ]
     if not failed:
         return skip("no supported failed release job")
+    workflow_sha = run["head_sha"]
+    if pr:
+        # The run head is the PR head, but local reusable workflows record the
+        # merge commit whose workflow files GitHub actually executed.
+        merge_ref = f"refs/pull/{pr['number']}/merge"
+        workflow_shas = set()
+        for workflow in run.get("referenced_workflows", []):
+            if workflow.get("ref") != merge_ref or not workflow.get(
+                "path", ""
+            ).startswith(f"{REPO}/.github/workflows/"):
+                continue
+            sha = workflow.get("sha", "")
+            if not SHA.fullmatch(sha) or not workflow["path"].endswith(f"@{sha}"):
+                raise ValueError("invalid recorded workflow commit")
+            workflow_shas.add(sha)
+        if len(workflow_shas) != 1:
+            raise ValueError("failed PR run has no unique recorded workflow commit")
+        workflow_sha = workflow_shas.pop()
     logs = [job_log(job["id"]) for job in failed[:3]]
     context = {
         "mode": mode,
         "run_id": int(run_id),
         "attempt": attempt,
         "failed_head_sha": run["head_sha"],
+        "failed_workflow_sha": workflow_sha,
+        "failed_workflow_path": run["path"],
         "failed_jobs": [j["id"] for j in failed[:3]],
         "base_branch": "dev" if mode == "watch" else pr["head"]["ref"],
         "base_sha": command(["git", "rev-parse", "HEAD"])
@@ -338,6 +358,20 @@ def bootstrap(directory):
         raise ValueError("invalid base commit")
     if command(["git", "rev-parse", "HEAD"]) != context["base_sha"]:
         raise ValueError("checkout does not match the validated repair base")
+    workflow_sha = context["failed_workflow_sha"]
+    workflow_path = context["failed_workflow_path"]
+    workflow_names = {"watch": "termux-release-watch", "build": "rust-release"}
+    if (
+        not SHA.fullmatch(workflow_sha)
+        or context["mode"] not in workflow_names
+        or workflow_path != f".github/workflows/{workflow_names[context['mode']]}.yml"
+    ):
+        raise ValueError("invalid failed workflow source")
+    command(["git", "fetch", "--no-tags", "origin", workflow_sha])
+    failed_workflow = command(["git", "show", f"{workflow_sha}:{workflow_path}"])
+    # gh-aw restores trusted .github files from dev. Preserve that boundary and
+    # expose the failed revision separately as evidence, never as executable config.
+    (directory / "failed-workflow.yml").write_text(failed_workflow + "\n")
     if context["mode"] == "watch":
         source = context["patch_source_sha"]
         if not SHA.fullmatch(source):
