@@ -34,7 +34,7 @@ permissions:
 jobs:
   reusable-smoke:
     name: Termux Reusable Smoke
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag == '' && inputs.artifact_url == '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact_name == '' && inputs.release_tag == '' && inputs.artifact_url == '' }}
     uses: wallentx/gh-actions/.github/workflows/termux-run.yml@main
     with:
       packages: |
