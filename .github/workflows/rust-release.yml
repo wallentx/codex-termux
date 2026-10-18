@@ -588,7 +588,11 @@ jobs:
 
       - name: Test Unix-domain-socket support
         if: ${{ matrix.target == 'aarch64-linux-android' }}
-        run: cargo test --locked -p codex-uds --lib --target x86_64-unknown-linux-gnu
+        run: |
+          # Release manifests bump workspace versions while the upstream lockfile retains 0.0.0.
+          # Update workspace entries without upgrading already-locked external dependencies.
+          cargo update --workspace
+          cargo test --locked -p codex-uds --lib --target x86_64-unknown-linux-gnu
 
       - name: Cargo build
         shell: bash
