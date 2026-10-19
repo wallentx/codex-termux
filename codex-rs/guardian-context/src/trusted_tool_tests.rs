@@ -4,6 +4,7 @@ use super::TrustedToolSource;
 use super::USER_CONFIGURATION_PREFIX;
 use codex_context_fragments::ContextualUserFragment;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -26,7 +27,7 @@ fn trusted_tool_context_attests_only_the_matching_source_and_identity() {
             connector_id: Some("calendar".into()),
             source,
         };
-        let context = fragment.render();
+        let context = fragment.render().expect_text();
         let (instructions, metadata) = context.split_once('\n').unwrap();
 
         assert_eq!(fragment.role(), "developer");
@@ -49,7 +50,7 @@ fn trusted_tool_context_has_a_hard_token_budget() {
         connector_id: None,
         source: TrustedToolSource::UserConfiguration("unbounded instructions ".repeat(1_000)),
     };
-    let context = fragment.render();
+    let context = fragment.render().expect_text();
     assert!(context.starts_with(USER_CONFIGURATION_PREFIX));
     assert!(
         context.len() <= TruncationPolicy::Tokens(MAX_TRUSTED_TOOL_CONTEXT_TOKENS).byte_budget()
@@ -61,7 +62,7 @@ fn trusted_tool_context_has_a_hard_token_budget() {
         connector_id: None,
         source: TrustedToolSource::PluginServiceOrchestrator,
     };
-    let context = fragment.render();
+    let context = fragment.render().expect_text();
     assert!(
         context.len() <= TruncationPolicy::Tokens(MAX_TRUSTED_TOOL_CONTEXT_TOKENS).byte_budget()
     );

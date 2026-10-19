@@ -1900,8 +1900,9 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
             vec![json!("/root"), json!("/root/worker")]
         );
         let context_windows = child_request
-            .message_input_texts("developer")
+            .message_input_text_groups("developer")
             .into_iter()
+            .map(|parts| parts.concat())
             .filter(|text| text.starts_with("<context_window>\n"))
             .collect::<Vec<_>>();
         let identities = context_windows
@@ -1946,10 +1947,9 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         );
         assert!(
             child_request.has_message_with_input_texts("developer", |message| {
-                matches!(
-                    message,
-                    [text] if text.starts_with("<context_window>\nAgent name: /root/worker\n")
-                )
+                message
+                    .concat()
+                    .starts_with("<context_window>\nAgent name: /root/worker\n")
             })
         );
     }

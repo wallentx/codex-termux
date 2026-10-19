@@ -365,7 +365,7 @@ fn assign_missing_response_item_ids_assigns_additional_tools_ids() {
     let items = Cow::Owned(vec![ResponseItem::AdditionalTools {
         id: None,
         role: "developer".to_string(),
-        tools: Vec::new(),
+        tools: Arc::from([]),
     }]);
 
     let items = Session::assign_missing_response_item_ids(items);
@@ -10952,10 +10952,9 @@ async fn build_initial_context_adds_multi_agent_v2_subagent_usage_hint_as_develo
 
     let developer_messages = developer_message_texts(&initial_context);
     assert!(
-        developer_messages
-            .iter()
-            .flatten()
-            .any(|text| text.contains("<context_window>\nAgent name: /root/worker\n")),
+        developer_messages.iter().any(|message| message
+            .concat()
+            .contains("<context_window>\nAgent name: /root/worker\n")),
         "expected subagent context window to include its canonical name, got {developer_messages:?}"
     );
     assert!(
@@ -13089,6 +13088,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         step_context: StepContext::for_test(Arc::clone(&tc)),
         turn_store: Arc::new(codex_extension_api::ExtensionData::new(tc.sub_id.clone())),
         tool_runtime: test_tool_runtime(Arc::clone(&sess), Arc::clone(&tc)),
+        defer_tool_dispatch: false,
         cancellation_token: CancellationToken::new(),
     };
 

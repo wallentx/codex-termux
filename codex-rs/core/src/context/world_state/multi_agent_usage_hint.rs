@@ -38,7 +38,8 @@ impl WorldStateSection for MultiAgentUsageHintState {
     type Snapshot = WorldStateHash;
 
     fn matches_current_legacy_fragment(&self, role: &str, text: &str) -> bool {
-        role == self.instructions.role() && text == self.instructions.render()
+        role == self.instructions.role()
+            && text == self.instructions.render().into_text().unwrap_or_default()
     }
 
     fn render_diff(
@@ -53,8 +54,10 @@ impl WorldStateSection for MultiAgentUsageHintState {
             PreviousSectionState::Known(_) | PreviousSectionState::Absent => {
                 if self.instructions.markers().0.is_empty() {
                     Some(Box::new(
-                        MultiAgentUsageHint::new(&self.instructions.body())
-                            .with_metadata(ContentItemMetadata::tool(self.namespace.clone())),
+                        MultiAgentUsageHint::new(
+                            &self.instructions.body().into_text().unwrap_or_default(),
+                        )
+                        .with_metadata(ContentItemMetadata::tool(self.namespace.clone())),
                     ))
                 } else {
                     Some(Box::new(self.instructions.clone().with_metadata(

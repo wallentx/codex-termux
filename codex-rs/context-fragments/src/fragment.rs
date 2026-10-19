@@ -1,8 +1,10 @@
 use crate::AnnotatedContent;
 use crate::message_from_parts;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::input_text;
 
 /// A rendered contextual fragment and the role that owns its annotated content.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,11 +46,13 @@ impl From<RenderedFragment> for ResponseItem {
 ///
 /// Implementations own the response role and provide the exact fragment body.
 /// Marked fragments also provide start/end markers used to recognize injected
-/// context later. `render()` concatenates markers and body without adding
-/// separators, so implementations should include any whitespace they need
-/// between tags in `body()`. Unmarked fragments should leave both markers empty,
-/// in which case the default helpers render only the body and never match
-/// arbitrary text.
+/// context later. `render()` concatenates markers and `InputText` bodies without
+/// adding separators, so implementations should include any whitespace they need
+/// between tags in `body()`. All other content passes through unchanged. Unmarked
+/// fragments should leave both markers empty and never match arbitrary text.
+/// Producers must enforce size bounds for all model-visible content before rendering.
+/// User-role non-text content is currently classified as ordinary user media because
+/// contextual-user-message recognition relies on text markers.
 pub trait ContextualUserFragment {
     fn role(&self) -> &'static str;
 
@@ -73,7 +77,7 @@ pub trait ContextualUserFragment {
 
     fn markers(&self) -> (&'static str, &'static str);
 
-    fn body(&self) -> String;
+    fn body(&self) -> ContentItem;
 
     fn type_markers() -> (&'static str, &'static str)
     where
@@ -87,21 +91,30 @@ pub trait ContextualUserFragment {
         matches_marked_text(start_marker, end_marker, text)
     }
 
-    fn render(&self) -> String {
+    fn render(&self) -> ContentItem {
         let (start_marker, end_marker) = self.markers();
         let body = self.body();
         if start_marker.is_empty() && end_marker.is_empty() {
             return body;
         }
 
-        format!("{start_marker}{body}{end_marker}")
+        match body {
+            ContentItem::InputText { text } => {
+                input_text(format!("{start_marker}{text}{end_marker}"))
+            }
+            content => content,
+        }
     }
 
     /// Renders the role, model-visible content, and classification together.
     fn render_fragment(&self) -> RenderedFragment {
         RenderedFragment::new(
             self.role(),
-            AnnotatedContent::text(self.render(), self.content_kind(), self.content_metadata()),
+            AnnotatedContent::from_parts(
+                self.render(),
+                self.content_kind(),
+                self.content_metadata(),
+            ),
         )
     }
 
@@ -136,10 +149,10 @@ impl<F: ContextualUserFragment> ContextualUserFragment for AttributedFragment<F>
     fn type_markers() -> (&'static str, &'static str) {
         F::type_markers()
     }
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         self.fragment.body()
     }
-    fn render(&self) -> String {
+    fn render(&self) -> ContentItem {
         self.fragment.render()
     }
     fn content_metadata(&self) -> ContentItemMetadata {

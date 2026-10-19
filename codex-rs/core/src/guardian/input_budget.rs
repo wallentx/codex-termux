@@ -98,7 +98,10 @@ pub(crate) async fn check_pending(session: &Session, turn: &TurnContext) -> Code
                     max_input_tokens: maximum,
                     existing_context_tokens: minimum_prefix,
                 },
-                GuardianBudgetOmission.render(),
+                GuardianBudgetOmission
+                    .render()
+                    .into_text()
+                    .unwrap_or_default(),
                 HistoryTruncation::Allow,
             )
             .map_err(|_error| {
@@ -227,7 +230,14 @@ pub(crate) async fn finalize(
         history_truncation
     };
     let mut context = context
-        .enforce_budget(budget, GuardianBudgetOmission.render(), history_truncation)
+        .enforce_budget(
+            budget,
+            GuardianBudgetOmission
+                .render()
+                .into_text()
+                .unwrap_or_default(),
+            history_truncation,
+        )
         .map_err(|error| {
             session
                 .services

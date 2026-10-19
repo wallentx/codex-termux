@@ -22,6 +22,7 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use codex_protocol_test_support::ContentItemTestExt;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_sandbox;
@@ -325,7 +326,7 @@ async fn guardian_authorization_revision_survives_compaction_not_user_input() ->
         InternalContextSource::from_static("goal"),
         "Inspecting the deployment.",
     );
-    let notification_text = internal_context.render();
+    let notification_text = internal_context.render().expect_text();
     test.codex
         .inject_response_items(vec![ContextualUserFragment::into(internal_context)])
         .await?;

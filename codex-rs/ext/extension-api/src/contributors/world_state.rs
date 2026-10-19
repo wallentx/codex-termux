@@ -4,6 +4,7 @@ use codex_exec_server_protocol::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server_protocol::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -45,12 +46,15 @@ pub enum PreviousWorldStateSection<'a> {
     Known(&'a Value),
 }
 
-/// Plain model-visible data rendered by an extension-owned World State section.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Model-visible content rendered by an extension-owned World State section.
+/// Markers apply only to `InputText` bodies.
+/// The producer owns size bounds for the content; rendering does not truncate it.
+/// Non-text user-role bodies are currently classified as ordinary user media.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderedWorldStateFragment {
     role: &'static str,
     markers: (&'static str, &'static str),
-    body: String,
+    body: ContentItem,
     metadata: ContentItemMetadata,
 }
 
@@ -58,12 +62,12 @@ impl RenderedWorldStateFragment {
     pub fn new(
         role: &'static str,
         markers: (&'static str, &'static str),
-        body: impl Into<String>,
+        body: ContentItem,
     ) -> Self {
         Self {
             role,
             markers,
-            body: body.into(),
+            body,
             metadata: ContentItemMetadata::harness(),
         }
     }
@@ -86,7 +90,7 @@ impl RenderedWorldStateFragment {
         self.markers
     }
 
-    pub fn body(&self) -> &str {
+    pub fn body(&self) -> &ContentItem {
         &self.body
     }
 }

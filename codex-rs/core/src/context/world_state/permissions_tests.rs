@@ -12,6 +12,7 @@ use codex_protocol::openai_models::ApprovalMessages;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::PermissionMessages;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::path::Path;
@@ -62,23 +63,26 @@ fn approved_prefix_is_rendered_without_reinjecting_permissions() {
         .render_fragment_diff(Known(&without_snapshot))
         .1
         .expect("approving a prefix should render a world-state update")
-        .render();
+        .render()
+        .expect_text();
 
     assert_ne!(without_snapshot, with_snapshot);
     assert_ne!(
-        without_approved_prefix.instructions.body(),
-        with_approved_prefix.instructions.body()
+        without_approved_prefix.instructions.body().expect_text(),
+        with_approved_prefix.instructions.body().expect_text()
     );
     assert!(
         !without_approved_prefix
             .instructions
             .body()
+            .expect_text()
             .contains(approved_prefix)
     );
     assert!(
         with_approved_prefix
             .instructions
             .body()
+            .expect_text()
             .contains(approved_prefix)
     );
     assert_eq!(
@@ -90,7 +94,8 @@ fn approved_prefix_is_rendered_without_reinjecting_permissions() {
     let before_approval_permissions =
         permissions_state(PermissionProfile::read_only(), AskForApproval::OnRequest)
             .instructions
-            .render();
+            .render()
+            .expect_text();
     let model_visible_before_and_after = format!(
         "BEFORE APPROVAL — PERMISSIONS ALREADY IN CONTEXT (CONDENSED)\n{before_approval_permissions}\n\nAFTER APPROVAL — WORLD-STATE DIFF APPENDS\n{rendered_update}\n\nFULL PERMISSIONS BLOCK APPENDED AFTER APPROVAL\nNone",
     );
@@ -126,12 +131,15 @@ fn renders_only_newly_approved_prefixes() {
         with_new_prefix
             .render_fragment_diff(Known(&existing_snapshot))
             .1
-            .map(|fragment| fragment.render()),
+            .map(|fragment| fragment.render().expect_text()),
         Some("Approved command prefix saved:\n- [\"cargo\", \"test\"]".to_string())
     );
     let (snapshot, fragment) = with_new_prefix.render_fragment_diff(Known(&current_snapshot));
     assert_eq!(
-        (snapshot, fragment.map(|fragment| fragment.render())),
+        (
+            snapshot,
+            fragment.map(|fragment| fragment.render().expect_text())
+        ),
         (None, None)
     );
 }
@@ -155,7 +163,7 @@ fn legacy_snapshot_deserializes_and_only_suppresses_matching_full_permissions() 
         "permissions": WorldStateHash::from_fragment(&without_approved_prefix.instructions),
     }))
     .expect("legacy world-state snapshot should deserialize");
-    let expected_permissions = with_approved_prefix.instructions.render();
+    let expected_permissions = with_approved_prefix.instructions.render().expect_text();
     let retained = ContextualUserFragment::into(with_approved_prefix.instructions.clone());
     let mut world_state = WorldState::default();
     world_state.add_section(with_approved_prefix);
@@ -171,7 +179,7 @@ fn legacy_snapshot_deserializes_and_only_suppresses_matching_full_permissions() 
             .render_history_fragment_diff(Some(&stale_legacy), &[retained])
             .1
             .into_iter()
-            .map(|fragment| fragment.render())
+            .map(|fragment| fragment.render().expect_text())
             .collect::<Vec<_>>(),
         vec![expected_permissions]
     );
@@ -197,9 +205,13 @@ fn removing_an_approved_prefix_renders_full_permissions() {
         ))
         .1
         .expect("removing a prefix should refresh permissions")
-        .render();
+        .render()
+        .expect_text();
 
-    assert_eq!(rendered, without_approved_prefix.instructions.render());
+    assert_eq!(
+        rendered,
+        without_approved_prefix.instructions.render().expect_text()
+    );
 }
 
 #[test]

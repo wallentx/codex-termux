@@ -1106,7 +1106,7 @@ impl LocalAgentControl {
                 [parent_usage_hints.root, parent_usage_hints.subagent]
                     .into_iter()
                     .flatten()
-                    .map(|instructions| instructions.render())
+                    .map(|instructions| instructions.render().into_text().unwrap_or_default())
                     .collect()
             } else {
                 Vec::new()

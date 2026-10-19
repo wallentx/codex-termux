@@ -18,6 +18,7 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -665,6 +666,7 @@ async fn guardian_review_session_config_resolves_policy_and_template(
                 guardian_output_contract_prompt(),
             )
             .render()
+            .expect_text()
         )
     );
 }

@@ -7,6 +7,9 @@ use std::path::Path;
 
 use super::TransportEvent;
 use crate::transport::websocket::run_websocket_connection;
+use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
+use crate::websocket_compression::WebSocketCompression;
+use crate::websocket_compression::ZSTD_STREAM_PROTOCOL;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -57,6 +60,7 @@ pub async fn start_control_socket_acceptor(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
     daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
 ) -> IoResult<JoinHandle<()>> {
     let (listener, socket_guard) = bind_private_daemon_socket(socket_path.as_path()).await?;
     info!(
@@ -70,6 +74,7 @@ pub async fn start_control_socket_acceptor(
         shutdown_token,
         socket_guard,
         daemon_shutdown_access,
+        compression,
     )))
 }
 
@@ -164,6 +169,7 @@ async fn run_control_socket_acceptor(
     shutdown_token: CancellationToken,
     socket_guard: DaemonSocketFileGuard,
     daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
 ) {
     let _socket_guard = socket_guard;
     loop {
@@ -193,6 +199,7 @@ async fn run_control_socket_acceptor(
         let transport_event_tx = transport_event_tx.clone();
         tokio::spawn(async move {
             let mut shutdown_request = false;
+            let mut negotiated_compression = WebSocketCompression::Plain;
             let websocket_config = WebSocketConfig::default();
             let max_unfragmented_message_bytes = [
                 websocket_config.max_frame_size,
@@ -212,6 +219,17 @@ async fn run_control_socket_acceptor(
                             return Err(rejection);
                         }
                         shutdown_request = true;
+                    } else if compression == WebSocketCompression::Zstd
+                        && request
+                            .headers()
+                            .get(WEBSOCKET_COMPRESSION_HEADER)
+                            .is_some_and(|value| value == ZSTD_STREAM_PROTOCOL)
+                    {
+                        negotiated_compression = WebSocketCompression::Zstd;
+                        response.headers_mut().insert(
+                            WEBSOCKET_COMPRESSION_HEADER,
+                            HeaderValue::from_static(ZSTD_STREAM_PROTOCOL),
+                        );
                     }
                     if let Some(max_bytes) = max_unfragmented_message_bytes {
                         response.headers_mut().insert(
@@ -236,7 +254,13 @@ async fn run_control_socket_acceptor(
                 return;
             }
             let (websocket_writer, websocket_reader) = websocket_stream.split();
-            run_websocket_connection(websocket_writer, websocket_reader, transport_event_tx).await;
+            run_websocket_connection(
+                websocket_writer,
+                websocket_reader,
+                transport_event_tx,
+                negotiated_compression,
+            )
+            .await;
         });
     }
     info!("control socket acceptor shutting down");

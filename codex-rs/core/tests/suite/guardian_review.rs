@@ -664,11 +664,11 @@ async fn guardian_review_recovers_after_compaction(
     );
 
     assert_eq!(
-        requests[0].has_content_kinds(&["token_budget.context_window"]),
+        requests[0].has_content_kinds(&["token_budget.context_window"; 3]),
         !with_parent_checkpoint
     );
     for request in &guardian_requests {
-        assert!(!request.has_content_kinds(&["token_budget.context_window"]));
+        assert!(!request.has_content_kinds(&["token_budget.context_window"; 3]));
     }
     let compact_requests = requests
         .iter()

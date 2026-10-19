@@ -13,6 +13,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
@@ -80,7 +81,7 @@ fn builds_permissions_from_profile() {
         /*exec_permission_approvals_enabled*/ false,
         /*request_permissions_tool_enabled*/ false,
     );
-    let text = instructions.body();
+    let text = instructions.body().expect_text();
     assert!(text.contains("`sandbox_mode` is `workspace-write`"));
     assert!(text.contains("Network access is enabled."));
     assert!(text.contains(writable_root.to_string_lossy().as_ref()));
@@ -149,7 +150,7 @@ fn builds_permissions_from_profile_with_executor_denied_reads() {
         /*exec_permission_approvals_enabled*/ false,
         /*request_permissions_tool_enabled*/ false,
     );
-    let text = instructions.body();
+    let text = instructions.body().expect_text();
     assert!(text.contains("## Denied filesystem reads"));
     assert!(text.contains("Do not request escalation or additional permissions"));
     assert!(text.contains(r"path `C:\workspace\blocked`"));
@@ -318,7 +319,8 @@ fn empty_catalog_permission_message_preserves_non_sandbox_sections() {
             permission_messages: ResolvedPermissionMessages::new(Some(&messages)),
         },
     )
-    .body();
+    .body()
+    .expect_text();
 
     assert!(!text.contains("Filesystem sandboxing defines"));
     assert!(text.contains("Approval policy is currently never"));
@@ -335,7 +337,8 @@ fn includes_request_rule_instructions_for_on_request() {
         },
         user_approval_context(),
     )
-    .body();
+    .body()
+    .expect_text();
 
     assert!(text.contains("prefix_rule"));
     assert!(text.contains("Approved command prefixes"));
@@ -360,7 +363,8 @@ fn includes_request_permissions_tool_instructions_for_unless_trusted_when_enable
         },
         user_approval_context(),
     )
-    .body();
+    .body()
+    .expect_text();
 
     assert!(text.contains("`approval_policy` is `unless-trusted`"));
     assert!(text.contains("# request_permissions Tool"));
@@ -376,7 +380,9 @@ fn on_request_permission_guidance_matches_enabled_capabilities() {
             request_permissions_tool_enabled,
             ..WORKSPACE_CONTEXT
         };
-        let text = PermissionsInstructions::from_resolved(context, user_approval_context()).body();
+        let text = PermissionsInstructions::from_resolved(context, user_approval_context())
+            .body()
+            .expect_text();
         for (enabled, expected) in [
             (
                 exec_permission_approvals_enabled,
@@ -472,7 +478,8 @@ fn empty_catalog_approval_message_suppresses_legacy_approval_section() {
             permission_messages: ResolvedPermissionMessages::new(/*messages*/ None),
         },
     )
-    .body();
+    .body()
+    .expect_text();
 
     assert!(text.contains("`sandbox_mode` is `workspace-write`"));
     assert!(text.contains("Network access is restricted."));
@@ -762,6 +769,7 @@ fn bounds_permission_paths_at_whole_entry_boundaries() {
                 user_approval_context(),
             )
             .body()
+            .expect_text()
         };
     // Any two fit, but all three exceed the shared budget. Include multibyte paths.
     let writable = format!("/writable/{}", "é".repeat(6_000));

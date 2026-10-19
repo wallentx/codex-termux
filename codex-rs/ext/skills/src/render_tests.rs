@@ -9,6 +9,7 @@ use crate::provider::SkillProvider;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ContextualUserFragment;
 use codex_protocol::protocol::SkillScope;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
@@ -178,6 +179,7 @@ fn ordering_follows_render_policy() {
         )
         .expect("catalog should render")
         .body()
+        .expect_text()
     };
 
     assert_eq!(
@@ -242,7 +244,7 @@ fn description_selection_follows_render_policy() {
     .expect("catalog should render");
 
     assert_eq!(
-        core.body(),
+        core.body().expect_text(),
         render_available_skills_body(
             SkillPromptKind::Unaliased,
             &[],
@@ -253,7 +255,7 @@ fn description_selection_follows_render_policy() {
         )
     );
     assert_eq!(
-        extension.body(),
+        extension.body().expect_text(),
         render_available_skills_body(
             SkillPromptKind::Unaliased,
             &[],
@@ -331,7 +333,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
         SkillMetadataBudget::Characters(usize::MAX),
     )
     .expect("unaliased host catalog should render");
-    insta::assert_snapshot!(unaliased.body(), @r###"
+    insta::assert_snapshot!(unaliased.body().expect_text(), @r###"
 
     ## Skills
     A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `executor package` locators are owned by their execution environment, `cloud package` locators are opaque package identifiers, and `custom resource` locators use their provider's access mechanism.
@@ -366,7 +368,7 @@ fn host_only_prompts_preserve_existing_behavior_with_and_without_aliases() {
         SkillMetadataBudget::Characters(200),
     )
     .expect("aliased host catalog should render");
-    insta::assert_snapshot!(aliased.body(), @r###"
+    insta::assert_snapshot!(aliased.body().expect_text(), @r###"
 
     ## Skills
     A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a short path that can be expanded into an absolute path using the skill roots table.
@@ -420,8 +422,13 @@ fn path_aliases_are_used_without_budget_pressure_when_they_reduce_prompt_size() 
     )
     .expect("catalog should render");
 
-    assert!(fragment.body().contains("### Skill roots"));
-    assert!(fragment.body().contains("(file: r0/alpha/SKILL.md)"));
+    assert!(fragment.body().expect_text().contains("### Skill roots"));
+    assert!(
+        fragment
+            .body()
+            .expect_text()
+            .contains("(file: r0/alpha/SKILL.md)")
+    );
 }
 
 #[test]
@@ -472,7 +479,7 @@ fn path_aliases_retain_every_skill_under_budget_pressure() {
         SkillMetadataBudget::Characters(alias_minimum),
     )
     .expect("catalog should render");
-    let body = fragment.body();
+    let body = fragment.body().expect_text();
 
     assert!(body.contains(&format!("- `r0` = `{root}`")));
     assert!(body.contains("(file: r0/skill-0/SKILL.md)"));
@@ -615,7 +622,7 @@ fn mixed_catalogs_keep_absolute_authority_aware_rendering_under_budget_pressure(
         SkillMetadataBudget::Characters(absolute_minimum),
     )
     .expect("catalog should render");
-    let body = fragment.body();
+    let body = fragment.body().expect_text();
 
     assert!(!body.contains("### Skill roots"));
     assert!(body.contains(&format!("(file: {root}/skill-0/SKILL.md)")));
@@ -977,13 +984,24 @@ fn omission_notice_follows_render_policy_and_is_charged_to_catalog_budget() {
     .expect("catalog should render");
     let rendered_metadata_cost = fragment
         .body()
+        .expect_text()
         .lines()
         .filter(|line| line.starts_with("- "))
         .map(|line| approx_token_count(&format!("{line}\n")))
         .sum::<usize>();
 
-    assert!(!core_fragment.body().contains("additional skills omitted"));
-    assert!(fragment.body().contains("additional skills omitted"));
+    assert!(
+        !core_fragment
+            .body()
+            .expect_text()
+            .contains("additional skills omitted")
+    );
+    assert!(
+        fragment
+            .body()
+            .expect_text()
+            .contains("additional skills omitted")
+    );
     assert!(rendered_metadata_cost <= 100);
 }
 
@@ -1014,9 +1032,14 @@ fn character_fallback_counts_multibyte_metadata_by_characters() {
     )
     .expect("catalog should render");
 
-    assert!(fragment.body().contains("multibyte-one"));
-    assert!(fragment.body().contains("multibyte-two"));
-    assert!(!fragment.body().contains("additional skills omitted"));
+    assert!(fragment.body().expect_text().contains("multibyte-one"));
+    assert!(fragment.body().expect_text().contains("multibyte-two"));
+    assert!(
+        !fragment
+            .body()
+            .expect_text()
+            .contains("additional skills omitted")
+    );
 }
 
 #[test]
@@ -1055,7 +1078,7 @@ fn catalog_report_counts_partial_description_truncation() {
     let fragment = render
         .into_fragment(/*include_skills_usage_instructions*/ false)
         .expect("partial description should render");
-    assert!(fragment.body().contains(expected_line));
+    assert!(fragment.body().expect_text().contains(expected_line));
 }
 
 #[test]
@@ -1096,8 +1119,8 @@ fn catalog_emits_omission_marker_when_every_minimum_skill_line_exceeds_budget() 
     let core_fragment = core_render
         .into_fragment(/*include_skills_usage_instructions*/ false)
         .expect("core-compatible rendering should preserve an empty skills fragment");
-    assert!(core_fragment.body().contains("## Skills"));
-    assert!(!core_fragment.body().contains("- oversized:"));
+    assert!(core_fragment.body().expect_text().contains("## Skills"));
+    assert!(!core_fragment.body().expect_text().contains("- oversized:"));
     let render = render_available_skills(
         &catalog,
         SkillCatalogRenderPolicy::ExtensionCompatible,
@@ -1110,10 +1133,11 @@ fn catalog_emits_omission_marker_when_every_minimum_skill_line_exceeds_budget() 
         .into_fragment(/*include_skills_usage_instructions*/ false)
         .expect("omission marker should fit");
 
-    assert!(!fragment.body().contains("- oversized:"));
+    assert!(!fragment.body().expect_text().contains("- oversized:"));
     assert!(
         fragment
             .body()
+            .expect_text()
             .contains("- 1 additional skill omitted from this bounded skills list.")
     );
 }

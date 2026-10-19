@@ -1,10 +1,15 @@
 use super::*;
 use codex_context_fragments::AnnotatedContent;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
+use pretty_assertions::assert_ne;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
+use std::sync::Arc;
 
 #[derive(Clone, Deserialize, Serialize)]
 struct TestSection {
@@ -55,8 +60,8 @@ impl ContextualUserFragment for TestFragment {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.0.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.0.clone())
     }
 }
 
@@ -66,6 +71,32 @@ fn world_state_hash_normalizes_crlf_line_endings() {
         WorldStateHash::from_fragment(&TestFragment("line one\r\nline two".to_string())),
         WorldStateHash::from_fragment(&TestFragment("line one\nline two".to_string())),
     );
+}
+
+#[test]
+fn world_state_hash_tracks_typed_content_and_role() {
+    let hash = |role, audio_url: &str| {
+        WorldStateHash::from_fragment(&WorldStateContextFragment {
+            fragment: RenderedWorldStateFragment::new(
+                role,
+                ("", ""),
+                ContentItem::InputAudio {
+                    audio_url: audio_url.to_string(),
+                },
+            ),
+            content_kind: ContentItemKind("generic.test".to_string()),
+        })
+    };
+
+    assert_eq!(
+        hash("developer", "audio-one"),
+        hash("developer", "audio-one")
+    );
+    assert_ne!(
+        hash("developer", "audio-one"),
+        hash("developer", "audio-two")
+    );
+    assert_ne!(hash("developer", "audio-one"), hash("user", "audio-one"));
 }
 
 #[test]
@@ -136,7 +167,7 @@ fn render_diff_restores_the_typed_section_snapshot() {
         vec!["after"],
         rendered
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|fragment| fragment.body().expect_text())
             .collect::<Vec<_>>()
     );
 }
@@ -156,7 +187,7 @@ fn extension_owned_section_uses_its_snapshot_and_renderer() {
                         Some(RenderedWorldStateFragment::new(
                             "developer",
                             ("<extension_test>", "</extension_test>"),
-                            "after",
+                            input_text("after".to_string()),
                         ))
                     }
                     PreviousWorldStateSection::Absent
@@ -181,46 +212,63 @@ fn extension_owned_section_uses_its_snapshot_and_renderer() {
     assert_eq!(rendered.len(), 1);
     assert_eq!(rendered[0].role(), "developer");
     assert_eq!(
-        rendered[0].render(),
+        rendered[0].render().expect_text(),
         "<extension_test>after</extension_test>"
     );
 }
 
 #[test]
-fn extension_owned_section_uses_its_stable_id_as_content_kind_feature() {
-    let mut world_state = WorldState::default();
-    world_state.add_extension_section(WorldStateSectionContribution::new("extension_test", |_| {
+fn extension_owned_section_preserves_typed_content_and_attribution() {
+    let image = ContentItem::InputImage {
+        image: codex_protocol::models::ImageReference::File {
+            file_id: "extension-image".to_string(),
+        },
+        detail: None,
+    };
+    for (body, expected) in [
         (
-            Some(json!({"value": "after"})),
-            Some(
-                RenderedWorldStateFragment::new(
-                    "developer",
-                    ("<extension_test>", "</extension_test>"),
-                    "after",
+            input_text("after".to_string()),
+            input_text("<extension_test>after</extension_test>".to_string()),
+        ),
+        (image.clone(), image),
+    ] {
+        let mut world_state = WorldState::default();
+        world_state.add_extension_section(WorldStateSectionContribution::new(
+            "extension_test",
+            move |_| {
+                (
+                    Some(json!({"value": "after"})),
+                    Some(
+                        RenderedWorldStateFragment::new(
+                            "developer",
+                            ("<extension_test>", "</extension_test>"),
+                            body.clone(),
+                        )
+                        .with_metadata(codex_protocol::models::ContentItemMetadata::skills()),
+                    ),
                 )
-                .with_metadata(codex_protocol::models::ContentItemMetadata::skills()),
-            ),
-        )
-    }));
+            },
+        ));
 
-    let rendered = world_state
-        .render_history_fragment_diff(Some(&WorldStateSnapshot::default()), &[])
-        .1;
+        let rendered = world_state
+            .render_history_fragment_diff(Some(&WorldStateSnapshot::default()), &[])
+            .1;
 
-    assert_eq!(
-        rendered
-            .into_iter()
-            .map(|fragment| fragment.render_fragment().into_parts())
-            .collect::<Vec<_>>(),
-        vec![(
-            "developer",
-            AnnotatedContent::text(
-                "<extension_test>after</extension_test>",
-                ContentItemKind("extension_test.instructions".to_string()),
-                codex_protocol::models::ContentItemMetadata::skills(),
-            ),
-        )]
-    );
+        assert_eq!(
+            rendered
+                .into_iter()
+                .map(|fragment| fragment.render_fragment().into_parts())
+                .collect::<Vec<_>>(),
+            vec![(
+                "developer",
+                AnnotatedContent::from_parts(
+                    expected,
+                    ContentItemKind("extension_test.instructions".to_string()),
+                    codex_protocol::models::ContentItemMetadata::skills(),
+                ),
+            )]
+        );
+    }
 }
 
 #[test]
@@ -234,7 +282,7 @@ fn missing_retained_fragment_is_rendered_again() {
                     PreviousWorldStateSection::Absent => Some(RenderedWorldStateFragment::new(
                         "developer",
                         ("<extension_test>", "</extension_test>"),
-                        "current catalog",
+                        input_text("current catalog".to_string()),
                     )),
                     PreviousWorldStateSection::Unknown | PreviousWorldStateSection::Known(_) => {
                         None
@@ -264,7 +312,7 @@ fn missing_retained_fragment_is_rendered_again() {
             .render_history_fragment_diff(Some(&previous), &[])
             .1
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|fragment| fragment.body().expect_text())
             .collect::<Vec<_>>(),
         vec!["current catalog"]
     );
@@ -324,7 +372,7 @@ fn unreadable_section_snapshot_is_treated_as_unknown() {
         vec!["unknown"],
         rendered
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|fragment| fragment.body().expect_text())
             .collect::<Vec<_>>()
     );
 }
@@ -396,9 +444,9 @@ impl WorldStateSection for MixedOutputSection {
                 content: WorldStateUpdateContent::Item(Box::new(ResponseItem::AdditionalTools {
                     id: None,
                     role: "developer".to_string(),
-                    tools: vec![
+                    tools: Arc::from([
                         json!({"type": "function", "name": "example", "description": self.0.to_string()}),
-                    ],
+                    ]),
                 })),
             },
             WorldStateUpdate {
@@ -410,7 +458,7 @@ impl WorldStateSection for MixedOutputSection {
                 content: WorldStateUpdateContent::Item(Box::new(ResponseItem::AdditionalTools {
                     id: None,
                     role: "developer".to_string(),
-                    tools: vec![json!({"type": "function", "name": "context_tool"})],
+                    tools: Arc::from([json!({"type": "function", "name": "context_tool"})]),
                 })),
             },
             WorldStateUpdate::fragment(TestFragment("after tools".to_string())),
@@ -434,13 +482,13 @@ fn mixed_output_preserves_order_and_restores_its_snapshot() {
         ResponseItem::AdditionalTools {
             id: None,
             role: "developer".to_string(),
-            tools: vec![json!({"type": "function", "name": "example", "description": "2"})],
+            tools: Arc::from([json!({"type": "function", "name": "example", "description": "2"})]),
         },
         ContextualUserFragment::into(TestFragment("prefix instructions".to_string())),
         ResponseItem::AdditionalTools {
             id: None,
             role: "developer".to_string(),
-            tools: vec![json!({"type": "function", "name": "context_tool"})],
+            tools: Arc::from([json!({"type": "function", "name": "context_tool"})]),
         },
         ContextualUserFragment::into(TestFragment("after tools".to_string())),
     ];

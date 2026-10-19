@@ -2,7 +2,9 @@
 //! Evidence stays in separate content parts to preserve its budgeting and source metadata.
 
 use codex_context_fragments::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 /// Owns only the section delimiters; separately budgeted assistant entries supply the body.
 pub(crate) struct RetainedAssistantContext;
@@ -27,7 +29,7 @@ impl ContextualUserFragment for RetainedAssistantContext {
         )
     }
 
-    fn body(&self) -> String {
-        String::new()
+    fn body(&self) -> ContentItem {
+        input_text(String::new())
     }
 }

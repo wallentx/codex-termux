@@ -1,6 +1,7 @@
 use super::*;
 use crate::context::world_state::test_support::FragmentSectionTestExt as _;
 use codex_execpolicy::Decision;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -29,7 +30,7 @@ fn renders_only_newly_approved_prefixes() {
         with_new_prefix
             .render_fragment_diff(Known(&existing_snapshot))
             .1
-            .map(|fragment| fragment.render()),
+            .map(|fragment| fragment.render().expect_text()),
         Some("Approved command prefix saved:\n- [\"cargo\", \"test\"]".to_string())
     );
     assert!(
@@ -54,7 +55,7 @@ fn does_not_duplicate_a_retained_legacy_update() {
         state
             .render_fragment_diff(Unknown)
             .1
-            .map(|fragment| fragment.render()),
+            .map(|fragment| fragment.render().expect_text()),
         None
     );
 }

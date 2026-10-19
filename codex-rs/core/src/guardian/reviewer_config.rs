@@ -45,7 +45,9 @@ pub fn build_guardian_review_session_config(
         policy_template,
         guardian_output_contract_prompt(),
     )
-    .render();
+    .render()
+    .into_text()
+    .unwrap_or_default();
     if guardian_config
         .features
         .enabled(Feature::GuardianConversationHistoryTools)
@@ -58,7 +60,9 @@ pub fn build_guardian_review_session_config(
                     .guardian_conversation_history_prompt
                     .as_deref(),
             }
-            .render(),
+            .render()
+            .into_text()
+            .unwrap_or_default(),
         );
     }
     guardian_config.base_instructions = Some(instructions);

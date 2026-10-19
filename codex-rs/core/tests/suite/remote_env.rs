@@ -63,6 +63,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SandboxPermissions;
+use codex_protocol::models::input_text;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -209,7 +210,7 @@ impl ContextContributor for ReadyCapabilityRootsTestExtension {
                         Some(RenderedWorldStateFragment::new(
                             "user",
                             ("<ready_capability_roots>", "</ready_capability_roots>"),
-                            body.clone(),
+                            input_text(body.clone()),
                         )),
                     )
                 },

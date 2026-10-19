@@ -4,6 +4,7 @@ use codex_context_fragments::ContextualUserFragment;
 use codex_guardian_context::TRANSCRIPT_JSON_INSTRUCTIONS;
 use codex_guardian_context::truncate_text;
 use codex_protocol::TranscriptFormat;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 
 use super::GuardianClassifierInstructions;
@@ -38,7 +39,8 @@ fn reviewer_policy_substitution_preserves_template_layout_and_appends_contract()
                 template,
                 "Review contract."
             )
-            .render(),
+            .render()
+            .expect_text(),
             format!("{TRANSCRIPT_JSON_INSTRUCTIONS}\n\n{expected}"),
         );
     }
@@ -71,7 +73,8 @@ fn reviewer_extra_policy_substitution_preserves_tenant_policy() {
                 template,
                 "Review contract.",
             )
-            .render(),
+            .render()
+            .expect_text(),
             format!("{TRANSCRIPT_JSON_INSTRUCTIONS}\n\n{expected}"),
         );
     }
@@ -87,7 +90,8 @@ fn reviewer_policy_substitution_keeps_inserted_policy_text_literal() {
             "Tenant: {{ tenant_policy_config }}\nAdditional: {{ extra_policy }}",
             "Review contract.",
         )
-        .render(),
+        .render()
+        .expect_text(),
         format!(
             "{TRANSCRIPT_JSON_INSTRUCTIONS}\n\nTenant: Tenant says {{{{ tenant_policy_config }}}} and {{{{ extra_policy }}}}.\nAdditional: Additional says {{{{ tenant_policy_config }}}} and {{{{ extra_policy }}}}.\n\nReview contract.\n"
         ),
@@ -126,7 +130,8 @@ fn classifier_policy_substitution_and_legacy_append_keep_one_terminal_contract_b
                     "Classifier contract.",
                     max_tokens,
                 )
-                .render(),
+                .render()
+                .expect_text(),
                 format!("{TRANSCRIPT_JSON_INSTRUCTIONS}\n\n{expected}"),
             );
         }

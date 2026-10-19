@@ -9,6 +9,7 @@ use codex_protocol::AgentPath;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::input_text;
 use codex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
@@ -40,26 +41,16 @@ impl TokenBudgetContext {
 
     /// Wraps tool hints without losing their source or changing the concatenated prompt text.
     pub(crate) fn render_with_hints(&self, hints: Vec<AnnotatedContent>) -> ResponseItem {
-        if hints.is_empty() {
-            return ContextualUserFragment::into(self.clone());
+        let (open, close) = self.markers();
+        let annotate = |content| {
+            AnnotatedContent::from_parts(content, self.content_kind(), self.content_metadata())
+        };
+        let mut content = vec![annotate(input_text(open)), annotate(self.body())];
+        for hint in hints {
+            content.push(hint);
+            content.push(annotate(input_text("\n")));
         }
-        let mut content = vec![AnnotatedContent::text(
-            format!("{CONTEXT_WINDOW_OPEN_TAG}{}", self.body()),
-            self.content_kind(),
-            self.content_metadata(),
-        )];
-        for mut part in hints {
-            let ContentItem::InputText { text } = part.content_mut() else {
-                unreachable!("context-window hints are text prompt fragments");
-            };
-            text.push('\n');
-            content.push(part);
-        }
-        content.push(AnnotatedContent::text(
-            CONTEXT_WINDOW_CLOSE_TAG,
-            self.content_kind(),
-            self.content_metadata(),
-        ));
+        content.push(annotate(input_text(close)));
         message_from_parts(self.role(), content)
     }
 }
@@ -81,7 +72,7 @@ impl ContextualUserFragment for TokenBudgetContext {
         (CONTEXT_WINDOW_OPEN_TAG, CONTEXT_WINDOW_CLOSE_TAG)
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let first_window_id = self.first_window_id;
         let window_id = self.window_id;
         let mut lines = vec![
@@ -92,7 +83,7 @@ impl ContextualUserFragment for TokenBudgetContext {
         if let Some(previous_window_id) = self.previous_window_id {
             lines.push(format!("Previous context window id: {previous_window_id}"));
         }
-        format!("\n{}\n", lines.join("\n"))
+        input_text(format!("\n{}\n", lines.join("\n")))
     }
 }
 
@@ -151,8 +142,8 @@ impl ContextualUserFragment for ContextWindowGuidance {
         )
     }
 
-    fn body(&self) -> String {
-        format!("\n{}\n", self.message)
+    fn body(&self) -> ContentItem {
+        input_text(format!("\n{}\n", self.message))
     }
 }
 
@@ -190,13 +181,13 @@ impl ContextualUserFragment for TokenBudgetRemainingContext {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        match self.tokens_left {
+    fn body(&self) -> ContentItem {
+        input_text(match self.tokens_left {
             Some(tokens_left) => {
                 format!("You have {tokens_left} tokens left in this context window.")
             }
             None => "You have unknown tokens left in this context window.".to_string(),
-        }
+        })
     }
 }
 
@@ -230,8 +221,8 @@ impl ContextualUserFragment for TokenBudgetReminder {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.message.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.message.clone())
     }
 }
 
@@ -265,7 +256,7 @@ impl ContextualUserFragment for AutoCompactFallbackPrompt {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.message.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.message.clone())
     }
 }

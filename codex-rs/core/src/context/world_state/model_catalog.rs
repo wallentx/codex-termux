@@ -11,9 +11,11 @@ use crate::agent::child_config::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
 use crate::agent::child_config::model_supports_multi_agent_backend;
 use crate::context::ContextualUserFragment;
 use crate::context::environment_context::push_xml_escaped_text;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::ContentItemNamespace;
+use codex_protocol::models::input_text;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::MultiAgentVersion;
 
@@ -118,12 +120,12 @@ impl ContextualUserFragment for ModelCatalogState {
         ("<model_catalog>", "</model_catalog>")
     }
 
-    fn body(&self) -> String {
-        if self.catalog.is_empty() {
+    fn body(&self) -> ContentItem {
+        input_text(if self.catalog.is_empty() {
             "\nThe previous spawn_agent model catalog no longer applies.\n".to_string()
         } else {
             format!("\n{}", self.catalog)
-        }
+        })
     }
 }
 

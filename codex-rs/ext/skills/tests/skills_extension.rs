@@ -1,3 +1,4 @@
+use codex_protocol_test_support::ContentItemTestExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -269,7 +270,7 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
         vec![("developer", expected_catalog), ("user", expected_skill),],
         fragments
             .iter()
-            .map(|fragment| (fragment.role(), fragment.render()))
+            .map(|fragment| (fragment.role(), fragment.render().expect_text()))
             .collect::<Vec<_>>()
     );
     let injected_host_skill_prompts = turn_store
@@ -646,7 +647,8 @@ async fn executor_cloud_and_host_share_catalog_world_state_flow() -> TestResult 
             .render_diff(PreviousWorldStateSection::Absent)
             .1
             .ok_or("skill catalog should render through world state")?;
-        assert!(fragment.body().contains(expected_line));
+        let body = fragment.body().clone().expect_text();
+        assert!(body.contains(expected_line));
     }
 
     let expected_metrics = [
@@ -818,8 +820,9 @@ async fn host_world_state_uses_provider_catalog_with_core_compatible_rendering()
         .1
         .ok_or("host provider catalog should render")?;
 
-    assert!(host_fragment.body().contains("Fix lint errors."));
-    assert!(!host_fragment.body().contains("Short description."));
+    let body = host_fragment.body().clone().expect_text();
+    assert!(body.contains("Fix lint errors."));
+    assert!(!body.contains("Short description."));
     assert_eq!(1, list_calls.load(Ordering::Relaxed));
     Ok(())
 }
@@ -1197,12 +1200,9 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         available_sections[0].render_diff(PreviousWorldStateSection::Absent);
     let available_snapshot = available_snapshot.unwrap();
     let available_fragment = available_fragment.ok_or("available skills should render")?;
-    assert!(available_fragment.body().contains("lint-fix"));
-    assert!(
-        available_fragment
-            .body()
-            .contains("(executor package: executor/lint-fix)")
-    );
+    let available_body = available_fragment.body().clone().expect_text();
+    assert!(available_body.contains("lint-fix"));
+    assert!(available_body.contains("(executor package: executor/lint-fix)"));
 
     let fragments = registry.turn_input_contributors()[0]
         .contribute(
@@ -1228,8 +1228,9 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
 
     assert_eq!(1, fragments.len());
     assert_eq!("user", fragments[0].role());
-    assert!(fragments[0].render().contains("<name>lint-fix</name>"));
-    assert!(fragments[0].render().contains("# Lint Fix"));
+    let rendered = fragments[0].render().expect_text();
+    assert!(rendered.contains("<name>lint-fix</name>"));
+    assert!(rendered.contains("# Lint Fix"));
     assert_eq!(
         vec![(
             SkillAuthority::new(SkillSourceKind::Executor, "env-1"),
@@ -1272,11 +1273,8 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         }),
     );
     let unavailable_fragment = unavailable_fragment.ok_or("removed skills should render")?;
-    assert!(
-        unavailable_fragment
-            .body()
-            .contains("No selected-environment skills")
-    );
+    let unavailable_body = unavailable_fragment.body().clone().expect_text();
+    assert!(unavailable_body.contains("No selected-environment skills"));
 
     let unavailable_world_state =
         serde_json::Map::from_iter([("skills".to_string(), unavailable_snapshot.clone())]);
@@ -1303,13 +1301,11 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
     let restored_snapshot = restored_snapshot.unwrap();
     let restored_fragment = restored_fragment.ok_or("restored skills should render")?;
     assert_eq!(
-        restored_fragment.body(),
+        restored_fragment.body().clone().expect_text(),
         "\n## Skills update\nThe previously listed selected-environment skills are available again.\n",
     );
-    assert!(restored_sections[0].matches_retained_fragment("developer", available_fragment.body()));
-    assert!(
-        !restored_sections[0].matches_retained_fragment("developer", unavailable_fragment.body())
-    );
+    assert!(restored_sections[0].matches_retained_fragment("developer", &available_body));
+    assert!(!restored_sections[0].matches_retained_fragment("developer", &unavailable_body));
     assert_eq!(
         restored_sections[0]
             .render_diff(PreviousWorldStateSection::Absent)
@@ -1393,7 +1389,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         listing_disabled_fragment.ok_or("disabled skill listing should render")?;
     assert_eq!(
         "\n## Skills update\nSelected-environment skills are not listed automatically. Explicit skill mentions can still be resolved when available.\n",
-        listing_disabled_fragment.body()
+        listing_disabled_fragment.body().clone().expect_text()
     );
     let mut normalized_listing_disabled_snapshot = listing_disabled_snapshot.unwrap();
     normalized_listing_disabled_snapshot
@@ -1517,7 +1513,8 @@ async fn overlapping_executor_catalogs_render_their_own_roots() -> TestResult {
                 .1
                 .expect("executor skills should render")
                 .body()
-                .to_string()
+                .clone()
+                .expect_text()
         }
     };
     let (entered, paused) = tokio::sync::oneshot::channel();
@@ -1611,14 +1608,16 @@ async fn default_context_truncates_catalog_descriptions() -> TestResult {
 
     let (executor, cloud) =
         skill_world_state_fragments(&registry, &session_store, &thread_store, "turn-1").await?;
+    let executor = executor.body().clone().expect_text();
+    let cloud = cloud.body().clone().expect_text();
     let expected_description = "x".repeat(1_021) + "...";
     for index in 0..5 {
-        assert!(executor.body().contains(&format!(
+        assert!(executor.contains(&format!(
             "- executor-long-description-{index}: {expected_description} (executor package:"
         )));
     }
-    assert!(cloud.body().contains("- cloud-long-description:"));
-    for rendered in [executor.body(), cloud.body()] {
+    assert!(cloud.contains("- cloud-long-description:"));
+    for rendered in [executor, cloud] {
         assert!(rendered.contains(&expected_description));
         assert!(!rendered.contains(&"x".repeat(1_024)));
         assert!(!rendered.contains(&description));
@@ -1954,13 +1953,13 @@ async fn extreme_budget_pressure_removes_descriptions_before_omitting_entries() 
 
     let (executor, cloud) =
         skill_world_state_fragments(&registry, &session_store, &thread_store, "turn-1").await?;
+    let executor = executor.body().clone().expect_text();
+    let cloud = cloud.body().clone().expect_text();
     let included_executor_count = executor
-        .body()
         .lines()
         .filter(|line| line.starts_with("- executor-skill-"))
         .count();
     let included_cloud_count = cloud
-        .body()
         .lines()
         .filter(|line| line.starts_with("- cloud-skill-"))
         .count();
@@ -1968,16 +1967,12 @@ async fn extreme_budget_pressure_removes_descriptions_before_omitting_entries() 
     assert!(included_executor_count < 40);
     assert!(included_cloud_count > 0);
     assert!(included_cloud_count < 160);
-    assert!(
-        executor
-            .body()
-            .contains("- executor-skill-000: (executor package:")
-    );
-    assert!(cloud.body().contains("- cloud-skill-000: (cloud package:"));
-    assert!(!cloud.body().contains("- cloud-skill-159:"));
+    assert!(executor.contains("- executor-skill-000: (executor package:"));
+    assert!(cloud.contains("- cloud-skill-000: (cloud package:"));
+    assert!(!cloud.contains("- cloud-skill-159:"));
     for (total, included, rendered) in [
-        (40, included_executor_count, executor.body()),
-        (160, included_cloud_count, cloud.body()),
+        (40, included_executor_count, executor),
+        (160, included_cloud_count, cloud),
     ] {
         assert!(!rendered.contains("description-"));
         assert!(rendered.contains("additional skills omitted from this bounded skills list"));
@@ -2447,7 +2442,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
         .await;
 
     assert_eq!(1, fragments.len());
-    assert!(fragments[0].render().contains(root_b_locator));
+    assert!(fragments[0].render().expect_text().contains(root_b_locator));
     assert_eq!(
         vec![(
             SkillAuthority::new(SkillSourceKind::Executor, "root-b"),
@@ -2580,12 +2575,24 @@ async fn model_context_window_scales_executor_and_cloud_catalogs() -> TestResult
         executor_section.render_diff(PreviousWorldStateSection::Absent);
     let snapshot = snapshot.unwrap();
     let executor_fragment = executor_fragment.ok_or("bounded executor catalog should render")?;
-    assert!(!executor_fragment.body().contains("skill-39"));
+    assert!(
+        !executor_fragment
+            .body()
+            .clone()
+            .expect_text()
+            .contains("skill-39")
+    );
     let cloud_fragment = world_state_section(&sections, "cloud_skills")
         .render_diff(PreviousWorldStateSection::Absent)
         .1
         .ok_or("bounded cloud catalog should render")?;
-    assert!(cloud_fragment.body().contains("additional skills omitted"));
+    assert!(
+        cloud_fragment
+            .body()
+            .clone()
+            .expect_text()
+            .contains("additional skills omitted")
+    );
     let warnings = event_rx
         .try_iter()
         .map(CapturedExtensionEvent::into_warning)
@@ -2801,7 +2808,8 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
         .iter()
         .find(|fragment| fragment.role() == "developer")
         .ok_or("host catalog should render")?
-        .render();
+        .render()
+        .expect_text();
 
     assert!(
         catalog.contains(&format!("- `r0` = `{rendered_root}`")),
@@ -2882,9 +2890,11 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
         .await;
 
     assert_eq!(2, fragments.len());
-    assert!(fragments[0].render().contains("visible-skill"));
-    assert!(!fragments[0].render().contains("hidden-skill"));
-    assert!(fragments[1].render().contains("<name>hidden-skill</name>"));
+    let visible = fragments[0].render().expect_text();
+    let hidden = fragments[1].render().expect_text();
+    assert!(visible.contains("visible-skill"));
+    assert!(!visible.contains("hidden-skill"));
+    assert!(hidden.contains("<name>hidden-skill</name>"));
     assert_eq!(
         vec![(
             SkillAuthority::new(SkillSourceKind::Host, "host"),

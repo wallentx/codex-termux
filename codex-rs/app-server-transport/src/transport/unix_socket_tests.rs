@@ -9,6 +9,7 @@ use super::start_control_socket_acceptor;
 use super::unix_socket::acquire_removable_app_server_startup_lock;
 #[cfg(unix)]
 use super::unix_socket::try_acquire_removable_app_server_startup_lock;
+use crate::websocket_compression::WebSocketCompression;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_core::config::find_codex_home;
@@ -79,6 +80,7 @@ async fn long_control_socket_paths_connect_to_distinct_daemons() {
             transport_event_tx,
             shutdown_token.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
         )
         .await
         .expect("control socket acceptor should start");
@@ -131,6 +133,7 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
         transport_event_tx,
         shutdown_token.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("control socket acceptor should start");
@@ -239,6 +242,7 @@ async fn shutdown_is_only_accepted_on_managed_local_socket_for_its_own_pid() {
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("acceptor");
@@ -262,6 +266,7 @@ async fn shutdown_is_only_accepted_on_managed_local_socket_for_its_own_pid() {
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Managed,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("managed acceptor");
@@ -383,6 +388,7 @@ async fn control_socket_rejects_writable_parent_without_changing_permissions() {
         tx,
         CancellationToken::new(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .unwrap_err();
@@ -416,6 +422,7 @@ async fn control_socket_file_is_private_after_bind() {
         transport_event_tx,
         shutdown_token.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("control socket acceptor should start");
@@ -468,12 +475,14 @@ async fn control_socket_file_is_private_after_bind() {
             sender.clone(),
             shutdown.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
         ),
         start_control_socket_acceptor(
             socket_path.clone(),
             sender,
             shutdown.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
         ),
     );
     let (acceptor, error) = match (first, second) {
@@ -509,6 +518,7 @@ async fn control_socket_pins_directory_until_shutdown() {
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("acceptor");

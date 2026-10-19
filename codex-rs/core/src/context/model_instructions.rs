@@ -1,7 +1,9 @@
 //! A single model-context fragment for independent model and instruction changes.
 
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 const REPLACEMENT_NOTICE: &str =
     "The following instructions replace the previous base instructions:";
@@ -32,7 +34,7 @@ impl ContextualUserFragment for ModelInstructions {
         ("<model_instructions>", "</model_instructions>")
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let mut body = String::from("\n");
         if let Some(model) = &self.model {
             body.push_str(&format!("The current model is {model}.\n"));
@@ -47,6 +49,6 @@ impl ContextualUserFragment for ModelInstructions {
             }
             None => {}
         }
-        body
+        input_text(body)
     }
 }

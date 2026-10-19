@@ -96,6 +96,7 @@ members = [
     "realtime-webrtc",
     "voice-host",
     "protocol",
+    "protocol/tests/support",
     "prompts",
     "rollout",
     "rollout-trace",
@@ -161,7 +162,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.164.0-alpha.3"
+version = "0.164.0-alpha.4"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -267,6 +268,7 @@ codex-plugin = { path = "plugin" }
 codex-model-provider = { path = "model-provider" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }
+codex-protocol-test-support = { path = "protocol/tests/support" }
 codex-prompts = { path = "prompts" }
 codex-queue-extension = { path = "ext/queue" }
 codex-responses-api-proxy = { path = "responses-api-proxy" }

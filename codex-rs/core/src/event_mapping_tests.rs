@@ -23,6 +23,7 @@ use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -511,7 +512,8 @@ fn internal_model_context_does_not_parse_as_visible_turn_item() {
                 InternalContextSource::from_static("extension"),
                 "Internal steering.",
             )
-            .render(),
+            .render()
+            .expect_text(),
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,

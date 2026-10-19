@@ -40,6 +40,7 @@ tracing = { workspace = true }
 assert_matches = { workspace = true }
 codex-attachment-store = { workspace = true }
 codex-models-manager = { workspace = true }
+codex-protocol-test-support = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 dunce = { workspace = true }
 insta = { workspace = true }

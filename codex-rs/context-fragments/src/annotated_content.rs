@@ -4,6 +4,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::input_text;
 use codex_utils_string::plan_token_truncation;
 
 /// Content, classification and attribution travel together through edits and truncation.
@@ -72,10 +73,19 @@ pub fn truncate_annotated_text(
 impl AnnotatedContent {
     /// Creates content and its classification together.
     pub fn new(content: ContentItem, kind: ContentItemKind) -> Self {
+        Self::from_parts(content, kind, ContentItemMetadata::default())
+    }
+
+    /// Creates content with its producer-owned classification and attribution.
+    pub fn from_parts(
+        content: ContentItem,
+        kind: ContentItemKind,
+        metadata: ContentItemMetadata,
+    ) -> Self {
         Self {
             content,
             kind,
-            metadata: ContentItemMetadata::default(),
+            metadata,
         }
     }
 
@@ -85,11 +95,7 @@ impl AnnotatedContent {
         kind: ContentItemKind,
         metadata: ContentItemMetadata,
     ) -> Self {
-        Self {
-            content: ContentItem::InputText { text: text.into() },
-            kind,
-            metadata,
-        }
+        Self::from_parts(input_text(text), kind, metadata)
     }
 
     /// Returns the model-visible content.

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::data_url_from_bytes;
@@ -910,6 +911,21 @@ pub enum ContentItem {
     },
 }
 
+/// Constructs an input-text content item.
+pub fn input_text(text: impl Into<String>) -> ContentItem {
+    ContentItem::InputText { text: text.into() }
+}
+
+impl ContentItem {
+    /// Extracts text, returning `None` for non-text content.
+    pub fn into_text(self) -> Option<String> {
+        match self {
+            Self::InputText { text } | Self::OutputText { text, .. } => Some(text),
+            Self::InputImage { .. } | Self::InputAudio { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(untagged)]
 #[ts(untagged)]
@@ -1040,7 +1056,8 @@ pub enum ResponseItem {
         id: Option<ResponseItemId>,
         role: String,
         #[ts(type = "unknown[]")]
-        tools: Vec<serde_json::Value>,
+        // Share immutable declarations across history and request copies.
+        tools: Arc<[serde_json::Value]>,
     },
     Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2251,6 +2268,20 @@ pub enum FunctionCallOutputContentItem {
     },
 }
 
+/// Converts message content to tool output, preserving media and image detail.
+/// Output text becomes input text without its sampling annotations or logprobs.
+impl From<ContentItem> for FunctionCallOutputContentItem {
+    fn from(item: ContentItem) -> Self {
+        match item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
+                Self::InputText { text }
+            }
+            ContentItem::InputImage { image, detail } => Self::InputImage { image, detail },
+            ContentItem::InputAudio { audio_url } => Self::InputAudio { audio_url },
+        }
+    }
+}
+
 /// Converts structured function-call output content into plain text for
 /// human-readable surfaces.
 ///
@@ -2778,7 +2809,7 @@ mod tests {
         let mut additional_tools = ResponseItem::AdditionalTools {
             id: None,
             role: "developer".to_string(),
-            tools: Vec::new(),
+            tools: Arc::from([]),
         };
         additional_tools.set_id(Some(ResponseItemId::with_suffix("at", "test")));
         assert_eq!(

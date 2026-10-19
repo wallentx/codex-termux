@@ -276,7 +276,7 @@ impl GuardianReviewSessionReuseKey {
     }
 
     fn with_node_repl_policy(mut self, policy: &GuardianNodeReplPolicy) -> Self {
-        self.node_repl_policy = policy.body();
+        self.node_repl_policy = policy.body().into_text().unwrap_or_default();
         self
     }
 }
@@ -847,7 +847,10 @@ async fn run_review_on_session(
 }
 
 async fn ensure_guardian_followup_reminder(review_session: &GuardianReviewSession) {
-    let followup_reminder = GuardianFollowupReviewReminder.body();
+    let followup_reminder = GuardianFollowupReviewReminder
+        .body()
+        .into_text()
+        .unwrap_or_default();
     let already_injected = review_session
         .session
         .clone_history()
@@ -887,7 +890,7 @@ async fn ensure_guardian_node_repl_policy(
     }
 
     let policy = &params.node_repl_policy;
-    let policy_body = policy.body();
+    let policy_body = policy.body().into_text().unwrap_or_default();
     if policy_body.is_empty() {
         return Ok(());
     }

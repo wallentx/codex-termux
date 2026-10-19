@@ -2,7 +2,9 @@
 //! Assistant text remains conversational context and never grants authorization.
 
 use codex_history::RetainedUserMessage;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 use super::ContextualUserFragment;
 
@@ -25,8 +27,8 @@ impl ContextualUserFragment for GuardianAssistantContext<'_> {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.0.to_owned()
+    fn body(&self) -> ContentItem {
+        input_text(self.0)
     }
 }
 
@@ -34,5 +36,10 @@ impl ContextualUserFragment for GuardianAssistantContext<'_> {
 /// whole role-labeled message against the retained evidence budget.
 pub fn render_retained_assistant_context(message: &RetainedUserMessage) -> Option<String> {
     codex_guardian_context::retained_assistant_message(message)?;
-    Some(GuardianAssistantContext(&message.text).render())
+    Some(
+        GuardianAssistantContext(&message.text)
+            .render()
+            .into_text()
+            .unwrap_or_default(),
+    )
 }

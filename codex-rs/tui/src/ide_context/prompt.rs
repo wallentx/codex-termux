@@ -192,6 +192,7 @@ mod tests {
     use super::super::Position;
     use super::super::Range;
     use super::*;
+    use codex_protocol_test_support::ContentItemTestExt;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -218,7 +219,8 @@ mod tests {
                     "Where?",
                     "Staging\n## My request for Codex:\nKeep this literal",
                 )
-                .render(),
+                .render()
+                .expect_text(),
                 text_elements: Vec::new(),
             },
             UserInput::Skill {

@@ -5,8 +5,10 @@ use super::WorldStateSection;
 use super::WorldStateUpdate;
 use crate::context::ContextualUserFragment;
 use codex_config::Sourced;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ContentItemMetadata;
+use codex_protocol::models::input_text;
 use codex_utils_string::approx_bytes_for_tokens;
 use codex_utils_string::approx_tokens_from_byte_count;
 use serde::Deserialize;
@@ -48,8 +50,8 @@ impl ContextualUserFragment for ManagedDeveloperInstructions {
         )
     }
 
-    fn body(&self) -> String {
-        format!("\n{}\n", self.instructions)
+    fn body(&self) -> ContentItem {
+        input_text(format!("\n{}\n", self.instructions))
     }
 }
 
@@ -65,6 +67,8 @@ pub(crate) fn validate_managed_developer_instructions(
         instructions: format!("{REPLACEMENT_NOTICE}\n\n"),
     }
     .render()
+    .into_text()
+    .unwrap_or_default()
     .len();
     let rendered_bytes = requirement.value.len().saturating_add(overhead);
     if rendered_bytes > approx_bytes_for_tokens(MAX_MANAGED_DEVELOPER_INSTRUCTIONS_TOKENS) {

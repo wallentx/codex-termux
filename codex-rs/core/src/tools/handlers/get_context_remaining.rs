@@ -9,6 +9,7 @@ use crate::tools::handlers::get_context_remaining_spec::GET_CONTEXT_REMAINING_TO
 use crate::tools::handlers::get_context_remaining_spec::create_get_context_remaining_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -25,7 +26,7 @@ impl GetContextRemainingOutput {
         Self { tokens_left }
     }
 
-    fn fragment(&self) -> String {
+    fn fragment(&self) -> ContentItem {
         match self.tokens_left {
             Some(tokens_left) => {
                 crate::context::TokenBudgetRemainingContext::new(tokens_left).render()
@@ -37,7 +38,7 @@ impl GetContextRemainingOutput {
 
 impl ToolOutput for GetContextRemainingOutput {
     fn log_output(&self) -> String {
-        self.fragment()
+        self.fragment().into_text().unwrap_or_default()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -45,7 +46,7 @@ impl ToolOutput for GetContextRemainingOutput {
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.fragment(), Some(true))
+        FunctionToolOutput::from_content(vec![self.fragment().into()], Some(true))
             .to_response_item(call_id, payload)
     }
 

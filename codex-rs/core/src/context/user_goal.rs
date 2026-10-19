@@ -7,6 +7,7 @@ use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::input_text;
 use codex_protocol::protocol::ThreadGoalStatus;
 use std::collections::HashSet;
 
@@ -88,8 +89,8 @@ impl ContextualUserFragment for UserGoalUpdate {
         )
     }
 
-    fn body(&self) -> String {
-        match self {
+    fn body(&self) -> ContentItem {
+        input_text(match self {
             Self::Set { objective, status } => {
                 let mut text = "\n".to_owned();
                 if let Some(objective) = objective {
@@ -114,6 +115,6 @@ impl ContextualUserFragment for UserGoalUpdate {
                 text
             }
             Self::Clear => "\nUser cleared the goal.\n".to_owned(),
-        }
+        })
     }
 }

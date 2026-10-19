@@ -82,7 +82,9 @@ impl ContextContributor for MemoriesExtension {
                         let end = remaining.floor_char_boundary(remaining.len().min(8_900));
                         fragments.push(
                             MemoryContextFragment::ReadInstructions(remaining[..end].to_string())
-                                .render(),
+                                .render()
+                                .into_text()
+                                .unwrap_or_default(),
                         );
                         remaining = &remaining[end..];
                     }

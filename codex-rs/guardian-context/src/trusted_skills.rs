@@ -7,7 +7,9 @@ use crate::SectionError;
 use crate::SectionInput;
 use crate::SectionScope;
 use codex_context_fragments::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_protocol::protocol::TruncationPolicy;
 use serde_json::json;
 
@@ -42,7 +44,7 @@ impl ContextualUserFragment for TrustedSkills {
         ("", "")
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let mut paths = String::from("[");
         let max_path_bytes = TruncationPolicy::Tokens(MAX_TRUSTED_SKILL_TOKENS)
             .byte_budget()
@@ -63,7 +65,7 @@ impl ContextualUserFragment for TrustedSkills {
             paths.push_str(&encoded_path);
         }
         paths.push(']');
-        format!("{TRUSTED_SKILLS_PREFIX}{paths}")
+        input_text(format!("{TRUSTED_SKILLS_PREFIX}{paths}"))
     }
 }
 
