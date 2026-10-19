@@ -12,6 +12,7 @@ use codex_extension_api::ToolContributor;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolName;
 use codex_extension_api::ToolPayload;
+use codex_protocol::models::ContentItem;
 use codex_tools::ToolOutput;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::PathExt;
@@ -199,11 +200,11 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
 
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].slot(), PromptSlot::DeveloperPolicy);
-    assert!(
-        fragments[0]
-            .text()
-            .contains("Remember repository-specific implementation preferences.")
-    );
+    assert!(matches!(
+        fragments[0].content(),
+        ContentItem::InputText { text }
+            if text.contains("Remember repository-specific implementation preferences.")
+    ));
 }
 
 #[tokio::test]

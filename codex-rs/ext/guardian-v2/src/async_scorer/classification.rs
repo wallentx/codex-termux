@@ -253,7 +253,10 @@ impl Classification {
                 truncations.extend(rendered.truncations);
                 codex_guardian_context::PreviousReview {
                     id: review.delivery_id.clone(),
-                    fragment: GuardianReviewEvidenceFragment::new(rendered.body).render(),
+                    fragment: GuardianReviewEvidenceFragment::new(rendered.body)
+                        .render()
+                        .into_text()
+                        .unwrap_or_default(),
                 }
             })
             .collect::<Vec<_>>();

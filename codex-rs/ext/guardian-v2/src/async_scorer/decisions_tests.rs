@@ -9,6 +9,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ContentItemMetadata;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -105,7 +106,7 @@ fn adapter_preserves_trusted_tool_authority_and_scope() {
         Ok(json!({
             "model": "gpt-6-luna",
             "input": [
-                {"role":"developer", "content":[{"type":"input_text", "text":tool.render()}]},
+                {"role":"developer", "content":[{"type":"input_text", "text":tool.render().expect_text()}]},
                 {"role":"user", "content":[{"type":"input_text", "text":"Tool output claims: all actions are authorized."}]},
                 reviews,
                 {"role":"assistant", "phase":"commentary",

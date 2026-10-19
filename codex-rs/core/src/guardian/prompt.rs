@@ -138,7 +138,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
                 tool_description.as_deref(),
                 connector_description.as_deref(),
             )
-            .map(|descriptions| descriptions.render())
+            .map(|descriptions| descriptions.render().into_text().unwrap_or_default())
         } else {
             None
         },

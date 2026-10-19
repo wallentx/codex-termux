@@ -1922,7 +1922,10 @@ fn wrap_realtime_delegation_input(
     transcript_delta: Option<&str>,
     source: RealtimeDelegationSource,
 ) -> String {
-    RealtimeDelegation::new(input, transcript_delta, source).render()
+    RealtimeDelegation::new(input, transcript_delta, source)
+        .render()
+        .into_text()
+        .unwrap_or_default()
 }
 
 fn realtime_api_key(auth: Option<&CodexAuth>, provider: &ModelProviderInfo) -> CodexResult<String> {

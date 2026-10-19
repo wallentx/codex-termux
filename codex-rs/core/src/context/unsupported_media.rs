@@ -1,5 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UnsupportedMedia {
@@ -39,7 +41,7 @@ impl ContextualUserFragment for UnsupportedMedia {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.text.to_string()
+    fn body(&self) -> ContentItem {
+        input_text(self.text.to_string())
     }
 }

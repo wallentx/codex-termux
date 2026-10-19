@@ -55,7 +55,10 @@ struct GeneratedRecap {
 }
 
 fn recap_prompt(history: &str) -> String {
-    RecapPrompt::new(history).render()
+    RecapPrompt::new(history)
+        .render()
+        .into_text()
+        .unwrap_or_default()
 }
 
 fn recap_output_schema() -> Value {

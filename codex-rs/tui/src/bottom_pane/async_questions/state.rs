@@ -137,8 +137,10 @@ impl AsyncQuestions {
         if text.is_empty() {
             return;
         }
-        let reply =
-            AnsweredQuestion::new(&answer.question_id, &answer.question.title, text).render();
+        let reply = AnsweredQuestion::new(&answer.question_id, &answer.question.title, text)
+            .render()
+            .into_text()
+            .unwrap_or_default();
         if reply.chars().count() > codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS {
             self.composer.show_footer_flash(
                 "Answer too long; shorten it before sending".into(),

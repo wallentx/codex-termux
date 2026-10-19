@@ -252,7 +252,7 @@ impl MessageBoardHost for LocalBoardHost {
                 notice.0.metadata.author.clone(),
                 recipient_path,
                 Vec::new(),
-                notice.render(),
+                notice.render().into_text().unwrap_or_default(),
                 /*trigger_turn*/ false,
             );
             // Remote metadata is untrusted. Skip an oversized notice without closing

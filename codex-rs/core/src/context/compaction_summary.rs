@@ -1,5 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionSummary {
@@ -33,7 +35,7 @@ impl ContextualUserFragment for CompactionSummary {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.summary.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.summary.clone())
     }
 }

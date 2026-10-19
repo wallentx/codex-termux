@@ -456,7 +456,7 @@ impl<'a> CatalogContext<'a> {
             .unwrap_or_default();
         let body = rendered
             .and_then(|rendered| rendered.into_fragment(self.include_usage))
-            .map(|fragment| fragment.body());
+            .map(|fragment| fragment.body().into_text().unwrap_or_default());
         let include_instructions = self.config.include_instructions;
         let metrics = self.input.extension_metrics.clone();
         let warning_emitter = Arc::clone(&self.warning_emitter);

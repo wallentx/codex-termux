@@ -14,9 +14,11 @@ use codex_context_fragments::ContextualUserFragment;
 use codex_execpolicy::Policy;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::format_allow_prefixes;
+use codex_protocol::models::input_text;
 use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GranularApprovalConfig;
@@ -272,8 +274,8 @@ impl ContextualUserFragment for PermissionsInstructions {
         ("<permissions instructions>", "</permissions instructions>")
     }
 
-    fn body(&self) -> String {
-        self.text.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.text.clone())
     }
 }
 

@@ -7,6 +7,7 @@ use super::WorldStateSnapshot;
 use super::WorldStateUpdate;
 use super::WorldStateUpdateContent;
 use crate::context::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
 pub(super) fn render_section_cases<'a, S: WorldStateSection>(
@@ -23,7 +24,12 @@ pub(super) fn render_section_cases<'a, S: WorldStateSection>(
                     .into_iter()
                     .map(|update| match update.content {
                         WorldStateUpdateContent::Fragment(fragment) => {
-                            format!(" (role - {})\n{}", fragment.role(), fragment.render())
+                            let rendered = match fragment.render() {
+                                ContentItem::InputText { text }
+                                | ContentItem::OutputText { text, .. } => text,
+                                content => format!("{content:?}"),
+                            };
+                            format!(" (role - {})\n{rendered}", fragment.role())
                         }
                         WorldStateUpdateContent::Item(item) => {
                             let placement = match update.placement {

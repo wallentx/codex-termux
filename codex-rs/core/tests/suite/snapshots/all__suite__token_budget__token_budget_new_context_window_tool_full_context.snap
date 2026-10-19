@@ -11,13 +11,15 @@ Scenario: New context window tool installs fresh full context before the next fo
 01:message/developer[2]:
     [01] <SKILLS_INSTRUCTIONS>
     [02] <PERMISSIONS_INSTRUCTIONS>
-02:message/developer:
-    <context_window>
-    Agent name: /root
-    First context window id: <UUID 1>
-    Current context window id: <UUID 2>
-    Previous context window id: <UUID 1>
-    </context_window>
+02:message/developer[3]:
+    [01] <context_window>
+    [02]
+        Agent name: /root
+        First context window id: <UUID 1>
+        Current context window id: <UUID 2>
+        Previous context window id: <UUID 1>
+
+    [03] </context_window>
 03:message/user:
     <ENVIRONMENT_CONTEXT>
 04:function_call/update_plan:{"plan":[{"status":"in_progress","step":"Continue in the new context window"}]}

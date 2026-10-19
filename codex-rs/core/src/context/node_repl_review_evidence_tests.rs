@@ -1,5 +1,6 @@
 use codex_protocol::models::ImageReference;
 use codex_protocol::user_input::UserInput;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use pretty_assertions::assert_eq;
 
@@ -52,7 +53,10 @@ fn evidence_snapshots_keep_response_order_and_escape_closing_markers() {
     let first = evidence
         .snapshot_since(/*reviewed_sequence*/ 0)
         .expect("completed responses should produce evidence");
-    let body = first.context(NodeReplReviewEvidenceMode::TextOnly).body();
+    let body = first
+        .context(NodeReplReviewEvidenceMode::TextOnly)
+        .body()
+        .expect_text();
     assert_eq!(first.sequence, 2);
     assert!(body.find("first") < body.find("second"));
     assert!(body.contains("<\\/node_repl_review_evidence>second"));
@@ -68,6 +72,7 @@ fn evidence_snapshots_keep_response_order_and_escape_closing_markers() {
         !delta
             .context(NodeReplReviewEvidenceMode::TextOnly)
             .body()
+            .expect_text()
             .contains("first")
     );
     assert!(evidence.snapshot_since(/*reviewed_sequence*/ 2).is_none());
@@ -81,7 +86,8 @@ fn evidence_bounds_visible_text_and_marks_empty_completed_responses() {
         .snapshot_since(/*reviewed_sequence*/ 0)
         .expect("empty successful responses should produce evidence")
         .context(NodeReplReviewEvidenceMode::TextOnly)
-        .render();
+        .render()
+        .expect_text();
     assert!(empty.contains("completed without visible text"));
     let snapshot = "page-middle".repeat(2_000);
     evidence.record("js", "cell", "snapshot", vec![text_input(&snapshot)]);
@@ -89,7 +95,8 @@ fn evidence_bounds_visible_text_and_marks_empty_completed_responses() {
         .snapshot_since(/*reviewed_sequence*/ 1)
         .expect("large DOM snapshots should produce evidence")
         .context(NodeReplReviewEvidenceMode::TextOnly)
-        .render();
+        .render()
+        .expect_text();
     assert!(full.contains(&snapshot));
     evidence.record(
         "js",
@@ -107,7 +114,8 @@ fn evidence_bounds_visible_text_and_marks_empty_completed_responses() {
     );
     let rendered = oversized
         .context(NodeReplReviewEvidenceMode::TextOnly)
-        .render();
+        .render()
+        .expect_text();
     assert!(rendered.contains("start"));
     assert!(rendered.contains("end"));
     assert!(rendered.contains("<truncated omitted_approx_tokens="));
@@ -178,7 +186,8 @@ fn evidence_evicts_complete_oldest_responses_and_rejects_oversized_items() {
     let retained = evidence.snapshot_since(/*reviewed_sequence*/ 0).unwrap();
     let body = retained
         .context(NodeReplReviewEvidenceMode::TextOnly)
-        .body();
+        .body()
+        .expect_text();
     for expected in ["earlier", "recent", "oversized text"] {
         assert!(body.contains(expected));
     }

@@ -1,4 +1,3 @@
-use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -223,21 +222,7 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
         ResponseInputItem::Message { content, .. } => content_items_to_code_mode_result(
             &content
                 .into_iter()
-                .map(|item| match item {
-                    codex_protocol::models::ContentItem::InputText { text }
-                    | codex_protocol::models::ContentItem::OutputText { text, .. } => {
-                        FunctionCallOutputContentItem::InputText { text }
-                    }
-                    codex_protocol::models::ContentItem::InputImage { image, detail } => {
-                        FunctionCallOutputContentItem::InputImage {
-                            image,
-                            detail: detail.or(Some(DEFAULT_IMAGE_DETAIL)),
-                        }
-                    }
-                    codex_protocol::models::ContentItem::InputAudio { audio_url } => {
-                        FunctionCallOutputContentItem::InputAudio { audio_url }
-                    }
-                })
+                .map(FunctionCallOutputContentItem::from)
                 .collect::<Vec<_>>(),
         ),
         ResponseInputItem::FunctionCallOutput { output, .. }

@@ -2357,6 +2357,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -2939,6 +2940,7 @@ name = "codex-context-fragments"
 version = "0.0.0"
 dependencies = [
  "codex-protocol",
+ "codex-protocol-test-support",
  "codex-utils-string",
  "pretty_assertions",
  "serde_json",
@@ -3002,6 +3004,7 @@ dependencies = [
  "codex-plugin",
  "codex-prompts",
  "codex-protocol",
+ "codex-protocol-test-support",
  "codex-response-debug-context",
  "codex-rmcp-client",
  "codex-rollout",
@@ -3593,6 +3596,7 @@ dependencies = [
  "codex-context-fragments",
  "codex-history",
  "codex-protocol",
+ "codex-protocol-test-support",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -3644,6 +3648,7 @@ dependencies = [
  "codex-model-provider-info",
  "codex-prompts",
  "codex-protocol",
+ "codex-protocol-test-support",
  "codex-utils-cargo-bin",
  "codex-websocket-client",
  "core_test_support",
@@ -4358,6 +4363,7 @@ dependencies = [
  "codex-git-utils",
  "codex-guardian-context",
  "codex-protocol",
+ "codex-protocol-test-support",
  "codex-utils-absolute-path",
  "codex-utils-template",
  "pretty_assertions",
@@ -4408,6 +4414,13 @@ dependencies = [
  "ts-rs",
  "uuid",
  "wildmatch",
+]
+
+[[package]]
+name = "codex-protocol-test-support"
+version = "0.0.0"
+dependencies = [
+ "codex-protocol",
 ]
 
 [[package]]
@@ -4681,6 +4694,7 @@ dependencies = [
  "codex-models-manager",
  "codex-otel",
  "codex-protocol",
+ "codex-protocol-test-support",
  "codex-skills",
  "codex-tools",
  "codex-utils-absolute-path",
@@ -4890,6 +4904,7 @@ dependencies = [
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
+ "codex-protocol-test-support",
  "codex-realtime-webrtc",
  "codex-rollout",
  "codex-sandboxing",

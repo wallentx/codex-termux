@@ -11,7 +11,9 @@ use crate::environment_selection::TurnEnvironmentState;
 use crate::session::turn_context::TurnContext;
 use crate::shell::ShellType;
 use codex_features::Feature;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
@@ -217,7 +219,7 @@ impl ContextualUserFragment for EnvironmentsState {
         environment_context_markers()
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         self.rendered_full().body()
     }
 }
@@ -258,7 +260,7 @@ impl ContextualUserFragment for RenderedEnvironments {
         environment_context_markers()
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let mut rendered = "\n".to_string();
         if self.legacy_single {
             if let Some(EnvironmentUpdate::Current(environment)) = self.updates.values().next() {
@@ -323,7 +325,7 @@ impl ContextualUserFragment for RenderedEnvironments {
             }
             rendered.push_str("  </subagents>\n");
         }
-        rendered
+        input_text(rendered)
     }
 }
 

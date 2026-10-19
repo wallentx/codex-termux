@@ -8,9 +8,7 @@ fn model_change_renders_when_persisted_or_inferred_from_previous_turn() {
     let previous = ModelInstructionsSnapshot::ModelOnly("gpt-old".to_string());
     let previous_incremental = serde_json::from_value(serde_json::json!({
         "model": "gpt-new",
-        "instructions": WorldStateHash::from_fragment(&BaseInstructionsFragment(
-            "instructions".into(),
-        )),
+        "instructions": WorldStateHash::from_fragment(&BaseInstructionsFragment("instructions".into())),
     }))
     .unwrap();
 

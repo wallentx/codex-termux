@@ -11,7 +11,7 @@ use codex_protocol::models::ContentItemMetadata;
 pub enum PromptSlot {
     DeveloperPolicy,
     DeveloperCapabilities,
-    /// Text inside the context-window message, supplied by `contribute_thread_context`.
+    /// Content inside the context-window message, supplied by `contribute_thread_context`.
     ContextWindow,
 }
 
@@ -22,16 +22,12 @@ pub struct PromptFragment {
 }
 
 impl PromptFragment {
-    /// Places a contextual fragment in the prompt, preserving its text, kind, and source.
+    /// Places a contextual fragment in the prompt, preserving its content, kind, and source.
     /// The slot determines placement within the developer message, regardless of its original role.
     pub fn from_fragment(slot: PromptSlot, fragment: &impl ContextualUserFragment) -> Self {
         Self {
             slot,
-            content: AnnotatedContent::text(
-                fragment.render(),
-                fragment.content_kind(),
-                fragment.content_metadata(),
-            ),
+            content: fragment.render_fragment().into_parts().1,
         }
     }
 
@@ -75,15 +71,12 @@ impl PromptFragment {
         self.slot
     }
 
-    /// Returns the model-visible text.
-    pub fn text(&self) -> &str {
-        let ContentItem::InputText { text } = self.content.content() else {
-            unreachable!("prompt fragments contain text");
-        };
-        text
+    /// Returns the model-visible content.
+    pub fn content(&self) -> &ContentItem {
+        self.content.content()
     }
 
-    /// Returns the producer-owned classification of the model-visible text.
+    /// Returns the producer-owned classification of the model-visible content.
     pub fn content_kind(&self) -> &ContentItemKind {
         self.content.kind()
     }

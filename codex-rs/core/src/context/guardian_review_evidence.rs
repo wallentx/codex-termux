@@ -9,7 +9,9 @@ use std::sync::PoisonError;
 
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_guardian_context::MAX_PREVIOUS_REVIEWS;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_protocol::protocol::GuardianAssessmentEvent;
 use serde_json::json;
 
@@ -214,7 +216,7 @@ impl ContextualUserFragment for GuardianReviewEvidenceFragment {
         ("<guardian_sync_review>", "</guardian_sync_review>")
     }
 
-    fn body(&self) -> String {
-        self.body.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.body.clone())
     }
 }

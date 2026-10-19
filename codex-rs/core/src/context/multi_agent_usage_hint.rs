@@ -1,5 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 /// Configured multi-agent instructions emitted as a standalone developer message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +36,7 @@ impl ContextualUserFragment for MultiAgentUsageHint {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.text.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.text.clone())
     }
 }

@@ -3,7 +3,9 @@
 //! without promoting tool descriptions or results to trusted instructions.
 
 use codex_context_fragments::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use serde_json::json;
 
 use crate::ContextSection;
@@ -61,7 +63,7 @@ impl ContextualUserFragment for TrustedTool {
         ("", "")
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let (prefix, source) = match &self.source {
             TrustedToolSource::UserConfiguration(path) => {
                 (USER_CONFIGURATION_PREFIX, path.as_str())
@@ -71,7 +73,7 @@ impl ContextualUserFragment for TrustedTool {
                 "plugin_service_orchestrator",
             ),
         };
-        truncate_entry(
+        input_text(truncate_entry(
             &format!(
                 "{prefix}{TRUSTED_TOOL_SCOPE}\n{}",
                 json!({
@@ -81,7 +83,7 @@ impl ContextualUserFragment for TrustedTool {
                 })
             ),
             MAX_TRUSTED_TOOL_CONTEXT_TOKENS,
-        )
+        ))
     }
 }
 

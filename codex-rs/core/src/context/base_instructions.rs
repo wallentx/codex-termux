@@ -4,6 +4,7 @@ use super::ContextualUserFragment;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::input_text;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BaseInstructionsFragment(pub(crate) String);
@@ -54,7 +55,7 @@ impl ContextualUserFragment for BaseInstructionsFragment {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.0.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.0.clone())
     }
 }

@@ -7512,7 +7512,7 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             COMPACTION_SUMMARY
         );
         for request in &guardian_requests {
-            assert!(!request.has_content_kinds(&["token_budget.context_window"]));
+            assert!(!request.has_content_kinds(&["token_budget.context_window"; 3]));
         }
     }
     let parent_request = requests.last().expect("parent turn should complete");

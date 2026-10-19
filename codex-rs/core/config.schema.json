@@ -753,6 +753,9 @@
             "api_key_model_discovery": {
               "type": "boolean"
             },
+            "app_server_websocket_compression": {
+              "type": "boolean"
+            },
             "apply_patch_freeform": {
               "type": "boolean"
             },
@@ -1292,6 +1295,9 @@
               "type": "boolean"
             },
             "view_image": {
+              "type": "boolean"
+            },
+            "wake_on_agent_messages": {
               "type": "boolean"
             },
             "web_search": {
@@ -2301,6 +2307,13 @@
           },
           "type": "array"
         },
+        "PostModelRequest": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
         "PostToolUse": {
           "default": [],
           "items": {
@@ -2309,6 +2322,13 @@
           "type": "array"
         },
         "PreCompact": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
+        "PreModelRequest": {
           "default": [],
           "items": {
             "$ref": "#/definitions/MatcherGroup"
@@ -7142,6 +7162,9 @@
         "api_key_model_discovery": {
           "type": "boolean"
         },
+        "app_server_websocket_compression": {
+          "type": "boolean"
+        },
         "apply_patch_freeform": {
           "type": "boolean"
         },
@@ -7681,6 +7704,9 @@
           "type": "boolean"
         },
         "view_image": {
+          "type": "boolean"
+        },
+        "wake_on_agent_messages": {
           "type": "boolean"
         },
         "web_search": {

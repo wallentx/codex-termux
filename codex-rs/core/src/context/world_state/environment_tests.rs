@@ -6,6 +6,7 @@ use anyhow::Result;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -182,7 +183,8 @@ fn changing_primary_environment_updates_model_context_and_persisted_state() -> R
         .render_fragment_diff(PreviousSectionState::Known(&previous))
         .1
         .expect("primary change should update the model")
-        .render();
+        .render()
+        .expect_text();
 
     assert_eq!(
         rendered,
@@ -300,7 +302,8 @@ fn crossing_single_environment_boundary_restates_current_environments() -> Resul
             ))
             .1
             .expect("adding an environment should update the model")
-            .render();
+            .render()
+            .expect_text();
         assert_eq!(
             expanded,
             format!(
@@ -317,7 +320,8 @@ fn crossing_single_environment_boundary_restates_current_environments() -> Resul
             ))
             .1
             .expect("removing an environment should update the model")
-            .render();
+            .render()
+            .expect_text();
         assert_eq!(
             reduced,
             format!(
@@ -373,7 +377,7 @@ fn failure_context_is_escaped_incremental_and_cleared_on_recovery() -> Result<()
         .collect(),
         ..Default::default()
     };
-    insta::assert_snapshot!(failed.body(), @r#"
+    insta::assert_snapshot!(failed.body().expect_text(), @r#"
 
       <environments>
         <environment id="remote">
@@ -412,8 +416,8 @@ fn failure_context_is_escaped_incremental_and_cleared_on_recovery() -> Result<()
         ))
         .1
         .expect("recovery must be visible to the model");
-    assert!(!update.body().contains("<error>"));
-    assert!(update.body().contains("<shell>bash</shell>"));
+    assert!(!update.body().expect_text().contains("<error>"));
+    assert!(update.body().expect_text().contains("<shell>bash</shell>"));
     Ok(())
 }
 

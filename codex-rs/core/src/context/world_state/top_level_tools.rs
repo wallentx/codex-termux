@@ -18,9 +18,11 @@ use codex_otel::TOOL_SPEC_DESCRIPTION_BYTES_METRIC_BUCKETS;
 use codex_prompts::ResolvedIncrementalToolMessages;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::input_text;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -211,7 +213,7 @@ impl WorldStateSection for TopLevelToolsState {
                 ResponseItem::AdditionalTools {
                     id: None,
                     role: "developer".to_string(),
-                    tools,
+                    tools: Arc::from(tools),
                 },
             ));
         }
@@ -286,8 +288,8 @@ impl ContextualUserFragment for IncrementalToolsHint {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.0.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.0.clone())
     }
 }
 
@@ -316,7 +318,7 @@ impl ContextualUserFragment for RemovedTools {
     }
 
     /// Lists removed namespaces and individual tools in separate sections of one notice.
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let sections = [
             (
                 self.messages.removed_namespaces_header.as_str(),
@@ -338,7 +340,7 @@ impl ContextualUserFragment for RemovedTools {
                 body.push_str(name);
             }
         }
-        body
+        input_text(body)
     }
 }
 
