@@ -52,6 +52,9 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 codex-utils-absolute-path = { workspace = true }
 pretty_assertions = { workspace = true }
