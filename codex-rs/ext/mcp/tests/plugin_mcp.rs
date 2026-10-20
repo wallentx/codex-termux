@@ -653,19 +653,24 @@ async fn raw_selected_plugin_contributions(
         .features
         .enabled(Feature::ExecutorCapabilityDiscovery)
     {
+        let resolved_roots = environment_manager
+            .resolve_selected_capability_roots(
+                &selected_capability_roots,
+                &HashMap::from([(
+                    LOCAL_ENVIRONMENT_ID.to_string(),
+                    environment_manager.get_environment(LOCAL_ENVIRONMENT_ID),
+                )]),
+            )
+            .await;
         Some(
-            ExecutorCapabilityDiscoveryCache::new(environment_manager)
-                .snapshot(&selected_capability_roots, &Default::default())
+            ExecutorCapabilityDiscoveryCache::default()
+                .snapshot(&resolved_roots, &Default::default())
                 .await,
         )
     } else {
         None
     };
 
-    let v2 = [codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot {
-        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
-        result: Err("V2 must not change existing contributions".to_string()),
-    }];
     let selected = registry.mcp_server_contributors()[0]
         .selected_plugins(
             McpServerContributionContext::for_step(
@@ -675,7 +680,7 @@ async fn raw_selected_plugin_contributions(
                 "test_originator",
                 &selected_capability_roots,
                 executor_capability_discovery.as_ref(),
-                Some(&v2),
+                /*executor_capability_discovery_v2*/ None,
             ),
             &config.plugins,
         )
@@ -752,19 +757,20 @@ async fn run_cloud_plugin_projection_scenarios() -> anyhow::Result<()> {
             } else if cloud_available {
                 Ok(PluginCatalog {
                     entries: vec![PluginCatalogEntry {
+                        enabled: true,
                         id: PluginIdentity::Remote {
                             remote_plugin_id: "plugin_notes".into(),
                         },
                         display_name: "Cloud Notes".into(),
-                        version: Some("1".into()),
-                        mcp_servers: [("notes".into(), declaration.to_string())].into(),
+                        version: "1".into(),
+                        mcp_servers: [("notes".into(), declaration.clone())].into(),
                         connector_ids: vec!["calendar".into()],
                         locations: vec![PluginSourceLocation::Cloud {
                             resource_uri: "plugin://plugin_notes".into(),
                             bundle_uri: None,
                         }],
                     }],
-                    warnings: Vec::new(),
+                    ..Default::default()
                 })
             } else {
                 Err("plugin-service unavailable".into())

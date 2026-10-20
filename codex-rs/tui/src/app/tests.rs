@@ -483,7 +483,8 @@ async fn next_thread_settings_updated(
         .await
         .expect("app-server should emit an event")
         .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
+        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) =
+            event.event
             && let ServerNotification::ThreadSettingsUpdated(notification) = *notification
             && notification.thread_id == thread_id.to_string()
         {
@@ -961,6 +962,11 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
             text_elements: Vec::new(),
         }])
     );
+
+    for expected in ["follow-up after replay", "earlier prompt"] {
+        app.chat_widget.handle_key_event(KeyCode::Up.into());
+        assert_eq!(app.chat_widget.composer_text_with_pending(), expected);
+    }
 
     Ok(())
 }
@@ -2876,7 +2882,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             app_server.thread_unsubscribe(child_thread_id).await?;
             let closed = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), async {
                 while let Some(event) = app_server.next_event().await {
-                    if matches!(&event,
+                    if matches!(&event.event,
                         codex_app_server_client::AppServerEvent::ServerNotification(notification)
                             if matches!(notification.as_ref(), ServerNotification::ThreadClosed(closed)
                                 if closed.thread_id == child_thread_id.to_string()))
@@ -2891,7 +2897,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             app.select_agent_thread(&mut tui, &mut app_server, child_thread_id)
                 .await?;
             // A queued close from the old runtime must not undo the new attachment.
-            app.handle_app_server_event(&app_server, closed).await;
+            app.handle_backend_event(&app_server, closed).await;
             app.drain_active_thread_events(&mut tui).await?;
             assert_eq!(app.active_thread_id, Some(child_thread_id));
             assert!(!matches!(
@@ -3188,7 +3194,8 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         .await
         .expect("app-server should emit an event")
         .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
+        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) =
+            event.event
             && let ServerNotification::ThreadStarted(notification) = notification.as_ref()
             && notification.thread.id == side_thread_id.to_string()
         {
@@ -10267,3 +10274,6 @@ mod active_reconnect;
 #[cfg(unix)]
 #[path = "tests/navigation_reconnect_tests.rs"]
 mod navigation_reconnect;
+
+#[path = "tests/backend_event_tests.rs"]
+mod backend_event_tests;
