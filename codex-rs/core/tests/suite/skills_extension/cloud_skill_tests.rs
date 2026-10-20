@@ -123,6 +123,7 @@ text({ names: result.skills.map(skill => skill.name), warnings: result.warnings,
         &mut extensions,
         SkillProviders::new().with_cloud_provider(Arc::new(FakeCloudSkillProvider {
             catalog: SkillCatalog {
+                is_partial: false,
                 entries: [
                     "alpha-visible",
                     "bravo-visible-skill",
@@ -464,7 +465,7 @@ text({ names: result.skills.map(skill => skill.name), warnings: result.warnings,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_turn_aliases_discovered_singleton_cloud_root() -> Result<()> {
+async fn production_turn_aliases_discovered_singleton_cloud_locator() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     const SKILL_ROOT: &str = "skill://plugin_connector_1p_2330815c823c8191941e5dc465bb899f";
@@ -482,6 +483,7 @@ async fn production_turn_aliases_discovered_singleton_cloud_root() -> Result<()>
         &mut extensions,
         SkillProviders::new().with_cloud_provider(Arc::new(FakeCloudSkillProvider {
             catalog: SkillCatalog {
+                is_partial: false,
                 entries: vec![
                     SkillCatalogEntry::new(
                         SkillPackageId(format!("{SKILL_ROOT}/search")),
@@ -535,19 +537,12 @@ async fn production_turn_aliases_discovered_singleton_cloud_root() -> Result<()>
     let request = response.single_request();
     let developer_text = request.message_input_texts("developer").join("\n");
     assert!(
-        developer_text.contains(&format!("- `c0` = `{SKILL_ROOT}`")),
-        "model request should include the discovered cloud root: {developer_text}"
-    );
-    assert!(
         developer_text.lines().any(|line| {
             line.starts_with("- demo:search:") && line.ends_with("(cloud package: c0/search)")
         }),
-        "model request should include the aliased cloud skill: {developer_text}"
+        "model request should include the aliased cloud package: {developer_text}"
     );
-    assert!(
-        developer_text.contains("- Root aliases: Pass short package locators directly"),
-        "model request should explain how to read aliased packages: {developer_text}"
-    );
+    assert!(developer_text.contains(&format!("- `c0` = `{SKILL_ROOT}`")));
     let user_text = request.message_input_texts("user").join("\n");
     assert!(
         user_text.contains("<skill>\n<name>demo:search</name>") && user_text.contains(SKILL_BODY),
@@ -580,6 +575,7 @@ async fn cloud_skill_reads_run_in_parallel() -> Result<()> {
         &mut extensions,
         SkillProviders::new().with_cloud_provider(Arc::new(FakeCloudSkillProvider {
             catalog: SkillCatalog {
+                is_partial: false,
                 entries: vec![SkillCatalogEntry::new(
                     SkillPackageId(PACKAGE.to_string()),
                     SkillAuthority::new(SkillSourceKind::Cloud, CODEX_APPS_MCP_SERVER_NAME),
@@ -689,6 +685,7 @@ async fn cloud_skill_can_read_referenced_resource_without_an_executor() -> Resul
     let responses_server = responses::start_mock_server().await;
     let provider = Arc::new(FakeCloudSkillProvider {
         catalog: SkillCatalog {
+            is_partial: false,
             entries: vec![
                 SkillCatalogEntry::new(
                     SkillPackageId(SKILL_RESOURCE_URI.to_string()),

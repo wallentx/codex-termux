@@ -1383,7 +1383,7 @@ See the Codex keymap documentation for supported actions and examples."
                     app_server_event = app_server.next_event(), if listen_for_app_server_events && !app.reconnect.offline
                         && (matches!(app.app_server_target, AppServerTarget::Embedded) || !has_pending_app_events) => {
                         match app_server_event {
-                            Some(event) => app.handle_app_server_event(&app_server, event).await,
+                            Some(event) => app.handle_backend_event(&app_server, event).await,
                             None => {
                                 listen_for_app_server_events = false;
                                 app.begin_reconnect();
@@ -1455,7 +1455,6 @@ See the Codex keymap documentation for supported actions and examples."
                         }
                     } => {
                         app.chat_widget.refresh_goal_status_indicator_for_time_tick();
-                        app.chat_widget.refresh_thread_title_progress_for_time_tick();
                         app.chat_widget.refresh_terminal_title();
                         AppRunControl::Continue
                     }
