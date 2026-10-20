@@ -102,6 +102,7 @@ members = [
     "rollout-trace",
     "rmcp-client",
     "responses-api-proxy",
+    "runtime-agent-instance",
     "response-debug-context",
     "sandboxing",
     "stdio-to-uds",
@@ -162,7 +163,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.164.0-alpha.6"
+version = "0.164.0-alpha.7"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -554,6 +555,7 @@ whoami = "1.6.1"
 wildmatch = "2.6.1"
 winapi-util = "0.1.11"
 windows-sys = "0.61.2"
+winreg = "0.55.0"
 # Keep the zip 2.x feature set. In zip 9, `bzip2-rs` selects the bzip2-sys
 # backend we already build; the default selects libbz2-rs-sys instead.
 zip = { version = "9.0.0", default-features = false, features = [
