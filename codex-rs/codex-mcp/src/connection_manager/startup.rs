@@ -42,13 +42,14 @@ pub(super) async fn emit_update(
     submit_id: &str,
     tx_event: &Sender<Event>,
     update: McpStartupUpdateEvent,
-) -> Result<(), async_channel::SendError<Event>> {
+) -> Result<(), Box<async_channel::SendError<Event>>> {
     tx_event
         .send(Event {
             id: submit_id.to_string(),
             msg: EventMsg::McpStartupUpdate(update),
         })
         .await
+        .map_err(Box::new)
 }
 
 pub(super) fn mcp_startup_failure_reason(
@@ -57,6 +58,13 @@ pub(super) fn mcp_startup_failure_reason(
 ) -> Option<McpStartupFailureReason> {
     if !error.is_authentication_required() {
         return None;
+    }
+    if let StartupOutcomeError::Failed {
+        is_ema_authentication_required: true,
+        ..
+    } = error
+    {
+        return Some(McpStartupFailureReason::ReauthenticationRequired);
     }
     match auth_state {
         Some(

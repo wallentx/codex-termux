@@ -1,5 +1,6 @@
-//! Dedicated enterprise grants and one thread's EMA authorization lifetime.
-//! Account credentials identify the owner; only the separate keyring grant is exchanged.
+//! One thread's EMA authorization lifetime and guarded HTTP dispatch.
+//! Account and delivered-policy changes cancel the same owner and its admitted requests.
+//! Credential selection and recovery belong to each connection's token source.
 
 use std::sync::Arc;
 
@@ -7,9 +8,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use codex_config::CloudConfigBundleBindingStatus;
 use codex_config::McpEmaAuthScope;
-use codex_config::McpEmaRegistration;
 use codex_config::McpServerIdpOAuthConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
@@ -20,36 +19,33 @@ use codex_exec_server::HttpRequestResponse;
 use codex_exec_server::HttpResponseBodyStream;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
-use codex_rmcp_client::EmaAccessToken;
 use codex_rmcp_client::EmaAuthFailure;
-use codex_rmcp_client::EmaAuthTokenExchangeRequest;
 use codex_rmcp_client::EmaAuthenticatedHttpClient;
-use codex_rmcp_client::EmaCredentialSnapshot;
-use codex_rmcp_client::EmaIdpIdentityRequest;
-use codex_rmcp_client::EmaInvalidGrantSource;
 use codex_rmcp_client::EmaRequestAuthority;
-use codex_rmcp_client::EmaTokenSource;
 use codex_rmcp_client::McpOAuthRefreshMode;
 use codex_rmcp_client::McpProtocolMode;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::StoredOAuthCredentialSnapshot;
 use codex_rmcp_client::StreamableHttpBearerToken;
 use codex_rmcp_client::StreamableHttpRedirectMode;
-use codex_rmcp_client::exchange_ema_auth_token;
-use codex_rmcp_client::resolve_ema_idp_identity;
-use codex_rmcp_client::stored_ema_identity_is_usable;
 use codex_rmcp_client::stored_oauth_credential_snapshot;
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
-use url::Url;
 
 use crate::EffectiveMcpServer;
 use crate::McpConfig;
 use crate::McpServerSource;
+use crate::ema_token_source::EnterpriseTokenSource;
 use crate::rmcp_client::StartupOutcomeError;
 
 pub(crate) type EmaAuthContext = Result<Arc<EmaAuth>, StartupOutcomeError>;
+
+#[derive(Clone)]
+pub(crate) struct EmaConnectionAuth {
+    pub(crate) owner: Arc<EmaAuth>,
+    pub(crate) authority: EmaRequestAuthority,
+}
 
 pub fn ema_auth_scope(auth: Option<&CodexAuth>) -> Option<McpEmaAuthScope> {
     let auth = auth?;
@@ -58,9 +54,11 @@ pub fn ema_auth_scope(auth: Option<&CodexAuth>) -> Option<McpEmaAuthScope> {
 
 /// Retained by the thread across MCP refreshes; a revoked owner cannot be replaced.
 pub(crate) struct EmaAuth {
-    scope: McpEmaAuthScope,
-    config: Arc<McpConfig>,
-    authority: EmaRequestAuthority,
+    pub(crate) scope: McpEmaAuthScope,
+    pub(crate) config: Arc<McpConfig>,
+    pub(crate) manager: Arc<AuthManager>,
+    pub(crate) account: CodexAuth,
+    pub(crate) authority: EmaRequestAuthority,
     _revocation: AbortOnDropHandle<()>,
 }
 
@@ -82,24 +80,23 @@ impl EmaAuth {
         }
         let cancellation = config.mcp_ema_cancellation.clone();
         let policy = config.config_layer_stack.cloud_config_binding().cloned();
-        let authority = EmaRequestAuthority::new(cancellation.clone(), {
+        let authority = EmaRequestAuthority::new(cancellation.token(), {
+            let cancellation = cancellation.clone();
             let changes = changes.clone();
-            let policy = policy.clone();
             move || {
-                changes.borrow().login_generation == login_generation
-                    && policy.as_ref().is_none_or(|binding| {
-                        binding.read().status == CloudConfigBundleBindingStatus::Current
-                    })
+                !cancellation.is_cancelled()
+                    && changes.borrow().login_generation == login_generation
             }
-        });
-        authority.check()?;
+        })
+        .with_policy(policy.clone());
+        authority.check_new_request()?;
         let revocation = tokio::spawn(async move {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {}
                 () = async {
                     match policy {
-                        Some(binding) => binding.invalidated().await,
+                        Some(policy) => policy.invalidated().await,
                         None => std::future::pending().await,
                     }
                 } => {}
@@ -116,13 +113,31 @@ impl EmaAuth {
         Ok(Arc::new(Self {
             scope,
             config,
+            manager: Arc::clone(manager),
+            account: auth
+                .context("enterprise MCP requires an account owner")?
+                .clone(),
             authority,
             _revocation: AbortOnDropHandle::new(revocation),
         }))
     }
 
+    pub(crate) async fn check_account(&self) -> Result<()> {
+        self.authority.check()?;
+        if !self.manager.account_login_is_current(&self.account).await? {
+            self.authority.revoke();
+            bail!(codex_rmcp_client::EmaTokenSourceError::new(
+                codex_rmcp_client::EmaCredentialKind::Account,
+                EmaAuthFailure::ReauthenticationRequired,
+            ));
+        }
+        self.authority.check()?;
+        Ok(())
+    }
+
     pub(crate) async fn connect(
         self: &Arc<Self>,
+        authority: EmaRequestAuthority,
         server_name: &str,
         server: &EffectiveMcpServer,
         http_client: Arc<dyn HttpClient>,
@@ -146,34 +161,20 @@ impl EmaAuth {
             .ema_registration()
             .context("enterprise MCP registration is missing")?
             .clone();
-        let credentials = stored_ema_credentials(
-            registration.idp(),
-            &self.scope,
-            self.config.auth_keyring_backend_kind,
-        )
-        .await?
-        .ok_or(EmaAuthFailure::ReauthenticationRequired)?
-        .pin_ema_credentials()
-        .await?;
         let exchange_client: Arc<dyn HttpClient> = Arc::new(EnterpriseExchangeHttpClient {
             inner: Arc::clone(&http_client),
-            authority: self.authority.clone(),
-            cancellation: self.config.mcp_ema_cancellation.clone(),
+            authority: authority.clone(),
+            cancellation: self.config.mcp_ema_cancellation.token(),
         });
         let url = registration.server_url().to_owned();
-        let source = EnterpriseTokenSource {
-            endpoint: Url::parse(registration.server_url())?,
-            registration,
-            credentials,
-            auth: Arc::clone(self),
-            http_client: exchange_client,
-        };
-        let token = source.access_token().await?;
+        let mut source =
+            EnterpriseTokenSource::new(registration, Arc::clone(self), exchange_client).await?;
+        let token = source.initial_access_token().await?;
         let http_client = Arc::new(EmaAuthenticatedHttpClient::new(
             http_client,
             source,
             token,
-            self.authority.clone(),
+            authority,
         ));
         RmcpClient::new_streamable_http_client_with_protocol_mode_and_redirect_mode(
             server_name,
@@ -201,24 +202,18 @@ pub(crate) async fn stored_ema_credentials(
 ) -> Result<Option<StoredOAuthCredentialSnapshot>> {
     let name = idp.credential_name(scope);
     let idp = idp.clone();
+    let originator = codex_otel::auth_storage::AuthStorageOriginator::current();
     tokio::task::spawn_blocking(move || {
-        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-            stored_oauth_credential_snapshot(
-                &name,
-                &idp.issuer,
-                OAuthCredentialsStoreMode::Keyring,
-                keyring_backend,
-            )
-            .map(|snapshot| {
-                snapshot.filter(|snapshot| {
-                    stored_ema_identity_is_usable(
-                        snapshot.credentials(),
-                        &idp.issuer,
-                        &idp.client_id,
-                    )
-                })
+        originator.sync_scope(|| {
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                stored_oauth_credential_snapshot(
+                    &name,
+                    &idp.issuer,
+                    OAuthCredentialsStoreMode::Keyring,
+                    keyring_backend,
+                )
+                .map_err(|_| anyhow!("failed to read enterprise credentials"))
             })
-            .map_err(|_| anyhow!("failed to read enterprise credentials"))
         })
     })
     .await
@@ -239,7 +234,7 @@ impl HttpClient for EnterpriseExchangeHttpClient {
         params: HttpRequestParams,
     ) -> BoxFuture<'_, Result<HttpRequestResponse, ExecServerError>> {
         Box::pin(async move {
-            self.authority.check()?;
+            self.authority.check_new_request()?;
             tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => Err(ExecServerError::HttpRequest("enterprise MCP authorization was revoked".into())),
@@ -256,7 +251,7 @@ impl HttpClient for EnterpriseExchangeHttpClient {
         params: HttpRequestParams,
     ) -> BoxFuture<'_, Result<(HttpRequestResponse, HttpResponseBodyStream), ExecServerError>> {
         Box::pin(async move {
-            self.authority.check()?;
+            self.authority.check_new_request()?;
             tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => Err(ExecServerError::HttpRequest("enterprise MCP authorization was revoked".into())),
@@ -266,80 +261,5 @@ impl HttpClient for EnterpriseExchangeHttpClient {
                 }
             }
         })
-    }
-}
-
-struct EnterpriseTokenSource {
-    endpoint: Url,
-    registration: McpEmaRegistration,
-    credentials: EmaCredentialSnapshot,
-    auth: Arc<EmaAuth>,
-    http_client: Arc<dyn HttpClient>,
-}
-
-impl EmaTokenSource for EnterpriseTokenSource {
-    fn endpoint(&self) -> &Url {
-        &self.endpoint
-    }
-
-    async fn access_token(&self) -> Result<EmaAccessToken> {
-        self.auth.authority.check()?;
-        let idp = self.registration.idp();
-        let exchange = exchange_ema_auth_token(EmaAuthTokenExchangeRequest {
-            server_url: self.registration.server_url(),
-            resource: self.registration.resource(),
-            scopes: self.registration.scopes(),
-            mcp_client_id: self.registration.client_id(),
-            expected_authorization_server_issuer: self.registration.authorization_server_issuer(),
-            idp_issuer: &idp.issuer,
-            idp_client_id: &idp.client_id,
-            idp_identity: Box::pin(async {
-                self.auth.authority.check()?;
-                resolve_ema_idp_identity(EmaIdpIdentityRequest {
-                    issuer: &idp.issuer,
-                    client_id: &idp.client_id,
-                    credentials: self.credentials.acquire_current_ema_credentials().await?,
-                    http_client: Arc::clone(&self.http_client),
-                    redirect_mode: StreamableHttpRedirectMode::Legacy,
-                })
-                .await
-            }),
-            idp_http_client: Arc::clone(&self.http_client),
-            resource_http_client: Arc::clone(&self.http_client),
-        });
-        let result = tokio::select! {
-            biased;
-            () = self.auth.config.mcp_ema_cancellation.cancelled() => {
-                bail!(EmaAuthFailure::ReauthenticationRequired);
-            }
-            result = exchange => result,
-        };
-        self.auth.authority.check()?;
-        match result {
-            Ok((token, _credentials)) => {
-                self.credentials.acquire_current_ema_credentials().await?;
-                self.auth.authority.check()?;
-                Ok(token)
-            }
-            Err(error) => {
-                if matches!(
-                    error.downcast_ref::<EmaAuthFailure>(),
-                    Some(EmaAuthFailure::InvalidGrant {
-                        grant_source: EmaInvalidGrantSource::EnterpriseIdentity,
-                    })
-                ) && self
-                    .credentials
-                    .invalidate_ema_credentials_if_current()
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("failed to clear rejected enterprise credentials");
-                }
-                Err(match error.downcast::<EmaAuthFailure>() {
-                    Ok(failure) => failure.into(),
-                    Err(_) => anyhow!("enterprise MCP token exchange failed"),
-                })
-            }
-        }
     }
 }
