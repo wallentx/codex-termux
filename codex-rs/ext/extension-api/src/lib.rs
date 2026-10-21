@@ -1,5 +1,6 @@
 mod capabilities;
 mod contributors;
+mod message_lifecycle;
 mod registry;
 mod session_isolation;
 mod state;
@@ -7,6 +8,8 @@ mod tool_policy;
 mod turn_admission;
 mod user_instructions;
 
+pub use message_lifecycle::MessageLifecycleContributor;
+pub use message_lifecycle::MessageLifecycleInput;
 pub use session_isolation::IsolatedSessionExtensions;
 pub use session_isolation::SessionIsolation;
 pub use tool_policy::ToolPolicy;
@@ -49,6 +52,7 @@ pub use codex_tools::parse_tool_input_schema_without_compaction;
 pub use contributors::ApprovalDecision;
 pub use contributors::ApprovalDecisionInput;
 pub use contributors::ApprovalReviewContributor;
+pub use contributors::CodeModeCellTiming;
 pub use contributors::CommandStartInput;
 pub use contributors::ConfigContributor;
 pub use contributors::ContextContributor;

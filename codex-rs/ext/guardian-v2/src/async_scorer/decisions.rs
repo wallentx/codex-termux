@@ -1,12 +1,13 @@
 //! Bounded Decisions transport for the optional Guardian comparison classifier.
 //! Admission retains the newest requests and cancels the oldest unfinished request at capacity.
-//! Unsupported evidence is rejected intact; errors never contain credentials or wire bodies.
+//! Comparisons omit reasoning and compaction.
+//! Other unsupported evidence is rejected intact.
+//! Errors never contain credentials or wire bodies.
 //! Evidence preserves message roles, content order, and boundaries.
 //! The caller records measurements after baseline publication; dropping its task aborts Decisions work.
 
 use super::sampler::LunaSampler;
 use super::sampler::LunaSamplingRequest;
-use codex_context_fragments::RenderedFragment;
 use codex_history::ResponseItemEnvelope;
 use codex_http_client::HttpClient;
 use codex_protocol::models::ContentItem;
@@ -41,8 +42,10 @@ pub(super) enum DecisionsError {
     Credentials,
     #[error("Decisions HTTP client setup failed")]
     ClientSetup,
-    #[error("Decisions cannot represent the complete classifier evidence")]
-    UnsupportedEvidence,
+    #[error("Decisions received unexpected classifier request setup")]
+    UnexpectedRequestSetup,
+    #[error("Decisions cannot represent this input item")]
+    UnsupportedInputItem,
     #[error("Decisions cannot represent this image evidence")]
     UnsupportedImage,
     #[error("Decisions cannot represent audio evidence")]
@@ -117,17 +120,15 @@ impl DecisionsSampler {
         })
     }
 
-    /// Retain the newest requests; the caller joins after baseline publication.
-    pub(super) fn spawn(
+    pub(super) fn start_snapshot_comparison(
         self: &Arc<Self>,
         request: &LunaSamplingRequest,
         max_input_tokens: usize,
     ) -> DecisionsTask {
         let started = Instant::now();
         let body = request_body(
-            &request.instructions,
+            request.instructions.annotated_content().content(),
             &request.input,
-            request.parent_compaction.as_ref(),
         )
         .and_then(|body| {
             // Reuse Guardian's complete budget without changing its sampling path.
@@ -147,6 +148,44 @@ impl DecisionsSampler {
             }
             Ok(body)
         });
+        self.spawn_request(body, started)
+    }
+
+    pub(super) fn start_conversation_comparison(
+        self: &Arc<Self>,
+        input: &[ResponseItemEnvelope],
+    ) -> DecisionsTask {
+        let started = Instant::now();
+        let body = (|| {
+            let [tools, instructions, evidence @ ..] = input else {
+                return Err(DecisionsError::UnexpectedRequestSetup);
+            };
+            if !matches!(
+                &tools.item,
+                ResponseItem::AdditionalTools { role, tools, .. }
+                    if role == "developer" && tools.is_empty()
+            ) {
+                return Err(DecisionsError::UnexpectedRequestSetup);
+            }
+            let ResponseItem::Message { role, content, .. } = &instructions.item else {
+                return Err(DecisionsError::UnexpectedRequestSetup);
+            };
+            let [rubric] = content.as_slice() else {
+                return Err(DecisionsError::UnexpectedRequestSetup);
+            };
+            if role != "developer" {
+                return Err(DecisionsError::UnexpectedRequestSetup);
+            }
+            request_body(rubric, evidence.iter().map(|item| &item.item))
+        })();
+        self.spawn_request(body, started)
+    }
+
+    fn spawn_request(
+        self: &Arc<Self>,
+        body: Result<Value, DecisionsError>,
+        started: Instant,
+    ) -> DecisionsTask {
         let body = match body {
             Ok(body) => body,
             Err(error) => {
@@ -212,20 +251,24 @@ impl DecisionsSampler {
     }
 }
 
-fn request_body(
-    instructions: &RenderedFragment,
-    evidence: &[ResponseItem],
-    parent_compaction: Option<&ResponseItem>,
+fn request_body<'a>(
+    instructions: &ContentItem,
+    evidence: impl IntoIterator<Item = &'a ResponseItem>,
 ) -> Result<Value, DecisionsError> {
-    if parent_compaction.is_some() {
-        return Err(DecisionsError::UnsupportedEvidence);
-    }
-    let ContentItem::InputText { text: rubric } = instructions.annotated_content().content() else {
-        return Err(DecisionsError::UnsupportedEvidence);
+    let ContentItem::InputText { text: rubric } = instructions else {
+        return Err(DecisionsError::UnexpectedRequestSetup);
     };
     let mut image_bytes = 0usize;
     let mut messages = Vec::new();
     for item in evidence {
+        if matches!(
+            item,
+            ResponseItem::Reasoning { .. }
+                | ResponseItem::Compaction { .. }
+                | ResponseItem::ContextCompaction { .. }
+        ) {
+            continue;
+        }
         let ResponseItem::Message {
             role,
             content,
@@ -233,7 +276,7 @@ fn request_body(
             ..
         } = item
         else {
-            return Err(DecisionsError::UnsupportedEvidence);
+            return Err(DecisionsError::UnsupportedInputItem);
         };
         let mut parts = Vec::with_capacity(content.len());
         for part in content {
