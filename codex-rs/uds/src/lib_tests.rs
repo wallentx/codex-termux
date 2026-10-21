@@ -6,6 +6,32 @@ use tokio::io::AsyncWriteExt;
 
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn shared_daemon_directory_is_private_and_accepts_socket_connections() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = prepare_shared_daemon_socket_directory().expect("private daemon directory");
+    let metadata = std::fs::symlink_metadata(&root).expect("daemon directory metadata");
+    assert_eq!(
+        (metadata.is_dir(), metadata.uid(), metadata.mode() & 0o777),
+        (true, unsafe { libc::geteuid() }, 0o700),
+    );
+
+    let socket_dir = tempfile::TempDir::new_in(root).expect("daemon socket test directory");
+    let socket_path = socket_dir.path().join("socket");
+    let mut listener = UnixListener::bind(&socket_path)
+        .await
+        .expect("daemon socket should bind");
+    let _client = UnixStream::connect(&socket_path)
+        .await
+        .expect("daemon socket should connect");
+    let _server = listener
+        .accept()
+        .await
+        .expect("daemon socket should accept");
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn private_directory_rejects_volume_roots() {
