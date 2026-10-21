@@ -1,5 +1,6 @@
 pub(crate) mod startup;
 
+use crate::PromptCacheKey;
 use crate::WithTurnExtensionData;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -144,7 +145,6 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::HistoryPosition;
-use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
@@ -483,6 +483,7 @@ impl From<CompactedHistoryMetadata> for CompactedHistoryInstallation<'_> {
 pub(crate) struct SessionSpawnArgs {
     pub(crate) startup: Option<Arc<startup::SessionStartup>>,
     pub(crate) config: Config,
+    pub(crate) prompt_cache_key: PromptCacheKey,
     pub(crate) allow_provider_model_fallback: bool,
     pub(crate) instructions: SessionInstructions,
     pub(crate) installation_id: String,
@@ -599,6 +600,7 @@ impl Session {
         let SessionSpawnArgs {
             startup,
             config,
+            prompt_cache_key,
             allow_provider_model_fallback,
             instructions,
             installation_id,
@@ -965,6 +967,7 @@ impl Session {
         let session = Box::pin(Session::new(
             startup.clone(),
             session_configuration,
+            prompt_cache_key,
             &environment_selections,
             config.clone(),
             instructions,
@@ -1056,7 +1059,7 @@ impl SessionIo {
     ) -> CodexResult<String> {
         self.submit_with_trace(
             op, /*trace*/ None, /*parent_turn_id*/ None, /*root_turn_id*/ None,
-            /*residency_guard*/ None,
+            /*residency_guard*/ None, /*message_delivery*/ None,
         )
         .await
     }
@@ -1068,6 +1071,7 @@ impl SessionIo {
         parent_turn_id: Option<String>,
         root_turn_id: Option<String>,
         residency_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        message_delivery: Option<crate::agent_communication::MessageDelivery>,
     ) -> CodexResult<String> {
         let id = new_submission_id();
         let WithTurnExtensionData {
@@ -1082,6 +1086,7 @@ impl SessionIo {
             parent_turn_id,
             root_turn_id,
             residency_guard,
+            message_delivery,
         };
         self.submit_with_id(sub).await?;
         Ok(id)
@@ -1127,6 +1132,7 @@ impl SessionIo {
             parent_turn_id: None,
             root_turn_id: None,
             residency_guard: None,
+            message_delivery: None,
         })
         .await?;
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
@@ -1153,6 +1159,7 @@ impl SessionIo {
             parent_turn_id: None,
             root_turn_id: None,
             residency_guard: None,
+            message_delivery: None,
         })
         .await?;
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
@@ -4089,8 +4096,9 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         model_info: &ModelInfo,
-        communication: InterAgentCommunication,
+        communication: impl Into<crate::PendingAgentMessage>,
     ) {
+        let communication = communication.into();
         let mut response_item = communication.to_model_input_item();
         if let ResponseItem::AgentMessage {
             content,
@@ -4156,6 +4164,9 @@ impl Session {
                 std::slice::from_mut(&mut response_item),
                 model_info.truncation_policy.into(),
             );
+        }
+        if let Some(delivery) = &communication.delivery {
+            delivery.consumed(self.thread_id);
         }
         self.persist_rollout_items(&[
             RolloutItem::InterAgentCommunicationMetadata {
