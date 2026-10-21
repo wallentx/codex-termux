@@ -43,6 +43,9 @@ pub struct CodeCell {
     pub runtime_status: CodeCellRuntimeStatus,
     pub initial_response_at_unix_ms: Option<i64>,
     pub initial_response_seq: Option<RawEventSeq>,
+    pub initial_response_status: Option<CodeCellRuntimeStatus>,
+    pub raw_initial_response_payload_id: Option<RawPayloadId>,
+    pub raw_result_payload_id: Option<RawPayloadId>,
     pub yielded_at_unix_ms: Option<i64>,
     pub yielded_seq: Option<RawEventSeq>,
     pub source_js: String,
@@ -169,6 +172,8 @@ pub enum ToolCallKind {
     ExecCommand,
     WriteStdin,
     ApplyPatch,
+    /// Resolved backend identity from an MCP runtime invocation. The callable
+    /// namespace/name may differ and remain in the summary and raw invocation.
     Mcp {
         server: String,
         tool: String,
