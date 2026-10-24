@@ -11,6 +11,7 @@ use anyhow::Result;
 use codex_exec_server_protocol::JSONRPCMessage;
 use codex_exec_server_protocol::JSONRPCRequest;
 use codex_exec_server_protocol::RequestId;
+use codex_protocol::protocol::W3cTraceContext;
 use futures::Sink;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -28,8 +29,86 @@ use super::*;
 use crate::connection::JsonRpcConnectionEvent;
 use crate::noise_channel::PendingResponderHandshake;
 
+fn noise_harness_connection_from_websocket<T>(
+    stream: T,
+    args: NoiseHarnessConnectionArgs,
+) -> JsonRpcConnection
+where
+    T: Sink<Message, Error = WebSocketError>
+        + Stream<Item = Result<Message, WebSocketError>>
+        + Unpin
+        + Send
+        + 'static,
+{
+    noise_harness_connection_from_websocket_with_readiness(stream, args).connection
+}
+
 const ENVIRONMENT_ID: &str = "environment-1";
 const EXECUTOR_REGISTRATION_ID: &str = "registration-1";
+
+#[test]
+fn websocket_read_diagnostics_use_typed_errors_only() {
+    let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "private data");
+    for (error, expected) in [
+        (WebSocketError::Io(reset), "websocket_read_connection_reset"),
+        (
+            WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+            "websocket_read_reset_without_close",
+        ),
+        (
+            WebSocketError::Protocol(ProtocolError::InvalidOpcode(255)),
+            "websocket_read_protocol",
+        ),
+    ] {
+        assert_eq!(websocket_read_error_reason(&error), expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_encrypted_request_frame_exposes_only_its_trace_context() -> Result<()> {
+    let (connection, mut control, mut outbound_rx) = connected_controlled_harness().await?;
+    let traceparent = "00-00000000000000000000000000000001-0000000000000002-01";
+    let tracestate = "dd=s:1";
+
+    connection
+        .outgoing_tx
+        .send(JSONRPCMessage::Request(JSONRPCRequest {
+            id: RequestId::Integer(1),
+            method: "fs/getMetadata".to_string(),
+            params: Some(serde_json::json!({
+                "payload": "x".repeat(NOISE_RECORD_PLAINTEXT_LEN * 2),
+            })),
+            trace: Some(W3cTraceContext {
+                traceparent: Some(traceparent.to_string()),
+                tracestate: Some(tracestate.to_string()),
+            }),
+        }))
+        .await?;
+
+    control.wait_for_blocked_write(/*expected*/ 1).await?;
+    control.grant_writes(/*count*/ 1);
+    let first = read_outbound_frame(&mut outbound_rx).await?;
+    assert_eq!(
+        (first.traceparent.as_deref(), first.tracestate.as_deref()),
+        (Some(traceparent), Some(tracestate))
+    );
+    let first_payload = first.into_data()?.payload;
+    assert!(
+        !first_payload
+            .windows("fs/getMetadata".len())
+            .any(|window| window == b"fs/getMetadata")
+    );
+
+    control.wait_for_blocked_write(/*expected*/ 2).await?;
+    control.grant_writes(/*count*/ 1);
+    let second = read_outbound_frame(&mut outbound_rx).await?;
+    assert_eq!((second.traceparent, second.tracestate), (None, None));
+
+    for task in &connection.task_handles {
+        task.abort();
+    }
+    Ok(())
+}
 
 #[tokio::test(start_paused = true)]
 async fn fragmented_writes_yield_to_keepalive_and_queued_pong() -> Result<()> {
@@ -240,6 +319,15 @@ async fn application_event_delivery_is_bounded() -> Result<()> {
 async fn read_outbound_data(
     outbound_rx: &mut futures_mpsc::UnboundedReceiver<Message>,
 ) -> Result<RelayData> {
+    read_outbound_frame(outbound_rx)
+        .await?
+        .into_data()
+        .map_err(anyhow::Error::from)
+}
+
+async fn read_outbound_frame(
+    outbound_rx: &mut futures_mpsc::UnboundedReceiver<Message>,
+) -> Result<RelayMessageFrame> {
     let Message::Binary(payload) = timeout(Duration::from_secs(1), outbound_rx.next())
         .await?
         .context("harness closed before sending data")?
@@ -248,7 +336,7 @@ async fn read_outbound_data(
     };
     let frame = decode_relay_message_frame(payload.as_ref())?;
     assert_eq!(frame.validate()?, RelayFrameBodyKind::Data);
-    frame.into_data().map_err(anyhow::Error::from)
+    Ok(frame)
 }
 
 async fn connected_controlled_harness() -> Result<(
@@ -301,7 +389,7 @@ async fn connected_controlled_harness() -> Result<(
 }
 
 struct ControlledWebSocket {
-    inbound_rx: futures_mpsc::UnboundedReceiver<Result<Message, std::convert::Infallible>>,
+    inbound_rx: futures_mpsc::UnboundedReceiver<Result<Message, WebSocketError>>,
     outbound_tx: futures_mpsc::UnboundedSender<Message>,
     write_permit_rx: futures_mpsc::UnboundedReceiver<()>,
     blocked_write_tx: futures_mpsc::UnboundedSender<usize>,
@@ -311,7 +399,7 @@ struct ControlledWebSocket {
 }
 
 struct ControlledWebSocketHandle {
-    inbound_tx: futures_mpsc::UnboundedSender<Result<Message, std::convert::Infallible>>,
+    inbound_tx: futures_mpsc::UnboundedSender<Result<Message, WebSocketError>>,
     write_permit_tx: futures_mpsc::UnboundedSender<()>,
     blocked_write_rx: futures_mpsc::UnboundedReceiver<usize>,
     inbound_reads: Arc<AtomicUsize>,
@@ -385,7 +473,7 @@ impl ControlledWebSocketHandle {
 }
 
 impl Sink<Message> for ControlledWebSocket {
-    type Error = std::convert::Infallible;
+    type Error = WebSocketError;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
@@ -430,7 +518,7 @@ impl Sink<Message> for ControlledWebSocket {
 }
 
 impl futures::Stream for ControlledWebSocket {
-    type Item = Result<Message, std::convert::Infallible>;
+    type Item = Result<Message, WebSocketError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let result = Pin::new(&mut self.inbound_rx).poll_next(cx);

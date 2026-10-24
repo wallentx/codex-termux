@@ -12,17 +12,24 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_exec_server::Environment;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_rmcp_client::ToolListRevision;
 use lru::LruCache;
 use rmcp::model::ElicitationCapability;
 use sha1::Digest;
 use sha1::Sha1;
 use tokio::time::Instant;
 
+use crate::McpProtocolMode;
 use crate::McpRuntimeContext;
 use crate::ToolInfo;
+use crate::server::McpCredentialPolicy;
+use crate::server::McpServerConnectionIdentity;
+use crate::server::has_explicit_http_authorization;
 
 const TOOL_CATALOG_CACHE_CAPACITY: usize = 32;
 const TOOL_CATALOG_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
@@ -51,21 +58,31 @@ struct ToolCatalogCacheEntry {
 #[derive(Default)]
 struct ToolCatalogCacheState {
     snapshot: Option<ToolCatalogSnapshot>,
+    optional_startup_deadline: Option<OptionalStartupDeadline>,
     last_accepted_generation: u64,
     disabled_by_server: bool,
 }
 
+struct OptionalStartupDeadline {
+    grace: Duration,
+    deadline: Instant,
+}
+
 struct ToolCatalogSnapshot {
     tools: Vec<ToolInfo>,
+    meta: Option<Arc<serde_json::Value>>,
     published_at: Instant,
+    tool_list_revision: Option<ToolListRevision>,
 }
 
 #[derive(Clone)]
 pub(crate) struct McpToolCatalogCacheContext {
+    pub(crate) track_tool_list_changes: bool,
     entry: Arc<ToolCatalogCacheEntry>,
 }
 
 pub(crate) struct McpToolCatalogFetchTicket {
+    pub(crate) tool_list_revision: Option<ToolListRevision>,
     generation: u64,
 }
 
@@ -76,21 +93,24 @@ impl McpToolCatalogCache {
         config: &McpServerConfig,
         runtime_context: &McpRuntimeContext,
         resolved_environment: Option<&Arc<Environment>>,
-        client_elicitation_capability: &ElicitationCapability,
-        supports_openai_form_elicitation: bool,
+        client_context: (&ElicitationCapability, &ClientMcpExtensions),
+        connection_identity: Option<(&McpServerConnectionIdentity, McpProtocolMode, bool)>,
     ) -> Option<McpToolCatalogCacheContext> {
         let identity = ToolCatalogIdentity::new(
             server_name,
             config,
             runtime_context,
             resolved_environment,
-            client_elicitation_capability,
-            supports_openai_form_elicitation,
+            client_context,
+            connection_identity,
         )?;
         let entry = lock_unpoisoned(&self.entries)
             .get_or_insert(identity, || Arc::new(ToolCatalogCacheEntry::default()))
             .clone();
-        Some(McpToolCatalogCacheContext { entry })
+        Some(McpToolCatalogCacheContext {
+            entry,
+            track_tool_list_changes: false,
+        })
     }
 }
 
@@ -104,20 +124,103 @@ impl Default for ToolCatalogCacheEntry {
 }
 
 impl McpToolCatalogCacheContext {
+    fn accepts_snapshot(&self, snapshot: &ToolCatalogSnapshot) -> bool {
+        // Enabling refresh must not reuse a catalog published without notification tracking.
+        snapshot
+            .tool_list_revision
+            .as_ref()
+            .map_or(!self.track_tool_list_changes, |revision| {
+                revision.current() == 0
+            })
+    }
+
     pub(crate) fn has_tools(&self) -> bool {
-        self.current_tools().is_some()
+        self.current_revision_if(|_| true).is_some()
+    }
+
+    /// Checks eligibility and reads the revision under one lock without cloning tools.
+    /// The predicate borrows the current catalog while the cache entry is locked.
+    pub(crate) fn current_revision_if(
+        &self,
+        accepts_tools: impl FnOnce(&[ToolInfo]) -> bool,
+    ) -> Option<u64> {
+        let state = lock_unpoisoned(&self.entry.state);
+        let snapshot = state.snapshot.as_ref()?;
+        (!state.disabled_by_server
+            && self.accepts_snapshot(snapshot)
+            && !snapshot.tools.is_empty()
+            && snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL
+            && accepts_tools(&snapshot.tools))
+        .then_some(state.last_accepted_generation)
+    }
+
+    pub(crate) fn optional_startup_deadline(
+        &self,
+        default_deadline: Instant,
+        startup_grace: Duration,
+    ) -> Instant {
+        let mut state = lock_unpoisoned(&self.entry.state);
+        if state.disabled_by_server
+            || state.snapshot.as_ref().is_some_and(|snapshot| {
+                self.accepts_snapshot(snapshot)
+                    && snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL
+            })
+        {
+            return default_deadline;
+        }
+        let cached_deadline =
+            state
+                .optional_startup_deadline
+                .get_or_insert(OptionalStartupDeadline {
+                    grace: startup_grace,
+                    deadline: default_deadline,
+                });
+        if cached_deadline.grace != startup_grace {
+            *cached_deadline = OptionalStartupDeadline {
+                grace: startup_grace,
+                deadline: default_deadline,
+            };
+        }
+        cached_deadline.deadline
     }
 
     pub(crate) fn current_tools(&self) -> Option<Vec<ToolInfo>> {
-        lock_unpoisoned(&self.entry.state)
+        self.current_tools_or(/*fallback*/ None)
+    }
+
+    /// Prefers the current catalog, retaining a capture's fallback across expiry but not opt-out.
+    pub(crate) fn current_tools_or(
+        &self,
+        fallback: Option<Vec<ToolInfo>>,
+    ) -> Option<Vec<ToolInfo>> {
+        self.current_catalog_or(fallback.map(|tools| (tools, None)))
+            .map(|(tools, _)| tools)
+    }
+
+    pub(crate) fn current_catalog_or(
+        &self,
+        fallback: Option<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>)>,
+    ) -> Option<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>)> {
+        let state = lock_unpoisoned(&self.entry.state);
+        if state.disabled_by_server
+            || state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !self.accepts_snapshot(snapshot))
+        {
+            return None;
+        }
+        state
             .snapshot
             .as_ref()
             .filter(|snapshot| snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL)
-            .map(|snapshot| snapshot.tools.clone())
+            .map(|snapshot| (snapshot.tools.clone(), snapshot.meta.clone()))
+            .or(fallback)
     }
 
     pub(crate) fn begin_fetch(&self) -> McpToolCatalogFetchTicket {
         McpToolCatalogFetchTicket {
+            tool_list_revision: None,
             generation: self
                 .entry
                 .next_fetch_generation
@@ -132,7 +235,12 @@ impl McpToolCatalogCacheContext {
         state.snapshot = None;
     }
 
-    pub(crate) fn publish_if_newest(&self, ticket: McpToolCatalogFetchTicket, tools: &[ToolInfo]) {
+    pub(crate) fn publish_if_newest(
+        &self,
+        ticket: McpToolCatalogFetchTicket,
+        tools: &[ToolInfo],
+        meta: Option<Arc<serde_json::Value>>,
+    ) {
         let mut state = lock_unpoisoned(&self.entry.state);
         if state.disabled_by_server || ticket.generation <= state.last_accepted_generation {
             return;
@@ -140,16 +248,17 @@ impl McpToolCatalogCacheContext {
 
         let mut tools = tools.to_vec();
         for tool in &mut tools {
-            // Initialize instructions belong to one live connection and must not cross sessions.
-            tool.namespace_description = None;
             // Tool annotations affect approval and parallelism decisions, so only the live
             // connection may supply them.
             tool.tool.annotations = None;
         }
         state.last_accepted_generation = ticket.generation;
+        state.optional_startup_deadline = None;
         state.snapshot = Some(ToolCatalogSnapshot {
             tools,
+            meta,
             published_at: Instant::now(),
+            tool_list_revision: ticket.tool_list_revision,
         });
     }
 }
@@ -200,14 +309,11 @@ impl ToolCatalogIdentity {
         config: &McpServerConfig,
         runtime_context: &McpRuntimeContext,
         environment: Option<&Arc<Environment>>,
-        client_elicitation_capability: &ElicitationCapability,
-        supports_openai_form_elicitation: bool,
+        client_context: (&ElicitationCapability, &ClientMcpExtensions),
+        connection_identity: Option<(&McpServerConnectionIdentity, McpProtocolMode, bool)>,
     ) -> Option<Self> {
-        let transport = ToolCatalogTransportIdentity::new(
-            config,
-            client_elicitation_capability,
-            supports_openai_form_elicitation,
-        )?;
+        let transport =
+            ToolCatalogTransportIdentity::new(config, client_context, connection_identity)?;
         Some(Self {
             server_name: server_name.to_string(),
             transport,
@@ -216,7 +322,7 @@ impl ToolCatalogIdentity {
                 &config.transport,
                 McpServerTransportConfig::Stdio { cwd: None, .. }
             )
-            .then(|| runtime_context.local_stdio_fallback_cwd()),
+            .then(|| runtime_context.local_process_cwd()),
         })
     }
 }
@@ -224,14 +330,83 @@ impl ToolCatalogIdentity {
 #[derive(PartialEq, Eq, Hash)]
 enum ToolCatalogTransportIdentity {
     Stdio { fingerprint: [u8; 20] },
+    StreamableHttp { fingerprint: [u8; 20] },
 }
 
 impl ToolCatalogTransportIdentity {
     fn new(
         config: &McpServerConfig,
-        client_elicitation_capability: &ElicitationCapability,
-        supports_openai_form_elicitation: bool,
+        client_context: (&ElicitationCapability, &ClientMcpExtensions),
+        connection_identity: Option<(&McpServerConnectionIdentity, McpProtocolMode, bool)>,
     ) -> Option<Self> {
+        let (client_elicitation_capability, client_mcp_extensions) = client_context;
+        if let McpServerTransportConfig::StreamableHttp {
+            url,
+            bearer_token_env_var,
+            http_headers,
+            env_http_headers,
+            http_headers_helper,
+        } = &config.transport
+        {
+            // Helper output is a dynamic credential identity that cannot be represented by config.
+            if http_headers_helper.is_some() {
+                return None;
+            }
+            let (connection_identity, protocol_mode, agent_plugin) = connection_identity?;
+            if config.oauth.is_some()
+                || config.scopes.is_some()
+                || config.oauth_resource.is_some()
+                || (matches!(config.auth, McpServerAuth::ChatGpt)
+                    && !has_explicit_http_authorization(config))
+                || (!has_explicit_http_authorization(config)
+                    && connection_identity.oauth_credentials().ok()?.is_some())
+            {
+                return None;
+            }
+
+            let mut hasher = Sha1::new();
+            hasher.update(match connection_identity.credential_policy {
+                McpCredentialPolicy::HostFallbackAllowed => b"host-fallback".as_slice(),
+                McpCredentialPolicy::ExecutorOnly => b"executor-only".as_slice(),
+            });
+            hasher.update(
+                serde_json::to_vec(&(
+                    url,
+                    bearer_token_env_var,
+                    http_headers
+                        .as_ref()
+                        .map(|headers| headers.iter().collect::<BTreeMap<_, _>>()),
+                    env_http_headers
+                        .as_ref()
+                        .map(|headers| headers.iter().collect::<BTreeMap<_, _>>()),
+                    &config.auth,
+                    &config.environment_id,
+                    agent_plugin,
+                    protocol_mode.preferred_protocol_version().as_str(),
+                    client_elicitation_capability,
+                    client_mcp_extensions.iter().collect::<BTreeMap<_, _>>(),
+                ))
+                .ok()?,
+            );
+            let mut env_vars = bearer_token_env_var
+                .iter()
+                .chain(env_http_headers.iter().flat_map(|headers| headers.values()))
+                .collect::<Vec<_>>();
+            env_vars.sort_unstable();
+            env_vars.dedup();
+            for name in env_vars {
+                hasher.update(name.as_bytes());
+                if connection_identity.credential_policy == McpCredentialPolicy::HostFallbackAllowed
+                {
+                    let mut value_hasher = DefaultHasher::new();
+                    std::env::var_os(name).hash(&mut value_hasher);
+                    hasher.update(value_hasher.finish().to_le_bytes());
+                }
+            }
+            return Some(Self::StreamableHttp {
+                fingerprint: hasher.finalize().into(),
+            });
+        }
         let McpServerTransportConfig::Stdio {
             command,
             args,
@@ -240,7 +415,6 @@ impl ToolCatalogTransportIdentity {
             cwd,
         } = &config.transport
         else {
-            // HTTP catalogs need a canonical resolved-auth identity before they can be shared.
             return None;
         };
         if env_vars
@@ -265,7 +439,7 @@ impl ToolCatalogTransportIdentity {
                 cwd,
                 &config.environment_id,
                 client_elicitation_capability,
-                supports_openai_form_elicitation,
+                client_mcp_extensions.iter().collect::<BTreeMap<_, _>>(),
             ))
             .ok()?,
         );

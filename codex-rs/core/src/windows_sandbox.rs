@@ -1,3 +1,5 @@
+//! Windows sandbox configuration, runtime policy, and lifecycle diagnostics.
+
 use crate::config::Config;
 use crate::config::edit::ConfigEditsBuilder;
 use codex_config::config_toml::ConfigToml;
@@ -9,6 +11,8 @@ use codex_login::default_client::originator;
 use codex_otel::sanitize_metric_tag_value;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::sandbox::effective_windows_sandbox_type;
+use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -16,11 +20,101 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Kill switch for the elevated sandbox NUX on Windows.
-///
-/// When false, revert to the previous sandbox NUX, which only
-/// prompts users to enable the legacy sandbox feature.
-pub const ELEVATED_SANDBOX_NUX_ENABLED: bool = true;
+/// Records local MXC availability and the selected backend at startup.
+pub fn log_windows_sandbox_startup(config: &Config) {
+    #[cfg(windows)]
+    {
+        let sandbox_dir = codex_windows_sandbox::sandbox_dir(config.codex_home.as_path());
+        let _ = std::fs::create_dir_all(&sandbox_dir);
+        let available = codex_sandboxing::windows_mxc_available();
+        codex_windows_sandbox::log_note(
+            &format!("MXC availability: {available}"),
+            Some(&sandbox_dir),
+        );
+        log_windows_sandbox_selection(
+            config.codex_home.as_path(),
+            config.effective_local_windows_sandbox_type(),
+            WindowsSandboxLevel::from_config(config),
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = config;
+}
+
+/// Records the local backend after an accepted selection change.
+pub(crate) fn log_windows_sandbox_change(
+    codex_home: &Path,
+    sandbox_type: SandboxType,
+    sandbox_level: WindowsSandboxLevel,
+) {
+    #[cfg(windows)]
+    {
+        let codex_home = codex_home.to_owned();
+        tokio::task::spawn_blocking(move || {
+            log_windows_sandbox_selection(&codex_home, sandbox_type, sandbox_level);
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (codex_home, sandbox_type, sandbox_level);
+}
+
+#[cfg(windows)]
+fn log_windows_sandbox_selection(
+    codex_home: &Path,
+    sandbox_type: SandboxType,
+    sandbox_level: WindowsSandboxLevel,
+) {
+    let backend = if sandbox_type == SandboxType::WindowsMxc {
+        "mxc"
+    } else {
+        match sandbox_level {
+            WindowsSandboxLevel::Disabled => "disabled",
+            WindowsSandboxLevel::RestrictedToken => "unelevated",
+            WindowsSandboxLevel::Elevated => "elevated",
+        }
+    };
+    let sandbox_dir = codex_windows_sandbox::sandbox_dir(codex_home);
+    let _ = std::fs::create_dir_all(&sandbox_dir);
+    codex_windows_sandbox::log_note(
+        &format!("Windows sandbox selection: {backend}"),
+        Some(&sandbox_dir),
+    );
+}
+
+/// Selects local binding policy from the sandbox and executor OS.
+pub fn local_binding_policy_for_sandbox(
+    sandbox_type: SandboxType,
+    platform_os: Option<&str>,
+) -> codex_network_proxy::LocalBindingPolicy {
+    if sandbox_type == SandboxType::WindowsMxc && platform_os == Some("windows") {
+        codex_network_proxy::LocalBindingPolicy::RequireTrue
+    } else {
+        codex_network_proxy::LocalBindingPolicy::DefaultFalse
+    }
+}
+
+pub fn managed_proxy_routing_for_windows_sandbox(
+    sandbox_type: SandboxType,
+) -> codex_network_proxy::ManagedProxyRouting {
+    if cfg!(windows) && sandbox_type == SandboxType::WindowsMxc {
+        codex_network_proxy::ManagedProxyRouting::DedicatedListeners
+    } else {
+        codex_network_proxy::ManagedProxyRouting::SharedIngress
+    }
+}
+
+/// Adapts the selected implementation for legacy checks that only understand setup levels.
+/// Backend selection must continue to use [`SandboxType`] directly.
+pub(crate) fn windows_sandbox_level_for_legacy_checks(
+    sandbox_type: SandboxType,
+    sandbox_level: WindowsSandboxLevel,
+) -> WindowsSandboxLevel {
+    if effective_windows_sandbox_type(sandbox_type, sandbox_level) == SandboxType::WindowsMxc {
+        WindowsSandboxLevel::RestrictedToken
+    } else {
+        sandbox_level
+    }
+}
 
 pub trait WindowsSandboxLevelExt {
     fn from_config(config: &Config) -> WindowsSandboxLevel;
@@ -32,6 +126,7 @@ impl WindowsSandboxLevelExt for WindowsSandboxLevel {
         match config.permissions.windows_sandbox_mode {
             Some(WindowsSandboxModeToml::Elevated) => WindowsSandboxLevel::Elevated,
             Some(WindowsSandboxModeToml::Unelevated) => WindowsSandboxLevel::RestrictedToken,
+            Some(WindowsSandboxModeToml::Mxc) => WindowsSandboxLevel::Disabled,
             None => Self::from_features(&config.features),
         }
     }
@@ -48,26 +143,11 @@ impl WindowsSandboxLevelExt for WindowsSandboxLevel {
     }
 }
 
-pub fn windows_sandbox_level_from_config(config: &Config) -> WindowsSandboxLevel {
-    WindowsSandboxLevel::from_config(config)
-}
-
-pub fn windows_sandbox_level_from_features(features: &Features) -> WindowsSandboxLevel {
-    WindowsSandboxLevel::from_features(features)
-}
-
 pub fn resolve_windows_sandbox_mode(cfg: &ConfigToml) -> Option<WindowsSandboxModeToml> {
     cfg.windows
         .as_ref()
         .and_then(|windows| windows.sandbox)
         .or_else(|| legacy_windows_sandbox_mode(cfg.features.as_ref()))
-}
-
-pub fn resolve_windows_sandbox_private_desktop(cfg: &ConfigToml) -> bool {
-    cfg.windows
-        .as_ref()
-        .and_then(|windows| windows.sandbox_private_desktop)
-        .unwrap_or(true)
 }
 
 pub fn legacy_windows_sandbox_mode(
@@ -113,69 +193,65 @@ pub fn sandbox_setup_is_complete(_codex_home: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub fn elevated_setup_failure_details(err: &anyhow::Error) -> Option<(String, String)> {
-    let failure = codex_windows_sandbox::extract_setup_failure(err)?;
-    let code = failure.code.as_str().to_string();
-    let message = codex_windows_sandbox::sanitize_setup_metric_tag_value(&failure.message);
-    Some((code, message))
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn elevated_setup_failure_details(_err: &anyhow::Error) -> Option<(String, String)> {
-    None
-}
-
-#[cfg(target_os = "windows")]
-pub fn elevated_setup_failure_metric_name(err: &anyhow::Error) -> &'static str {
-    if codex_windows_sandbox::extract_setup_failure(err).is_some_and(|failure| {
-        matches!(
-            failure.code,
-            codex_windows_sandbox::SetupErrorCode::OrchestratorHelperLaunchCanceled
-        )
-    }) {
-        "codex.windows_sandbox.elevated_setup_canceled"
-    } else {
-        "codex.windows_sandbox.elevated_setup_failure"
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn elevated_setup_failure_metric_name(_err: &anyhow::Error) -> &'static str {
-    panic!("elevated_setup_failure_metric_name is only supported on Windows")
-}
-
-#[cfg(target_os = "windows")]
-pub fn run_elevated_setup(
+pub fn prepare_elevated_sandbox(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
     command_cwd: &Path,
     env_map: &HashMap<String, String>,
     codex_home: &Path,
 ) -> anyhow::Result<()> {
-    let permissions =
-        codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-            permission_profile,
-            workspace_roots,
-        )?;
-    codex_windows_sandbox::run_elevated_setup(
-        codex_windows_sandbox::SandboxSetupRequest {
+    if !sandbox_setup_is_complete(codex_home) {
+        let permissions =
+            codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                permission_profile,
+                workspace_roots,
+            )?;
+        codex_windows_sandbox::run_elevated_setup(codex_windows_sandbox::SandboxSetupRequest {
             permissions: &permissions,
             command_cwd,
             env_map,
             codex_home,
             proxy_enforced: false,
-        },
-        codex_windows_sandbox::SetupRootOverrides::default(),
+        })?;
+    }
+    codex_windows_sandbox::run_setup_refresh(
+        permission_profile,
+        workspace_roots,
+        command_cwd,
+        env_map,
+        codex_home,
+        /*proxy_enforced*/ false,
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn provisioning_settings(
+    network: Option<&crate::config::NetworkProxySpec>,
+) -> std::io::Result<codex_windows_sandbox::WindowsSandboxProvisioningSettings> {
+    let Some(network) = network.filter(|network| network.enabled()) else {
+        return Ok(codex_windows_sandbox::WindowsSandboxProvisioningSettings::default());
+    };
+    Ok(codex_windows_sandbox::WindowsSandboxProvisioningSettings {
+        proxy_ports: network.configured_proxy_ports()?,
+        allow_local_binding: network.allow_local_binding(),
+    })
+}
+
 #[cfg(target_os = "windows")]
-pub fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> anyhow::Result<()> {
-    codex_windows_sandbox::run_elevated_provisioning_setup(codex_home, real_user)
+pub fn run_elevated_provisioning_setup(
+    codex_home: &Path,
+    real_user: &str,
+    network: Option<&crate::config::NetworkProxySpec>,
+) -> anyhow::Result<()> {
+    codex_windows_sandbox::run_elevated_provisioning_setup(
+        codex_home,
+        real_user,
+        provisioning_settings(network)?,
+    )
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn run_elevated_setup(
+pub fn prepare_elevated_sandbox(
     _permission_profile: &PermissionProfile,
     _workspace_roots: &[AbsolutePathBuf],
     _command_cwd: &Path,
@@ -186,7 +262,11 @@ pub fn run_elevated_setup(
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn run_elevated_provisioning_setup(_codex_home: &Path, _real_user: &str) -> anyhow::Result<()> {
+pub fn run_elevated_provisioning_setup(
+    _codex_home: &Path,
+    _real_user: &str,
+    _network: Option<&crate::config::NetworkProxySpec>,
+) -> anyhow::Result<()> {
     anyhow::bail!("elevated Windows sandbox setup is only supported on Windows")
 }
 
@@ -282,12 +362,7 @@ pub async fn run_windows_sandbox_setup(request: WindowsSandboxSetupRequest) -> a
             Ok(())
         }
         Err(err) => {
-            emit_windows_sandbox_setup_failure_metrics(
-                mode,
-                originator_tag.as_str(),
-                start.elapsed(),
-                &err,
-            );
+            emit_windows_sandbox_setup_failure_metrics(mode, start.elapsed(), &err);
             Err(err)
         }
     }
@@ -307,15 +382,13 @@ async fn run_windows_sandbox_setup_and_persist(
     let setup_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         match mode {
             WindowsSandboxSetupMode::Elevated => {
-                if !sandbox_setup_is_complete(setup_codex_home.as_path()) {
-                    run_elevated_setup(
-                        &permission_profile,
-                        workspace_roots.as_slice(),
-                        command_cwd.as_path(),
-                        &env_map,
-                        setup_codex_home.as_path(),
-                    )?;
-                }
+                prepare_elevated_sandbox(
+                    &permission_profile,
+                    workspace_roots.as_slice(),
+                    command_cwd.as_path(),
+                    &env_map,
+                    setup_codex_home.as_path(),
+                )?;
             }
             WindowsSandboxSetupMode::Unelevated => {
                 run_legacy_setup_preflight(
@@ -367,15 +440,17 @@ fn emit_windows_sandbox_setup_success_metrics(
     );
 }
 
-fn emit_windows_sandbox_setup_failure_metrics(
+/// Records setup failures, including service attempts that fail before the helper path.
+pub fn emit_windows_sandbox_setup_failure_metrics(
     mode: WindowsSandboxSetupMode,
-    originator_tag: &str,
     duration: std::time::Duration,
     _err: &anyhow::Error,
 ) {
     let Some(metrics) = codex_otel::global() else {
         return;
     };
+    let originator_tag = sanitize_metric_tag_value(originator().value.as_str());
+    let originator_tag = originator_tag.as_str();
     let mode_tag = windows_sandbox_setup_mode_tag(mode);
     let _ = metrics.record_duration(
         "codex.windows_sandbox.setup_duration_ms",
@@ -398,9 +473,11 @@ fn emit_windows_sandbox_setup_failure_metrics(
             let mut failure_tags: Vec<(&str, &str)> = vec![("originator", originator_tag)];
             let mut code_tag: Option<String> = None;
             let mut message_tag: Option<String> = None;
-            if let Some((code, message)) = elevated_setup_failure_details(_err) {
-                code_tag = Some(code);
-                message_tag = Some(message);
+            if let Some(failure) = codex_windows_sandbox::extract_setup_failure(_err) {
+                code_tag = Some(failure.code.as_str().to_string());
+                message_tag = Some(codex_windows_sandbox::sanitize_setup_metric_tag_value(
+                    &failure.message,
+                ));
             }
             if let Some(code) = code_tag.as_deref() {
                 failure_tags.push(("code", code));
@@ -408,11 +485,18 @@ fn emit_windows_sandbox_setup_failure_metrics(
             if let Some(message) = message_tag.as_deref() {
                 failure_tags.push(("message", message));
             }
-            let _ = metrics.counter(
-                elevated_setup_failure_metric_name(_err),
-                /*inc*/ 1,
-                &failure_tags,
-            );
+            let metric_name =
+                if codex_windows_sandbox::extract_setup_failure(_err).is_some_and(|failure| {
+                    matches!(
+                        failure.code,
+                        codex_windows_sandbox::SetupErrorCode::OrchestratorHelperLaunchCanceled
+                    )
+                }) {
+                    "codex.windows_sandbox.elevated_setup_canceled"
+                } else {
+                    "codex.windows_sandbox.elevated_setup_failure"
+                };
+            let _ = metrics.counter(metric_name, /*inc*/ 1, &failure_tags);
         }
     } else {
         let _ = metrics.counter(

@@ -23,7 +23,7 @@ use serde_json::Value;
 pub type RawEventSeq = u64;
 
 /// Current raw event envelope schema version.
-pub(crate) const RAW_TRACE_EVENT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const RAW_TRACE_EVENT_SCHEMA_VERSION: u32 = 2;
 
 /// One append-only raw trace event.
 ///
@@ -92,6 +92,11 @@ pub enum RawTraceEventPayload {
         codex_turn_id: CodexTurnId,
         status: ExecutionStatus,
     },
+    /// The harness appended this Responses item to its history. This is not
+    /// evidence of its rendered content, which may be truncated before sampling.
+    HistoryItemAccepted {
+        item_id: String,
+    },
     InferenceStarted {
         inference_call_id: InferenceCallId,
         thread_id: AgentThreadId,
@@ -143,6 +148,11 @@ pub enum RawTraceEventPayload {
     McpToolCallCorrelationAssigned {
         tool_call_id: ToolCallId,
         mcp_call_id: McpCallId,
+    },
+    /// Exec selected by the runtime after resolving a recyclable process handle.
+    StdinTargetResolved {
+        tool_call_id: ToolCallId,
+        exec_tool_call_id: ToolCallId,
     },
     ToolCallRuntimeStarted {
         tool_call_id: ToolCallId,
@@ -240,9 +250,11 @@ impl RawTraceEventPayload {
             | RawTraceEventPayload::ThreadEnded { .. }
             | RawTraceEventPayload::CodexTurnStarted { .. }
             | RawTraceEventPayload::CodexTurnEnded { .. }
+            | RawTraceEventPayload::HistoryItemAccepted { .. }
             | RawTraceEventPayload::CompactionRequestFailed { .. }
             | RawTraceEventPayload::CodeCellStarted { .. }
             | RawTraceEventPayload::McpToolCallCorrelationAssigned { .. }
+            | RawTraceEventPayload::StdinTargetResolved { .. }
             | RawTraceEventPayload::AgentResultObserved {
                 carried_payload: None,
                 ..

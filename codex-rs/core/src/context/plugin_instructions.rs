@@ -1,4 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PluginInstructions {
@@ -12,6 +15,10 @@ impl PluginInstructions {
 }
 
 impl ContextualUserFragment for PluginInstructions {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("plugins.instructions".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -24,7 +31,7 @@ impl ContextualUserFragment for PluginInstructions {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.text.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.text.clone())
     }
 }

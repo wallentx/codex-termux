@@ -1,0 +1,62 @@
+//! Checks that forks use committed history and progress while the next review runs.
+
+use super::*;
+use pretty_assertions::assert_eq;
+
+#[test]
+fn fork_keeps_committed_history_and_cursor_while_next_review_is_uncommitted() {
+    let mut state = ConversationState::default();
+    let first = TranscriptCursor {
+        parent_history_version: 1,
+        transcript_entry_count: 2,
+    };
+    state.complete_review(first);
+    state.commit_snapshot(vec!["first review"]);
+    let second = TranscriptCursor {
+        transcript_entry_count: 4,
+        ..first
+    };
+    // A failed review can retain new input without completing or replacing the
+    // last successful checkpoint used by concurrent forks.
+    state.admit_transcript(second);
+    let fork = ConversationState::from(state.snapshot().unwrap().clone());
+    assert_eq!(
+        (
+            state.cursor(),
+            state.completed_review_count(),
+            fork.snapshot().unwrap().history(),
+            fork.cursor(),
+            fork.completed_review_count(),
+        ),
+        (Some(second), 1, &vec!["first review"], Some(first), 1),
+    );
+    state.complete_review(second);
+
+    let fork = ConversationState::from(state.snapshot().unwrap().clone());
+    assert_eq!(
+        (
+            fork.snapshot().unwrap().history(),
+            fork.cursor(),
+            fork.completed_review_count(),
+        ),
+        (&vec!["first review"], Some(first), 1),
+    );
+
+    state.commit_snapshot(vec!["first review", "second review"]);
+    let mut fork = ConversationState::from(state.snapshot().unwrap().clone());
+    let history = fork.take_history();
+    assert_eq!(
+        (history, fork.cursor(), fork.completed_review_count()),
+        (Some(vec!["first review", "second review"]), Some(second), 2),
+    );
+    assert!(fork.snapshot().is_none());
+    assert_eq!(
+        (
+            state.take_history(),
+            state.cursor(),
+            state.completed_review_count(),
+        ),
+        (Some(vec!["first review", "second review"]), Some(second), 2),
+    );
+    assert!(state.snapshot().is_none());
+}

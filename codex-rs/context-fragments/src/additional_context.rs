@@ -1,3 +1,6 @@
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_utils_string::truncate_middle_with_token_budget;
 
 use crate::ContextualUserFragment;
@@ -21,6 +24,10 @@ impl AdditionalContextUserFragment {
 impl ContextualUserFragment for AdditionalContextUserFragment {
     fn role(&self) -> &'static str {
         "user"
+    }
+
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind(format!("additional_content.{}", self.key))
     }
 
     fn markers(&self) -> (&'static str, &'static str) {
@@ -47,8 +54,8 @@ impl ContextualUserFragment for AdditionalContextUserFragment {
         value_and_close.ends_with(&format!("</external_{key}>"))
     }
 
-    fn body(&self) -> String {
-        additional_context_body(&self.key, &self.value)
+    fn body(&self) -> ContentItem {
+        input_text(additional_context_body(&self.key, &self.value))
     }
 }
 
@@ -69,6 +76,10 @@ impl ContextualUserFragment for AdditionalContextDeveloperFragment {
         "developer"
     }
 
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind(format!("additional_content.{}", self.key))
+    }
+
     fn markers(&self) -> (&'static str, &'static str) {
         Self::type_markers()
     }
@@ -77,8 +88,8 @@ impl ContextualUserFragment for AdditionalContextDeveloperFragment {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        additional_context_developer_body(&self.key, &self.value)
+    fn body(&self) -> ContentItem {
+        input_text(additional_context_developer_body(&self.key, &self.value))
     }
 }
 

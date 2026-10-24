@@ -1,21 +1,21 @@
+use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
-use crate::shell::ShellType;
+use crate::shell::ShellInvocation;
 use crate::shell::get_shell_by_model_provided_path;
+use crate::tools::context::ToolEnvironments;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::PostToolUsePayload;
-use codex_exec_server::Environment;
 use codex_protocol::models::AdditionalPermissionProfile;
-use codex_tools::UnifiedExecShellMode;
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-#[cfg(test)]
-use crate::tools::handlers::parse_arguments;
 
 mod exec_command;
 mod write_stdin;
@@ -23,6 +23,42 @@ mod write_stdin;
 pub use exec_command::ExecCommandHandler;
 pub(crate) use exec_command::ExecCommandHandlerOptions;
 pub use write_stdin::WriteStdinHandler;
+
+/// Terminal tools expose the unified-exec process ID as `session_id`.
+pub(crate) fn terminal_session_for_input(
+    invocation: &ToolInvocation,
+) -> BoxFuture<'_, Result<ToolEnvironments, FunctionCallError>> {
+    #[derive(Deserialize)]
+    struct TerminalSessionArgs {
+        session_id: i32,
+    }
+
+    Box::pin(async move {
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return Err(FunctionCallError::Fatal(
+                "expected function arguments for terminal session".to_string(),
+            ));
+        };
+        let args: TerminalSessionArgs = parse_arguments(arguments)?;
+        resolve_tool_environment(
+            &invocation.step_context.environments,
+            /*environment_id*/ None,
+        )?;
+        invocation
+            .session
+            .services
+            .unified_exec_manager
+            .resolve_terminal(args.session_id)
+            .await
+            .map(ToolEnvironments::Terminal)
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "{} failed: {err}",
+                    invocation.tool_name.name
+                ))
+            })
+    })
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExecCommandArgs {
@@ -36,9 +72,11 @@ pub(crate) struct ExecCommandArgs {
     #[serde(default = "default_exec_yield_time_ms")]
     yield_time_ms: u64,
     #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
     max_output_tokens: Option<usize>,
     #[serde(default)]
-    sandbox_permissions: SandboxPermissions,
+    sandbox_permissions: Option<SandboxPermissions>,
     #[serde(default)]
     additional_permissions: Option<AdditionalPermissionProfile>,
     #[serde(default)]
@@ -48,9 +86,7 @@ pub(crate) struct ExecCommandArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct ExecCommandEnvironmentArgs {
-    #[serde(default)]
-    environment_id: Option<String>,
+struct ExecCommandWorkdirArgs {
     // Keep this raw until after environment selection; relative paths must be
     // resolved against the selected environment cwd, not the process cwd.
     #[serde(default)]
@@ -72,7 +108,7 @@ fn default_tty() -> bool {
 #[derive(Debug)]
 pub(crate) struct ResolvedCommand {
     pub(crate) command: Vec<String>,
-    pub(crate) shell_type: ShellType,
+    pub(crate) shell: ShellInvocation,
 }
 
 fn post_unified_exec_tool_use_payload(
@@ -97,7 +133,6 @@ fn post_unified_exec_tool_use_payload(
 pub(crate) fn get_command(
     args: &ExecCommandArgs,
     session_shell: Arc<Shell>,
-    shell_mode: &UnifiedExecShellMode,
     allow_login_shell: bool,
 ) -> Result<ResolvedCommand, String> {
     let use_login_shell = match args.login {
@@ -110,46 +145,18 @@ pub(crate) fn get_command(
         None => allow_login_shell,
     };
 
-    match shell_mode {
-        UnifiedExecShellMode::Direct => {
-            let model_shell = args
-                .shell
-                .as_ref()
-                .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)));
-            let shell = model_shell.as_ref().unwrap_or(session_shell.as_ref());
-            Ok(ResolvedCommand {
-                command: shell.derive_exec_args(&args.cmd, use_login_shell),
-                shell_type: shell.shell_type,
-            })
-        }
-        UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
-            if args.shell.is_some() {
-                return Err(
-                    "`shell` is not supported for local zsh-fork exec; omit `shell` to use zsh-fork, or target a remote environment where `shell` is supported.".to_string(),
-                );
-            }
-
-            Ok(ResolvedCommand {
-                command: vec![
-                    zsh_fork_config.shell_zsh_path.to_string_lossy().to_string(),
-                    if use_login_shell { "-lc" } else { "-c" }.to_string(),
-                    args.cmd.clone(),
-                ],
-                shell_type: ShellType::Zsh,
-            })
-        }
-    }
-}
-
-pub(crate) fn shell_mode_for_environment(
-    turn_shell_mode: &UnifiedExecShellMode,
-    environment: &Environment,
-) -> UnifiedExecShellMode {
-    if environment.is_remote() {
-        UnifiedExecShellMode::Direct
-    } else {
-        turn_shell_mode.clone()
-    }
+    let shell = args
+        .shell
+        .as_ref()
+        .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
+        .unwrap_or_else(|| session_shell.as_ref().clone());
+    Ok(ResolvedCommand {
+        command: shell.derive_exec_args(&args.cmd, use_login_shell),
+        shell: ShellInvocation {
+            shell,
+            use_login_shell,
+        },
+    })
 }
 
 #[cfg(test)]

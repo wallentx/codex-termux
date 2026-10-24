@@ -32,16 +32,9 @@ pub(crate) fn effective_plugins_changed_callback(
         thread_manager.skills_service().clear_cache();
 
         let refresh_thread_manager = Arc::clone(&thread_manager);
-        let refresh_config_manager = config_manager.clone();
         tokio::spawn(async move {
-            if refresh_thread_manager.list_thread_ids().await.is_empty() {
-                return;
-            }
-            crate::mcp_refresh::queue_best_effort_refresh(
-                &refresh_thread_manager,
-                &refresh_config_manager,
-            )
-            .await;
+            refresh_thread_manager.invalidate_mcp_runtimes().await;
+            refresh_thread_manager.refresh_hook_runtimes().await;
         });
 
         if change.materialized_remote_plugins.is_empty() {
@@ -101,7 +94,7 @@ fn hook_trusted_hash_edit(hook_key: &str, current_hash: &str) -> ConfigEdit {
     }
 }
 
-async fn trust_materialized_plugin_hooks(
+pub(crate) async fn trust_materialized_plugin_hooks(
     materializations: Vec<RemotePluginMaterialization>,
     auth_manager: &AuthManager,
     thread_manager: &ThreadManager,
@@ -126,14 +119,17 @@ async fn trust_materialized_plugin_hooks(
         .plugins_manager()
         .plugins_for_config(&config.plugins_config_input())
         .await;
-    let hooks = codex_hooks::list_hooks(codex_hooks::HooksConfig {
+    let hooks_config = codex_hooks::HooksConfig {
         feature_enabled: true,
         bypass_hook_trust: config.bypass_hook_trust,
         config_layer_stack: Some(config.config_layer_stack),
         plugin_hook_sources: plugin_outcome.effective_plugin_hook_sources(),
         plugin_hook_load_warnings: plugin_outcome.effective_plugin_hook_warnings(),
         ..Default::default()
-    });
+    };
+    let hooks = tokio::task::spawn_blocking(move || codex_hooks::list_hooks(hooks_config))
+        .await
+        .map_err(|err| format!("hook discovery task failed: {err}"))?;
     if !hooks.warnings.is_empty() {
         warn!(
             warnings = ?hooks.warnings,

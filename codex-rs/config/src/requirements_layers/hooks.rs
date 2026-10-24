@@ -99,7 +99,7 @@ impl HookMergeState {
             incoming_inactive_dir,
             source,
         );
-        changed |= append_hook_events(&mut existing.value.hooks, incoming.hooks);
+        changed |= append_hook_events(&mut existing.value.hooks, *incoming.hooks);
         if changed {
             merge_output_source(&mut existing.source, source);
         }
@@ -204,6 +204,8 @@ fn append_hook_events(existing: &mut HookEventsToml, incoming: HookEventsToml) -
     // Destructure without `..` so new hook events cannot be introduced without
     // deciding whether requirements layer merging should append them.
     let HookEventsToml {
+        pre_model_request,
+        post_model_request,
         pre_tool_use,
         permission_request,
         post_tool_use,
@@ -215,9 +217,12 @@ fn append_hook_events(existing: &mut HookEventsToml, incoming: HookEventsToml) -
         subagent_start,
         subagent_stop,
         stop,
+        interrupt,
     } = incoming;
 
     let mut changed = false;
+    changed |= append_vec(&mut existing.pre_model_request, pre_model_request);
+    changed |= append_vec(&mut existing.post_model_request, post_model_request);
     changed |= append_vec(&mut existing.pre_tool_use, pre_tool_use);
     changed |= append_vec(&mut existing.permission_request, permission_request);
     changed |= append_vec(&mut existing.post_tool_use, post_tool_use);
@@ -229,6 +234,7 @@ fn append_hook_events(existing: &mut HookEventsToml, incoming: HookEventsToml) -
     changed |= append_vec(&mut existing.subagent_start, subagent_start);
     changed |= append_vec(&mut existing.subagent_stop, subagent_stop);
     changed |= append_vec(&mut existing.stop, stop);
+    changed |= append_vec(&mut existing.interrupt, interrupt);
     changed
 }
 

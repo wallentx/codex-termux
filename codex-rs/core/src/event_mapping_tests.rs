@@ -12,6 +12,7 @@ use codex_protocol::items::WebSearchItem;
 use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
@@ -22,6 +23,7 @@ use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -49,7 +51,7 @@ fn recognizes_context_window_as_contextual_developer_content() {
     let content = vec![ContentItem::InputText {
         text: format!(
             r#"{CONTEXT_WINDOW_OPEN_TAG}
-Thread id: 00000000-0000-0000-0000-000000000000
+Agent name: /root
 {CONTEXT_WINDOW_CLOSE_TAG}"#
         ),
     }];
@@ -76,6 +78,8 @@ fn parses_user_message_with_text_and_two_images() {
     let img2 = "https://example.com/two.jpg".to_string();
 
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -83,11 +87,15 @@ fn parses_user_message_with_text_and_two_images() {
                 text: "Hello world".to_string(),
             },
             ContentItem::InputImage {
-                image_url: img1.clone(),
+                image: ImageReference::Inline {
+                    image_url: img1.clone(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputImage {
-                image_url: img2.clone(),
+                image: ImageReference::Inline {
+                    image_url: img2.clone(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
@@ -105,11 +113,11 @@ fn parses_user_message_with_text_and_two_images() {
                     text_elements: Vec::new(),
                 },
                 UserInput::Image {
-                    image_url: img1,
+                    image: ImageReference::Inline { image_url: img1 },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 UserInput::Image {
-                    image_url: img2,
+                    image: ImageReference::Inline { image_url: img2 },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
             ];
@@ -119,6 +127,51 @@ fn parses_user_message_with_text_and_two_images() {
     }
 }
 
+/// Canonical user-message events must retain opaque file IDs for durable thread history.
+#[test]
+fn parses_user_message_with_file_image() {
+    let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputImage {
+                image: ImageReference::File {
+                    file_id: "file_123".to_string(),
+                },
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            ContentItem::InputText {
+                text: "describe it".to_string(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let turn_item = parse_turn_item(&item).expect("expected user message turn item");
+
+    let TurnItem::UserMessage(user) = turn_item else {
+        panic!("expected TurnItem::UserMessage");
+    };
+    assert_eq!(
+        user.content,
+        vec![
+            UserInput::Image {
+                image: ImageReference::File {
+                    file_id: "file_123".to_string(),
+                },
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            UserInput::Text {
+                text: "describe it".to_string(),
+                text_elements: Vec::new(),
+            },
+        ]
+    );
+}
+
 #[test]
 fn skips_local_image_label_text() {
     let image_url = "data:image/png;base64,abc".to_string();
@@ -126,12 +179,16 @@ fn skips_local_image_label_text() {
     let user_text = "Please review this image.".to_string();
 
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
             ContentItem::InputText { text: label },
             ContentItem::InputImage {
-                image_url: image_url.clone(),
+                image: ImageReference::Inline {
+                    image_url: image_url.clone(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
@@ -151,7 +208,7 @@ fn skips_local_image_label_text() {
         TurnItem::UserMessage(user) => {
             let expected_content = vec![
                 UserInput::Image {
-                    image_url,
+                    image: ImageReference::Inline { image_url },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 UserInput::Text {
@@ -172,6 +229,8 @@ fn skips_local_audio_label_text() {
     let user_text = "Please transcribe this audio.".to_string();
 
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -212,6 +271,8 @@ fn skips_local_audio_label_text() {
 #[test]
 fn parses_assistant_message_input_text_for_backward_compatibility() {
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::InputText {
@@ -253,12 +314,16 @@ fn skips_unnamed_image_label_text() {
     let user_text = "Please review this image.".to_string();
 
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
             ContentItem::InputText { text: label },
             ContentItem::InputImage {
-                image_url: image_url.clone(),
+                image: ImageReference::Inline {
+                    image_url: image_url.clone(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
@@ -278,7 +343,7 @@ fn skips_unnamed_image_label_text() {
         TurnItem::UserMessage(user) => {
             let expected_content = vec![
                 UserInput::Image {
-                    image_url,
+                    image: ImageReference::Inline { image_url },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 UserInput::Text {
@@ -296,6 +361,8 @@ fn skips_unnamed_image_label_text() {
 fn skips_user_instructions_and_env() {
     let items = vec![
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -304,6 +371,8 @@ fn skips_user_instructions_and_env() {
             phase: None,
                 internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -312,6 +381,8 @@ fn skips_user_instructions_and_env() {
             phase: None,
                 internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -320,6 +391,8 @@ fn skips_user_instructions_and_env() {
             phase: None,
                 internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -329,6 +402,8 @@ fn skips_user_instructions_and_env() {
             phase: None,
                 internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -337,6 +412,8 @@ fn skips_user_instructions_and_env() {
             phase: None,
                 internal_chat_message_metadata_passthrough: None,},
             ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![
@@ -377,6 +454,7 @@ fn parses_hook_prompt_message_as_distinct_turn_item() {
                 HookPromptFragment {
                     text: "Retry with exactly the phrase meow meow meow.".to_string(),
                     hook_run_id: "hook-run-1".to_string(),
+                    metadata: Default::default(),
                 }
             );
         }
@@ -387,6 +465,8 @@ fn parses_hook_prompt_message_as_distinct_turn_item() {
 #[test]
 fn parses_hook_prompt_and_hides_other_contextual_fragments() {
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "user".to_string(),
         content: vec![
@@ -412,6 +492,7 @@ fn parses_hook_prompt_and_hides_other_contextual_fragments() {
                 vec![HookPromptFragment {
                     text: "Retry with care & joy.".to_string(),
                     hook_run_id: "hook-run-1".to_string(),
+                    metadata: Default::default(),
                 }]
             );
         }
@@ -422,6 +503,8 @@ fn parses_hook_prompt_and_hides_other_contextual_fragments() {
 #[test]
 fn internal_model_context_does_not_parse_as_visible_turn_item() {
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -429,7 +512,8 @@ fn internal_model_context_does_not_parse_as_visible_turn_item() {
                 InternalContextSource::from_static("extension"),
                 "Internal steering.",
             )
-            .render(),
+            .render()
+            .expect_text(),
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
@@ -441,9 +525,13 @@ fn internal_model_context_does_not_parse_as_visible_turn_item() {
 #[test]
 fn parses_agent_message() {
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "Hello from Codex".to_string(),
         }],
         phase: None,
@@ -532,6 +620,7 @@ fn parses_reasoning_including_raw_content() {
 #[test]
 fn parses_web_search_call() {
     let item = ResponseItem::WebSearchCall {
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("ws", "1")),
         status: Some("completed".to_string()),
         action: Some(WebSearchAction::Search {
@@ -563,6 +652,7 @@ fn parses_web_search_call() {
 #[test]
 fn parses_web_search_open_page_call() {
     let item = ResponseItem::WebSearchCall {
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("ws", "open")),
         status: Some("completed".to_string()),
         action: Some(WebSearchAction::OpenPage {
@@ -592,6 +682,7 @@ fn parses_web_search_open_page_call() {
 #[test]
 fn parses_web_search_find_in_page_call() {
     let item = ResponseItem::WebSearchCall {
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("ws", "find")),
         status: Some("completed".to_string()),
         action: Some(WebSearchAction::FindInPage {
@@ -623,6 +714,7 @@ fn parses_web_search_find_in_page_call() {
 #[test]
 fn parses_partial_web_search_call_without_action_as_other() {
     let item = ResponseItem::WebSearchCall {
+        encrypted_content: None,
         id: Some(ResponseItemId::with_suffix("ws", "partial")),
         status: Some("in_progress".to_string()),
         action: None,

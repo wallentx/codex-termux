@@ -1,8 +1,12 @@
-use codex_core_skills::model::SkillMetadata;
+use std::collections::HashSet;
+
+use codex_app_server_protocol::SkillMetadata;
 use codex_plugin::PluginCapabilitySummary;
 
 use crate::skills_helpers::skill_description;
 use crate::skills_helpers::skill_display_name;
+use crate::task_mentions::MAX_TASK_TITLE_CHARS;
+use crate::task_mentions::TaskMention;
 
 use super::candidate::Candidate;
 use super::candidate::MentionType;
@@ -11,15 +15,51 @@ use super::candidate::Selection;
 pub(crate) fn build_search_catalog(
     skills: Option<&[SkillMetadata]>,
     plugins: Option<&[PluginCapabilitySummary]>,
+    tasks: &[TaskMention],
 ) -> Vec<Candidate> {
+    let plugin_ids: HashSet<_> = plugins
+        .into_iter()
+        .flatten()
+        .map(|plugin| plugin.config_name.as_str())
+        .collect();
     let mut candidates = Vec::new();
     if let Some(skills) = skills {
-        candidates.extend(skills.iter().map(skill_candidate));
+        // Keep skills visible when older servers omit plugin ownership.
+        candidates.extend(
+            skills
+                .iter()
+                .filter(|skill| {
+                    !skill
+                        .plugin_id
+                        .as_deref()
+                        .is_some_and(|plugin_id| plugin_ids.contains(plugin_id))
+                })
+                .map(skill_candidate),
+        );
     }
 
     if let Some(plugins) = plugins {
         candidates.extend(plugins.iter().map(plugin_candidate));
     }
+
+    candidates.extend(tasks.iter().map(|task| {
+        let title = task.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title: String = title.chars().take(MAX_TASK_TITLE_CHARS).collect();
+        Candidate {
+            display_name: title.clone(),
+            description: (!task.cwd.is_empty()).then(|| task.cwd.clone()),
+            search_terms: vec![
+                title.clone(),
+                task.cwd.chars().take(MAX_TASK_TITLE_CHARS).collect(),
+                task.snippet.chars().take(MAX_TASK_TITLE_CHARS).collect(),
+            ],
+            mention_type: MentionType::Task,
+            selection: Selection::Tool {
+                insert_text: format!("@{title}"),
+                path: Some(format!("thread://{}", task.thread_id)),
+            },
+        }
+    }));
 
     candidates
 }
@@ -40,7 +80,7 @@ fn skill_candidate(skill: &SkillMetadata) -> Candidate {
         mention_type: MentionType::Skill,
         selection: Selection::Tool {
             insert_text: format!("${skill_name}"),
-            path: Some(skill.path_to_skills_md.to_string_lossy().into_owned()),
+            path: Some(skill.path.as_str().to_owned()),
         },
     }
 }
@@ -90,6 +130,21 @@ fn plugin_mention_name(plugin_name: &str, display_name: &str) -> String {
             }
         }
         return result;
+    }
+
+    // Generated app IDs have no useful words to title-case; use a bounded mention label instead.
+    if let Some(app_id) = plugin_name.strip_prefix("app-")
+        && app_id.len() == 32
+        && app_id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && (1..=64).contains(&display_name.len())
+        && display_name
+            .bytes()
+            .all(crate::mention_codec::is_mention_name_char)
+        && !crate::mention_codec::is_common_env_var(display_name)
+    {
+        return display_name.to_owned();
     }
 
     title_case_plugin_name(plugin_name)
@@ -202,6 +257,34 @@ mod tests {
             plugin_mention_name("google_calendar", "Google Calendar"),
             "Google_Calendar"
         );
+        assert_eq!(
+            plugin_mention_name(
+                "app-6a6b12e06c5c8191ac5d5252fa5f92c8",
+                "app_6a6b12e06c5c8191ac5d5252fa5f92c8"
+            ),
+            "app-6a6b12e06c5c8191ac5d5252fa5f92c8"
+        );
+    }
+
+    #[test]
+    fn generated_app_mentions_use_bounded_display_names() {
+        let plugin_name = "app-6a6b12e06c5c8191ac5d5252fa5f92c8";
+        for display_name in ["Postman", "foo-bar_baz", &"a".repeat(64)] {
+            assert_eq!(plugin_mention_name(plugin_name, display_name), display_name);
+        }
+        for display_name in [
+            "",
+            "Foo Bar",
+            "Café",
+            "PATH",
+            "XDG_CONFIG_HOME",
+            &"a".repeat(65),
+        ] {
+            assert_eq!(
+                plugin_mention_name(plugin_name, display_name),
+                "App-6a6b12e06c5c8191ac5d5252fa5f92c8"
+            );
+        }
     }
 
     #[test]
@@ -211,5 +294,19 @@ mod tests {
             plugin_mention_name("browser-use", "Browser Use"),
             "Browser-Use"
         );
+        for (plugin_name, expected) in [
+            ("1vault", "1vault"),
+            ("app-short", "App-Short"),
+            (
+                "app-6a6b12e06c5c8191ac5d5252fa5f92cg",
+                "App-6a6b12e06c5c8191ac5d5252fa5f92cg",
+            ),
+            (
+                "app-6A6B12E06C5C8191AC5D5252FA5F92C8",
+                "App-6A6B12E06C5C8191AC5D5252FA5F92C8",
+            ),
+        ] {
+            assert_eq!(plugin_mention_name(plugin_name, "Vault"), expected);
+        }
     }
 }

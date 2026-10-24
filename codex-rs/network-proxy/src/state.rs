@@ -8,8 +8,8 @@ use crate::mitm_hook::MitmHookConfig;
 use crate::mitm_hook::compile_mitm_hooks;
 use crate::mitm_hook::validate_mitm_hook_config;
 use crate::policy::DomainPattern;
-use crate::policy::compile_allowlist_globset;
-use crate::policy::compile_denylist_globset;
+use crate::policy::compile_allowlist;
+use crate::policy::compile_denylist;
 use crate::policy::is_global_wildcard_domain_pattern;
 use crate::runtime::ConfigState;
 use serde::Deserialize;
@@ -57,34 +57,58 @@ pub struct PartialNetworkProxyConfig {
     pub mitm_hooks: Option<Vec<MitmHookConfig>>,
 }
 
+/// Compiles policy using the supplied executor OS, which may differ from this host.
+/// Socket paths are validated without native normalization or filesystem access.
 pub fn build_config_state(
-    config: NetworkProxyConfig,
+    mut config: NetworkProxyConfig,
     constraints: NetworkProxyConstraints,
+    executor_os: crate::Platform,
 ) -> anyhow::Result<ConfigState> {
-    crate::config::validate_unix_socket_allowlist_paths(&config)?;
+    if constraints.enabled == Some(false) {
+        config.credential_broker = false;
+    }
+    let brokerage_created_proxy = config.credential_broker && !config.enabled;
+    let brokerage_created_default_allowlist = brokerage_created_proxy
+        && config.allowed_domains().is_none()
+        && constraints.allowed_domains.is_none();
+    if brokerage_created_proxy {
+        config.enabled = true;
+    }
+    if brokerage_created_default_allowlist {
+        config.set_allowed_domains(vec!["*".to_string()]);
+    }
+    crate::config::validate_unix_socket_allowlist_paths(&config, executor_os)?;
     anyhow::ensure!(
         !config.credential_broker || config.mitm,
         "network.credential_broker requires network.mitm = true"
+    );
+    anyhow::ensure!(
+        config.mitm_ca.is_none() || config.mitm,
+        "network.mitm_ca requires network.mitm = true"
     );
     let allowed_domains = config.allowed_domains().unwrap_or_default();
     let denied_domains = config.denied_domains().unwrap_or_default();
     validate_non_global_wildcard_domain_patterns("network.denied_domains", &denied_domains)
         .map_err(NetworkProxyConstraintError::into_anyhow)?;
-    let deny_set = compile_denylist_globset(&denied_domains)?;
-    let allow_set = compile_allowlist_globset(&allowed_domains)?;
+    let deny_set = compile_denylist(&denied_domains)?;
+    let allow_set = compile_allowlist(&allowed_domains)?;
+    let review_set = compile_allowlist(&config.review_domains)?;
     let mitm_hooks = compile_mitm_hooks(&config)?;
     let mitm = if config.mitm {
         Some(Arc::new(MitmState::new(MitmUpstreamConfig {
             allow_upstream_proxy: config.allow_upstream_proxy,
-            allow_local_binding: config.allow_local_binding,
+            external_ca: config.mitm_ca.clone(),
         })?))
     } else {
         None
     };
     Ok(ConfigState {
+        executor_os,
         config,
+        brokerage_created_default_allowlist,
         allow_set,
         deny_set,
+        review_set,
         mitm,
         mitm_hooks,
         constraints,
@@ -196,7 +220,7 @@ pub fn validate_policy_against_constraints(
         .dangerously_allow_all_unix_sockets
         .unwrap_or(constraints.allow_unix_sockets.is_none());
     validate(
-        config.dangerously_allow_all_unix_sockets,
+        config.dangerously_allow_all_unix_sockets.unwrap_or(false),
         move |candidate| {
             if *candidate && !allow_all_unix_sockets {
                 Err(invalid_value(
@@ -211,7 +235,7 @@ pub fn validate_policy_against_constraints(
     )?;
 
     if let Some(allow_local_binding) = constraints.allow_local_binding {
-        validate(config.allow_local_binding, move |candidate| {
+        validate(config.allow_local_binding(), move |candidate| {
             if *candidate && !allow_local_binding {
                 Err(invalid_value(
                     "network.allow_local_binding",

@@ -1,8 +1,9 @@
 use super::super::test_support::render_section_cases;
 use super::*;
+use codex_protocol_test_support::ContentItemTestExt;
 
 fn state(active: bool, start_instructions: Option<&str>) -> RealtimeState {
-    RealtimeState::new(active, start_instructions)
+    RealtimeState::new(active, start_instructions, /*end_instructions*/ None)
 }
 
 #[test]
@@ -34,10 +35,12 @@ fn snapshots() {
 }
 
 #[test]
-fn retained_fragment_matcher_only_matches_starts() {
-    let start = RealtimeStartWithInstructions::new("custom instructions").render();
-    let end = RealtimeEndInstructions::new("inactive").render();
+fn retained_fragment_matcher_matches_realtime_fragments() {
+    let start = RealtimeStartWithInstructions::new("custom instructions")
+        .render()
+        .expect_text();
+    let end = RealtimeEndInstructions::new().render().expect_text();
 
     assert!(RealtimeState::matches_legacy_fragment("developer", &start));
-    assert!(!RealtimeState::matches_legacy_fragment("developer", &end));
+    assert!(RealtimeState::matches_legacy_fragment("developer", &end));
 }

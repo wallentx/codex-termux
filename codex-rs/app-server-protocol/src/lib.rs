@@ -1,17 +1,16 @@
 mod experimental_api;
-mod export;
+mod precomputed_exports;
 mod protocol;
 pub mod rpc;
-mod schema_fixtures;
 
 pub use experimental_api::*;
-pub use export::GenerateTsOptions;
-pub use export::generate_internal_json_schema;
-pub use export::generate_json;
-pub use export::generate_json_with_experimental;
-pub use export::generate_ts;
-pub use export::generate_ts_with_options;
-pub use export::generate_types;
+pub use precomputed_exports::GenerateTsOptions;
+pub use precomputed_exports::generate_internal_json_schema;
+pub use precomputed_exports::generate_json;
+pub use precomputed_exports::generate_json_with_experimental;
+pub use precomputed_exports::generate_ts;
+pub use precomputed_exports::generate_ts_with_options;
+pub use precomputed_exports::generate_types;
 pub use protocol::common::*;
 pub use protocol::event_mapping::*;
 pub use protocol::item_builders::*;
@@ -41,10 +40,33 @@ pub use protocol::v1::Tools;
 pub use protocol::v1::UserSavedConfig;
 pub use protocol::v2::*;
 pub use rpc::*;
+#[cfg(test)]
 pub use schema_fixtures::SchemaFixtureOptions;
-#[doc(hidden)]
-pub use schema_fixtures::generate_typescript_schema_fixture_subtree_for_tests;
+#[cfg(test)]
 pub use schema_fixtures::read_schema_fixture_subtree;
+#[cfg(test)]
 pub use schema_fixtures::read_schema_fixture_tree;
+#[cfg(test)]
 pub use schema_fixtures::write_schema_fixtures;
+#[cfg(test)]
 pub use schema_fixtures::write_schema_fixtures_with_options;
+
+#[cfg(not(test))]
+pub(crate) use codex_app_server_protocol_noop_macros::JsonSchema;
+#[cfg(not(test))]
+pub(crate) use codex_app_server_protocol_noop_macros::TS;
+#[cfg(test)]
+pub(crate) use schemars::JsonSchema;
+#[cfg(test)]
+pub(crate) use ts_rs::TS;
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;
+// Release tooling selects this module's schema writer by its exact test name.
+#[cfg(test)]
+mod schema_fixtures_tests;
+#[cfg(test)]
+use tests::export;
+#[cfg(test)]
+use tests::schema_fixtures;

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::collections::btree_map::Entry;
 use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::io::{self};
 use std::path::Path;
@@ -9,12 +10,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthEnvTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
+use codex_state::LogWriteFailureReporter;
 use tracing::Event;
 use tracing::Level;
 use tracing::field::Visit;
@@ -24,10 +31,24 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::registry::LookupSpan;
 
+mod archive;
+mod daemon_logs;
+pub use daemon_logs::daemon_log_attachments;
 pub(crate) mod feedback_diagnostics;
+mod guardian;
+mod report_upload;
+mod rollout_archive;
+mod upload;
 pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 pub use feedback_diagnostics::FeedbackDiagnostic;
 pub use feedback_diagnostics::FeedbackDiagnostics;
+pub use guardian::GuardianReviewFailures;
+pub use guardian::GuardianReviewRecord;
+pub use guardian::guardian_review_failures;
+pub use guardian::record_guardian_review_failure;
+pub use report_upload::FeedbackDelivery;
+pub use report_upload::FeedbackTransport;
+pub use report_upload::prepare_report_attachment;
 
 /// Filename used for the redacted `codex doctor --json` feedback attachment.
 pub const DOCTOR_REPORT_ATTACHMENT_FILENAME: &str = "codex-doctor-report.json";
@@ -40,9 +61,19 @@ pub const WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME: &str = "windows-sandbox.log";
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const SENTRY_DSN: &str =
     "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
-const UPLOAD_TIMEOUT_SECS: u64 = 10;
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 300);
+// Raw collection budgets used by the report API, not the interactive upload.
+pub const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_ATTACHMENTS_BYTES: usize = 126 * 1024 * 1024;
+// Bound decoded envelopes, including framing. Do not shorten attachments to fit:
+// they may already be compressed, and callers need an error for incomplete delivery.
+// This bounds the decoded request including framing, not guaranteed attachment storage.
+// https://develop.sentry.dev/sdk/foundations/envelopes/#size-limits
+const MAX_DECODED_UPLOAD_BYTES: usize = 200 * 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const FEEDBACK_TAGS_TARGET: &str = "feedback_tags";
-const MAX_FEEDBACK_TAGS: usize = 64;
+// Leave room for every feature, usage settings, and request/auth diagnostics.
+const MAX_FEEDBACK_TAGS: usize = 512;
 
 /// Structured request/auth fields that should be attached to feedback uploads.
 pub struct FeedbackRequestTags<'a> {
@@ -171,6 +202,17 @@ pub struct CodexFeedback {
     inner: Arc<FeedbackInner>,
 }
 
+impl LogWriteFailureReporter for CodexFeedback {
+    fn report_failure(&self, diagnostic: &str) {
+        // Bypass tracing so this diagnostic cannot return to the SQLite writer.
+        self.inner
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_bytes(diagnostic.as_bytes());
+    }
+}
+
 impl Default for CodexFeedback {
     fn default() -> Self {
         Self::new()
@@ -194,7 +236,7 @@ impl CodexFeedback {
         }
     }
 
-    /// Returns a [`tracing_subscriber`] layer that captures full-fidelity logs into this feedback
+    /// Returns a [`tracing_subscriber`] layer that captures diagnostic logs into this feedback
     /// ring buffer.
     ///
     /// This is intended for initialization code so call sites don't have to duplicate the exact
@@ -208,12 +250,21 @@ impl CodexFeedback {
             .with_timer(tracing_subscriber::fmt::time::SystemTime)
             .with_ansi(false)
             .with_target(false)
-            // Capture everything, regardless of the caller's `RUST_LOG`, so feedback includes the
-            // full trace when the user uploads a report.
+            // Capture diagnostics independently of `RUST_LOG` without filling the feedback ring
+            // with high-volume request and response payloads.
             .with_filter(
                 Targets::new()
                     .with_default(Level::TRACE)
-                    .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF),
+                    // Opted-in content belongs to the configured OTLP destination, not feedback.
+                    .with_target("codex_otel.log_only", LevelFilter::OFF)
+                    .with_target("codex_http_client::transport", LevelFilter::DEBUG)
+                    .with_target("codex_api::sse", LevelFilter::DEBUG)
+                    // `tracing-log` checks legacy log records against their original
+                    // target before re-emitting them as `log`; tungstenite TRACE
+                    // includes full websocket frames and authenticated handshakes.
+                    .with_target("tungstenite", LevelFilter::DEBUG)
+                    .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF)
+                    .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF),
             )
     }
 
@@ -358,6 +409,107 @@ pub struct FeedbackAttachmentPath {
     pub attachment_filename_override: Option<String>,
 }
 
+impl FeedbackAttachmentPath {
+    /// Read a whole regular file within the caller's size limit.
+    pub fn read_attachment(&self, max_bytes: usize) -> io::Result<Option<FeedbackAttachment>> {
+        let mut attachment_path = self.path.clone();
+        let mut rollout_path = codex_rollout::rollout_id_from_path(&self.path)
+            .map(|_| codex_rollout::plain_rollout_path(&self.path));
+        let mut raw_rollout = false;
+        let decoded = if let Some(plain_path) = &rollout_path {
+            match codex_rollout::read_rollout_prefix(&self.path, max_bytes.saturating_add(1)) {
+                Ok(Some(buffer)) => Some(buffer),
+                Ok(None) => {
+                    tracing::error!(
+                        "feedback attachment skipped: rollout is missing or not a regular file"
+                    );
+                    return Ok(None);
+                }
+                Err(error)
+                    if error.raw_os_error().is_none()
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::InvalidData
+                                | io::ErrorKind::Other
+                        )
+                        && !plain_path.try_exists().unwrap_or(true) =>
+                {
+                    // Preserve a selected, undecodable archive for diagnosis. Never replace
+                    // a preferred plain rollout with its potentially stale compressed sibling.
+                    attachment_path = plain_path.with_extension("jsonl.zst");
+                    rollout_path = None;
+                    raw_rollout = true;
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let buffer = if let Some(buffer) = decoded {
+            buffer
+        } else {
+            let metadata = fs::metadata(&attachment_path)?;
+            if !metadata.is_file() {
+                tracing::error!("feedback attachment skipped: not a regular file");
+                return Ok(None);
+            }
+            if metadata.len() > max_bytes as u64 {
+                tracing::error!(
+                    bytes = metadata.len(),
+                    max_bytes,
+                    "feedback attachment skipped: size limit exceeded"
+                );
+                return Ok(None);
+            }
+            let mut buffer = Vec::new();
+            // Detect files that grow past the limit after the metadata check.
+            fs::File::open(&attachment_path)?
+                .take(max_bytes as u64 + 1)
+                .read_to_end(&mut buffer)?;
+            buffer
+        };
+        if buffer.len() > max_bytes {
+            tracing::error!(
+                bytes_read = buffer.len(),
+                max_bytes,
+                "feedback attachment skipped: decoded size limit exceeded"
+            );
+            return Ok(None);
+        }
+        let mut filename = self
+            .attachment_filename_override
+            .clone()
+            .unwrap_or_else(|| {
+                rollout_path
+                    .as_ref()
+                    .unwrap_or(&attachment_path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "extra-log.log".to_string())
+            });
+        if raw_rollout && !filename.ends_with(".zst") {
+            filename.push_str(".zst");
+        }
+        let content_type = match Path::new(&filename)
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            Some(extension) if extension.eq_ignore_ascii_case("jsonl") => "text/plain".to_string(),
+            _ => mime_guess::from_path(&filename)
+                .first_or_octet_stream()
+                .essence_str()
+                .to_string(),
+        };
+        Ok(Some(FeedbackAttachment {
+            filename,
+            content_type: Some(content_type),
+            buffer,
+        }))
+    }
+}
+
 /// In-memory attachment to include in a feedback upload.
 ///
 /// Use this for generated diagnostics that should not be materialized on disk,
@@ -383,20 +535,83 @@ pub struct FeedbackUploadOptions<'a> {
     pub reason: Option<&'a str>,
     pub tags: Option<&'a BTreeMap<String, String>>,
     pub include_logs: bool,
-    /// Generated attachments that are already buffered and safe to upload.
+    /// Owned diagnostics and frozen rollout prefixes that are safe to upload.
     ///
-    /// These are included after `codex-logs.log` and before path-backed rollout
-    /// attachments. They are only passed by the caller after any user consent
-    /// gate has decided logs and diagnostics should be uploaded.
-    pub extra_attachments: &'a [FeedbackAttachment],
+    /// Diagnostics follow `codex-logs.log`; rollout prefixes join the archive with
+    /// path-backed rollouts. Callers must apply any user consent gate first.
+    pub extra_attachments: Vec<FeedbackAttachment>,
     pub extra_attachment_paths: &'a [FeedbackAttachmentPath],
     pub session_source: Option<SessionSource>,
     pub logs_override: Option<Vec<u8>>,
 }
 
 impl FeedbackSnapshot {
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+    /// Refreshes log bytes while preserving the captured metadata and thread identity.
+    pub fn refresh_logs(&mut self, feedback: &CodexFeedback) {
+        self.bytes = feedback
+            .inner
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot_bytes();
+    }
+
+    fn feedback_event(
+        &self,
+        classification: &str,
+        reason: Option<&str>,
+        tags: Option<&BTreeMap<String, String>>,
+        session_source: Option<&SessionSource>,
+    ) -> sentry::protocol::Event<'static> {
+        use sentry::protocol::Event;
+        use sentry::protocol::Exception;
+        use sentry::protocol::Level;
+        use sentry::protocol::Values;
+
+        let level = match classification {
+            "bug" | "bad_result" | "safety_check" => Level::Error,
+            _ => Level::Info,
+        };
+        let custom_title = tags
+            .and_then(|tags| tags.get("feedback_title"))
+            .map(|title| title.trim())
+            .filter(|title| !title.is_empty());
+        let title = custom_title.map_or_else(
+            || {
+                format!(
+                    "[{}]: Codex session {}",
+                    display_classification(classification),
+                    self.thread_id
+                )
+            },
+            str::to_owned,
+        );
+        let mut event = Event {
+            level,
+            message: Some(title.clone()),
+            tags: self.upload_tags(classification, reason, tags, session_source),
+            ..Default::default()
+        };
+        if custom_title.is_some() {
+            // A shared title must not merge independent reports and suppress new-issue alerts.
+            event.fingerprint = vec![event.event_id.to_string().into()].into();
+        }
+        if let Some(reason) = reason {
+            event.exception = Values::from(vec![Exception {
+                ty: title,
+                value: Some(reason.to_string()),
+                ..Default::default()
+            }]);
+        }
+        event
+    }
+
+    pub fn log_attachment(&self, logs_override: Option<Vec<u8>>) -> FeedbackAttachment {
+        FeedbackAttachment {
+            filename: "codex-logs.log".to_string(),
+            content_type: Some("text/plain".to_string()),
+            buffer: logs_override.unwrap_or_else(|| self.bytes.clone()),
+        }
     }
 
     pub fn feedback_diagnostics(&self) -> &FeedbackDiagnostics {
@@ -416,83 +631,198 @@ impl FeedbackSnapshot {
         self.feedback_diagnostics.attachment_text()
     }
 
-    pub fn save_to_temp_file(&self) -> io::Result<PathBuf> {
-        let dir = std::env::temp_dir();
-        let filename = format!("codex-feedback-{}.log", self.thread_id);
-        let path = dir.join(filename);
-        fs::write(&path, self.as_bytes())?;
-        Ok(path)
+    /// Submit feedback to Sentry with whole attachments within a shared deadline.
+    /// Success means HTTP acceptance, not durable attachment storage. Callers must
+    /// retain their source files; errors can occur after part of a report is accepted.
+    /// https://github.com/getsentry/relay/blob/master/relay-server/src/endpoints/common.rs
+    pub async fn upload_feedback(
+        &self,
+        options: FeedbackUploadOptions<'_>,
+        http_client_factory: &HttpClientFactory,
+    ) -> Result<()> {
+        self.upload_feedback_with_dsn(
+            options,
+            http_client_factory,
+            SENTRY_DSN,
+            Instant::now() + UPLOAD_TIMEOUT,
+        )
+        .await
     }
 
-    /// Upload feedback to Sentry with optional attachments.
-    pub fn upload_feedback(&self, options: FeedbackUploadOptions<'_>) -> Result<()> {
-        use std::str::FromStr;
-        use std::sync::Arc;
+    /// Atomically saves the consent-selected report and attachments without uploading.
+    /// Existing paths are rejected and failures never publish a partial archive.
+    pub fn save_feedback(&self, options: FeedbackUploadOptions<'_>, path: &Path) -> Result<()> {
+        let report = serde_json::to_vec(&self.feedback_event(
+            options.classification,
+            options.reason,
+            options.tags,
+            options.session_source.as_ref(),
+        ))?;
+        anyhow::ensure!(
+            report.len() <= MAX_EVENT_BYTES,
+            "feedback event exceeds the size limit"
+        );
+        let logs = options
+            .include_logs
+            .then(|| self.log_attachment(options.logs_override));
+        let diagnostics = self
+            .feedback_diagnostics_attachment_text(options.include_logs)
+            .map(|text| FeedbackAttachment {
+                buffer: text.into_bytes(),
+                filename: FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME.to_string(),
+                content_type: Some("text/plain".to_string()),
+            });
+        archive::save(
+            path,
+            &report,
+            logs.into_iter()
+                .chain(options.extra_attachments)
+                .chain(diagnostics)
+                .map(archive::Input::Owned)
+                .chain(
+                    options
+                        .extra_attachment_paths
+                        .iter()
+                        .map(archive::Input::Path),
+                ),
+            archive::Limits::default(),
+        )
+    }
 
-        use sentry::Client;
-        use sentry::ClientOptions;
+    async fn upload_feedback_with_dsn(
+        &self,
+        options: FeedbackUploadOptions<'_>,
+        http_client_factory: &HttpClientFactory,
+        dsn: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        use std::str::FromStr;
+
         use sentry::protocol::Envelope;
         use sentry::protocol::EnvelopeItem;
-        use sentry::protocol::Event;
-        use sentry::protocol::Level;
-        use sentry::transports::DefaultTransportFactory;
         use sentry::types::Dsn;
 
-        // Build Sentry client
-        let client = Client::from_config(ClientOptions {
-            dsn: Some(Dsn::from_str(SENTRY_DSN).map_err(|e| anyhow!("invalid DSN: {e}"))?),
-            transport: Some(Arc::new(DefaultTransportFactory {})),
-            ..Default::default()
-        });
+        let started_at = Instant::now();
+        let dsn = Dsn::from_str(dsn).map_err(|error| anyhow!("invalid DSN: {error}"))?;
 
-        let tags = self.upload_tags(
+        let event = self.feedback_event(
             options.classification,
             options.reason,
             options.tags,
             options.session_source.as_ref(),
         );
-
-        let level = match options.classification {
-            "bug" | "bad_result" | "safety_check" => Level::Error,
-            _ => Level::Info,
-        };
-
         let mut envelope = Envelope::new();
-        let title = format!(
-            "[{}]: Codex session {}",
-            display_classification(options.classification),
-            self.thread_id
+        envelope.add_item(EnvelopeItem::Event(event));
+        let (event_body, event_bytes) =
+            upload::encode_envelope(&envelope).context("failed to serialize feedback event")?;
+        anyhow::ensure!(
+            event_bytes <= MAX_EVENT_BYTES,
+            "feedback event exceeds the size limit"
+        );
+        let headers = envelope.headers().clone();
+        drop(envelope);
+        let client_pool = RouteAwareClientPool::new_without_redirects_or_request_logging(
+            http_client_factory.clone(),
+            ClientRouteClass::Other,
+        );
+        // Accept the report before reading diagnostics; all envelopes share one deadline.
+        let mut rate_limited = false;
+        let status = upload::send_envelope(
+            &client_pool,
+            &dsn,
+            event_body,
+            upload::EnvelopeKind::Event,
+            deadline,
+            &mut rate_limited,
+        )
+        .await?;
+        anyhow::ensure!(
+            status.is_success(),
+            "Sentry rejected feedback upload with HTTP status {status}"
         );
 
-        let mut event = Event {
-            level,
-            message: Some(title.clone()),
-            tags,
-            ..Default::default()
-        };
-        if let Some(r) = options.reason {
-            use sentry::protocol::Exception;
-            use sentry::protocol::Values;
-
-            event.exception = Values::from(vec![Exception {
-                ty: title,
-                value: Some(r.to_string()),
-                ..Default::default()
-            }]);
-        }
-        envelope.add_item(EnvelopeItem::Event(event));
-
-        for attachment in self.feedback_attachments(
+        let mut attachments = self.feedback_attachments(
+            &headers,
             options.include_logs,
             options.extra_attachments,
             options.extra_attachment_paths,
             options.logs_override,
-        ) {
-            envelope.add_item(EnvelopeItem::Attachment(attachment));
-        }
+        );
+        let mut uploaded_attachments = 0;
+        let mut attachments_failed = false;
+        // Keep attachments linked to the accepted event, without replaying its contents.
+        // Inspect the upper bound without reading the next file after the deadline.
+        while attachments.size_hint().1 != Some(0) {
+            if rate_limited || Instant::now() >= deadline {
+                attachments_failed = true;
+                tracing::error!(
+                    reason = if rate_limited {
+                        "rate limit"
+                    } else {
+                        "upload deadline"
+                    },
+                    "remaining feedback attachments skipped"
+                );
+                break;
+            }
+            let Some(attachment) = attachments.next() else {
+                break;
+            };
+            if Instant::now() >= deadline {
+                attachments_failed = true;
+                tracing::error!(
+                    "remaining feedback attachments skipped: upload deadline reached while reading attachment"
+                );
+                break;
+            }
+            let mut status = None;
+            let result: Result<()> = async {
+                let body = upload::encode_attachment_envelope(&headers, attachment?)?;
+                let response_status = upload::send_envelope(
+                    &client_pool,
+                    &dsn,
+                    body,
+                    upload::EnvelopeKind::Attachment,
+                    deadline,
+                    &mut rate_limited,
+                )
+                .await
+                .map_err(|error| {
+                    // Transport error strings can contain credential-bearing URLs.
+                    if let Some(cause) = error.downcast_ref::<codex_http_client::RouteAwareRequestError>() {
+                        anyhow!(
+                            "feedback transport failed: class={:?}, timeout={}, connect={}, request={}, body={}",
+                            cause.failure_class(), cause.is_timeout(), cause.is_connect(), cause.is_request(), cause.is_body()
+                        )
+                    } else {
+                        error
+                    }
+                })?;
 
-        client.send_envelope(envelope);
-        client.flush(Some(Duration::from_secs(UPLOAD_TIMEOUT_SECS)));
+                status = Some(response_status.as_u16());
+                anyhow::ensure!(response_status.is_success(), "Sentry rejected attachment");
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                attachments_failed = true;
+                // Keep trying other diagnostics before reporting the partial failure.
+                tracing::error!(status, error = %format!("{error:#}"), "feedback attachment upload failed; continuing");
+            } else {
+                uploaded_attachments += 1;
+            }
+        }
+        tracing::info!(
+            thread_id = %self.thread_id,
+            uploaded_attachments,
+            attachments_failed,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "feedback event uploaded to Sentry"
+        );
+        anyhow::ensure!(
+            !attachments_failed,
+            "feedback report was accepted, but some attachments failed to upload"
+        );
         Ok(())
     }
 
@@ -512,8 +842,15 @@ impl FeedbackSnapshot {
         if let Some(source) = session_source {
             tags.insert(String::from("session_source"), source.to_string());
         }
-        if let Some(r) = reason {
-            tags.insert(String::from("reason"), r.to_string());
+        if let Some(reason) = reason {
+            // Sentry tags cannot contain newlines or exceed 200 characters. Keep the
+            // full comment in the exception body and a preview for tag consumers.
+            let preview = reason
+                .chars()
+                .take(200)
+                .map(|ch| if matches!(ch, '\r' | '\n') { ' ' } else { ch })
+                .collect();
+            tags.insert(String::from("reason"), preview);
         }
 
         let reserved = [
@@ -545,85 +882,103 @@ impl FeedbackSnapshot {
         tags
     }
 
-    fn feedback_attachments(
-        &self,
+    fn feedback_attachments<'a>(
+        &'a self,
+        headers: &'a sentry::protocol::EnvelopeHeaders,
         include_logs: bool,
-        extra_attachments: &[FeedbackAttachment],
-        extra_attachment_paths: &[FeedbackAttachmentPath],
+        extra_attachments: Vec<FeedbackAttachment>,
+        extra_attachment_paths: &'a [FeedbackAttachmentPath],
         logs_override: Option<Vec<u8>>,
-    ) -> Vec<sentry::protocol::Attachment> {
+    ) -> impl Iterator<Item = Result<sentry::protocol::Attachment>> + 'a {
         use sentry::protocol::Attachment;
 
-        let mut attachments = Vec::new();
-
-        if include_logs {
-            attachments.push(Attachment {
-                buffer: logs_override.unwrap_or_else(|| self.bytes.clone()),
-                filename: String::from("codex-logs.log"),
-                content_type: Some("text/plain".to_string()),
-                ty: None,
+        // Partition metadata without reading files before the event is accepted. Keep
+        // generated diagnostics first, then rollouts, then remaining files in caller order.
+        let (rollouts, diagnostics_attachments): (Vec<_>, Vec<_>) =
+            extra_attachments.into_iter().partition(|attachment| {
+                codex_rollout::rollout_id_from_path(Path::new(&attachment.filename)).is_some()
             });
-        }
-
-        attachments.extend(extra_attachments.iter().map(|attachment| Attachment {
-            buffer: attachment.buffer.clone(),
-            filename: attachment.filename.clone(),
-            content_type: attachment.content_type.clone(),
-            ty: None,
-        }));
-
-        if let Some(text) = self.feedback_diagnostics_attachment_text(include_logs) {
-            attachments.push(Attachment {
+        let (rollout_paths, diagnostic_paths): (Vec<_>, Vec<_>) =
+            extra_attachment_paths.iter().partition(|attachment| {
+                codex_rollout::rollout_id_from_path(&attachment.path).is_some()
+            });
+        let has_rollouts = !rollouts.is_empty() || !rollout_paths.is_empty();
+        let archive = has_rollouts
+            .then_some((rollout_paths, rollouts))
+            .into_iter()
+            .flat_map(move |(paths, rollouts)| {
+                let archive =
+                    tempfile::tempdir()
+                        .map_err(anyhow::Error::from)
+                        .and_then(|directory| {
+                            let output_path = directory.path().join("rollouts.tar.gz");
+                            let Some(archive) = rollout_archive::archive_rollouts(
+                                &output_path,
+                                paths.iter().copied(),
+                                &rollouts,
+                                MAX_DECODED_UPLOAD_BYTES,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            let attachment = archive
+                                .read_attachment(MAX_DECODED_UPLOAD_BYTES)?
+                                .context("rollout archive is missing or exceeds the size limit")?;
+                            // Measure framing without copying the archive. Account for the extra
+                            // decimal digits when the empty attachment's length becomes nonzero.
+                            let mut envelope =
+                                sentry::protocol::Envelope::new().with_headers(headers.clone());
+                            envelope.add_item(Attachment {
+                                filename: attachment.filename.clone(),
+                                content_type: attachment.content_type.clone(),
+                                ..Default::default()
+                            });
+                            let mut framing = Vec::new();
+                            envelope.to_writer(&mut framing)?;
+                            let archive_bytes = attachment.buffer.len();
+                            let envelope_bytes = framing.len()
+                                + archive_bytes
+                                + archive_bytes.checked_ilog10().unwrap_or(0) as usize;
+                            anyhow::ensure!(
+                                envelope_bytes <= MAX_DECODED_UPLOAD_BYTES,
+                                "rollout archive envelope exceeds the size limit"
+                            );
+                            Ok(Some(attachment))
+                        });
+                rollout_archive::with_individual_fallback(
+                    archive,
+                    paths,
+                    rollouts,
+                    MAX_DECODED_UPLOAD_BYTES,
+                )
+            });
+        let logs = include_logs.then(|| self.log_attachment(logs_override));
+        let diagnostics = self
+            .feedback_diagnostics_attachment_text(include_logs)
+            .map(|text| FeedbackAttachment {
                 buffer: text.into_bytes(),
                 filename: FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME.to_string(),
                 content_type: Some("text/plain".to_string()),
-                ty: None,
             });
-        }
 
-        for attachment_path in extra_attachment_paths {
-            let data = match fs::read(&attachment_path.path) {
-                Ok(data) => data,
-                Err(err) => {
-                    tracing::warn!(
-                        path = %attachment_path.path.display(),
-                        error = %err,
-                        "failed to read log attachment; skipping"
-                    );
-                    continue;
-                }
-            };
-            let filename = attachment_path
-                .attachment_filename_override
-                .clone()
-                .unwrap_or_else(|| {
-                    attachment_path
-                        .path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "extra-log.log".to_string())
-                });
-            let content_type = match Path::new(&filename)
-                .extension()
-                .and_then(|extension| extension.to_str())
-            {
-                Some(extension) if extension.eq_ignore_ascii_case("jsonl") => {
-                    "text/plain".to_string()
-                }
-                _ => mime_guess::from_path(&filename)
-                    .first_or_octet_stream()
-                    .essence_str()
-                    .to_string(),
-            };
-            attachments.push(Attachment {
-                buffer: data,
-                filename,
-                content_type: Some(content_type),
-                ty: None,
-            });
-        }
-
-        attachments
+        logs.into_iter()
+            .chain(diagnostics_attachments)
+            .chain(diagnostics)
+            .map(Ok)
+            .chain(archive)
+            .chain(diagnostic_paths.into_iter().map(|attachment_path| {
+                attachment_path
+                    .read_attachment(MAX_DECODED_UPLOAD_BYTES)?
+                    .context("feedback attachment is not a regular file or exceeds the size limit")
+            }))
+            .map(|attachment| {
+                attachment.map(|attachment| Attachment {
+                    buffer: attachment.buffer,
+                    filename: attachment.filename,
+                    content_type: attachment.content_type,
+                    ty: None,
+                })
+            })
     }
 }
 
@@ -655,6 +1010,12 @@ where
 
         let mut visitor = FeedbackTagsVisitor::default();
         event.record(&mut visitor);
+        // Expand runtime-selected keys alongside ordinary tracing fields.
+        if let Some(json) = visitor.tags.remove("tags_json")
+            && let Ok(tags) = serde_json::from_str::<BTreeMap<String, String>>(&json)
+        {
+            visitor.tags.extend(tags);
+        }
         if visitor.tags.is_empty() {
             return;
         }
@@ -708,262 +1069,5 @@ impl Visit for FeedbackTagsVisitor {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::ffi::OsStr;
-    use std::fs;
-
-    use super::*;
-    use crate::FeedbackDiagnostic;
-    use pretty_assertions::assert_eq;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    #[test]
-    fn ring_buffer_drops_front_when_full() {
-        let fb = CodexFeedback::with_capacity(/*max_bytes*/ 8);
-        {
-            let mut w = fb.make_writer().make_writer();
-            w.write_all(b"abcdefgh").unwrap();
-            w.write_all(b"ij").unwrap();
-        }
-        let snap = fb.snapshot(/*session_id*/ None);
-        // Capacity 8: after writing 10 bytes, we should keep the last 8.
-        pretty_assertions::assert_eq!(std::str::from_utf8(snap.as_bytes()).unwrap(), "cdefghij");
-    }
-
-    #[test]
-    fn logger_layer_excludes_responses_websocket_timing_payloads() {
-        let fb = CodexFeedback::new();
-        let _guard = tracing_subscriber::registry()
-            .with(fb.logger_layer())
-            .set_default();
-
-        tracing::trace!(target: "codex_api::responses_websocket_timing", payload = "secret");
-        tracing::trace!(target: "codex_feedback_test", "retained");
-
-        let logs = String::from_utf8(fb.snapshot(/*session_id*/ None).bytes).unwrap();
-        assert!(!logs.contains("secret"));
-        assert!(logs.contains("retained"));
-    }
-
-    #[test]
-    fn metadata_layer_records_tags_from_feedback_target() {
-        let fb = CodexFeedback::new();
-        let _guard = tracing_subscriber::registry()
-            .with(fb.metadata_layer())
-            .set_default();
-
-        tracing::info!(target: FEEDBACK_TAGS_TARGET, model = "gpt-5", cached = true, "tags");
-
-        let snap = fb.snapshot(/*session_id*/ None);
-        pretty_assertions::assert_eq!(snap.tags.get("model").map(String::as_str), Some("gpt-5"));
-        pretty_assertions::assert_eq!(snap.tags.get("cached").map(String::as_str), Some("true"));
-    }
-
-    #[test]
-    fn feedback_attachments_gate_connectivity_diagnostics() {
-        let extra_filename = format!("codex-feedback-extra-{}.jsonl", ThreadId::new());
-        let extra_path = std::env::temp_dir().join(&extra_filename);
-        let extra_attachment_path = FeedbackAttachmentPath {
-            path: extra_path.clone(),
-            attachment_filename_override: None,
-        };
-        fs::write(&extra_path, "rollout").expect("extra attachment should be written");
-
-        let snapshot_with_diagnostics = CodexFeedback::new()
-            .snapshot(/*session_id*/ None)
-            .with_feedback_diagnostics(FeedbackDiagnostics::new(vec![FeedbackDiagnostic {
-                headline: "Proxy environment variables are set and may affect connectivity."
-                    .to_string(),
-                details: vec!["HTTPS_PROXY = https://example.com:443".to_string()],
-            }]));
-
-        let attachments_with_diagnostics = snapshot_with_diagnostics.feedback_attachments(
-            /*include_logs*/ true,
-            &[FeedbackAttachment {
-                filename: DOCTOR_REPORT_ATTACHMENT_FILENAME.to_string(),
-                content_type: Some("application/json".to_string()),
-                buffer: b"{\"overallStatus\":\"ok\"}".to_vec(),
-            }],
-            std::slice::from_ref(&extra_attachment_path),
-            Some(vec![1]),
-        );
-
-        assert_eq!(
-            attachments_with_diagnostics
-                .iter()
-                .map(|attachment| attachment.filename.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "codex-logs.log",
-                DOCTOR_REPORT_ATTACHMENT_FILENAME,
-                FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME,
-                extra_filename.as_str()
-            ]
-        );
-        assert_eq!(attachments_with_diagnostics[0].buffer, vec![1]);
-        assert_eq!(
-            attachments_with_diagnostics[1].buffer,
-            b"{\"overallStatus\":\"ok\"}".to_vec()
-        );
-        assert_eq!(
-            attachments_with_diagnostics[2].buffer,
-            b"Connectivity diagnostics\n\n- Proxy environment variables are set and may affect connectivity.\n  - HTTPS_PROXY = https://example.com:443".to_vec()
-        );
-        assert_eq!(attachments_with_diagnostics[3].buffer, b"rollout".to_vec());
-        assert_eq!(
-            attachments_with_diagnostics[3].content_type.as_deref(),
-            Some("text/plain")
-        );
-        assert_eq!(
-            OsStr::new(attachments_with_diagnostics[3].filename.as_str()),
-            OsStr::new(extra_filename.as_str())
-        );
-        let attachments_without_diagnostics = CodexFeedback::new()
-            .snapshot(/*session_id*/ None)
-            .with_feedback_diagnostics(FeedbackDiagnostics::default())
-            .feedback_attachments(/*include_logs*/ true, &[], &[], Some(vec![1]));
-
-        assert_eq!(
-            attachments_without_diagnostics
-                .iter()
-                .map(|attachment| attachment.filename.as_str())
-                .collect::<Vec<_>>(),
-            vec!["codex-logs.log"]
-        );
-        assert_eq!(attachments_without_diagnostics[0].buffer, vec![1]);
-        fs::remove_file(extra_path).expect("extra attachment should be removed");
-    }
-
-    #[test]
-    fn path_backed_attachments_use_binary_content_types() {
-        let suffix = ThreadId::new();
-        let gzip_filename = format!("codex-desktop-app-logs-{suffix}.tar.gz");
-        let unknown_filename = format!("codex-feedback-extra-{suffix}.binunknown");
-        let gzip_path = std::env::temp_dir().join(&gzip_filename);
-        let unknown_path = std::env::temp_dir().join(&unknown_filename);
-        let gzip_bytes = b"\x1f\x8b\x08\x00\xff";
-        let unknown_bytes = b"\x00\x9f\x92\x96";
-        fs::write(&gzip_path, gzip_bytes).expect("gzip attachment should be written");
-        fs::write(&unknown_path, unknown_bytes).expect("unknown attachment should be written");
-
-        let attachments = CodexFeedback::new()
-            .snapshot(/*session_id*/ None)
-            .feedback_attachments(
-                /*include_logs*/ false,
-                &[],
-                &[
-                    FeedbackAttachmentPath {
-                        path: gzip_path.clone(),
-                        attachment_filename_override: None,
-                    },
-                    FeedbackAttachmentPath {
-                        path: unknown_path.clone(),
-                        attachment_filename_override: None,
-                    },
-                ],
-                /*logs_override*/ None,
-            );
-
-        fs::remove_file(gzip_path).expect("gzip attachment should be removed");
-        fs::remove_file(unknown_path).expect("unknown attachment should be removed");
-        assert_eq!(
-            attachments
-                .iter()
-                .map(|attachment| (
-                    attachment.filename.as_str(),
-                    attachment.content_type.as_deref(),
-                    attachment.buffer.as_slice(),
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    gzip_filename.as_str(),
-                    Some("application/gzip"),
-                    gzip_bytes.as_slice(),
-                ),
-                (
-                    unknown_filename.as_str(),
-                    Some("application/octet-stream"),
-                    unknown_bytes.as_slice(),
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn upload_tags_include_client_tags_and_preserve_reserved_fields() {
-        let mut tags = BTreeMap::new();
-        tags.insert("thread_id".to_string(), "wrong-thread".to_string());
-        tags.insert("turn_id".to_string(), "wrong-turn".to_string());
-        tags.insert(
-            "classification".to_string(),
-            "wrong-classification".to_string(),
-        );
-        tags.insert("cli_version".to_string(), "wrong-version".to_string());
-        tags.insert("session_source".to_string(), "wrong-source".to_string());
-        tags.insert("reason".to_string(), "wrong-reason".to_string());
-        tags.insert("account_id".to_string(), "actual-account".to_string());
-        tags.insert("model".to_string(), "gpt-5".to_string());
-        let snapshot = FeedbackSnapshot {
-            bytes: Vec::new(),
-            tags,
-            feedback_diagnostics: FeedbackDiagnostics::default(),
-            thread_id: "thread-123".to_string(),
-        };
-        let mut client_tags = BTreeMap::new();
-        client_tags.insert("thread_id".to_string(), "wrong-client-thread".to_string());
-        client_tags.insert("turn_id".to_string(), "turn-456".to_string());
-        client_tags.insert(
-            "classification".to_string(),
-            "wrong-client-classification".to_string(),
-        );
-        client_tags.insert(
-            "cli_version".to_string(),
-            "wrong-client-version".to_string(),
-        );
-        client_tags.insert(
-            "session_source".to_string(),
-            "wrong-client-source".to_string(),
-        );
-        client_tags.insert("reason".to_string(), "wrong-client-reason".to_string());
-        client_tags.insert("client_tag".to_string(), "from-client".to_string());
-
-        let upload_tags = snapshot.upload_tags(
-            "bug",
-            Some("actual reason"),
-            Some(&client_tags),
-            Some(&SessionSource::Cli),
-        );
-
-        assert_eq!(
-            upload_tags.get("thread_id").map(String::as_str),
-            Some("thread-123")
-        );
-        assert_eq!(
-            upload_tags.get("turn_id").map(String::as_str),
-            Some("turn-456")
-        );
-        assert_eq!(
-            upload_tags.get("classification").map(String::as_str),
-            Some("bug")
-        );
-        assert_eq!(
-            upload_tags.get("session_source").map(String::as_str),
-            Some("cli")
-        );
-        assert_eq!(
-            upload_tags.get("reason").map(String::as_str),
-            Some("actual reason")
-        );
-        assert_eq!(
-            upload_tags.get("account_id").map(String::as_str),
-            Some("actual-account")
-        );
-        assert_eq!(
-            upload_tags.get("client_tag").map(String::as_str),
-            Some("from-client")
-        );
-        assert_eq!(upload_tags.get("model").map(String::as_str), Some("gpt-5"));
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

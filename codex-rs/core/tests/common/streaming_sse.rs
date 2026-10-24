@@ -52,7 +52,8 @@ impl StreamingSseServer {
 
 /// Starts a lightweight HTTP server that supports:
 /// - GET /v1/models -> empty models response
-/// - POST /v1/responses -> SSE stream gated per-chunk, served in order
+/// - GET responses routes -> 426 to select the HTTP fallback
+/// - POST responses and Guardian routes -> SSE stream gated per-chunk, served in order
 ///
 /// Returns the server handle and a list of receivers that fire when each
 /// response stream finishes sending its final chunk.
@@ -116,7 +117,13 @@ pub async fn start_streaming_sse_server(
                             return;
                         }
 
-                        if method == "POST" && path == "/v1/responses" {
+                        let responses_route = matches!(path, "/v1/responses" | "/backend-api/codex/responses");
+                        if method == "GET" && responses_route {
+                            let _ = write_http_response(&mut stream, /*status*/ 426, "websockets unsupported", "text/plain").await;
+                            return;
+                        }
+
+                        if method == "POST" && (responses_route || path == "/backend-api/codex/guardian") {
                             let body = match read_request_body(&mut stream, &request, body_prefix)
                                 .await
                             {
@@ -284,8 +291,10 @@ fn unix_ms_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_http_client::ClientRouteClass;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
     use pretty_assertions::assert_eq;
-    use reqwest::StatusCode;
     use tokio::net::TcpStream;
     use tokio::time::Duration;
     use tokio::time::timeout;
@@ -607,13 +616,16 @@ data: {"type":"response.completed","response":{"id":"resp-1"}}
             "stream": true
         });
 
-        let resp = reqwest::Client::new()
+        let client = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .build_client(&url, ClientRouteClass::Other)
+            .expect("build HTTP client");
+        let resp = client
             .post(url)
             .json(&payload)
             .send()
             .await
             .expect("send request");
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status().as_u16(), 200);
 
         let bytes = resp.bytes().await.expect("read response body");
         assert_eq!(bytes, response_body.as_bytes());

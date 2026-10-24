@@ -10,11 +10,12 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
-use crate::engine::CommandShell;
+use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
-use crate::engine::command_runner::CommandRunResult;
+use crate::engine::HandlerRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
+use crate::output_spill::AdditionalContext;
 use crate::schema::NullableString;
 use crate::schema::SubagentCommandInputFields;
 use crate::schema::UserPromptSubmitCommandInput;
@@ -36,14 +37,14 @@ pub struct UserPromptSubmitOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
     pub should_stop: bool,
     pub stop_reason: Option<String>,
-    pub additional_contexts: Vec<String>,
+    pub additional_contexts: Vec<crate::HookContext>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct UserPromptSubmitHandlerData {
     should_stop: bool,
     stop_reason: Option<String>,
-    additional_contexts_for_model: Vec<String>,
+    additional_contexts_for_model: Vec<AdditionalContext>,
 }
 
 pub(crate) fn preview(
@@ -61,12 +62,11 @@ pub(crate) fn preview(
 }
 
 pub(crate) async fn run(
-    handlers: &[ConfiguredHandler],
-    shell: &CommandShell,
+    engine: &ClaudeHooksEngine,
     request: UserPromptSubmitRequest,
 ) -> UserPromptSubmitOutcome {
     let matched = dispatcher::select_handlers(
-        handlers,
+        &engine.handlers,
         HookEventName::UserPromptSubmit,
         /*matcher_input*/ None,
     );
@@ -80,7 +80,7 @@ pub(crate) async fn run(
     }
 
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
-    let input_json = match serde_json::to_string(&UserPromptSubmitCommandInput {
+    let input = match serde_json::to_value(UserPromptSubmitCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
         agent_id: subagent.agent_id,
@@ -92,7 +92,7 @@ pub(crate) async fn run(
         permission_mode: request.permission_mode.clone(),
         prompt: request.prompt.clone(),
     }) {
-        Ok(input_json) => input_json,
+        Ok(input) => input,
         Err(error) => {
             return serialization_failure_outcome(common::serialization_failure_hook_events(
                 matched,
@@ -103,9 +103,9 @@ pub(crate) async fn run(
     };
 
     let results = dispatcher::execute_handlers(
-        shell,
+        engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id),
         parse_completed,
@@ -121,6 +121,11 @@ pub(crate) async fn run(
             .iter()
             .map(|result| result.data.additional_contexts_for_model.as_slice()),
     );
+    let additional_contexts = engine
+        .command_runtime
+        .output_spiller()
+        .maybe_spill_additional_contexts(additional_contexts)
+        .await;
 
     UserPromptSubmitOutcome {
         hook_events: results.into_iter().map(|result| result.completed).collect(),
@@ -132,7 +137,7 @@ pub(crate) async fn run(
 
 fn parse_completed(
     handler: &ConfiguredHandler,
-    run_result: CommandRunResult,
+    run_result: HandlerRunResult,
     turn_id: Option<String>,
 ) -> dispatcher::ParsedHandler<UserPromptSubmitHandlerData> {
     let mut entries = Vec::new();
@@ -162,41 +167,46 @@ fn parse_completed(
                             text: system_message,
                         });
                     }
-                    if parsed.invalid_block_reason.is_none()
+                    if (!handler.can_apply_control_effects()
+                        || parsed.invalid_block_reason.is_none())
                         && let Some(additional_context) = parsed.additional_context
                     {
                         common::append_additional_context(
                             &mut entries,
                             &mut additional_contexts_for_model,
+                            handler,
                             additional_context,
+                            &run_result.context_metadata,
                         );
                     }
                     let _ = parsed.universal.suppress_output;
-                    if !parsed.universal.continue_processing {
-                        status = HookRunStatus::Stopped;
-                        should_stop = true;
-                        stop_reason = parsed.universal.stop_reason.clone();
-                        if let Some(stop_reason_text) = parsed.universal.stop_reason {
+                    if handler.can_apply_control_effects() {
+                        if !parsed.universal.continue_processing {
+                            status = HookRunStatus::Stopped;
+                            should_stop = true;
+                            stop_reason = parsed.universal.stop_reason.clone();
+                            if let Some(stop_reason_text) = parsed.universal.stop_reason {
+                                entries.push(HookOutputEntry {
+                                    kind: HookOutputEntryKind::Stop,
+                                    text: stop_reason_text,
+                                });
+                            }
+                        } else if let Some(invalid_block_reason) = parsed.invalid_block_reason {
+                            status = HookRunStatus::Failed;
                             entries.push(HookOutputEntry {
-                                kind: HookOutputEntryKind::Stop,
-                                text: stop_reason_text,
+                                kind: HookOutputEntryKind::Error,
+                                text: invalid_block_reason,
                             });
-                        }
-                    } else if let Some(invalid_block_reason) = parsed.invalid_block_reason {
-                        status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_block_reason,
-                        });
-                    } else if parsed.should_block {
-                        status = HookRunStatus::Blocked;
-                        should_stop = true;
-                        stop_reason = parsed.reason.clone();
-                        if let Some(reason) = parsed.reason {
-                            entries.push(HookOutputEntry {
-                                kind: HookOutputEntryKind::Feedback,
-                                text: reason,
-                            });
+                        } else if parsed.should_block {
+                            status = HookRunStatus::Blocked;
+                            should_stop = true;
+                            stop_reason = parsed.reason.clone();
+                            if let Some(reason) = parsed.reason {
+                                entries.push(HookOutputEntry {
+                                    kind: HookOutputEntryKind::Feedback,
+                                    text: reason,
+                                });
+                            }
                         }
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {
@@ -210,11 +220,13 @@ fn parse_completed(
                     common::append_additional_context(
                         &mut entries,
                         &mut additional_contexts_for_model,
+                        handler,
                         additional_context,
+                        &run_result.context_metadata,
                     );
                 }
             }
-            Some(2) => {
+            Some(2) if handler.can_apply_control_effects() => {
                 if let Some(reason) = common::trimmed_non_empty(&run_result.stderr) {
                     status = HookRunStatus::Blocked;
                     should_stop = true;
@@ -286,7 +298,8 @@ mod tests {
     use super::UserPromptSubmitHandlerData;
     use super::parse_completed;
     use crate::engine::ConfiguredHandler;
-    use crate::engine::command_runner::CommandRunResult;
+    use crate::engine::HandlerRunResult;
+    use crate::output_spill::AdditionalContext;
 
     #[test]
     fn continue_false_preserves_context_for_later_turns() {
@@ -305,7 +318,10 @@ mod tests {
             UserPromptSubmitHandlerData {
                 should_stop: true,
                 stop_reason: Some("pause".to_string()),
-                additional_contexts_for_model: vec!["do not inject".to_string()],
+                additional_contexts_for_model: vec![AdditionalContext {
+                    context: crate::HookContext::harness("do not inject".to_string()),
+                    limit: Default::default(),
+                }],
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Stopped);
@@ -341,7 +357,10 @@ mod tests {
             UserPromptSubmitHandlerData {
                 should_stop: true,
                 stop_reason: Some("slow down".to_string()),
-                additional_contexts_for_model: vec!["do not inject".to_string()],
+                additional_contexts_for_model: vec![AdditionalContext {
+                    context: crate::HookContext::harness("do not inject".to_string()),
+                    limit: Default::default(),
+                }],
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
@@ -362,13 +381,10 @@ mod tests {
 
     #[test]
     fn claude_block_decision_requires_reason() {
+        let stdout = r#"{"decision":"block","hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"do not inject"}}"#;
         let parsed = parse_completed(
             &handler(),
-            run_result(
-                Some(0),
-                r#"{"decision":"block","hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"do not inject"}}"#,
-                "",
-            ),
+            run_result(Some(0), stdout, ""),
             Some("turn-1".to_string()),
         );
 
@@ -388,6 +404,21 @@ mod tests {
                 text: "UserPromptSubmit hook returned decision:block without a non-empty reason"
                     .to_string(),
             }]
+        );
+
+        let async_handler = handler_with_async(/*async*/ true);
+        let parsed = parse_completed(
+            &async_handler,
+            run_result(Some(0), stdout, ""),
+            Some("turn-1".to_string()),
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert_eq!(
+            parsed.completed.run.entries,
+            vec![HookOutputEntry {
+                kind: HookOutputEntryKind::Context,
+                text: "do not inject".to_string(),
+            }],
         );
     }
 
@@ -415,24 +446,44 @@ mod tests {
                 text: "blocked by policy".to_string(),
             }]
         );
+
+        let async_handler = handler_with_async(/*async*/ true);
+        let parsed = parse_completed(
+            &async_handler,
+            run_result(Some(2), "", "blocked by policy\n"),
+            Some("turn-1".to_string()),
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+        assert!(!parsed.data.should_stop);
     }
 
     fn handler() -> ConfiguredHandler {
+        handler_with_async(/*async*/ false)
+    }
+
+    fn handler_with_async(r#async: bool) -> ConfiguredHandler {
         ConfiguredHandler {
+            builtin: false,
+            plugin_trust: None,
             event_name: HookEventName::UserPromptSubmit,
             matcher: None,
-            command: "echo hook".to_string(),
             timeout_sec: 5,
             status_message: None,
-            source_path: test_path_buf("/tmp/hooks.json").abs(),
+            additional_context_limit: Default::default(),
+            source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: codex_protocol::protocol::HookSource::User,
             display_order: 0,
-            env: std::collections::HashMap::new(),
+            kind: crate::engine::ConfiguredHandlerKind::Command {
+                command: "echo hook".to_string(),
+                r#async,
+                env: std::collections::HashMap::new(),
+            },
         }
     }
 
-    fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult {
-        CommandRunResult {
+    fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
+        HandlerRunResult {
+            context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,

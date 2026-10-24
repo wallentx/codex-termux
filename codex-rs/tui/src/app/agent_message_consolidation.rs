@@ -5,9 +5,9 @@
 //! tail in the bottom pane. Once the answer finishes, the app replaces that
 //! trailing run with a single source-backed `AgentMarkdownCell`. This makes the
 //! transcript the canonical owner of the raw markdown source used for future
-//! resize re-renders.
+//! resize re-renders. The retained view preserves its displayed revision before that
+//! replacement, then repaints without replaying terminal scrollback.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use color_eyre::eyre::Result;
@@ -17,7 +17,6 @@ use super::resize_reflow::trailing_run_start;
 use crate::app_event::ConsolidationScrollbackReflow;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
-use crate::inline_visualization::InlineVisualizationContext;
 use crate::pager_overlay::Overlay;
 use crate::tui;
 
@@ -25,9 +24,7 @@ impl App {
     pub(super) fn handle_consolidate_agent_message(
         &mut self,
         tui: &mut tui::Tui,
-        source: String,
-        cwd: PathBuf,
-        inline_visualization_context: Option<InlineVisualizationContext>,
+        source: history_cell::AgentMarkdownCell,
         scrollback_reflow: ConsolidationScrollbackReflow,
         deferred_history_cell: Option<Box<dyn HistoryCell>>,
     ) -> Result<()> {
@@ -39,6 +36,9 @@ impl App {
             if let Some(Overlay::Transcript(t)) = &mut self.overlay {
                 t.insert_cell(cell.clone());
             }
+            if !tui.is_owned_screen() {
+                self.native_history.defer(&cell);
+            }
             self.transcript_cells.push(cell);
         }
 
@@ -47,25 +47,34 @@ impl App {
         let end = self.transcript_cells.len();
         tracing::debug!(
             "ConsolidateAgentMessage: transcript_cells.len()={end}, source_len={}",
-            source.len()
+            source.copy_source().map_or(/*default*/ 0, str::len)
         );
         let start = trailing_run_start::<history_cell::AgentMessageCell>(&self.transcript_cells);
         if start < end {
             tracing::debug!(
                 "ConsolidateAgentMessage: replacing cells [{start}..{end}] with AgentMarkdownCell"
             );
-            let consolidated: Arc<dyn HistoryCell> = Arc::new(
-                history_cell::AgentMarkdownCell::new_with_inline_visualizations(
-                    source,
-                    &cwd,
-                    inline_visualization_context,
-                ),
-            );
+            let consolidated: Arc<dyn HistoryCell> = Arc::new(source);
+            self.native_history
+                .consolidate(&self.transcript_cells[start..end], &consolidated);
+            if tui.is_owned_screen() {
+                self.transcript_view.replace_group(
+                    &self.transcript_cells,
+                    start..end,
+                    &consolidated,
+                );
+            } else {
+                self.transcript_view.replace_range(
+                    &self.transcript_cells,
+                    start..end,
+                    &consolidated,
+                );
+            }
             self.transcript_cells
                 .splice(start..end, std::iter::once(consolidated.clone()));
 
             if let Some(Overlay::Transcript(t)) = &mut self.overlay {
-                t.consolidate_cells(start..end, consolidated.clone());
+                t.regroup_cells(start..end, consolidated.clone());
                 tui.frame_requester().schedule_frame();
             }
 
@@ -85,6 +94,12 @@ impl App {
         tui: &mut tui::Tui,
         scrollback_reflow: ConsolidationScrollbackReflow,
     ) -> Result<()> {
+        if tui.is_owned_screen() {
+            self.transcript_reflow.clear_pending_reflow();
+            self.transcript_reflow.clear_stream_flags();
+            tui.frame_requester().schedule_frame();
+            return Ok(());
+        }
         match scrollback_reflow {
             ConsolidationScrollbackReflow::IfResizeReflowRan => {
                 self.maybe_finish_stream_reflow(tui)?;

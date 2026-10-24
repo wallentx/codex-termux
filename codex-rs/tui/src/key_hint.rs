@@ -11,25 +11,34 @@
 //! `is_plain_text_key_event` gives searchable pickers a shared boundary between
 //! text input and navigation commands.
 //!
-//! It also supplies rendering helpers that convert bindings into styled
-//! `ratatui::text::Span` values for UI hint display.
+//! Rendering helpers emphasize each complete shortcut uniformly, including its separators.
+//! Plain-text uses share the same compact labels.
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use ratatui::style::Color;
 use ratatui::style::Style;
-use ratatui::style::Stylize;
 use ratatui::text::Span;
 
-#[cfg(test)]
-const ALT_PREFIX: &str = "⌥ + ";
-#[cfg(all(not(test), target_os = "macos"))]
-const ALT_PREFIX: &str = "⌥ + ";
-#[cfg(all(not(test), not(target_os = "macos")))]
-const ALT_PREFIX: &str = "alt + ";
-const CTRL_PREFIX: &str = "ctrl + ";
-const SHIFT_PREFIX: &str = "shift + ";
+#[cfg(any(test, target_os = "macos"))]
+const MODIFIER_LABELS: [(KeyModifiers, &str); 4] = [
+    (KeyModifiers::CONTROL, "⌃"),
+    (KeyModifiers::SHIFT, "⇧"),
+    (KeyModifiers::ALT, "⌥"),
+    (KeyModifiers::SUPER, "⌘"),
+];
+#[cfg(not(any(test, target_os = "macos")))]
+const MODIFIER_LABELS: [(KeyModifiers, &str); 4] = [
+    #[cfg(target_os = "linux")]
+    (KeyModifiers::CONTROL, "^"),
+    #[cfg(not(target_os = "linux"))]
+    (KeyModifiers::CONTROL, "ctrl"),
+    (KeyModifiers::SHIFT, "shift"),
+    (KeyModifiers::ALT, "alt"),
+    (KeyModifiers::SUPER, "super"),
+];
 
 /// One concrete key event that can trigger a TUI action.
 ///
@@ -46,7 +55,71 @@ pub(crate) struct KeyBinding {
     modifiers: KeyModifiers,
 }
 
+/// A user-visible shortcut made from one key or a two-key chord.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ShortcutHint {
+    Single(KeyBinding),
+    Chord {
+        prefix: KeyBinding,
+        completion: KeyBinding,
+    },
+}
+
+impl ShortcutHint {
+    pub(crate) fn spans(self) -> Vec<Span<'static>> {
+        vec![self.into()]
+    }
+
+    pub(crate) fn display_label(self) -> String {
+        match self {
+            Self::Single(binding) => binding.display_label(),
+            Self::Chord { prefix, completion } => {
+                format!("{} {}", prefix.display_label(), completion.display_label())
+            }
+        }
+    }
+
+    pub(crate) fn is_press(self, event: KeyEvent) -> bool {
+        matches!(self, Self::Single(binding) if binding.is_press(event))
+    }
+}
+
+impl From<KeyBinding> for ShortcutHint {
+    fn from(binding: KeyBinding) -> Self {
+        Self::Single(binding)
+    }
+}
+
 impl KeyBinding {
+    pub(crate) fn display_label(&self) -> String {
+        let mut label = String::new();
+        for (modifier, name) in MODIFIER_LABELS {
+            if self.modifiers.contains(modifier) {
+                label.push_str(name);
+                if !matches!(name, "⌃" | "⇧" | "⌥" | "⌘" | "^") {
+                    label.push('+');
+                }
+            }
+        }
+        let key = match self.key {
+            #[cfg(test)]
+            KeyCode::Backspace => "backspace".to_string(),
+            #[cfg(test)]
+            KeyCode::Delete => "del".to_string(),
+            KeyCode::Enter => "enter".to_string(),
+            KeyCode::Char(' ') => "space".to_string(),
+            KeyCode::Up => "↑".to_string(),
+            KeyCode::Down => "↓".to_string(),
+            KeyCode::Left => "←".to_string(),
+            KeyCode::Right => "→".to_string(),
+            KeyCode::PageUp => "pgup".to_string(),
+            KeyCode::PageDown => "pgdn".to_string(),
+            _ => self.key.to_string().to_ascii_lowercase(),
+        };
+        label.push_str(&key);
+        label
+    }
+
     pub(crate) const fn new(key: KeyCode, modifiers: KeyModifiers) -> Self {
         Self { key, modifiers }
     }
@@ -66,20 +139,27 @@ impl KeyBinding {
         (self.key, self.modifiers)
     }
 
-    pub(crate) fn display_label(&self) -> String {
-        let modifiers = modifiers_to_string(self.modifiers);
-        let key = match self.key {
-            KeyCode::Enter => "enter".to_string(),
-            KeyCode::Char(' ') => "space".to_string(),
-            KeyCode::Up => "↑".to_string(),
-            KeyCode::Down => "↓".to_string(),
-            KeyCode::Left => "←".to_string(),
-            KeyCode::Right => "→".to_string(),
-            KeyCode::PageUp => "pgup".to_string(),
-            KeyCode::PageDown => "pgdn".to_string(),
-            _ => self.key.to_string().to_ascii_lowercase(),
+    /// Legacy Ctrl+] is reported as Ctrl+5; keep matching and conflicts consistent.
+    pub(crate) fn normalized_parts(&self) -> (KeyCode, KeyModifiers) {
+        match self.parts() {
+            (KeyCode::Char('5'), KeyModifiers::CONTROL) => ctrl(KeyCode::Char(']')).parts(),
+            parts => parts,
+        }
+    }
+
+    /// Return whether two events came from the same held key.
+    ///
+    /// Shift can change Tab into BackTab while it is held, so both codes represent Tab here.
+    pub(crate) fn is_same_physical_key(self, other: Self) -> bool {
+        let physical_code = |binding: Self| match binding.normalized_parts().0 {
+            KeyCode::BackTab => KeyCode::Tab,
+            code => code,
         };
-        format!("{modifiers}{key}")
+        physical_code(self) == physical_code(other)
+    }
+
+    pub(crate) fn spans(&self) -> Vec<Span<'static>> {
+        vec![self.into()]
     }
 }
 
@@ -87,19 +167,23 @@ pub(crate) fn normalize_key_parts(
     key: KeyCode,
     mut modifiers: KeyModifiers,
 ) -> (KeyCode, KeyModifiers) {
+    if key == KeyCode::BackTab || (key == KeyCode::Tab && modifiers.contains(KeyModifiers::SHIFT)) {
+        modifiers.remove(KeyModifiers::SHIFT);
+        return (KeyCode::BackTab, modifiers);
+    }
     let KeyCode::Char(ch) = key else {
         return (key, modifiers);
     };
     if modifiers.is_empty()
         && let Some(ctrl_char) = c0_control_char_to_ctrl_char(ch)
     {
-        return (KeyCode::Char(ctrl_char), KeyModifiers::CONTROL | modifiers);
+        return normalize_key_parts(KeyCode::Char(ctrl_char), KeyModifiers::CONTROL);
     }
     if ch.is_ascii_uppercase() {
         modifiers.insert(KeyModifiers::SHIFT);
         return (KeyCode::Char(ch.to_ascii_lowercase()), modifiers);
     }
-    (key, modifiers)
+    KeyBinding::new(key, modifiers).normalized_parts()
 }
 
 fn c0_control_char_to_ctrl_char(ch: char) -> Option<char> {
@@ -133,9 +217,9 @@ impl KeyBindingListExt for [KeyBinding] {
 /// Searchable pickers use this to avoid stealing plain printable characters for
 /// navigation when the same character might be a valid query. For example, a
 /// list may bind `j` and `k` for movement, but a searchable list must let
-/// plain `j` update the query while still allowing `Ctrl+J` to move. Calling
-/// this after normalizing keybindings would blur that distinction and cause
-/// printable search input to disappear.
+/// plain `j` update the query while still allowing `Ctrl+J` or `Cmd+J` to move.
+/// Calling this after normalizing keybindings would blur that distinction and
+/// cause printable search input to disappear.
 pub(crate) fn is_plain_text_key_event(event: KeyEvent) -> bool {
     matches!(
         event,
@@ -146,6 +230,7 @@ pub(crate) fn is_plain_text_key_event(event: KeyEvent) -> bool {
         } if !ch.is_ascii_control()
             && !modifiers.contains(KeyModifiers::CONTROL)
             && !modifiers.contains(KeyModifiers::ALT)
+            && !modifiers.contains(KeyModifiers::SUPER)
     )
 }
 
@@ -169,20 +254,6 @@ pub(crate) const fn ctrl_alt(key: KeyCode) -> KeyBinding {
     KeyBinding::new(key, KeyModifiers::CONTROL.union(KeyModifiers::ALT))
 }
 
-fn modifiers_to_string(modifiers: KeyModifiers) -> String {
-    let mut result = String::new();
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        result.push_str(CTRL_PREFIX);
-    }
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        result.push_str(SHIFT_PREFIX);
-    }
-    if modifiers.contains(KeyModifiers::ALT) {
-        result.push_str(ALT_PREFIX);
-    }
-    result
-}
-
 impl From<KeyBinding> for Span<'static> {
     fn from(binding: KeyBinding) -> Self {
         (&binding).into()
@@ -194,8 +265,33 @@ impl From<&KeyBinding> for Span<'static> {
     }
 }
 
+impl From<ShortcutHint> for Span<'static> {
+    fn from(hint: ShortcutHint) -> Self {
+        Span::styled(hint.display_label(), key_hint_style())
+    }
+}
+
 fn key_hint_style() -> Style {
-    Style::default().dim()
+    let preferred = match (
+        crate::terminal_palette::default_fg(),
+        crate::terminal_palette::default_bg(),
+    ) {
+        (Some(fg), Some(bg)) if crate::color::is_light(bg) => {
+            crate::terminal_palette::rgb_color(crate::color::blend(fg, bg, /*alpha*/ 0.85))
+        }
+        _ => Color::Reset,
+    };
+    Style::default()
+        .fg(crate::style::readable_color_on(
+            preferred, /*background*/ None,
+        ))
+        .bold()
+        .not_dim()
+}
+
+/// Emphasize the complete key label, including chords, alternatives, and literal punctuation.
+pub(crate) fn key_label_spans(label: &str) -> Vec<Span<'static>> {
+    vec![Span::styled(label.to_owned(), key_hint_style())]
 }
 
 pub(crate) fn has_ctrl_or_alt(mods: KeyModifiers) -> bool {
@@ -213,6 +309,10 @@ pub(crate) fn is_altgr(mods: KeyModifiers) -> bool {
 pub(crate) fn is_altgr(_mods: KeyModifiers) -> bool {
     false
 }
+
+#[cfg(test)]
+#[path = "key_hint_label_tests.rs"]
+mod label_tests;
 
 #[cfg(test)]
 mod tests {
@@ -245,6 +345,14 @@ mod tests {
         assert!(bindings.is_pressed(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
         assert!(bindings.is_pressed(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)));
         assert!(!bindings.is_pressed(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn super_char_event_is_not_plain_text() {
+        assert!(!is_plain_text_key_event(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::SUPER,
+        )));
     }
 
     #[test]
@@ -314,6 +422,7 @@ mod tests {
             ('z', '\u{001a}'),
             ('4', '\u{001c}'),
             ('5', '\u{001d}'),
+            (']', '\u{001d}'),
             ('6', '\u{001e}'),
             ('7', '\u{001f}'),
         ];

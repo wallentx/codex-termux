@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "SortDirection": {
+      "enum": [
+        "asc",
+        "desc"
+      ],
+      "type": "string"
+    },
+    "ThreadItemsListAnchor": {
+      "description": "An exclusive item position within the requested visible turn.",
+      "oneOf": [
+        {
+          "properties": {
+            "itemId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "item"
+              ],
+              "title": "ItemThreadItemsListAnchorType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "itemId",
+            "type"
+          ],
+          "title": "ItemThreadItemsListAnchor",
+          "type": "object"
+        }
+      ]
+    },
+    "ThreadItemsListCursor": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/definitions/ThreadItemsListAnchor"
+        }
+      ],
+      "description": "Starting position for an item-history page."
+    }
+  },
+  "properties": {
+    "cursor": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadItemsListCursor"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Opaque continuation cursor or an exclusive item anchor in the requested visible turn. An item anchor requires a non-empty `turnId`; ascending (the default) returns items after it, and descending returns items before it. Continue with the returned string cursor."
+    },
+    "limit": {
+      "description": "Optional item page size.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "sortDirection": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SortDirection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional item pagination direction; defaults to ascending."
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Optional turn id to filter by. When omitted, returns items across the thread.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "threadId"
+  ],
+  "title": "ThreadItemsListParams",
+  "type": "object"
+}

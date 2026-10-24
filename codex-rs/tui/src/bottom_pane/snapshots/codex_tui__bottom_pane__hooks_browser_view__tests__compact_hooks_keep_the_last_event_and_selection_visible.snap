@@ -1,0 +1,20 @@
+---
+source: tui/src/bottom_pane/hooks_browser_view.rs
+expression: text
+---
+
+  Hooks
+  Lifecycle hooks from config and
+  enabled plugins.
+
+  Event               Active/Installed
+↑
+  SubagentStart       0/0
+  SubagentStop        0/0
+  Stop                0/0
+  Interrupt           0/0
+  PreModelRequest     0/0
+› PostModelRequest    0/0
+
+
+  enter details · esc close

@@ -1,4 +1,10 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
+
+pub(crate) const APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX: &str =
+    "Approved command prefix saved:";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ApprovedCommandPrefixSaved {
@@ -14,6 +20,10 @@ impl ApprovedCommandPrefixSaved {
 }
 
 impl ContextualUserFragment for ApprovedCommandPrefixSaved {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("permissions.approved_command_prefix_saved".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -26,7 +36,10 @@ impl ContextualUserFragment for ApprovedCommandPrefixSaved {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        format!("Approved command prefix saved:\n{}", self.prefixes)
+    fn body(&self) -> ContentItem {
+        input_text(format!(
+            "{APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX}\n{}",
+            self.prefixes
+        ))
     }
 }

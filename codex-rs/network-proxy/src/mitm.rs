@@ -1,4 +1,5 @@
 use crate::certs::ManagedMitmCa;
+use crate::config::NetworkMitmCaConfig;
 use crate::config::NetworkMode;
 use crate::mitm_hook::HookEvaluation;
 use crate::mitm_hook::MitmHookActions;
@@ -7,6 +8,7 @@ use crate::reasons::REASON_METHOD_NOT_ALLOWED;
 use crate::reasons::REASON_MITM_HOOK_DENIED;
 use crate::responses::blocked_text_response;
 use crate::responses::text_response;
+use crate::runtime::HostAuthorization;
 use crate::runtime::HostBlockDecision;
 use crate::runtime::HostBlockReason;
 use crate::state::BlockedRequest;
@@ -26,8 +28,6 @@ use rama_core::extensions::ExtensionsRef;
 use rama_core::futures::stream::Stream as FuturesStream;
 use rama_core::rt::Executor;
 use rama_core::service::service_fn;
-use rama_core::stream::PeekStream;
-use rama_core::stream::StackReader;
 use rama_core::stream::Stream;
 use rama_http::Body;
 use rama_http::BodyDataStream;
@@ -40,47 +40,94 @@ use rama_http::Uri;
 use rama_http::header::HOST;
 use rama_http::layer::remove_header::RemoveRequestHeaderLayer;
 use rama_http::layer::remove_header::RemoveResponseHeaderLayer;
+use rama_http::uri::Scheme;
 use rama_http_backend::server::HttpServer;
 use rama_net::proxy::ProxyTarget;
 use rama_net::stream::SocketInfo;
-use rama_net::tls::server::TlsPeekStream;
+use rama_tls_rustls::dep::rustls;
 use rama_tls_rustls::server::TlsAcceptorData;
 use rama_tls_rustls::server::TlsAcceptorLayer;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context as TaskContext;
 use std::task::Poll;
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::time::timeout;
 use tracing::info;
 use tracing::warn;
 
 /// State needed to terminate a CONNECT tunnel and enforce policy on inner HTTPS requests.
 pub struct MitmState {
     ca: Arc<ManagedMitmCa>,
-    upstream: UpstreamClient,
+    allow_upstream_proxy: bool,
+    upstream_tls_root_store: Arc<rustls::RootCertStore>,
     inspect: bool,
     max_body_bytes: usize,
 }
 
 pub(crate) struct MitmUpstreamConfig {
     pub(crate) allow_upstream_proxy: bool,
-    pub(crate) allow_local_binding: bool,
+    pub(crate) external_ca: Option<NetworkMitmCaConfig>,
 }
 
 #[derive(Clone)]
 struct MitmPolicyContext {
     target_host: String,
     target_port: u16,
+    scheme: Scheme,
     mode: NetworkMode,
     app_state: Arc<NetworkProxyState>,
+}
+
+impl MitmPolicyContext {
+    async fn deny_hook(&self, method: &str, client: Option<String>) -> Response {
+        let _ = self
+            .app_state
+            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                host: self.target_host.clone(),
+                reason: REASON_MITM_HOOK_DENIED.to_string(),
+                client,
+                method: Some(method.to_string()),
+                mode: Some(self.mode),
+                protocol: self.scheme.to_string(),
+                decision: None,
+                source: None,
+                port: Some(self.target_port),
+            }))
+            .await;
+        warn!(
+            "MITM blocked by hook policy (host={}, method={method}, mode={:?})",
+            self.target_host, self.mode
+        );
+        blocked_text_response(REASON_MITM_HOOK_DENIED)
+    }
+
+    fn placeholders_match(&self, req: &Request, actions: &MitmHookActions) -> bool {
+        actions.inject_request_headers.iter().all(|header| {
+            header.placeholder.as_ref().is_none_or(|placeholder| {
+                self.scheme == Scheme::HTTPS
+                    && self.target_port == 443
+                    && req
+                        .headers()
+                        .get_all(&header.name)
+                        .iter()
+                        .eq(std::iter::once(placeholder))
+            })
+        })
+    }
+
+    fn credential_destination(&self, req: &Request) -> String {
+        let authority = authority_header_value(&self.target_host, self.target_port, &self.scheme);
+        let path = path_and_query(req.uri());
+        // Server-wide OPTIONS must not borrow authority from a narrower credential URL prefix.
+        let credential_path = if path == "*" { "/" } else { &path };
+        format!("{}://{authority}{credential_path}", self.scheme)
+    }
 }
 
 #[derive(Clone)]
 struct MitmRequestContext {
     policy: MitmPolicyContext,
     mitm: Arc<MitmState>,
+    upstream: UpstreamClient,
 }
 
 enum MitmPolicyDecision {
@@ -92,52 +139,6 @@ enum MitmPolicyDecision {
 
 const MITM_INSPECT_BODIES: bool = false;
 const MITM_MAX_BODY_BYTES: usize = 4096;
-const TLS_PREFIX_LEN: usize = 5;
-const TLS_PREFIX_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// Peeks enough bytes to distinguish a TLS handshake from an opaque CONNECT stream.
-///
-/// The first-byte timeout preserves server-first protocols. Once the client starts a possible TLS
-/// prefix, all five record-header bytes are accumulated so fragmented handshakes cannot bypass
-/// interception. Every byte read is replayed through `TlsPeekStream`.
-pub(crate) async fn peek_tls_prefix<S>(mut stream: S) -> Result<(bool, TlsPeekStream<S>)>
-where
-    S: Stream + Unpin + ExtensionsMut,
-{
-    let mut peek_buf = [0_u8; TLS_PREFIX_LEN];
-    let mut bytes_read =
-        match timeout(TLS_PREFIX_FIRST_BYTE_TIMEOUT, stream.read(&mut peek_buf)).await {
-            Ok(result) => result.context("read TLS prefix")?,
-            Err(_) => 0,
-        };
-    while bytes_read > 0 && bytes_read < TLS_PREFIX_LEN {
-        let possible_tls_prefix = matches!(
-            &peek_buf[..bytes_read],
-            [0x16] | [0x16, 0x03] | [0x16, 0x03, 0x00..=0x04, ..]
-        );
-        if !possible_tls_prefix {
-            break;
-        }
-        let read = stream
-            .read(&mut peek_buf[bytes_read..])
-            .await
-            .context("read TLS prefix")?;
-        if read == 0 {
-            break;
-        }
-        bytes_read += read;
-    }
-
-    let is_tls = bytes_read == TLS_PREFIX_LEN && matches!(peek_buf, [0x16, 0x03, 0x00..=0x04, ..]);
-    let offset = TLS_PREFIX_LEN - bytes_read;
-    if offset > 0 {
-        peek_buf.copy_within(0..bytes_read, offset);
-    }
-    let mut peek = StackReader::new(peek_buf);
-    peek.skip(offset);
-    Ok((is_tls, PeekStream::new(peek, stream)))
-}
-
 impl std::fmt::Debug for MitmState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Avoid dumping internal state (CA material, connectors, etc.) to logs.
@@ -156,25 +157,19 @@ impl MitmState {
         // and host-specific hooks both need visibility after CONNECT is established. We
         // generate a process-local CA and issue per-host leaf certs so we can terminate TLS and
         // apply policy.
-        let ca = ManagedMitmCa::load_or_create()?;
-        let upstream_tls_root_store =
-            crate::certs::upstream_tls_root_store(&crate::certs::ca_env_from_process())?;
-
-        let upstream = if config.allow_upstream_proxy {
-            UpstreamClient::from_env_proxy_with_allow_local_binding(
-                config.allow_local_binding,
-                upstream_tls_root_store,
-            )
-        } else {
-            UpstreamClient::direct_with_allow_local_binding(
-                config.allow_local_binding,
-                upstream_tls_root_store,
-            )
+        let ca = match config.external_ca.as_ref() {
+            Some(ca) => ManagedMitmCa::load_from_files(ca)?,
+            None => ManagedMitmCa::load_or_create()?,
         };
+        let upstream_tls_root_store = crate::certs::upstream_tls_root_store_for_cert_path(
+            ca.certificate_path(),
+            &crate::certs::ca_env_from_process(),
+        )?;
 
         Ok(Self {
             ca,
-            upstream,
+            allow_upstream_proxy: config.allow_upstream_proxy,
+            upstream_tls_root_store,
             inspect: MITM_INSPECT_BODIES,
             max_body_bytes: MITM_MAX_BODY_BYTES,
         })
@@ -193,8 +188,8 @@ impl MitmState {
     }
 }
 
-/// Terminate a raw client stream with a generated leaf cert and proxy inner HTTPS traffic.
-pub(crate) async fn mitm_stream<S>(stream: S) -> Result<()>
+/// Proxy inner HTTP traffic, terminating TLS with a generated leaf certificate for HTTPS.
+pub(crate) async fn mitm_stream<S>(stream: S, scheme: Scheme) -> Result<()>
 where
     S: Stream + Unpin + ExtensionsMut,
 {
@@ -216,20 +211,37 @@ where
         .clone();
     let target_host = normalize_host(&target.host.to_string());
     let target_port = target.port;
-    let acceptor_data = mitm.tls_acceptor_data_for_host(&target_host)?;
+    let acceptor_data = if scheme == Scheme::HTTPS {
+        Some(mitm.tls_acceptor_data_for_host(&target_host)?)
+    } else {
+        None
+    };
     let mode = stream
         .extensions()
         .get::<NetworkMode>()
         .copied()
         .unwrap_or(NetworkMode::Full);
+    let upstream = if mitm.allow_upstream_proxy {
+        UpstreamClient::from_env_proxy_with_tls_root_store(
+            app_state.clone(),
+            mitm.upstream_tls_root_store.clone(),
+        )
+    } else {
+        UpstreamClient::direct_with_tls_root_store(
+            app_state.clone(),
+            mitm.upstream_tls_root_store.clone(),
+        )
+    };
     let request_ctx = Arc::new(MitmRequestContext {
         policy: MitmPolicyContext {
             target_host,
             target_port,
+            scheme,
             mode,
             app_state,
         },
         mitm,
+        upstream,
     });
 
     let executor = stream
@@ -239,10 +251,8 @@ where
         .unwrap_or_default();
 
     let http_service = HttpServer::auto(executor).service(
-        (
-            RemoveResponseHeaderLayer::hop_by_hop(),
-            RemoveRequestHeaderLayer::hop_by_hop(),
-        )
+        (request_ctx.policy.scheme == Scheme::HTTPS)
+            .then(RemoveResponseHeaderLayer::hop_by_hop)
             .into_layer(service_fn({
                 let request_ctx = request_ctx.clone();
                 move |req| {
@@ -252,22 +262,34 @@ where
             })),
     );
 
-    let https_service = TlsAcceptorLayer::new(acceptor_data)
-        .with_store_client_hello(true)
-        .into_layer(http_service);
-
-    https_service
-        .serve(stream)
-        .await
-        .map_err(|err| anyhow!("MITM serve error: {err}"))?;
+    match acceptor_data {
+        Some(acceptor_data) => {
+            TlsAcceptorLayer::new(acceptor_data)
+                .with_store_client_hello(true)
+                .into_layer(http_service)
+                .serve(stream)
+                .await
+        }
+        None => http_service.serve(stream).await,
+    }
+    .map_err(|err| anyhow!("MITM serve error: {err}"))?;
     Ok(())
 }
 
 async fn handle_mitm_request(
-    req: Request,
+    mut req: Request,
     request_ctx: Arc<MitmRequestContext>,
 ) -> Result<Response, std::convert::Infallible> {
-    let response = match forward_request(req, &request_ctx).await {
+    crate::aws_sigv4::preserve_signing_headers(&mut req);
+    let response = match (request_ctx.policy.scheme == Scheme::HTTPS)
+        .then(RemoveRequestHeaderLayer::hop_by_hop)
+        .into_layer(service_fn(move |req| {
+            let request_ctx = request_ctx.clone();
+            async move { forward_request(req, &request_ctx).await }
+        }))
+        .serve(req)
+        .await
+    {
         Ok(resp) => resp,
         Err(err) => {
             warn!("MITM request handling failed: {err}");
@@ -278,11 +300,33 @@ async fn handle_mitm_request(
 }
 
 async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Result<Response> {
+    let credential_destination = request_ctx.policy.credential_destination(&req);
     let hook_actions = match evaluate_mitm_policy(&req, &request_ctx.policy).await? {
         MitmPolicyDecision::Allow { hook_actions } => hook_actions,
         MitmPolicyDecision::Block(response) => return Ok(response),
     };
 
+    // Select the credential from the guest's headers before injecting or stripping anything.
+    let mut signing = None;
+    let client = req
+        .extensions()
+        .get::<SocketInfo>()
+        .map(|info| info.peer_addr().to_string());
+    if let Some(signer) = hook_actions
+        .as_ref()
+        .and_then(|actions| actions.aws_sigv4.as_ref())
+    {
+        match signer.plan(&req) {
+            Ok(Some(guest)) => signing = Some((signer, guest)),
+            Ok(None) => {}
+            Err(_) => {
+                return Ok(request_ctx
+                    .policy
+                    .deny_hook(req.method().as_str(), client)
+                    .await);
+            }
+        }
+    }
     let target_host = request_ctx.policy.target_host.clone();
     let target_port = request_ctx.policy.target_port;
     let mitm = request_ctx.mitm.clone();
@@ -292,13 +336,18 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     let log_path = path_for_log(req.uri());
 
     let (mut parts, body) = req.into_parts();
-    request_ctx
-        .policy
-        .app_state
-        .inject_request_credentials(&target_host, &mut parts.headers);
-    apply_mitm_hook_actions(&mut parts.headers, hook_actions.as_ref());
-    let authority = authority_header_value(&target_host, target_port);
-    parts.uri = build_https_uri(&authority, &path)?;
+    let authority = authority_header_value(&target_host, target_port, &request_ctx.policy.scheme);
+    parts.uri = Uri::builder()
+        .scheme(request_ctx.policy.scheme.clone())
+        .authority(authority.as_str())
+        .path_and_query(path.as_str())
+        .build()?;
+    apply_request_credentials(
+        &mut parts.headers,
+        hook_actions.as_ref(),
+        request_ctx.policy.app_state.as_ref(),
+        &credential_destination,
+    );
     parts
         .headers
         .insert(HOST, HeaderValue::from_str(&authority)?);
@@ -319,8 +368,18 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
         body
     };
 
-    let upstream_req = Request::from_parts(parts, body);
-    let upstream_resp = mitm.upstream.serve(upstream_req).await?;
+    let mut upstream_req = Request::from_parts(parts, body);
+    if let Some((signer, guest)) = signing {
+        let Ok(signed) = signer.sign(upstream_req, &guest).await else {
+            return Ok(request_ctx.policy.deny_hook(&method, client).await);
+        };
+        upstream_req = signed;
+    }
+    let upstream_resp = if request_ctx.policy.scheme == Scheme::HTTP {
+        crate::brokered_tunnel::forward_http_request(upstream_req, &request_ctx.upstream).await?
+    } else {
+        request_ctx.upstream.serve(upstream_req).await?
+    };
     respond_with_inspection(
         upstream_resp,
         inspect,
@@ -346,6 +405,34 @@ async fn evaluate_mitm_policy(
     req: &Request,
     policy: &MitmPolicyContext,
 ) -> Result<MitmPolicyDecision> {
+    if policy.scheme == Scheme::HTTP {
+        let matches_target = |authority: &rama_http::uri::Authority| {
+            !authority.as_str().contains('@')
+                && normalize_host(authority.host()) == policy.target_host
+                && authority.port_u16().unwrap_or(80) == policy.target_port
+        };
+        let invalid_destination = req
+            .uri()
+            .scheme()
+            .is_some_and(|scheme| scheme != &Scheme::HTTP)
+            || req
+                .uri()
+                .authority()
+                .is_some_and(|authority| !matches_target(authority))
+            || req.headers().get_all(HOST).iter().any(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.parse::<rama_http::uri::Authority>().ok())
+                    .is_none_or(|authority| !matches_target(&authority))
+            });
+        if invalid_destination {
+            return Ok(MitmPolicyDecision::Block(text_response(
+                StatusCode::BAD_REQUEST,
+                "tunnel destination mismatch",
+            )));
+        }
+    }
     if req.method().as_str() == "CONNECT" {
         return Ok(MitmPolicyDecision::Block(text_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -379,7 +466,12 @@ async fn evaluate_mitm_policy(
     if matches!(
         policy
             .app_state
-            .host_blocked(&policy.target_host, policy.target_port)
+            .host_blocked_with_local_binding(
+                &policy.target_host,
+                policy.target_port,
+                /*allow_local_binding*/ None,
+                HostAuthorization::Approved,
+            )
             .await?,
         HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal)
     ) {
@@ -392,7 +484,7 @@ async fn evaluate_mitm_policy(
                 client: client.clone(),
                 method: Some(method.clone()),
                 mode: Some(policy.mode),
-                protocol: "https".to_string(),
+                protocol: policy.scheme.to_string(),
                 decision: None,
                 source: None,
                 port: Some(policy.target_port),
@@ -407,37 +499,32 @@ async fn evaluate_mitm_policy(
 
     let hook_actions = match policy
         .app_state
-        .evaluate_mitm_hook_request(&policy.target_host, req)
+        .evaluate_mitm_hook_request(
+            &policy.target_host,
+            req,
+            &crate::mitm_hook::MitmHookOrigin {
+                scheme: policy.scheme.clone(),
+                port: policy.target_port,
+            },
+            &[policy.credential_destination(req)],
+        )
         .await?
     {
-        HookEvaluation::Matched { actions } => Some(actions),
-        HookEvaluation::HookedHostNoMatch => {
-            let _ = policy
-                .app_state
-                .record_blocked(BlockedRequest::new(BlockedRequestArgs {
-                    host: policy.target_host.clone(),
-                    reason: REASON_MITM_HOOK_DENIED.to_string(),
-                    client: client.clone(),
-                    method: Some(method.clone()),
-                    mode: Some(policy.mode),
-                    protocol: "https".to_string(),
-                    decision: None,
-                    source: None,
-                    port: Some(policy.target_port),
-                }))
-                .await;
-            warn!(
-                "MITM blocked by hook policy (host={}, method={method}, mode={:?})",
-                policy.target_host, policy.mode
-            );
-            return Ok(MitmPolicyDecision::Block(blocked_text_response(
-                REASON_MITM_HOOK_DENIED,
-            )));
+        HookEvaluation::Matched { actions } if policy.placeholders_match(req, &actions) => {
+            Some(actions)
+        }
+        HookEvaluation::Matched { .. } | HookEvaluation::HookedHostNoMatch => {
+            return Ok(MitmPolicyDecision::Block(
+                policy.deny_hook(&method, client).await,
+            ));
         }
         HookEvaluation::NoHooksForHost => None,
     };
 
-    if !policy.mode.allows_method(&method) {
+    let opaque_http_upgrade = policy.scheme == Scheme::HTTP
+        && policy.mode == NetworkMode::Limited
+        && req.headers().contains_key(rama_http::header::UPGRADE);
+    if !policy.mode.allows_method(&method) || opaque_http_upgrade {
         let _ = policy
             .app_state
             .record_blocked(BlockedRequest::new(BlockedRequestArgs {
@@ -446,7 +533,7 @@ async fn evaluate_mitm_policy(
                 client: client.clone(),
                 method: Some(method.clone()),
                 mode: Some(policy.mode),
-                protocol: "https".to_string(),
+                protocol: policy.scheme.to_string(),
                 decision: None,
                 source: None,
                 port: Some(policy.target_port),
@@ -464,11 +551,16 @@ async fn evaluate_mitm_policy(
     Ok(MitmPolicyDecision::Allow { hook_actions })
 }
 
-fn apply_mitm_hook_actions(headers: &mut HeaderMap, actions: Option<&MitmHookActions>) {
+fn apply_request_credentials(
+    headers: &mut HeaderMap,
+    actions: Option<&MitmHookActions>,
+    app_state: &NetworkProxyState,
+    credential_destination: &str,
+) {
+    app_state.inject_request_credentials(credential_destination, headers);
     let Some(actions) = actions else {
         return;
     };
-
     for header_name in &actions.strip_request_headers {
         headers.remove(header_name);
     }
@@ -593,24 +685,20 @@ fn extract_request_host(req: &Request) -> Option<String> {
         .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
 }
 
-fn authority_header_value(host: &str, port: u16) -> String {
+fn authority_header_value(host: &str, port: u16, scheme: &Scheme) -> String {
     // Host header / URI authority formatting.
+    let default_port = if scheme == &Scheme::HTTP { 80 } else { 443 };
     if host.contains(':') {
-        if port == 443 {
+        if port == default_port {
             format!("[{host}]")
         } else {
             format!("[{host}]:{port}")
         }
-    } else if port == 443 {
+    } else if port == default_port {
         host.to_string()
     } else {
         format!("{host}:{port}")
     }
-}
-
-fn build_https_uri(authority: &str, path: &str) -> Result<Uri> {
-    let target = format!("https://{authority}{path}");
-    Ok(target.parse()?)
 }
 
 fn path_and_query(uri: &Uri) -> String {
@@ -627,3 +715,7 @@ fn path_for_log(uri: &Uri) -> String {
 #[cfg(test)]
 #[path = "mitm_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mitm_forwarding_tests.rs"]
+mod forwarding_tests;

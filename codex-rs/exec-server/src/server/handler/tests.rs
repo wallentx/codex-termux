@@ -2,14 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::ExecServerHandler;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ProcessId;
+use crate::discover_v2::capability_manager::CapabilityManager;
 use crate::protocol::ExecParams;
 use crate::protocol::InitializeParams;
 use crate::protocol::ReadParams;
@@ -25,10 +28,12 @@ fn exec_params(process_id: &str) -> ExecParams {
 
 fn exec_params_with_argv(process_id: &str, argv: Vec<String>) -> ExecParams {
     ExecParams {
+        metadata: Default::default(),
         process_id: ProcessId::from(process_id),
         argv,
         cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
             .expect("cwd URI"),
+        shell_snapshot: None,
         env_policy: None,
         env: inherited_path_env(),
         tty: false,
@@ -73,12 +78,16 @@ fn windows_command_processor() -> String {
     std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
 }
 
-fn test_runtime_paths() -> ExecServerRuntimePaths {
-    ExecServerRuntimePaths::new(
+fn test_runtime_paths() -> ExecServerRuntimeOptions {
+    ExecServerRuntimeOptions::new(
         std::env::current_exe().expect("current exe"),
         /*codex_linux_sandbox_exe*/ None,
     )
     .expect("runtime paths")
+}
+
+fn test_http_client_factory() -> HttpClientFactory {
+    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
 }
 
 async fn initialized_handler() -> Arc<ExecServerHandler> {
@@ -86,8 +95,10 @@ async fn initialized_handler() -> Arc<ExecServerHandler> {
     let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let handler = Arc::new(ExecServerHandler::new(
         registry,
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(outgoing_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     let initialize_response = handler
         .initialize(InitializeParams {
@@ -108,8 +119,8 @@ async fn duplicate_process_ids_allow_only_one_successful_start() {
     let second_handler = Arc::clone(&handler);
 
     let (first, second) = tokio::join!(
-        first_handler.exec(exec_params("proc-1")),
-        second_handler.exec(exec_params("proc-1")),
+        first_handler.exec(exec_params("proc-1"), /*launch_context*/ None),
+        second_handler.exec(exec_params("proc-1"), /*launch_context*/ None),
     );
 
     let (successes, failures): (Vec<_>, Vec<_>) =
@@ -133,7 +144,7 @@ async fn duplicate_process_ids_allow_only_one_successful_start() {
 async fn terminate_reports_false_after_process_exit() {
     let handler = initialized_handler().await;
     handler
-        .exec(exec_params("proc-1"))
+        .exec(exec_params("proc-1"), /*launch_context*/ None)
         .await
         .expect("start process");
 
@@ -164,8 +175,10 @@ async fn long_poll_read_fails_after_session_resume() {
     let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let first_handler = Arc::new(ExecServerHandler::new(
         Arc::clone(&registry),
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(first_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     let initialize_response = first_handler
         .initialize(InitializeParams {
@@ -179,10 +192,13 @@ async fn long_poll_read_fails_after_session_resume() {
     // Keep the process quiet and alive so the pending read can only complete
     // after session resume, not because the process produced output or exited.
     first_handler
-        .exec(exec_params_with_argv(
-            "proc-long-poll",
-            shell_argv("sleep 5", "ping -n 6 127.0.0.1 >NUL"),
-        ))
+        .exec(
+            exec_params_with_argv(
+                "proc-long-poll",
+                shell_argv("sleep 5", "ping -n 6 127.0.0.1 >NUL"),
+            ),
+            /*launch_context*/ None,
+        )
         .await
         .expect("start process");
 
@@ -204,8 +220,10 @@ async fn long_poll_read_fails_after_session_resume() {
     let (second_tx, _second_rx) = mpsc::channel(16);
     let second_handler = Arc::new(ExecServerHandler::new(
         registry,
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(second_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     second_handler
         .initialize(InitializeParams {
@@ -237,8 +255,10 @@ async fn active_session_resume_is_rejected() {
     let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let first_handler = Arc::new(ExecServerHandler::new(
         Arc::clone(&registry),
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(first_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     let initialize_response = first_handler
         .initialize(InitializeParams {
@@ -251,8 +271,10 @@ async fn active_session_resume_is_rejected() {
     let (second_tx, _second_rx) = mpsc::channel(16);
     let second_handler = Arc::new(ExecServerHandler::new(
         registry,
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(second_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     let err = second_handler
         .initialize(InitializeParams {
@@ -279,8 +301,10 @@ async fn output_and_exit_are_retained_after_notification_receiver_closes() {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let handler = Arc::new(ExecServerHandler::new(
         SessionRegistry::new(crate::ExecServerTelemetry::default()),
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(outgoing_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     handler
         .initialize(InitializeParams {
@@ -293,13 +317,16 @@ async fn output_and_exit_are_retained_after_notification_receiver_closes() {
 
     let process_id = ProcessId::from("proc-notification-fail");
     handler
-        .exec(exec_params_with_argv(
-            process_id.as_str(),
-            shell_argv(
-                "sleep 0.05; printf 'first\\n'; sleep 0.05; printf 'second\\n'",
-                "echo first&& ping -n 2 127.0.0.1 >NUL&& echo second",
+        .exec(
+            exec_params_with_argv(
+                process_id.as_str(),
+                shell_argv(
+                    "sleep 0.05; printf 'first\\n'; sleep 0.05; printf 'second\\n'",
+                    "echo first&& ping -n 2 127.0.0.1 >NUL&& echo second",
+                ),
             ),
-        ))
+            /*launch_context*/ None,
+        )
         .await
         .expect("start process");
 
@@ -311,7 +338,10 @@ async fn output_and_exit_are_retained_after_notification_receiver_closes() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     handler
-        .exec(exec_params(process_id.as_str()))
+        .exec(
+            exec_params(process_id.as_str()),
+            /*launch_context*/ None,
+        )
         .await
         .expect("process id should be reusable after exit retention");
 

@@ -2,14 +2,19 @@
 # Reviewed 2026-07-02. Keep this list in sync with ../deny.toml.
 ignore = [
     "RUSTSEC-2024-0388", # derivative 2.2.0 via starlark/starlark_syntax; upstream crate is unmaintained
+    "RUSTSEC-2024-0449", # unsafe-libyaml via serde_yaml in skills, ext/skills, core-plugins, external-agent-migration; remove when migrated off serde_yaml/unsafe-libyaml
     "RUSTSEC-2025-0057", # fxhash 0.2.1 via starlark_map/bm25; upstream crate is unmaintained
-    "RUSTSEC-2024-0436", # paste 1.0.15 via starlark/ratatui; upstream crate is unmaintained
+    "RUSTSEC-2024-0436", # paste 1.0.15 via starlark/v8; upstream crate is unmaintained
     "RUSTSEC-2023-0089", # atomic-polyfill via postcard/heapless/pagable; upstream crate is unmaintained
     "RUSTSEC-2024-0320", # yaml-rust via syntect; remove when syntect drops or updates it
     "RUSTSEC-2025-0141", # bincode via syntect; remove when syntect drops or updates it
     "RUSTSEC-2026-0118", # hickory-proto via rama-dns/rama-tcp; remove when rama updates to hickory 0.26.1 or hickory-net
     "RUSTSEC-2026-0119", # hickory-proto via rama-dns/rama-tcp; remove when rama updates to hickory 0.26.1 or hickory-net
-    "RUSTSEC-2026-0173", # proc-macro-error2 via i18n-embed-fl/age/codex-secrets; remove when local secrets storage migrates off age or age drops i18n-embed-fl
     "RUSTSEC-2026-0194", # quick-xml via plist/syntect and wayland-scanner; trusted inputs only; remove when rust-plist#191 and wayland-rs#938 are released
     "RUSTSEC-2026-0195", # quick-xml via plist/syntect and wayland-scanner; trusted inputs only; remove when rust-plist#191 and wayland-rs#938 are released
+    "RUSTSEC-2026-0370", # zvariant 4.2.0 via zbus 4.4.0 in Linux TUI and keyring/secret-service; remove when those paths migrate off the retired standalone crates
+    "RUSTSEC-2026-0371", # zbus_names 3.0.0 via zbus 4.4.0 in Linux TUI and keyring/secret-service; remove when those paths migrate off the retired standalone crates
+    "RUSTSEC-2026-0372", # zvariant_derive 4.2.0 via zbus 4.4.0 in Linux TUI and keyring/secret-service; remove when those paths migrate off the retired standalone crates
+    # Reviewed 2026-10-20.
+    "RUSTSEC-2026-0374", # basic-toml 0.1.10 via i18n-config/i18n-embed-fl under age 0.12.1 in codex-secrets; no patched release; remove when age's localization dependencies migrate off basic-toml
 ]

@@ -474,15 +474,13 @@ async fn run_git_command(
     cwd: &Path,
     args: &[&str],
 ) -> Result<WorkspaceCommandOutput, crate::workspace_command::WorkspaceCommandError> {
-    let mut argv = Vec::with_capacity(args.len() + 1);
+    let mut argv = Vec::with_capacity(args.len() + 3);
     argv.push("git".to_string());
+    argv.push("-c".to_string());
+    argv.push(codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG.to_string());
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
     runner
-        .run(
-            WorkspaceCommand::new(argv)
-                .cwd(cwd.to_path_buf())
-                .env("GIT_OPTIONAL_LOCKS", "0"),
-        )
+        .run(WorkspaceCommand::new(argv, cwd.to_path_buf()).env("GIT_OPTIONAL_LOCKS", "0"))
         .await
 }
 
@@ -500,8 +498,7 @@ async fn run_gh_command(
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
     runner
         .run(
-            WorkspaceCommand::new(argv)
-                .cwd(cwd.to_path_buf())
+            WorkspaceCommand::new(argv, cwd.to_path_buf())
                 .env("GH_PROMPT_DISABLED", "1")
                 .env("GIT_TERMINAL_PROMPT", "0"),
         )
@@ -672,8 +669,18 @@ mod tests {
     }
 
     fn response(argv: &[&str], exit_code: i32, stdout: &str) -> FakeResponse {
+        let mut argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+        if argv.first().map(String::as_str) == Some("git") {
+            argv.splice(
+                1..1,
+                [
+                    "-c".to_string(),
+                    codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG.to_string(),
+                ],
+            );
+        }
         FakeResponse {
-            argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
+            argv,
             output: WorkspaceCommandOutput {
                 exit_code,
                 stdout: stdout.to_string(),
@@ -701,7 +708,16 @@ mod tests {
         }
 
         fn saw(&self, argv: &[&str]) -> bool {
-            let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+            let mut argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+            if argv.first().map(String::as_str) == Some("git") {
+                argv.splice(
+                    1..1,
+                    [
+                        "-c".to_string(),
+                        codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG.to_string(),
+                    ],
+                );
+            }
             self.seen
                 .lock()
                 .expect("seen lock")

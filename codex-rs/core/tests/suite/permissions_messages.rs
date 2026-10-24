@@ -1,21 +1,20 @@
 use anyhow::Result;
 use codex_config::ConfigLayerStack;
 use codex_core::ForkSnapshot;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
-use codex_core::context::ApprovalPromptContext;
-use codex_core::context::ContextualUserFragment;
-use codex_core::context::PermissionsInstructions;
-use codex_core::load_exec_policy;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ApprovalMessages;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::PermissionMessages;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses::ResponsesRequest;
@@ -28,14 +27,17 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::collections::HashSet;
 use tempfile::TempDir;
+use test_case::test_case;
 
 fn permissions_texts(request: &ResponsesRequest) -> Vec<String> {
     request
         .message_input_texts("developer")
         .into_iter()
         .filter(|text| text.contains("<permissions instructions>"))
+        .map(|text| text.replace("\r\n", "\n"))
         .collect()
 }
 
@@ -46,14 +48,13 @@ fn model_with_approval_messages(
 ) -> codex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
-        instructions_template: None,
-        instructions_variables: None,
         approvals: Some(ApprovalMessages {
             on_request: Some(on_request.to_string()),
             on_request_auto_review: Some(on_request_auto_review.to_string()),
+            never: None,
+            unless_trusted: None,
         }),
-        auto_review: None,
-        permissions: None,
+        ..Default::default()
     });
     model
 }
@@ -64,11 +65,8 @@ fn model_with_permission_messages(
 ) -> codex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
-        instructions_template: None,
-        instructions_variables: None,
-        approvals: None,
-        auto_review: None,
         permissions: Some(permissions),
+        ..Default::default()
     });
     model
 }
@@ -78,16 +76,10 @@ async fn submit_text_turn(
     text: &str,
 ) -> Result<()> {
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     Ok(())
@@ -104,6 +96,7 @@ async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()>
     )
     .await;
     let model_slug = "catalog-approvals-model";
+    let override_instructions = "literal {{ personality }} override";
     let model = model_with_approval_messages(
         model_slug,
         "catalog user approval instructions",
@@ -112,16 +105,19 @@ async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()>
     let mut builder = test_codex()
         .with_model(model_slug)
         .with_config(move |config| {
+            config.base_instructions = Some(override_instructions.to_string());
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.model_catalog = Some(ModelsResponse {
                 models: vec![model],
             });
         });
-    let test = builder.build(&server).await?;
+    let test = builder.build_with_auto_env(&server).await?;
 
     submit_text_turn(&test, "hello").await?;
 
-    let permissions = permissions_texts(&req.single_request());
+    let request = req.single_request();
+    assert_eq!(request.instructions_text(), override_instructions);
+    let permissions = permissions_texts(&request);
     assert_eq!(permissions.len(), 1);
     assert!(permissions[0].contains("catalog user approval instructions"));
     assert!(permissions[0].contains("Filesystem sandboxing defines"));
@@ -161,7 +157,7 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             model: Some(second_slug.to_string()),
             ..Default::default()
         },
@@ -176,6 +172,66 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
             .last()
             .is_some_and(|text| text.contains("model B approvals"))
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_non_on_request_approval_messages_are_sent_in_initial_permissions() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    for (approval_policy, approvals, expected, unexpected) in [
+        (
+            AskForApproval::Never,
+            ApprovalMessages {
+                on_request: None,
+                on_request_auto_review: None,
+                never: Some("catalog never approval instructions".to_string()),
+                unless_trusted: None,
+            },
+            "catalog never approval instructions",
+            "Approval policy is currently never",
+        ),
+        (
+            AskForApproval::UnlessTrusted,
+            ApprovalMessages {
+                on_request: None,
+                on_request_auto_review: None,
+                never: None,
+                unless_trusted: Some("catalog unless-trusted approval instructions".to_string()),
+            },
+            "catalog unless-trusted approval instructions",
+            "`approval_policy` is `unless-trusted`",
+        ),
+    ] {
+        let server = start_mock_server().await;
+        let req = mount_sse_once(
+            &server,
+            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        )
+        .await;
+        let model_slug = "catalog-non-on-request-approvals-model";
+        let mut model = model_info_from_slug(model_slug);
+        model.model_messages = Some(ModelMessages {
+            approvals: Some(approvals),
+            ..Default::default()
+        });
+        let mut builder = test_codex()
+            .with_model(model_slug)
+            .with_config(move |config| {
+                config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+                config.model_catalog = Some(ModelsResponse {
+                    models: vec![model],
+                });
+            });
+        let test = builder.build(&server).await?;
+
+        submit_text_turn(&test, "hello").await?;
+
+        let permissions = permissions_texts(&req.single_request());
+        assert_eq!(permissions.len(), 1);
+        assert!(permissions[0].contains(expected));
+        assert!(!permissions[0].contains(unexpected));
+    }
     Ok(())
 }
 
@@ -202,6 +258,9 @@ async fn catalog_permission_message_is_sent_initially_and_after_model_change() -
             danger_full_access: None,
             workspace_write: None,
             read_only: Some("model A permissions: {{ network_access }}".to_string()),
+            approved_prefixes: None,
+            writable_root: None,
+            writable_roots: None,
         },
     );
     let second = model_with_permission_messages(
@@ -210,6 +269,9 @@ async fn catalog_permission_message_is_sent_initially_and_after_model_change() -
             danger_full_access: None,
             workspace_write: None,
             read_only: Some("model B permissions: {{ network_access }}".to_string()),
+            approved_prefixes: None,
+            writable_root: None,
+            writable_roots: None,
         },
     );
     let mut builder = test_codex()
@@ -229,7 +291,7 @@ async fn catalog_permission_message_is_sent_initially_and_after_model_change() -
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             model: Some(second_slug.to_string()),
             ..Default::default()
         },
@@ -275,6 +337,9 @@ async fn empty_catalog_permission_message_preserves_approval_instructions() -> R
             danger_full_access: None,
             workspace_write: None,
             read_only: Some(String::new()),
+            approved_prefixes: None,
+            writable_root: None,
+            writable_roots: None,
         },
     );
     let mut builder = test_codex()
@@ -318,16 +383,10 @@ async fn permissions_message_sent_once_on_start() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -358,22 +417,16 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
             ..Default::default()
         },
@@ -381,16 +434,10 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     .await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -427,30 +474,18 @@ async fn permissions_message_not_added_when_no_change() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -487,22 +522,16 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
             ..Default::default()
         },
@@ -510,16 +539,10 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
     .await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -560,31 +583,19 @@ async fn resume_replays_permissions_messages() -> Result<()> {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let initial = builder.build(&server).await?;
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
-    let home = initial.home.clone();
 
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     core_test_support::submit_thread_settings(
         &initial.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
             ..Default::default()
         },
@@ -593,32 +604,20 @@ async fn resume_replays_permissions_messages() -> Result<()> {
 
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let resumed = builder.resume(&server, home, rollout_path).await?;
+    let resumed = builder.restart(&server, &initial).await?;
     resumed
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "after resume".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "after resume".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -665,26 +664,19 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
         .rollout_path
         .clone()
         .expect("rollout path");
-    let home = initial.home.clone();
 
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     core_test_support::submit_thread_settings(
         &initial.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
             ..Default::default()
         },
@@ -693,16 +685,10 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
 
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -712,19 +698,13 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     builder = builder.with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
     });
-    let resumed = builder.resume(&server, home, rollout_path.clone()).await?;
+    let resumed = builder.restart(&server, &initial).await?;
     resumed
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "after resume".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "after resume".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -740,26 +720,18 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     fork_config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
     let forked = initial
         .thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             ForkSnapshot::Interrupted,
-            fork_config.clone(),
+            codex_core::StartThreadOptions::new(fork_config.clone()),
             rollout_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
         )
         .await?;
     forked
         .thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "after fork".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "after fork".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&forked.thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -777,8 +749,50 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     Ok(())
 }
 
+const WORKSPACE_PERMISSIONS_PREFIX: &str = concat!(
+    "<permissions instructions>\n",
+    "Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `workspace-write`: The sandbox permits reading files, and editing files in `cwd` and `writable_roots`. Editing files in other directories requires approval. Network access is restricted.\n",
+    "Approval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.\n",
+);
+
+#[test_case(
+    1,
+    PermissionMessages::default(),
+    " The writable root is {roots}.";
+    "default singular"
+)]
+#[test_case(
+    2,
+    PermissionMessages::default(),
+    " The writable roots are {roots}.";
+    "default plural"
+)]
+#[test_case(
+    1,
+    PermissionMessages {
+        writable_root: Some("Catalog single: {{ roots }}!".to_string()),
+        writable_roots: Some("Catalog plural: {{ roots }}!".to_string()),
+        ..Default::default()
+    },
+    "Catalog single: {roots}!";
+    "override singular"
+)]
+#[test_case(
+    2,
+    PermissionMessages {
+        writable_root: Some("Catalog single: {{ roots }}!".to_string()),
+        writable_roots: Some("Catalog plural: {{ roots }}!".to_string()),
+        ..Default::default()
+    },
+    "Catalog plural: {roots}!";
+    "override plural"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn permissions_message_includes_writable_roots() -> Result<()> {
+async fn permissions_message_includes_writable_roots(
+    root_count: usize,
+    permissions: PermissionMessages,
+    expected_root_sentence: &str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -788,66 +802,219 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     )
     .await;
     let writable = TempDir::new()?;
-    let writable_root = AbsolutePathBuf::try_from(writable.path())?;
-    let writable_root_for_config = writable_root.clone();
-    let permission_profile = PermissionProfile::workspace_write_with(
-        std::slice::from_ref(&writable_root),
+    let writable_root = AbsolutePathBuf::try_from(writable.path().canonicalize()?)?;
+    let extra_roots = if root_count == 2 {
+        vec![writable_root.clone()]
+    } else {
+        vec![]
+    };
+    let denied_root = writable_root.join("blocked");
+    let mut file_system = PermissionProfile::workspace_write_with(
+        &extra_roots,
         NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ false,
-        /*exclude_slash_tmp*/ false,
-    );
-
-    let mut builder = test_codex().with_config(move |config| {
-        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config
-            .permissions
-            .set_permission_profile(permission_profile)
-            .expect("test permission profile should be allowed");
-        let workspace_roots = vec![config.cwd.clone(), writable_root_for_config];
-        config.workspace_roots = workspace_roots.clone();
-        config.permissions.set_workspace_roots(workspace_roots);
-        config.config_layer_stack = ConfigLayerStack::default();
-    });
-    let test = builder.build(&server).await?;
-
-    test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await?;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let permissions = permissions_texts(&req.single_request());
-    let normalize_line_endings = |s: &str| s.replace("\r\n", "\n");
-    let exec_policy = load_exec_policy(&test.config.config_layer_stack).await?;
-    let permission_profile = test.config.permissions.effective_permission_profile();
-    let expected = PermissionsInstructions::from_permission_profile(
-        &permission_profile,
-        AskForApproval::OnRequest,
-        ApprovalPromptContext::new(
-            test.config.approvals_reviewer,
-            /*messages*/ None,
-            /*permission_messages*/ None,
-        ),
-        &exec_policy,
-        test.config.cwd.as_path(),
-        /*exec_permission_approvals_enabled*/ false,
-        /*request_permissions_tool_enabled*/ false,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
     )
-    .render();
-    let expected_normalized = normalize_line_endings(&expected);
-    let actual_normalized: Vec<String> = permissions
-        .iter()
-        .map(|s| normalize_line_endings(s))
-        .collect();
-    assert_eq!(actual_normalized, vec![expected_normalized]);
+    .file_system_sandbox_policy();
+    // Windows restricted-token sandboxes cannot enforce deny-read policies.
+    // Keep the writable-root cases enabled there without the extra denial.
+    let denied_reads = if cfg!(windows) {
+        String::new()
+    } else {
+        file_system.entries.push(FileSystemSandboxEntry::new(
+            denied_root.clone().into(),
+            FileSystemAccessMode::Deny,
+        ));
+        let denied_root = denied_root.to_string_lossy();
+        format!(
+            "\n## Denied filesystem reads\nThe active permission profile denies reading these paths/globs. Do not request escalation or additional permissions to read them; these denials are policy restrictions.\n- path `{denied_root}`"
+        )
+    };
+    let permission_profile =
+        PermissionProfile::from_runtime_permissions(&file_system, NetworkSandboxPolicy::Restricted);
+    let model_slug = "catalog-writable-roots-model";
+    let mut model = model_with_permission_messages(model_slug, permissions);
+    model.use_responses_lite = true;
+    let mut builder = test_codex()
+        .with_model(model_slug)
+        .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+            config
+                .permissions
+                .set_permission_profile(permission_profile)
+                .expect("test permission profile should be allowed");
+            let mut workspace_roots = vec![config.cwd.clone()];
+            workspace_roots.extend(extra_roots);
+            config.workspace_roots = workspace_roots.clone();
+            config.permissions.set_workspace_roots(workspace_roots);
+            config.config_layer_stack = ConfigLayerStack::default();
+            config.model_catalog = Some(ModelsResponse {
+                models: vec![model],
+            });
+        });
+    // This case intentionally exercises host-local workspace and extra roots.
+    let test = builder.build(&server).await?;
+    submit_text_turn(&test, "hello").await?;
 
+    let mut roots = vec![AbsolutePathBuf::try_from(
+        test.config.cwd.as_path().canonicalize()?,
+    )?];
+    if root_count == 2 {
+        roots.push(writable_root);
+    }
+    roots.sort();
+    let roots = roots
+        .iter()
+        .map(|root| format!("`{}`", root.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let root_sentence = expected_root_sentence.replace("{roots}", &roots);
+    let request = req.single_request();
+    let expected = format!(
+        "{WORKSPACE_PERMISSIONS_PREFIX}{root_sentence}{denied_reads}\n</permissions instructions>"
+    );
+    assert_eq!(permissions_texts(&request), vec![expected.clone()]);
+    let annotated_permissions = request
+        .input()
+        .into_iter()
+        .flat_map(|item| {
+            item["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter(|(_, content)| {
+                    content["text"]
+                        .as_str()
+                        .is_some_and(|text| text.replace("\r\n", "\n") == expected)
+                })
+                .map(|(index, _)| {
+                    (
+                        item["role"].clone(),
+                        item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                            [index]
+                            .clone(),
+                        item["internal_chat_message_metadata_passthrough"]["content_item_metadata"]
+                            [index]
+                            .clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        annotated_permissions,
+        vec![(
+            json!("developer"),
+            json!("permissions.instructions"),
+            json!({"provenance": {"type": "harness", "hook": false}}),
+        )]
+    );
     Ok(())
+}
+
+pub(super) async fn catalog_writable_roots_model_change_requests() -> Result<Vec<ResponsesRequest>>
+{
+    let server = start_mock_server().await;
+    let req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let first_slug = "catalog-writable-roots-a";
+    let second_slug = "catalog-writable-roots-b";
+    let models = [
+        (
+            first_slug,
+            "The writable root for model A is {{ roots }}.",
+            "Wrong A plural: {{ roots }}.",
+        ),
+        (
+            second_slug,
+            "The writable root for model B is {{ roots }}.",
+            "Wrong B plural: {{ roots }}.",
+        ),
+    ]
+    .into_iter()
+    .map(|(slug, single, plural)| {
+        model_with_permission_messages(
+            slug,
+            serde_json::from_value(json!({"writable_root": single, "writable_roots": plural}))
+                .expect("valid catalog permission messages"),
+        )
+    })
+    .collect();
+    let mut builder = test_codex()
+        .with_model(first_slug)
+        .with_config(move |config| {
+            config.base_instructions = Some("Help with the workspace.".to_string());
+            // Match the canonical writable root so snapshot normalization recognizes the cwd.
+            if !core_test_support::is_remote_test_environment() {
+                config.cwd = dunce::canonicalize(config.cwd.as_path())
+                    .expect("test workspace should be canonicalizable")
+                    .try_into()
+                    .expect("canonical workspace path should be absolute");
+            }
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::workspace_write_with(
+                    &[],
+                    NetworkSandboxPolicy::Restricted,
+                    /*exclude_tmpdir_env_var*/ true,
+                    /*exclude_slash_tmp*/ true,
+                ))
+                .expect("workspace-write profile should be allowed");
+            config.workspace_roots = vec![config.cwd.clone()];
+            config
+                .permissions
+                .set_workspace_roots(config.workspace_roots.clone());
+            config.config_layer_stack = ConfigLayerStack::default();
+            config.model_catalog = Some(ModelsResponse { models });
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    submit_text_turn(&test, "Inspect the writable workspace.").await?;
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            model: Some(second_slug.to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    submit_text_turn(&test, "Continue with the selected model.").await?;
+    let req3 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+    )
+    .await;
+    submit_text_turn(&test, "Continue without changing permissions.").await?;
+    let writable_root = test
+        .fs()
+        .canonicalize(&test.workspace_path_uri("")?, /*sandbox*/ None)
+        .await?
+        .inferred_native_path_string();
+    let requests = vec![
+        req1.single_request(),
+        req2.single_request(),
+        req3.single_request(),
+    ];
+    let first = format!(
+        "{WORKSPACE_PERMISSIONS_PREFIX}The writable root for model A is `{writable_root}`.\n</permissions instructions>"
+    );
+    let second = format!(
+        "{WORKSPACE_PERMISSIONS_PREFIX}The writable root for model B is `{writable_root}`.\n</permissions instructions>"
+    );
+    assert_eq!(permissions_texts(&requests[0]), vec![first.clone()]);
+    assert_eq!(permissions_texts(&requests[1]), vec![first, second]);
+    assert_eq!(
+        permissions_texts(&requests[2]),
+        permissions_texts(&requests[1])
+    );
+    Ok(requests)
 }

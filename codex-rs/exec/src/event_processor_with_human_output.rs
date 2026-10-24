@@ -12,6 +12,7 @@ use codex_core::config::Config;
 use codex_model_provider_info::WireApi;
 use codex_protocol::num_format::format_with_separators;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_utils_path_uri::PathUri;
 use codex_utils_sandbox_summary::summarize_permission_profile;
 use owo_colors::OwoColorize;
 use owo_colors::Style;
@@ -36,6 +37,7 @@ pub(crate) struct EventProcessorWithHumanOutput {
     final_message_rendered: bool,
     emit_final_message_on_shutdown: bool,
     last_total_token_usage: Option<ThreadTokenUsage>,
+    last_turn_diff: String,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -61,6 +63,7 @@ impl EventProcessorWithHumanOutput {
             final_message_rendered: false,
             emit_final_message_on_shutdown: false,
             last_total_token_usage: None,
+            last_turn_diff: String::new(),
         }
     }
 
@@ -239,6 +242,14 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 CodexStatus::Running
             }
             ServerNotification::Warning(notification) => self.process_warning(notification.message),
+            ServerNotification::AuthRecoveryStarted(notification) => {
+                eprintln!("{}", notification.message);
+                CodexStatus::Running
+            }
+            ServerNotification::AuthRecoveryCompleted(notification) => {
+                eprintln!("{}", notification.message.style(self.green));
+                CodexStatus::Running
+            }
             ServerNotification::Error(notification) => {
                 eprintln!(
                     "{} {}",
@@ -332,9 +343,12 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 TurnStatus::InProgress => CodexStatus::Running,
             },
             ServerNotification::TurnDiffUpdated(notification) => {
-                if !notification.diff.trim().is_empty() {
+                if notification.diff != self.last_turn_diff && !notification.diff.trim().is_empty()
+                {
                     eprintln!("{}", notification.diff);
                 }
+                // Remember empty updates too, so a restored diff is rendered again.
+                self.last_turn_diff = notification.diff;
                 CodexStatus::Running
             }
             ServerNotification::TurnPlanUpdated(notification) => {
@@ -360,7 +374,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
                 CodexStatus::Running
             }
-            ServerNotification::TurnStarted(_) => CodexStatus::Running,
+            ServerNotification::TurnStarted(_) => {
+                self.last_turn_diff.clear();
+                CodexStatus::Running
+            }
             _ => CodexStatus::Running,
         }
     }
@@ -436,8 +453,8 @@ fn config_summary_entries(
             "sandbox",
             summarize_permission_profile(
                 &permission_profile,
-                &config.cwd,
-                config.effective_workspace_roots().as_slice(),
+                &PathUri::from_abs_path(&config.cwd),
+                &config.effective_workspace_roots(),
             ),
         ),
     ];
