@@ -908,6 +908,7 @@ async fn run_cloud_plugin_projection_scenarios() -> anyhow::Result<()> {
             initialized, installed,
             "{case}: cloud-only declarations must not start MCPs"
         );
+        // Failed discovery stays in cooldown across both model steps.
         assert_eq!(
             cloud.calls.load(Ordering::SeqCst),
             usize::from(cloud_enabled),

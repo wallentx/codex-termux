@@ -1,11 +1,13 @@
 //! Reusable provider catalog caches and Cloud resource contents.
 //! Provider catalogs remain unfiltered until step preparation applies policy.
+//! Cloud discovery publishes only into its current auth and resource generation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
+use codex_extension_api::CatalogRefreshBackoff;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpResourceClientAuthKey;
 use codex_mcp::McpResourceServerCacheKey;
@@ -32,6 +34,7 @@ pub(crate) struct SkillCatalogState {
     pub(crate) executor_v2_cache: Option<CachedExecutorV2Catalog>,
     // Shared by both discovery modes.
     pub(crate) cloud_generation: Option<Arc<CloudSkillGeneration>>,
+    pub(crate) cloud_retry: Option<CatalogRefreshBackoff>,
     pub(crate) cloud_resources: CloudResourceCache,
 }
 

@@ -1756,7 +1756,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "description": "When `false`, disables the feedback flow across Codex product surfaces.",
+          "description": "When `false`, disables feedback uploads and background Guardian review retention. Explicit local exports remain available.",
           "type": "boolean"
         }
       },
@@ -2492,6 +2492,14 @@
       },
       "type": "object"
     },
+    "McpEmaTokenEndpointAuthMethod": {
+      "description": "Token endpoint authentication selected by a confidential EMA client registration.",
+      "enum": [
+        "client_secret_basic",
+        "client_secret_post"
+      ],
+      "type": "string"
+    },
     "McpEnterpriseManagedAuthConfig": {
       "additionalProperties": false,
       "properties": {
@@ -2561,12 +2569,24 @@
       "additionalProperties": false,
       "properties": {
         "client_id": {
-          "description": "Public OAuth client registered with that enterprise IdP.",
+          "description": "OAuth client registered with that enterprise IdP.",
+          "type": "string"
+        },
+        "client_secret": {
+          "description": "Provisioned client secret for confidential IdP login and token exchange. Omitted for a public client.",
           "type": "string"
         },
         "issuer": {
           "description": "Issuer used for enterprise OAuth discovery and identity validation.",
           "type": "string"
+        },
+        "token_endpoint_auth_method": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpEmaTokenEndpointAuthMethod"
+            }
+          ],
+          "description": "Registered EMA client authentication method. Defaults to client_secret_basic when a secret is configured; requires a client secret."
         }
       },
       "required": [
@@ -2600,6 +2620,14 @@
         "client_secret": {
           "description": "OAuth client secret used for token exchange with a pre-registered client.",
           "type": "string"
+        },
+        "token_endpoint_auth_method": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpEmaTokenEndpointAuthMethod"
+            }
+          ],
+          "description": "Registered EMA client authentication method. Defaults to client_secret_basic when a secret is configured; requires a client secret."
         }
       },
       "type": "object"
@@ -3090,6 +3118,7 @@
       "type": "object"
     },
     "NetworkMitmActionToml": {
+      "additionalProperties": false,
       "properties": {
         "inject_request_headers": {
           "default": [],
@@ -3143,6 +3172,15 @@
           },
           "type": "array"
         },
+        "ports": {
+          "default": [],
+          "items": {
+            "format": "uint16",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
         "query": {
           "additionalProperties": {
             "items": {
@@ -3152,6 +3190,13 @@
           },
           "default": {},
           "type": "object"
+        },
+        "schemes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -3163,9 +3208,14 @@
       "type": "object"
     },
     "NetworkMitmInjectedHeaderToml": {
+      "additionalProperties": false,
       "properties": {
         "name": {
           "default": "",
+          "type": "string"
+        },
+        "placeholder": {
+          "default": null,
           "type": "string"
         },
         "prefix": {
@@ -3197,6 +3247,13 @@
             "$ref": "#/definitions/NetworkMitmHookToml"
           },
           "type": "object"
+        },
+        "version": {
+          "description": "Set to 2 when using origin-scoped hooks or credential substitution.",
+          "format": "uint8",
+          "maximum": 2.0,
+          "minimum": 2.0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -7894,7 +7951,7 @@
           "$ref": "#/definitions/AbsolutePathBuf"
         }
       ],
-      "description": "Directory where Codex writes log files. Setting this value explicitly also enables the TUI text log in this directory. Defaults to `$CODEX_HOME/log`."
+      "description": "Directory for log files. Setting this value explicitly also routes the SQLite logs database here and enables the TUI text log in this directory. When unset, log files use `$CODEX_HOME/log` and SQLite logs use `sqlite_home`. Existing SQLite logs in `sqlite_home` are not migrated automatically. A managed `sqlite_home` requirement keeps SQLite logs in that required directory."
     },
     "marketplaces": {
       "additionalProperties": {

@@ -5,6 +5,7 @@ use codex_core_plugins::PluginRootOwnership;
 use codex_core_plugins::catalog_from_snapshots;
 use codex_exec_server::ExecutorCapabilityDiscoveryV2Snapshot;
 use codex_exec_server::FileSystemSandboxContext;
+use codex_extension_api::CatalogRefreshBackoff;
 use codex_extension_api::SelectedPluginContribution;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::McpResourceClient;
@@ -13,10 +14,13 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Plugin configuration and caches owned by one thread; mutable state stays extension-private.
 #[derive(Default)]
 pub struct PluginsThreadState {
+    /// Serializes discovery; true only when the last refresh published successfully.
+    pub(crate) cloud_refresh_lock: AsyncMutex<bool>,
     state: Mutex<PluginContributorState>,
 }
 
@@ -38,6 +42,7 @@ impl PluginsThreadState {
 pub(crate) struct PluginContributorState {
     pub(crate) plugins_enabled: bool,
     pub(crate) cloud_generation: Option<CloudPluginGeneration>,
+    pub(crate) cloud_retry: Option<CatalogRefreshBackoff>,
     pub(crate) executor_catalog: Option<PluginCatalog>,
     executor_snapshots: Vec<ExecutorCapabilityDiscoveryV2Snapshot>,
     pub(crate) executor_cache: Vec<CachedSelectedRoot>,
