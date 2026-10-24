@@ -626,6 +626,29 @@ def release_tree(upstream, source, baseline, excluded):
         base_tree = code_tree(baseline)
         source_tree = code_tree(source)
         upstream_tree = code_tree(upstream)
+        # Git 2.43 (used by ubuntu-slim) requires commits for merge-tree's
+        # --merge-base and branch arguments. Keep normalized trees in private,
+        # deterministic commit objects without updating any refs.
+        commit_env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME="Termux release tree",
+            GIT_AUTHOR_EMAIL="termux-release-tree@users.noreply.github.com",
+            GIT_AUTHOR_DATE="2000-01-01T00:00:00 +0000",
+            GIT_COMMITTER_NAME="Termux release tree",
+            GIT_COMMITTER_EMAIL="termux-release-tree@users.noreply.github.com",
+            GIT_COMMITTER_DATE="2000-01-01T00:00:00 +0000",
+        )
+
+        def commit_tree(tree, parent=None):
+            args = ["-c", "commit.gpgsign=false", "commit-tree", tree]
+            if parent:
+                args.extend(("-p", parent))
+            args.extend(("-m", "Normalized Termux release merge input"))
+            return git(*args, env=commit_env).decode().strip()
+
+        base_commit = commit_tree(base_tree)
+        upstream_commit = commit_tree(upstream_tree, base_commit)
+        source_commit = commit_tree(source_tree, base_commit)
         merged = subprocess.run(
             [
                 "git",
@@ -635,9 +658,9 @@ def release_tree(upstream, source, baseline, excluded):
                 "--write-tree",
                 "--name-only",
                 "--no-messages",
-                f"--merge-base={base_tree}",
-                upstream_tree,
-                source_tree,
+                f"--merge-base={base_commit}",
+                upstream_commit,
+                source_commit,
             ],
             capture_output=True,
             text=True,
@@ -645,6 +668,14 @@ def release_tree(upstream, source, baseline, excluded):
         )
         result = merged.stdout.splitlines()[0] if merged.stdout else ""
         conflicts = merged.stdout.splitlines()[1:]
+        if merged.returncode not in (0, 1) or not re.fullmatch(
+            r"[0-9a-f]{40,64}", result
+        ):
+            raise ValueError(
+                "release merge could not produce a tree; no release refs changed:\n"
+                + merged.stdout
+                + merged.stderr
+            )
         if merged.returncode == 1:
             git("read-tree", result, env=env)
             remaining = []

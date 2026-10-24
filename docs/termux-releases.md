@@ -17,6 +17,8 @@ requested upstream + Termux delta |
 a private index. The baseline is the upstream tag paired with the selected
 snapshot's latest reachable Termux release tag. For an older release line, the
 generator selects a compatible tested snapshot instead of a newer target.
+The normalized trees are wrapped in private commit objects for the merge, so
+Git 2.43 runners and newer local Git versions use the same explicit base.
 
 Automation and package-version metadata are excluded from the portable delta.
 Upstream file renames are supported. All other upstream paths must match the
