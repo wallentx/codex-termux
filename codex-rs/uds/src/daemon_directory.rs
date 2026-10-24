@@ -11,8 +11,15 @@ use std::path::PathBuf;
 
 /// Returns the fixed executor-local directory that every sandbox must hide.
 pub fn shared_daemon_socket_directory() -> io::Result<PathBuf> {
-    // Resolve the system alias /tmp -> /private/tmp on macOS.
-    let temporary_root = fs::canonicalize("/tmp")?;
+    // Android has no writable /tmp. Keep the Termux root fixed so environment
+    // overrides cannot move privileged sockets outside the reserved directory.
+    let temporary_root = if cfg!(target_os = "android") {
+        "/data/data/com.termux/files/usr/tmp"
+    } else {
+        "/tmp"
+    };
+    // Resolve system aliases, including /tmp -> /private/tmp on macOS.
+    let temporary_root = fs::canonicalize(temporary_root)?;
     let uid = unsafe { libc::geteuid() };
     Ok(temporary_root.join(format!("codex-daemon-{uid}")))
 }
