@@ -110,6 +110,9 @@ mod incremental_tools_resume;
 #[path = "scenarios_model_instructions.rs"]
 mod model_instructions;
 
+#[path = "scenarios_context_management_tools.rs"]
+mod context_management_tools;
+
 #[path = "scenarios_code_mode_settled_helpers_tests.rs"]
 mod code_mode_settled_helpers;
 
@@ -2671,6 +2674,20 @@ async fn model_catalog_refresh_preserves_tools_and_history() -> Result<()> {
         &requests,
         &ContextSnapshotOptions::default().include_request_settings(),
     ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_writable_roots_follow_selected_model() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let requests =
+        super::permissions_messages::catalog_writable_roots_model_change_requests().await?;
+    let snapshot = context_snapshot::format_request_history_snapshot(
+        "Catalog writable-root wording follows the selected model, appending changed permissions once while preserving prior input.",
+        &requests,
+        &ContextSnapshotOptions::default().include_request_settings(),
+    );
+    insta::assert_snapshot!(snapshot);
     Ok(())
 }
 

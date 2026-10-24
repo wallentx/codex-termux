@@ -10,6 +10,7 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::McpServerCommandMatcher;
+use codex_config::McpServerDisabledReason;
 use codex_config::McpServerIdentity;
 use codex_config::McpServerRequirement;
 use codex_config::McpServerValueMatcher;
@@ -395,6 +396,34 @@ consolidation_model = "gpt-5.2"
         )
         .disable_on_external_context
     );
+}
+
+#[tokio::test]
+async fn fresh_memory_profiles_preserve_explicit_version_and_transition_opt_out() {
+    for (settings, expected) in [
+        ("", codex_protocol::MemoryVersion::V2),
+        ("version = 'v1'", codex_protocol::MemoryVersion::V1),
+        ("dual_write = false", codex_protocol::MemoryVersion::V1),
+        (
+            "version = 'v2'\ndual_write = false",
+            codex_protocol::MemoryVersion::V2,
+        ),
+    ] {
+        let home = tempdir().expect("tempdir");
+        let cfg = toml::from_str::<ConfigToml>(&format!(
+            "[features]\nmemories = true\n[memories]\n{settings}"
+        ))
+        .expect("memory config");
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            home.abs(),
+        )
+        .await
+        .expect("load config");
+        assert_eq!(config.memories.version, expected, "{settings}");
+        assert!(!home.path().join("memories").exists());
+    }
 }
 
 #[tokio::test]
@@ -1223,6 +1252,108 @@ command = "print-token"
         .insert("X-Custom-Header".to_string(), "value".into());
 
     assert_eq!(config.model_provider_id, "amazon-bedrock");
+    assert_eq!(config.model_provider, expected_provider);
+}
+
+#[tokio::test]
+async fn load_config_uses_resolved_cwd_for_default_gcp_auth() {
+    let codex_home = tempdir().expect("tempdir");
+    let workspace = tempdir().expect("tempdir");
+    let cwd = workspace.abs();
+
+    for base_url in [None, Some("https://vertex.example.com/v1")] {
+        let mut cfg = ConfigToml {
+            model_provider: Some("gcp".to_string()),
+            ..Default::default()
+        };
+        if let Some(base_url) = base_url {
+            cfg.model_providers.insert(
+                "gcp".to_string(),
+                ModelProviderInfo {
+                    base_url: Some(base_url.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides {
+                cwd: Some(cwd.to_path_buf()),
+                ..Default::default()
+            },
+            codex_home.abs(),
+        )
+        .await
+        .expect("load config");
+
+        let mut expected_provider = ModelProviderInfo::create_gcp_provider();
+        expected_provider.base_url = base_url.map(str::to_string);
+        expected_provider.auth = Some(ModelProviderAuthInfo {
+            command: if cfg!(windows) {
+                "gcloud.cmd"
+            } else {
+                "gcloud"
+            }
+            .to_string(),
+            args: vec![
+                "auth".into(),
+                "application-default".into(),
+                "print-access-token".into(),
+            ],
+            timeout_ms: std::num::NonZeroU64::new(30_000).expect("timeout should be non-zero"),
+            refresh_interval_ms: 3_000_000,
+            cwd: cwd.clone(),
+        });
+        assert_eq!(config.model_provider_id, "gcp");
+        assert_eq!(config.model_provider, expected_provider);
+        assert_eq!(config.model_providers.get("gcp"), Some(&expected_provider));
+    }
+}
+
+#[tokio::test]
+async fn load_config_applies_gcp_transport_overrides() {
+    let cfg = toml::from_str::<ConfigToml>(
+        r#"
+model_provider = "gcp"
+
+[model_providers.gcp]
+base_url = "https://vertex.example.com/v1"
+http_headers = { "X-Custom-Header" = "value" }
+
+[model_providers.gcp.auth]
+command = "print-token"
+"#,
+    )
+    .expect("GCP transport overrides should deserialize");
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load config");
+
+    let mut expected_provider = built_in_model_providers(/*openai_base_url*/ None)
+        .remove("gcp")
+        .expect("GCP provider should be built in");
+    expected_provider.base_url = Some("https://vertex.example.com/v1".to_string());
+    expected_provider.auth = Some(ModelProviderAuthInfo {
+        command: "print-token".to_string(),
+        args: Vec::new(),
+        timeout_ms: std::num::NonZeroU64::new(5_000).expect("timeout should be non-zero"),
+        refresh_interval_ms: 300_000,
+        cwd: std::env::current_dir()
+            .expect("current directory should be available")
+            .try_into()
+            .expect("current directory should be absolute"),
+    });
+    expected_provider.http_headers = Some(std::collections::HashMap::from([(
+        "X-Custom-Header".to_string(),
+        "value".into(),
+    )]));
+
+    assert_eq!(config.model_provider_id, "gcp");
     assert_eq!(config.model_provider, expected_provider);
 }
 
@@ -5300,8 +5431,10 @@ fn filter_mcp_servers_by_allowlist_blocks_all_when_empty() {
         ("server-b".to_string(), http_mcp("https://example.com/b")),
     ]);
 
+    servers.get_mut("server-b").expect("server-b").enabled = false;
     let source = RequirementSource::LegacyManagedConfigTomlFromMdm;
     let requirements = Sourced::new(BTreeMap::new(), source.clone());
+    filter_mcp_servers_by_requirements(&mut servers, Some(&requirements));
     filter_mcp_servers_by_requirements(&mut servers, Some(&requirements));
 
     let reason = Some(McpServerDisabledReason::Requirements { source });
@@ -5314,8 +5447,16 @@ fn filter_mcp_servers_by_allowlist_blocks_all_when_empty() {
             ))
             .collect::<HashMap<String, (bool, Option<McpServerDisabledReason>)>>(),
         HashMap::from([
-            ("server-a".to_string(), (false, reason.clone())),
-            ("server-b".to_string(), (false, reason)),
+            ("server-a".to_string(), (false, reason)),
+            (
+                "server-b".to_string(),
+                (
+                    false,
+                    Some(McpServerDisabledReason::ExplicitAndRequirements {
+                        source: requirements.source.clone(),
+                    })
+                ),
+            ),
         ])
     );
 }
@@ -6301,7 +6442,7 @@ async fn memory_tool_makes_memories_root_readable_without_creating_or_widening_w
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
-    let memories_root = codex_home.path().join("memories");
+    let memories_root = codex_home.path().join("memories_v2");
     let memories_root_abs = memories_root.abs();
 
     let config = Config::load_from_base_config_with_overrides(
@@ -8601,6 +8742,7 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
     let cfg = ConfigToml {
         features: Some(toml::from_str(features).unwrap()),
         auto_review: Some(AutoReviewToml {
+            timeout_ms: None,
             circuit_break_action: None,
             policy: Some("  Use the user-configured guardian policy.  ".to_string()),
             extra_policy: Some("  Use the user-configured additional policy.  ".to_string()),
@@ -8664,6 +8806,7 @@ async fn requirements_guardian_policy_beats_auto_review() -> std::io::Result<()>
         .map_err(std::io::Error::other)?;
         let cfg = ConfigToml {
             auto_review: Some(AutoReviewToml {
+                timeout_ms: None,
                 circuit_break_action: None,
                 policy: Some("Use the user-configured guardian policy.".to_string()),
                 extra_policy: Some("Use the user-configured additional policy.".to_string()),
@@ -8705,6 +8848,7 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         auto_review: Some(AutoReviewToml {
+            timeout_ms: None,
             circuit_break_action: None,
             policy: Some("   ".to_string()),
             extra_policy: Some("   ".to_string()),

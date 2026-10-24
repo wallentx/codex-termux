@@ -4642,6 +4642,7 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
     let rollout_dir = rollout_path.parent().expect("rollout parent directory");
     std::fs::create_dir_all(rollout_dir)?;
     let session_meta = SessionMeta {
+        attached_thread: false,
         creator_user_id: None,
         creator_account_id: None,
         session_id: conversation_id.into(),
@@ -6054,6 +6055,51 @@ async fn thread_resume_with_overrides_preserves_recency_and_checkpoints_model() 
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_does_not_checkpoint_unchanged_settings() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+
+    let RestartedThreadFixture {
+        mut mcp,
+        thread_id,
+        rollout_file_path,
+        ..
+    } = start_materialized_thread_and_restart(codex_home.path(), "materialize").await?;
+
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_file_path).await?;
+    let settings_before_resume = items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!settings_before_resume.is_empty());
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&rollout_file_path).await?;
+    let settings_after_resume = items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(settings_after_resume, settings_before_resume);
 
     Ok(())
 }

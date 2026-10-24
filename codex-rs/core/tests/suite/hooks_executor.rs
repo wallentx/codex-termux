@@ -27,9 +27,11 @@ use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
+use core_test_support::TestTargetOs;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::apps_enabled_builder;
 use core_test_support::apps_test_server::recorded_apps_tool_calls;
+use core_test_support::exec_server::ExecServerProcess;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -41,10 +43,13 @@ use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
+use core_test_support::test_codex::environment_config_for_selection;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
@@ -66,6 +71,264 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 use super::rmcp_client::remote_aware_environment_id;
+use super::rmcp_client::remote_aware_stdio_server_bin;
+
+#[test_case(
+    json!({"permissionDecision": "deny", "permissionDecisionReason": "blocked by owner"}),
+    "blocked by owner"; "camelCase environment selects the owners blocking hook"
+)]
+#[test_case(
+    json!({"permissionDecision": "allow", "updatedInput": {"permissions": {"network": {"enabled": true}}}}),
+    "\"scope\":\"turn\""; "rewrite may omit the original environment"
+)]
+#[test_case(
+    json!({"permissionDecision": "allow", "updatedInput": {"environmentId": "another", "permissions": {"network": {"enabled":true}}}}),
+    "PreToolUse hook cannot change the tool environment"; "rewrite cannot change the original environment"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_tool_use_preserves_request_permissions_environment(
+    hook_output: Value,
+    expected_message: &str,
+) -> Result<()> {
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            for feature in [Feature::CodexHooks, Feature::RequestPermissionsTool] {
+                config.features.enable(feature).expect("enable feature");
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let (selections, _executor) = environments_with_pre_tool_use_hook(
+        &test,
+        HookEnvironment::Secondary,
+        "^request_permissions$",
+        hook_output,
+    )
+    .await?;
+    let args = json!({"environmentId": selections[1].environment_id, "permissions": {"network": {"enabled": true}}});
+    let responses = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_function_call("permissions", "request_permissions", &args.to_string()),
+                ev_completed("first"),
+            ])),
+            completed_turn_response("second"),
+        ],
+    )
+    .await;
+    test.submit_turn_with_environments("request network access", Some(selections))
+        .await?;
+    let output = responses
+        .function_call_output_text("permissions")
+        .context("expected request_permissions result")?;
+    assert!(output.contains(expected_message), "{output}");
+    Ok(())
+}
+
+#[test_case(HookEnvironment::Secondary; "unrelated environment cannot block a targeted resource call")]
+#[test_case(HookEnvironment::Primary; "server owner can block a targeted resource call")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_resource_hooks_follow_server_ownership(
+    hook_environment: HookEnvironment,
+) -> Result<()> {
+    skip_if_wine_exec!(Ok(()), "requires a Windows test_stdio_server binary");
+    let server = start_mock_server().await;
+    let command = remote_aware_stdio_server_bin()?;
+    let test = test_codex()
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("enable hooks");
+            let mcp_server: McpServerConfig = serde_json::from_value(json!({
+                "command": command,
+                "environment_id": remote_aware_environment_id(),
+                "cwd": config.cwd,
+            }))
+            .expect("valid docs MCP server configuration");
+            config
+                .mcp_servers
+                .set(HashMap::from([("docs".to_string(), mcp_server)]))
+                .expect("configure docs MCP server");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, "docs").await?;
+
+    let denied = "denied by resource hook";
+    let expected = match hook_environment {
+        HookEnvironment::Primary => denied,
+        HookEnvironment::Secondary => "memo://codex/",
+    };
+    let (mut selections, _executor) = environments_with_pre_tool_use_hook(
+        &test,
+        hook_environment,
+        "^(read|list)_mcp_resource",
+        json!({"permissionDecision": "deny", "permissionDecisionReason": denied}),
+    )
+    .await?;
+    // Put the server's environment second so routing every call to the primary fails this test too.
+    selections.reverse();
+    let read = json!({"server": "docs", "uri": "memo://codex/example-note"});
+    let list = json!({"server": " docs "});
+    let calls = [
+        ("read", "read_mcp_resource", read, expected),
+        ("list", "list_mcp_resources", list.clone(), expected),
+        ("templates", "list_mcp_resource_templates", list, expected),
+        ("list-all", "list_mcp_resources", json!({}), denied),
+        (
+            "unknown",
+            "list_mcp_resources",
+            json!({"server": "missing"}),
+            "unknown MCP server 'missing'",
+        ),
+    ];
+    let mut events = vec![ev_response_created("resources")];
+    events.extend(
+        calls
+            .iter()
+            .map(|(id, tool, args, _)| ev_function_call(id, tool, &args.to_string())),
+    );
+    events.push(ev_completed("resources"));
+    let responses = mount_response_sequence(
+        &server,
+        vec![sse_response(sse(events)), completed_turn_response("done")],
+    )
+    .await;
+    test.submit_turn_with_environments("inspect MCP resources", Some(selections))
+        .await?;
+    for (id, _, _, expected) in calls {
+        let output = responses
+            .function_call_output_text(id)
+            .context("missing resource tool result")?;
+        assert!(
+            output.contains(expected),
+            "{id}: expected {expected:?} in {output}"
+        );
+    }
+    Ok(())
+}
+
+enum HookEnvironment {
+    Primary,
+    Secondary,
+}
+
+async fn environments_with_pre_tool_use_hook(
+    test: &TestCodex,
+    hook_environment: HookEnvironment,
+    matcher: &str,
+    mut hook_output: Value,
+) -> Result<(Vec<TurnEnvironmentSelection>, Option<ExecServerProcess>)> {
+    let mut executor = None;
+    let executor_url = if let Some(url) = test.executor_environment().exec_server_url() {
+        url
+    } else {
+        &executor
+            .insert(ExecServerProcess::start().await?)
+            .websocket_url
+    };
+    let mut primary = test.executor_environment().selection().clone();
+    let mut secondary = primary.clone();
+    secondary.environment_id = "secondary".to_string();
+    test.thread_manager
+        .environment_manager()
+        .upsert_environment(
+            secondary.environment_id.clone(),
+            executor_url.to_owned(),
+            /*connect_timeout*/ None,
+        )?;
+
+    let owner = match hook_environment {
+        HookEnvironment::Primary => &mut primary,
+        HookEnvironment::Secondary => &mut secondary,
+    };
+    hook_output["hookEventName"] = json!("PreToolUse");
+    let output = json!({"hookSpecificOutput": hook_output});
+    let command = match test_target_os() {
+        TestTargetOs::Windows => format!("ForEach-Object {{ '{output}' }}"),
+        TestTargetOs::Linux | TestTargetOs::MacOs => format!("printf '%s' '{output}'"),
+    };
+    let mut config = environment_config_for_selection(&test.config, owner);
+    config.environment_hooks = serde_json::from_value(json!({
+        "PreToolUse": [{
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": command}],
+        }],
+    }))?;
+    owner.config = EnvironmentConfigState::Ready(config);
+    Ok((vec![primary, secondary], executor))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn environment_requires_loadable_managed_hooks_at_startup_and_readiness() -> Result<()> {
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("enable hooks");
+            config
+                .features
+                .enable(Feature::DeferredExecutor)
+                .expect("allow the environment to start with pending configuration");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let mut selection = test.executor_environment().selection().clone();
+    let mut config = environment_config_for_selection(&test.config, &selection);
+    config.environment_hooks = toml::from_str(
+        r#"
+        [[PreToolUse]]
+        matcher = "["
+        [[PreToolUse.hooks]]
+        type = "command"
+        command = "echo managed-hook"
+        "#,
+    )?;
+    selection.config = EnvironmentConfigState::Ready(config.clone());
+    let start = |selection: TurnEnvironmentSelection| {
+        test.thread_manager.start_thread(StartThreadOptions {
+            environments: Some(vec![selection.into_request()]),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+    };
+    let assert_invalid_matcher = |error: String| {
+        assert!(error.contains("invalid matcher"), "{error}");
+        assert!(error.contains(&selection.environment_id), "{error}");
+    };
+    let error = start(selection.clone())
+        .await
+        .err()
+        .context("startup accepted an invalid managed hook")?;
+    assert_invalid_matcher(error.to_string());
+
+    selection.config = EnvironmentConfigState::Pending;
+    let thread = start(selection.clone()).await?.thread;
+    let error = thread
+        .environment_ready(&selection, config.clone())
+        .await
+        .expect_err("an invalid managed hook must prevent readiness");
+    assert_invalid_matcher(error.to_string());
+    assert_eq!(
+        thread.environment_selections().await,
+        vec![selection.clone()]
+    );
+
+    config.environment_hooks.pre_tool_use[0].matcher = Some("^Bash$".to_string());
+    thread.environment_ready(&selection, config).await?;
+    assert!(
+        thread
+            .config_snapshot()
+            .await
+            .is_primary_environment_configured()
+    );
+    thread.shutdown_and_wait().await?;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_plugin_selection_disables_executor_hooks_without_disabling_their_server()
@@ -939,6 +1202,7 @@ impl ExecutorHookFixture {
             .environment_ready(
                 &selection,
                 EnvironmentConfig {
+                    environment_hooks: Default::default(),
                     allow_login_shell: false,
                     workspace_roots: selection.workspace_roots.clone(),
                     permission_profile: PermissionProfileSnapshot::legacy(
