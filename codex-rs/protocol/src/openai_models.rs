@@ -35,6 +35,11 @@ use crate::protocol::MultiAgentVersion;
 mod access_programs;
 mod incremental_tools;
 pub use incremental_tools::IncrementalToolMessages;
+#[path = "openai_models/memento_v2.rs"]
+mod memento_v2;
+pub use memento_v2::ContextManagementToolMessages;
+pub use memento_v2::HistoryToolMessages;
+pub use memento_v2::NotesToolMessages;
 #[path = "openai_models/guardian.rs"]
 mod guardian;
 pub use guardian::GuardianModelPolicy;
@@ -585,6 +590,15 @@ pub struct ConfirmationPolicies {
 /// Model-owned tool messages and description prefixes.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ToolMessages {
+    /// Native Memento V2 history tool definitions, independent of runtime namespace aliases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryToolMessages>,
+    /// Native Memento V2 notes tool definitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<NotesToolMessages>,
+    /// Memento V2 context-window control tool definitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagementToolMessages>,
     /// Optional wording for incremental catalog notices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incremental_tools: Option<IncrementalToolMessages>,
@@ -634,7 +648,8 @@ pub struct ToolMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Complete JSON Schema encoded as a string. Consumed by Multi-Agent V2 tools, Code Mode wait,
-    /// request_user_input_async (the send_user_message_async catalog key), and MCP resource helpers.
+    /// request_user_input_async (the send_user_message_async catalog key), MCP resource helpers,
+    /// and Memento V2 tools.
     /// Uses the harness's supported schema subset; unrecognized keywords are ignored.
     /// Missing, null, invalid or unsupported structures, or a root without `type: "object"`
     /// retains the harness parameters. Schema semantics must remain API-compatible.
@@ -779,7 +794,7 @@ pub struct AutoReviewMessages {
     pub timeout_instructions: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct PermissionMessages {
     pub danger_full_access: Option<String>,
     pub workspace_write: Option<String>,
@@ -788,6 +803,14 @@ pub struct PermissionMessages {
     /// an empty string suppresses the approved-prefix section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_prefixes: Option<String>,
+    /// Single writable-root sentence with exactly one `{{ roots }}` placeholder.
+    /// Missing, null, empty, invalid, or oversized templates use the bundled sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writable_root: Option<String>,
+    /// Multiple writable-roots sentence with exactly one `{{ roots }}` placeholder.
+    /// Missing, null, empty, invalid, or oversized templates use the bundled sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writable_roots: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
@@ -1315,8 +1338,31 @@ mod tests {
                 workspace_write: Some(String::new()),
                 read_only: None,
                 approved_prefixes: None,
+                ..PermissionMessages::default()
             })
         );
+    }
+
+    #[test]
+    fn writable_root_messages_preserve_sparse_wire_values() {
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"writable_root": null, "writable_roots": null}),
+            serde_json::json!({"writable_root": "", "writable_roots": "Roots: {{ roots }}."}),
+        ] {
+            let messages: PermissionMessages = serde_json::from_value(input.clone()).unwrap();
+            let mut expected = serde_json::json!({
+                "danger_full_access": null,
+                "workspace_write": null,
+                "read_only": null,
+            });
+            for key in ["writable_root", "writable_roots"] {
+                if let Some(value) = input.get(key).filter(|value| !value.is_null()) {
+                    expected[key] = value.clone();
+                }
+            }
+            assert_eq!(serde_json::to_value(messages).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -1560,6 +1606,7 @@ mod tests {
                 workspace_write: Some("workspace".to_string()),
                 read_only: None,
                 approved_prefixes: None,
+                ..PermissionMessages::default()
             }),
             multi_agent: None,
             token_budget: None,

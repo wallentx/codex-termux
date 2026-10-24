@@ -453,6 +453,12 @@
         "policy": {
           "description": "Additional policy instructions inserted into the guardian prompt.",
           "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Overall Guardian review budget in milliseconds, including setup and retries. Defaults to 90,000. Set to 0 to wait without a review deadline; cancellation and independent transport timeouts still apply.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -964,6 +970,9 @@
             "guardian_node_repl_transcript_images": {
               "type": "boolean"
             },
+            "guardian_recorded_items": {
+              "type": "boolean"
+            },
             "guardian_reuse_parent_compaction": {
               "type": "boolean"
             },
@@ -978,6 +987,9 @@
             },
             "guardianv2_decisions_comparison": {
               "type": "boolean"
+            },
+            "guardianv3": {
+              "$ref": "#/definitions/FeatureToml_for_GuardianV3ConfigToml"
             },
             "hooks": {
               "type": "boolean"
@@ -1262,6 +1274,9 @@
               "type": "boolean"
             },
             "tui_app_server": {
+              "type": "boolean"
+            },
+            "tui_multi_backend": {
               "type": "boolean"
             },
             "ultrafast_mode": {
@@ -1679,6 +1694,16 @@
         },
         {
           "$ref": "#/definitions/GuardianV2ConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_GuardianV3ConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/GuardianV3ConfigToml"
         }
       ]
     },
@@ -2132,6 +2157,16 @@
         "reasoning"
       ],
       "type": "string"
+    },
+    "GuardianV3ConfigToml": {
+      "additionalProperties": false,
+      "description": "User-configurable settings for Guardian V3.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
     },
     "History": {
       "additionalProperties": false,
@@ -2746,7 +2781,7 @@
               "$ref": "#/definitions/MemoryVersion"
             }
           ],
-          "description": "Selects the memory pipeline; v1 remains the default."
+          "description": "Selects the memory pipeline. Fresh profiles default to v2 when memories are enabled, unless dual-write is explicitly disabled; existing v1 profiles default to v1."
         }
       },
       "type": "object"
@@ -7476,6 +7511,9 @@
         "guardian_node_repl_transcript_images": {
           "type": "boolean"
         },
+        "guardian_recorded_items": {
+          "type": "boolean"
+        },
         "guardian_reuse_parent_compaction": {
           "type": "boolean"
         },
@@ -7490,6 +7528,9 @@
         },
         "guardianv2_decisions_comparison": {
           "type": "boolean"
+        },
+        "guardianv3": {
+          "$ref": "#/definitions/FeatureToml_for_GuardianV3ConfigToml"
         },
         "hooks": {
           "type": "boolean"
@@ -7774,6 +7815,9 @@
           "type": "boolean"
         },
         "tui_app_server": {
+          "type": "boolean"
+        },
+        "tui_multi_backend": {
           "type": "boolean"
         },
         "ultrafast_mode": {

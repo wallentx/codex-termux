@@ -871,14 +871,30 @@ fn write_auth_json(
     fake_jwt
 }
 
-struct ProviderAuthCommandFixture {
+pub(super) struct ProviderAuthCommandFixture {
     tempdir: TempDir,
     command: String,
     args: Vec<String>,
 }
 
 impl ProviderAuthCommandFixture {
-    fn new(tokens: &[&str]) -> std::io::Result<Self> {
+    /// Each thread can resolve credentials independently, including at the same time.
+    pub(super) fn fixed_token(token: &str) -> std::io::Result<Self> {
+        let tempdir = tempfile::tempdir()?;
+        std::fs::write(tempdir.path().join("token.txt"), token)?;
+        let (command, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd.exe", &["/D", "/C", "type", "token.txt"])
+        } else {
+            ("cat", &["token.txt"])
+        };
+        Ok(Self {
+            tempdir,
+            command: command.to_owned(),
+            args: args.iter().copied().map(str::to_owned).collect(),
+        })
+    }
+
+    pub(super) fn new(tokens: &[&str]) -> std::io::Result<Self> {
         let tempdir = tempfile::tempdir()?;
         let tokens_file = tempdir.path().join("tokens.txt");
         let mut token_file_contents = String::new();
@@ -942,7 +958,7 @@ move /y tokens.next tokens.txt >nul
         })
     }
 
-    fn auth(&self) -> ModelProviderAuthInfo {
+    pub(super) fn auth(&self) -> ModelProviderAuthInfo {
         ModelProviderAuthInfo {
             command: self.command.clone(),
             args: self.args.iter().cloned().map(Into::into).collect(),

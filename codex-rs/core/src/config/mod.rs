@@ -43,7 +43,6 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::History;
 use codex_config::types::McpServerConfig;
-use codex_config::types::McpServerDisabledReason;
 use codex_config::types::MemoriesConfig;
 use codex_config::types::ModelAvailabilityNuxConfig;
 use codex_config::types::Notice;
@@ -90,6 +89,7 @@ use codex_mcp::McpProtocolMode;
 use codex_mcp::McpServerRegistration;
 use codex_mcp::ResolvedMcpCatalog;
 use codex_model_provider::ProviderCapabilities;
+use codex_model_provider_info::GCP_PROVIDER_ID;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
@@ -97,9 +97,11 @@ use codex_model_provider_info::built_in_model_providers;
 use codex_model_provider_info::merge_configured_model_providers;
 use codex_models_manager::ModelsManagerConfig;
 use codex_prompts::ResolvedModelMessages;
+use codex_protocol::MemoryVersion;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
+use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -739,6 +741,9 @@ pub struct Config {
 
     /// Include a structured error when Guardian's circuit breaker interrupts a turn.
     pub guardian_circuit_break_action: CircuitBreakAction,
+
+    /// Overall Guardian review budget. None means unlimited; cancellation still applies.
+    pub guardian_review_timeout: Option<Duration>,
 
     /// Whether to inject the `<permissions instructions>` developer block.
     pub include_permissions_instructions: bool,
@@ -2263,10 +2268,7 @@ fn filter_mcp_servers_by_requirements(
         if allowed {
             server.disabled_reason = None;
         } else {
-            server.enabled = false;
-            server.disabled_reason = Some(McpServerDisabledReason::Requirements {
-                source: source.clone(),
-            });
+            server.disable_by_requirements(source.clone());
         }
     }
 }
@@ -2299,10 +2301,7 @@ fn filter_plugin_mcp_servers_by_requirements(
         if allowed {
             server.disabled_reason = None;
         } else {
-            server.enabled = false;
-            server.disabled_reason = Some(McpServerDisabledReason::Requirements {
-                source: source.clone(),
-            });
+            server.disable_by_requirements(source.clone());
         }
     }
 }
@@ -3646,7 +3645,20 @@ impl Config {
             ));
         }
 
-        let memories_config: MemoriesConfig = cfg.memories.clone().unwrap_or_default().into();
+        let mut memories = cfg.memories.clone().unwrap_or_default();
+        // Fresh profiles have no V1 context to preserve or warm up before using V2.
+        // Keep explicit selections and transition opt-outs, and fail closed on IO errors.
+        if features.enabled(Feature::MemoryTool)
+            && memories.version.is_none()
+            && memories.dual_write != Some(false)
+            && matches!(
+                tokio::fs::try_exists(codex_home.join(MemoryVersion::V1.directory_name())).await,
+                Ok(false)
+            )
+        {
+            memories.version = Some(MemoryVersion::V2);
+        }
+        let memories_config: MemoriesConfig = memories.into();
         let memories_root = codex_home.join(memories_config.version.directory_name());
 
         let profiles_are_active = effective_permission_selection.profiles_are_active(
@@ -3969,9 +3981,26 @@ impl Config {
             .clone()
             .filter(|value| !value.is_empty());
 
-        let model_providers =
+        let mut model_providers =
             merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+
+        if let Some(provider) = model_providers.get_mut(GCP_PROVIDER_ID)
+            && provider.auth.is_none()
+        {
+            // Registry construction must not depend on the process cwd, which may be deleted.
+            provider.auth = Some(ModelProviderAuthInfo {
+                command: if cfg!(windows) { "gcloud.cmd" } else { "gcloud" }.to_string(),
+                args: vec![
+                    "auth".into(),
+                    "application-default".into(),
+                    "print-access-token".into(),
+                ],
+                timeout_ms: std::num::NonZeroU64::new(30_000).unwrap_or(std::num::NonZeroU64::MIN),
+                refresh_interval_ms: 3_000_000,
+                cwd: resolved_cwd.clone(),
+            });
+        }
 
         let model_provider_id = config_layer_stack.required_model_provider().map(str::to_string)
             .or(model_provider)
@@ -4588,6 +4617,13 @@ impl Config {
             guardian_transcript_mode,
             guardian_conversation_history_prompt,
             guardian_conversation_history_max_output_tokens,
+            guardian_review_timeout: cfg
+                .auto_review
+                .as_ref()
+                .and_then(|auto_review| auto_review.timeout_ms)
+                .map_or(Some(codex_guardian_reviewer::REVIEW_TIMEOUT), |timeout_ms| {
+                    (timeout_ms != 0).then(|| Duration::from_millis(u64::from(timeout_ms)))
+                }),
             guardian_circuit_break_action: cfg
                 .auto_review
                 .as_ref()

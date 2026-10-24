@@ -1,6 +1,8 @@
 mod account;
 #[path = "account_system_proxy_tests.rs"]
 mod account_system_proxy;
+
+mod account_gcp;
 mod account_thread_usage;
 mod agent_message_board;
 mod analytics;
@@ -8,6 +10,8 @@ mod app_installed;
 mod app_list;
 mod app_read;
 mod application_network;
+#[path = "attached_thread_tests.rs"]
+mod attached_thread;
 mod attestation;
 #[path = "auth_storage_originator_tests.rs"]
 mod auth_storage_originator;
@@ -62,6 +66,7 @@ mod experimental_api;
 mod experimental_feature_list;
 mod external_agent_config;
 mod external_agent_import_sync;
+mod external_agent_memory_concurrency;
 mod feedback;
 mod frozen_cloud_skills;
 mod fs;

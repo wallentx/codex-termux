@@ -60,6 +60,7 @@ use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::service::ServiceError;
 use rmcp::transport::AuthorizationManager;
+use rmcp::transport::IntoTransport;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::auth::AuthClient;
 use rmcp::transport::auth::AuthError;
@@ -94,6 +95,7 @@ use crate::oauth::validate_refresh_token_issuer;
 use crate::oauth_client_credentials::OAuthClientCredentials;
 use crate::oauth_http_client::OAuthHttpClientAdapter;
 use crate::oauth_refresh_mode::McpOAuthRefreshMode;
+use crate::ordered_byte_transport::OrderedByteTransport;
 use crate::protocol_mode::McpProtocolMode;
 use crate::startup_error::is_authentication_required_error;
 use crate::stdio_server_launcher::StdioServerCommand;
@@ -829,13 +831,18 @@ impl RmcpClient {
         Ok(result)
     }
 
-    pub async fn call_tool(
+    /// Builds metadata against the session that sends each attempt, including a recovery retry.
+    /// The resolver must be safe to invoke again and must retain the call's captured authority.
+    pub async fn call_tool<F>(
         &self,
         name: String,
-        arguments: Option<serde_json::Value>,
-        meta: Option<serde_json::Value>,
+        arguments: Option<Value>,
+        meta_for_session: F,
         timeout: Option<Duration>,
-    ) -> Result<CallToolResult> {
+    ) -> Result<CallToolResult>
+    where
+        F: Fn(&rmcp::model::ServerCapabilities) -> Result<Option<Value>> + Send + Sync,
+    {
         let authentication_required_result = |error| {
             if !is_authentication_required_error(&error) {
                 return Err(error);
@@ -866,59 +873,66 @@ impl RmcpClient {
             }
             None => None,
         };
-        let mut meta = match meta {
-            Some(Value::Object(map)) => Some(RequestMetaObject::from(map)),
-            Some(other) => {
-                return Err(anyhow!(
-                    "MCP tool request _meta must be a JSON object, got {other}"
-                ));
-            }
-            None => None,
-        };
-        self.apply_read_only_tools_meta(&mut meta);
-        let meta = crate::trace_context::with_current_trace(meta);
         let mut rmcp_params = CallToolRequestParams::new(name);
         rmcp_params.arguments = arguments;
         let requested_modern = self.protocol_mode == McpProtocolMode::V20260728;
+        let meta_for_session = &meta_for_session;
         match self
             .run_service_operation("tools/call", timeout, move |service| {
                 let mut rmcp_params = rmcp_params.clone();
-                let meta = meta.clone();
                 async move {
+                    // Resolve from this service, not a cached startup capability or another
+                    // service observed before recovery. Local policy failures never send a call.
+                    let meta = (|| {
+                        let info = service
+                            .peer()
+                            .peer_info()
+                            .context("MCP session has no negotiated server capabilities")?;
+                        let mut meta = match meta_for_session(&info.capabilities)? {
+                            Some(Value::Object(map)) => Some(RequestMetaObject::from(map)),
+                            Some(other) => {
+                                return Err(anyhow!(
+                                    "MCP tool request _meta must be a JSON object, got {other}"
+                                ));
+                            }
+                            None => None,
+                        };
+                        self.apply_read_only_tools_meta(&mut meta);
+                        Ok(crate::trace_context::with_current_trace(meta))
+                    })();
+                    let meta = match meta {
+                        Ok(meta) => meta,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     let modern_session = requested_modern
                         && service.peer().peer_info().is_some_and(|info| {
                             info.protocol_version == ProtocolVersion::V_2026_07_28
                         });
                     if modern_session {
                         rmcp_params.meta = meta;
-                        return crate::tool_input::call_tool(&service, rmcp_params).await;
+                        return crate::tool_input::call_tool(&service, rmcp_params)
+                            .await
+                            .map(Ok);
                     }
                     let mut options = rmcp::service::PeerRequestOptions::no_options();
                     options.meta = meta;
-                    let result = service
-                        .peer()
-                        .send_request_with_option(
-                            ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
-                                rmcp_params,
-                            )),
-                            options,
-                        )
-                        .await?
-                        .await_response()
-                        .await?;
+                    let (_, result) =
+                        crate::tool_request::call_tool(service.peer(), rmcp_params, options)
+                            .await?;
                     match result {
-                        ServerResult::CallToolResult(result) => Ok(result),
-                        _ => Err(rmcp::service::ServiceError::UnexpectedResponse),
+                        ServerResult::CallToolResult(result) => Ok(Ok(result)),
+                        _ => Err(ServiceError::UnexpectedResponse),
                     }
                 }
                 .boxed()
             })
             .await
         {
-            Ok(result) => {
+            Ok(Ok(result)) => {
                 self.persist_oauth_tokens().await;
                 Ok(result)
             }
+            Ok(Err(error)) => Err(error),
             Err(error) => {
                 let Some(ClientOperationError::Service(ServiceError::TransportSend(transport))) =
                     error.downcast_ref()
@@ -1329,7 +1343,12 @@ impl RmcpClient {
             PendingTransport::InProcess { transport } => (
                 client_service
                     .serve_with_lifecycle(
-                        track_tool_list_changes(transport, Arc::clone(&self.tool_list_revision)),
+                        track_tool_list_changes(
+                            OrderedByteTransport::new(
+                                IntoTransport::<RoleClient, _, _>::into_transport(transport),
+                            ),
+                            Arc::clone(&self.tool_list_revision),
+                        ),
                         lifecycle,
                     )
                     .boxed(),
@@ -1338,7 +1357,10 @@ impl RmcpClient {
             PendingTransport::Stdio { transport } => (
                 client_service
                     .serve_with_lifecycle(
-                        track_tool_list_changes(*transport, Arc::clone(&self.tool_list_revision)),
+                        track_tool_list_changes(
+                            OrderedByteTransport::new(*transport),
+                            Arc::clone(&self.tool_list_revision),
+                        ),
                         lifecycle,
                     )
                     .boxed(),

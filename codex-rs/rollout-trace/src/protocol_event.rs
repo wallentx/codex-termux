@@ -59,7 +59,11 @@ pub(crate) fn codex_turn_trace_event(
                 context_turn_id: codex_turn_id.clone(),
                 payload: RawTraceEventPayload::CodexTurnEnded {
                     codex_turn_id,
-                    status: ExecutionStatus::Completed,
+                    status: if event.error.is_some() {
+                        ExecutionStatus::Failed
+                    } else {
+                        ExecutionStatus::Completed
+                    },
                 },
             })
         }
@@ -76,6 +80,12 @@ pub(crate) fn codex_turn_trace_event(
                 },
             })
         }
+        EventMsg::RawResponseItem(event) => Some(CodexTurnTraceEvent {
+            context_turn_id: default_turn_id.to_string(),
+            payload: RawTraceEventPayload::HistoryItemAccepted {
+                item_id: event.item.id()?.to_string(),
+            },
+        }),
         _ => None,
     }
 }
@@ -411,6 +421,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ShutdownComplete
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)
+        | EventMsg::PrivateSessionEvent(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::RawResponseCompleted(_)
         | EventMsg::ItemStarted(_)
@@ -491,6 +502,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::PlanUpdate(_)
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)
+        | EventMsg::PrivateSessionEvent(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::RawResponseCompleted(_)
         | EventMsg::ItemStarted(_)
