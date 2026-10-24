@@ -596,6 +596,9 @@ impl Session {
     }
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+        args.config
+            .config_layer_stack
+            .ensure_config_server_applied()?;
         args.config.validate_windows_mxc_requirement()?;
         let SessionSpawnArgs {
             startup,
@@ -909,8 +912,6 @@ impl Session {
             &config.features,
             &model_info,
         );
-        let service_tier =
-            get_service_tier(config.service_tier.clone(), &config.features, &model_info);
         let storage_originator = AuthStorageOriginator::from_client_name(&originator);
         let session_configuration = SessionConfiguration {
             turn_extension_init,
@@ -921,7 +922,7 @@ impl Session {
             step_settings: Arc::new(StepSettings {
                 collaboration_mode,
                 reasoning_summary: config.model_reasoning_summary,
-                service_tier,
+                service_tier: config.service_tier.clone(),
                 personality: config.personality,
                 approval_policy: config.permissions.approval_policy.clone(),
                 approvals_reviewer: config.approvals_reviewer,
@@ -2116,16 +2117,26 @@ impl Session {
         &self,
         updates: &SessionSettingsUpdate,
     ) -> ConstraintResult<ThreadConfigSnapshot> {
-        let state = self.state.lock().await;
-        let configuration = self.apply_session_settings(&state.session_configuration, updates)?;
-        Ok(configuration.thread_config_snapshot(configuration.environments.clone()))
+        let configuration = {
+            let state = self.state.lock().await;
+            self.apply_session_settings(&state.session_configuration, updates)?
+        };
+        Ok(self
+            .effective_thread_config_snapshot(&configuration, configuration.environments.clone())
+            .await)
     }
 
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
-        let state = self.state.lock().await;
-        state
-            .session_configuration
-            .thread_config_snapshot(state.session_configuration.environments.clone())
+        self.resume_config_snapshot().await.0
+    }
+
+    pub(crate) async fn resume_config_snapshot(&self) -> (ThreadConfigSnapshot, Option<String>) {
+        let configuration = self.state.lock().await.session_configuration.clone();
+        let selected_service_tier = configuration.step_settings.service_tier.clone();
+        let snapshot = self
+            .effective_thread_config_snapshot(&configuration, configuration.environments.clone())
+            .await;
+        (snapshot, selected_service_tier)
     }
 
     /// Captures configured child bindings, or the active turn's bindings for legacy inheritance.
@@ -2240,7 +2251,8 @@ impl Session {
         }
         (
             config,
-            configuration.thread_config_snapshot(environments.all_selections()),
+            self.effective_thread_config_snapshot(&configuration, environments.all_selections())
+                .await,
             configuration.windows_sandbox_level,
             environments,
             reasoning_effort_pin,
@@ -3766,11 +3778,28 @@ impl Session {
                     metadata: image,
                 });
         }
-        let rollout_items: Vec<RolloutItem> =
-            items.into_iter().map(RolloutItem::ResponseItem).collect();
-        if self.persist_rollout_items(&rollout_items).await
-            && let Some(revision) = mcp_revision
+        let settings_guard =
+            if force_mcp_checkpoint && self.reference_context_item().await.is_none() {
+                Some(thread_settings::acquire_persistence_lock(self).await)
+            } else {
+                None
+            };
+        let initial_settings = if settings_guard.is_some()
+            && self.reference_context_item().await.is_none()
+            && self.state.lock().await.take_initial_settings_pending()
         {
+            Some(thread_settings::applied_event(self).await)
+        } else {
+            None
+        };
+        let rollout_items = initial_settings
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .chain(items.into_iter().map(RolloutItem::ResponseItem))
+            .collect::<Vec<_>>();
+        let persisted = self.persist_rollout_items(&rollout_items).await;
+        drop(settings_guard);
+        if persisted && let Some(revision) = mcp_revision {
             self.services
                 .executed_tool_calls
                 .mark_mcp_attribution_persisted(revision);
@@ -3969,8 +3998,6 @@ impl Session {
                 .executor_capability_discovery_for_step_v2(&turn_context.config, &environments)
                 .await;
             let v2_snapshots = executor_capability_discovery_v2.as_ref();
-            // V1 discovery is still retained on StepContext for executor Stop/Interrupt hooks.
-            // TODO: Prepare hook sources at capture time, including V2, instead.
             let (executor_capability_discovery, discovery_recovered) = if v2_snapshots.is_some() {
                 (None, false)
             } else {
@@ -4045,6 +4072,12 @@ impl Session {
                     .or_cancel(cancellation_token)
                     .await?;
             }
+            let executor_hook_sources = crate::hook_runtime::prepare_executor_hook_sources(
+                &mcp,
+                &selected_plugins,
+                executor_capability_discovery.as_deref(),
+                executor_capability_discovery_v2.as_deref(),
+            );
             extension_data.insert(selected_plugins);
             let tool_router = turn::built_tools(
                 self.as_ref(),
@@ -4056,12 +4089,7 @@ impl Session {
                 prepared_recommendations,
             )
             .await?;
-            Ok::<_, CodexErr>((
-                executor_capability_discovery,
-                mcp,
-                tool_router,
-                extension_data,
-            ))
+            Ok::<_, CodexErr>((executor_hook_sources, mcp, tool_router, extension_data))
         });
         // Returned warnings must finish delivery even if tools fail or preparation is cancelled.
         let (loaded_agents_md, prepared_tools) =
@@ -4070,7 +4098,7 @@ impl Session {
         if cancellation_token.is_cancelled() {
             return Err(CodexErr::TurnAborted);
         }
-        let (executor_capability_discovery, mcp, tool_router, extension_data) = prepared_tools??;
+        let (executor_hook_sources, mcp, tool_router, extension_data) = prepared_tools??;
         Ok(Arc::new(StepContext {
             preempt: turn_context
                 .config
@@ -4085,7 +4113,7 @@ impl Session {
             extension_data,
             environments,
             inherited_environments,
-            executor_capability_discovery,
+            executor_hook_sources,
             mcp,
             tool_router,
             loaded_agents_md,
@@ -5223,6 +5251,8 @@ impl Session {
             }
 
             state.set_token_info(Some(info));
+            // The local estimate already includes every retained reasoning item.
+            state.set_server_reasoning_included(/*included*/ true);
         }
         self.set_auto_compact_window_estimated_prefill_for_scope(
             turn_context,

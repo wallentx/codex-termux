@@ -1939,9 +1939,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "chrono",
- "codex-agent-message-board-extension",
  "codex-extension-api",
  "codex-http-client",
+ "codex-message-board",
  "codex-protocol",
  "eventsource-stream",
  "futures",
@@ -1960,24 +1960,14 @@ dependencies = [
 name = "codex-agent-message-board-extension"
 version = "0.0.0"
 dependencies = [
- "base64 0.22.1",
- "caseless",
- "chrono",
- "codex-attachment-store",
  "codex-extension-api",
+ "codex-message-board",
  "codex-protocol",
  "codex-state",
  "codex-tools",
- "codex-utils-output-truncation",
  "futures",
- "pretty_assertions",
- "serde",
  "serde_json",
- "sqlx",
- "tempfile",
  "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -2180,6 +2170,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -2580,6 +2571,7 @@ dependencies = [
  "insta",
  "jsonwebtoken",
  "libc",
+ "libsqlite3-sys",
  "os_info",
  "owo-colors",
  "predicates",
@@ -2833,6 +2825,7 @@ dependencies = [
  "codex-features",
  "codex-file-system",
  "codex-git-utils",
+ "codex-http-client",
  "codex-model-provider-info",
  "codex-network-proxy",
  "codex-protocol",
@@ -2981,6 +2974,7 @@ dependencies = [
  "codex-mcp",
  "codex-mcp-extension",
  "codex-memories-read",
+ "codex-message-board",
  "codex-model-provider",
  "codex-model-provider-info",
  "codex-models-manager",
@@ -3173,6 +3167,14 @@ name = "codex-diagnostics"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "pretty_assertions",
+]
+
+[[package]]
+name = "codex-direct-tool-timing"
+version = "0.0.0"
+dependencies = [
+ "codex-utils-critical-path",
  "pretty_assertions",
 ]
 
@@ -3467,6 +3469,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -3496,6 +3499,7 @@ dependencies = [
  "futures",
  "rustix 1.1.4",
  "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -3737,6 +3741,7 @@ dependencies = [
  "bytes",
  "codex-utils-cargo-bin",
  "codex-utils-rustls-provider",
+ "curl",
  "futures",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -3755,13 +3760,16 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha2 0.10.9",
+ "socket2 0.6.3",
  "system-configuration",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "windows-sys 0.61.2",
  "zstd",
 ]
@@ -4066,6 +4074,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-message-board"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "caseless",
+ "chrono",
+ "codex-attachment-store",
+ "codex-protocol",
+ "codex-state",
+ "codex-tools",
+ "codex-utils-output-truncation",
+ "futures",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "codex-message-history"
 version = "0.0.0"
 dependencies = [
@@ -4118,6 +4149,7 @@ name = "codex-model-provider-info"
 version = "0.0.0"
 dependencies = [
  "codex-client",
+ "codex-http-client",
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-redacted-string",
@@ -4128,7 +4160,6 @@ dependencies = [
  "serde",
  "tempfile",
  "toml 0.9.11+spec-1.1.0",
- "url",
 ]
 
 [[package]]
@@ -6112,6 +6143,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
 dependencies = [
  "cmov",
+]
+
+[[package]]
+name = "curl"
+version = "0.4.50"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a45ee8994e5307cb4c60cfc1c20bf7263ffb771ddc135c9f768a14bcbc15b09"
+dependencies = [
+ "curl-sys",
+ "libc",
+ "openssl-probe 0.1.6",
+ "openssl-sys",
+ "schannel",
+ "socket2 0.6.3",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "curl-sys"
+version = "0.4.90+curl-8.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97799a0d220bfb3361e0fe4936966ff8c4b24d65c3f06dfc70d7b680b44e7897"
+dependencies = [
+ "cc",
+ "libc",
+ "libz-sys",
+ "openssl-sys",
+ "pkg-config",
+ "vcpkg",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9902,6 +9963,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
  "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
+name = "libz-sys"
+version = "1.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
+dependencies = [
+ "cc",
+ "libc",
  "pkg-config",
  "vcpkg",
 ]
