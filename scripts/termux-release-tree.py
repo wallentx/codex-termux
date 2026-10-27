@@ -128,6 +128,24 @@ def merge_updater_additions(text, *, path=None):
                 ):
                     return ours.replace(original, replacement, 1)
             return match[0]
+        if path == "codex-rs/tui/src/update_action.rs":
+            # Upstream split the installer test per platform; Termux only
+            # added one assertion at the top of the old combined test.
+            old = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+            assertion = (
+                "        assert_eq!(\n"
+                "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+                '            ("codex", &["update"][..])\n'
+                "        );\n"
+            )
+            if (
+                base.startswith(old)
+                and theirs == old + assertion + base[len(old) :]
+                and ours
+                == "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+            ):
+                return ours + assertion
+            return match[0]
         if not base and theirs in additions:
             return theirs + ours
         signature = (

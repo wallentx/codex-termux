@@ -579,6 +579,20 @@ class UpdaterAdaptationTests(unittest.TestCase):
                         unsafe,
                     )
 
+    def test_split_installer_test_keeps_termux_assertion(self):
+        old = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        new = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        body = '        assert_eq!(\n            UpdateAction::StandaloneUnix.command_args(),\n            ("sh", &[][..])\n        );\n'
+        assertion = '        assert_eq!(\n            UpdateAction::TermuxSelfUpdate.command_args(),\n            ("codex", &["update"][..])\n        );\n'
+        conflict = f"<<<<<<< upstream\n{new}||||||| baseline\n{old}{body}=======\n{old}{assertion}{body}>>>>>>> target\n"
+        path = "codex-rs/tui/src/update_action.rs"
+        self.assertEqual(
+            module.merge_updater_additions(conflict, path=path), new + assertion
+        )
+        self.assertEqual(module.merge_updater_additions(conflict), conflict)
+        unsafe = conflict.replace(assertion, assertion + "        custom();\n")
+        self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
+
     def test_known_insertion_preserves_upstream_addition(self):
         ours = "    Daemon,\n"
         theirs = "    /// Update by replacing the current Termux binary from wallentx/codex-termux.\n    TermuxSelfUpdate,\n"
