@@ -65,8 +65,34 @@
           ],
           "title": "AmazonBedrockAccount",
           "type": "object"
+        },
+        {
+          "description": "Google Cloud Vertex AI with externally managed credentials.",
+          "properties": {
+            "type": {
+              "enum": [
+                "gcp"
+              ],
+              "title": "GcpAccountType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "GcpAccount",
+          "type": "object"
         }
       ]
+    },
+    "AccountRoutingOverride": {
+      "description": "Backend routing policy. Wire values match the accounts/check contract.",
+      "enum": [
+        "NO_CONSTRAINT",
+        "us",
+        "us_cr"
+      ],
+      "type": "string"
     },
     "PlanType": {
       "enum": [
@@ -75,15 +101,42 @@
         "plus",
         "pro",
         "prolite",
+        "promax",
         "team",
+        "self_serve_business_prolite",
         "self_serve_business_usage_based",
         "business",
+        "ent26",
+        "enterprise_cbp_automation",
         "enterprise_cbp_usage_based",
         "enterprise",
         "edu",
+        "edu_plus",
+        "edu_pro",
+        "sci",
+        "sci_plus",
         "unknown"
       ],
       "type": "string"
+    },
+    "WorkspaceRouting": {
+      "properties": {
+        "accountRoutingOverride": {
+          "$ref": "#/definitions/AccountRoutingOverride"
+        },
+        "backendOrigin": {
+          "type": "string"
+        },
+        "chatgptAccountId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "accountRoutingOverride",
+        "backendOrigin",
+        "chatgptAccountId"
+      ],
+      "type": "object"
     }
   },
   "properties": {

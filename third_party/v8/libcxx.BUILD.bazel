@@ -111,7 +111,7 @@ cc_runtime_stage0_library(
         "//conditions:default": ["-fPIC"],
     }),
     defines = [
-        "CR_LIBCXX_REVISION=99457fa555797f8c5ac3c076ca288d8481d3b23a",
+        "CR_LIBCXX_REVISION=b16984ce99c702355a5b2b4c52574e82cec41fb9",
         "LIBCXX_BUILDING_LIBCXXABI",
         "LIBC_NAMESPACE=__llvm_libc_cr",
         "_LIBCPP_BUILDING_LIBRARY",

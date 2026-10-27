@@ -41,9 +41,13 @@ fn push_visible_message(messages: &mut Vec<ResponseItem>, item: &ResponseItem) {
         } => {
             if let Some(text) = plaintext_agent_message_content(content) {
                 messages.push(ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: ASSISTANT_ROLE.to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: format!("Agent message from {author}:\n{text}"),
                     }],
                     phase: None,
@@ -57,6 +61,7 @@ fn push_visible_message(messages: &mut Vec<ResponseItem>, item: &ResponseItem) {
             content,
             phase,
             internal_chat_message_metadata_passthrough: metadata,
+            ..
         } if role == USER_ROLE
             && matches!(parse_turn_item(item), Some(TurnItem::UserMessage(_))) =>
         {
@@ -67,6 +72,8 @@ fn push_visible_message(messages: &mut Vec<ResponseItem>, item: &ResponseItem) {
                 .collect::<Vec<_>>();
             if !content.is_empty() {
                 messages.push(ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: role.clone(),
                     content,
@@ -84,6 +91,7 @@ mod tests {
     use codex_api::SearchInput;
     use codex_protocol::ResponseItemId;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ImageReference;
     use codex_protocol::models::ResponseItem;
     use pretty_assertions::assert_eq;
 
@@ -93,10 +101,14 @@ mod tests {
 
     fn message(role: &str, text: &str) -> ResponseItem {
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: role.to_string(),
             content: vec![if role == ASSISTANT_ROLE {
                 ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: text.to_string(),
                 }
             } else {
@@ -124,11 +136,14 @@ mod tests {
             message(ASSISTANT_ROLE, "old assistant"),
             previous_user,
             ResponseItem::FunctionCall {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 name: "tool".to_string(),
                 namespace: None,
                 arguments: "{}".to_string(),
                 call_id: "call-1".to_string(),
+                encrypted_function_args: None,
                 internal_chat_message_metadata_passthrough: None,
             },
             previous_assistant,
@@ -150,6 +165,8 @@ mod tests {
     #[test]
     fn keeps_only_text_from_recent_user_messages() {
         let previous_user = ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: USER_ROLE.to_string(),
             content: vec![
@@ -157,7 +174,9 @@ mod tests {
                     text: "previous user".to_string(),
                 },
                 ContentItem::InputImage {
-                    image_url: "data:image/png;base64,image".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,image".to_string(),
+                    },
                     detail: None,
                 },
             ],

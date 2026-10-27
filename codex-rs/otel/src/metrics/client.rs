@@ -36,10 +36,16 @@ use opentelemetry_semantic_conventions as semconv;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::Weak;
 use std::time::Duration;
 use tracing::debug;
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;
 
 const ENV_ATTRIBUTE: &str = "env";
 const METER_NAME: &str = "codex";
@@ -53,7 +59,8 @@ const MILLISECOND_DURATION_BOUNDARIES: &[f64] = &[
 ];
 const SECOND_DURATION_UNIT: &str = "s";
 const SECOND_DURATION_BOUNDARIES: &[f64] = &[
-    0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+    0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 12.0,
+    15.0, 20.0, 30.0, 60.0, 120.0,
 ];
 
 #[derive(Debug, Eq, Hash, PartialEq)]
@@ -97,7 +104,8 @@ impl MetricReader for SharedManualReader {
 }
 
 #[derive(Debug)]
-struct MetricsClientInner {
+pub(super) struct MetricsClientInner {
+    pub(super) network_policy: codex_http_client::NetworkPolicy,
     meter_provider: SdkMeterProvider,
     meter: Meter,
     counters: Mutex<HashMap<InstrumentKey, Counter<u64>>>,
@@ -105,6 +113,8 @@ struct MetricsClientInner {
     histograms: Mutex<HashMap<String, Histogram<f64>>>,
     duration_histograms: Mutex<HashMap<InstrumentKey, Histogram<f64>>>,
     runtime_reader: Option<Arc<ManualReader>>,
+    requires_analytics_consent: bool,
+    statsig_disabled_metrics: &'static [&'static str],
     default_tags: BTreeMap<String, String>,
 }
 
@@ -124,6 +134,10 @@ impl MetricsClientInner {
             });
         }
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
 
         let mut counters = self
             .counters
@@ -145,17 +159,31 @@ impl MetricsClientInner {
         Ok(())
     }
 
-    fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
+    fn histogram(
+        &self,
+        name: &str,
+        value: i64,
+        boundaries: Option<&[f64]>,
+        tags: &[(&str, &str)],
+    ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
 
         let mut histograms = self
             .histograms
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let histogram = histograms
-            .entry(name.to_string())
-            .or_insert_with(|| self.meter.f64_histogram(name.to_string()).build());
+        let histogram = histograms.entry(name.to_string()).or_insert_with(|| {
+            let builder = self.meter.f64_histogram(name.to_string());
+            match boundaries {
+                Some(boundaries) => builder.with_boundaries(boundaries.to_vec()).build(),
+                None => builder.build(),
+            }
+        });
         histogram.record(value as f64, &attributes);
         Ok(())
     }
@@ -169,6 +197,10 @@ impl MetricsClientInner {
     ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
 
         let mut gauges = self
             .gauges
@@ -199,6 +231,11 @@ impl MetricsClientInner {
     ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
+
         let _gauge = self
             .meter
             .i64_observable_gauge(name.to_string())
@@ -219,6 +256,10 @@ impl MetricsClientInner {
     ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
 
         let mut histograms = self
             .duration_histograms
@@ -277,18 +318,25 @@ impl MetricsClientInner {
 
 /// OpenTelemetry metrics client used by Codex.
 #[derive(Clone, Debug)]
-pub struct MetricsClient(std::sync::Arc<MetricsClientInner>);
+pub struct MetricsClient {
+    // Keep the original provider so its owner only shuts down its own exporter.
+    pub(super) inner: Arc<MetricsClientInner>,
+    // Installed clients share this slot, so existing clones follow account changes.
+    pub(super) active: Option<Arc<RwLock<Arc<MetricsClientInner>>>>,
+}
 
 impl MetricsClient {
     /// Build a metrics client from configuration and validate defaults.
     pub fn new(config: MetricsConfig) -> Result<Self> {
         let MetricsConfig {
+            http_client_factory,
             environment,
             service_name,
             service_version,
             exporter,
             export_interval,
             runtime_reader,
+            statsig_disabled_metrics,
             default_tags,
         } = config;
 
@@ -315,31 +363,79 @@ impl MetricsClient {
             )
         });
 
+        let requires_analytics_consent =
+            matches!(exporter, MetricsExporter::Otlp(OtelExporter::Statsig));
         let (meter_provider, meter) = match exporter {
             MetricsExporter::InMemory(exporter) => {
                 build_provider(resource, exporter, export_interval, runtime_reader.clone())
             }
             MetricsExporter::Otlp(exporter) => {
-                let exporter = build_otlp_metric_exporter(exporter, Temporality::Delta)?;
+                let temporality = otlp_metrics_temporality(
+                    &exporter,
+                    std::env::var("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE")
+                        .ok()
+                        .as_deref(),
+                );
+                let exporter = crate::network_policy::PolicyExporter {
+                    exporter: build_otlp_metric_exporter(
+                        exporter,
+                        temporality,
+                        &http_client_factory,
+                    )?,
+                    policy: http_client_factory.network_policy().clone(),
+                };
                 build_provider(resource, exporter, export_interval, runtime_reader.clone())
             }
         };
 
-        Ok(Self(std::sync::Arc::new(MetricsClientInner {
-            meter_provider,
-            meter,
-            counters: Mutex::new(HashMap::new()),
-            gauges: Mutex::new(HashMap::new()),
-            histograms: Mutex::new(HashMap::new()),
-            duration_histograms: Mutex::new(HashMap::new()),
-            runtime_reader,
-            default_tags,
-        })))
+        Ok(Self {
+            inner: Arc::new(MetricsClientInner {
+                network_policy: http_client_factory.network_policy().clone(),
+                meter_provider,
+                meter,
+                counters: Mutex::new(HashMap::new()),
+                gauges: Mutex::new(HashMap::new()),
+                histograms: Mutex::new(HashMap::new()),
+                duration_histograms: Mutex::new(HashMap::new()),
+                runtime_reader,
+                requires_analytics_consent,
+                statsig_disabled_metrics,
+                default_tags,
+            }),
+            active: None,
+        })
+    }
+
+    pub(super) fn active_inner(&self) -> Arc<MetricsClientInner> {
+        match &self.active {
+            Some(active) => active
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            None => Arc::clone(&self.inner),
+        }
     }
 
     /// Send a single counter increment.
     pub fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.0.counter(name, /*description*/ None, inc, tags)
+        self.active_inner()
+            .counter(name, /*description*/ None, inc, tags)
+    }
+
+    /// Record a counter while applying analytics consent only to the built-in exporter.
+    /// The consent check and recording use the same exporter even during provider replacement.
+    pub fn counter_with_analytics_consent(
+        &self,
+        name: &str,
+        inc: i64,
+        tags: &[(&str, &str)],
+        analytics_enabled: bool,
+    ) -> Result<()> {
+        let inner = self.active_inner();
+        if inner.requires_analytics_consent && !analytics_enabled {
+            return Ok(());
+        }
+        inner.counter(name, /*description*/ None, inc, tags)
     }
 
     /// Send a single counter increment with an instrument description.
@@ -350,17 +446,32 @@ impl MetricsClient {
         inc: i64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.counter(name, Some(description), inc, tags)
+        self.active_inner()
+            .counter(name, Some(description), inc, tags)
     }
 
     /// Send a single histogram sample.
     pub fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.0.histogram(name, value, tags)
+        self.active_inner()
+            .histogram(name, value, /*boundaries*/ None, tags)
+    }
+
+    /// Send a single histogram sample using explicit bucket boundaries.
+    pub fn histogram_with_boundaries(
+        &self,
+        name: &str,
+        value: i64,
+        boundaries: &[f64],
+        tags: &[(&str, &str)],
+    ) -> Result<()> {
+        self.active_inner()
+            .histogram(name, value, Some(boundaries), tags)
     }
 
     /// Send a single gauge measurement.
     pub fn gauge(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.0.gauge(name, /*description*/ None, value, tags)
+        self.active_inner()
+            .gauge(name, /*description*/ None, value, tags)
     }
 
     /// Send a single gauge measurement with an instrument description.
@@ -371,7 +482,8 @@ impl MetricsClient {
         value: i64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.gauge(name, Some(description), value, tags)
+        self.active_inner()
+            .gauge(name, Some(description), value, tags)
     }
 
     /// Register a gauge callback that reports the current value on every collection.
@@ -382,7 +494,7 @@ impl MetricsClient {
         observe: impl Fn() -> i64 + Send + Sync + 'static,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0
+        self.active_inner()
             .register_observable_gauge(name, description, observe, tags)
     }
 
@@ -393,7 +505,7 @@ impl MetricsClient {
         duration: Duration,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.duration_histogram(
+        self.active_inner().duration_histogram(
             name,
             duration.as_millis().min(i64::MAX as u128) as f64,
             MILLISECOND_DURATION_UNIT,
@@ -410,7 +522,7 @@ impl MetricsClient {
         duration_ms: f64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.duration_histogram(
+        self.active_inner().duration_histogram(
             name,
             duration_ms,
             MILLISECOND_DURATION_UNIT,
@@ -428,7 +540,7 @@ impl MetricsClient {
         duration: Duration,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.0.duration_histogram(
+        self.active_inner().duration_histogram(
             name,
             duration.as_secs_f64(),
             SECOND_DURATION_UNIT,
@@ -448,7 +560,8 @@ impl MetricsClient {
 
     /// Collect a runtime metrics snapshot without shutting down the provider.
     pub fn snapshot(&self) -> Result<ResourceMetrics> {
-        let Some(reader) = &self.0.runtime_reader else {
+        let inner = self.active_inner();
+        let Some(reader) = &inner.runtime_reader else {
             return Err(MetricsError::RuntimeSnapshotUnavailable);
         };
         let mut snapshot = ResourceMetrics::default();
@@ -460,12 +573,15 @@ impl MetricsClient {
 
     /// Flush metrics and stop the underlying OTEL meter provider.
     pub fn shutdown(&self) -> Result<()> {
-        self.0.shutdown()
+        super::buffered::GLOBAL.suspend(self);
+        self.inner.shutdown()
     }
 }
 
 fn os_resource_attributes() -> Vec<KeyValue> {
-    let os_info = os_info::get();
+    // Provider creation must not repeat OS discovery subprocesses.
+    static OS_INFO: LazyLock<os_info::Info> = LazyLock::new(os_info::get);
+    let os_info = &*OS_INFO;
     let os_type_raw = os_info.os_type().to_string();
     let os_type = sanitize_metric_tag_value(os_type_raw.as_str());
     let os_version_raw = os_info.version().to_string();
@@ -503,15 +619,30 @@ where
     (provider, meter)
 }
 
+fn otlp_metrics_temporality(exporter: &OtelExporter, preference: Option<&str>) -> Temporality {
+    // Select before resolving Statsig to OTLP so its built-in route stays Delta.
+    match exporter {
+        OtelExporter::None | OtelExporter::Statsig => Temporality::Delta,
+        OtelExporter::OtlpGrpc { .. } | OtelExporter::OtlpHttp { .. } => match preference {
+            Some(value) if value.eq_ignore_ascii_case("cumulative") => Temporality::Cumulative,
+            Some(value) if value.eq_ignore_ascii_case("lowmemory") => Temporality::LowMemory,
+            // Preserve Codex's existing default for unset, empty, or unknown values.
+            _ => Temporality::Delta,
+        },
+    }
+}
+
 fn build_otlp_metric_exporter(
     exporter: OtelExporter,
     temporality: Temporality,
+    factory: &codex_http_client::HttpClientFactory,
 ) -> Result<opentelemetry_otlp::MetricExporter> {
     match exporter {
         OtelExporter::None => Err(MetricsError::ExporterDisabled),
         OtelExporter::Statsig => build_otlp_metric_exporter(
             crate::config::resolve_exporter(&OtelExporter::Statsig),
             temporality,
+            factory,
         ),
         OtelExporter::OtlpGrpc {
             endpoint,
@@ -563,7 +694,17 @@ fn build_otlp_metric_exporter(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if let Some(tls) = tls.as_ref() {
+            if factory.network_policy().is_managed() {
+                let client = crate::otlp::build_async_http_client(
+                    factory,
+                    tls.as_ref(),
+                    OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+                )
+                .map_err(|err| MetricsError::InvalidConfig {
+                    message: err.to_string(),
+                })?;
+                exporter_builder = exporter_builder.with_http_client(client);
+            } else if let Some(tls) = tls.as_ref() {
                 let client =
                     crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)
                         .map_err(|err| MetricsError::InvalidConfig {

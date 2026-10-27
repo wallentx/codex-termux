@@ -1,0 +1,15 @@
+---
+source: tui/src/startup_draft_tests.rs
+expression: frames
+---
+before onboarding: hidden (0x0 viewport)
+---
+after onboarding:
+
+  >_ OpenAI Codex (v<VERSION>)
+     loading
+
+
+› Ask Codex to do anything
+
+  ? for shortcuts

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import importlib.metadata
+import ast
 import os
+import runpy
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATED_TARGETS = [
@@ -34,24 +38,84 @@ def _snapshot_targets(root: Path) -> dict[str, dict[str, bytes] | bytes | None]:
     return {str(rel_path): _snapshot_target(root, rel_path) for rel_path in GENERATED_TARGETS}
 
 
-def test_generated_files_are_up_to_date():
-    """Regenerating from the pinned runtime package should leave artifacts unchanged."""
+@pytest.mark.parametrize("format_output", [True, False])
+def test_generated_files_are_up_to_date(tmp_path, format_output):
+    """Both generation modes preserve the reviewed API, with optional formatting."""
     before = _snapshot_targets(ROOT)
+    sdk = tmp_path / "sdk" / "python"
+    sdk.mkdir(parents=True)
+    for directory in ("src", "scripts"):
+        shutil.copytree(
+            ROOT / directory, sdk / directory, ignore=shutil.ignore_patterns("__pycache__")
+        )
+    for name in ("pyproject.toml", "release_version.py"):
+        shutil.copyfile(ROOT / name, sdk / name)
 
-    # Regenerate contract artifacts via the pinned runtime package, not a local
-    # app-server binary from the checkout or CI environment.
-    assert importlib.metadata.version("openai-codex-cli-bin") == "0.144.4"
     env = os.environ.copy()
-    env.pop("CODEX_EXEC_PATH", None)
     python_bin = str(Path(sys.executable).parent)
     env["PATH"] = f"{python_bin}{os.pathsep}{env.get('PATH', '')}"
 
+    command = [
+        sys.executable,
+        "scripts/update_sdk_artifacts.py",
+        "generate-types",
+        "--schema-dir",
+        str(ROOT.parents[1] / "codex-rs/app-server-protocol/schema/json"),
+    ]
+    if not format_output:
+        command.append("--no-format")
     subprocess.run(
-        [sys.executable, "scripts/update_sdk_artifacts.py", "generate-types"],
-        cwd=ROOT,
+        command,
+        cwd=sdk,
         check=True,
         env=env,
     )
 
-    after = _snapshot_targets(ROOT)
-    assert before == after, "Generated files drifted after regeneration"
+    after = _snapshot_targets(sdk)
+    if format_output:
+        assert before == after, "Generated files drifted after regeneration"
+    else:
+        assert [ast.dump(ast.parse((ROOT / path).read_bytes())) for path in GENERATED_TARGETS] == [
+            ast.dump(ast.parse((sdk / path).read_bytes())) for path in GENERATED_TARGETS
+        ]
+
+
+@pytest.mark.parametrize("mode", ["repository", "scratch", "experimental"])
+def test_schema_refresh_only_updates_python_for_repository_schemas(monkeypatch, tmp_path, mode):
+    script = ROOT.parents[1] / "codex-rs/app-server-protocol/scripts/write_schema_fixtures.py"
+    arguments = {
+        "repository": [],
+        "scratch": ["--schema-root", str(tmp_path / "schema")],
+        "experimental": ["--experimental"],
+    }[mode]
+    calls = []
+    monkeypatch.setattr(sys, "argv", [str(script), *arguments])
+    monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: calls.append((args, kwargs)))
+
+    runpy.run_path(str(script), run_name="__main__")
+
+    assert [args[0] for args, _kwargs in calls] == (
+        ["cargo", "uv"] if mode == "repository" else ["cargo"]
+    )
+    assert all(kwargs["check"] for _args, kwargs in calls)
+    if mode == "repository":
+        assert calls[1][0][-3:] == [
+            "generate-types",
+            "--schema-dir",
+            str(ROOT.parents[1] / "codex-rs/app-server-protocol/schema/json"),
+        ]
+
+
+def test_schema_generation_failure_does_not_update_python(monkeypatch):
+    script = ROOT.parents[1] / "codex-rs/app-server-protocol/scripts/write_schema_fixtures.py"
+    calls = []
+
+    def fail(args, **_kwargs):
+        calls.append(args[0])
+        raise subprocess.CalledProcessError(1, args)
+
+    monkeypatch.setattr(sys, "argv", [str(script)])
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        runpy.run_path(str(script), run_name="__main__")
+    assert calls == ["cargo"]

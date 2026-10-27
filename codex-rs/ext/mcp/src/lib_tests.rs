@@ -29,9 +29,16 @@ async fn hosted_plugin_runtime_forwards_thread_originator() -> Result<(), Box<dy
             "codex_work_desktop",
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
+            /*executor_capability_discovery_v2*/ None,
         ))
         .await;
-    let [McpServerContribution::Set { config: server, .. }] = contributions.as_slice() else {
+    let [
+        McpServerContribution::HostedApps {
+            config: server,
+            protocol_mode: None,
+        },
+    ] = contributions.as_slice()
+    else {
         panic!("hosted plugin runtime should contribute one server");
     };
     let McpServerTransportConfig::StreamableHttp { http_headers, .. } = &server.transport else {
@@ -47,3 +54,8 @@ async fn hosted_plugin_runtime_forwards_thread_originator() -> Result<(), Box<dy
 
     Ok(())
 }
+
+#[path = "event_stream_tests.rs"]
+mod event_stream_tests;
+#[path = "stream_manager_tests.rs"]
+mod stream_manager_tests;

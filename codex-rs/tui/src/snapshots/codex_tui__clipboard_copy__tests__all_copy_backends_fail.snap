@@ -1,0 +1,5 @@
+---
+source: tui/src/clipboard_copy.rs
+expression: error
+---
+Windows clipboard: powershell unavailable; native clipboard: native unavailable; terminal clipboard: tmux clipboard: tmux unavailable; OSC 52 fallback: osc blocked

@@ -1,33 +1,34 @@
+use crate::model::ExternalAgentSessionImportLimits;
 use crate::sessions::ExternalAgentSessionMigration;
+use crate::sessions::SessionRecordFormat;
 use crate::sessions::ledger::load_import_ledger;
 use crate::sessions::ledger::save_import_ledger;
 use crate::sessions::now_unix_seconds;
-use crate::sessions::records::summarize_session_with_cwd;
+use crate::sessions::records_cla;
+use crate::sessions::records_cur;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
-
-pub(super) const SESSION_IMPORT_MAX_COUNT: usize = 50;
-const SESSION_IMPORT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 pub(super) struct SessionFileCandidate {
     pub path: PathBuf,
     pub fallback_cwd: Option<PathBuf>,
+    pub record_format: SessionRecordFormat,
 }
 
 pub(super) fn detect_recent_sessions(
     codex_home: &Path,
     candidates: impl IntoIterator<Item = SessionFileCandidate>,
     require_existing_cwd: bool,
+    limits: ExternalAgentSessionImportLimits,
 ) -> io::Result<Vec<ExternalAgentSessionMigration>> {
     let now = now_unix_seconds();
     let mut ledger = load_import_ledger(codex_home)?;
     let source_states = ledger.source_states();
-    let mut recent = BinaryHeap::with_capacity(SESSION_IMPORT_MAX_COUNT + 1);
+    let mut recent = BinaryHeap::new();
 
     for candidate in candidates {
         let Ok(metadata) = fs::metadata(&candidate.path) else {
@@ -39,9 +40,7 @@ pub(super) fn detect_recent_sessions(
         let Ok(modified_at) = modified_at.duration_since(std::time::UNIX_EPOCH) else {
             continue;
         };
-        if (modified_at.as_secs() as i64)
-            < now.saturating_sub(SESSION_IMPORT_MAX_AGE.as_secs() as i64)
-        {
+        if (modified_at.as_secs() as i64) < now.saturating_sub(limits.max_age.as_secs() as i64) {
             continue;
         }
         let Ok(modified_at_nanos) = i64::try_from(modified_at.as_nanos()) else {
@@ -61,8 +60,9 @@ pub(super) fn detect_recent_sessions(
             Reverse(modified_at_nanos),
             candidate.path,
             candidate.fallback_cwd,
+            candidate.record_format,
         ));
-        if recent.len() > SESSION_IMPORT_MAX_COUNT {
+        if recent.len() > limits.max_sessions {
             recent.pop();
         }
     }
@@ -70,7 +70,7 @@ pub(super) fn detect_recent_sessions(
     drop(source_states);
     let mut migrations = Vec::new();
     let mut ledger_changed = false;
-    for (modified_at, path, fallback_cwd) in recent.into_sorted_vec() {
+    for (modified_at, path, fallback_cwd, record_format) in recent.into_sorted_vec() {
         match ledger.refresh_current_source(&path, modified_at.0) {
             Ok(false) => {}
             Ok(true) => {
@@ -79,7 +79,13 @@ pub(super) fn detect_recent_sessions(
             }
             Err(_) => continue,
         }
-        let Ok(Some(summary)) = summarize_session_with_cwd(&path, fallback_cwd.as_deref()) else {
+        let summary = match record_format {
+            SessionRecordFormat::Cla => records_cla::summarize_session(&path),
+            SessionRecordFormat::Cur => {
+                records_cur::summarize_session(&path, fallback_cwd.as_deref())
+            }
+        };
+        let Ok(Some(summary)) = summary else {
             continue;
         };
         if require_existing_cwd && !summary.migration.cwd.is_dir() {

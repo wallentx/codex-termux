@@ -1,3 +1,6 @@
+//! Credentials and recovery bound to one remote-control login lifetime.
+//! A request can refresh credentials, but cannot adopt a replacement authentication owner.
+
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use codex_api::SharedAuthProvider;
@@ -10,9 +13,58 @@ use tokio::sync::watch;
 use tracing::info;
 use tracing::warn;
 
+#[derive(Clone)]
+pub(super) struct RemoteControlAuth {
+    manager: Arc<AuthManager>,
+    pub(super) owner: crate::ConnectionAuth,
+    pub(super) network_policy: codex_http_client::NetworkPolicy,
+}
+
+pub(super) struct RemoteControlRecovery {
+    auth: RemoteControlAuth,
+    recovery: UnauthorizedRecovery,
+}
+
+impl RemoteControlAuth {
+    pub(super) fn capture(manager: Arc<AuthManager>) -> (Self, bool) {
+        loop {
+            let owner = crate::ConnectionAuth::capture(&manager);
+            let authenticated = manager
+                .auth_cached()
+                .is_some_and(|auth| auth.uses_codex_backend() && auth.get_account_id().is_some());
+            if owner.is_current() {
+                return (
+                    Self {
+                        network_policy: manager.application_network_policy(),
+                        manager,
+                        owner,
+                    },
+                    authenticated,
+                );
+            }
+        }
+    }
+
+    pub(super) fn ensure_current(&self) -> io::Result<()> {
+        self.owner.ensure_current()
+    }
+
+    pub(super) fn unauthorized_recovery(&self) -> RemoteControlRecovery {
+        RemoteControlRecovery {
+            auth: self.clone(),
+            recovery: self.manager.unauthorized_recovery(),
+        }
+    }
+
+    pub(super) fn auth_change_receiver(&self) -> watch::Receiver<u64> {
+        self.manager.auth_change_receiver()
+    }
+}
+
 pub(super) const REMOTE_CONTROL_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 
 pub(super) struct RemoteControlConnectionAuth {
+    pub(super) http_client_factory: codex_http_client::HttpClientFactory,
     pub(super) auth_provider: SharedAuthProvider,
     pub(super) account_id: String,
 }
@@ -20,7 +72,9 @@ pub(super) struct RemoteControlConnectionAuth {
 impl RemoteControlConnectionAuth {
     pub(super) fn request_headers(&self) -> io::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        self.auth_provider.add_auth_headers(&mut headers);
+        self.auth_provider
+            .add_auth_headers(&mut headers)
+            .map_err(io::Error::other)?;
         headers.insert(
             REMOTE_CONTROL_ACCOUNT_ID_HEADER,
             HeaderValue::from_str(&self.account_id).map_err(|err| {
@@ -35,11 +89,21 @@ impl RemoteControlConnectionAuth {
 }
 
 pub(super) async fn load_remote_control_auth(
+    auth: &RemoteControlAuth,
+) -> io::Result<RemoteControlConnectionAuth> {
+    auth.ensure_current()?;
+    let credentials = load_auth_manager(&auth.manager).await?;
+    auth.ensure_current()?;
+    Ok(credentials)
+}
+
+async fn load_auth_manager(
     auth_manager: &Arc<AuthManager>,
 ) -> io::Result<RemoteControlConnectionAuth> {
     let mut reloaded = false;
-    let auth = loop {
-        let Some(auth) = auth_manager.auth().await else {
+    let (auth, http_client_factory) = loop {
+        let Some((auth, http_client_factory)) = auth_manager.auth_with_http_client_factory().await
+        else {
             if reloaded {
                 return Err(io::Error::new(
                     ErrorKind::PermissionDenied,
@@ -51,14 +115,14 @@ pub(super) async fn load_remote_control_auth(
             continue;
         };
         if !auth.uses_codex_backend() {
-            break auth;
+            break (auth, http_client_factory);
         }
         if auth.get_account_id().is_none() && !reloaded {
             auth_manager.reload().await;
             reloaded = true;
             continue;
         }
-        break auth;
+        break (auth, http_client_factory);
     };
 
     if !auth.uses_codex_backend() {
@@ -69,6 +133,7 @@ pub(super) async fn load_remote_control_auth(
     }
 
     Ok(RemoteControlConnectionAuth {
+        http_client_factory,
         auth_provider: codex_model_provider::auth_provider_from_auth(&auth),
         account_id: auth.get_account_id().ok_or_else(|| {
             io::Error::new(
@@ -79,10 +144,46 @@ pub(super) async fn load_remote_control_auth(
     })
 }
 
+pub(super) async fn request_client(
+    factory: &codex_http_client::HttpClientFactory,
+    endpoint: &str,
+) -> io::Result<codex_http_client::HttpClient> {
+    codex_login::default_client::create_client_for_route_without_request_logging_async(
+        factory.clone(),
+        endpoint.to_string(),
+        codex_http_client::ClientRouteClass::Api,
+    )
+    .await
+}
+
+pub(super) fn is_policy_denial(error: &io::Error) -> bool {
+    let Some(cause) = error.get_ref() else {
+        return false;
+    };
+    cause.is::<codex_http_client::NetworkPolicyDenied>()
+}
+
+pub(super) fn is_auth_error(error: &io::Error) -> bool {
+    error.kind() == ErrorKind::PermissionDenied && !is_policy_denial(error)
+}
+
+pub(super) fn request_error(error: codex_http_client::HttpError) -> io::Error {
+    match error {
+        codex_http_client::HttpError::Policy(denied) => {
+            io::Error::new(ErrorKind::PermissionDenied, denied)
+        }
+        error => io::Error::other(error),
+    }
+}
+
 pub(super) async fn recover_remote_control_auth(
-    auth_recovery: &mut UnauthorizedRecovery,
+    recovery: &mut RemoteControlRecovery,
     auth_change_rx: &mut watch::Receiver<u64>,
 ) -> bool {
+    if recovery.auth.ensure_current().is_err() {
+        return false;
+    }
+    let auth_recovery = &mut recovery.recovery;
     if !auth_recovery.has_next() {
         return false;
     }
@@ -92,6 +193,9 @@ pub(super) async fn recover_remote_control_auth(
     let auth_change_revision_before_recovery = *auth_change_rx.borrow();
     match auth_recovery.next().await {
         Ok(step_result) => {
+            if recovery.auth.ensure_current().is_err() {
+                return false;
+            }
             if step_result.auth_state_changed() == Some(true) {
                 mark_recovery_auth_change_seen(
                     auth_change_rx,
@@ -137,7 +241,7 @@ mod tests {
     }
 
     impl AuthProvider for TestAuthProvider {
-        fn add_auth_headers(&self, headers: &mut HeaderMap) {
+        fn add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
             headers.insert(
                 axum::http::header::AUTHORIZATION,
                 HeaderValue::from_static("Bearer test-token"),
@@ -146,6 +250,7 @@ mod tests {
             for account_id in &self.account_ids {
                 headers.append("ChatGPT-Account-ID", HeaderValue::from_static(account_id));
             }
+            Ok(())
         }
     }
 
@@ -154,6 +259,9 @@ mod tests {
         provider_account_ids: Vec<&'static str>,
     ) -> RemoteControlConnectionAuth {
         RemoteControlConnectionAuth {
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
             auth_provider: Arc::new(TestAuthProvider {
                 account_ids: provider_account_ids,
             }),

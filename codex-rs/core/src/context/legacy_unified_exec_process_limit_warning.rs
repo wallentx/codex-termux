@@ -1,10 +1,17 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 // This warning is not produced anymore but fragment definition is used to filter messaged from old sessions
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LegacyUnifiedExecProcessLimitWarning;
 
 impl ContextualUserFragment for LegacyUnifiedExecProcessLimitWarning {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("unified_exec.legacy_process_limit_warning".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -23,7 +30,7 @@ impl ContextualUserFragment for LegacyUnifiedExecProcessLimitWarning {
         )
     }
 
-    fn body(&self) -> String {
-        String::new()
+    fn body(&self) -> ContentItem {
+        input_text(String::new())
     }
 }

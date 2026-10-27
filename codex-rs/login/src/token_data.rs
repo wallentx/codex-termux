@@ -21,7 +21,22 @@ pub struct TokenData {
 
     pub refresh_token: String,
 
+    /// OAuth authority recorded when this refresh token was issued. Older records have no
+    /// provenance; never infer authority from unverified token claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_provenance: Option<AccountOAuthProvenance>,
+
+    /// Identifies one completed login; token rotation preserves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_owner_id: Option<String>,
+
     pub account_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct AccountOAuthProvenance {
+    pub issuer: String,
+    pub client_id: String,
 }
 
 /// Flat subset of useful claims in id_token from auth.json.
@@ -104,6 +119,18 @@ struct StandardJwtClaims {
     exp: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct AccountUserClaims {
+    #[serde(rename = "https://api.openai.com/auth")]
+    auth: Option<AccountUserAuthClaims>,
+}
+
+#[derive(Deserialize)]
+struct AccountUserAuthClaims {
+    chatgpt_account_user_id: Option<String>,
+    chatgpt_account_id: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum IdTokenInfoError {
     #[error("invalid ID token format")]
@@ -114,7 +141,7 @@ pub enum IdTokenInfoError {
     Json(#[from] serde_json::Error),
 }
 
-fn decode_jwt_payload<T: DeserializeOwned>(jwt: &str) -> Result<T, IdTokenInfoError> {
+pub(crate) fn decode_jwt_payload<T: DeserializeOwned>(jwt: &str) -> Result<T, IdTokenInfoError> {
     // JWT format: header.payload.signature
     let mut parts = jwt.split('.');
     let (_header_b64, payload_b64, _sig_b64) = match (parts.next(), parts.next(), parts.next()) {
@@ -132,6 +159,31 @@ pub fn parse_jwt_expiration(jwt: &str) -> Result<Option<DateTime<Utc>>, IdTokenI
     Ok(claims
         .exp
         .and_then(|exp| DateTime::<Utc>::from_timestamp(exp, 0)))
+}
+
+// Keep membership parsing separate from ordinary auth claims: a malformed optional
+// membership must disable local verification without breaking an otherwise valid login.
+// Both paths share decode_jwt_payload for the JWT envelope.
+pub(crate) fn parse_chatgpt_account_user_id(
+    jwt: &str,
+    account_id: &str,
+) -> Result<Option<String>, IdTokenInfoError> {
+    if account_id.is_empty() || account_id.trim() != account_id {
+        return Ok(None);
+    }
+    if jwt.split('.').count() != 3 {
+        return Err(IdTokenInfoError::InvalidFormat);
+    }
+    let claims: AccountUserClaims = decode_jwt_payload(jwt)?;
+    let Some(auth) = claims.auth else {
+        return Ok(None);
+    };
+    if auth.chatgpt_account_id.as_deref() != Some(account_id) {
+        return Ok(None);
+    }
+    Ok(auth
+        .chatgpt_account_user_id
+        .filter(|id| !id.is_empty() && id.trim() == id.as_str()))
 }
 
 pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoError> {

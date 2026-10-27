@@ -6,6 +6,7 @@ use crate::chatgpt_client::chatgpt_get_request_with_timeout;
 use crate::chatgpt_client::chatgpt_post_request_with_timeout;
 
 use codex_connectors::AppInfo;
+use codex_connectors::AppToolPolicyEvaluator;
 use codex_connectors::ConnectorDirectoryCacheContext;
 use codex_connectors::ConnectorDirectoryCacheKey;
 use codex_connectors::ConnectorMetadata;
@@ -21,7 +22,6 @@ pub use codex_core::connectors::list_accessible_connectors_from_mcp_tools_with_m
 pub use codex_core::connectors::list_accessible_connectors_from_mcp_tools_with_options;
 pub use codex_core::connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status;
 pub use codex_core::connectors::list_cached_accessible_connectors_from_mcp_tools;
-pub use codex_core::connectors::with_app_enabled_state;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_plugin::AppConnectorId;
@@ -32,18 +32,18 @@ const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTOR_METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_APPS_PRODUCT_SKU: &str = "codex";
 
-async fn apps_enabled(config: &Config) -> bool {
+async fn apps_enabled(config: &Config) -> anyhow::Result<bool> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
     let auth = auth_manager.auth().await;
-    config
+    Ok(config
         .features
-        .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
+        .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend)))
 }
 
 async fn connector_auth(config: &Config) -> anyhow::Result<CodexAuth> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
     let auth = auth_manager
         .auth()
         .await
@@ -56,7 +56,7 @@ async fn connector_auth(config: &Config) -> anyhow::Result<CodexAuth> {
 }
 
 pub async fn list_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>> {
-    if !apps_enabled(config).await {
+    if !apps_enabled(config).await? {
         return Ok(Vec::new());
     }
     let (connectors_result, accessible_result) = tokio::join!(
@@ -65,12 +65,13 @@ pub async fn list_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>> {
     );
     let connectors = connectors_result?;
     let accessible = accessible_result?;
-    Ok(with_app_enabled_state(
-        merge_connectors_with_accessible(
-            connectors, accessible, /*all_connectors_loaded*/ true,
+    Ok(
+        AppToolPolicyEvaluator::new(&config.config_layer_stack).apply_app_enabled_state(
+            merge_connectors_with_accessible(
+                connectors, accessible, /*all_connectors_loaded*/ true,
+            ),
         ),
-        config,
-    ))
+    )
 }
 
 pub async fn list_all_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>> {
@@ -81,7 +82,7 @@ pub async fn list_cached_all_connectors(
     config: &Config,
     plugin_apps: &[AppConnectorId],
 ) -> Option<Vec<AppInfo>> {
-    if !apps_enabled(config).await {
+    if !apps_enabled(config).await.ok()? {
         return Some(Vec::new());
     }
 
@@ -99,7 +100,7 @@ pub async fn list_all_connectors_with_options(
     force_refetch: bool,
     plugin_apps: &[AppConnectorId],
 ) -> anyhow::Result<Vec<AppInfo>> {
-    if !apps_enabled(config).await {
+    if !apps_enabled(config).await? {
         return Ok(Vec::new());
     }
     let auth = connector_auth(config).await?;
@@ -133,6 +134,8 @@ pub struct ConnectorMetadataReadResult {
 ///
 /// The store is created before awaiting the backend request, so a response that arrives after an
 /// account or backend change can only commit to the scope under which it was requested.
+/// Capture `auth` and `config.application_network_policy` together using
+/// `AuthManager::auth_with_http_client_factory` so the request retains that account's policy.
 pub async fn read_connector_metadata(
     config: &Config,
     auth: &CodexAuth,
@@ -233,6 +236,10 @@ struct BatchApp {
     name: String,
     description: Option<String>,
     icon_url: Option<String>,
+    #[serde(default, rename = "icon_dark_url", alias = "icon_url_dark")]
+    icon_url_dark: Option<String>,
+    #[serde(default)]
+    distribution_channel: Option<String>,
     #[serde(default)]
     tools: Option<Vec<BatchAppToolSummary>>,
 }
@@ -242,6 +249,12 @@ struct BatchAppToolSummary {
     name: String,
     title: Option<String>,
     description: String,
+    #[serde(default)]
+    is_enabled: Option<bool>,
+    #[serde(default)]
+    disabled_reason: Option<String>,
+    #[serde(default)]
+    is_read_only: bool,
 }
 
 fn batch_app_to_metadata(app: BatchApp) -> ConnectorMetadata {
@@ -250,6 +263,8 @@ fn batch_app_to_metadata(app: BatchApp) -> ConnectorMetadata {
         name,
         description,
         icon_url,
+        icon_url_dark,
+        distribution_channel,
         tools,
     } = app;
     ConnectorMetadata {
@@ -257,6 +272,8 @@ fn batch_app_to_metadata(app: BatchApp) -> ConnectorMetadata {
         name,
         description,
         icon_url,
+        icon_url_dark,
+        distribution_channel,
         tool_summaries: tools.map(|tools| {
             tools
                 .into_iter()
@@ -265,11 +282,17 @@ fn batch_app_to_metadata(app: BatchApp) -> ConnectorMetadata {
                         name,
                         title,
                         description,
+                        is_enabled,
+                        disabled_reason,
+                        is_read_only,
                     } = tool;
                     ConnectorToolSummary {
                         name,
                         title,
                         description,
+                        is_enabled: is_enabled.unwrap_or(true),
+                        disabled_reason,
+                        is_read_only,
                     }
                 })
                 .collect()
@@ -351,6 +374,43 @@ mod tests {
     use codex_connectors::metadata::connector_install_url;
     use codex_plugin::AppConnectorId;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn batch_app_accepts_missing_optional_metadata() {
+        let app = serde_json::from_value::<BatchApp>(json!({
+            "id": "alpha",
+            "name": "Alpha",
+            "description": "Alpha description",
+            "icon_url": null,
+            "tools": [{
+                "name": "search",
+                "title": "Search",
+                "description": "Search Alpha",
+            }],
+        }))
+        .expect("valid legacy batch app");
+
+        assert_eq!(
+            batch_app_to_metadata(app),
+            ConnectorMetadata {
+                id: "alpha".to_string(),
+                name: "Alpha".to_string(),
+                description: Some("Alpha description".to_string()),
+                icon_url: None,
+                icon_url_dark: None,
+                distribution_channel: None,
+                tool_summaries: Some(vec![ConnectorToolSummary {
+                    name: "search".to_string(),
+                    title: Some("Search".to_string()),
+                    description: "Search Alpha".to_string(),
+                    is_enabled: true,
+                    disabled_reason: None,
+                    is_read_only: false,
+                }]),
+            }
+        );
+    }
 
     fn app(id: &str) -> AppInfo {
         AppInfo {

@@ -7,24 +7,25 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandToolOptions {
-    pub allow_login_shell: bool,
     pub exec_permission_approvals_enabled: bool,
 }
 
 #[cfg(test)]
 pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
     create_exec_command_tool_with_environment_id(
-        options, /*include_environment_id*/ false, /*include_shell_parameter*/ true,
+        options,
+        /*include_environment_id*/ false,
+        /*include_windows_shell_guidance*/ cfg!(windows),
     )
 }
 
 pub(crate) fn create_exec_command_tool_with_environment_id(
     options: CommandToolOptions,
     include_environment_id: bool,
-    include_shell_parameter: bool,
+    include_windows_shell_guidance: bool,
 ) -> ToolSpec {
     let yield_time_ms_description = if cfg!(windows) {
-        "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 2000-30000 ms. Set a shorter value only when intentionally starting a long-lived or interactive process and you want a session ID promptly."
+        "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms."
     } else {
         "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
     };
@@ -58,23 +59,19 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             )),
         ),
     ]);
-    if include_shell_parameter {
-        properties.insert(
-            "shell".to_string(),
-            JsonSchema::string(Some(
-                "Shell binary to launch. Defaults to the user's default shell.".to_string(),
-            )),
-        );
-    }
-    if options.allow_login_shell {
-        properties.insert(
-            "login".to_string(),
-            JsonSchema::boolean(Some(
-                "True runs the shell with -l/-i semantics; false disables them. Defaults to true."
-                    .to_string(),
-            )),
-        );
-    }
+    properties.insert(
+        "shell".to_string(),
+        JsonSchema::string(Some(
+            "Shell binary to launch. Defaults to the user's default shell.".to_string(),
+        )),
+    );
+    properties.insert(
+        "login".to_string(),
+        JsonSchema::boolean(Some(
+            "True runs the shell with -l/-i semantics; false disables them. Defaults to true."
+                .to_string(),
+        )),
+    );
     if include_environment_id {
         properties.insert(
             "environment_id".to_string(),
@@ -90,7 +87,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
 
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
-        description: if cfg!(windows) {
+        description: if include_windows_shell_guidance {
             format!(
                 "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
                 windows_shell_guidance()
@@ -106,7 +103,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             Some(vec!["cmd".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(unified_exec_output_schema()),
+        output_schema: Some(unified_exec_output_schema().into()),
     })
 }
 
@@ -150,77 +147,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
             Some(vec!["session_id".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(unified_exec_output_schema()),
-    })
-}
-
-pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
-    let mut properties = BTreeMap::from([
-        (
-            "command".to_string(),
-            JsonSchema::string(Some(
-                "Shell script to run in the user's default shell.".to_string(),
-            )),
-        ),
-        (
-            "workdir".to_string(),
-            JsonSchema::string(Some(
-                "Working directory for the command. Defaults to the turn cwd.".to_string(),
-            )),
-        ),
-        (
-            "timeout_ms".to_string(),
-            JsonSchema::number(Some(
-                "Maximum command runtime. Defaults to 10000 ms.".to_string(),
-            )),
-        ),
-    ]);
-    if options.allow_login_shell {
-        properties.insert(
-            "login".to_string(),
-            JsonSchema::boolean(Some(
-                "True runs with login shell semantics; false disables them. Defaults to true."
-                    .to_string(),
-            )),
-        );
-    }
-    properties.extend(create_approval_parameters(
-        options.exec_permission_approvals_enabled,
-    ));
-
-    let description = if cfg!(windows) {
-        format!(
-            r#"Runs a Powershell command (Windows) and returns its output.
-
-Examples of valid command strings:
-
-- ls -a (show hidden): "Get-ChildItem -Force"
-- recursive find by name: "Get-ChildItem -Recurse -Filter *.py"
-- recursive grep: "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"
-- ps aux | grep python: "Get-Process | Where-Object {{ $_.ProcessName -like '*python*' }}"
-- setting an env var: "$env:FOO='bar'; echo $env:FOO"
-- running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -"
-
-{}"#,
-            windows_shell_guidance()
-        )
-    } else {
-        r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
-            .to_string()
-    };
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "shell_command".to_string(),
-        description,
-        strict: false,
-        defer_loading: None,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["command".to_string()]),
-            Some(false.into()),
-        ),
-        output_schema: None,
+        output_schema: Some(unified_exec_output_schema().into()),
     })
 }
 
@@ -335,7 +262,7 @@ fn create_approval_parameters(
         let mut additional_permissions = permission_profile_schema();
         additional_permissions.description = Some(
             "Sandboxed filesystem or network access for this command; only with `sandbox_permissions: \"with_additional_permissions\"`."
-                .to_string(),
+                .into(),
         );
         properties.insert("additional_permissions".to_string(), additional_permissions);
     }
@@ -352,7 +279,7 @@ fn permission_profile_schema() -> JsonSchema {
         /*required*/ None,
         Some(false.into()),
     );
-    schema.description = Some("Filesystem or network access request.".to_string());
+    schema.description = Some("Filesystem or network access request.".into());
     schema
 }
 
@@ -367,7 +294,7 @@ fn network_permissions_schema() -> JsonSchema {
         /*required*/ None,
         Some(false.into()),
     );
-    schema.description = Some("Network access request.".to_string());
+    schema.description = Some("Network access request.".into());
     schema
 }
 
@@ -398,7 +325,7 @@ fn file_system_permissions_schema() -> JsonSchema {
         /*required*/ None,
         Some(false.into()),
     );
-    schema.description = Some("Filesystem access request.".to_string());
+    schema.description = Some("Filesystem access request.".into());
     schema
 }
 

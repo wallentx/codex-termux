@@ -5,6 +5,7 @@ use super::manager::ExternalAuthRefreshContext;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use std::fmt;
 use std::io;
+use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -101,9 +102,9 @@ struct CachedExternalBearerToken {
 
 async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result<String> {
     let program = resolve_provider_auth_program(&config.command, &config.cwd)?;
-    let mut command = Command::new(&program);
+    let mut command = Command::from(codex_utils_process::background_command(&program));
     command
-        .args(&config.args)
+        .args(config.args.iter().map(Deref::deref))
         .current_dir(config.cwd.as_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

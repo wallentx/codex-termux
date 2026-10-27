@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
 use codex_config::McpServerTransportConfig;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::McpManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
-use codex_core_plugins::PluginsManager;
+use codex_core::plugins_manager_for_config;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use codex_extension_api::McpServerContributor;
+use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::test_support::auth_manager_from_optional_auth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use pretty_assertions::assert_eq;
 
@@ -28,13 +31,13 @@ async fn contributes_hosted_plugin_runtime_without_an_executor() -> TestResult {
         .build()
         .await?;
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let manager = installed_manager(&config);
+    let manager = installed_manager(&config, Some(auth.clone()));
 
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     let server = servers
         .get(CODEX_APPS_MCP_SERVER_NAME)
-        .and_then(|server| server.configured_config())
-        .ok_or("hosted plugin runtime should be contributed as a configured server")?;
+        .ok_or("hosted plugin runtime should be contributed as a configured server")?
+        .config();
     let McpServerTransportConfig::StreamableHttp { url, .. } = &server.transport else {
         panic!("hosted plugin runtime should use streamable HTTP");
     };
@@ -57,11 +60,28 @@ async fn runtime_overlay_preserves_disabled_server() -> TestResult {
             ),
             ("mcp_servers.codex_apps.enabled".to_string(), false.into()),
         ])
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement("[mcp_servers]"),
+        )
         .build()
         .await?;
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let manager = installed_manager(&config);
+    let manager = installed_manager(&config, Some(auth.clone()));
 
+    let configured = manager.configured_servers(&config).await;
+    // Standalone login must still reject requirements-denied, explicitly disabled entries.
+    let login_client = Arc::new(codex_exec_server::RouteAwareHttpClient::new(
+        config.http_client_factory(),
+    ));
+    assert_eq!(
+        codex_mcp::apply_http_headers_helper(
+            login_client,
+            &configured[CODEX_APPS_MCP_SERVER_NAME],
+            codex_home.path().to_path_buf(),
+        )
+        .err(),
+        Some("the MCP server is disabled by managed requirements".to_string())
+    );
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     let server = servers
         .get(CODEX_APPS_MCP_SERVER_NAME)
@@ -72,7 +92,7 @@ async fn runtime_overlay_preserves_disabled_server() -> TestResult {
 }
 
 #[tokio::test]
-async fn legacy_fallback_overwrites_reserved_config_without_an_extension() -> TestResult {
+async fn default_fallback_overwrites_reserved_config_without_an_extension() -> TestResult {
     let codex_home = tempfile::tempdir()?;
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
@@ -87,19 +107,20 @@ async fn legacy_fallback_overwrites_reserved_config_without_an_extension() -> Te
         .build()
         .await?;
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let manager = McpManager::new(Arc::new(PluginsManager::new(
-        config.codex_home.to_path_buf(),
+    let manager = McpManager::new(Arc::new(plugins_manager_for_config(
+        &config,
+        AuthManager::from_auth_for_testing(auth.clone()),
     )));
 
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     let server = servers
         .get(CODEX_APPS_MCP_SERVER_NAME)
-        .and_then(|server| server.configured_config())
-        .ok_or("legacy Apps MCP should be present")?;
+        .ok_or("default Apps MCP should be present")?
+        .config();
     let McpServerTransportConfig::StreamableHttp { url, .. } = &server.transport else {
-        panic!("legacy Apps MCP should use streamable HTTP");
+        panic!("default Apps MCP should use streamable HTTP");
     };
-    assert_eq!(url, "https://chatgpt.com/backend-api/wham/apps");
+    assert_eq!(url, "https://chatgpt.com/backend-api/ps/mcp");
 
     Ok(())
 }
@@ -118,7 +139,10 @@ async fn later_extension_can_remove_same_name_registration() -> TestResult {
     codex_mcp_extension::install(&mut builder);
     builder.mcp_server_contributor(Arc::new(RemoveCodexApps));
     let manager = McpManager::new_with_extensions(
-        Arc::new(PluginsManager::new(config.codex_home.to_path_buf())),
+        Arc::new(plugins_manager_for_config(
+            &config,
+            AuthManager::from_auth_for_testing(auth.clone()),
+        )),
         Arc::new(builder.build()),
         codex_core::CodexAppsToolsCache::default(),
     );
@@ -139,7 +163,7 @@ async fn hosted_apps_mcp_requires_chatgpt_auth() -> TestResult {
         .build()
         .await?;
     let auth = CodexAuth::from_api_key("test");
-    let manager = installed_manager(&config);
+    let manager = installed_manager(&config, Some(auth.clone()));
 
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
@@ -163,9 +187,10 @@ async fn disabled_apps_remove_reserved_server_config_for_all_hosts() -> TestResu
         .build()
         .await?;
     let managers = [
-        installed_manager(&config),
-        McpManager::new(Arc::new(PluginsManager::new(
-            config.codex_home.to_path_buf(),
+        installed_manager(&config, /*auth*/ None),
+        McpManager::new(Arc::new(plugins_manager_for_config(
+            &config,
+            auth_manager_from_optional_auth(/*auth*/ None),
         ))),
     ];
     for manager in managers {
@@ -175,11 +200,14 @@ async fn disabled_apps_remove_reserved_server_config_for_all_hosts() -> TestResu
     Ok(())
 }
 
-fn installed_manager(config: &Config) -> McpManager {
+fn installed_manager(config: &Config, auth: Option<CodexAuth>) -> McpManager {
     let mut builder = ExtensionRegistryBuilder::new();
     codex_mcp_extension::install(&mut builder);
     McpManager::new_with_extensions(
-        Arc::new(PluginsManager::new(config.codex_home.to_path_buf())),
+        Arc::new(plugins_manager_for_config(
+            config,
+            auth_manager_from_optional_auth(auth),
+        )),
         Arc::new(builder.build()),
         codex_core::CodexAppsToolsCache::default(),
     )

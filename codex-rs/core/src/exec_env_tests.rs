@@ -41,6 +41,22 @@ fn inject_permission_profile_env_removes_stale_value_without_active_profile() {
     assert_eq!(env.get(CODEX_PERMISSION_PROFILE_ENV_VAR), None);
 }
 
+#[test]
+fn inject_apply_patch_env_enables_older_executables_despite_stale_values() {
+    let mut env = HashMap::from([(
+        CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_ascii_lowercase(),
+        "stale".to_string(),
+    )]);
+    inject_apply_patch_env(&mut env);
+    assert_eq!(
+        env,
+        HashMap::from([(
+            CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_string(),
+            "1".to_string(),
+        )])
+    );
+}
+
 #[cfg(target_os = "windows")]
 #[test]
 fn inject_permission_profile_env_replaces_differently_cased_windows_key() {

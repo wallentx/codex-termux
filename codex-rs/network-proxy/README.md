@@ -5,6 +5,10 @@
 - an HTTP proxy (default `127.0.0.1:3128`)
 - a SOCKS5 proxy (default `127.0.0.1:8081`, enabled by default)
 
+On Windows, managed HTTP listeners prefer ports `3128-3159`, and SOCKS5 listeners prefer ports
+`8081-8112`. An explicitly configured port is attempted first. If every preferred port is occupied,
+the proxy preserves its existing ephemeral loopback fallback.
+
 It enforces an allow/deny policy and a "limited" mode intended for read-only network access.
 
 ## Quickstart
@@ -41,7 +45,10 @@ mode = "full" # default when unset; use "limited" for read-only mode
 # If false, local/private networking is rejected. Explicit allowlisting of local IP literals
 # (or `localhost`) is required to permit them.
 # Hostnames that resolve to local/private IPs are still blocked even if allowlisted.
-allow_local_binding = false
+# Clients that always bypass proxies for loopback, such as Go's `net/http`, remain blocked by
+# the operating-system sandbox when local binding is disabled.
+# Omitted: true for MXC, false elsewhere. MXC rejects an effective false.
+# allow_local_binding = false
 
 # DANGEROUS (macOS-only): bypasses unix socket allowlisting and permits any
 # absolute socket path from `x-unix-socket`.
@@ -76,8 +83,38 @@ strip_request_headers = ["authorization"]
 
 ### 2) Run the proxy
 
+In a Codex permission profile, set `version = 2` on `[permissions.<profile>.network.mitm]`
+before using scoped hooks or credential substitution. Older clients reject this table key,
+so rolling back cannot silently enable unconditional header injection.
+
+The proxy can also run without a full Codex permissions profile. Put the network policy in a
+standalone JSON file:
+
+```json
+{
+  "network": {
+    "enabled": true,
+    "proxy_url": "http://127.0.0.1:3128",
+    "enable_socks5": false,
+    "enable_socks5_udp": false,
+    "allow_upstream_proxy": false,
+    "allow_local_binding": false,
+    "mode": "full",
+    "mitm": false,
+    "domains": {
+      "api.example.com": "allow"
+    }
+  }
+}
+```
+
+`mitm` defaults to `false`. `mitm_ca` defaults to `None` and is omitted from serialized JSON when
+unset. HTTPS MITM is enabled automatically for limited mode or configured `mitm_hooks`. Set `mitm` to
+`true` to enable it explicitly. The proxy requires `network.enabled = true` and rejects unknown
+fields, including fields nested inside MITM hooks.
+
 ```bash
-cargo run -p codex-network-proxy --
+cargo run -p codex-network-proxy -- --config /path/to/network-proxy.json
 ```
 
 ### 3) Point a client at it
@@ -208,6 +245,12 @@ what it can reasonably guarantee.
 
 - Allowlist-first policy: if `domains` has no `allow` entries, requests are blocked until an allowlist is configured.
 - Domain patterns: exact hosts are supported, `*.example.com` matches subdomains only, and `**.example.com` matches the apex plus subdomains; the global `*` wildcard is only accepted when explicitly enabled for allowlist compilation and is otherwise rejected.
+- Within a domain pattern, `?` matches exactly one byte, including a dot. For example,
+  `api?.example.com` matches `api1.example.com`, but not `api.example.com` or `api12.example.com`.
+  It can be combined with `*`, `*.`, and `**.` in both allow and deny entries.
+  Matching uses UTF-8 bytes with ASCII case insensitivity; it does not convert between Unicode
+  domain names and IDNA/Punycode. Internationalized domains arriving as Punycode must be matched
+  using their Punycode spelling.
 - Deny wins: `domains` entries marked `deny` always override the allowlist.
 - Local/private network protection: when `allow_local_binding = false`, the proxy blocks loopback
   and common private/link-local ranges. Explicit allowlisting of local IP literals (or `localhost`)
@@ -221,12 +264,22 @@ what it can reasonably guarantee.
   - the HTTP proxy listener clamps non-loopback binds unless explicitly enabled via
     `dangerously_allow_non_loopback_proxy`
 - when unix socket proxying is enabled, all proxy listeners are forced to loopback to avoid turning the
-    proxy into a remote bridge into local daemons.
+  proxy into a remote bridge into local daemons.
 - `dangerously_allow_all_unix_sockets = true` bypasses the unix socket allowlist entirely (still
   macOS-only and absolute-path-only). Use only in tightly controlled environments.
 - `enabled` is enforced at runtime; when false the proxy no-ops and does not bind listeners.
-Limitations:
+  Limitations:
 
 - DNS rebinding is hard to fully prevent without pinning the resolved IP(s) all the way down to the
   transport layer. If your threat model includes hostile DNS, enforce network egress at a lower
   layer too (e.g., firewall / VPC / corporate proxy policies).
+
+### Native origin and exact secret substitution
+
+MITM hook `match.schemes` and `match.ports` constrain the trusted tunnel origin;
+empty lists preserve existing behavior. An injected header can set `placeholder`
+to require one exact whole-header value before substitution. Missing, mismatched,
+or duplicate values fail closed. This form requires HTTPS port 443 and cannot
+modify routing or framing headers. Secret sources remain trusted host references;
+resolved values are marked sensitive in diagnostics and file sources are bounded
+to 64 KiB. Ambiguous semicolon paths cannot authorize scoped credentials.

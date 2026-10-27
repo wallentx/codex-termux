@@ -1,0 +1,36 @@
+---
+source: tui/src/transcript_view/prompt_header_tests.rs
+expression: "snapshots.join(\"\\n\\n\")"
+---
+Latest
+› Second café question
+seven
+eight
+nine
+ten
+
+Earlier answer
+› First question
+one
+two
+three
+four
+
+After prepend
+› First question
+one
+two
+three
+four
+
+Prompt visible
+› First question
+
+
+one
+two
+
+Short screen
+eight
+nine
+ten

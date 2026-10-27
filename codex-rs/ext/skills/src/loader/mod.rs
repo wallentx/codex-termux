@@ -1,0 +1,25 @@
+mod discovery;
+mod environment;
+mod host;
+mod host_merge;
+#[cfg(test)]
+mod io_test_support;
+mod metadata;
+mod namespace;
+
+pub(crate) use environment::load_environment_skills_from_discovery;
+pub(crate) use environment::load_environment_skills_from_root;
+pub(crate) use host::HostSkillRoot;
+pub(crate) use host::HostSkillRootSnapshot;
+pub(crate) use host::load_host_skill_root;
+pub(crate) use host_merge::load_and_merge_host_skill_roots;
+pub(crate) use host_merge::load_and_merge_host_skill_roots_with_request_snapshots;
+
+pub(crate) const MAX_CONCURRENT_ROOT_SCANS: usize = 8;
+pub(super) const SKILLS_FILENAME: &str = "SKILL.md";
+pub(super) const SKILLS_METADATA_DIR: &str = "agents";
+pub(super) const SKILLS_METADATA_FILENAME: &str = "openai.yaml";
+pub(super) const MAX_NAME_LEN: usize = 64;
+pub(super) const MAX_QUALIFIED_NAME_LEN: usize = MAX_NAME_LEN * 2 + 1;
+pub(super) const MAX_SCAN_DEPTH: usize = 6;
+pub(super) const MAX_SKILLS_DIRS_PER_ROOT: usize = 2000;

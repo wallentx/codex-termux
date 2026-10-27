@@ -3,17 +3,18 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
+use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 
+use super::picker_rows::render_rows_single_line;
 use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 use super::selection_popup_common::GenericDisplayRow;
-use super::selection_popup_common::render_rows_single_line;
 use crate::key_hint;
-use crate::render::Insets;
-use crate::render::RectExt;
 use crate::text_formatting::truncate_text;
 use codex_utils_fuzzy_match::fuzzy_match;
 
@@ -36,6 +37,13 @@ pub(crate) struct MentionMatch {
     score: i32,
 }
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum MatchTier {
+    Exact,
+    Prefix,
+    Fuzzy,
+}
+
 impl MentionItem {
     /// Matches the display name first, then falls back to the best distinct search term.
     pub(crate) fn fuzzy_match_query(&self, query: &str) -> Option<MentionMatch> {
@@ -56,6 +64,24 @@ impl MentionItem {
                 })
         }
     }
+
+    fn match_tier(&self, lowercase_query: &str) -> MatchTier {
+        let display_name = self.display_name.to_lowercase();
+        let insert_name = self
+            .insert_text
+            .strip_prefix('$')
+            .unwrap_or(&self.insert_text)
+            .to_lowercase();
+        if display_name == lowercase_query || insert_name == lowercase_query {
+            MatchTier::Exact
+        } else if display_name.starts_with(lowercase_query)
+            || insert_name.starts_with(lowercase_query)
+        {
+            MatchTier::Prefix
+        } else {
+            MatchTier::Fuzzy
+        }
+    }
 }
 
 const MENTION_NAME_TRUNCATE_LEN: usize = 28;
@@ -63,6 +89,7 @@ const MENTION_NAME_TRUNCATE_LEN: usize = 28;
 pub(crate) struct SkillPopup {
     query: String,
     mentions: Vec<MentionItem>,
+    frequencies: HashMap<String, usize>,
     state: ScrollState,
 }
 
@@ -71,8 +98,14 @@ impl SkillPopup {
         Self {
             query: String::new(),
             mentions,
+            frequencies: HashMap::new(),
             state: ScrollState::new(),
         }
+    }
+
+    pub(crate) fn with_frequencies(mut self, frequencies: HashMap<String, usize>) -> Self {
+        self.frequencies = frequencies;
+        self
     }
 
     pub(crate) fn set_mentions(&mut self, mentions: Vec<MentionItem>) {
@@ -88,7 +121,7 @@ impl SkillPopup {
     pub(crate) fn calculate_required_height(&self, _width: u16) -> u16 {
         let rows = self.rows_from_matches(self.filtered());
         let visible = rows.len().clamp(1, MAX_POPUP_ROWS);
-        (visible as u16).saturating_add(2)
+        (visible as u16).saturating_add(/*rhs*/ 3)
     }
 
     pub(crate) fn move_up(&mut self) {
@@ -126,29 +159,29 @@ impl SkillPopup {
     ) -> Vec<GenericDisplayRow> {
         matches
             .into_iter()
-            .map(|(idx, indices, _score)| {
+            .enumerate()
+            .map(|(visible_idx, (idx, indices, _score))| {
                 let mention = &self.mentions[idx];
                 let name = truncate_text(&mention.display_name, MENTION_NAME_TRUNCATE_LEN);
-                let description = match (
-                    mention.category_tag.as_deref(),
-                    mention.description.as_deref(),
-                ) {
-                    (Some(tag), Some(description)) if !description.is_empty() => {
-                        Some(format!("{tag} {description}"))
-                    }
-                    (Some(tag), _) => Some(tag.to_string()),
-                    (None, Some(description)) if !description.is_empty() => {
-                        Some(description.to_string())
-                    }
-                    _ => None,
-                };
                 GenericDisplayRow {
+                    category_tag: mention.category_tag.clone(),
+                    selection_style: Some(super::picker_style::selection_style()),
                     name,
-                    name_prefix_spans: Vec::new(),
+                    name_prefix_spans: vec![
+                        if self.state.selected_idx == Some(visible_idx) {
+                            "› "
+                        } else {
+                            "  "
+                        }
+                        .into(),
+                    ],
                     match_indices: indices,
                     display_shortcut: None,
-                    description,
-                    category_tag: None,
+                    description: mention
+                        .description
+                        .as_ref()
+                        .filter(|description| !description.is_empty())
+                        .cloned(),
                     is_disabled: false,
                     disabled_reason: None,
                     wrap_indent: None,
@@ -159,6 +192,7 @@ impl SkillPopup {
 
     fn filtered(&self) -> Vec<(usize, Option<Vec<usize>>, i32)> {
         let filter = self.query.trim();
+        let lowercase_filter = filter.to_lowercase();
         let mut out: Vec<(usize, Option<Vec<usize>>, i32)> = Vec::new();
 
         for (idx, mention) in self.mentions.iter().enumerate() {
@@ -172,26 +206,27 @@ impl SkillPopup {
             }
         }
 
-        out.sort_by(|a, b| {
-            if filter.is_empty() {
-                self.mentions[a.0]
-                    .sort_rank
-                    .cmp(&self.mentions[b.0].sort_rank)
+        out.sort_by_cached_key(|(idx, indices, score)| {
+            let mention = &self.mentions[*idx];
+            let tier = if filter.is_empty() {
+                MatchTier::Fuzzy
             } else {
-                a.1.is_none()
-                    .cmp(&b.1.is_none())
-                    .then_with(|| a.2.cmp(&b.2))
-                    .then_with(|| {
-                        self.mentions[a.0]
-                            .sort_rank
-                            .cmp(&self.mentions[b.0].sort_rank)
-                    })
-            }
-            .then_with(|| {
-                let an = self.mentions[a.0].display_name.as_str();
-                let bn = self.mentions[b.0].display_name.as_str();
-                an.cmp(bn)
-            })
+                mention.match_tier(&lowercase_filter)
+            };
+            let frequency = mention
+                .path
+                .as_ref()
+                .and_then(|path| self.frequencies.get(path))
+                .copied()
+                .unwrap_or_default();
+            (
+                tier,
+                Reverse(frequency),
+                indices.is_none(),
+                *score,
+                mention.sort_rank,
+                &mention.display_name,
+            )
         });
 
         out
@@ -200,22 +235,17 @@ impl SkillPopup {
 
 impl WidgetRef for SkillPopup {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        let (list_area, hint_area) = if area.height > 2 {
-            let [list_area, _spacer_area, hint_area] = Layout::vertical([
-                Constraint::Length(area.height - 2),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .areas(area);
+        let (list_area, hint_area) = if area.height > 1 {
+            let [list_area, hint_area] =
+                Layout::vertical([Constraint::Length(area.height - 1), Constraint::Length(1)])
+                    .areas(area);
             (list_area, Some(hint_area))
         } else {
             (area, None)
         };
         let rows = self.rows_from_matches(self.filtered());
         render_rows_single_line(
-            list_area.inset(Insets::tlbr(
-                /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
-            )),
+            list_area,
             buf,
             &rows,
             &self.state,
@@ -236,11 +266,10 @@ impl WidgetRef for SkillPopup {
 
 fn skill_popup_hint_line() -> Line<'static> {
     Line::from(vec![
-        "Press ".into(),
         key_hint::plain(KeyCode::Enter).into(),
-        " to insert or ".into(),
+        " insert · ".dim(),
         key_hint::plain(KeyCode::Esc).into(),
-        " to close".into(),
+        " close".dim(),
     ])
 }
 
@@ -309,7 +338,7 @@ mod tests {
         );
         assert_eq!(
             popup.calculate_required_height(72),
-            (MAX_POPUP_ROWS as u16) + 2
+            (MAX_POPUP_ROWS as u16) + 3
         );
     }
 
@@ -329,6 +358,59 @@ mod tests {
         }
 
         insta::assert_snapshot!("skill_popup_scrolled", render_popup(&popup, /*width*/ 72));
+    }
+
+    #[test]
+    fn category_tags_distinguish_mentions_when_descriptions_hide() {
+        let mut snapshots = Vec::new();
+        for name in ["Shared", "Shared mention with a very long name"] {
+            let mut popup = SkillPopup::new(
+                [("[App]", 0), ("[Skill]", 1)]
+                    .into_iter()
+                    .map(|(tag, rank)| MentionItem {
+                        description: Some("Secondary details".to_string()),
+                        ..ranked_mention_item(name, &[], tag, rank)
+                    })
+                    .collect(),
+            );
+            popup.set_query("Shared");
+
+            for width in [32, 72] {
+                let rendered = render_popup(&popup, width);
+                assert!(rendered.contains("[App]"), "{rendered}");
+                assert!(rendered.contains("[Skill]"), "{rendered}");
+                assert_eq!(rendered.contains("Secondary details"), width == 72);
+                snapshots.push(format!("name={name:?}, width={width}\n{rendered}"));
+            }
+        }
+        insta::assert_snapshot!("skill_popup_category_tags", snapshots.join("\n\n"));
+    }
+
+    #[test]
+    fn lowercase_expansion_preserves_match_ranking_and_highlighting() {
+        let mut popup = SkillPopup::new(vec![
+            named_mention_item("İx", &[]),
+            named_mention_item("i\u{0307}x", &[]),
+            named_mention_item("aİx", &[]),
+            named_mention_item("ai\u{0307}x", &[]),
+        ]);
+        popup.set_query("\u{0307}x");
+
+        // Each pair lowercases identically. The dot starts a contiguous match,
+        // but not a prefix, even when it came from the expansion of 'İ'.
+        assert_eq!(
+            popup.filtered(),
+            vec![
+                (3, Some(vec![2, 3]), 0),
+                (2, Some(vec![1, 2]), 0),
+                (1, Some(vec![1, 2]), 0),
+                (0, Some(vec![0, 1]), 0),
+            ]
+        );
+        insta::assert_snapshot!(
+            "skill_popup_lowercase_expansion",
+            render_popup(&popup, /*width*/ 48)
+        );
     }
 
     #[test]
@@ -364,9 +446,16 @@ mod tests {
     }
 
     #[test]
-    fn query_match_score_sorts_before_plugin_rank_bias() {
+    fn match_tier_precedes_preference_and_plugin_rank() {
         let mut popup = SkillPopup::new(vec![
-            plugin_mention_item("GitHub", &["github", "pull requests", "pr"]),
+            MentionItem {
+                path: Some("plugin://github".to_owned()),
+                ..plugin_mention_item("GitHub", &["github", "pull requests", "pr"])
+            },
+            MentionItem {
+                insert_text: "$pr".to_owned(),
+                ..named_mention_item("Review and triage", &["pr"])
+            },
             named_mention_item("pr-review-triage", &["pr-review-triage"]),
             named_mention_item("prd", &["prd"]),
             named_mention_item("Plugin Creator", &["plugin-creator", "Plugin Creator"]),
@@ -375,7 +464,8 @@ mod tests {
                 &["logging-best-practices", "Logging Best Practices"],
             ),
             named_mention_item("PR Babysitter", &["babysit-pr", "PR Babysitter"]),
-        ]);
+        ])
+        .with_frequencies(HashMap::from([("plugin://github".to_owned(), 50)]));
         popup.set_query("pr");
 
         let filtered_items: Vec<(String, Option<String>)> = popup
@@ -392,15 +482,16 @@ mod tests {
         assert_eq!(
             filtered_items,
             vec![
+                ("Review and triage".to_string(), Some("[Skill]".to_string())),
                 ("PR Babysitter".to_string(), Some("[Skill]".to_string())),
                 ("pr-review-triage".to_string(), Some("[Skill]".to_string())),
                 ("prd".to_string(), Some("[Skill]".to_string())),
+                ("GitHub".to_string(), Some("[Plugin]".to_string())),
                 ("Plugin Creator".to_string(), Some("[Skill]".to_string())),
                 (
                     "Logging Best Practices".to_string(),
                     Some("[Skill]".to_string())
                 ),
-                ("GitHub".to_string(), Some("[Plugin]".to_string())),
             ]
         );
     }

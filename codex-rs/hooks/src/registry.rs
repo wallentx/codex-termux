@@ -1,14 +1,14 @@
-use codex_config::ConfigLayerStack;
-use codex_plugin::PluginHookSource;
-use tokio::process::Command;
-
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::CommandShell;
+use crate::engine::ConfiguredHandler;
 use crate::engine::HookListEntry;
+use crate::engine::command_runner::CommandHookRuntime;
 use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactOutcome;
 use crate::events::compact::PreCompactRequest;
 use crate::events::compact::StatelessHookOutcome;
+use crate::events::interrupt::InterruptOutcome;
+use crate::events::interrupt::InterruptRequest;
 use crate::events::permission_request::PermissionRequestOutcome;
 use crate::events::permission_request::PermissionRequestRequest;
 use crate::events::post_tool_use::PostToolUseOutcome;
@@ -23,10 +23,24 @@ use crate::events::stop::StopOutcome;
 use crate::events::stop::StopRequest;
 use crate::events::user_prompt_submit::UserPromptSubmitOutcome;
 use crate::events::user_prompt_submit::UserPromptSubmitRequest;
+use crate::mcp::HookMcpExecutor;
 use crate::types::Hook;
 use crate::types::HookEvent;
 use crate::types::HookPayload;
 use crate::types::HookResponse;
+use async_channel::Receiver;
+use codex_config::ConfigLayerStack;
+use codex_plugin::ExecutorPluginHookSource;
+use codex_plugin::PluginHookSource;
+use codex_protocol::ThreadId;
+use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
+use std::ffi::OsString;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::process::Command;
 
 #[derive(Default, Clone)]
 pub struct HooksConfig {
@@ -48,39 +62,151 @@ pub struct HookListOutcome {
 
 #[derive(Clone)]
 pub struct Hooks {
-    after_agent: Vec<Hook>,
+    // TODO: Once legacy `notify` is removed, capture this snapshot in `CommandHookRuntime::new`
+    // and remove the environment plumbing from `Hooks` and `from_config`.
+    environment: Arc<Vec<(OsString, OsString)>>,
+    after_agent: Arc<[Hook]>,
     engine: ClaudeHooksEngine,
-}
-
-impl Default for Hooks {
-    fn default() -> Self {
-        Self::new(HooksConfig::default())
-    }
+    plugin_hook_sources: Arc<[PluginHookSource]>,
+    plugin_hook_load_warnings: Arc<[String]>,
 }
 
 impl Hooks {
-    pub fn new(config: HooksConfig) -> Self {
+    /// Bind this session's hook runtime and output files to its thread, rejecting unloadable
+    /// required managed hooks.
+    pub fn new(
+        config: HooksConfig,
+        thread_id: ThreadId,
+        mcp_executor: Arc<dyn HookMcpExecutor>,
+    ) -> anyhow::Result<(Self, Receiver<codex_protocol::protocol::HookCompletedEvent>)> {
+        let (result_sender, result_receiver) = async_channel::unbounded();
+        let environment = Arc::new(std::env::vars_os().collect());
+        let hooks = Self::from_config(config, mcp_executor, Arc::clone(&environment), |shell| {
+            CommandHookRuntime::new(shell, environment, thread_id, result_sender)
+        });
+        crate::engine::discovery::ensure_required_hooks_loaded(
+            hooks.engine.required_load_errors(),
+        )?;
+        Ok((hooks, result_receiver))
+    }
+
+    /// Preserve in-flight background hooks while applying a refreshed configuration.
+    pub fn reconfigured(&self, config: HooksConfig) -> Self {
+        Self::from_config(
+            config,
+            Arc::clone(&self.engine.mcp_executor),
+            Arc::clone(&self.environment),
+            |shell| self.engine.command_runtime.reconfigured(shell),
+        )
+    }
+
+    pub fn matches_plugin_hooks<'a>(
+        &self,
+        sources: impl IntoIterator<Item = &'a PluginHookSource>,
+        warnings: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
+        self.plugin_hook_sources.iter().eq(sources)
+            && self.plugin_hook_load_warnings.iter().eq(warnings)
+    }
+
+    /// Adds only owner-admitted requirements hooks; execution remains scoped to their environment.
+    pub fn with_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+        executor: Arc<dyn crate::HookEnvironmentExecutor>,
+    ) -> Self {
+        let discovered = self.discover_environment_hooks(sources);
+        let mut hooks = self.clone();
+        hooks.engine.command_runtime.environment_executor = Some(executor);
+        if !discovered.handlers.is_empty() {
+            Arc::make_mut(&mut hooks.engine.handlers).extend(discovered.handlers);
+        }
+        if !discovered.warnings.is_empty() {
+            let mut warnings = hooks.engine.warnings.to_vec();
+            warnings.extend(discovered.warnings);
+            hooks.engine.warnings = warnings.into();
+        }
+        hooks
+    }
+
+    /// List this session's declarations, including hooks that are disabled or not yet trusted.
+    pub fn list_with_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+    ) -> HookListOutcome {
+        let discovered = self.discover_environment_hooks(sources);
+        let mut hooks = self.engine.hook_entries.as_ref().clone();
+        hooks.extend(discovered.hook_entries);
+        let mut warnings = self.engine.warnings.to_vec();
+        warnings.extend(discovered.warnings);
+        HookListOutcome { hooks, warnings }
+    }
+
+    fn discover_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+    ) -> crate::engine::discovery::DiscoveryResult {
+        if !self.engine.enabled {
+            return crate::engine::discovery::DiscoveryResult::default();
+        }
+        let display_order = self
+            .engine
+            .hook_entries
+            .last()
+            .map_or(0, |entry| entry.display_order.saturating_add(1));
+        crate::engine::discovery::discover_environment_hooks(sources, display_order)
+    }
+
+    pub fn with_executor_hooks(&self, executor_hooks: Vec<ExecutorPluginHookSource>) -> Self {
+        let mut hooks = self.clone();
+        hooks.engine.set_executor_hooks(executor_hooks);
+        hooks
+    }
+
+    pub fn for_memory_consolidation(&self, executor_hooks: Vec<ExecutorPluginHookSource>) -> Self {
+        let mut hooks = self.with_executor_hooks(executor_hooks);
+        Arc::make_mut(&mut hooks.engine.handlers)
+            .retain(ConfiguredHandler::runs_for_memory_consolidation);
+        hooks
+    }
+
+    fn from_config(
+        config: HooksConfig,
+        mcp_executor: Arc<dyn HookMcpExecutor>,
+        environment: Arc<Vec<(OsString, OsString)>>,
+        build_runtime: impl FnOnce(CommandShell) -> CommandHookRuntime,
+    ) -> Self {
         let after_agent = config
             .legacy_notify_argv
             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
-            .map(crate::notify_hook)
+            .map(|argv| crate::legacy_notify::notify_hook(argv, Arc::clone(&environment)))
             .into_iter()
             .collect();
+        let command_runtime = build_runtime(CommandShell {
+            program: config.shell_program.unwrap_or_default(),
+            args: config.shell_args,
+        });
         let engine = ClaudeHooksEngine::new(
             config.feature_enabled,
             config.bypass_hook_trust,
             config.config_layer_stack.as_ref(),
-            config.plugin_hook_sources,
-            config.plugin_hook_load_warnings,
-            CommandShell {
-                program: config.shell_program.unwrap_or_default(),
-                args: config.shell_args,
-            },
+            config.plugin_hook_sources.clone(),
+            config.plugin_hook_load_warnings.clone(),
+            command_runtime,
+            mcp_executor,
         );
         Self {
+            environment,
             after_agent,
             engine,
+            plugin_hook_sources: config.plugin_hook_sources.into(),
+            plugin_hook_load_warnings: config.plugin_hook_load_warnings.into(),
         }
+    }
+
+    /// Abort and join outstanding async hooks during session shutdown.
+    pub async fn shutdown(&self) {
+        self.engine.command_runtime.shutdown().await;
     }
 
     pub fn startup_warnings(&self) -> &[String] {
@@ -127,6 +253,13 @@ impl Hooks {
         request: &PermissionRequestRequest,
     ) -> Vec<codex_protocol::protocol::HookRunSummary> {
         self.engine.preview_permission_request(request)
+    }
+
+    /// Maximum configured timeout among PermissionRequest hooks.
+    ///
+    /// Matching handlers run concurrently, so their aggregate timeout is bounded by this maximum.
+    pub fn max_permission_request_timeout(&self) -> Duration {
+        self.engine.max_permission_request_timeout()
     }
 
     pub fn preview_post_tool_use(
@@ -213,6 +346,43 @@ impl Hooks {
     pub async fn run_session_end(&self, request: SessionEndRequest) -> SessionEndOutcome {
         self.engine.run_session_end(request).await
     }
+
+    pub fn preview_interrupt(&self) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_interrupt()
+    }
+
+    pub async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {
+        self.engine.run_interrupt(request).await
+    }
+
+    /// None if unconfigured; Sync if any handler must finish before continuing.
+    pub fn execution_mode_for_event(&self, event: HookEventName) -> Option<HookExecutionMode> {
+        self.engine
+            .handlers
+            .iter()
+            .filter(|handler| handler.event_name == event)
+            .map(ConfiguredHandler::execution_mode)
+            .min_by_key(|mode| matches!(mode, HookExecutionMode::Async))
+    }
+
+    /// Run a hook task independently of the turn, but abort and join it at session shutdown.
+    pub fn schedule_async_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.engine.command_runtime.schedule_async_task(task);
+    }
+
+    pub fn preview_model_request(
+        &self,
+        request: &crate::ModelRequestHookInput,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        crate::events::model_request::preview(&self.engine.handlers, request)
+    }
+
+    pub async fn run_model_request(
+        &self,
+        request: crate::ModelRequestHookInput,
+    ) -> Vec<codex_protocol::protocol::HookCompletedEvent> {
+        crate::events::model_request::run(&self.engine, request).await
+    }
 }
 
 pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
@@ -225,6 +395,7 @@ pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
         config.plugin_hook_sources,
         config.plugin_hook_load_warnings,
         config.bypass_hook_trust,
+        crate::engine::discovery::DiscoveryMode::Listing,
     );
     HookListOutcome {
         hooks: discovered.hook_entries,
@@ -232,12 +403,19 @@ pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
     }
 }
 
-pub fn command_from_argv(argv: &[String]) -> Option<Command> {
+// TODO: Remove this legacy-notify-only command builder when `notify` support is removed.
+pub(crate) fn command_from_argv(
+    argv: &[String],
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Option<Command> {
     let (program, args) = argv.split_first()?;
     if program.is_empty() {
         return None;
     }
-    let mut command = Command::new(program);
+    let mut command = Command::from(codex_utils_process::background_command(program));
     command.args(args);
+    command.env_clear();
+    command.envs(environment);
+    scrub_non_inheritable_env_vars(command.as_std_mut());
     Some(command)
 }

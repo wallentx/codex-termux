@@ -1,7 +1,5 @@
 //! Prompt rendering for IDE context injected into TUI user turns.
 
-use codex_app_server_protocol::ByteRange;
-use codex_app_server_protocol::TextElement;
 use codex_app_server_protocol::UserInput;
 
 use super::IdeContext;
@@ -9,11 +7,6 @@ use super::IdeContext;
 const MAX_ACTIVE_SELECTION_CHARS: usize = 40_000;
 const MAX_OPEN_TABS: usize = 100;
 const MAX_OPEN_TABS_CHARS: usize = 20_000;
-// Match the desktop app and IDE extension delimiter exactly. IDE context is serialized into the
-// raw prompt before this marker, then transcript rendering strips back to the request after the last
-// marker. Keeping the same marker and stripping semantics lets threads created with IDE context in
-// one surface replay cleanly in the others.
-const PROMPT_REQUEST_BEGIN: &str = "## My request for Codex:";
 
 pub(crate) fn apply_ide_context_to_user_input(
     context: &IdeContext,
@@ -22,75 +15,12 @@ pub(crate) fn apply_ide_context_to_user_input(
     let Some(context_text) = render_prompt_context(context) else {
         return false;
     };
-
-    let prefix = format!("{context_text}\n{PROMPT_REQUEST_BEGIN}\n");
-    if let Some(text_index) = items
-        .iter()
-        .position(|item| matches!(item, UserInput::Text { .. }))
-    {
-        // Prefix the existing text item in place so image and text items keep
-        // the same relative order they had in the user's original submission.
-        let item = std::mem::replace(
-            &mut items[text_index],
-            UserInput::Text {
-                text: String::new(),
-                text_elements: Vec::new(),
-            },
-        );
-        let UserInput::Text {
-            text,
-            text_elements,
-        } = item
-        else {
-            unreachable!("position matched a text item");
-        };
-        items[text_index] = prefixed_text_input(prefix, text, text_elements);
-    } else {
-        items.insert(
-            0,
-            UserInput::Text {
-                text: prefix,
-                text_elements: Vec::new(),
-            },
-        );
-    }
-
+    crate::user_prompt::apply_prompt_context_to_user_input(&context_text, items);
     true
 }
 
 pub(crate) fn has_prompt_context(context: &IdeContext) -> bool {
     render_prompt_context(context).is_some()
-}
-
-pub(crate) fn extract_prompt_request_with_offset(message: &str) -> (&str, usize) {
-    let Some((before_request, request)) = message.rsplit_once(PROMPT_REQUEST_BEGIN) else {
-        return (message, 0);
-    };
-
-    let request_start = before_request.len() + PROMPT_REQUEST_BEGIN.len();
-    let trimmed_request = request.trim();
-    let leading_trimmed_len = request.len() - request.trim_start().len();
-    (trimmed_request, request_start + leading_trimmed_len)
-}
-
-fn prefixed_text_input(prefix: String, text: String, text_elements: Vec<TextElement>) -> UserInput {
-    let prefix_len = prefix.len();
-    UserInput::Text {
-        text: format!("{prefix}{text}"),
-        text_elements: text_elements
-            .into_iter()
-            .map(|element| {
-                let range = element.byte_range.clone();
-                TextElement::new(
-                    ByteRange {
-                        start: range.start + prefix_len,
-                        end: range.end + prefix_len,
-                    },
-                    element.placeholder().map(str::to_string),
-                )
-            })
-            .collect(),
-    }
 }
 
 fn render_prompt_context(context: &IdeContext) -> Option<String> {
@@ -192,6 +122,9 @@ mod tests {
     use super::super::Position;
     use super::super::Range;
     use super::*;
+    use codex_app_server_protocol::ByteRange;
+    use codex_app_server_protocol::TextElement;
+    use codex_protocol_test_support::ContentItemTestExt;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -200,6 +133,53 @@ mod tests {
             label: label.to_string(),
             path: path.to_string(),
         }
+    }
+
+    #[test]
+    fn async_question_reply_stays_recognizable_with_ide_context() {
+        use codex_context_fragments::AnsweredQuestion;
+        use codex_context_fragments::ContextualUserFragment;
+
+        let context = IdeContext {
+            active_file: None,
+            open_tabs: vec![descriptor("lib.rs", "src/lib.rs")],
+        };
+        let mut expected = vec![
+            UserInput::Text {
+                text: AnsweredQuestion::new(
+                    "question-id",
+                    "Where?",
+                    "Staging\n## My request for Codex:\nKeep this literal",
+                )
+                .render()
+                .expect_text(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Skill {
+                name: "route".into(),
+                path: std::path::PathBuf::from("route/SKILL.md"),
+            },
+        ];
+        let mut items = expected.clone();
+        let replies = crate::async_question_reply::parse_input(&items);
+        let display = crate::chatwidget::ChatWidget::user_message_display_from_inputs(&items);
+        assert_eq!(
+            display.message,
+            "> Where?\n\nStaging\n## My request for Codex:\nKeep this literal"
+        );
+        let UserInput::Text { text, .. } = &mut expected[0] else {
+            panic!("reply text");
+        };
+        *text = format!(
+            "# Context from my IDE setup:\n\n## Open tabs:\n- lib.rs: src/lib.rs\n\n## My request for Codex:\n{text}"
+        );
+        assert!(apply_ide_context_to_user_input(&context, &mut items));
+        assert_eq!(items, expected);
+        assert_eq!(crate::async_question_reply::parse_input(&items), replies);
+        assert_eq!(
+            crate::chatwidget::ChatWidget::user_message_display_from_inputs(&items),
+            display
+        );
     }
 
     #[test]
@@ -302,17 +282,6 @@ mod tests {
                     )],
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn extract_prompt_request_returns_text_after_last_delimiter() {
-        let message =
-            "# Context\n## My request for Codex:\nFirst\n## My request for Codex:\n  Second\n";
-
-        assert_eq!(
-            extract_prompt_request_with_offset(message),
-            ("Second", message.find("Second").expect("request offset"))
         );
     }
 
