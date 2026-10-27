@@ -424,6 +424,87 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
             source,
         )
 
+    def test_writer_lock_fallback_follows_bounded_coordination_wait(self):
+        baseline = (
+            "use codex_protocol::ThreadId;\n"
+            "    file: Option<File>,\n}\n" + module._WRITER_LOCK_BASE_COORDINATION
+        )
+        source = self.apply(baseline, module.WRITER_LOCK_EDITS[:2]).replace(
+            module._WRITER_LOCK_BASE_COORDINATION,
+            module._WRITER_LOCK_SOURCE_COORDINATION,
+        )
+        upstream = baseline.replace(
+            module._WRITER_LOCK_BASE_COORDINATION,
+            module._WRITER_LOCK_UPSTREAM_COORDINATION,
+        )
+        # Only the anchors present in this reduced fixture are exercised here.
+        with self.assertRaises(ValueError):
+            module.adapt_writer_lock_timeout(baseline, source, upstream)
+        # Already-adapted or unchanged baselines stay inactive.
+        self.assertEqual(
+            module.adapt_writer_lock_timeout(baseline, source, baseline), source
+        )
+        self.assertEqual(
+            module.adapt_writer_lock_timeout(baseline, baseline, upstream), baseline
+        )
+
+    def test_exact_refs_preserve_writer_lock_and_update_test(self):
+        refs = (
+            "rust-v0.166.0-alpha.2",
+            "8c7891c720710563d33bf74e83aad10762f48c42",
+            "rust-v0.165.0-alpha.1",
+        )
+        path = "codex-rs/rollout/src/writer_lock.rs"
+        try:
+            upstream, source, baseline = (
+                subprocess.check_output(
+                    ["git", "show", f"{ref}:{path}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                ).decode()
+                for ref in refs
+            )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        adapted = module.adapt_writer_lock_timeout(baseline, source, upstream)
+        self.assertIn(
+            "TryLockDirOutcome::Acquired(guard) => Some(Some(guard))", adapted
+        )
+        self.assertIn("io::ErrorKind::TimedOut", adapted)
+        self.assertNotIn("file.lock()", adapted)
+        self.assertEqual(
+            module.adapt_writer_lock_timeout(upstream, adapted, upstream), adapted
+        )
+        for unsafe in (source + "// edit\n", source.replace("fallback_lock,", "None,")):
+            with self.subTest(source=unsafe), self.assertRaises(ValueError):
+                module.adapt_writer_lock_timeout(baseline, unsafe, upstream)
+
+    def test_split_installer_test_keeps_termux_assertion_separate(self):
+        header = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        assertion = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        body = "        assert_eq!(unix);\n"
+        path = "codex-rs/tui/src/update_action.rs"
+        ours = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        conflict = (
+            f"<<<<<<< upstream\n{ours}||||||| baseline\n{header}{body}"
+            f"=======\n{header}{assertion}{body}>>>>>>> target\n"
+        )
+        self.assertEqual(
+            module.merge_updater_additions(conflict, path=path),
+            "    fn termux_self_update_command_runs_codex_update() {\n"
+            + assertion
+            + "    }\n\n    #[test]\n"
+            + ours,
+        )
+        self.assertEqual(module.merge_updater_additions(conflict), conflict)
+        unsafe = conflict.replace(assertion, assertion + "        extra();\n")
+        self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
+
     def test_exact_refs_preserve_lock_fallback_through_daemon_socket_split(self):
         refs = ("rust-v0.163.0", "063d0b87de1bc4c9ba955355d4476d8f22982ba3")
         path = "codex-rs/app-server-transport/src/transport/unix_socket.rs"
