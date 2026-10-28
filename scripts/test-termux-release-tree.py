@@ -455,6 +455,96 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class UpdaterAndWriterLockConflictTests(unittest.TestCase):
+    refs = (
+        "rust-v0.166.0-alpha.5",
+        "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+        "rust-v0.165.0",
+    )
+
+    def show(self, ref, path):
+        return subprocess.check_output(
+            ["git", "show", f"{ref}:{path}"], cwd=ROOT, stderr=subprocess.DEVNULL
+        ).decode()
+
+    def conflict_hunks(self, path):
+        try:
+            upstream, source, baseline = (self.show(ref, path) for ref in self.refs)
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
+            files = []
+            for name, text in (
+                ("ours", upstream),
+                ("base", baseline),
+                ("theirs", source),
+            ):
+                file = Path(scratch) / name
+                file.write_text(text)
+                files.append(str(file))
+            merged = subprocess.run(
+                ["git", "merge-file", "-p", "--diff3", *files],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
+        return merged
+
+    def test_update_action_test_split_keeps_termux_assertion(self):
+        path = "codex-rs/tui/src/update_action.rs"
+        merged = self.conflict_hunks(path)
+        resolved = module.merge_updater_additions(merged, path=path)
+        self.assertNotIn("<<<<<<<", resolved)
+        self.assertIn("fn termux_self_update_command_runs_codex_update()", resolved)
+        self.assertIn(
+            "fn standalone_windows_update_command_reruns_latest_installer()", resolved
+        )
+        self.assertNotIn(
+            "fn standalone_update_commands_rerun_latest_installer", resolved
+        )
+        unsafe = merged.replace(
+            '("codex", &["update"][..])', '("codex", &["other"][..])'
+        )
+        self.assertIn("<<<<<<<", module.merge_updater_additions(unsafe, path=path))
+
+    def test_writer_lock_fallback_follows_bounded_coordination_wait(self):
+        path = module.WRITER_LOCK_PATH
+        merged = self.conflict_hunks(path)
+        resolved = module.merge_writer_lock_conflicts(merged)
+        self.assertNotIn("<<<<<<<", resolved)
+        self.assertIn("try_lock_writer_file(&file, &path)?", resolved)
+        self.assertIn("Duration::from_secs(/*secs*/ 30)", resolved)
+        self.assertIn("io::ErrorKind::TimedOut", resolved)
+        self.assertNotIn("file.try_lock()", resolved.split("fn lock_coordination")[1])
+        unsafe = merged.replace(
+            "Duration::from_millis(/*millis*/ 50)", "Duration::ZERO"
+        )
+        self.assertIn("<<<<<<<", module.merge_writer_lock_conflicts(unsafe))
+        self.assertEqual(module.merge_writer_lock_conflicts(resolved), resolved)
+
+    def test_exact_refs_generate_tree_with_only_downstream_changes(self):
+        try:
+            for ref in self.refs:
+                subprocess.check_call(
+                    ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        previous = os.getcwd()
+        os.chdir(ROOT)
+        try:
+            tree = module.release_tree(*self.refs, [".github"])
+        finally:
+            os.chdir(previous)
+        core = subprocess.check_output(
+            ["git", "show", f"{tree}:codex-rs/core/Cargo.toml"], cwd=ROOT
+        ).decode()
+        self.assertIn("codex-utils-critical-path = { workspace = true }\n", core)
+        self.assertIn("codex-utils-file-lock = { workspace = true }\n", core)
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
