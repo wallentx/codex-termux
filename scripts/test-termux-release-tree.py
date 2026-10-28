@@ -455,6 +455,81 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class WriterLockAdaptationTests(unittest.TestCase):
+    def setUp(self):
+        m = module
+        self.baseline = (
+            m._WRITER_LOCK_DOC
+            + m._WRITER_LOCK_IMPORT
+            + "// body\n"
+            + m._WRITER_LOCK_BASE_FN
+        )
+        self.upstream = (
+            m._WRITER_LOCK_BOUNDED_DOC
+            + m._WRITER_LOCK_TIME_IMPORTS
+            + "// body\n"
+            + m._WRITER_LOCK_UPSTREAM_FN
+        )
+        self.source = (
+            m._WRITER_LOCK_DOC
+            + m._WRITER_LOCK_IMPORT
+            + "// body\nfn try_lock_writer_file() {}\n"
+            + m._WRITER_LOCK_SOURCE_FN
+        )
+
+    def test_fallback_follows_bounded_coordination_wait(self):
+        adapted = module.adapt_writer_lock(self.baseline, self.source, self.upstream)
+        self.assertEqual(
+            adapted,
+            module._WRITER_LOCK_BOUNDED_DOC
+            + module._WRITER_LOCK_TIME_IMPORTS
+            + "// body\nfn try_lock_writer_file() {}\n"
+            + module._WRITER_LOCK_PORTED_FN,
+        )
+        self.assertIn("TimedOut", adapted)
+        self.assertIn("WouldBlock if Instant::now() < deadline", adapted)
+
+    def test_adapter_is_inactive_once_baseline_has_bounded_wait(self):
+        self.assertEqual(
+            module.adapt_writer_lock(self.upstream, self.source, self.upstream),
+            self.source,
+        )
+        self.assertEqual(
+            module.adapt_writer_lock(self.baseline, self.source, self.baseline),
+            self.source,
+        )
+
+    def test_unrecognized_edits_fail_closed(self):
+        with self.assertRaises(ValueError):
+            module.adapt_writer_lock(
+                self.baseline, self.source, self.upstream + "// extra\n"
+            )
+
+    def test_exact_refs_generate_bounded_fallback_lock(self):
+        refs = (
+            "rust-v0.166.0-alpha.4",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        try:
+            tree = module.release_tree(*refs, [".github"])
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+        path = module.WRITER_LOCK_PATH
+        text = module.git("show", f"{tree}:{path}").decode()
+        self.assertIn("try_lock_writer_file(&file, &path)?", text)
+        self.assertIn("ErrorKind::TimedOut", text)
+        self.assertNotIn("<<<<<<<", text)
+        update = module.git(
+            "show", f"{tree}:codex-rs/tui/src/update_action.rs"
+        ).decode()
+        self.assertIn("fn termux_self_update_command_runs_codex_update", update)
+        self.assertIn("fn standalone_unix_update_fails_when_installer", update)
+        # Everything else must still be exactly upstream.
+        changed = module.paths_between(refs[0], tree)
+        self.assertIn(path.encode(), changed)
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
