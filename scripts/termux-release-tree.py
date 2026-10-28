@@ -94,6 +94,36 @@ def drop_retired_clipboard_guard(baseline, source, upstream):
     return baseline if source == expected else source
 
 
+def merge_update_action_test(ours, base, theirs):
+    """Keep the Termux command assertion when upstream splits the installer test."""
+    unix = """        assert_eq!(
+            UpdateAction::StandaloneUnix.command_args(),
+            (
+                "sh",
+                &[
+                    "-c",
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+                ][..],
+            )
+        );
+"""
+    termux = """        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
+"""
+    old = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+    new = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+    if ours != new or base != old + unix or theirs != old + termux + unix:
+        return None
+    return (
+        "    fn termux_self_update_command_runs_codex_update() {\n"
+        + termux
+        + "    }\n\n    #[test]\n"
+        + new
+    )
+
+
 def merge_updater_additions(text, *, path=None):
     """Carry only reviewed Termux updater edits through upstream changes."""
     additions = {
@@ -128,6 +158,8 @@ def merge_updater_additions(text, *, path=None):
                 ):
                     return ours.replace(original, replacement, 1)
             return match[0]
+        if path == "codex-rs/tui/src/update_action.rs":
+            return merge_update_action_test(ours, base, theirs) or match[0]
         if not base and theirs in additions:
             return theirs + ours
         signature = (
@@ -189,6 +221,87 @@ def merge_dependency_additions(text, *, path):
         ):
             return match[0]
         return "".join(sorted(lines))
+
+    return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
+
+
+WRITER_LOCK_PATH = "codex-rs/rollout/src/writer_lock.rs"
+
+
+def merge_writer_lock_conflicts(text):
+    """Port the unsupported-lock fallback onto upstream's bounded coordination wait."""
+    pattern = r"^<<<<<<<[^\n]*\n(.*?)^\|\|\|\|\|\|\|[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n"
+    open_upstream = "            .open(self.directory.join(COORDINATION_LOCK_FILE))?;\n"
+    open_source = "            .open(&path)?;\n"
+    upstream_wait = """        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        Ok(file)
+"""
+    baseline_wait = """        file.lock().map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })?;
+        Ok(file)
+"""
+    source_wait = """        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+    ported = """            .open(&path)?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        let fallback_lock = loop {
+            match try_lock_writer_file(&file, &path)? {
+                TryWriterLockOutcome::Acquired(fallback_lock) => break fallback_lock,
+                TryWriterLockOutcome::WouldBlock if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                TryWriterLockOutcome::WouldBlock => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+            }
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+
+    def resolve(match):
+        ours, base, theirs = match.groups()
+        if (
+            ours == open_upstream + upstream_wait
+            and base == open_upstream + baseline_wait
+            and theirs == open_source + source_wait
+        ):
+            return ported
+        return match[0]
 
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
 
@@ -689,7 +802,11 @@ def release_tree(upstream, source, baseline, excluded):
                 dependency_path = path == "codex-rs/Cargo.lock" or (
                     path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
                 )
-                if not (has_termux_updater and updater_path) and not dependency_path:
+                if (
+                    not (has_termux_updater and updater_path)
+                    and not dependency_path
+                    and path != WRITER_LOCK_PATH
+                ):
                     remaining.append(path)
                     continue
                 text = git("show", f"{result}:{path}").decode()
@@ -697,6 +814,8 @@ def release_tree(upstream, source, baseline, excluded):
                     text = merge_updater_additions(text, path=path)
                 if dependency_path:
                     text = merge_dependency_additions(text, path=path)
+                if path == WRITER_LOCK_PATH:
+                    text = merge_writer_lock_conflicts(text)
                 if re.search(r"^(?:<<<<<<<|=======|>>>>>>>)", text, re.MULTILINE):
                     remaining.append(path)
                 else:
