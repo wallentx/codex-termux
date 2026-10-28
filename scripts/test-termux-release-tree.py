@@ -454,6 +454,94 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
             module.adapt_split_daemon_socket(baseline, source, baseline), source
         )
 
+    def test_exact_refs_preserve_writer_lock_fallback_through_bounded_wait(self):
+        path = module.WRITER_LOCK_PATH
+        refs = (
+            "rust-v0.165.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.166.0-alpha.5.1",
+        )
+        try:
+            baseline, source, upstream = (
+                subprocess.check_output(
+                    ["git", "show", f"{ref}:{path}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                ).decode()
+                for ref in refs
+            )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        self.assertIn("ErrorKind::TimedOut", adapted.replace("io::", ""))
+        self.assertIn("try_acquire_sibling_lock_dir", adapted)
+        self.assertIn("fallback_lock: Option<LockDirGuard>", adapted)
+        self.assertNotIn("file.try_lock()", adapted)
+        self.assertNotIn(".lock()", adapted)
+        for unsafe in (source + "// edit\n", source.replace("fallback_lock,", "")):
+            with self.subTest(source=unsafe[-20:]), self.assertRaises(ValueError):
+                module.adapt_writer_lock(baseline, unsafe, upstream)
+        # Once the paired baseline already has the redesign, the adapter is inactive.
+        self.assertEqual(module.adapt_writer_lock(upstream, source, upstream), source)
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+
+    def test_split_update_test_keeps_termux_assertion(self):
+        old = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        new = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        assertion = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        path = "codex-rs/tui/src/update_action.rs"
+        conflict = (
+            f"<<<<<<< upstream\n{new}||||||| baseline\n{old}"
+            f"=======\n{old}{assertion}>>>>>>> target\n"
+        )
+        resolved = module.merge_updater_additions(conflict, path=path)
+        self.assertEqual(
+            resolved,
+            "    fn termux_self_update_runs_codex_update() {\n"
+            + assertion
+            + "    }\n\n    #[test]\n"
+            + new,
+        )
+        unsafe = conflict.replace(assertion, assertion + "// extra\n")
+        self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
+
+    def test_exact_failed_refs_generate_release_tree(self):
+        refs = (
+            "rust-v0.166.0-alpha.5.1",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        if any(
+            subprocess.run(
+                ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                cwd=ROOT,
+                capture_output=True,
+                check=False,
+            ).returncode
+            for ref in refs
+        ):
+            self.skipTest("exact downstream refs are not available")
+        result = subprocess.run(
+            ["python3", str(HELPER), *refs],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tree = result.stdout.strip()
+        text = subprocess.check_output(
+            ["git", "show", f"{tree}:codex-rs/rollout/src/writer_lock.rs"],
+            cwd=ROOT,
+        ).decode()
+        self.assertIn("TimedOut", text)
+        self.assertIn("try_acquire_sibling_lock_dir", text)
+
 
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
