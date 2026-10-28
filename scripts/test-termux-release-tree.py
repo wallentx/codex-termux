@@ -672,5 +672,88 @@ class DependencyAdditionTests(unittest.TestCase):
                     )
 
 
+class WriterLockAndUpdateActionTests(unittest.TestCase):
+    def conflict(self, upstream, base, source):
+        return (
+            f"<<<<<<< upstream\n{upstream}||||||| baseline\n{base}"
+            f"=======\n{source}>>>>>>> source\n"
+        )
+
+    def test_writer_lock_fallback_keeps_upstream_bounded_wait(self):
+        text = "use codex_utils_file_lock::FileLockOutcome;\nuse codex_utils_file_lock::LockDirGuard;\n"
+        text += self.conflict(
+            module.WRITER_LOCK_UPSTREAM,
+            module.WRITER_LOCK_BASELINE,
+            module.WRITER_LOCK_SOURCE,
+        )
+        merged = module.merge_writer_lock_timeout(text)
+        self.assertEqual(
+            merged,
+            "use codex_utils_file_lock::LockDirGuard;\n" + module.WRITER_LOCK_PORTED,
+        )
+        self.assertIn("Instant::now() >= deadline", merged)
+        self.assertIn("TimedOut", merged)
+
+    def test_writer_lock_unrecognized_edits_remain_conflicts(self):
+        for upstream, base, source in (
+            (
+                module.WRITER_LOCK_UPSTREAM + "x\n",
+                module.WRITER_LOCK_BASELINE,
+                module.WRITER_LOCK_SOURCE,
+            ),
+            (
+                module.WRITER_LOCK_UPSTREAM,
+                module.WRITER_LOCK_BASELINE,
+                module.WRITER_LOCK_SOURCE + "x\n",
+            ),
+            (
+                module.WRITER_LOCK_UPSTREAM,
+                module.WRITER_LOCK_BASELINE + "x\n",
+                module.WRITER_LOCK_SOURCE,
+            ),
+        ):
+            text = self.conflict(upstream, base, source)
+            self.assertEqual(module.merge_writer_lock_timeout(text), text)
+
+    def test_update_action_test_split_keeps_termux_assertion(self):
+        text = self.conflict(
+            module._NEW_TEST,
+            module._OLD_TEST + module._UNIX_ASSERT,
+            module._OLD_TEST + module._TERMUX_ASSERT + module._UNIX_ASSERT,
+        )
+        self.assertEqual(
+            module.merge_update_action_test(text),
+            module._NEW_TEST + module._TERMUX_ASSERT,
+        )
+        unsafe = text.replace("TermuxSelfUpdate", "Other")
+        self.assertEqual(module.merge_update_action_test(unsafe), unsafe)
+
+    def test_exact_refs_when_available(self):
+        refs = ("rust-v0.166.0-alpha.3", "rust-v0.165.0")
+        source = "5db5559ab8bdc27c8982944605f9c72d4d2abcde"
+        try:
+            for ref in (*refs, source):
+                subprocess.check_call(
+                    ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not fetched")
+        tree = module.release_tree(refs[0], source, refs[1], [".github"])
+        writer = module.git("show", f"{tree}:{module.WRITER_LOCK_PATH}").decode()
+        update = module.git("show", f"{tree}:{module.UPDATE_ACTION_PATH}").decode()
+        for text in (writer, update):
+            self.assertNotIn("<<<<<<<", text)
+        self.assertIn("try_acquire_sibling_lock_dir(&path)?", writer)
+        self.assertIn(
+            "timed out waiting for the thread writer coordination lock", writer
+        )
+        self.assertIn("UpdateAction::TermuxSelfUpdate.command_args()", update)
+        self.assertIn(
+            "standalone_unix_update_fails_when_installer_download_fails", update
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -149,6 +149,147 @@ def merge_updater_additions(text, *, path=None):
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
 
 
+WRITER_LOCK_PATH = "codex-rs/rollout/src/writer_lock.rs"
+UPDATE_ACTION_PATH = "codex-rs/tui/src/update_action.rs"
+CONFLICT_PATTERN = re.compile(
+    r"^<<<<<<<[^\n]*\n(.*?)^\|\|\|\|\|\|\|[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n",
+    re.MULTILINE | re.DOTALL,
+)
+_WRITER_OPEN = "            .open(self.directory.join(COORDINATION_LOCK_FILE))?;\n"
+_WRITER_ERROR = (
+    "io::Error::other(format!(\n"
+    '                "failed to acquire thread writer coordination lock: {err}"\n'
+    "            ))"
+)
+WRITER_LOCK_BASELINE = (
+    _WRITER_OPEN
+    + f"        file.lock().map_err(|err| {{\n            {_WRITER_ERROR}\n        }})?;\n"
+    "        Ok(file)\n"
+)
+WRITER_LOCK_SOURCE = (
+    "            .open(&path)?;\n"
+    f"        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {{\n            {_WRITER_ERROR}\n        }})? {{\n"
+    "            FileLockOutcome::Acquired => None,\n"
+    "            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),\n"
+    "        };\n"
+    "        Ok(CoordinationLockGuard {\n"
+    "            _file: file,\n"
+    "            _fallback_lock: fallback_lock,\n"
+    "        })\n"
+)
+WRITER_LOCK_UPSTREAM = (
+    _WRITER_OPEN
+    + """        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        Ok(file)
+"""
+)
+WRITER_LOCK_PORTED = """            .open(&path)?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        // The sibling lock directory gets the same bounded wait as a native lock.
+        let fallback_lock = loop {
+            match try_lock_exclusive_optional(&file)? {
+                TryFileLockOutcome::Acquired => break None,
+                TryFileLockOutcome::Unsupported => {
+                    if let TryLockDirOutcome::Acquired(guard) =
+                        try_acquire_sibling_lock_dir(&path)?
+                    {
+                        break Some(guard);
+                    }
+                }
+                TryFileLockOutcome::WouldBlock => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+_UNIX_ASSERT = """        assert_eq!(
+            UpdateAction::StandaloneUnix.command_args(),
+            (
+                "sh",
+                &[
+                    "-c",
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+                ][..],
+            )
+        );
+"""
+_TERMUX_ASSERT = """        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
+"""
+_OLD_TEST = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+_NEW_TEST = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+
+
+def merge_writer_lock_timeout(text):
+    """Port the lock fallback onto upstream's bounded coordination wait."""
+
+    ported = False
+
+    def resolve(match):
+        nonlocal ported
+        if match.groups() == (
+            WRITER_LOCK_UPSTREAM,
+            WRITER_LOCK_BASELINE,
+            WRITER_LOCK_SOURCE,
+        ):
+            ported = True
+            return WRITER_LOCK_PORTED
+        return match[0]
+
+    text = CONFLICT_PATTERN.sub(resolve, text)
+    if ported:
+        # The bounded loop replaces the blocking helpers imported by the old edit.
+        for name in (
+            "FileLockOutcome",
+            "acquire_sibling_lock_dir",
+            "lock_exclusive_optional",
+        ):
+            text = text.replace(f"use codex_utils_file_lock::{name};\n", "")
+    return text
+
+
+def merge_update_action_test(text):
+    """Keep the Termux command assertion when upstream splits the installer test."""
+
+    def resolve(match):
+        ours, base, theirs = match.groups()
+        if (
+            ours == _NEW_TEST
+            and base == _OLD_TEST + _UNIX_ASSERT
+            and theirs == _OLD_TEST + _TERMUX_ASSERT + _UNIX_ASSERT
+        ):
+            return ours + _TERMUX_ASSERT
+        return match[0]
+
+    return CONFLICT_PATTERN.sub(resolve, text)
+
+
 def merge_dependency_additions(text, *, path):
     """Preserve reviewed dependency additions without restoring upstream removals."""
     manifest = path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
@@ -689,10 +830,18 @@ def release_tree(upstream, source, baseline, excluded):
                 dependency_path = path == "codex-rs/Cargo.lock" or (
                     path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
                 )
-                if not (has_termux_updater and updater_path) and not dependency_path:
+                if (
+                    not (has_termux_updater and updater_path)
+                    and not dependency_path
+                    and path not in (WRITER_LOCK_PATH, UPDATE_ACTION_PATH)
+                ):
                     remaining.append(path)
                     continue
                 text = git("show", f"{result}:{path}").decode()
+                if path == WRITER_LOCK_PATH:
+                    text = merge_writer_lock_timeout(text)
+                if path == UPDATE_ACTION_PATH:
+                    text = merge_update_action_test(text)
                 if has_termux_updater and updater_path:
                     text = merge_updater_additions(text, path=path)
                 if dependency_path:
