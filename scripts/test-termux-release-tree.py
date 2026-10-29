@@ -602,6 +602,112 @@ class UpdaterAdaptationTests(unittest.TestCase):
         self.assertEqual(module.merge_updater_additions(conflict), conflict)
 
 
+class RedesignedUpstreamConflictTests(unittest.TestCase):
+    update_path = "codex-rs/tui/src/update_action.rs"
+    header = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+    assertion = (
+        "        assert_eq!(\n"
+        "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+        '            ("codex", &["update"][..])\n'
+        "        );\n"
+    )
+    windows = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+    base_body = "        assert_eq!(unix);\n"
+
+    def update_conflict(self, ours=None, theirs=None):
+        ours = self.windows if ours is None else ours
+        base = self.header + self.base_body
+        theirs = (
+            self.header + self.assertion + self.base_body if theirs is None else theirs
+        )
+        return f"<<<<<<< upstream\n{ours}||||||| baseline\n{base}=======\n{theirs}>>>>>>> target\n"
+
+    def test_termux_update_assertion_survives_upstream_test_split(self):
+        self.assertEqual(
+            module.merge_updater_additions(
+                self.update_conflict(), path=self.update_path
+            ),
+            "    fn termux_self_update_command_runs_codex_update() {\n"
+            + self.assertion
+            + "    }\n\n    #[test]\n"
+            + self.windows,
+        )
+
+    def test_other_update_test_edits_remain_conflicts(self):
+        conflict = self.update_conflict(
+            theirs=self.header + self.assertion + "        assert_eq!(other);\n"
+        )
+        self.assertEqual(
+            module.merge_updater_additions(conflict, path=self.update_path), conflict
+        )
+
+    old_wait = (
+        "            .open(self.directory.join(COORDINATION_LOCK_FILE))?;\n"
+        "        file.lock().map_err(|err| {\n"
+        "            io::Error::other(format!(\n"
+        '                "failed to acquire thread writer coordination lock: {err}"\n'
+        "            ))\n"
+        "        })?;\n"
+        "        Ok(file)\n"
+    )
+    fallback = (
+        "            .open(&path)?;\n"
+        "        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {\n"
+        "            io::Error::other(format!(\n"
+        '                "failed to acquire thread writer coordination lock: {err}"\n'
+        "            ))\n"
+        "        })? {\n"
+        "            FileLockOutcome::Acquired => None,\n"
+        "            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),\n"
+        "        };\n"
+        "        Ok(CoordinationLockGuard {\n"
+        "            _file: file,\n"
+        "            _fallback_lock: fallback_lock,\n"
+        "        })\n"
+    )
+    bounded = (
+        "            .open(self.directory.join(COORDINATION_LOCK_FILE))?;\n"
+        "        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);\n"
+        "        loop {\n"
+        "            match file.try_lock() {\n"
+        "                Ok(()) => break,\n"
+        "                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {\n"
+        "                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));\n"
+        "                }\n"
+        "                Err(fs::TryLockError::WouldBlock) => {\n"
+        "                    return Err(io::Error::new(\n"
+        "                        io::ErrorKind::TimedOut,\n"
+        '                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",\n'
+        "                    ));\n"
+        "                }\n"
+        "                Err(fs::TryLockError::Error(err)) => return Err(err),\n"
+        "            }\n"
+        "        }\n"
+        "        Ok(file)\n"
+    )
+
+    def writer_conflict(self, upstream=None):
+        upstream = self.bounded if upstream is None else upstream
+        return f"<<<<<<< upstream\n{upstream}||||||| baseline\n{self.old_wait}=======\n{self.fallback}>>>>>>> target\n"
+
+    def test_bounded_coordination_wait_keeps_unsupported_lock_fallback(self):
+        merged = module.merge_writer_lock_fallback(self.writer_conflict())
+        self.assertNotIn("<<<<<<<", merged)
+        self.assertIn("try_lock_writer_file(&file, &path)?", merged)
+        self.assertIn("Instant::now() < deadline", merged)
+        self.assertIn("_fallback_lock: fallback_lock", merged)
+        self.assertNotIn("file.try_lock()", merged)
+
+    def test_unrecognized_writer_lock_conflicts_remain_conflicts(self):
+        conflict = self.writer_conflict(self.bounded.replace("30", "31"))
+        self.assertEqual(module.merge_writer_lock_fallback(conflict), conflict)
+
+    def test_checkpointed_baseline_leaves_text_untouched(self):
+        self.assertEqual(
+            module.merge_writer_lock_fallback(self.old_wait), self.old_wait
+        )
+
+
 class DependencyAdditionTests(unittest.TestCase):
     def test_android_openssl_survives_deletion_of_a_neighboring_section(self):
         path = "codex-rs/core/Cargo.toml"
