@@ -4,6 +4,7 @@
 import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -453,6 +454,126 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         self.assertEqual(
             module.adapt_split_daemon_socket(baseline, source, baseline), source
         )
+
+
+class WriterLockAndUpdateTestAdaptationTests(unittest.TestCase):
+    def conflict(self, ours, base, theirs):
+        return f"<<<<<<< upstream\n{ours}||||||| baseline\n{base}=======\n{theirs}>>>>>>> target\n"
+
+    def test_writer_lock_keeps_upstream_timeout_and_termux_fallback(self):
+        imports = "".join(module._WRITER_LOCK_UNUSED_IMPORTS)
+        text = (
+            imports
+            + "use codex_utils_file_lock::TryFileLockOutcome;\n"
+            + self.conflict(
+                module._WRITER_LOCK_UPSTREAM,
+                module._WRITER_LOCK_BASE,
+                module._WRITER_LOCK_TERMUX,
+            )
+        )
+        merged = module.merge_writer_lock_timeout(text)
+        self.assertEqual(
+            merged,
+            "use codex_utils_file_lock::TryFileLockOutcome;\n"
+            + module._WRITER_LOCK_MERGED,
+        )
+        self.assertIn("TimedOut", merged)
+        self.assertIn("try_acquire_sibling_lock_dir", merged)
+        self.assertNotIn("file.lock()", merged)
+        self.assertNotIn("<<<<<<<", merged)
+
+    def test_writer_lock_unrecognized_conflicts_remain_conflicts(self):
+        for unsafe in (
+            self.conflict(
+                module._WRITER_LOCK_UPSTREAM + "// edit\n",
+                module._WRITER_LOCK_BASE,
+                module._WRITER_LOCK_TERMUX,
+            ),
+            self.conflict(
+                module._WRITER_LOCK_UPSTREAM,
+                module._WRITER_LOCK_BASE,
+                module._WRITER_LOCK_TERMUX.replace("Some(", "None // "),
+            ),
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertEqual(module.merge_writer_lock_timeout(unsafe), unsafe)
+        # Without the original lock imports nothing is silently dropped.
+        text = self.conflict(
+            module._WRITER_LOCK_UPSTREAM,
+            module._WRITER_LOCK_BASE,
+            module._WRITER_LOCK_TERMUX,
+        )
+        self.assertEqual(module.merge_writer_lock_timeout(text), text)
+
+    def test_updater_test_split_keeps_only_termux_assertion(self):
+        path = "codex-rs/tui/src/update_action.rs"
+        header = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        assertion = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        body = "        assert_eq!(unix);\n"
+        ours = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        conflict = self.conflict(ours, header + body, header + assertion + body)
+        self.assertEqual(
+            module.merge_updater_additions(conflict, path=path), ours + assertion
+        )
+        for unsafe in (
+            self.conflict(ours, header + body, header + assertion + "x\n" + body),
+            self.conflict("    let x = 1;\n", header + body, header + assertion + body),
+        ):
+            self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
+
+    def test_exact_refs_generate_verified_release_tree(self):
+        refs = (
+            "rust-v0.166.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        for ref in refs:
+            if subprocess.run(
+                ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                cwd=ROOT,
+                capture_output=True,
+            ).returncode:
+                self.skipTest("exact release refs are not available")
+        with tempfile.TemporaryDirectory() as scratch:
+            env = dict(os.environ, RUNNER_TEMP=scratch)
+            tree = (
+                subprocess.check_output(
+                    [
+                        sys.executable,
+                        str(ROOT / "scripts/termux-release-tree.py"),
+                        *refs,
+                    ],
+                    cwd=ROOT,
+                    env=env,
+                    stderr=subprocess.DEVNULL,
+                )
+                .decode()
+                .strip()
+            )
+
+            def show(path):
+                return subprocess.check_output(
+                    ["git", "show", f"{tree}:{path}"], cwd=ROOT
+                ).decode()
+
+            writer = show("codex-rs/rollout/src/writer_lock.rs")
+            self.assertIn(
+                "timed out waiting for the thread writer coordination", writer
+            )
+            self.assertIn("try_acquire_sibling_lock_dir", writer)
+            self.assertNotIn("<<<<<<<", writer)
+            self.assertIn("codex-utils-critical-path", show("codex-rs/core/Cargo.toml"))
+            self.assertIn("codex-utils-file-lock", show("codex-rs/core/Cargo.toml"))
+            update = show("codex-rs/tui/src/update_action.rs")
+            self.assertIn(
+                "standalone_unix_update_fails_when_installer_download_fails", update
+            )
+            self.assertIn("UpdateAction::TermuxSelfUpdate.command_args()", update)
 
 
 class RetiredClipboardGuardTests(unittest.TestCase):

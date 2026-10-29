@@ -130,6 +130,22 @@ def merge_updater_additions(text, *, path=None):
             return match[0]
         if not base and theirs in additions:
             return theirs + ours
+        if path == "codex-rs/tui/src/update_action.rs":
+            header = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+            termux_assertion = (
+                "        assert_eq!(\n"
+                "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+                '            ("codex", &["update"][..])\n'
+                "        );\n"
+            )
+            # Upstream split the updater test; retain only the Termux assertion.
+            if (
+                base.startswith(header)
+                and theirs == header + termux_assertion + base[len(header) :]
+                and re.fullmatch(r"    fn [a-z0-9_]+\(\) \{\n", ours)
+            ):
+                return ours + termux_assertion
+            return match[0]
         signature = (
             "async fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {\n"
         )
@@ -191,6 +207,101 @@ def merge_dependency_additions(text, *, path):
         return "".join(sorted(lines))
 
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
+
+
+WRITER_LOCK_PATH = "codex-rs/rollout/src/writer_lock.rs"
+
+_WRITER_LOCK_BASE = """            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        file.lock().map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })?;
+        Ok(file)
+"""
+_WRITER_LOCK_UPSTREAM = """            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        Ok(file)
+"""
+_WRITER_LOCK_TERMUX = """            .open(&path)?;
+        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+_WRITER_LOCK_MERGED = """            .open(&path)?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        let fallback_lock = loop {
+            match try_lock_exclusive_optional(&file)? {
+                TryFileLockOutcome::Acquired => break None,
+                TryFileLockOutcome::Unsupported => {
+                    if let TryLockDirOutcome::Acquired(guard) =
+                        try_acquire_sibling_lock_dir(&path)?
+                    {
+                        break Some(guard);
+                    }
+                }
+                TryFileLockOutcome::WouldBlock => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+_WRITER_LOCK_UNUSED_IMPORTS = (
+    "use codex_utils_file_lock::FileLockOutcome;\n",
+    "use codex_utils_file_lock::acquire_sibling_lock_dir;\n",
+    "use codex_utils_file_lock::lock_exclusive_optional;\n",
+)
+
+
+def merge_writer_lock_timeout(text):
+    """Keep upstream's bounded coordination wait while retaining the lock fallback."""
+    pattern = r"^<<<<<<<[^\n]*\n(.*?)^\|\|\|\|\|\|\|[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n"
+    matches = list(re.finditer(pattern, text, flags=re.MULTILINE | re.DOTALL))
+    if len(matches) != 1 or matches[0].groups() != (
+        _WRITER_LOCK_UPSTREAM,
+        _WRITER_LOCK_BASE,
+        _WRITER_LOCK_TERMUX,
+    ):
+        return text
+    merged = text[: matches[0].start()] + _WRITER_LOCK_MERGED + text[matches[0].end() :]
+    for line in _WRITER_LOCK_UNUSED_IMPORTS:
+        if merged.count(line) != 1:
+            return text
+        merged = merged.replace(line, "", 1)
+    return merged
 
 
 def port_startup_lock_edits(upstream):
@@ -689,10 +800,16 @@ def release_tree(upstream, source, baseline, excluded):
                 dependency_path = path == "codex-rs/Cargo.lock" or (
                     path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
                 )
-                if not (has_termux_updater and updater_path) and not dependency_path:
+                if (
+                    not (has_termux_updater and updater_path)
+                    and not dependency_path
+                    and path != WRITER_LOCK_PATH
+                ):
                     remaining.append(path)
                     continue
                 text = git("show", f"{result}:{path}").decode()
+                if path == WRITER_LOCK_PATH:
+                    text = merge_writer_lock_timeout(text)
                 if has_termux_updater and updater_path:
                     text = merge_updater_additions(text, path=path)
                 if dependency_path:
