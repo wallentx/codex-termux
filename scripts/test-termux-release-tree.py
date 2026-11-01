@@ -455,6 +455,64 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class BoundedCoordinationLockTests(unittest.TestCase):
+    def conflict(self, ours, base, theirs):
+        return f"<<<<<<< upstream\n{ours}||||||| baseline\n{base}=======\n{theirs}>>>>>>> target\n"
+
+    def test_writer_lock_fallback_follows_bounded_coordination_wait(self):
+        imports = "".join(module.WRITER_LOCK_UNUSED_IMPORTS)
+        conflict = self.conflict(
+            module.WRITER_LOCK_OURS,
+            module.WRITER_LOCK_BASE,
+            module.WRITER_LOCK_THEIRS,
+        )
+        merged = module.merge_writer_lock_fallback(f"{imports}{conflict}tail\n")
+        self.assertEqual(merged, f"{module.WRITER_LOCK_MERGED}tail\n")
+        self.assertIn("TryFileLockOutcome::Unsupported", merged)
+        self.assertIn("ErrorKind::TimedOut", merged)
+
+    def test_unrecognized_writer_lock_conflicts_remain(self):
+        conflict = self.conflict(
+            module.WRITER_LOCK_OURS + "// edit\n",
+            module.WRITER_LOCK_BASE,
+            module.WRITER_LOCK_THEIRS,
+        )
+        self.assertEqual(module.merge_writer_lock_fallback(conflict), conflict)
+
+    def test_update_action_test_keeps_termux_assertion_and_upstream_split(self):
+        conflict = self.conflict(
+            module.UPDATE_ACTION_TEST,
+            module.UPDATE_ACTION_BASE,
+            module.UPDATE_ACTION_THEIRS,
+        )
+        merged = module.merge_update_action_tests(conflict)
+        self.assertEqual(merged, module.UPDATE_ACTION_MERGED)
+        changed = self.conflict(
+            module.UPDATE_ACTION_TEST,
+            module.UPDATE_ACTION_BASE,
+            module.UPDATE_ACTION_THEIRS + "// edit\n",
+        )
+        self.assertEqual(module.merge_update_action_tests(changed), changed)
+
+    def test_exact_refs_resolve_bounded_lock_and_installer_test_conflicts(self):
+        refs = (
+            "rust-v0.167.0-alpha.2",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        try:
+            tree = module.release_tree(*refs, [".github"]).strip()
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        for path, expected in (
+            ("codex-rs/rollout/src/writer_lock.rs", module.WRITER_LOCK_MERGED),
+            ("codex-rs/tui/src/update_action.rs", module.UPDATE_ACTION_MERGED),
+        ):
+            text = module.git("show", f"{tree}:{path}").decode()
+            self.assertIn(expected, text)
+            self.assertNotIn("<<<<<<<", text)
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
