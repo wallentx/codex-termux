@@ -193,6 +193,153 @@ def merge_dependency_additions(text, *, path):
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
 
 
+CONFLICT_PATTERN = (
+    r"^<<<<<<<[^\n]*\n(.*?)^\|\|\|\|\|\|\|[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n"
+)
+
+WRITER_LOCK_BASE = """            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        file.lock().map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })?;
+        Ok(file)
+"""
+WRITER_LOCK_THEIRS = """            .open(&path)?;
+        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+WRITER_LOCK_OURS = """            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        Ok(file)
+"""
+WRITER_LOCK_MERGED = """            .open(&path)?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        let fallback_lock = loop {
+            match try_lock_exclusive_optional(&file)? {
+                TryFileLockOutcome::Acquired => break None,
+                TryFileLockOutcome::Unsupported => break Some(acquire_sibling_lock_dir(&path)?),
+                TryFileLockOutcome::WouldBlock if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                TryFileLockOutcome::WouldBlock => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+            }
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+WRITER_LOCK_UNUSED_IMPORTS = (
+    "use codex_utils_file_lock::FileLockOutcome;\n",
+    "use codex_utils_file_lock::lock_exclusive_optional;\n",
+)
+
+UPDATE_ACTION_TEST = (
+    "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+)
+UPDATE_ACTION_BASE = """    fn standalone_update_commands_rerun_latest_installer() {
+        assert_eq!(
+            UpdateAction::StandaloneUnix.command_args(),
+            (
+                "sh",
+                &[
+                    "-c",
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+                ][..],
+            )
+        );
+"""
+UPDATE_ACTION_THEIRS = """    fn standalone_update_commands_rerun_latest_installer() {
+        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
+""" + UPDATE_ACTION_BASE.split("\n", 1)[1]
+UPDATE_ACTION_MERGED = (
+    """    fn termux_self_update_command_runs_codex_update() {
+        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
+    }
+
+    #[test]
+"""
+    + UPDATE_ACTION_TEST
+)
+
+
+def merge_writer_lock_fallback(text):
+    """Carry the unsupported-lock fallback through upstream's bounded coordination wait."""
+    resolved = False
+
+    def resolve(match):
+        nonlocal resolved
+        if match.groups() != (WRITER_LOCK_OURS, WRITER_LOCK_BASE, WRITER_LOCK_THEIRS):
+            return match[0]
+        resolved = True
+        return WRITER_LOCK_MERGED
+
+    text = re.sub(CONFLICT_PATTERN, resolve, text, flags=re.MULTILINE | re.DOTALL)
+    if resolved:
+        # The bounded loop replaces the blocking helper, so its imports are unused.
+        for line in WRITER_LOCK_UNUSED_IMPORTS:
+            text = text.replace(line, "", 1)
+    return text
+
+
+def merge_update_action_tests(text):
+    """Keep the Termux updater assertion beside upstream's split installer tests."""
+
+    def resolve(match):
+        if match.groups() != (
+            UPDATE_ACTION_TEST,
+            UPDATE_ACTION_BASE,
+            UPDATE_ACTION_THEIRS,
+        ):
+            return match[0]
+        return UPDATE_ACTION_MERGED
+
+    return re.sub(CONFLICT_PATTERN, resolve, text, flags=re.MULTILINE | re.DOTALL)
+
+
+LOCK_RESOLVERS = {
+    "codex-rs/rollout/src/writer_lock.rs": merge_writer_lock_fallback,
+    "codex-rs/tui/src/update_action.rs": merge_update_action_tests,
+}
+
+
 def port_startup_lock_edits(upstream):
     import_anchor = "use codex_utils_absolute_path::AbsolutePathBuf;\n"
     field = "    _file: std::fs::File,\n"
@@ -689,7 +836,11 @@ def release_tree(upstream, source, baseline, excluded):
                 dependency_path = path == "codex-rs/Cargo.lock" or (
                     path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
                 )
-                if not (has_termux_updater and updater_path) and not dependency_path:
+                if (
+                    not (has_termux_updater and updater_path)
+                    and not dependency_path
+                    and path not in LOCK_RESOLVERS
+                ):
                     remaining.append(path)
                     continue
                 text = git("show", f"{result}:{path}").decode()
@@ -697,6 +848,8 @@ def release_tree(upstream, source, baseline, excluded):
                     text = merge_updater_additions(text, path=path)
                 if dependency_path:
                     text = merge_dependency_additions(text, path=path)
+                if path in LOCK_RESOLVERS:
+                    text = LOCK_RESOLVERS[path](text)
                 if re.search(r"^(?:<<<<<<<|=======|>>>>>>>)", text, re.MULTILINE):
                     remaining.append(path)
                 else:
