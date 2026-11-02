@@ -455,6 +455,52 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class WriterLockAdaptationTests(unittest.TestCase):
+    REFS = (
+        "rust-v0.165.0",
+        "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+        "rust-v0.167.0-alpha.3",
+    )
+    PATH = module.WRITER_LOCK_PATH
+
+    def show(self, ref):
+        return subprocess.check_output(
+            ["git", "show", f"{ref}:{self.PATH}"], cwd=ROOT, stderr=subprocess.DEVNULL
+        ).decode()
+
+    def exact_refs(self):
+        try:
+            return [self.show(ref) for ref in self.REFS]
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+
+    def test_exact_refs_keep_fallback_through_bounded_coordination_wait(self):
+        baseline, source, upstream = self.exact_refs()
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        self.assertIn("timed out waiting for the thread writer coordination", adapted)
+        self.assertIn("try_acquire_sibling_lock_dir", adapted)
+        self.assertIn("_fallback_lock: fallback_lock", adapted)
+        self.assertNotIn(".try_lock()", adapted)
+        self.assertNotIn(".lock()", adapted)
+        self.assertEqual(module.adapt_writer_lock(upstream, adapted, upstream), adapted)
+
+    def test_unrecognized_writer_lock_delta_is_rejected(self):
+        baseline, source, upstream = self.exact_refs()
+        for unsafe in (
+            source + "// extra\n",
+            source.replace("drop(fallback_lock);", ""),
+        ):
+            with self.subTest(source=unsafe), self.assertRaises(ValueError):
+                module.adapt_writer_lock(baseline, unsafe, upstream)
+
+    def test_adapter_is_inactive_without_redesign_or_downstream_delta(self):
+        baseline, source, upstream = self.exact_refs()
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+        self.assertEqual(
+            module.adapt_writer_lock(baseline, baseline, upstream), baseline
+        )
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
@@ -584,6 +630,24 @@ class UpdaterAdaptationTests(unittest.TestCase):
         theirs = "    /// Update by replacing the current Termux binary from wallentx/codex-termux.\n    TermuxSelfUpdate,\n"
         conflict = f"<<<<<<< upstream\n{ours}||||||| baseline\n=======\n{theirs}>>>>>>> target\n"
         self.assertEqual(module.merge_updater_additions(conflict), theirs + ours)
+
+    def test_split_unix_update_test_keeps_only_termux_assertion(self):
+        path = "codex-rs/tui/src/update_action.rs"
+        test = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        termux = (
+            "        assert_eq!(\n            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n        );\n'
+        )
+        unix = "        assert_eq!(\n            UpdateAction::StandaloneUnix.command_args(),\n            old\n        );\n"
+        renamed = (
+            "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        )
+        conflict = f"<<<<<<< upstream\n{renamed}||||||| baseline\n{test}{unix}=======\n{test}{termux}{unix}>>>>>>> target\n"
+        self.assertEqual(
+            module.merge_updater_additions(conflict, path=path), renamed + termux
+        )
+        unsafe = conflict.replace(termux, termux + "        extra();\n")
+        self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
 
     def test_nonempty_base_is_not_treated_as_an_insertion(self):
         conflict = '<<<<<<< upstream\n    Daemon,\n||||||| baseline\n    Existing,\n=======\n            UpdateAction::TermuxSelfUpdate => ("codex", &["update"]),\n>>>>>>> target\n'
