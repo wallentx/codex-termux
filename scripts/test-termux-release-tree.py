@@ -455,6 +455,120 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class LockMergeTests(unittest.TestCase):
+    def conflict(self, ours, base, theirs):
+        return f"<<<<<<< a\n{ours}||||||| b\n{base}=======\n{theirs}>>>>>>> c\n"
+
+    def test_installation_id_fallback_follows_shared_lock_redesign(self):
+        text = self.conflict(
+            module._INSTALLATION_ID_UPSTREAM,
+            module._INSTALLATION_ID_BASE,
+            module._INSTALLATION_ID_SOURCE,
+        )
+        text = (
+            "use codex_utils_file_lock::FileLockOutcome;\n"
+            "use codex_utils_file_lock::acquire_sibling_lock_dir;\n"
+            "use codex_utils_file_lock::lock_exclusive_optional;\n" + text
+        )
+        merged = module.merge_lock_edits(text, path=module.INSTALLATION_ID_PATH)
+        self.assertEqual(
+            merged,
+            "use codex_utils_file_lock::acquire_sibling_lock_dir;\n"
+            + module._INSTALLATION_ID_PORTED,
+        )
+        self.assertIn("file.lock_shared()", merged)
+        self.assertIn("ErrorKind::Unsupported", merged)
+        self.assertIn("if lock_dir_guard.is_none()", merged)
+
+    def test_writer_lock_fallback_keeps_bounded_coordination_wait(self):
+        text = self.conflict(
+            module._WRITER_LOCK_UPSTREAM,
+            module._WRITER_LOCK_BASE,
+            module._WRITER_LOCK_SOURCE,
+        )
+        merged = module.merge_lock_edits(text, path=module.WRITER_LOCK_PATH)
+        self.assertEqual(merged, module._WRITER_LOCK_PORTED)
+        self.assertIn("ErrorKind::TimedOut", merged)
+        self.assertIn("TryFileLockOutcome::Unsupported", merged)
+        self.assertIn("_fallback_lock: fallback_lock", merged)
+
+    def test_unrecognized_lock_conflicts_remain_conflicts(self):
+        for path, upstream, base, source in (
+            (
+                module.INSTALLATION_ID_PATH,
+                module._INSTALLATION_ID_UPSTREAM,
+                module._INSTALLATION_ID_BASE,
+                module._INSTALLATION_ID_SOURCE,
+            ),
+            (
+                module.WRITER_LOCK_PATH,
+                module._WRITER_LOCK_UPSTREAM,
+                module._WRITER_LOCK_BASE,
+                module._WRITER_LOCK_SOURCE,
+            ),
+        ):
+            text = self.conflict(upstream, base, source + "        extra();\n")
+            with self.subTest(path=path):
+                self.assertEqual(module.merge_lock_edits(text, path=path), text)
+
+    def test_update_action_test_split_keeps_termux_assertion(self):
+        old = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        new = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        assertion = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        base = old + "        assert_eq!(unix);\n"
+        merged = module.merge_updater_additions(
+            self.conflict(new, base, old + assertion + "        assert_eq!(unix);\n"),
+            path="codex-rs/tui/src/update_action.rs",
+        )
+        self.assertEqual(merged, new + assertion)
+        unsafe = self.conflict(new, base, old + assertion + "        extra();\n")
+        self.assertEqual(
+            module.merge_updater_additions(
+                unsafe, path="codex-rs/tui/src/update_action.rs"
+            ),
+            unsafe,
+        )
+
+    def test_exact_refs_generate_release_tree_preserving_upstream(self):
+        upstream, source, baseline = (
+            "rust-v0.167.0-alpha.4",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        try:
+            tree = module.release_tree(upstream, source, baseline, [".github"])
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+        changed = set(
+            subprocess.check_output(
+                ["git", "diff", "--name-only", upstream, tree], cwd=ROOT
+            )
+            .decode()
+            .splitlines()
+        )
+        self.assertIn("codex-rs/rollout/src/writer_lock.rs", changed)
+        self.assertLessEqual(
+            changed,
+            set(
+                subprocess.check_output(
+                    ["git", "diff", "--name-only", baseline, source], cwd=ROOT
+                )
+                .decode()
+                .splitlines()
+            ),
+        )
+        text = subprocess.check_output(
+            ["git", "show", f"{tree}:codex-rs/rollout/src/writer_lock.rs"], cwd=ROOT
+        ).decode()
+        self.assertIn("Duration::from_secs(/*secs*/ 30)", text)
+        self.assertIn("try_acquire_sibling_lock_dir", text)
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
