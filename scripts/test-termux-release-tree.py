@@ -672,5 +672,126 @@ class DependencyAdditionTests(unittest.TestCase):
                     )
 
 
+class LockLifecycleMergeTests(unittest.TestCase):
+    def conflict(self, path):
+        base, source, upstream, _, _ = module.LOCK_LIFECYCLE_MERGES[path]
+        return (
+            f"<<<<<<< upstream\n{upstream}||||||| baseline\n{base}"
+            f"=======\n{source}>>>>>>> target\n"
+        )
+
+    def test_known_conflicts_keep_upstream_lock_behavior_and_fallback(self):
+        installation = module.merge_lock_lifecycle(
+            self.conflict(module.INSTALLATION_ID_PATH),
+            path=module.INSTALLATION_ID_PATH,
+        )
+        self.assertIn("file.lock_shared()", installation)
+        self.assertIn("acquire_sibling_lock_dir(&path)", installation)
+        self.assertIn("if lock_dir_guard.is_none() {", installation)
+        self.assertNotIn("<<<<<<<", installation)
+        writer = module.merge_lock_lifecycle(
+            self.conflict(module.WRITER_LOCK_PATH), path=module.WRITER_LOCK_PATH
+        )
+        self.assertIn("Duration::from_secs(/*secs*/ 30)", writer)
+        self.assertIn("try_acquire_sibling_lock_dir(&path)", writer)
+        self.assertIn("CoordinationLockGuard {", writer)
+        self.assertNotIn("<<<<<<<", writer)
+
+    def test_unrecognized_lock_conflicts_remain_conflicts(self):
+        for path in module.LOCK_LIFECYCLE_MERGES:
+            conflict = self.conflict(path)
+            for unsafe in (
+                conflict.replace("||||||| baseline\n", "||||||| baseline\nold\n"),
+                conflict.replace("=======\n", "=======\n// extra\n"),
+                conflict.replace("<<<<<<< upstream\n", "<<<<<<< upstream\n// extra\n"),
+            ):
+                with self.subTest(path=path, unsafe=unsafe):
+                    self.assertEqual(
+                        module.merge_lock_lifecycle(unsafe, path=path), unsafe
+                    )
+        self.assertEqual(
+            module.merge_lock_lifecycle(
+                self.conflict(module.WRITER_LOCK_PATH), path="other.rs"
+            ),
+            self.conflict(module.WRITER_LOCK_PATH),
+        )
+
+    def test_update_action_split_test_keeps_termux_assertion(self):
+        conflict = (
+            "<<<<<<< upstream\n"
+            "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+            "||||||| baseline\n"
+            "    fn standalone_update_commands_rerun_latest_installer() {\n"
+            "        assert_eq!(UpdateAction::StandaloneUnix.command_args(), x);\n"
+            "=======\n"
+            "    fn standalone_update_commands_rerun_latest_installer() {\n"
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+            "        assert_eq!(UpdateAction::StandaloneUnix.command_args(), x);\n"
+            ">>>>>>> target\n"
+        )
+        path = "codex-rs/tui/src/update_action.rs"
+        merged = module.merge_updater_additions(conflict, path=path)
+        self.assertIn("fn termux_update_command_runs_codex_update()", merged)
+        self.assertIn(
+            "    #[test]\n    fn standalone_windows_update_command_reruns_latest_installer() {\n",
+            merged,
+        )
+        self.assertNotIn("<<<<<<<", merged)
+        unsafe = conflict.replace("=======\n", "=======\n// extra\n")
+        self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
+
+    def test_exact_refs_generate_tree_preserving_upstream(self):
+        refs = ("rust-v0.168.0-alpha.2", "5db5559ab8", "rust-v0.165.0")
+        try:
+            for ref in refs:
+                subprocess.check_output(
+                    ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
+            result = subprocess.run(
+                ["python3", str(HELPER), *refs, ".github"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=dict(os.environ, RUNNER_TEMP=scratch),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tree = result.stdout.strip()
+
+            def show(path):
+                return subprocess.check_output(
+                    ["git", "show", f"{tree}:{path}"], cwd=ROOT, text=True
+                )
+
+            installation = show(module.INSTALLATION_ID_PATH)
+            self.assertIn("file.lock_shared()", installation)
+            self.assertIn("acquire_sibling_lock_dir", installation)
+            writer = show(module.WRITER_LOCK_PATH)
+            self.assertIn("timed out waiting for the thread writer", writer)
+            self.assertIn("try_acquire_sibling_lock_dir", writer)
+            unrelated = subprocess.check_output(
+                [
+                    "git",
+                    "diff",
+                    "--name-only",
+                    refs[0],
+                    tree,
+                    "--",
+                    "codex-rs/core/src",
+                ],
+                cwd=ROOT,
+                text=True,
+            ).split()
+            self.assertEqual(unrelated, [module.INSTALLATION_ID_PATH])
+
+
 if __name__ == "__main__":
     unittest.main()
