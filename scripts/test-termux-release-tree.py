@@ -454,6 +454,65 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
             module.adapt_split_daemon_socket(baseline, source, baseline), source
         )
 
+    def test_exact_refs_port_lock_fallbacks_and_preserve_upstream(self):
+        upstream, source, baseline = (
+            "rust-v0.168.0-alpha.1",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        try:
+            for ref in (upstream, source, baseline):
+                subprocess.check_output(
+                    ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+        cwd = os.getcwd()
+        os.chdir(ROOT)
+        try:
+            tree = module.release_tree(upstream, source, baseline, [".github"])
+        finally:
+            os.chdir(cwd)
+
+        def show(path):
+            return subprocess.check_output(
+                ["git", "show", f"{tree}:{path}"], cwd=ROOT, text=True
+            )
+
+        installation = show(module.INSTALLATION_ID_PATH)
+        self.assertIn("file.lock_shared()", installation)
+        self.assertIn("if lock_dir_guard.is_none() {", installation)
+        writer = show(module.WRITER_LOCK_PATH)
+        self.assertIn("try_lock_writer_file(&file, &path)?", writer)
+        self.assertIn("timed out waiting for the thread writer coordination", writer)
+        action = show("codex-rs/tui/src/update_action.rs")
+        self.assertIn("fn termux_self_update_runs_codex_update()", action)
+        self.assertIn(
+            "standalone_unix_update_fails_when_installer_download_fails", action
+        )
+        changed = subprocess.check_output(
+            ["git", "diff", "--name-only", upstream, tree], cwd=ROOT, text=True
+        ).split()
+        downstream = subprocess.check_output(
+            ["git", "diff", "--name-only", baseline, source], cwd=ROOT, text=True
+        ).split()
+        self.assertEqual(sorted(set(changed) - set(downstream)), [])
+
+    def test_lock_fallback_merge_is_fail_closed(self):
+        marker = "<<<<<<< a\n{}||||||| b\n{}=======\n{}>>>>>>> c\n"
+        unrelated = marker.format("one\n", "two\n", "three\n")
+        for path in (module.INSTALLATION_ID_PATH, module.WRITER_LOCK_PATH):
+            self.assertEqual(
+                module.merge_lock_fallbacks(unrelated, path=path), unrelated
+            )
+
+    def test_lock_fallback_rejects_unrecognized_imports(self):
+        text = "use codex_utils_file_lock::FileLockOutcome;\n"
+        with self.assertRaises(ValueError):
+            module.merge_lock_fallbacks(text, path=module.WRITER_LOCK_PATH)
+
 
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
