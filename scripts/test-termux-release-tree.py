@@ -602,6 +602,93 @@ class UpdaterAdaptationTests(unittest.TestCase):
         self.assertEqual(module.merge_updater_additions(conflict), conflict)
 
 
+class KnownConflictTests(unittest.TestCase):
+    def conflict(self, path):
+        ours, base, theirs, _ = module.KNOWN_CONFLICTS[path]
+        return (
+            f"<<<<<<< upstream\n{ours}||||||| baseline\n{base}"
+            f"=======\n{theirs}>>>>>>> target\n"
+        )
+
+    def test_reviewed_conflicts_port_fallbacks_onto_new_upstream_code(self):
+        for path, (_, _, _, ported) in module.KNOWN_CONFLICTS.items():
+            with self.subTest(path=path):
+                self.assertEqual(
+                    module.merge_known_conflicts(self.conflict(path), path=path),
+                    ported,
+                )
+        self.assertIn(
+            "try_lock_writer_file",
+            module.KNOWN_CONFLICTS["codex-rs/rollout/src/writer_lock.rs"][3],
+        )
+        self.assertIn(
+            "acquire_sibling_lock_dir",
+            module.KNOWN_CONFLICTS["codex-rs/core/src/installation_id.rs"][3],
+        )
+
+    def test_unrecognized_or_unrelated_conflicts_remain(self):
+        for path in module.KNOWN_CONFLICTS:
+            conflict = self.conflict(path)
+            for unsafe in (conflict.replace("Termux", "Other"),):
+                if unsafe == conflict:
+                    continue
+                with self.subTest(path=path):
+                    self.assertEqual(
+                        module.merge_known_conflicts(unsafe, path=path), unsafe
+                    )
+            edited = conflict.replace("=======\n", "=======\n// extra\n")
+            self.assertEqual(module.merge_known_conflicts(edited, path=path), edited)
+            self.assertEqual(
+                module.merge_known_conflicts(conflict, path="other/file.rs"), conflict
+            )
+
+    def test_checkpointed_baseline_without_conflict_is_unchanged(self):
+        text = "fn lock() {}\n"
+        for path in module.KNOWN_CONFLICTS:
+            self.assertEqual(module.merge_known_conflicts(text, path=path), text)
+
+    def test_exact_refs_resolve_lock_and_updater_redesigns(self):
+        refs = (
+            "rust-v0.168.0-alpha.6",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        try:
+            for ref in refs:
+                subprocess.check_output(
+                    ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+        old = os.getcwd()
+        os.chdir(ROOT)
+        try:
+            tree = module.release_tree(*refs, [".github"])
+        finally:
+            os.chdir(old)
+
+        def show(path):
+            return subprocess.check_output(
+                ["git", "show", f"{tree}:{path}"], cwd=ROOT, text=True
+            )
+
+        self.assertNotIn("<<<<<<<", show("codex-rs/rollout/src/writer_lock.rs"))
+        self.assertIn(
+            "Duration::from_secs", show("codex-rs/rollout/src/writer_lock.rs")
+        )
+        self.assertIn("lock_shared", show("codex-rs/core/src/installation_id.rs"))
+        self.assertIn(
+            "acquire_sibling_lock_dir", show("codex-rs/core/src/installation_id.rs")
+        )
+        self.assertIn("TermuxSelfUpdate", show("codex-rs/tui/src/update_action.rs"))
+        self.assertIn(
+            "standalone_unix_update_fails_when_installer_download_fails",
+            show("codex-rs/tui/src/update_action.rs"),
+        )
+
+
 class DependencyAdditionTests(unittest.TestCase):
     def test_android_openssl_survives_deletion_of_a_neighboring_section(self):
         path = "codex-rs/core/Cargo.toml"
