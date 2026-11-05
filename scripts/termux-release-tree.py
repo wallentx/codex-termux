@@ -193,6 +193,188 @@ def merge_dependency_additions(text, *, path):
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
 
 
+_LOCK_IMPORTS = (
+    "use codex_utils_file_lock::FileLockOutcome;\n",
+    "use codex_utils_file_lock::lock_exclusive_optional;\n",
+)
+
+# path -> (upstream, baseline, downstream, resolution, imports left unused)
+FALLBACK_CONFLICTS = {
+    "codex-rs/core/src/installation_id.rs": (
+        """        file.lock_shared()?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        if Uuid::parse_str(contents.trim()).is_err() {
+            // Another process can initialize the ID while we switch locks. Read it again
+            // under the exclusive lock before deciding whether to create a new one.
+            file.unlock()?;
+            file.lock()?;
+            file.seek(SeekFrom::Start(0))?;
+            contents.clear();
+            file.read_to_string(&mut contents)?;
+        }
+""",
+        "        file.lock()?;\n",
+        """        let _lock_dir_guard = match lock_exclusive_optional(&file)? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+""",
+        """        // Filesystems without advisory locks serialize through a sibling lock directory.
+        let mut _lock_dir_guard = None;
+        let mut file_locking = true;
+        match file.lock_shared() {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                _lock_dir_guard = Some(acquire_sibling_lock_dir(&path)?);
+                file_locking = false;
+            }
+            Err(err) => return Err(err),
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        if Uuid::parse_str(contents.trim()).is_err() {
+            // Another process can initialize the ID while we switch locks. Read it again
+            // under the exclusive lock before deciding whether to create a new one.
+            if file_locking {
+                file.unlock()?;
+                file.lock()?;
+            }
+            file.seek(SeekFrom::Start(0))?;
+            contents.clear();
+            file.read_to_string(&mut contents)?;
+        }
+""",
+        _LOCK_IMPORTS,
+    ),
+    "codex-rs/rollout/src/writer_lock.rs": (
+        """            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        Ok(file)
+""",
+        """            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        file.lock().map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })?;
+        Ok(file)
+""",
+        """            .open(&path)?;
+        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+""",
+        """            .open(&path)?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        let fallback_lock = loop {
+            match try_lock_writer_file(&file, &path)? {
+                TryWriterLockOutcome::Acquired(fallback_lock) => break fallback_lock,
+                TryWriterLockOutcome::WouldBlock if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                TryWriterLockOutcome::WouldBlock => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+            }
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+""",
+        _LOCK_IMPORTS + ("use codex_utils_file_lock::acquire_sibling_lock_dir;\n",),
+    ),
+    "codex-rs/tui/src/update_action.rs": (
+        "    fn standalone_windows_update_command_reruns_latest_installer() {\n",
+        """    fn standalone_update_commands_rerun_latest_installer() {
+        assert_eq!(
+            UpdateAction::StandaloneUnix.command_args(),
+            (
+                "sh",
+                &[
+                    "-c",
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+                ][..],
+            )
+        );
+""",
+        """    fn standalone_update_commands_rerun_latest_installer() {
+        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
+        assert_eq!(
+            UpdateAction::StandaloneUnix.command_args(),
+            (
+                "sh",
+                &[
+                    "-c",
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+                ][..],
+            )
+        );
+""",
+        """    fn termux_self_update_command_runs_codex_update() {
+        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
+    }
+
+    #[test]
+    fn standalone_windows_update_command_reruns_latest_installer() {
+""",
+        (),
+    ),
+}
+
+
+def merge_fallback_edits(text, *, path):
+    """Port reviewed lock/updater edits onto hunks upstream redesigned."""
+    rule = FALLBACK_CONFLICTS.get(path)
+    if rule is None:
+        return text
+    exact, resolved, imports = rule[:3], rule[3], rule[4]
+    pattern = r"^<<<<<<<[^\n]*\n(.*?)^\|\|\|\|\|\|\|[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n"
+    matches = list(re.finditer(pattern, text, flags=re.MULTILINE | re.DOTALL))
+    if len(matches) != 1 or matches[0].groups() != exact:
+        return text
+    merged = text[: matches[0].start()] + resolved + text[matches[0].end() :]
+    for line in imports:
+        if merged.count(line) != 1:
+            return text
+        merged = merged.replace(line, "", 1)
+    return merged
+
+
 def port_startup_lock_edits(upstream):
     import_anchor = "use codex_utils_absolute_path::AbsolutePathBuf;\n"
     field = "    _file: std::fs::File,\n"
@@ -689,7 +871,11 @@ def release_tree(upstream, source, baseline, excluded):
                 dependency_path = path == "codex-rs/Cargo.lock" or (
                     path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
                 )
-                if not (has_termux_updater and updater_path) and not dependency_path:
+                if (
+                    not (has_termux_updater and updater_path)
+                    and not dependency_path
+                    and path not in FALLBACK_CONFLICTS
+                ):
                     remaining.append(path)
                     continue
                 text = git("show", f"{result}:{path}").decode()
@@ -697,6 +883,7 @@ def release_tree(upstream, source, baseline, excluded):
                     text = merge_updater_additions(text, path=path)
                 if dependency_path:
                     text = merge_dependency_additions(text, path=path)
+                text = merge_fallback_edits(text, path=path)
                 if re.search(r"^(?:<<<<<<<|=======|>>>>>>>)", text, re.MULTILINE):
                     remaining.append(path)
                 else:
