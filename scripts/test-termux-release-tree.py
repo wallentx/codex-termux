@@ -602,6 +602,86 @@ class UpdaterAdaptationTests(unittest.TestCase):
         self.assertEqual(module.merge_updater_additions(conflict), conflict)
 
 
+class FallbackConflictTests(unittest.TestCase):
+    def conflict(self, path, rule=None):
+        ours, base, theirs, _, _ = rule or module.FALLBACK_CONFLICTS[path]
+        return f"<<<<<<< upstream\n{ours}||||||| baseline\n{base}=======\n{theirs}>>>>>>> target\n"
+
+    def test_reviewed_conflicts_port_to_new_upstream_api(self):
+        for path, rule in module.FALLBACK_CONFLICTS.items():
+            with self.subTest(path=path):
+                imports = "".join(rule[4])
+                resolved = module.merge_fallback_edits(
+                    imports + self.conflict(path), path=path
+                )
+                self.assertEqual(resolved, rule[3])
+
+    def test_unreviewed_or_ambiguous_conflicts_remain_conflicts(self):
+        for path, rule in module.FALLBACK_CONFLICTS.items():
+            with self.subTest(path=path):
+                imports = "".join(rule[4])
+                for text in (
+                    imports
+                    + self.conflict(path).replace("=======", "// edit\n=======", 1),
+                    imports + self.conflict(path) * 2,
+                    imports + "x\n" + self.conflict(path).replace(rule[0], "other\n"),
+                    # Imports must be exactly those the old code needed.
+                    "".join(rule[4][:1]) + self.conflict(path)
+                    if rule[4]
+                    else self.conflict(path) + "mismatch\n",
+                ):
+                    if not rule[4] and text.endswith("mismatch\n"):
+                        continue
+                    self.assertEqual(module.merge_fallback_edits(text, path=path), text)
+        text = self.conflict("codex-rs/tui/src/update_action.rs")
+        self.assertEqual(module.merge_fallback_edits(text, path="other.rs"), text)
+
+    def test_exact_refs_resolve_lock_and_updater_conflicts(self):
+        refs = (
+            "rust-v0.168.0-alpha.3",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        try:
+            for ref in refs:
+                subprocess.check_call(
+                    ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
+            env = dict(os.environ, RUNNER_TEMP=scratch)
+            tree = subprocess.run(
+                ["python3", str(HELPER), *refs, ".github"],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        for path, needle in (
+            ("codex-rs/core/src/installation_id.rs", "file.lock_shared()"),
+            (
+                "codex-rs/rollout/src/writer_lock.rs",
+                "try_lock_writer_file(&file, &path)?",
+            ),
+            ("codex-rs/tui/src/update_action.rs", "TermuxSelfUpdate.command_args"),
+        ):
+            text = subprocess.check_output(
+                ["git", "show", f"{tree}:{path}"], cwd=ROOT, text=True
+            )
+            self.assertNotRegex(text, r"(?m)^(?:<<<<<<<|=======|>>>>>>>)")
+            self.assertIn(needle, text)
+        installation = subprocess.check_output(
+            ["git", "show", f"{tree}:codex-rs/core/src/installation_id.rs"],
+            cwd=ROOT,
+            text=True,
+        )
+        self.assertIn("acquire_sibling_lock_dir", installation)
+
+
 class DependencyAdditionTests(unittest.TestCase):
     def test_android_openssl_survives_deletion_of_a_neighboring_section(self):
         path = "codex-rs/core/Cargo.toml"
