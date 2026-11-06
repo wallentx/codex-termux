@@ -193,6 +193,204 @@ def merge_dependency_additions(text, *, path):
     return re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
 
 
+_WRITER_LOCK_UPSTREAM = """            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        Ok(file)
+"""
+_WRITER_LOCK_BASE = """            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        file.lock().map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })?;
+        Ok(file)
+"""
+_WRITER_LOCK_SOURCE = """            .open(&path)?;
+        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+_WRITER_LOCK_PORTED = """            .open(&path)?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        let fallback_lock = loop {
+            match try_lock_exclusive_optional(&file)? {
+                TryFileLockOutcome::Acquired => break None,
+                TryFileLockOutcome::WouldBlock => {}
+                TryFileLockOutcome::Unsupported => match try_acquire_sibling_lock_dir(&path)? {
+                    TryLockDirOutcome::Acquired(guard) => break Some(guard),
+                    TryLockDirOutcome::WouldBlock => {}
+                },
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+"""
+
+_INSTALLATION_ID_UPSTREAM = """        file.lock_shared()?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        if Uuid::parse_str(contents.trim()).is_err() {
+            // Another process can initialize the ID while we switch locks. Read it again
+            // under the exclusive lock before deciding whether to create a new one.
+            file.unlock()?;
+            file.lock()?;
+            file.seek(SeekFrom::Start(0))?;
+            contents.clear();
+            file.read_to_string(&mut contents)?;
+        }
+"""
+_INSTALLATION_ID_BASE = "        file.lock()?;\n"
+_INSTALLATION_ID_SOURCE = """        let _lock_dir_guard = match lock_exclusive_optional(&file)? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+"""
+_INSTALLATION_ID_PORTED = """        let mut _lock_dir_guard = None;
+        if let Err(err) = file.lock_shared() {
+            if err.kind() != std::io::ErrorKind::Unsupported {
+                return Err(err);
+            }
+            _lock_dir_guard = Some(acquire_sibling_lock_dir(&path)?);
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        if Uuid::parse_str(contents.trim()).is_err() {
+            // Another process can initialize the ID while we switch locks. Read it again
+            // under the exclusive lock before deciding whether to create a new one.
+            if _lock_dir_guard.is_none() {
+                file.unlock()?;
+                if lock_exclusive_optional(&file)? == FileLockOutcome::Unsupported {
+                    _lock_dir_guard = Some(acquire_sibling_lock_dir(&path)?);
+                }
+            }
+            file.seek(SeekFrom::Start(0))?;
+            contents.clear();
+            file.read_to_string(&mut contents)?;
+        }
+"""
+
+_UPDATE_ACTION_UPSTREAM = (
+    "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+)
+_UPDATE_ACTION_OLD_HEADER = (
+    "    fn standalone_update_commands_rerun_latest_installer() {\n"
+)
+_UPDATE_ACTION_UNIX_ASSERT = """        assert_eq!(
+            UpdateAction::StandaloneUnix.command_args(),
+            (
+                "sh",
+                &[
+                    "-c",
+                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+                ][..],
+            )
+        );
+"""
+_UPDATE_ACTION_TERMUX_ASSERT = """        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
+"""
+_UPDATE_ACTION_BASE = _UPDATE_ACTION_OLD_HEADER + _UPDATE_ACTION_UNIX_ASSERT
+_UPDATE_ACTION_SOURCE = (
+    _UPDATE_ACTION_OLD_HEADER
+    + _UPDATE_ACTION_TERMUX_ASSERT
+    + _UPDATE_ACTION_UNIX_ASSERT
+)
+_UPDATE_ACTION_PORTED = (
+    "    fn termux_self_update_command_runs_codex_update() {\n"
+    + _UPDATE_ACTION_TERMUX_ASSERT
+    + "    }\n\n    #[test]\n"
+    + _UPDATE_ACTION_UPSTREAM
+)
+
+# path -> (upstream side, shared base, Termux side, ported replacement)
+REDESIGN_HUNKS = {
+    "codex-rs/core/src/installation_id.rs": (
+        _INSTALLATION_ID_UPSTREAM,
+        _INSTALLATION_ID_BASE,
+        _INSTALLATION_ID_SOURCE,
+        _INSTALLATION_ID_PORTED,
+    ),
+    "codex-rs/rollout/src/writer_lock.rs": (
+        _WRITER_LOCK_UPSTREAM,
+        _WRITER_LOCK_BASE,
+        _WRITER_LOCK_SOURCE,
+        _WRITER_LOCK_PORTED,
+    ),
+    "codex-rs/tui/src/update_action.rs": (
+        _UPDATE_ACTION_UPSTREAM,
+        _UPDATE_ACTION_BASE,
+        _UPDATE_ACTION_SOURCE,
+        _UPDATE_ACTION_PORTED,
+    ),
+}
+
+
+def merge_redesigned_hunks(text, *, path):
+    """Port reviewed lock and updater-test edits onto redesigned upstream hunks.
+
+    A conflict is resolved only when all three sides match the reviewed text
+    exactly; anything else stays a conflict so the preflight fails closed.
+    """
+    hunk = REDESIGN_HUNKS.get(path)
+    if hunk is None:
+        return text
+    pattern = r"^<<<<<<<[^\n]*\n(.*?)^\|\|\|\|\|\|\|[^\n]*\n(.*?)^=======\n(.*?)^>>>>>>>[^\n]*\n"
+
+    def resolve(match):
+        return hunk[3] if match.groups() == hunk[:3] else match[0]
+
+    resolved = re.sub(pattern, resolve, text, flags=re.MULTILINE | re.DOTALL)
+    if resolved != text and path == "codex-rs/rollout/src/writer_lock.rs":
+        # The bounded retry loop no longer uses the blocking lock helpers.
+        for name in (
+            "FileLockOutcome",
+            "acquire_sibling_lock_dir",
+            "lock_exclusive_optional",
+        ):
+            line = f"use codex_utils_file_lock::{name};\n"
+            if (
+                resolved.count(line) == 1
+                and len(re.findall(rf"\b{name}\b", resolved)) == 1
+            ):
+                resolved = resolved.replace(line, "", 1)
+    return resolved
+
+
 def port_startup_lock_edits(upstream):
     import_anchor = "use codex_utils_absolute_path::AbsolutePathBuf;\n"
     field = "    _file: std::fs::File,\n"
@@ -689,10 +887,15 @@ def release_tree(upstream, source, baseline, excluded):
                 dependency_path = path == "codex-rs/Cargo.lock" or (
                     path.startswith("codex-rs/") and path.endswith("/Cargo.toml")
                 )
-                if not (has_termux_updater and updater_path) and not dependency_path:
+                if (
+                    not (has_termux_updater and updater_path)
+                    and not dependency_path
+                    and path not in REDESIGN_HUNKS
+                ):
                     remaining.append(path)
                     continue
                 text = git("show", f"{result}:{path}").decode()
+                text = merge_redesigned_hunks(text, path=path)
                 if has_termux_updater and updater_path:
                     text = merge_updater_additions(text, path=path)
                 if dependency_path:

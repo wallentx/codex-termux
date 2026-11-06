@@ -455,6 +455,121 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class RedesignedHunkTests(unittest.TestCase):
+    PATTERN = "<<<<<<< upstream\n{}||||||| baseline\n{}=======\n{}>>>>>>> target\n"
+
+    def conflict(self, path, **override):
+        sides = list(module.REDESIGN_HUNKS[path][:3])
+        for index, value in override.items():
+            sides[int(index[1:])] = value
+        return self.PATTERN.format(*sides)
+
+    def test_reviewed_hunks_are_ported_and_markers_removed(self):
+        for path, (*_, ported) in module.REDESIGN_HUNKS.items():
+            with self.subTest(path=path):
+                merged = module.merge_redesigned_hunks(self.conflict(path), path=path)
+                self.assertNotIn("<<<<<<<", merged)
+                self.assertIn(ported.splitlines()[0].strip(), merged)
+
+    def test_writer_lock_keeps_bounded_wait_and_fallback(self):
+        path = "codex-rs/rollout/src/writer_lock.rs"
+        imports = "".join(
+            f"use codex_utils_file_lock::{name};\n"
+            for name in (
+                "FileLockOutcome",
+                "acquire_sibling_lock_dir",
+                "lock_exclusive_optional",
+            )
+        )
+        merged = module.merge_redesigned_hunks(imports + self.conflict(path), path=path)
+        self.assertNotIn("use codex_utils_file_lock", merged)
+        for needle in (
+            "Duration::from_secs(/*secs*/ 30)",
+            "ErrorKind::TimedOut",
+            "try_acquire_sibling_lock_dir(&path)",
+            "TryLockDirOutcome::WouldBlock => {}",
+            "_fallback_lock: fallback_lock",
+        ):
+            self.assertIn(needle, merged)
+
+    def test_installation_id_keeps_shared_read_and_fallback(self):
+        path = "codex-rs/core/src/installation_id.rs"
+        merged = module.merge_redesigned_hunks(self.conflict(path), path=path)
+        self.assertIn("file.lock_shared()", merged)
+        self.assertIn("ErrorKind::Unsupported", merged)
+        self.assertIn("acquire_sibling_lock_dir(&path)", merged)
+        self.assertIn("file.seek(SeekFrom::Start(0))?;", merged)
+
+    def test_update_action_test_keeps_termux_assertion(self):
+        path = "codex-rs/tui/src/update_action.rs"
+        merged = module.merge_redesigned_hunks(self.conflict(path), path=path)
+        self.assertIn("fn termux_self_update_command_runs_codex_update", merged)
+        self.assertIn("fn standalone_windows_update_command_reruns", merged)
+
+    def test_unrecognized_or_other_paths_stay_conflicts(self):
+        for path in module.REDESIGN_HUNKS:
+            for side in ("s0", "s1", "s2"):
+                with self.subTest(path=path, side=side):
+                    unsafe = self.conflict(
+                        path,
+                        **{side: module.REDESIGN_HUNKS[path][int(side[1])] + "x\n"},
+                    )
+                    self.assertEqual(
+                        module.merge_redesigned_hunks(unsafe, path=path), unsafe
+                    )
+        conflict = self.conflict("codex-rs/core/src/installation_id.rs")
+        self.assertEqual(
+            module.merge_redesigned_hunks(conflict, path="codex-rs/other.rs"),
+            conflict,
+        )
+
+    def test_checkpointed_baseline_without_conflict_is_unchanged(self):
+        text = "fn already_ported() {}\n"
+        for path in module.REDESIGN_HUNKS:
+            self.assertEqual(module.merge_redesigned_hunks(text, path=path), text)
+
+    def test_exact_refs_resolve_and_preserve_upstream(self):
+        refs = (
+            "rust-v0.168.0-alpha.7",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        try:
+            for ref in refs:
+                subprocess.check_output(
+                    ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+        cwd = os.getcwd()
+        os.chdir(ROOT)
+        try:
+            tree = module.release_tree(*refs, [".github"])
+        finally:
+            os.chdir(cwd)
+        changed = set(
+            subprocess.check_output(
+                ["git", "diff", "--name-only", refs[0], tree], cwd=ROOT, text=True
+            ).splitlines()
+        )
+        self.assertTrue(set(module.REDESIGN_HUNKS) <= changed)
+        # The upstream hunks outside the ported regions must survive.
+        wl = subprocess.check_output(
+            ["git", "show", f"{tree}:codex-rs/rollout/src/writer_lock.rs"],
+            cwd=ROOT,
+            text=True,
+        )
+        self.assertIn("bounded wait", wl)
+        ua = subprocess.check_output(
+            ["git", "show", f"{tree}:codex-rs/tui/src/update_action.rs"],
+            cwd=ROOT,
+            text=True,
+        )
+        self.assertIn("standalone_unix_update_fails_when_installer_download_fails", ua)
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
