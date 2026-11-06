@@ -455,6 +455,129 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class WriterLockAdaptationTests(unittest.TestCase):
+    def sample(self):
+        baseline = (
+            module._WRITER_LOCK_DOC[0]
+            + module._WRITER_LOCK_IMPORT[0]
+            + "fn a() {}\n"
+            + module._WRITER_LOCK_BASE_WAIT
+        )
+        source = baseline.replace(
+            module._WRITER_LOCK_BASE_WAIT,
+            module._WRITER_LOCK_SOURCE_WAIT
+            + "        Ok(file) // try_lock_exclusive_optional\n",
+        )
+        upstream = (
+            baseline.replace(*module._WRITER_LOCK_DOC)
+            .replace(*module._WRITER_LOCK_IMPORT)
+            .replace(module._WRITER_LOCK_BASE_WAIT, module._WRITER_LOCK_UPSTREAM_WAIT)
+        )
+        return baseline, source, upstream
+
+    def test_fallback_follows_bounded_coordination_wait(self):
+        baseline, source, upstream = self.sample()
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        self.assertIn(module._WRITER_LOCK_PORTED_WAIT, adapted)
+        self.assertIn("ErrorKind::TimedOut", adapted)
+        self.assertIn("try_acquire_sibling_lock_dir(&path)", adapted)
+        self.assertNotIn("acquire_sibling_lock_dir(&path)?),", adapted)
+        self.assertIn("use std::time::Instant;", adapted)
+        # Once adapted, the adapter must be inactive against the same upstream.
+        self.assertEqual(module.adapt_writer_lock(upstream, adapted, upstream), adapted)
+
+    def test_unchanged_baseline_and_unrecognized_edits_fail_closed(self):
+        baseline, source, upstream = self.sample()
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+        self.assertEqual(
+            module.adapt_writer_lock(baseline, baseline, upstream), baseline
+        )
+        with self.assertRaises(ValueError):
+            module.adapt_writer_lock(baseline, source, upstream + "// extra\n")
+        with self.assertRaises(ValueError):
+            module.adapt_writer_lock(
+                baseline, source.replace("FileLockOutcome::Acquired", "Other"), upstream
+            )
+
+    def test_exact_refs_port_writer_lock_and_split_update_test(self):
+        refs = (
+            "rust-v0.167.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        if any(
+            subprocess.run(
+                ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                cwd=ROOT,
+                capture_output=True,
+                check=False,
+            ).returncode
+            for ref in refs
+        ):
+            self.skipTest("exact downstream refs are not available")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
+            env = dict(os.environ, RUNNER_TEMP=scratch)
+            result = subprocess.run(
+                ["python3", str(HELPER), *refs],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tree = result.stdout.strip()
+
+            def show(path):
+                return subprocess.check_output(
+                    ["git", "show", f"{tree}:{path}"], cwd=ROOT, text=True
+                )
+
+            self.assertIn("try_acquire_sibling_lock_dir", show(module.WRITER_LOCK_PATH))
+            self.assertIn("ErrorKind::TimedOut", show(module.WRITER_LOCK_PATH))
+            self.assertIn(
+                "fn termux_self_update_command_runs_codex_update",
+                show("codex-rs/tui/src/update_action.rs"),
+            )
+
+
+class UpdateActionTestSplitTests(unittest.TestCase):
+    header = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+    assertion = module.TERMUX_UPDATE_ASSERTION
+
+    def conflict(self, ours, base, theirs):
+        return f"<<<<<<< upstream\n{ours}||||||| baseline\n{base}=======\n{theirs}>>>>>>> target\n"
+
+    def test_termux_assertion_gets_its_own_test(self):
+        base = self.header + "        old();\n"
+        ours = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        merged = module.merge_updater_additions(
+            self.conflict(
+                ours, base, self.header + self.assertion + "        old();\n"
+            ),
+            path="codex-rs/tui/src/update_action.rs",
+        )
+        self.assertEqual(
+            merged,
+            "    fn termux_self_update_command_runs_codex_update() {\n"
+            + self.assertion
+            + "    }\n\n    #[test]\n"
+            + ours,
+        )
+
+    def test_other_edits_remain_conflicts(self):
+        base = self.header + "        old();\n"
+        conflict = self.conflict(
+            "    fn renamed() {\n", base, self.header + "        other();\n"
+        )
+        self.assertEqual(
+            module.merge_updater_additions(
+                conflict, path="codex-rs/tui/src/update_action.rs"
+            ),
+            conflict,
+        )
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (

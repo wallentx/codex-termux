@@ -94,6 +94,13 @@ def drop_retired_clipboard_guard(baseline, source, upstream):
     return baseline if source == expected else source
 
 
+TERMUX_UPDATE_ASSERTION = """        assert_eq!(
+            UpdateAction::TermuxSelfUpdate.command_args(),
+            ("codex", &["update"][..])
+        );
+"""
+
+
 def merge_updater_additions(text, *, path=None):
     """Carry only reviewed Termux updater edits through upstream changes."""
     additions = {
@@ -127,6 +134,21 @@ def merge_updater_additions(text, *, path=None):
                     and ours.count(original) == 1
                 ):
                     return ours.replace(original, replacement, 1)
+            return match[0]
+        if path == "codex-rs/tui/src/update_action.rs":
+            header = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+            if (
+                base.startswith(header)
+                and theirs == header + TERMUX_UPDATE_ASSERTION + base[len(header) :]
+                and re.fullmatch(r"    fn \w+\(\) \{\n", ours)
+            ):
+                # Upstream split this test; keep the Termux assertion in its own test.
+                return (
+                    "    fn termux_self_update_command_runs_codex_update() {\n"
+                    + TERMUX_UPDATE_ASSERTION
+                    + "    }\n\n    #[test]\n"
+                    + ours
+                )
             return match[0]
         if not base and theirs in additions:
             return theirs + ours
@@ -491,6 +513,115 @@ def adapt_android_package_validation(baseline, source, upstream):
     )
 
 
+WRITER_LOCK_PATH = "codex-rs/rollout/src/writer_lock.rs"
+
+_WRITER_LOCK_DOC = (
+    "//! Thread lock-file creation and removal uses the existing home coordination lock.\n",
+    "//! Thread lock-file creation and removal uses a bounded wait for the home coordination lock.\n",
+)
+_WRITER_LOCK_IMPORT = (
+    "use std::sync::atomic::Ordering;\n",
+    "use std::sync::atomic::Ordering;\nuse std::time::Duration;\nuse std::time::Instant;\n",
+)
+_WRITER_LOCK_BASE_WAIT = """        file.lock().map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })?;
+        Ok(file)
+"""
+_WRITER_LOCK_UPSTREAM_WAIT = """        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        Ok(file)
+"""
+_WRITER_LOCK_SOURCE_WAIT = """        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+"""
+_WRITER_LOCK_PORTED_WAIT = """        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        let fallback_lock = loop {
+            match try_lock_exclusive_optional(&file) {
+                Ok(TryFileLockOutcome::Acquired) => break None,
+                Ok(TryFileLockOutcome::Unsupported) => {
+                    match try_acquire_sibling_lock_dir(&path)? {
+                        TryLockDirOutcome::Acquired(guard) => break Some(guard),
+                        TryLockDirOutcome::WouldBlock => {}
+                    }
+                }
+                Ok(TryFileLockOutcome::WouldBlock) => {}
+                Err(err) => {
+                    return Err(io::Error::other(format!(
+                        "failed to acquire thread writer coordination lock: {err}"
+                    )));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+        };
+"""
+
+
+def adapt_writer_lock(baseline, source, upstream):
+    """Carry the unsupported-lock fallback through upstream's bounded coordination wait."""
+    if (
+        _WRITER_LOCK_UPSTREAM_WAIT not in upstream
+        or _WRITER_LOCK_UPSTREAM_WAIT in baseline
+        or source == baseline
+        or "try_lock_exclusive_optional" not in source
+    ):
+        return source
+    # Anything beyond the bounded wait in upstream's change is unreviewed.
+    expected = baseline
+    for before, after in (
+        _WRITER_LOCK_DOC,
+        _WRITER_LOCK_IMPORT,
+        (_WRITER_LOCK_BASE_WAIT, _WRITER_LOCK_UPSTREAM_WAIT),
+    ):
+        if expected.count(before) != 1:
+            raise ValueError("unrecognized writer lock baseline; refusing adaptation")
+        expected = expected.replace(before, after, 1)
+    if expected != upstream:
+        raise ValueError(
+            "unrecognized upstream writer lock change; refusing adaptation"
+        )
+    adapted = source
+    for before, after in (
+        _WRITER_LOCK_DOC,
+        _WRITER_LOCK_IMPORT,
+        (_WRITER_LOCK_SOURCE_WAIT, _WRITER_LOCK_PORTED_WAIT),
+    ):
+        if adapted.count(before) != 1:
+            raise ValueError(
+                "unrecognized Termux writer lock delta; refusing adaptation"
+            )
+        adapted = adapted.replace(before, after, 1)
+    return adapted
+
+
 def release_tree(upstream, source, baseline, excluded):
     upstream, source, baseline = (
         git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip()
@@ -532,6 +663,7 @@ def release_tree(upstream, source, baseline, excluded):
         for path, adapter in (
             (ARG0_PATH, adapt_arg0_lock),
             (DAEMON_PREPARE_PATH, adapt_android_package_validation),
+            (WRITER_LOCK_PATH, adapt_writer_lock),
         ):
             if not all(
                 git("ls-tree", ref, "--", path) for ref in (baseline, source, upstream)
