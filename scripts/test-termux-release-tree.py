@@ -454,6 +454,63 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
             module.adapt_split_daemon_socket(baseline, source, baseline), source
         )
 
+    def exact_files(self, refs, path):
+        try:
+            return [
+                subprocess.check_output(
+                    ["git", "show", f"{ref}:{path}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                ).decode()
+                for ref in refs
+            ]
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+
+    def test_exact_refs_preserve_installation_id_lock_fallback(self):
+        refs = (
+            "rust-v0.165.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.169.0-alpha.2",
+        )
+        baseline, source, upstream = self.exact_files(refs, module.INSTALLATION_ID_PATH)
+        adapted = module.adapt_installation_id_lock(baseline, source, upstream)
+        self.assertIn("file.lock_shared()", adapted)
+        self.assertIn("acquire_sibling_lock_dir(&path)", adapted)
+        self.assertIn("if lock_dir_guard.is_none()", adapted)
+        with self.assertRaises(ValueError):
+            module.adapt_installation_id_lock(baseline, source + "// edit\n", upstream)
+        # Inactive once the baseline already has the redesign (checkpointed).
+        self.assertEqual(
+            module.adapt_installation_id_lock(upstream, adapted, upstream), adapted
+        )
+        self.assertEqual(
+            module.adapt_installation_id_lock(baseline, source, baseline), source
+        )
+
+    def test_exact_refs_preserve_writer_lock_fallback(self):
+        refs = (
+            "rust-v0.165.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.169.0-alpha.2",
+        )
+        baseline, source, upstream = self.exact_files(refs, module.WRITER_LOCK_PATH)
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        for needle in (
+            "fn open_coordination(",
+            "try_lock_shared_writer_file(&file, &coordination_path)",
+            "drop(coordination_fallback);",
+            "fn wait_for_coordination(",
+        ):
+            self.assertIn(needle, adapted)
+        # Unsupported locking must never fall through to the raw std lock calls.
+        self.assertNotIn(".try_lock()", adapted)
+        self.assertNotIn(".try_lock_shared()", adapted)
+        with self.assertRaises(ValueError):
+            module.adapt_writer_lock(baseline, source + "// edit\n", upstream)
+        self.assertEqual(module.adapt_writer_lock(upstream, adapted, upstream), adapted)
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+
 
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
@@ -578,6 +635,34 @@ class UpdaterAdaptationTests(unittest.TestCase):
                         ),
                         unsafe,
                     )
+
+    def test_updater_assertion_survives_upstream_test_split(self):
+        header = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        renamed = (
+            "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        )
+        assertion = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        base = header + "        assert_eq!(unix);\n"
+        conflict = (
+            f"<<<<<<< upstream\n{renamed}||||||| baseline\n{base}"
+            f"=======\n{header}{assertion}{base[len(header) :]}>>>>>>> target\n"
+        )
+        path = "codex-rs/tui/src/update_action.rs"
+        self.assertEqual(
+            module.merge_updater_additions(conflict, path=path),
+            "    fn termux_self_update_command_runs_codex_update() {\n"
+            + assertion
+            + "    }\n\n    #[test]\n"
+            + renamed,
+        )
+        self.assertEqual(module.merge_updater_additions(conflict), conflict)
+        unsafe = conflict.replace(assertion, assertion + "        extra();\n")
+        self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
 
     def test_known_insertion_preserves_upstream_addition(self):
         ours = "    Daemon,\n"
