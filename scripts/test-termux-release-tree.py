@@ -672,5 +672,180 @@ class DependencyAdditionTests(unittest.TestCase):
                     )
 
 
+class WriterLockRedesignTests(unittest.TestCase):
+    BASELINE = "rust-v0.165.0"
+    SOURCE = "5db5559ab8bdc27c8982944605f9c72d4d2abcde"
+    UPSTREAM = "rust-v0.169.0-alpha.7"
+
+    def show(self, ref, path):
+        return subprocess.check_output(
+            ["git", "show", f"{ref}:{path}"], cwd=ROOT, stderr=subprocess.DEVNULL
+        ).decode()
+
+    def texts(self, path):
+        try:
+            return [
+                self.show(ref, path)
+                for ref in (self.BASELINE, self.SOURCE, self.UPSTREAM)
+            ]
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+
+    def test_exact_refs_keep_fallback_through_bounded_coordination(self):
+        baseline, source, upstream = self.texts(module.WRITER_LOCK_PATH)
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        for needle in (
+            "try_lock_writer_file_shared",
+            "fn wait_for_coordination(\n        try_lock: impl Fn() -> io::Result<TryWriterLockOutcome>",
+            "fallback_lock: Option<LockDirGuard>",
+            "-> io::Result<Option<CoordinationLockGuard>>",
+        ):
+            self.assertIn(needle, adapted)
+        # Upstream's bounded wait and non-blocking cleanup stay intact.
+        self.assertIn("timed out waiting for the thread writer coordination", adapted)
+        self.assertNotIn(".try_lock()", adapted.split("#[cfg(test)]")[0])
+        self.assertNotIn(".lock()", adapted)
+        self.assertEqual(module.adapt_writer_lock(upstream, adapted, upstream), adapted)
+
+    def test_writer_lock_adapter_stays_inactive_for_checkpointed_baseline(self):
+        baseline, source, upstream = self.texts(module.WRITER_LOCK_PATH)
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+        self.assertEqual(
+            module.adapt_writer_lock(baseline, baseline, upstream), baseline
+        )
+
+    def test_writer_lock_adapter_rejects_unrecognized_edits(self):
+        baseline, source, upstream = self.texts(module.WRITER_LOCK_PATH)
+        for unsafe in (
+            source + "// extra\n",
+            source.replace("fallback_lock,\n        })", "None,\n        })", 1),
+        ):
+            with self.subTest(source=unsafe[-40:]), self.assertRaises(ValueError):
+                module.adapt_writer_lock(baseline, unsafe, upstream)
+        with self.assertRaises(ValueError):
+            module.adapt_writer_lock(
+                baseline, source, upstream.replace("fn lock_coordination", "fn lock_x")
+            )
+
+    def test_installation_id_conflict_ports_fallback_to_shared_read(self):
+        conflict = (
+            f"<<<<<<< upstream\n{module._ID_UPSTREAM}"
+            f"||||||| baseline\n{module._ID_BASE}"
+            f"=======\n{module._ID_SOURCE}>>>>>>> target\n"
+        )
+        text = (
+            "use codex_utils_file_lock::FileLockOutcome;\n"
+            "use codex_utils_file_lock::acquire_sibling_lock_dir;\n"
+            "use codex_utils_file_lock::lock_exclusive_optional;\n" + conflict
+        )
+        merged = module.merge_installation_id_lock(text)
+        self.assertEqual(
+            merged,
+            "use codex_utils_file_lock::acquire_sibling_lock_dir;\n"
+            + module._ID_PORTED,
+        )
+        for unsafe in (
+            text.replace(module._ID_SOURCE, module._ID_SOURCE + "extra();\n"),
+            text.replace(module._ID_BASE, "        other();\n"),
+        ):
+            with self.subTest(unsafe=unsafe[-30:]):
+                self.assertEqual(module.merge_installation_id_lock(unsafe), unsafe)
+
+    def test_file_lock_dependency_moves_only_when_layout_matches(self):
+        dep = "codex-utils-file-lock = { workspace = true }\n"
+        anchor = "codex-utils-absolute-path = { workspace = true }\n"
+        lock = (
+            '[[package]]\nname = "codex-core"\ndependencies = [\n'
+            ' "codex-utils-absolute-path",\n "codex-utils-file-lock",\n]\n\n'
+            '[[package]]\nname = "codex-runtime-agent-instance"\ndependencies = [\n'
+            ' "codex-utils-absolute-path",\n "serde",\n]\n'
+        )
+        core, runtime, moved = module.relocate_file_lock_dependency(
+            f"a = 1\n{dep}", f"{anchor}b = 1\n", lock
+        )
+        self.assertEqual((core, runtime), ("a = 1\n", f"{anchor}{dep}b = 1\n"))
+        self.assertEqual(
+            moved,
+            lock.replace(
+                ' "codex-utils-absolute-path",\n "codex-utils-file-lock",\n',
+                ' "codex-utils-absolute-path",\n',
+                1,
+            ).replace(
+                ' "codex-utils-absolute-path",\n "serde",\n',
+                ' "codex-utils-absolute-path",\n "codex-utils-file-lock",\n "serde",\n',
+            ),
+        )
+        with self.assertRaises(ValueError):
+            module.relocate_file_lock_dependency("a = 1\n", f"{anchor}", lock)
+
+    def test_update_action_test_conflict_keeps_termux_assertion(self):
+        old = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        new = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        body = '        assert_eq!(\n            UpdateAction::StandaloneUnix.command_args(),\n            ("sh", &[][..])\n        );\n'
+        termux = (
+            "        assert_eq!(\n            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n        );\n'
+        )
+        conflict = (
+            f"<<<<<<< upstream\n{new}||||||| baseline\n{old}{body}"
+            f"=======\n{old}{termux}{body}>>>>>>> target\n"
+        )
+        merged = module.merge_updater_additions(
+            conflict, path="codex-rs/tui/src/update_action.rs"
+        )
+        self.assertEqual(
+            merged,
+            "    fn termux_self_update_command_runs_codex_update() {\n"
+            + termux
+            + "    }\n\n    #[test]\n"
+            + new,
+        )
+        altered = conflict.replace(termux, termux + "        extra();\n")
+        self.assertEqual(
+            module.merge_updater_additions(
+                altered, path="codex-rs/tui/src/update_action.rs"
+            ),
+            altered,
+        )
+
+    def test_exact_refs_produce_verified_tree_with_upstream_preserved(self):
+        for ref in (self.BASELINE, self.SOURCE, self.UPSTREAM):
+            if subprocess.run(
+                ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                cwd=ROOT,
+                capture_output=True,
+                check=False,
+            ).returncode:
+                self.skipTest("exact release refs are not available")
+        result = subprocess.run(
+            ["python3", str(HELPER), self.UPSTREAM, self.SOURCE, self.BASELINE]
+            + [".github"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tree = result.stdout.strip()
+        self.assertIn(
+            "Adapted Termux delta in codex-rs/rollout/src/writer_lock.rs", result.stderr
+        )
+        self.assertIn("Verified release tree", result.stderr)
+        runtime = subprocess.check_output(
+            ["git", "show", f"{tree}:{module.INSTALLATION_ID_PATH}"], cwd=ROOT
+        ).decode()
+        self.assertIn("acquire_sibling_lock_dir", runtime)
+        # The generated tree differs from upstream only in downstream-owned paths.
+        changed = set(
+            subprocess.check_output(
+                ["git", "diff", "--name-only", self.UPSTREAM, tree], cwd=ROOT
+            )
+            .decode()
+            .splitlines()
+        )
+        self.assertNotIn("codex-rs/core/src/lib.rs", changed)
+        self.assertIn("codex-rs/runtime-agent-instance/Cargo.toml", changed)
+
+
 if __name__ == "__main__":
     unittest.main()
