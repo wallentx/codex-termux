@@ -454,6 +454,99 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
             module.adapt_split_daemon_socket(baseline, source, baseline), source
         )
 
+    def test_exact_refs_port_writer_lock_fallback_to_bounded_wait(self):
+        path = module.WRITER_LOCK_PATH
+        refs = (
+            "rust-v0.165.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.167.1",
+        )
+        try:
+            baseline, source, upstream = (
+                subprocess.check_output(
+                    ["git", "show", f"{ref}:{path}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                ).decode()
+                for ref in refs
+            )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        self.assertIn("Duration::from_secs(/*secs*/ 30)", adapted)
+        self.assertIn("io::ErrorKind::TimedOut", adapted)
+        self.assertIn("try_acquire_sibling_lock_dir(&path)", adapted)
+        self.assertIn("drop(self.fallback_lock.take());", adapted)
+        self.assertNotIn("file.try_lock()", adapted)
+        self.assertNotIn(".lock()", adapted)
+        for unsafe in (
+            source + "// edit\n",
+            source.replace("fallback_lock,", "None,", 1),
+        ):
+            with self.subTest(source=unsafe), self.assertRaises(ValueError):
+                module.adapt_writer_lock(baseline, unsafe, upstream)
+        # Once upstream's bounded wait is in the paired baseline, stay inactive.
+        self.assertEqual(module.adapt_writer_lock(upstream, source, upstream), source)
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+
+    def test_exact_refs_generate_release_tree_with_all_compatibility_edits(self):
+        refs = ("rust-v0.167.1", "5db5559ab8bdc27c8982944605f9c72d4d2abcde")
+        try:
+            for ref in (*refs, "rust-v0.165.0"):
+                subprocess.check_call(
+                    ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        tree = module.release_tree(*refs, "rust-v0.165.0", [".github"])
+
+        def show(path):
+            return subprocess.check_output(
+                ["git", "show", f"{tree}:{path}"], cwd=ROOT, text=True
+            )
+
+        self.assertIn("try_acquire_sibling_lock_dir", show(module.WRITER_LOCK_PATH))
+        self.assertIn("Duration::from_secs(/*secs*/ 30)", show(module.WRITER_LOCK_PATH))
+        actions = show("codex-rs/tui/src/update_action.rs")
+        self.assertIn("TermuxSelfUpdate", actions)
+        self.assertIn(
+            "fn standalone_unix_update_fails_when_installer_download_fails", actions
+        )
+        core = show("codex-rs/core/Cargo.toml")
+        self.assertIn("codex-utils-file-lock", core)
+        self.assertIn("codex-utils-critical-path", core)
+        self.assertNotIn("<<<<<<<", show("codex-rs/Cargo.lock"))
+
+    def test_split_installer_test_keeps_termux_assertion(self):
+        test = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        assertion = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        rest = "        assert_eq!(unix);\n"
+
+        def conflict(theirs):
+            return (
+                f"<<<<<<< upstream\n    fn standalone_windows_update_command_reruns_latest_installer() {{\n"
+                f"||||||| baseline\n{test}{rest}=======\n{theirs}>>>>>>> target\n"
+            )
+
+        path = "codex-rs/tui/src/update_action.rs"
+        self.assertEqual(
+            module.merge_updater_additions(
+                conflict(test + assertion + rest), path=path
+            ),
+            "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+            + assertion,
+        )
+        unsafe = conflict(test + assertion + "        // extra\n" + rest)
+        self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
+
 
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
