@@ -454,6 +454,133 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
             module.adapt_split_daemon_socket(baseline, source, baseline), source
         )
 
+    def show(self, ref, path):
+        try:
+            return subprocess.check_output(
+                ["git", "show", f"{ref}:{path}"], cwd=ROOT, stderr=subprocess.DEVNULL
+            ).decode()
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+
+    def test_exact_refs_preserve_writer_lock_fallback_through_bounded_coordination(
+        self,
+    ):
+        refs = (
+            "rust-v0.165.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.170.0-alpha.2",
+        )
+        baseline, source, upstream = (
+            self.show(ref, module.WRITER_LOCK_PATH) for ref in refs
+        )
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        for expected in (
+            "fn wait_for_coordination(\n        try_lock: impl Fn() -> io::Result<TryWriterLockOutcome>,",
+            "try_lock_shared_optional(file)",
+            "try_acquire_sibling_lock_dir(path)",
+            "drop(self.fallback_lock.take());",
+            "have_exclusive",
+        ):
+            self.assertIn(expected, adapted)
+        self.assertNotIn(".try_lock()", adapted)
+        self.assertNotIn(".try_lock_shared()", adapted)
+        self.assertEqual(module.adapt_writer_lock(upstream, adapted, upstream), adapted)
+        # A checkpointed baseline that already has the redesign is not adapted.
+        self.assertEqual(module.adapt_writer_lock(upstream, source, upstream), source)
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+        for unsafe in (
+            source + "// edit\n",
+            source.replace("drop(fallback_lock);", "", 1),
+        ):
+            with self.subTest(source=unsafe), self.assertRaises(ValueError):
+                module.adapt_writer_lock(baseline, unsafe, upstream)
+
+    def test_exact_refs_preserve_installation_id_fallback_after_module_move(self):
+        refs = (
+            "rust-v0.165.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.170.0-alpha.2",
+        )
+        baseline, source = (
+            self.show(ref, module.INSTALLATION_ID_CORE_PATH) for ref in refs[:2]
+        )
+        upstream = self.show(refs[2], module.INSTALLATION_ID_PATH)
+        manifest = self.show(refs[2], module.INSTALLATION_ID_MANIFEST)
+        adapted, adapted_manifest = module.adapt_installation_id(
+            baseline, source, upstream, manifest
+        )
+        self.assertIn("Some(acquire_sibling_lock_dir(&path)?)", adapted)
+        self.assertIn("if lock_dir_guard.is_none() {", adapted)
+        self.assertIn(
+            "codex-utils-file-lock = { workspace = true }\n", adapted_manifest
+        )
+        for unsafe in (source + "// edit\n", baseline):
+            with self.subTest(source=unsafe), self.assertRaises(ValueError):
+                module.adapt_installation_id(baseline, unsafe, upstream, manifest)
+        with self.assertRaises(ValueError):
+            module.adapt_installation_id(baseline, source, upstream, adapted_manifest)
+
+    def test_exact_refs_generate_tree_preserving_unrelated_upstream_changes(self):
+        refs = (
+            "rust-v0.170.0-alpha.2",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        for ref in refs:
+            self.show(ref, "codex-rs/Cargo.toml")
+        result = subprocess.run(
+            ["python3", str(HELPER), *refs, ".github"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tree = result.stdout.strip()
+        changed = set(
+            subprocess.check_output(
+                ["git", "diff", "--name-only", refs[0], tree], cwd=ROOT, text=True
+            ).splitlines()
+        )
+        self.assertNotIn(module.INSTALLATION_ID_CORE_PATH, changed)
+        self.assertIn(module.INSTALLATION_ID_PATH, changed)
+        self.assertIn("codex-rs/rollout/src/writer_lock.rs", changed)
+        # Upstream-only files (message board, direct tool timing) stay untouched.
+        self.assertNotIn("codex-rs/core/src/lib.rs", changed)
+        self.assertNotIn("codex-rs/message-board/Cargo.toml", changed)
+        core = subprocess.check_output(
+            ["git", "show", f"{tree}:codex-rs/core/Cargo.toml"], cwd=ROOT, text=True
+        )
+        self.assertIn("codex-direct-tool-timing", core)
+        self.assertIn("[target.aarch64-linux-android.dependencies]", core)
+
+    def test_split_installer_test_keeps_termux_assertion_and_upstream_tests(self):
+        head = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        termux = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        base = head + "        // unix\n"
+        text = (
+            "<<<<<<< ours\n    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+            f"||||||| base\n{base}=======\n{head}{termux}        // unix\n>>>>>>> theirs\n"
+        )
+        path = "codex-rs/tui/src/update_action.rs"
+        resolved = module.merge_updater_additions(text, path=path)
+        self.assertEqual(
+            resolved,
+            "    fn termux_self_update_command_runs_codex_update() {\n"
+            + termux
+            + "    }\n\n    #[test]\n"
+            "    fn standalone_windows_update_command_reruns_latest_installer() {\n",
+        )
+        unrelated = text.replace("// unix", "// other", 1)
+        self.assertEqual(
+            module.merge_updater_additions(unrelated, path=path), unrelated
+        )
+
 
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):

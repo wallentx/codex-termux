@@ -128,6 +128,29 @@ def merge_updater_additions(text, *, path=None):
                 ):
                     return ours.replace(original, replacement, 1)
             return match[0]
+        if path == "codex-rs/tui/src/update_action.rs":
+            head = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+            termux = (
+                "        assert_eq!(\n"
+                "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+                '            ("codex", &["update"][..])\n'
+                "        );\n"
+            )
+            # Upstream split the combined installer test; keep the Termux
+            # assertion as its own test and take upstream's new test body.
+            if (
+                base.startswith(head)
+                and theirs == head + termux + base[len(head) :]
+                and ours.startswith("    fn ")
+                and "TermuxSelfUpdate" not in ours
+            ):
+                return (
+                    "    fn termux_self_update_command_runs_codex_update() {\n"
+                    + termux
+                    + "    }\n\n    #[test]\n"
+                    + ours
+                )
+            return match[0]
         if not base and theirs in additions:
             return theirs + ours
         signature = (
@@ -491,6 +514,538 @@ def adapt_android_package_validation(baseline, source, upstream):
     )
 
 
+WRITER_LOCK_PATH = "codex-rs/rollout/src/writer_lock.rs"
+
+_WRITER_STRUCT = (
+    "    path: PathBuf,\n    file: Option<File>,\n}\n",
+    """    path: PathBuf,
+    file: Option<File>,
+    fallback_lock: Option<LockDirGuard>,
+}
+
+pub(crate) struct CoordinationLockGuard {
+    _file: File,
+    _fallback_lock: Option<LockDirGuard>,
+}
+
+enum TryWriterLockOutcome {
+    Acquired(Option<LockDirGuard>),
+    WouldBlock,
+}
+""",
+    1,
+)
+_WRITER_THREAD_LOCK = (
+    """        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("thread {thread_id} already has an active writer"),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(io::Error::other(format!(
+                    "failed to acquire thread writer lock {}: {err}",
+                    path.display()
+                )));
+            }
+        }
+
+        Ok(WriterLockGuard {
+            coordinator: Arc::clone(self),
+            path,
+            file: Some(file),
+        })
+""",
+    """        let fallback_lock = match try_lock_writer_file(&file, &path) {
+            Ok(TryWriterLockOutcome::Acquired(fallback_lock)) => fallback_lock,
+            Ok(TryWriterLockOutcome::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("thread {thread_id} already has an active writer"),
+                ));
+            }
+            Err(err) => {
+                return Err(io::Error::other(format!(
+                    "failed to acquire thread writer lock {}: {err}",
+                    path.display()
+                )));
+            }
+        };
+
+        Ok(WriterLockGuard {
+            coordinator: Arc::clone(self),
+            path,
+            file: Some(file),
+            fallback_lock,
+        })
+""",
+    1,
+)
+_WRITER_PUBLICATION = (
+    """    ) -> io::Result<Option<File>> {
+        let coordination_lock = self.lock_coordination()?;
+        let path = self.directory.join(format!("{thread_id}.lock"));
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => Ok(Some(coordination_lock)),
+                Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+                Err(std::fs::TryLockError::Error(err)) => Err(err),
+            },
+""",
+    """    ) -> io::Result<Option<CoordinationLockGuard>> {
+        let coordination_lock = self.lock_coordination()?;
+        let path = self.directory.join(format!("{thread_id}.lock"));
+        match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => match try_lock_writer_file(&file, &path)? {
+                TryWriterLockOutcome::Acquired(fallback_lock) => {
+                    drop(fallback_lock);
+                    Ok(Some(coordination_lock))
+                }
+                TryWriterLockOutcome::WouldBlock => Ok(None),
+            },
+""",
+    1,
+)
+_WRITER_SWEEP = (
+    """            match file.try_lock() {
+                Ok(()) => {
+                    drop(file);
+                    if let Err(err) = fs::remove_file(&path)
+                        && err.kind() != io::ErrorKind::NotFound
+                    {
+                        warn!(
+                            "failed to remove stale thread writer lock {}: {err}",
+                            path.display()
+                        );
+                    }
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(err)) => {
+""",
+    """            match try_lock_writer_file(&file, &path) {
+                Ok(TryWriterLockOutcome::Acquired(fallback_lock)) => {
+                    drop(file);
+                    if let Err(err) = fs::remove_file(&path)
+                        && err.kind() != io::ErrorKind::NotFound
+                    {
+                        warn!(
+                            "failed to remove stale thread writer lock {}: {err}",
+                            path.display()
+                        );
+                    }
+                    drop(fallback_lock);
+                }
+                Ok(TryWriterLockOutcome::WouldBlock) => {}
+                Err(err) => {
+""",
+    1,
+)
+_WRITER_DROP_FALLBACK = (
+    "        drop(coordination_lock);\n",
+    "        drop(self.fallback_lock.take());\n        drop(coordination_lock);\n",
+    1,
+)
+_WRITER_TEST_ANCHOR = '#[cfg(test)]\n#[path = "writer_lock_tests.rs"]\n'
+
+# Edits that make up the reviewed downstream delta on the pre-redesign file.
+WRITER_LOCK_BASELINE_EDITS = (
+    (
+        "use codex_protocol::ThreadId;\n",
+        """use codex_protocol::ThreadId;
+use codex_utils_file_lock::FileLockOutcome;
+use codex_utils_file_lock::LockDirGuard;
+use codex_utils_file_lock::TryFileLockOutcome;
+use codex_utils_file_lock::TryLockDirOutcome;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
+use codex_utils_file_lock::lock_exclusive_optional;
+use codex_utils_file_lock::try_acquire_sibling_lock_dir;
+use codex_utils_file_lock::try_lock_exclusive_optional;
+""",
+        1,
+    ),
+    _WRITER_STRUCT,
+    _WRITER_THREAD_LOCK,
+    _WRITER_PUBLICATION,
+    (
+        """    fn lock_coordination(&self) -> io::Result<File> {
+        fs::create_dir_all(&self.directory)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.directory.join(COORDINATION_LOCK_FILE))?;
+        file.lock().map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })?;
+        Ok(file)
+    }
+""",
+        """    fn lock_coordination(&self) -> io::Result<CoordinationLockGuard> {
+        fs::create_dir_all(&self.directory)?;
+        let path = self.directory.join(COORDINATION_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let fallback_lock = match lock_exclusive_optional(&file).map_err(|err| {
+            io::Error::other(format!(
+                "failed to acquire thread writer coordination lock: {err}"
+            ))
+        })? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+    }
+""",
+        1,
+    ),
+    _WRITER_SWEEP,
+    _WRITER_DROP_FALLBACK,
+)
+
+_WRITER_HELPERS = """fn try_lock_writer_file(file: &File, path: &Path) -> io::Result<TryWriterLockOutcome> {
+    writer_lock_outcome(try_lock_exclusive_optional(file)?, path)
+}
+
+fn try_lock_shared_writer_file(file: &File, path: &Path) -> io::Result<TryWriterLockOutcome> {
+    writer_lock_outcome(try_lock_shared_optional(file)?, path)
+}
+
+fn writer_lock_outcome(
+    outcome: TryFileLockOutcome,
+    path: &Path,
+) -> io::Result<TryWriterLockOutcome> {
+    match outcome {
+        TryFileLockOutcome::Acquired => Ok(TryWriterLockOutcome::Acquired(None)),
+        TryFileLockOutcome::WouldBlock => Ok(TryWriterLockOutcome::WouldBlock),
+        TryFileLockOutcome::Unsupported => match try_acquire_sibling_lock_dir(path)? {
+            TryLockDirOutcome::Acquired(guard) => Ok(TryWriterLockOutcome::Acquired(Some(guard))),
+            TryLockDirOutcome::WouldBlock => Ok(TryWriterLockOutcome::WouldBlock),
+        },
+    }
+}
+
+"""
+
+_WRITER_HELPERS_OLD = """fn try_lock_writer_file(file: &File, path: &Path) -> io::Result<TryWriterLockOutcome> {
+    match try_lock_exclusive_optional(file)? {
+        TryFileLockOutcome::Acquired => Ok(TryWriterLockOutcome::Acquired(None)),
+        TryFileLockOutcome::WouldBlock => Ok(TryWriterLockOutcome::WouldBlock),
+        TryFileLockOutcome::Unsupported => match try_acquire_sibling_lock_dir(path)? {
+            TryLockDirOutcome::Acquired(guard) => Ok(TryWriterLockOutcome::Acquired(Some(guard))),
+            TryLockDirOutcome::WouldBlock => Ok(TryWriterLockOutcome::WouldBlock),
+        },
+    }
+}
+
+"""
+
+_WRITER_DROP_HEAD = """        let coordination_lock = match self.coordinator.open_coordination() {
+            Ok(lock) => lock,
+            Err(err) => {
+                warn!("failed to coordinate thread writer lock cleanup: {err}");
+                return;
+            }
+        };
+
+        match coordination_lock.try_lock() {
+            Ok(()) => {}
+            // Leave the file for the next writer. Dropping the guard still closes it.
+            Err(fs::TryLockError::WouldBlock) => return,
+            Err(fs::TryLockError::Error(err)) => {
+                warn!("failed to coordinate thread writer lock cleanup: {err}");
+                return;
+            }
+        }
+"""
+
+# Edits that carry the same fallback onto upstream's bounded-wait coordination.
+WRITER_LOCK_UPSTREAM_EDITS = (
+    (
+        "use codex_protocol::ThreadId;\n",
+        """use codex_protocol::ThreadId;
+use codex_utils_file_lock::LockDirGuard;
+use codex_utils_file_lock::TryFileLockOutcome;
+use codex_utils_file_lock::TryLockDirOutcome;
+use codex_utils_file_lock::try_acquire_sibling_lock_dir;
+use codex_utils_file_lock::try_lock_exclusive_optional;
+use codex_utils_file_lock::try_lock_shared_optional;
+""",
+        1,
+    ),
+    _WRITER_STRUCT,
+    (
+        """        let file = self.open_coordination()?;
+        // Never queue a directory sweep behind another writer. Removal remains exclusive.
+        let have_exclusive = !self.cleanup_attempted.swap(true, Ordering::Relaxed)
+            && match file.try_lock() {
+                Ok(()) => true,
+                Err(fs::TryLockError::WouldBlock) => false,
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            };
+        if have_exclusive {
+            if let Err(err) = self.remove_stale_thread_locks() {
+                warn!("failed to clean up stale thread writer locks: {err}");
+            }
+        } else {
+            Self::wait_for_coordination(|| file.try_lock_shared())?;
+        }
+        let _coordination_lock = file;
+""",
+        """        let file = self.open_coordination()?;
+        let coordination_path = self.directory.join(COORDINATION_LOCK_FILE);
+        let mut coordination_fallback = None;
+        // Never queue a directory sweep behind another writer. Removal remains exclusive.
+        let have_exclusive = !self.cleanup_attempted.swap(true, Ordering::Relaxed)
+            && match try_lock_writer_file(&file, &coordination_path)? {
+                TryWriterLockOutcome::Acquired(fallback_lock) => {
+                    coordination_fallback = fallback_lock;
+                    true
+                }
+                TryWriterLockOutcome::WouldBlock => false,
+            };
+        if have_exclusive {
+            if let Err(err) = self.remove_stale_thread_locks() {
+                warn!("failed to clean up stale thread writer locks: {err}");
+            }
+        } else {
+            coordination_fallback = Self::wait_for_coordination(|| {
+                try_lock_shared_writer_file(&file, &coordination_path)
+            })?;
+        }
+        let _coordination_lock = CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: coordination_fallback,
+        };
+""",
+        1,
+    ),
+    _WRITER_THREAD_LOCK,
+    _WRITER_PUBLICATION,
+    (
+        """    fn lock_coordination(&self) -> io::Result<File> {
+        let file = self.open_coordination()?;
+        Self::wait_for_coordination(|| file.try_lock())?;
+        Ok(file)
+    }
+
+    fn wait_for_coordination(
+        try_lock: impl Fn() -> Result<(), fs::TryLockError>,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match try_lock() {
+                Ok(()) => return Ok(()),
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+""",
+        """    fn lock_coordination(&self) -> io::Result<CoordinationLockGuard> {
+        let file = self.open_coordination()?;
+        let path = self.directory.join(COORDINATION_LOCK_FILE);
+        let fallback_lock = Self::wait_for_coordination(|| try_lock_writer_file(&file, &path))?;
+        Ok(CoordinationLockGuard {
+            _file: file,
+            _fallback_lock: fallback_lock,
+        })
+    }
+
+    fn wait_for_coordination(
+        try_lock: impl Fn() -> io::Result<TryWriterLockOutcome>,
+    ) -> io::Result<Option<LockDirGuard>> {
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        loop {
+            match try_lock()? {
+                TryWriterLockOutcome::Acquired(fallback_lock) => return Ok(fallback_lock),
+                TryWriterLockOutcome::WouldBlock if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(/*millis*/ 50));
+                }
+                TryWriterLockOutcome::WouldBlock => {
+""",
+        1,
+    ),
+    (
+        """                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+    }
+""",
+        """                    ));
+                }
+            }
+        }
+    }
+""",
+        1,
+    ),
+    _WRITER_SWEEP,
+    (
+        _WRITER_DROP_HEAD,
+        """        let coordination_file = match self.coordinator.open_coordination() {
+            Ok(lock) => lock,
+            Err(err) => {
+                warn!("failed to coordinate thread writer lock cleanup: {err}");
+                return;
+            }
+        };
+        let coordination_path = self.coordinator.directory.join(COORDINATION_LOCK_FILE);
+        let coordination_fallback =
+            match try_lock_writer_file(&coordination_file, &coordination_path) {
+                Ok(TryWriterLockOutcome::Acquired(fallback_lock)) => fallback_lock,
+                // Leave the file for the next writer. Dropping the guard still closes it.
+                Ok(TryWriterLockOutcome::WouldBlock) => return,
+                Err(err) => {
+                    warn!("failed to coordinate thread writer lock cleanup: {err}");
+                    return;
+                }
+            };
+        let coordination_lock = CoordinationLockGuard {
+            _file: coordination_file,
+            _fallback_lock: coordination_fallback,
+        };
+""",
+        1,
+    ),
+    _WRITER_DROP_FALLBACK,
+)
+
+
+def adapt_writer_lock(baseline, source, upstream):
+    """Carry the writer-lock fallback through upstream's bounded coordination redesign."""
+    if (
+        "fn open_coordination(&self)" not in upstream
+        or "fn open_coordination(&self)" in baseline
+        or source == baseline
+        or "try_lock_exclusive_optional" not in source
+    ):
+        return source
+
+    def apply(text, edits, label):
+        for before, after, count in edits:
+            if text.count(before) != count:
+                raise ValueError(
+                    f"unrecognized {label} writer-lock code; refusing adaptation"
+                )
+            text = text.replace(before, after)
+        if text.count(_WRITER_TEST_ANCHOR) != 1:
+            raise ValueError(
+                f"unrecognized {label} writer-lock code; refusing adaptation"
+            )
+        return text
+
+    expected = apply(baseline, WRITER_LOCK_BASELINE_EDITS, "baseline").replace(
+        _WRITER_TEST_ANCHOR,
+        _WRITER_HELPERS_OLD + _WRITER_TEST_ANCHOR,
+    )
+    if source != expected:
+        raise ValueError("unrecognized Termux writer-lock delta; refusing adaptation")
+    return apply(upstream, WRITER_LOCK_UPSTREAM_EDITS, "upstream").replace(
+        _WRITER_TEST_ANCHOR, _WRITER_HELPERS + _WRITER_TEST_ANCHOR
+    )
+
+
+INSTALLATION_ID_CORE_PATH = "codex-rs/core/src/installation_id.rs"
+INSTALLATION_ID_PATH = "codex-rs/runtime-agent-instance/src/installation_id.rs"
+INSTALLATION_ID_MANIFEST = "codex-rs/runtime-agent-instance/Cargo.toml"
+
+INSTALLATION_ID_CORE_EDITS = (
+    (
+        "use codex_utils_absolute_path::AbsolutePathBuf;\n",
+        """use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_file_lock::FileLockOutcome;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
+use codex_utils_file_lock::lock_exclusive_optional;
+""",
+        1,
+    ),
+    (
+        "        file.lock()?;\n",
+        """        let _lock_dir_guard = match lock_exclusive_optional(&file)? {
+            FileLockOutcome::Acquired => None,
+            FileLockOutcome::Unsupported => Some(acquire_sibling_lock_dir(&path)?),
+        };
+""",
+        1,
+    ),
+)
+
+INSTALLATION_ID_UPSTREAM_EDITS = (
+    (
+        "use std::fs::OpenOptions;\n",
+        "use std::fs::OpenOptions;\nuse std::io::ErrorKind;\n",
+        1,
+    ),
+    (
+        "use codex_utils_absolute_path::AbsolutePathBuf;\nuse tokio::fs;\n",
+        "use codex_utils_absolute_path::AbsolutePathBuf;\nuse codex_utils_file_lock::acquire_sibling_lock_dir;\nuse tokio::fs;\n",
+        1,
+    ),
+    (
+        "        file.lock_shared()?;\n",
+        """        // Without advisory file locks, a sibling lock directory serializes readers too.
+        let lock_dir_guard = match file.lock_shared() {
+            Ok(()) => None,
+            Err(err) if err.kind() == ErrorKind::Unsupported => {
+                Some(acquire_sibling_lock_dir(&path)?)
+            }
+            Err(err) => return Err(err),
+        };
+""",
+        1,
+    ),
+    (
+        "            file.unlock()?;\n            file.lock()?;\n",
+        """            if lock_dir_guard.is_none() {
+                file.unlock()?;
+                file.lock()?;
+            }
+""",
+        1,
+    ),
+)
+
+
+def adapt_installation_id(baseline, source, upstream, manifest):
+    """Carry the lock fallback to the installation-id module upstream moved out of core."""
+    expected = baseline
+    adapted = upstream
+    for before, after, count in INSTALLATION_ID_CORE_EDITS:
+        if expected.count(before) != count:
+            raise ValueError(
+                "unrecognized installation-id baseline; refusing adaptation"
+            )
+        expected = expected.replace(before, after)
+    if source != expected:
+        raise ValueError(
+            "unrecognized Termux installation-id delta; refusing adaptation"
+        )
+    for before, after, count in INSTALLATION_ID_UPSTREAM_EDITS:
+        if adapted.count(before) != count:
+            raise ValueError(
+                "unrecognized upstream installation-id code; refusing adaptation"
+            )
+        adapted = adapted.replace(before, after)
+    dependency = "codex-utils-file-lock = { workspace = true }\n"
+    anchor = "codex-utils-absolute-path = { workspace = true }\n"
+    if dependency in manifest or manifest.count(anchor) != 1:
+        raise ValueError("unrecognized installation-id manifest; refusing adaptation")
+    return adapted, manifest.replace(anchor, anchor + dependency)
+
+
 def release_tree(upstream, source, baseline, excluded):
     upstream, source, baseline = (
         git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip()
@@ -532,6 +1087,7 @@ def release_tree(upstream, source, baseline, excluded):
         for path, adapter in (
             (ARG0_PATH, adapt_arg0_lock),
             (DAEMON_PREPARE_PATH, adapt_android_package_validation),
+            (WRITER_LOCK_PATH, adapt_writer_lock),
         ):
             if not all(
                 git("ls-tree", ref, "--", path) for ref in (baseline, source, upstream)
@@ -549,9 +1105,46 @@ def release_tree(upstream, source, baseline, excluded):
                     file=sys.stderr,
                 )
 
+        installation_id = None
+        if (
+            all(
+                git("ls-tree", ref, "--", INSTALLATION_ID_CORE_PATH)
+                for ref in (baseline, source)
+            )
+            and not git("ls-tree", upstream, "--", INSTALLATION_ID_CORE_PATH)
+            and git("ls-tree", upstream, "--", INSTALLATION_ID_PATH)
+            and not any(
+                git("ls-tree", ref, "--", INSTALLATION_ID_PATH)
+                for ref in (baseline, source)
+            )
+        ):
+            core_texts = [
+                git("show", f"{ref}:{INSTALLATION_ID_CORE_PATH}").decode()
+                for ref in (baseline, source)
+            ]
+            if core_texts[0] != core_texts[1]:
+                upstream_manifest = git(
+                    "show", f"{upstream}:{INSTALLATION_ID_MANIFEST}"
+                ).decode()
+                installation_id = (
+                    *adapt_installation_id(
+                        *core_texts,
+                        git("show", f"{upstream}:{INSTALLATION_ID_PATH}").decode(),
+                        upstream_manifest,
+                    ),
+                    git("show", f"{upstream}:{INSTALLATION_ID_PATH}").decode(),
+                    upstream_manifest,
+                )
+                print(
+                    "Adapted Termux installation-id lock fallback to its new upstream module.",
+                    file=sys.stderr,
+                )
+
         def put_blob(path, content):
             blob = git("hash-object", "-w", "--stdin", data=content).decode().strip()
-            git("update-index", "--cacheinfo", f"100644,{blob},{path}", env=env)
+            git(
+                "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=env
+            )
 
         def code_tree(ref):
             git("read-tree", ref, env=env)
@@ -608,6 +1201,26 @@ def release_tree(upstream, source, baseline, excluded):
                             "Retired Android warning guards for removed SuppressStderr helper.",
                             file=sys.stderr,
                         )
+            if installation_id is not None:
+                # Normalize the upstream move on every side so Git sees only the
+                # reviewed fallback instead of a rename/modify conflict.
+                git(
+                    "update-index",
+                    "--force-remove",
+                    INSTALLATION_ID_CORE_PATH,
+                    env=env,
+                )
+                adapted_id, adapted_manifest, upstream_id, upstream_manifest = (
+                    installation_id
+                )
+                put_blob(
+                    INSTALLATION_ID_PATH,
+                    (adapted_id if ref == source else upstream_id).encode(),
+                )
+                put_blob(
+                    INSTALLATION_ID_MANIFEST,
+                    (adapted_manifest if ref == source else upstream_manifest).encode(),
+                )
             if adapted_socket is not None:
                 # The adapter verifies the entire old downstream delta before
                 # porting it. Merge that reviewed delta against the new API.
