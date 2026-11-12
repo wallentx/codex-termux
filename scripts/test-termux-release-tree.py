@@ -455,6 +455,84 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class WriterLockAdaptationTests(unittest.TestCase):
+    refs = ("rust-v0.165.0", "5db5559ab8bdc27c8982944605f9c72d4d2abcde")
+    upstream_ref = "rust-v0.167.2"
+    path = module.WRITER_LOCK_PATH
+
+    def show(self, ref):
+        return subprocess.check_output(
+            ["git", "show", f"{ref}:{self.path}"], cwd=ROOT, stderr=subprocess.DEVNULL
+        ).decode()
+
+    def texts(self):
+        try:
+            return [self.show(ref) for ref in (*self.refs, self.upstream_ref)]
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+
+    def test_exact_refs_keep_fallback_inside_bounded_coordination_wait(self):
+        baseline, source, upstream = self.texts()
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        self.assertIn("TryLockDirOutcome::Acquired(guard)", adapted)
+        self.assertIn("ErrorKind::TimedOut", adapted.replace("io::", ""))
+        self.assertNotIn("file.try_lock()", adapted)
+        self.assertNotIn("file.lock()", adapted)
+        self.assertIn(
+            "fn lock_coordination(&self) -> io::Result<CoordinationLockGuard>", adapted
+        )
+        self.assertEqual(module.adapt_writer_lock(upstream, adapted, upstream), adapted)
+
+    def test_unrecognized_writer_lock_edits_fail_closed(self):
+        baseline, source, upstream = self.texts()
+        with self.assertRaises(ValueError):
+            module.adapt_writer_lock(baseline, source + "// extra\n", upstream)
+        with self.assertRaises(ValueError):
+            module.adapt_writer_lock(
+                baseline, source.replace("drop(fallback_lock);", ""), upstream
+            )
+
+    def test_adapter_is_inactive_without_upstream_redesign_or_downstream_delta(self):
+        baseline, source, _ = self.texts()
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+        self.assertEqual(
+            module.adapt_writer_lock(baseline, baseline, self.texts()[2]), baseline
+        )
+
+    def test_exact_refs_generate_tree_with_only_downstream_changes(self):
+        self.texts()
+        env = dict(os.environ, RUNNER_TEMP=os.environ.get("TMPDIR", "/tmp"))
+        tree = subprocess.check_output(
+            [
+                "python3",
+                str(HELPER),
+                self.upstream_ref,
+                self.refs[1],
+                self.refs[0],
+                ".github",
+            ],
+            cwd=ROOT,
+            env=env,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        text = subprocess.check_output(
+            ["git", "show", f"{tree}:{self.path}"], cwd=ROOT, text=True
+        )
+        self.assertIn("try_acquire_sibling_lock_dir", text)
+        self.assertIn("Duration::from_secs", text)
+        update = subprocess.check_output(
+            ["git", "show", f"{tree}:codex-rs/tui/src/update_action.rs"],
+            cwd=ROOT,
+            text=True,
+        )
+        self.assertIn(
+            "standalone_unix_update_fails_when_installer_download_fails", update
+        )
+        self.assertIn("TermuxSelfUpdate.command_args()", update)
+        self.assertNotIn("<<<<<<<", update)
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
@@ -578,6 +656,31 @@ class UpdaterAdaptationTests(unittest.TestCase):
                         ),
                         unsafe,
                     )
+
+    def test_split_updater_test_keeps_termux_assertion(self):
+        termux = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        base = "    fn standalone_update_commands_rerun_latest_installer() {\n        body();\n"
+        theirs = base.replace("{\n", "{\n" + termux, 1)
+        ours = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        conflict = f"<<<<<<< a\n{ours}||||||| b\n{base}=======\n{theirs}>>>>>>> c\n"
+        self.assertEqual(
+            module.merge_updater_additions(
+                conflict, path="codex-rs/tui/src/update_action.rs"
+            ),
+            ours + termux,
+        )
+        self.assertEqual(
+            module.merge_updater_additions(
+                conflict.replace("body();", "other();", 1),
+                path="codex-rs/tui/src/update_action.rs",
+            ),
+            conflict.replace("body();", "other();", 1),
+        )
 
     def test_known_insertion_preserves_upstream_addition(self):
         ours = "    Daemon,\n"
