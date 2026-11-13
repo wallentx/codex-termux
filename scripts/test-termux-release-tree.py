@@ -454,6 +454,118 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
             module.adapt_split_daemon_socket(baseline, source, baseline), source
         )
 
+    def test_exact_refs_keep_lock_fallback_with_upstream_lock_redesign(self):
+        refs = (
+            "rust-v0.168.0",
+            "5db5559ab8bdc27c8982944605f9c72d4d2abcde",
+            "rust-v0.165.0",
+        )
+        try:
+            for ref in refs:
+                subprocess.check_call(
+                    ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact downstream refs are not available")
+        sys_paths = subprocess.check_output(
+            [
+                "bash",
+                "-c",
+                'source scripts/termux-release-paths.sh; printf "%s\\n" "${TERMUX_RELEASE_BRANCH_SCRIPT_PATHS[@]}"',
+            ],
+            cwd=ROOT,
+            text=True,
+        ).split()
+        with tempfile.TemporaryDirectory() as scratch:
+            result = subprocess.run(
+                ["python3", str(HELPER), *refs, *sys_paths],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=dict(os.environ, RUNNER_TEMP=scratch),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tree = result.stdout.strip()
+
+        def show(path):
+            return subprocess.check_output(
+                ["git", "show", f"{tree}:{path}"], cwd=ROOT, text=True
+            )
+
+        installation = show(module.INSTALLATION_ID_PATH)
+        self.assertIn("file.lock_shared()", installation)
+        self.assertIn("acquire_sibling_lock_dir", installation)
+        writer = show(module.WRITER_LOCK_PATH)
+        self.assertIn("Duration::from_secs(/*secs*/ 30)", writer)
+        self.assertIn("try_acquire_sibling_lock_dir(&path)", writer)
+        self.assertIn("CoordinationLockGuard {", writer)
+        self.assertNotIn("<<<<<<<", installation + writer)
+        self.assertNotIn("::lock_exclusive_optional;", writer)
+        update_action = show("codex-rs/tui/src/update_action.rs")
+        self.assertIn("fn termux_self_update_runs_codex_update()", update_action)
+        self.assertIn("fn standalone_unix_update_fails_when_installer", update_action)
+
+    def test_lock_conflicts_resolve_only_reviewed_hunks(self):
+        for path, (
+            upstream,
+            base,
+            source,
+            resolved,
+        ) in module.LOCK_CONFLICT_RESOLUTIONS.items():
+            conflict = (
+                f"<<<<<<< upstream\n{upstream}||||||| baseline\n{base}"
+                f"=======\n{source}>>>>>>> target\n"
+            )
+            with self.subTest(path=path):
+                self.assertEqual(
+                    module.merge_lock_conflicts(conflict, path=path).count(resolved),
+                    1,
+                )
+                for unsafe in (
+                    conflict.replace(source, source + "extra();\n"),
+                    conflict.replace(upstream, upstream + "extra();\n"),
+                ):
+                    self.assertEqual(
+                        module.merge_lock_conflicts(unsafe, path=path), unsafe
+                    )
+                self.assertEqual(
+                    module.merge_lock_conflicts(conflict, path="other.rs"), conflict
+                )
+
+    def test_checkpointed_lock_baseline_is_unchanged(self):
+        for path, (
+            upstream,
+            _,
+            source,
+            resolved,
+        ) in module.LOCK_CONFLICT_RESOLUTIONS.items():
+            text = f"fn f() {{\n{resolved}}}\n"
+            self.assertEqual(module.merge_lock_conflicts(text, path=path), text)
+
+    def test_update_action_test_hunk_keeps_termux_and_upstream_tests(self):
+        path = "codex-rs/tui/src/update_action.rs"
+        old = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        new = "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        assertion = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        conflict = (
+            f"<<<<<<< upstream\n{new}||||||| baseline\n{old}        old();\n"
+            f"=======\n{old}{assertion}        old();\n>>>>>>> target\n"
+        )
+        merged = module.merge_updater_additions(conflict, path=path)
+        self.assertIn("fn termux_self_update_runs_codex_update()", merged)
+        self.assertTrue(merged.endswith("#[test]\n" + new))
+        unsafe = conflict.replace("old();\n>>>>>>>", "old();\nextra();\n>>>>>>>")
+        self.assertEqual(module.merge_updater_additions(unsafe, path=path), unsafe)
+
 
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
