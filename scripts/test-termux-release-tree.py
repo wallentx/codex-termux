@@ -602,6 +602,128 @@ class UpdaterAdaptationTests(unittest.TestCase):
         self.assertEqual(module.merge_updater_additions(conflict), conflict)
 
 
+class RelocatedLockAdaptationTests(unittest.TestCase):
+    BASELINE = "rust-v0.165.0"
+    SOURCE = "5db5559ab8bdc27c8982944605f9c72d4d2abcde"
+    UPSTREAM = "rust-v0.169.1"
+
+    def show(self, ref, path):
+        try:
+            return subprocess.check_output(
+                ["git", "show", f"{ref}:{path}"], cwd=ROOT, stderr=subprocess.DEVNULL
+            ).decode()
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+
+    def test_writer_lock_fallback_follows_bounded_coordination(self):
+        path = module.WRITER_LOCK_PATH
+        baseline, source, upstream = (
+            self.show(ref, path) for ref in (self.BASELINE, self.SOURCE, self.UPSTREAM)
+        )
+        adapted = module.adapt_writer_lock(baseline, source, upstream)
+        self.assertIn("fn open_coordination(&self)", adapted)
+        self.assertIn("try_lock_shared_optional(&file)", adapted)
+        self.assertIn("fallback_lock: Option<LockDirGuard>", adapted)
+        self.assertNotIn("file.try_lock()", adapted)
+        self.assertNotIn("coordination_lock.try_lock()", adapted)
+        # Baseline-redesign adapters stay inactive once upstream is the baseline.
+        self.assertEqual(module.adapt_writer_lock(upstream, adapted, upstream), adapted)
+        self.assertEqual(module.adapt_writer_lock(baseline, source, baseline), source)
+        for unsafe in (
+            source + "// edit\n",
+            source.replace("drop(fallback_lock);", ""),
+        ):
+            with self.subTest(source=unsafe[-20:]), self.assertRaises(ValueError):
+                module.adapt_writer_lock(baseline, unsafe, upstream)
+
+    def test_installation_id_fallback_follows_relocation(self):
+        baseline = self.show(self.BASELINE, module.INSTALLATION_ID_CORE_PATH)
+        source = self.show(self.SOURCE, module.INSTALLATION_ID_CORE_PATH)
+        upstream = self.show(self.UPSTREAM, module.INSTALLATION_ID_PATH)
+        adapted = module.adapt_installation_id(baseline, source, upstream)
+        self.assertIn("lock_exclusive_optional(&file)", adapted)
+        self.assertIn("ErrorKind::Unsupported", adapted)
+        self.assertEqual(
+            module.adapt_installation_id(upstream, adapted, upstream), adapted
+        )
+        self.assertEqual(
+            module.adapt_installation_id(baseline, source, baseline), source
+        )
+        with self.assertRaises(ValueError):
+            module.adapt_installation_id(baseline, source + "// edit\n", upstream)
+
+    def test_file_lock_dependency_moves_with_installation_id(self):
+        files = {
+            "codex-rs/core/Cargo.toml": "codex-utils-file-lock = { workspace = true }\n",
+            "codex-rs/runtime-agent-instance/Cargo.toml": "codex-utils-absolute-path = { workspace = true }\n",
+            "codex-rs/Cargo.lock": (
+                '[[package]]\nname = "codex-core"\ndependencies = [\n "codex-utils-file-lock",\n]\n\n'
+                '[[package]]\nname = "codex-runtime-agent-instance"\ndependencies = [\n "codex-utils-absolute-path",\n]\n'
+            ),
+        }
+        moved = module.move_file_lock_dependency(files)
+        self.assertEqual(moved["codex-rs/core/Cargo.toml"], "")
+        self.assertIn("file-lock", moved["codex-rs/runtime-agent-instance/Cargo.toml"])
+        self.assertEqual(moved["codex-rs/Cargo.lock"].count("codex-utils-file-lock"), 1)
+        with self.assertRaises(ValueError):
+            module.move_file_lock_dependency({**files, "codex-rs/core/Cargo.toml": ""})
+
+    def test_split_standalone_installer_test_keeps_termux_assertion(self):
+        test_fn = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        termux = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        conflict = (
+            "<<<<<<< upstream\n    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+            f"||||||| baseline\n{test_fn}        assert_eq!(UpdateAction::StandaloneUnix);\n"
+            f"=======\n{test_fn}{termux}        assert_eq!(UpdateAction::StandaloneUnix);\n"
+            ">>>>>>> target\n"
+        )
+        merged = module.merge_updater_additions(
+            conflict, path="codex-rs/tui/src/update_action.rs"
+        )
+        self.assertEqual(
+            merged,
+            "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+            + termux,
+        )
+        unsafe = conflict.replace("StandaloneUnix);\n=======", "Other);\n=======")
+        self.assertEqual(
+            module.merge_updater_additions(
+                unsafe, path="codex-rs/tui/src/update_action.rs"
+            ),
+            unsafe,
+        )
+
+    def test_exact_refs_generate_tree_with_only_downstream_changes(self):
+        for ref in (self.BASELINE, self.SOURCE, self.UPSTREAM):
+            if subprocess.run(
+                ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                cwd=ROOT,
+                capture_output=True,
+            ).returncode:
+                self.skipTest("exact release refs are not available")
+        tree = module.release_tree(
+            self.UPSTREAM, self.SOURCE, self.BASELINE, [".github"]
+        )
+        changed = {p.decode() for p in module.paths_between(self.UPSTREAM, tree)}
+        self.assertIn(module.WRITER_LOCK_PATH, changed)
+        self.assertIn(module.INSTALLATION_ID_PATH, changed)
+        self.assertNotIn(module.INSTALLATION_ID_CORE_PATH, changed)
+        self.assertNotIn("codex-rs/core/src/installation_id.rs", changed)
+        self.assertEqual(
+            module.git("ls-tree", tree, "--", module.INSTALLATION_ID_CORE_PATH), b""
+        )
+        for path in (
+            ".github/workflows/termux-release-watch.yml",
+            "codex-rs/cli/src/main.rs",
+        ):
+            self.assertNotIn(path, changed - {"codex-rs/cli/src/main.rs"})
+
+
 class DependencyAdditionTests(unittest.TestCase):
     def test_android_openssl_survives_deletion_of_a_neighboring_section(self):
         path = "codex-rs/core/Cargo.toml"
