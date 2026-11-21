@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::HookStateToml;
 use codex_config::TomlValue;
 
@@ -21,10 +20,7 @@ pub fn hook_states_from_stack(
     };
 
     let mut states: HashMap<String, HookStateToml> = HashMap::new();
-    for layer in config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ true,
-    ) {
+    for layer in config_layer_stack.all_layers_low_to_high() {
         if !matches!(
             layer.name,
             ConfigLayerSource::User { .. } | ConfigLayerSource::SessionFlags
@@ -62,6 +58,9 @@ pub fn hook_states_from_stack(
             }
             if let Some(trusted_hash) = state.trusted_hash {
                 effective_state.trusted_hash = Some(trusted_hash);
+            }
+            if let Some(trusted_content_hash) = state.trusted_content_hash {
+                effective_state.trusted_content_hash = Some(trusted_content_hash);
             }
         }
     }
@@ -108,6 +107,7 @@ mod tests {
                 HookStateToml {
                     enabled: Some(true),
                     trusted_hash: None,
+                    trusted_content_hash: None,
                 },
             )])
         );
@@ -128,6 +128,7 @@ mod tests {
                         HookStateToml {
                             enabled: Some(/*enabled*/ false),
                             trusted_hash: None,
+                            trusted_content_hash: None,
                         },
                     ),
                 ),
@@ -138,6 +139,7 @@ mod tests {
                         HookStateToml {
                             enabled: None,
                             trusted_hash: Some("sha256:trusted".to_string()),
+                            trusted_content_hash: None,
                         },
                     ),
                 ),
@@ -154,6 +156,7 @@ mod tests {
                 HookStateToml {
                     enabled: Some(false),
                     trusted_hash: Some("sha256:trusted".to_string()),
+                    trusted_content_hash: None,
                 },
             )])
         );
@@ -193,6 +196,7 @@ mod tests {
                 HookStateToml {
                     enabled: Some(false),
                     trusted_hash: None,
+                    trusted_content_hash: None,
                 },
             )])
         );
@@ -234,6 +238,7 @@ mod tests {
                 HookStateToml {
                     enabled: Some(false),
                     trusted_hash: None,
+                    trusted_content_hash: None,
                 },
             )])
         );
@@ -245,6 +250,7 @@ mod tests {
             HookStateToml {
                 enabled,
                 trusted_hash: None,
+                trusted_content_hash: None,
             },
         )
     }

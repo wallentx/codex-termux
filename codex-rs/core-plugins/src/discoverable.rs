@@ -1,7 +1,7 @@
 use anyhow::Context;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
-use codex_core_skills::config_rules::skill_config_rules_from_stack;
+use codex_config::skill_config_rules_from_stack;
 use codex_login::CodexAuth;
 use codex_plugin::PluginId;
 use std::collections::HashSet;
@@ -12,6 +12,7 @@ use crate::OPENAI_CURATED_MARKETPLACE_NAME;
 use crate::PluginsConfigInput;
 use crate::PluginsManager;
 use crate::marketplace::MarketplacePluginInstallPolicy;
+use crate::remote::InstalledPluginDisplayAssets;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 
 const TOOL_SUGGEST_DISCOVERABLE_PLUGIN_ALLOWLIST: &[&str] = &[
@@ -87,9 +88,10 @@ impl PluginsManager {
             .context("failed to list plugin marketplaces for tool suggestions")?
             .marketplaces;
         let remote_installed_marketplaces = if use_remote_global_catalog {
-            self.build_remote_installed_plugin_marketplaces_from_cache(&[
-                REMOTE_GLOBAL_MARKETPLACE_NAME,
-            ])
+            self.build_remote_installed_plugin_marketplaces_from_cache_with_display_assets(
+                &[REMOTE_GLOBAL_MARKETPLACE_NAME],
+                InstalledPluginDisplayAssets::Skip,
+            )
         } else {
             None
         };

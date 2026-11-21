@@ -10,6 +10,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::SecondsFormat;
 use chrono::Utc;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpError;
 use codex_protocol::auth::PlanType as AuthPlanType;
 use codex_protocol::protocol::SessionSource;
 use crypto_box::SecretKey as Curve25519SecretKey;
@@ -18,6 +20,7 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
+use http::StatusCode;
 use jsonwebtoken::Algorithm;
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::Validation;
@@ -51,22 +54,23 @@ pub enum ChatGptEnvironment {
 
 impl ChatGptEnvironment {
     pub fn from_chatgpt_base_url(chatgpt_base_url: &str) -> Result<Self> {
-        match chatgpt_base_url.trim_end_matches('/') {
-            "https://chatgpt.com"
-            | "https://chatgpt.com/backend-api"
-            | "https://chatgpt.com/codex"
-            | "https://chatgpt.com/backend-api/codex"
-            | "https://chat.openai.com"
-            | "https://chat.openai.com/backend-api"
-            | "https://chat.openai.com/codex"
-            | "https://chat.openai.com/backend-api/codex" => Ok(Self::Production),
-            "https://chatgpt-staging.com"
-            | "https://chatgpt-staging.com/backend-api"
-            | "https://chatgpt-staging.com/codex"
-            | "https://chatgpt-staging.com/backend-api/codex" => Ok(Self::Staging),
-            _ => anyhow::bail!(
-                "Agent Identity only supports production and staging ChatGPT environments"
-            ),
+        let url = codex_http_client::validate_endpoint_url(chatgpt_base_url, "chatgpt_base_url")
+            .map_err(anyhow::Error::msg)?;
+        let host = url.host_str().unwrap_or_default();
+        anyhow::ensure!(
+            codex_http_client::is_allowed_chatgpt_host(host)
+                && url.port_or_known_default() == Some(443)
+                && url.query().is_none()
+                && matches!(
+                    url.path().trim_end_matches('/'),
+                    "" | "/backend-api" | "/codex" | "/backend-api/codex"
+                ),
+            "Agent Identity only supports production and staging ChatGPT environments"
+        );
+        if host == "chatgpt-staging.com" || host.ends_with(".chatgpt-staging.com") {
+            Ok(Self::Staging)
+        } else {
+            Ok(Self::Production)
         }
     }
 
@@ -167,12 +171,12 @@ struct RegisterAgentResponse {
 #[derive(Debug)]
 pub struct AgentIdentityRegistrationHttpError {
     operation: &'static str,
-    status: reqwest::StatusCode,
+    status: StatusCode,
     body: String,
 }
 
 impl AgentIdentityRegistrationHttpError {
-    fn new(operation: &'static str, status: reqwest::StatusCode, body: String) -> Self {
+    fn new(operation: &'static str, status: StatusCode, body: String) -> Self {
         Self {
             operation,
             status,
@@ -181,7 +185,7 @@ impl AgentIdentityRegistrationHttpError {
     }
 
     /// HTTP status returned by the registration endpoint.
-    pub fn status(&self) -> reqwest::StatusCode {
+    pub fn status(&self) -> StatusCode {
         self.status
     }
 }
@@ -212,7 +216,7 @@ fn is_retryable_registration_cause(cause: &(dyn StdError + 'static)) -> bool {
         return is_retryable_registration_status(error.status());
     }
 
-    if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+    if let Some(error) = cause.downcast_ref::<HttpError>() {
         if let Some(status) = error.status() {
             return is_retryable_registration_status(status);
         }
@@ -222,8 +226,8 @@ fn is_retryable_registration_cause(cause: &(dyn StdError + 'static)) -> bool {
     false
 }
 
-fn is_retryable_registration_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+fn is_retryable_registration_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 pub fn authorization_header_for_agent_task(
@@ -242,7 +246,7 @@ pub fn authorization_header_for_agent_task(
 }
 
 pub async fn fetch_agent_identity_jwks(
-    client: &reqwest::Client,
+    client: &HttpClient,
     agent_identity_jwt_base_url: &str,
 ) -> Result<JwkSet> {
     let response = client
@@ -310,7 +314,7 @@ pub fn sign_task_registration_payload(
 }
 
 pub async fn register_agent_task(
-    client: &reqwest::Client,
+    client: &HttpClient,
     agent_identity_authapi_base_url: &str,
     key: AgentIdentityKey<'_>,
 ) -> Result<String> {
@@ -353,7 +357,7 @@ pub async fn register_agent_task(
 }
 
 pub async fn register_agent_identity(
-    client: &reqwest::Client,
+    client: &HttpClient,
     agent_identity_authapi_base_url: &str,
     access_token: &str,
     is_fedramp_account: bool,
@@ -561,7 +565,6 @@ fn signing_key_from_private_key_pkcs8_base64(private_key_pkcs8_base64: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
     use ed25519_dalek::Signature;
     use ed25519_dalek::Verifier as _;
     use jsonwebtoken::EncodingKey;
@@ -890,12 +893,34 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
             ChatGptEnvironment::Staging.agent_identity_authapi_base_url(),
             "https://auth.api.openai.org/api/accounts"
         );
+        assert_eq!(
+            ChatGptEnvironment::from_chatgpt_base_url("https://us.chatgpt.com/backend-api")?,
+            ChatGptEnvironment::Production
+        );
+        assert_eq!(
+            ChatGptEnvironment::from_chatgpt_base_url(
+                "https://us.chatgpt-staging.com/backend-api"
+            )?,
+            ChatGptEnvironment::Staging
+        );
         Ok(())
     }
 
     #[test]
     fn chatgpt_environment_rejects_custom_urls() {
-        assert!(ChatGptEnvironment::from_chatgpt_base_url("http://localhost:8080").is_err(),);
+        for base in [
+            "http://localhost:8080",
+            "http://us.chatgpt.com",
+            "https://chatgpt.com.evil.example",
+            "https://us.chatgpt.com:8443",
+            "https://u@us.chatgpt.com",
+            "https://chatgpt.com/custom",
+        ] {
+            assert!(
+                ChatGptEnvironment::from_chatgpt_base_url(base).is_err(),
+                "{base}"
+            );
+        }
     }
 
     #[test]
@@ -937,12 +962,12 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
     fn retryable_registration_error_accepts_429_and_5xx() {
         let too_many_requests = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::TOO_MANY_REQUESTS,
             "rate limited".to_string(),
         ));
         let unavailable = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
-            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
             "try later".to_string(),
         ));
 
@@ -954,7 +979,7 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
     fn retryable_registration_error_rejects_hard_failures() {
         let forbidden = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
-            reqwest::StatusCode::FORBIDDEN,
+            StatusCode::FORBIDDEN,
             "not allowed".to_string(),
         ));
         let malformed = anyhow::anyhow!("failed to sign registration request");

@@ -4,16 +4,12 @@ use std::collections::HashMap;
 
 struct FakeEnvironment {
     vars: HashMap<String, String>,
-    tmux_client_info: TmuxClientInfo,
-    zellij_version: Option<String>,
 }
 
 impl FakeEnvironment {
     fn new() -> Self {
         Self {
             vars: HashMap::new(),
-            tmux_client_info: TmuxClientInfo::default(),
-            zellij_version: None,
         }
     }
 
@@ -21,34 +17,11 @@ impl FakeEnvironment {
         self.vars.insert(key.to_string(), value.to_string());
         self
     }
-
-    fn with_tmux_client_info(mut self, termtype: Option<&str>, termname: Option<&str>) -> Self {
-        self.tmux_client_info = TmuxClientInfo {
-            termtype: termtype.map(ToString::to_string),
-            termname: termname.map(ToString::to_string),
-        };
-        self
-    }
-
-    fn with_zellij_version(mut self, version: &str) -> Self {
-        self.zellij_version = Some(version.to_string());
-        self
-    }
 }
 
 impl Environment for FakeEnvironment {
     fn var(&self, name: &str) -> Option<String> {
         self.vars.get(name).cloned()
-    }
-
-    fn tmux_client_info(&self) -> TmuxClientInfo {
-        self.tmux_client_info.clone()
-    }
-
-    fn zellij_version(&self) -> Option<String> {
-        self.zellij_version
-            .clone()
-            .or_else(|| self.var_non_empty("ZELLIJ_VERSION"))
     }
 }
 
@@ -60,6 +33,7 @@ fn terminal_info(
     multiplexer: Option<Multiplexer>,
 ) -> TerminalInfo {
     TerminalInfo {
+        backend: None,
         name,
         term_program: term_program.map(ToString::to_string),
         version: version.map(ToString::to_string),
@@ -180,14 +154,17 @@ fn detects_iterm2() {
 
 #[test]
 fn detects_apple_terminal() {
-    let env = FakeEnvironment::new().with_var("TERM_PROGRAM", "Apple_Terminal");
+    let env = FakeEnvironment::new()
+        .with_var("TERM_PROGRAM", "Apple_Terminal")
+        .with_var("TERM_PROGRAM_VERSION", "455")
+        .with_var("TERM_SESSION_ID", "A1B2C3");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
         terminal_info(
             TerminalName::AppleTerminal,
             Some("Apple_Terminal"),
-            /*version*/ None,
+            Some("455"),
             /*term*/ None,
             /*multiplexer*/ None,
         ),
@@ -195,27 +172,8 @@ fn detects_apple_terminal() {
     );
     assert_eq!(
         terminal.user_agent_token(),
-        "Apple_Terminal",
+        "Apple_Terminal/455",
         "apple_term_program_user_agent"
-    );
-
-    let env = FakeEnvironment::new().with_var("TERM_SESSION_ID", "A1B2C3");
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::AppleTerminal,
-            /*term_program*/ None,
-            /*version*/ None,
-            /*term*/ None,
-            /*multiplexer*/ None
-        ),
-        "apple_term_session_id_info"
-    );
-    assert_eq!(
-        terminal.user_agent_token(),
-        "Apple_Terminal",
-        "apple_term_session_id_user_agent"
     );
 }
 
@@ -239,6 +197,33 @@ fn detects_ghostty() {
         "Ghostty",
         "ghostty_term_program_user_agent"
     );
+
+    let env = FakeEnvironment::new().with_var("TERM", "xterm-ghostty");
+    let terminal = detect_terminal_info_from_env(&env);
+    assert_eq!(
+        terminal,
+        terminal_info(
+            TerminalName::Ghostty,
+            /*term_program*/ None,
+            /*version*/ None,
+            Some("xterm-ghostty"),
+            /*multiplexer*/ None
+        ),
+        "ghostty_term_info"
+    );
+    assert_eq!(
+        terminal.user_agent_token(),
+        "xterm-ghostty",
+        "ghostty_term_user_agent"
+    );
+}
+
+#[test]
+fn detects_rex() {
+    for (key, value) in [("TERM_PROGRAM", "rex"), ("TERM", "xterm-rex")] {
+        let env = FakeEnvironment::new().with_var(key, value);
+        assert_eq!(detect_terminal_info_from_env(&env).name, TerminalName::Rex);
+    }
 }
 
 #[test]
@@ -294,22 +279,24 @@ fn detects_tmux_multiplexer() {
     let env = FakeEnvironment::new()
         .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
         .with_var("TERM_PROGRAM", "tmux")
-        .with_tmux_client_info(Some("xterm-256color"), Some("screen-256color"));
+        .with_var("TERM_PROGRAM_VERSION", "3.5a");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
         terminal_info(
             TerminalName::Unknown,
-            Some("xterm-256color"),
+            /*term_program*/ None,
             /*version*/ None,
-            Some("screen-256color"),
-            Some(Multiplexer::Tmux { version: None }),
+            /*term*/ None,
+            Some(Multiplexer::Tmux {
+                version: Some("3.5a".to_string())
+            }),
         ),
         "tmux_multiplexer_info"
     );
     assert_eq!(
         terminal.user_agent_token(),
-        "xterm-256color",
+        "unknown",
         "tmux_multiplexer_user_agent"
     );
 }
@@ -321,6 +308,7 @@ fn detects_zellij_multiplexer() {
     assert_eq!(
         terminal,
         TerminalInfo {
+            backend: None,
             name: TerminalName::Unknown,
             term_program: None,
             version: None,
@@ -347,115 +335,6 @@ fn detects_zellij_multiplexer_version() {
             }),
         ),
         "zellij_multiplexer_version"
-    );
-}
-
-#[test]
-fn detects_zellij_multiplexer_command_version() {
-    let env = FakeEnvironment::new()
-        .with_var("ZELLIJ", "1")
-        .with_zellij_version("0.44.1");
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::Unknown,
-            /*term_program*/ None,
-            /*version*/ None,
-            /*term*/ None,
-            Some(Multiplexer::Zellij {
-                version: Some("0.44.1".to_string()),
-            }),
-        ),
-        "zellij_multiplexer_command_version"
-    );
-}
-
-#[test]
-fn parses_zellij_version_output() {
-    assert_eq!(
-        parse_zellij_version("zellij 0.44.1"),
-        Some("0.44.1".to_string())
-    );
-    assert_eq!(parse_zellij_version("0.44.1"), Some("0.44.1".to_string()));
-    assert_eq!(parse_zellij_version(""), None);
-}
-
-#[test]
-fn detects_tmux_client_termtype() {
-    let env = FakeEnvironment::new()
-        .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
-        .with_var("TERM_PROGRAM", "tmux")
-        .with_tmux_client_info(Some("WezTerm"), /*termname*/ None);
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::WezTerm,
-            Some("WezTerm"),
-            /*version*/ None,
-            /*term*/ None,
-            Some(Multiplexer::Tmux { version: None }),
-        ),
-        "tmux_client_termtype_info"
-    );
-    assert_eq!(
-        terminal.user_agent_token(),
-        "WezTerm",
-        "tmux_client_termtype_user_agent"
-    );
-}
-
-#[test]
-fn detects_tmux_client_termname() {
-    let env = FakeEnvironment::new()
-        .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
-        .with_var("TERM_PROGRAM", "tmux")
-        .with_tmux_client_info(/*termtype*/ None, Some("xterm-256color"));
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::Unknown,
-            /*term_program*/ None,
-            /*version*/ None,
-            Some("xterm-256color"),
-            Some(Multiplexer::Tmux { version: None })
-        ),
-        "tmux_client_termname_info"
-    );
-    assert_eq!(
-        terminal.user_agent_token(),
-        "xterm-256color",
-        "tmux_client_termname_user_agent"
-    );
-}
-
-#[test]
-fn detects_tmux_term_program_uses_client_termtype() {
-    let env = FakeEnvironment::new()
-        .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
-        .with_var("TERM_PROGRAM", "tmux")
-        .with_var("TERM_PROGRAM_VERSION", "3.6a")
-        .with_tmux_client_info(Some("ghostty 1.2.3"), Some("xterm-ghostty"));
-    let terminal = detect_terminal_info_from_env(&env);
-    assert_eq!(
-        terminal,
-        terminal_info(
-            TerminalName::Ghostty,
-            Some("ghostty"),
-            Some("1.2.3"),
-            Some("xterm-ghostty"),
-            Some(Multiplexer::Tmux {
-                version: Some("3.6a".to_string()),
-            }),
-        ),
-        "tmux_term_program_client_termtype_info"
-    );
-    assert_eq!(
-        terminal.user_agent_token(),
-        "ghostty/1.2.3",
-        "tmux_term_program_client_termtype_user_agent"
     );
 }
 
@@ -796,13 +675,18 @@ fn detects_vte() {
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
-        terminal_info(
-            TerminalName::Vte,
-            /*term_program*/ None,
-            Some("7000"),
-            /*term*/ None,
-            /*multiplexer*/ None
-        ),
+        TerminalInfo {
+            backend: Some(TerminalBackend::Vte {
+                version: Some(7000)
+            }),
+            ..terminal_info(
+                TerminalName::Vte,
+                /*term_program*/ None,
+                Some("7000"),
+                /*term*/ None,
+                /*multiplexer*/ None
+            )
+        },
         "vte_version_info"
     );
     assert_eq!(
@@ -817,13 +701,18 @@ fn detects_vte() {
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
-        terminal_info(
-            TerminalName::Vte,
-            Some("VTE"),
-            Some("7000"),
-            /*term*/ None,
-            /*multiplexer*/ None
-        ),
+        TerminalInfo {
+            backend: Some(TerminalBackend::Vte {
+                version: Some(7000)
+            }),
+            ..terminal_info(
+                TerminalName::Vte,
+                Some("VTE"),
+                Some("7000"),
+                /*term*/ None,
+                /*multiplexer*/ None
+            )
+        },
         "vte_term_program_info"
     );
     assert_eq!(
@@ -836,13 +725,16 @@ fn detects_vte() {
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
-        terminal_info(
-            TerminalName::Vte,
-            /*term_program*/ None,
-            /*version*/ None,
-            /*term*/ None,
-            /*multiplexer*/ None
-        ),
+        TerminalInfo {
+            backend: Some(TerminalBackend::Vte { version: None }),
+            ..terminal_info(
+                TerminalName::Vte,
+                /*term_program*/ None,
+                /*version*/ None,
+                /*term*/ None,
+                /*multiplexer*/ None
+            )
+        },
         "vte_empty_info"
     );
     assert_eq!(terminal.user_agent_token(), "VTE", "vte_empty_user_agent");
@@ -850,7 +742,9 @@ fn detects_vte() {
 
 #[test]
 fn detects_windows_terminal() {
-    let env = FakeEnvironment::new().with_var("WT_SESSION", "1");
+    let env = FakeEnvironment::new()
+        .with_var("WT_SESSION", "1")
+        .with_var("TERM_SESSION_ID", "A1B2C3");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
@@ -893,7 +787,9 @@ fn detects_windows_terminal() {
 
 #[test]
 fn detects_term_fallbacks() {
-    let env = FakeEnvironment::new().with_var("TERM", "xterm-256color");
+    let env = FakeEnvironment::new()
+        .with_var("TERM", "xterm-256color")
+        .with_var("TERM_SESSION_ID", "A1B2C3");
     let terminal = detect_terminal_info_from_env(&env);
     assert_eq!(
         terminal,
@@ -941,4 +837,94 @@ fn detects_term_fallbacks() {
         "unknown_info"
     );
     assert_eq!(terminal.user_agent_token(), "unknown", "unknown_user_agent");
+}
+
+#[test]
+fn tmux_preserves_safe_underlying_terminal_identifiers() {
+    for (variable, value, name, version) in [
+        (
+            "WEZTERM_VERSION",
+            "2024.2",
+            TerminalName::WezTerm,
+            Some("2024.2"),
+        ),
+        ("ITERM_SESSION_ID", "w0t1p0", TerminalName::Iterm2, None),
+        ("KITTY_WINDOW_ID", "1", TerminalName::Kitty, None),
+        ("WT_SESSION", "session", TerminalName::WindowsTerminal, None),
+        (
+            "ALACRITTY_SOCKET",
+            "/tmp/alacritty",
+            TerminalName::Alacritty,
+            None,
+        ),
+        (
+            "GHOSTTY_RESOURCES_DIR",
+            "/Applications/Ghostty.app/Contents/Resources/ghostty",
+            TerminalName::Ghostty,
+            None,
+        ),
+    ] {
+        let env = FakeEnvironment::new()
+            .with_var("TMUX", "/tmp/tmux-1000/default,123,0")
+            .with_var("TERM_PROGRAM", "tmux")
+            .with_var("TERM_PROGRAM_VERSION", "3.5a")
+            .with_var("TERM", "screen-256color")
+            .with_var(variable, value);
+        assert_eq!(
+            detect_terminal_info_from_env(&env),
+            terminal_info(
+                name,
+                /*term_program*/ None,
+                version,
+                /*term*/ None,
+                Some(Multiplexer::Tmux {
+                    version: Some("3.5a".to_string())
+                }),
+            ),
+            "{variable}"
+        );
+    }
+}
+
+#[test]
+fn captures_vte_backend_when_gnome_identity_takes_precedence() {
+    let env = FakeEnvironment::new()
+        .with_var("GNOME_TERMINAL_SCREEN", "1")
+        .with_var("VTE_VERSION", "5204")
+        .with_var("TMUX", "session");
+    assert_eq!(
+        detect_terminal_info_from_env(&env),
+        TerminalInfo {
+            name: TerminalName::GnomeTerminal,
+            term_program: None,
+            version: None,
+            term: None,
+            multiplexer: Some(Multiplexer::Tmux { version: None }),
+            backend: Some(TerminalBackend::Vte {
+                version: Some(5204)
+            }),
+        }
+    );
+}
+
+#[test]
+fn raw_vte_version_takes_precedence_even_when_malformed() {
+    for (raw_version, version) in [("5204", Some(5204)), ("invalid", None), ("", None)] {
+        let env = FakeEnvironment::new()
+            .with_var("TERM_PROGRAM", "VTE")
+            .with_var("TERM_PROGRAM_VERSION", "7600")
+            .with_var("VTE_VERSION", raw_version);
+        assert_eq!(
+            detect_terminal_info_from_env(&env),
+            TerminalInfo {
+                name: TerminalName::Vte,
+                term_program: Some("VTE".to_string()),
+                version: Some("7600".to_string()),
+                term: None,
+                multiplexer: None,
+                backend: Some(TerminalBackend::Vte { version }),
+            },
+            "VTE_VERSION={raw_version:?}"
+        );
+    }
 }

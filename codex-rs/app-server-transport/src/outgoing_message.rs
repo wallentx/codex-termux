@@ -1,26 +1,17 @@
-use std::fmt;
-
+use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_app_server_protocol::ServerRequest;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
-/// Stable identifier for a transport connection.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ConnectionId(pub u64);
-
-impl fmt::Display for ConnectionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use codex_app_server_remote_client::ConnectionId;
 
 /// Outgoing message from the server to the client.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum OutgoingMessage {
     Request(ServerRequest),
     /// AppServerNotification is specific to the case where this is run as an
@@ -30,10 +21,10 @@ pub enum OutgoingMessage {
     Error(OutgoingError),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct OutgoingResponse {
+#[derive(Debug, Clone, Serialize)]
+pub struct OutgoingResponse<T = Box<ClientResponsePayload>> {
     pub id: RequestId,
-    pub result: Result,
+    pub result: T,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

@@ -1,5 +1,12 @@
 use anyhow::Result;
+use codex_config::CONFIG_TOML_FILE;
+use codex_config::LoaderOverrides;
+use codex_config::loader::project_trust_key;
+use codex_config::test_support::CloudConfigBundleFixture;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
+use codex_core::config::ConfigOverrides;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::manager::RefreshStrategy;
@@ -13,7 +20,6 @@ use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
@@ -30,6 +36,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
@@ -48,7 +55,6 @@ struct RemoteModelResponse {
 fn remote_model(slug: &str) -> ModelInfo {
     ModelInfo {
         visibility: ModelVisibility::List,
-        used_fallback_model_metadata: false,
         ..model_info_from_slug(slug)
     }
 }
@@ -133,16 +139,10 @@ async fn response_for_remote_model(
     )
     .await?;
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "list tools".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "list tools".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     let mut warnings = Vec::new();
     loop {
@@ -232,6 +232,48 @@ async fn remote_tool_mode_selector_overrides_feature_flags() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_code_mode_only_selector_fails_closed_when_host_is_disabled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut model = remote_model("test-tool-mode-code-mode-only-host-disabled");
+    model.tool_mode = Some(ToolMode::CodeModeOnly);
+    let response = response_for_remote_model(model, |config| {
+        config
+            .features
+            .disable(Feature::CodeModeHost)
+            .expect("code-mode host should be disabled");
+    })
+    .await?;
+
+    let tools = tool_names(&response.body);
+    assert!(
+        tools
+            .iter()
+            .any(|name| name == codex_code_mode::PUBLIC_TOOL_NAME)
+            && tools
+                .iter()
+                .any(|name| name == codex_code_mode::WAIT_TOOL_NAME),
+        "code-mode-only must retain code-mode tools: {tools:?}"
+    );
+    assert!(
+        tools
+            .iter()
+            .all(|name| { !matches!(name.as_str(), "shell" | "shell_command" | "exec_command") }),
+        "code-mode-only must never expose direct shell tools: {tools:?}"
+    );
+    assert!(
+        response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Code mode will fail closed")),
+        "code-mode-only should explain that it fails closed: {:?}",
+        response.warnings
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_code_mode_warning_is_emitted_each_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -287,16 +329,10 @@ async fn unsupported_code_mode_warning_is_emitted_each_turn() -> Result<()> {
     let mut warning_counts = Vec::new();
     for prompt in ["first turn", "second turn"] {
         test.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: prompt.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: prompt.to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
 
         let mut warning_count = 0;
@@ -379,6 +415,128 @@ async fn multi_agent_config_precedence_overrides_remote_model_selector() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migrating_only_the_project_agent_setting_preserves_v1_tools() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let home = TempDir::new()?;
+    let project = TempDir::new()?;
+    let project_key = toml::Value::String(project_trust_key(project.path()));
+    std::fs::write(
+        home.path().join(CONFIG_TOML_FILE),
+        format!(
+            "[features]\nmulti_agent = false\n[projects.{project_key}]\ntrust_level = 'trusted'"
+        ),
+    )?;
+    let project_dir = project.path().join(".codex");
+    std::fs::create_dir(&project_dir)?;
+    let config = || {
+        ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(project.path().to_path_buf()),
+                ..Default::default()
+            })
+    };
+    let migrated = "[agents]\nenabled = true";
+    for (project_settings, builder, model_version, expected_namespace) in [
+        ("", config(), None, None),
+        (
+            "[features]\nmulti_agent = true",
+            config(),
+            None,
+            Some("multi_agent_v1"),
+        ),
+        (migrated, config(), None, Some("multi_agent_v1")),
+        (
+            "[features]\nmulti_agent = true",
+            config().cli_overrides(vec![("features.collab".to_string(), true.into())]),
+            None,
+            Some("multi_agent_v1"),
+        ),
+        (
+            migrated,
+            config().cli_overrides(vec![("features.collab".to_string(), true.into())]),
+            None,
+            Some("multi_agent_v1"),
+        ),
+        (
+            "[agents]\nenabled = true\n[features]\ncollab = true",
+            config(),
+            None,
+            Some("multi_agent_v1"),
+        ),
+        (
+            "[agents]\nenabled = true\n[features]\ncollab = false",
+            config(),
+            None,
+            None,
+        ),
+        (
+            migrated,
+            config().cli_overrides(vec![("features.collab".to_string(), false.into())]),
+            None,
+            None,
+        ),
+        (
+            migrated,
+            config(),
+            Some(MultiAgentVersion::V2),
+            Some(MULTI_AGENT_V2_NAMESPACE),
+        ),
+        (
+            "[agents]\nenabled = true\n[features]\nmulti_agent = false",
+            config(),
+            None,
+            None,
+        ),
+        (
+            migrated,
+            config().cli_overrides(vec![("features.multi_agent".to_string(), false.into())]),
+            None,
+            None,
+        ),
+        (
+            migrated,
+            config().cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                    "[features]\nmulti_agent = false",
+                ),
+            ),
+            None,
+            None,
+        ),
+    ] {
+        std::fs::write(project_dir.join(CONFIG_TOML_FILE), project_settings)?;
+        let mut loaded = builder.build().await?;
+        let mut model = remote_model("project-agent-selector");
+        model.multi_agent_version = model_version;
+        let body = response_body_for_remote_model(model, move |fixture| {
+            // Use the real layered config with the fixture's model and mock transport.
+            loaded.model = fixture.model.clone();
+            loaded.model_provider = fixture.model_provider.clone();
+            loaded.codex_self_exe = fixture.codex_self_exe.clone();
+            *fixture = loaded;
+        })
+        .await?;
+        let agent_tools: Vec<_> = tool_names(&body)
+            .into_iter()
+            .filter(|name| {
+                matches!(
+                    name.as_str(),
+                    "multi_agent_v1" | MULTI_AGENT_V2_NAMESPACE | "spawn_agent"
+                )
+            })
+            .collect();
+        assert_eq!(
+            agent_tools,
+            expected_namespace.into_iter().collect::<Vec<_>>(),
+            "project config: {project_settings:?}, model: {model_version:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_multi_agent_selector_uses_model_selected_before_first_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -429,16 +587,10 @@ async fn remote_multi_agent_selector_uses_model_selected_before_first_turn() -> 
     assert_eq!(test.codex.multi_agent_version(), None);
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: ROOT_PROMPT.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: ROOT_PROMPT.into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))

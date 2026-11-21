@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Alignment;
+use ratatui::layout::HorizontalAlignment;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -67,8 +67,11 @@ impl PetPickerPreviewState {
         });
     }
 
-    pub(crate) fn area(&self) -> Option<Rect> {
-        self.inner.lock().ok().and_then(|inner| inner.last_area)
+    pub(crate) fn take_area(&self) -> Option<Rect> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|mut inner| inner.last_area.take())
     }
 
     fn update(&self, f: impl FnOnce(&mut PetPickerPreviewInner)) {
@@ -128,7 +131,7 @@ impl Renderable for PetPickerPreviewRenderable {
             lines.push(Line::from(body.dim()));
         }
         Paragraph::new(lines)
-            .alignment(Alignment::Center)
+            .alignment(HorizontalAlignment::Center)
             .render(text_area, buf);
     }
 

@@ -1,8 +1,8 @@
-#[cfg(test)]
-use super::common::SESSION_IMPORT_MAX_COUNT;
 use super::common::SessionFileCandidate;
 use super::common::detect_recent_sessions;
+use crate::model::ExternalAgentSessionImportLimits;
 use crate::sessions::ExternalAgentSessionMigration;
+use crate::sessions::SessionRecordFormat;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -10,6 +10,18 @@ use std::path::Path;
 pub fn detect_recent_cla_sessions(
     external_agent_home: &Path,
     codex_home: &Path,
+) -> io::Result<Vec<ExternalAgentSessionMigration>> {
+    detect_recent_cla_sessions_with_limits(
+        external_agent_home,
+        codex_home,
+        ExternalAgentSessionImportLimits::default(),
+    )
+}
+
+pub(crate) fn detect_recent_cla_sessions_with_limits(
+    external_agent_home: &Path,
+    codex_home: &Path,
+    limits: ExternalAgentSessionImportLimits,
 ) -> io::Result<Vec<ExternalAgentSessionMigration>> {
     let projects_root = external_agent_home.join("projects");
     if !projects_root.is_dir() {
@@ -39,10 +51,13 @@ pub fn detect_recent_cla_sessions(
             candidates.push(SessionFileCandidate {
                 path,
                 fallback_cwd: None,
+                record_format: SessionRecordFormat::Cla,
             });
         }
     }
-    detect_recent_sessions(codex_home, candidates, /*require_existing_cwd*/ true)
+    detect_recent_sessions(
+        codex_home, candidates, /*require_existing_cwd*/ true, limits,
+    )
 }
 
 #[cfg(test)]
@@ -50,6 +65,7 @@ mod tests {
     use super::*;
     use crate::sessions::ledger::record_imported_session;
     use codex_protocol::ThreadId;
+    use pretty_assertions::assert_eq;
     use serde_json::Value as JsonValue;
     use std::fs::FileTimes;
     use std::fs::OpenOptions;
@@ -82,6 +98,45 @@ mod tests {
                 path: session_path,
                 cwd: project_root,
                 title: Some("hello there".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn detects_only_the_continuation_of_a_backgrounded_session() {
+        let root = TempDir::new().expect("tempdir");
+        let external_agent_home = root.path().join(".external");
+        let project_root = root.path().join("repo");
+        let original = record("user", "plan a vacation", &project_root);
+        write_session(
+            &external_agent_home,
+            &project_root,
+            "original.jsonl",
+            &[
+                original.clone(),
+                serde_json::json!({
+                    "type": "continued-in",
+                    "sessionId": "original",
+                    "continuedInSessionId": "background",
+                }),
+            ],
+        );
+        let continuation = write_session(
+            &external_agent_home,
+            &project_root,
+            "background.jsonl",
+            &[
+                original,
+                record("assistant", "Here is your itinerary", &project_root),
+            ],
+        );
+
+        assert_eq!(
+            detect_recent_cla_sessions(&external_agent_home, root.path()).expect("detect"),
+            vec![ExternalAgentSessionMigration {
+                path: continuation,
+                cwd: project_root,
+                title: Some("plan a vacation".to_string()),
             }]
         );
     }
@@ -233,7 +288,8 @@ mod tests {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let modified_at = SystemTime::now();
         let mut expected = Vec::new();
-        for index in 0..=SESSION_IMPORT_MAX_COUNT {
+        let default_limits = ExternalAgentSessionImportLimits::default();
+        for index in 0..=default_limits.max_sessions {
             let file_name = format!("{index:02}-session.jsonl");
             let title = format!("session {index}");
             let path = write_session(
@@ -275,7 +331,7 @@ mod tests {
         }
 
         let changed_at = SystemTime::now()
-            + Duration::from_secs(/*secs*/ SESSION_IMPORT_MAX_COUNT as u64 + 1);
+            + Duration::from_secs(/*secs*/ default_limits.max_sessions as u64 + 1);
         for (index, session) in all_sessions.iter().enumerate() {
             let title = session.title.as_deref().expect("session title");
             std::fs::write(

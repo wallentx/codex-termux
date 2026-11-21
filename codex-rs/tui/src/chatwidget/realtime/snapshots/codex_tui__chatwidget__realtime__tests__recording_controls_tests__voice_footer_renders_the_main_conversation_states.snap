@@ -1,0 +1,56 @@
+---
+source: tui/src/chatwidget/realtime/recording_controls_tests.rs
+expression: "states.join(\"\\n\\n\")"
+---
+connecting:
+ voice ◌ connecting                                                 /voice stop
+
+› Ask Codex to do anything
+
+  status line stays visible
+  ? for shortcuts
+
+listening:
+ voice ● listening                                      f9 mute     /voice stop
+   mic ▁▁▁▁▁▁  codex ▁▁▁▁▁▁
+
+› Ask Codex to do anything
+
+  status line stays visible
+  ? for shortcuts
+
+speaking:
+ voice ● speaking                                       f9 mute     /voice stop
+   mic ▁▁▇▇▇▇  codex ▁▁████
+
+› Ask Codex to do anything
+
+  status line stays visible
+  ? for shortcuts
+
+muted:
+ voice ◌ muted                                          f9 unmute   /voice stop
+   mic ▁▁▁▁▁▁  codex ▁▁▇▇▇▇
+
+› Ask Codex to do anything
+
+  status line stays visible
+  ? for shortcuts
+
+transcript:
+ voice ● speaking                                       f9 mute     /voice stop
+   mic ▁▁▄▄▄▄  codex ▁▁▄▄▄▄
+
+› Ask Codex to do anything
+
+  status line stays visible
+  ? for shortcuts
+
+interrupted:
+ voice ● heard                                          f9 mute     /voice stop
+   mic ▁▁▄▄▄▄  codex ▁▁▄▄▄▄
+
+› Ask Codex to do anything
+
+  status line stays visible
+  ? for shortcuts

@@ -4,7 +4,7 @@ use super::*;
 
 impl ChatWidget {
     pub(super) fn notify(&mut self, notification: Notification) {
-        if !notification.allowed_for(&self.config.tui_notifications.notifications) {
+        if !notification.allowed_for(&self.local_settings.tui.notification_settings.notifications) {
             return;
         }
         if let Some(existing) = self.pending_notification.as_ref()
@@ -24,12 +24,13 @@ impl ChatWidget {
 }
 
 #[derive(Debug)]
-pub(super) enum Notification {
+pub(crate) enum Notification {
     AgentTurnComplete { response: String },
-    ExecApprovalRequested { command: String },
+    ExecApprovalRequested { subject: String },
     EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
     ElicitationRequested { server_name: String },
     PlanModePrompt { title: String },
+    AsyncQuestion { title: String },
 }
 
 impl Notification {
@@ -39,11 +40,8 @@ impl Notification {
                 Notification::agent_turn_preview(response)
                     .unwrap_or_else(|| "Agent turn complete".to_string())
             }
-            Notification::ExecApprovalRequested { command } => {
-                format!(
-                    "Approval requested: {}",
-                    truncate_text(command, /*max_graphemes*/ 30)
-                )
+            Notification::ExecApprovalRequested { subject } => {
+                format!("Approval requested: {subject}")
             }
             Notification::EditApprovalRequested { cwd, changes } => {
                 format!(
@@ -62,6 +60,9 @@ impl Notification {
             Notification::PlanModePrompt { title } => {
                 format!("Plan mode prompt: {title}")
             }
+            Notification::AsyncQuestion { title } => {
+                format!("Question: {title}")
+            }
         }
     }
 
@@ -72,6 +73,7 @@ impl Notification {
             | Notification::EditApprovalRequested { .. }
             | Notification::ElicitationRequested { .. } => "approval-requested",
             Notification::PlanModePrompt { .. } => "plan-mode-prompt",
+            Notification::AsyncQuestion { .. } => "async-question",
         }
     }
 
@@ -81,7 +83,8 @@ impl Notification {
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. }
             | Notification::ElicitationRequested { .. }
-            | Notification::PlanModePrompt { .. } => 1,
+            | Notification::PlanModePrompt { .. }
+            | Notification::AsyncQuestion { .. } => 1,
         }
     }
 

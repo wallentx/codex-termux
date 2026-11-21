@@ -1,6 +1,9 @@
 use std::time::Duration;
 
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserShellCommand {
@@ -27,6 +30,10 @@ impl UserShellCommand {
 }
 
 impl ContextualUserFragment for UserShellCommand {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("shell.user_command".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -39,10 +46,10 @@ impl ContextualUserFragment for UserShellCommand {
         ("<user_shell_command>", "</user_shell_command>")
     }
 
-    fn body(&self) -> String {
-        format!(
+    fn body(&self) -> ContentItem {
+        input_text(format!(
             "\n<command>\n{}\n</command>\n<result>\nExit code: {}\nDuration: {:.4} seconds\nOutput:\n{}\n</result>\n",
             self.command, self.exit_code, self.duration_seconds, self.output,
-        )
+        ))
     }
 }

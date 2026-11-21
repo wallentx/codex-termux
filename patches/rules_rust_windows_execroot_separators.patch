@@ -1,0 +1,55 @@
+--- a/cargo/private/cargo_build_script_runner/lib.rs
++++ b/cargo/private/cargo_build_script_runner/lib.rs
+@@ -377,14 +377,23 @@
+             return "${pwd}".to_owned();
+         }
+ 
+-        value
++        let redacted = value
+             .replace(&format!("{exec_root}/"), "${pwd}/")
+             .replace(&format!("{exec_root}\\"), "${pwd}\\")
+             // Flags such as `--remap-path-prefix=<exec_root>=.` (which build
+             // scripts see in CARGO_ENCODED_RUSTFLAGS and may echo back as
+             // `cargo:rustc-env`) follow the exec root with `=`. Leaving it
+             // unredacted bakes the per-action sandbox path into the output.
+-            .replace(&format!("{exec_root}="), "${pwd}=")
++            .replace(&format!("{exec_root}="), "${pwd}=");
++        #[cfg(windows)]
++        let redacted = {
++            // pkg-config can emit forward slashes for the same Windows root.
++            let root = exec_root.replace('\\', "/");
++            redacted
++                .replace(&format!("{root}/"), "${pwd}/")
++                .replace(&format!("{root}\\"), "${pwd}\\")
++        };
++        redacted
+     }
+ 
+     /// Redact for env vars: uses the generic `${out_dir}` token, resolved
+@@ -736,6 +745,26 @@
+                 cdylib_link_flags: "".to_owned(),
+                 bin_link_flags: "".to_owned(),
+             }
++        );
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn windows_include_metadata_redacts_both_root_spellings() {
++        let directory = std::env::current_dir().unwrap();
++        let root = directory.to_str().unwrap();
++        let forward = root.replace('\\', "/");
++        let outputs = vec![BuildScriptOutput::DepEnv(format!(
++            "INCLUDE={forward}/include;{root}\\lib;{forward}-other/include"
++        ))];
++        assert_eq!(
++            BuildScriptOutput::outputs_to_dep_env(&outputs, "glib", root),
++            format!("DEP_GLIB_INCLUDE=${{pwd}}/include;${{pwd}}\\lib;{forward}-other/include")
++        );
++        let outputs = vec![BuildScriptOutput::DepEnv(format!("INCLUDE={forward}/."))];
++        assert_eq!(
++            BuildScriptOutput::nonhermetic_absolute_paths(&outputs, root, ""),
++            Vec::<String>::new()
+         );
+     }
+ 

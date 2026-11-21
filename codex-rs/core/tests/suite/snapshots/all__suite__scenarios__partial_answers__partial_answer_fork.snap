@@ -1,0 +1,27 @@
+---
+source: core/tests/suite/scenarios_partial_answers.rs
+expression: "context_snapshot::format_request_history_snapshot(\"A forked worker receives both stable answer fragments, with their phases preserved and parent commentary filtered out.\",\n&child_requests, &ContextSnapshotOptions::default().rewrite_known_segments(),)"
+---
+Scenario: A forked worker receives both stable answer fragments, with their phases preserved and parent commentary filtered out.
+
+## Window 1
+-- request 1 (turn) --
+00:message/developer:
+    <MODEL_INSTRUCTIONS>
+01:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+02:message/user:
+    <ENVIRONMENT_CONTEXT>
+03:message/user:
+    Give me both results.
+04:message/assistant:
+    The first result is ready.
+05:message/assistant:
+    The second result is ready.
+06:message/user:
+    Have a worker check both results.
+07:message/developer:
+    <MULTI_AGENT_ROLE>
+08:message/developer:
+    <MULTI_AGENT_MODE>
+09:agent_message

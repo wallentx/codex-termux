@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests/bedrock_catalog_tests.rs
+expression: "render_bottom_popup(&chat, 100)"
+---
+  Select Model and Effort
+
+
+› 1. GPT-5.6 Terra (current)  Legacy balanced model for agentic coding.
+  2. GPT-5.6 Luna             Legacy fast model for simpler tasks.
+
+  enter select · esc back

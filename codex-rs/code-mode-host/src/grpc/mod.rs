@@ -1,0 +1,600 @@
+mod conversions;
+mod delegate;
+mod events;
+mod routing;
+mod session;
+mod validation;
+mod waits;
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+
+use codex_code_mode_protocol::CellId;
+use codex_code_mode_protocol::CodeModeOutputTruncation;
+use codex_code_mode_protocol::CodeModeSession;
+use codex_code_mode_protocol::CodeModeSessionOptions;
+use codex_code_mode_protocol::TerminateRequest;
+use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::grpc as proto;
+use codex_code_mode_protocol::grpc::code_mode_host_server::CodeModeHost;
+use codex_code_mode_protocol::host::LEGACY_MAX_PENDING_DELEGATE_CALLS;
+use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
+use codex_code_mode_runtime::ToolPreload;
+use codex_protocol::protocol::W3cTraceContext;
+use futures::Stream;
+use futures::StreamExt;
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Request;
+use tonic::Response;
+use tonic::Status;
+use tracing::Instrument;
+
+use self::session::GrpcHostState;
+use self::session::GrpcSession;
+use self::waits::WaitRegistration;
+
+type GrpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+type GrpcFuture<'a, T> = Pin<Box<dyn Future<Output = Result<Response<T>, Status>> + Send + 'a>>;
+
+fn with_heartbeats<T: Send + 'static>(
+    stream: GrpcStream<T>,
+    interval_s: u32,
+    heartbeat: impl Fn() -> T + Send + 'static,
+) -> GrpcStream<T> {
+    if interval_s == 0 {
+        return stream;
+    }
+    let duration = Duration::from_secs(u64::from(interval_s));
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + duration, duration);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let stream = tokio_stream::StreamExt::timeout_repeating(stream, interval);
+    Box::pin(stream.map(move |item| item.unwrap_or_else(|_| Ok(heartbeat()))))
+}
+
+fn trace_context_from_request<T>(request: &Request<T>) -> Option<W3cTraceContext> {
+    request
+        .metadata()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .map(|traceparent| W3cTraceContext {
+            traceparent: Some(traceparent.to_string()),
+            tracestate: None,
+        })
+}
+
+/// Serves transport-independent, leased code-mode sessions over gRPC.
+#[derive(Clone)]
+pub struct GrpcCodeModeHost {
+    state: Arc<GrpcHostState>,
+    tool_preloads: &'static [ToolPreload],
+    process_metrics: Option<Arc<crate::process_metrics::ProcessMetrics>>,
+}
+
+impl GrpcCodeModeHost {
+    /// Creates a host with independent session, execution, and callback limits.
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(GrpcHostState::new()),
+            tool_preloads: &[],
+            process_metrics: None,
+        }
+    }
+
+    /// Sets the trusted helpers used when this host opens a session.
+    pub fn with_tool_preloads(mut self, tool_preloads: &'static [ToolPreload]) -> Self {
+        self.tool_preloads = tool_preloads;
+        self
+    }
+
+    /// Uses a collector whose resources were prepared before sandbox entry.
+    pub fn with_process_metrics(collector: crate::CodeModeProcessMetricsCollector) -> Self {
+        Self {
+            process_metrics: Some(Arc::new(crate::process_metrics::ProcessMetrics::new(
+                collector,
+            ))),
+            ..Self::new()
+        }
+    }
+
+    async fn open_session_request(
+        &self,
+        request: proto::OpenSessionRequest,
+    ) -> Result<Response<GrpcStream<proto::SessionEvent>>, Status> {
+        let _permit = self.state.request_permit()?;
+        let max_pending_delegate_calls = request
+            .max_pending_delegate_calls
+            .map(|limit| limit as usize)
+            .unwrap_or(LEGACY_MAX_PENDING_DELEGATE_CALLS)
+            .min(MAX_PENDING_DELEGATE_CALLS);
+        if max_pending_delegate_calls == 0 {
+            return Err(Status::invalid_argument(
+                "callback capacity must be positive",
+            ));
+        }
+        let limits = conversions::session_limits(request.cell_execution_limits)?;
+        let output_truncation = match request
+            .output_truncation
+            .map(proto::OutputTruncation::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("unknown code-mode output truncation mode"))?
+        {
+            None | Some(proto::OutputTruncation::Unspecified | proto::OutputTruncation::Client) => {
+                CodeModeOutputTruncation::Client
+            }
+            Some(proto::OutputTruncation::Server) => CodeModeOutputTruncation::Server,
+        };
+        let events = self.state.open_session(
+            CodeModeSessionOptions {
+                cell_execution_limits: limits,
+                output_truncation,
+                ..Default::default()
+            },
+            max_pending_delegate_calls,
+            self.tool_preloads,
+        )?;
+        Ok(Response::new(with_heartbeats(
+            events,
+            request.heartbeat_interval_s,
+            || proto::SessionEvent {
+                event: Some(proto::session_event::Event::Heartbeat(
+                    proto::StreamHeartbeat {},
+                )),
+            },
+        )))
+    }
+
+    #[tracing::instrument(
+        name = "code_mode_host.grpc.close_session",
+        level = "info",
+        skip_all,
+        fields(
+            otel.name = "code_mode_host.grpc.close_session",
+            session.id = %request.session_id,
+        )
+    )]
+    async fn close_session_request(
+        &self,
+        request: proto::CloseSessionRequest,
+    ) -> Result<Response<proto::CloseSessionResponse>, Status> {
+        let _permit = self.state.control_permit()?;
+        self.state.close_session(&request.session_id).await?;
+        Ok(Response::new(proto::CloseSessionResponse {}))
+    }
+
+    async fn subscribe_request(
+        &self,
+        request: proto::SubscribeToToolCallsRequest,
+    ) -> Result<Response<GrpcStream<proto::ToolCall>>, Status> {
+        let _permit = self.state.request_permit()?;
+        let session = self.state.session(&request.session_id)?;
+        let calls = session.subscribe(request.tool_names)?;
+        let session_id = session.id;
+        Ok(Response::new(with_heartbeats(
+            calls,
+            request.heartbeat_interval_s,
+            move || proto::ToolCall {
+                session_id: session_id.to_string(),
+                heartbeat: Some(proto::StreamHeartbeat {}),
+                ..Default::default()
+            },
+        )))
+    }
+
+    async fn complete_tool_request(
+        &self,
+        request: proto::CompleteToolCallRequest,
+    ) -> Result<Response<proto::CompleteToolCallResponse>, Status> {
+        let _permit = self.state.control_permit()?;
+        let session = self.state.session(&request.session_id)?;
+        let invocation_id = validation::uuid(&request.invocation_id, "tool invocation ID")?;
+        let result = match request.outcome {
+            Some(proto::complete_tool_call_request::Outcome::Succeeded(result)) => Ok(
+                serde_json::from_slice(&result.output_json).map_err(|error| {
+                    Status::invalid_argument(format!("invalid code-mode tool output JSON: {error}"))
+                })?,
+            ),
+            Some(proto::complete_tool_call_request::Outcome::Failed(error)) => Err(error.message),
+            None => {
+                return Err(Status::invalid_argument(
+                    "tool completion is missing its outcome",
+                ));
+            }
+        };
+        session.complete_invocation(invocation_id, result)?;
+        Ok(Response::new(proto::CompleteToolCallResponse {}))
+    }
+
+    async fn acknowledge_notification_request(
+        &self,
+        request: proto::AcknowledgeNotificationRequest,
+    ) -> Result<Response<proto::AcknowledgeNotificationResponse>, Status> {
+        let _permit = self.state.control_permit()?;
+        self.state.session(&request.session_id)?;
+        validation::uuid(&request.notification_id, "notification ID")?;
+        Ok(Response::new(proto::AcknowledgeNotificationResponse {}))
+    }
+
+    async fn execute_request(
+        &self,
+        request: proto::ExecuteRequest,
+        callback_traceparent: Option<String>,
+    ) -> Result<Response<GrpcStream<proto::ExecuteEvent>>, Status> {
+        let received_at = Instant::now();
+        let session = self.state.session(&request.session_id)?;
+        validation::identifier(&request.execution_id, "execution ID")?;
+        let request_permit = self.state.request_permit()?;
+        let execution_id = request.execution_id.clone();
+        let catalog_revision = request.catalog_revision;
+        let request = conversions::execute_request(request)?;
+        let cell_permit = self.state.cell_permit()?;
+        let yield_signal = session.reserve_execution(&execution_id)?;
+        let mut admission = ExecutionAdmission {
+            session: Arc::clone(&session),
+            execution_id: Some(execution_id.clone()),
+        };
+        let started = tokio::select! {
+            _ = session.closed.cancelled() => {
+                return Err(Status::cancelled("code-mode session is closed"));
+            }
+            result = session.runtime.execute_with_catalog(request, catalog_revision, Arc::new(delegate::GrpcDelegate::new(Arc::downgrade(&session))), Some(yield_signal)) => {
+                result.map_err(Status::failed_precondition)?
+            }
+        };
+        let cell_id = started.cell_id.clone();
+        session.admit_execution(
+            execution_id.clone(),
+            cell_id.to_string(),
+            cell_permit,
+            callback_traceparent,
+        )?;
+
+        let (sender, receiver) = mpsc::channel(/*buffer*/ 2);
+        sender
+            .try_send(Ok(proto::ExecuteEvent {
+                event: Some(proto::execute_event::Event::Started(
+                    proto::ExecutionStarted {
+                        execution_id,
+                        cell_id: cell_id.to_string(),
+                    },
+                )),
+            }))
+            .map_err(|_| Status::internal("failed to publish code-mode execution admission"))?;
+        let outcome_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let _request_permit = request_permit;
+                tokio::select! {
+                    biased;
+                    _ = sender.closed() => {}
+                    response = started.initial_response() => {
+                        // Freeze timing before conversion or transport backpressure.
+                        let code_mode_host_duration = received_at.elapsed();
+                        let event = response.and_then(|response| {
+                            let response = response.with_code_mode_host_duration(code_mode_host_duration);
+                            let outcome = conversions::execution_outcome(response)
+                                .map_err(|error| error.to_string())?;
+                            Ok(proto::ExecuteEvent {
+                                event: Some(proto::execute_event::Event::Outcome(outcome)),
+                            })
+                        }).map_err(Status::internal);
+                        let _ = sender.send(event).await;
+                    }
+                    _ = session.closed.cancelled() => {}
+                }
+            }
+            .instrument(outcome_span),
+        );
+
+        let stream = ReceiverStream::new(receiver).inspect(move |event| {
+            if matches!(
+                event,
+                Ok(proto::ExecuteEvent {
+                    event: Some(proto::execute_event::Event::Outcome(_)),
+                })
+            ) {
+                admission.disarm();
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    #[tracing::instrument(
+        name = "code_mode_host.grpc.wait",
+        level = "info",
+        skip_all,
+        fields(
+            otel.name = "code_mode_host.grpc.wait",
+            session.id = %request.session_id,
+            cell.id = %request.cell_id,
+            wait.id = %request.wait_id,
+        )
+    )]
+    async fn wait_request(
+        &self,
+        request: proto::WaitRequest,
+    ) -> Result<Response<proto::WaitResponse>, Status> {
+        let received_at = Instant::now();
+        let session = self.state.session(&request.session_id)?;
+        validation::identifier(&request.cell_id, "cell ID")?;
+        validation::identifier(&request.wait_id, "wait ID")?;
+        let _permit = self.state.request_permit()?;
+        let max_output_tokens = conversions::observation_budget(
+            request.max_output_tokens,
+            session.runtime.output_truncation(),
+        )?;
+        let registration = WaitRegistration::new(Arc::clone(&session), request.wait_id)?;
+        let request = WaitRequest {
+            cell_id: CellId::new(request.cell_id),
+            yield_time_ms: request.yield_time_ms,
+            max_output_tokens,
+        };
+        let outcome = tokio::select! {
+            biased;
+            _ = registration.cancellation().cancelled() => {
+                return Err(Status::cancelled("code-mode wait was cancelled"));
+            }
+            _ = session.closed.cancelled() => {
+                return Err(Status::cancelled("code-mode session is closed"));
+            }
+            outcome = session.runtime.wait(request, Some(registration.yield_signal())) => {
+                outcome.map_err(Status::failed_precondition)?
+            }
+        };
+        let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
+        conversions::wait_response(outcome).map_err(|error| Status::internal(error.to_string()))
+    }
+
+    async fn cancel_wait_request(
+        &self,
+        request: proto::CancelWaitRequest,
+    ) -> Result<Response<proto::CancelWaitResponse>, Status> {
+        let _permit = self.state.control_permit()?;
+        let session = self.state.session(&request.session_id)?;
+        validation::identifier(&request.wait_id, "wait ID")?;
+        session.cancel_wait(&request.wait_id).await?;
+        Ok(Response::new(proto::CancelWaitResponse {}))
+    }
+
+    async fn yield_observation_request(
+        &self,
+        request: proto::YieldObservationRequest,
+    ) -> Result<Response<proto::YieldObservationResponse>, Status> {
+        let _permit = self.state.control_permit()?;
+        let session = self.state.session(&request.session_id)?;
+        match request.observation {
+            Some(proto::yield_observation_request::Observation::ExecutionId(id)) => {
+                session.yield_execution(&id)?;
+            }
+            Some(proto::yield_observation_request::Observation::WaitId(id)) => {
+                session.yield_wait(&id)?;
+            }
+            None => return Err(Status::invalid_argument("missing code-mode observation ID")),
+        }
+        Ok(Response::new(proto::YieldObservationResponse {}))
+    }
+
+    async fn terminate_request(
+        &self,
+        request: proto::TerminateRequest,
+    ) -> Result<Response<proto::WaitResponse>, Status> {
+        let received_at = Instant::now();
+        let session = self.state.session(&request.session_id)?;
+        validation::identifier(&request.cell_id, "cell ID")?;
+        let _permit = self.state.request_permit()?;
+        let max_output_tokens = conversions::observation_budget(
+            request.max_output_tokens,
+            session.runtime.output_truncation(),
+        )?;
+        let outcome = session
+            .terminate(TerminateRequest {
+                cell_id: CellId::new(request.cell_id),
+                max_output_tokens,
+            })
+            .await?;
+        let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
+        conversions::wait_response(outcome).map_err(|error| Status::internal(error.to_string()))
+    }
+}
+
+impl Default for GrpcCodeModeHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodeModeHost for GrpcCodeModeHost {
+    fn get_process_metrics<'a, 'async_trait>(
+        &'a self,
+        _request: Request<proto::GetProcessMetricsRequest>,
+    ) -> GrpcFuture<'async_trait, proto::GetProcessMetricsResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.process_metrics
+                .as_ref()
+                .ok_or_else(|| Status::unimplemented("process metrics are unsupported"))?
+                .sample()
+                .await
+        })
+    }
+
+    type OpenSessionStream = GrpcStream<proto::SessionEvent>;
+    type SubscribeToToolCallsStream = GrpcStream<proto::ToolCall>;
+    type ExecuteStream = GrpcStream<proto::ExecuteEvent>;
+
+    fn open_session<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::OpenSessionRequest>,
+    ) -> GrpcFuture<'async_trait, Self::OpenSessionStream>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        let trace = trace_context_from_request(&request);
+        let request = request.into_inner();
+        let open_session_span = tracing::info_span!("code_mode_host.grpc.open_session");
+        if let Some(trace) = trace.as_ref() {
+            codex_otel::set_parent_from_w3c_trace_context(&open_session_span, trace);
+        }
+        Box::pin(
+            self.open_session_request(request)
+                .instrument(open_session_span),
+        )
+    }
+
+    fn close_session<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::CloseSessionRequest>,
+    ) -> GrpcFuture<'async_trait, proto::CloseSessionResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.close_session_request(request.into_inner()))
+    }
+
+    fn subscribe_to_tool_calls<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::SubscribeToToolCallsRequest>,
+    ) -> GrpcFuture<'async_trait, Self::SubscribeToToolCallsStream>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.subscribe_request(request.into_inner()))
+    }
+
+    fn complete_tool_call<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::CompleteToolCallRequest>,
+    ) -> GrpcFuture<'async_trait, proto::CompleteToolCallResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.complete_tool_request(request.into_inner()))
+    }
+
+    fn acknowledge_notification<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::AcknowledgeNotificationRequest>,
+    ) -> GrpcFuture<'async_trait, proto::AcknowledgeNotificationResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.acknowledge_notification_request(request.into_inner()))
+    }
+
+    fn execute<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::ExecuteRequest>,
+    ) -> GrpcFuture<'async_trait, Self::ExecuteStream>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        let trace = trace_context_from_request(&request);
+        let request = request.into_inner();
+        let execute_span = tracing::info_span!(
+            "code_mode_host.grpc.execute",
+            otel.name = "code_mode_host.grpc.execute",
+            session.id = %request.session_id,
+            execution.id = %request.execution_id,
+            call_id = %request.tool_call_id,
+        );
+        if let Some(trace) = trace.as_ref() {
+            codex_otel::set_parent_from_w3c_trace_context(&execute_span, trace);
+        }
+        let callback_traceparent =
+            codex_otel::span_w3c_trace_context(&execute_span).and_then(|trace| trace.traceparent);
+        Box::pin(
+            self.execute_request(request, callback_traceparent)
+                .instrument(execute_span),
+        )
+    }
+
+    fn wait<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::WaitRequest>,
+    ) -> GrpcFuture<'async_trait, proto::WaitResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.wait_request(request.into_inner()))
+    }
+
+    fn cancel_wait<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::CancelWaitRequest>,
+    ) -> GrpcFuture<'async_trait, proto::CancelWaitResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.cancel_wait_request(request.into_inner()))
+    }
+
+    fn yield_observation<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::YieldObservationRequest>,
+    ) -> GrpcFuture<'async_trait, proto::YieldObservationResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.yield_observation_request(request.into_inner()))
+    }
+
+    fn terminate<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::TerminateRequest>,
+    ) -> GrpcFuture<'async_trait, proto::WaitResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.terminate_request(request.into_inner()))
+    }
+}
+
+struct ExecutionAdmission {
+    session: Arc<GrpcSession>,
+    execution_id: Option<String>,
+}
+
+impl ExecutionAdmission {
+    fn disarm(&mut self) {
+        if let Some(execution_id) = self.execution_id.take() {
+            self.session.retire_execution_observation(&execution_id);
+        }
+    }
+}
+
+impl Drop for ExecutionAdmission {
+    fn drop(&mut self) {
+        if let Some(execution_id) = self.execution_id.take() {
+            self.session.abandon_execution(&execution_id);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "robustness_tests.rs"]
+mod robustness_tests;
+
+#[cfg(test)]
+#[path = "capacity_tests.rs"]
+mod capacity_tests;

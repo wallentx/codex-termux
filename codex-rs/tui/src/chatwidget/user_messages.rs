@@ -14,17 +14,20 @@ use std::path::PathBuf;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::QueuedInputAction;
+use codex_app_server_protocol::ImageReference;
 use codex_app_server_protocol::TextElement as AppServerTextElement;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::models::local_image_label_text;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
 use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
 
 use super::ChatWidget;
+use super::StatusSurfaceOverrides;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserMessage {
@@ -58,19 +61,47 @@ pub(super) enum ShellEscapePolicy {
     Disallow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UserMessageSource {
+    Prompt,
+    DirectEnter,
+    QuestionAnswer,
+    SafetyRecourse,
+}
+
+/// Whether a recovered message can be submitted without risking a duplicate.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum MessageDelivery {
+    Unsent,
+    Unconfirmed(Option<String>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct QueuedUserMessage {
     pub(super) user_message: UserMessage,
+    pub(super) prepared_images: Option<Vec<UserInput>>,
     pub(super) action: QueuedInputAction,
+    pub(super) delivery: MessageDelivery,
     pub(super) pending_pastes: Vec<(String, String)>,
+    pub(super) source: UserMessageSource,
 }
 
 impl QueuedUserMessage {
+    pub(super) fn unconfirmed_user_message_id(&self) -> Option<&str> {
+        match &self.delivery {
+            MessageDelivery::Unconfirmed(id) => id.as_deref(),
+            MessageDelivery::Unsent => None,
+        }
+    }
+
     pub(super) fn new(user_message: UserMessage, action: QueuedInputAction) -> Self {
         Self {
             user_message,
+            prepared_images: None,
             action,
+            delivery: MessageDelivery::Unsent,
             pending_pastes: Vec::new(),
+            source: UserMessageSource::Prompt,
         }
     }
 
@@ -102,6 +133,7 @@ pub(super) enum QueueDrain {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(super) struct ThreadComposerState {
     pub(super) text: String,
+    pub(super) shell_mode: Option<bool>,
     pub(super) local_images: Vec<LocalImageAttachment>,
     pub(super) remote_image_urls: Vec<String>,
     pub(super) text_elements: Vec<TextElement>,
@@ -122,19 +154,31 @@ impl ThreadComposerState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
+    pub(crate) provider_error: Option<codex_app_server_protocol::ModelProviderError>,
+    pub(crate) questions: Option<crate::bottom_pane::QuestionState>,
+    pub(crate) pending_thread_settings:
+        Option<codex_app_server_protocol::ThreadSettingsUpdatedNotification>,
+    pub(super) initial_user_message: Option<UserMessage>,
+    pub(super) startup_submission: Option<crate::bottom_pane::ComposerDraftSnapshot>,
     pub(super) composer: Option<ThreadComposerState>,
     pub(super) safety_buffering_prompt: Option<UserMessage>,
-    pub(super) pending_steers: VecDeque<UserMessage>,
-    pub(super) pending_steer_history_records: VecDeque<UserMessageHistoryRecord>,
-    pub(super) pending_steer_compare_keys: VecDeque<PendingSteerCompareKey>,
+    pub(super) safety_buffering_source: UserMessageSource,
+    pub(crate) pending_steers: VecDeque<PendingSteer>,
     pub(super) rejected_steers_queue: VecDeque<UserMessage>,
+    pub(super) rejected_steer_sources: VecDeque<UserMessageSource>,
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+    pub(crate) recovered_queue: bool,
+    /// Reconcile delivery against resumed history after recovery or an idle thread switch.
+    pub(crate) reconnect_pending: bool,
     pub(super) user_turn_pending_start: bool,
+    pub(super) pending_user_message_client_id: Option<String>,
     pub(super) submit_pending_steers_after_interrupt: bool,
     pub(super) current_collaboration_mode: CollaborationMode,
     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
+    pub(super) plan_mode_reasoning_effort: Option<ReasoningEffortConfig>,
+    pub(super) status_surface_overrides: StatusSurfaceOverrides,
     pub(super) task_running: bool,
     pub(super) agent_turn_running: bool,
 }
@@ -170,10 +214,16 @@ impl From<&str> for UserMessage {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct PendingSteer {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingSteer {
+    /// Preserved across request retries and thread switches until this submission commits.
+    pub(crate) client_id: String,
+    /// The admission identifies the turn whose interruption can discard this input.
+    pub(super) admitted_turn_id: Option<String>,
+    pub(super) optimistically_rendered: bool,
     pub(super) user_message: UserMessage,
     pub(super) history_record: UserMessageHistoryRecord,
+    pub(super) source: UserMessageSource,
     pub(super) compare_key: PendingSteerCompareKey,
 }
 
@@ -437,7 +487,7 @@ fn merge_remapped_user_messages(messages: impl IntoIterator<Item = UserMessage>)
 }
 
 pub(super) fn user_message_for_restore(
-    message: UserMessage,
+    mut message: UserMessage,
     history_record: &UserMessageHistoryRecord,
 ) -> UserMessage {
     match history_record {
@@ -447,6 +497,10 @@ pub(super) fn user_message_for_restore(
             ..message
         },
         UserMessageHistoryRecord::Override(_) | UserMessageHistoryRecord::UserMessageText => {
+            if let Some(text) = crate::async_question_reply::display_text(&message.text) {
+                message.text = text;
+                message.text_elements.clear();
+            }
             message
         }
     }
@@ -462,7 +516,8 @@ pub(super) fn user_message_preview_text(
         }
         Some(UserMessageHistoryRecord::Override(_))
         | Some(UserMessageHistoryRecord::UserMessageText)
-        | None => message.text.clone(),
+        | None => crate::async_question_reply::display_text(&message.text)
+            .unwrap_or_else(|| message.text.clone()),
     }
 }
 
@@ -470,7 +525,10 @@ pub(super) fn user_message_display_for_history(
     message: UserMessage,
     history_record: &UserMessageHistoryRecord,
 ) -> UserMessageDisplay {
-    let message = user_message_for_restore(message, history_record);
+    let message = match history_record {
+        UserMessageHistoryRecord::UserMessageText => message,
+        UserMessageHistoryRecord::Override(_) => user_message_for_restore(message, history_record),
+    };
     ChatWidget::user_message_display_from_parts(
         message.text,
         message.text_elements,
@@ -535,6 +593,8 @@ pub(super) fn merge_user_messages_with_history_record(
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct UserMessageDisplay {
     pub(crate) message: String,
+    // Keep distinct replies distinct when their visible question and answer text match.
+    pub(super) replies: Vec<crate::async_question_reply::AsyncQuestionReply>,
     pub(crate) remote_image_urls: Vec<String>,
     pub(crate) local_images: Vec<PathBuf>,
     pub(crate) text_elements: Vec<TextElement>,
@@ -596,8 +656,58 @@ pub(crate) fn mention_bindings_from_user_inputs(
             | UserInput::LocalAudio { .. } => None,
         })
         .collect();
+    for item in items {
+        let UserInput::Text {
+            text,
+            text_elements,
+        } = item
+        else {
+            continue;
+        };
+        for element in text_elements {
+            if let Some((mention, path, end)) =
+                crate::task_mentions::parse_task_link(text, element.byte_range.start)
+                && end == element.byte_range.end
+                && element
+                    .placeholder()
+                    .and_then(|placeholder| placeholder.strip_prefix('@'))
+                    == Some(mention.as_str())
+            {
+                mention_bindings.push(MentionBinding {
+                    sigil: '@',
+                    mention,
+                    path,
+                });
+            }
+        }
+    }
     mention_bindings.sort_by_key(|binding| {
-        mention_start(binding.sigil, &binding.mention).unwrap_or(usize::MAX)
+        let token = if crate::task_mentions::valid_thread_path(&binding.path).is_some() {
+            crate::task_mentions::format_task_link(&binding.mention, &binding.path)
+        } else {
+            format!("{}{}", binding.sigil, binding.mention)
+        };
+        let mut text_offset = 0;
+        items
+            .iter()
+            .find_map(|item| {
+                let UserInput::Text {
+                    text,
+                    text_elements,
+                } = item
+                else {
+                    return None;
+                };
+                let offset = text_offset;
+                text_offset += text.len();
+                text_elements.iter().find_map(|element| {
+                    (text.get(element.byte_range.start..element.byte_range.end)
+                        == Some(token.as_str()))
+                    .then_some(offset + element.byte_range.start)
+                })
+            })
+            .or_else(|| mention_start(binding.sigil, &binding.mention))
+            .unwrap_or(usize::MAX)
     });
     mention_bindings
 }
@@ -615,8 +725,18 @@ impl ChatWidget {
         local_images: Vec<PathBuf>,
         remote_image_urls: Vec<String>,
     ) -> UserMessageDisplay {
+        let replies = crate::async_question_reply::parse(&message);
         let (message, prompt_request_offset) =
-            crate::ide_context::extract_prompt_request_with_offset(&message);
+            crate::user_prompt::extract_prompt_request_with_offset(&message);
+        if let Some(replies) = replies.or_else(|| crate::async_question_reply::parse(message)) {
+            return UserMessageDisplay {
+                message: crate::async_question_reply::display_replies(&replies),
+                replies,
+                text_elements: Vec::new(),
+                local_images,
+                remote_image_urls,
+            };
+        }
         let prompt_request_end = prompt_request_offset + message.len();
         // Prompt context uses the same delimiter and stripping behavior as the desktop app and IDE
         // extension. The raw user message goes to the agent, but every surface renders only the
@@ -639,16 +759,14 @@ impl ChatWidget {
 
         UserMessageDisplay {
             message: message.to_string(),
+            replies: Vec::new(),
             remote_image_urls,
             local_images,
             text_elements,
         }
     }
 
-    /// Build the compare key for a submitted pending steer without invoking the
-    /// expensive request-serialization path. Pending steers only need to match the
-    /// committed app-server `UserMessage` item emitted after input drains, which
-    /// preserves flattened text and total image count.
+    /// Build the legacy content key for app servers that do not echo submission IDs.
     pub(super) fn pending_steer_compare_key_from_items(
         items: &[UserInput],
     ) -> PendingSteerCompareKey {
@@ -679,6 +797,20 @@ impl ChatWidget {
         {
             tracing::warn!("audio user inputs are not supported by the TUI and will be omitted");
         }
+        // TODO(kc) preserve file-backed images when the TUI can resolve or replay them.
+        if items.iter().any(|item| {
+            matches!(
+                item,
+                UserInput::Image {
+                    image: ImageReference::File { .. },
+                    ..
+                }
+            )
+        }) {
+            tracing::warn!(
+                "file-backed image inputs are not supported by the TUI and will be omitted"
+            );
+        }
         let mut message = String::new();
         let mut remote_image_urls = Vec::new();
         let mut local_images = Vec::new();
@@ -705,7 +837,14 @@ impl ChatWidget {
                         )
                     }),
                 ),
-                UserInput::Image { url, .. } => remote_image_urls.push(url.clone()),
+                UserInput::Image {
+                    image: ImageReference::Inline { url },
+                    ..
+                } => remote_image_urls.push(url.clone()),
+                UserInput::Image {
+                    image: ImageReference::File { .. },
+                    ..
+                } => {}
                 UserInput::LocalImage { path, .. } => local_images.push(path.clone()),
                 UserInput::Audio { .. } // TODO: Include audio inputs in the user message display.
                 | UserInput::LocalAudio { .. } // TODO: Include audio inputs in the user message display.
@@ -714,11 +853,57 @@ impl ChatWidget {
             }
         }
 
+        (message, text_elements) = crate::task_mentions::decode_task_links(&message, text_elements);
+
         Self::user_message_display_from_parts(
             message,
             text_elements,
             local_images,
             remote_image_urls,
         )
+    }
+}
+
+pub(super) fn remove_confirmed_queued_messages(
+    messages: &mut VecDeque<QueuedUserMessage>,
+    history: &mut VecDeque<UserMessageHistoryRecord>,
+    confirmed_ids: &[String],
+) {
+    let mut index = 0;
+    messages.retain(|message| {
+        let confirmed = message
+            .unconfirmed_user_message_id()
+            .is_some_and(|id| confirmed_ids.iter().any(|confirmed_id| confirmed_id == id));
+        if confirmed {
+            history.remove(index);
+        } else {
+            index += 1;
+        }
+        !confirmed
+    });
+}
+
+impl ThreadInputState {
+    pub(crate) fn reconcile_confirmed_messages(&mut self, confirmed_ids: &[String]) {
+        self.pending_steers
+            .retain(|steer| !confirmed_ids.contains(&steer.client_id));
+        self.submit_pending_steers_after_interrupt &= !self.pending_steers.is_empty();
+        remove_confirmed_queued_messages(
+            &mut self.queued_user_messages,
+            &mut self.queued_user_message_history_records,
+            confirmed_ids,
+        );
+    }
+
+    pub(crate) fn has_unsent_input(&self) -> bool {
+        self.composer.is_some()
+            || !self.queued_user_messages.is_empty()
+            || !self.rejected_steers_queue.is_empty()
+    }
+
+    pub(crate) fn has_unconfirmed_messages(&self) -> bool {
+        self.queued_user_messages
+            .iter()
+            .any(|message| matches!(message.delivery, MessageDelivery::Unconfirmed(_)))
     }
 }

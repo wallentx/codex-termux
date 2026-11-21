@@ -34,6 +34,11 @@ impl ExtensionDataInit {
             .map(downcast_data)
     }
 
+    /// Consumes a startup-only attachment before creating the live scope.
+    pub fn remove<T: Any + Send + Sync>(&mut self) -> Option<Arc<T>> {
+        self.entries.remove(&TypeId::of::<T>()).map(downcast_data)
+    }
+
     /// Returns a host-supplied initial attachment without creating a mutable scope.
     pub fn get<T>(&self) -> Option<Arc<T>>
     where
@@ -99,9 +104,36 @@ impl ExtensionData {
     where
         T: Any + Send + Sync,
     {
+        self.insert_arc(Arc::new(value))
+    }
+
+    /// Stores a shared attachment without cloning its contents.
+    pub fn insert_arc<T>(&self, value: Arc<T>) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
         self.entries()
-            .insert(TypeId::of::<T>(), Arc::new(value))
+            .insert(TypeId::of::<T>(), value)
             .map(downcast_data)
+    }
+
+    /// Stores `value` only when `should_insert` accepts the current attachment.
+    ///
+    /// The predicate and insertion happen while this map is locked, so concurrent
+    /// callers cannot replace a value after checking a stale attachment.
+    pub fn insert_if<T>(&self, value: T, should_insert: impl FnOnce(Option<&T>) -> bool) -> bool
+    where
+        T: Any + Send + Sync,
+    {
+        let mut entries = self.entries();
+        let existing = entries
+            .get(&TypeId::of::<T>())
+            .map(|value| downcast_data::<T>(Arc::clone(value)));
+        if !should_insert(existing.as_deref()) {
+            return false;
+        }
+        entries.insert(TypeId::of::<T>(), Arc::new(value));
+        true
     }
 
     /// Removes and returns the attached value of type `T`, if one exists.

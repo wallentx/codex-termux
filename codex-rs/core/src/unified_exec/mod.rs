@@ -2,6 +2,7 @@
 //!
 //! Responsibilities
 //! - Manages interactive processes (create, reuse, buffer output with caps).
+//! - Supports completion-only calls that terminate on timeout or cancellation.
 //! - Uses the shared ToolOrchestrator to handle approval, sandbox selection, and
 //!   retry semantics in a single, descriptive flow.
 //! - Spawns the PTY from a sandbox-transformed `ExecRequest`; on sandbox denial,
@@ -12,8 +13,8 @@
 //! Flow at a glance (open process)
 //! 1) Build a small request `{ command, cwd }`.
 //! 2) Orchestrator: approval (bypass/cache/prompt) → select sandbox → run.
-//! 3) Runtime: transform `SandboxTransformRequest` -> `ExecRequest` -> spawn PTY.
-//! 4) If denial, orchestrator retries with `SandboxType::None`.
+//! 3) Prepare the approved sandbox on the execution host, then spawn the PTY.
+//! 4) On sandbox denial, the orchestrator may authorize a retry with different permissions.
 //! 5) Process handle is returned with streaming output + metadata.
 //!
 //! This keeps policy logic and user interaction centralized while the PTY/process
@@ -28,41 +29,44 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use codex_network_proxy::NetworkProxy;
-use codex_protocol::models::AdditionalPermissionProfile;
-use codex_tools::UnifiedExecShellMode;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
-use crate::session::turn_context::TurnEnvironment;
-use crate::shell::ShellType;
+use crate::tools::handlers::unified_exec::preparation::PreparedExecCommand;
 use crate::tools::network_approval::DeferredNetworkApproval;
+use codex_core_plugins::PluginMetricsSidecar;
 
 mod async_watcher;
+mod command_sessions;
 mod errors;
-mod head_tail_buffer;
+mod oneshot;
+pub(crate) mod output;
 mod process;
 mod process_manager;
+pub(crate) use process_manager::exec_env_policy_from_shell_policy;
 mod process_state;
+mod shell_snapshot;
+mod stdin_approval;
 
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
 }
 
+pub(crate) use command_sessions::command_sessions_state;
 pub(crate) use errors::UnifiedExecError;
-pub(crate) use process::NoopSpawnLifecycle;
-#[cfg(unix)]
-pub(crate) use process::SpawnLifecycle;
-pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
+pub(crate) use stdin_approval::TerminalPermissions;
+pub(crate) use stdin_approval::TerminalSandboxSource;
 
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
-pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
+pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 10_000;
 // Minimum yield time for an empty `write_stdin`.
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
@@ -72,17 +76,30 @@ pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
 
+const MAX_TRACE_ID_BYTES: usize = 256;
+
+fn trace_id(id: &str) -> Option<&str> {
+    (!id.is_empty() && id.len() <= MAX_TRACE_ID_BYTES).then_some(id)
+}
+
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
-    pub turn: Arc<TurnContext>,
+    pub step_context: Arc<StepContext>,
+    pub cancellation_token: CancellationToken,
     pub call_id: String,
 }
 
 impl UnifiedExecContext {
-    pub fn new(session: Arc<Session>, turn: Arc<TurnContext>, call_id: String) -> Self {
+    pub fn new(
+        session: Arc<Session>,
+        step_context: Arc<StepContext>,
+        cancellation_token: CancellationToken,
+        call_id: String,
+    ) -> Self {
         Self {
             session,
-            turn,
+            step_context,
+            cancellation_token,
             call_id,
         }
     }
@@ -90,32 +107,39 @@ impl UnifiedExecContext {
 
 #[derive(Debug)]
 pub(crate) struct ExecCommandRequest {
-    pub command: Vec<String>,
-    pub shell_type: ShellType,
-    pub hook_command: String,
+    pub prepared: PreparedExecCommand,
     pub process_id: i32,
-    pub yield_time_ms: u64,
-    pub max_output_tokens: Option<usize>,
-    pub cwd: PathUri,
-    pub sandbox_cwd: PathUri,
-    pub turn_environment: TurnEnvironment,
-    pub shell_mode: UnifiedExecShellMode,
     pub network: Option<NetworkProxy>,
-    pub tty: bool,
-    pub sandbox_permissions: SandboxPermissions,
-    pub additional_permissions: Option<AdditionalPermissionProfile>,
-    pub additional_permissions_preapproved: bool,
-    pub justification: Option<String>,
-    pub prefix_rule: Option<Vec<String>>,
+}
+
+/// The process and environment behind a terminal session ID at the time of lookup.
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalSession {
+    pub(crate) process_id: i32,
+    process: Arc<UnifiedExecProcess>,
+    call_id: String,
+    pub(crate) environment_id: String,
 }
 
 #[derive(Debug)]
 pub(crate) struct WriteStdinRequest<'a> {
-    pub process_id: i32,
+    pub terminal: &'a TerminalSession,
     pub input: &'a str,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub truncation_policy: TruncationPolicy,
+    pub interaction_event: Option<WriteStdinInteractionEvent<'a>>,
+}
+
+pub(crate) struct WriteStdinInteractionEvent<'a> {
+    pub session: &'a Arc<Session>,
+    pub turn: &'a Arc<TurnContext>,
+}
+
+impl std::fmt::Debug for WriteStdinInteractionEvent<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WriteStdinInteractionEvent")
+    }
 }
 
 #[derive(Default)]
@@ -126,7 +150,9 @@ pub(crate) struct ProcessStore {
 
 impl ProcessStore {
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
-        self.reserved_process_ids.remove(&process_id);
+        if !process_manager::should_use_deterministic_process_ids() {
+            self.reserved_process_ids.remove(&process_id);
+        }
         self.processes.remove(&process_id)
     }
 }
@@ -154,15 +180,29 @@ impl Default for UnifiedExecProcessManager {
 
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
+    plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
     call_id: String,
     process_id: i32,
     cwd: PathUri,
     initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
     hook_command: String,
     tty: bool,
+    environment_id: String,
+    permissions: TerminalPermissions,
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+}
+
+type SharedPluginMetricsSidecar = Arc<std::sync::Mutex<Option<PluginMetricsSidecar>>>;
+
+fn take_plugin_metrics_sidecar(
+    sidecar: &SharedPluginMetricsSidecar,
+) -> Option<PluginMetricsSidecar> {
+    sidecar
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
@@ -176,10 +216,6 @@ pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
 
 pub(crate) fn resolve_max_tokens(max_tokens: Option<usize>) -> usize {
     max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
-}
-
-pub(crate) fn format_output_omission_marker(omitted_bytes: usize) -> String {
-    format!("... {omitted_bytes} bytes omitted ...")
 }
 
 pub(crate) fn generate_chunk_id() -> String {

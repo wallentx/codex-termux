@@ -1,0 +1,1242 @@
+//! Handles reply-bearing turn-input operations.
+//!
+//! This is the one place Core decides whether submitted input starts a turn,
+//! steers an active turn, or is rejected. It replies after that decision; it
+//! does not wait for user-prompt hooks, updating the in-memory model context,
+//! rollout persistence, or sampling.
+//!
+//! Persistent thread settings apply on Started and Steered. Turn start
+//! options only update turn context on Started; input provenance follows each request.
+//! Host shutdown admission is checked before reserving or starting a new turn.
+//! Parent-delegated input and native child results finish admitted work during drain.
+//! Other automatic starts remain gated.
+//! Realtime drain refusals are returned to the fanout for ordered session teardown.
+//! Sender evidence is read without the active-turn lock and bound to the accepted turn.
+
+use super::TurnInput;
+use super::UserInputMetadata;
+use super::inject::validate_injected_response_item;
+use super::input_queue::InputQueueEntry;
+use super::input_queue::SubmittedAdditionalContext;
+use super::session::Session;
+use super::session::SessionConfiguration;
+use super::session::SessionSettingsUpdate;
+use super::thread_settings;
+use super::turn_context::NewTurnContextOptions;
+use super::turn_context::TurnContext;
+use crate::WithTurnExtensionData;
+use crate::agent::helper_daybreak::turn::HelperTurnAdmission;
+use crate::context::ContextualUserFragment;
+use crate::context::GuardianSenderMessages;
+use crate::state::ActiveTurn;
+use crate::state::AdditionalContextFormat;
+use crate::state::TurnState;
+use crate::tasks::RegularTask;
+use codex_features::Feature;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
+use codex_history::SenderUserMessages;
+use codex_history::UserInputOrigin;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AdditionalContextEntry;
+use codex_protocol::protocol::AdditionalContextKind;
+use codex_protocol::protocol::NonSteerableTurnKind;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::turn_input::AnnotatedResponseItem;
+use codex_protocol::turn_input::NotSubmittedReason;
+use codex_protocol::turn_input::ResponsesApiClientMetadataUpdate;
+type SubmittedTurnInput = codex_protocol::turn_input::TurnInput<ResolvedUserInput>;
+use codex_protocol::turn_input::TurnInputMode;
+type TurnInputRequest = codex_protocol::turn_input::TurnInputRequest<ResolvedUserInput>;
+use codex_protocol::turn_input::TurnInputSubmission;
+use codex_protocol::turn_input::TurnStartOptions;
+use codex_user_input::ResolvedUserInput;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+#[path = "turn_input_agent.rs"]
+mod agent;
+
+#[cfg(test)]
+#[path = "turn_input_tests.rs"]
+mod tests;
+
+/// Keeps automatic wake admission alive until the reserved turn is registered.
+pub(crate) struct PendingWorkTurnReservation {
+    pub(crate) turn_state: Arc<tokio::sync::Mutex<TurnState>>,
+    pub(crate) previous_options: TurnStartOptions,
+    pub(crate) admission: Option<Box<dyn Send>>,
+}
+
+/// Why input is starting a turn; shared by admission and input delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnStartKind {
+    User,
+    Automatic,
+    Recovery,
+}
+
+impl TurnStartKind {
+    fn permits_mode(self, mode: ModeKind) -> bool {
+        match self {
+            Self::User | Self::Recovery => true,
+            Self::Automatic => mode != ModeKind::Plan,
+        }
+    }
+
+    /// Automatic work may neither leave an existing Plan mode nor enter it.
+    fn permits_settings(
+        self,
+        current: &SessionConfiguration,
+        proposed: &SessionConfiguration,
+    ) -> bool {
+        self.permits_mode(current.step_settings.collaboration_mode.mode)
+            && self.permits_mode(proposed.step_settings.collaboration_mode.mode)
+    }
+}
+
+/// Thread settings and start-only options prepared before Core knows whether
+/// turn input starts or steers.
+///
+/// Thread settings are validated up front but only applied after Core accepts
+/// the input. Start-only options are only consumed by `apply_started`.
+struct PreparedTurnInputSettings {
+    thread_settings_update: Option<SessionSettingsUpdate>,
+    start_options: TurnStartOptions,
+}
+
+impl PreparedTurnInputSettings {
+    /// Validates turn-input settings without applying them so rejected input
+    /// leaves the thread unchanged.
+    async fn prepare(
+        session: &Session,
+        thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
+        start_options: TurnStartOptions,
+    ) -> CodexResult<Self> {
+        let thread_settings = thread_settings.into();
+        let thread_settings_update = if thread_settings.request
+            == ThreadSettingsOverrides::default()
+            && thread_settings.turn_extension_init.is_none()
+        {
+            None
+        } else {
+            let updates = thread_settings::prepare_update(
+                thread_settings,
+                &session.services.selected_capability_roots,
+            );
+            session
+                .preview_settings(&updates)
+                .await
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+            Some(updates)
+        };
+        Ok(Self {
+            thread_settings_update,
+            start_options,
+        })
+    }
+
+    fn required_active_final_output_json_schema(&self) -> Option<&Value> {
+        self.start_options.final_output_json_schema.as_ref()
+    }
+
+    /// Applies persistent settings and start-only options before creating a
+    /// new turn context. Returns `None` if admission rejects the candidate,
+    /// without committing its settings.
+    async fn apply_started(
+        self,
+        session: &Arc<Session>,
+        submission_id: String,
+        kind: TurnStartKind,
+    ) -> CodexResult<Option<Arc<TurnContext>>> {
+        let TurnStartOptions {
+            turn_trigger,
+            final_output_json_schema,
+            direct_only_tool_namespaces,
+            service_tier,
+            prompt_cache_ttl,
+            parent_turn_id,
+            initiating_agent_path,
+            root_turn_id,
+            cyber_access_program,
+            inherited_client_metadata,
+        } = self.start_options;
+        let helper_admission =
+            if kind == TurnStartKind::User && turn_trigger.as_deref() != Some("queue") {
+                HelperTurnAdmission::capture(session)
+            } else {
+                None
+            };
+        let emit_thread_settings_applied = self.thread_settings_update.is_some();
+        let _settings_guard = if emit_thread_settings_applied {
+            Some(thread_settings::acquire_persistence_lock(session).await)
+        } else {
+            None
+        };
+        let mut updates = self.thread_settings_update.unwrap_or_default();
+        updates.service_tier_for_turn = service_tier;
+
+        let options = NewTurnContextOptions {
+            direct_only_tool_namespaces,
+            final_output_json_schema,
+            prompt_cache_ttl,
+            cyber_access_program,
+            helper_admission,
+        };
+        let turn_context = match kind {
+            TurnStartKind::User | TurnStartKind::Recovery => Some(
+                session
+                    .new_turn_with_sub_id(submission_id.clone(), updates, options)
+                    .await?,
+            ),
+            TurnStartKind::Automatic => {
+                session
+                    .new_turn_with_sub_id_if(
+                        submission_id.clone(),
+                        updates,
+                        options,
+                        |current, proposed| kind.permits_settings(current, proposed),
+                    )
+                    .await?
+            }
+        };
+        let Some((turn_context, settings_snapshot)) = turn_context else {
+            return Ok(None);
+        };
+        turn_context
+            .turn_metadata_state
+            .update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+                replacement: Some(inherited_client_metadata),
+                ..Default::default()
+            });
+        if let Some(turn_trigger) = turn_trigger {
+            turn_context
+                .turn_metadata_state
+                .set_turn_trigger(turn_trigger);
+        }
+        if emit_thread_settings_applied {
+            thread_settings::emit_applied(session, submission_id, settings_snapshot).await;
+        }
+        if let Some(parent_turn_id) = parent_turn_id {
+            if let Some(initiating_agent_path) = initiating_agent_path {
+                turn_context
+                    .turn_metadata_state
+                    .set_initiating_agent_path(initiating_agent_path);
+            }
+            turn_context
+                .turn_metadata_state
+                .set_parent_turn_id(parent_turn_id);
+        }
+        if let Some(root_turn_id) = root_turn_id {
+            turn_context
+                .turn_metadata_state
+                .set_root_turn_id(root_turn_id);
+        }
+        Ok(Some(turn_context))
+    }
+
+    /// Applies only persistent settings after steering succeeds. The active
+    /// turn keeps its existing context; subsequent turns see the update.
+    async fn apply_steered(self, session: &Session, submission_id: String) -> CodexResult<()> {
+        let Some(thread_settings_update) = self.thread_settings_update else {
+            return Ok(());
+        };
+        thread_settings::apply_update(session, submission_id, thread_settings_update)
+            .await
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))
+    }
+}
+
+pub(super) async fn handle(
+    session: &Arc<Session>,
+    request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+    mode: TurnInputMode,
+    submission_id: String,
+) -> CodexResult<TurnInputSubmission> {
+    handle_inner(
+        session,
+        request.into(),
+        mode,
+        submission_id,
+        /*realtime_handoff_id*/ None,
+    )
+    .await
+}
+
+pub(super) async fn handle_realtime_handoff(
+    session: &Arc<Session>,
+    request: TurnInputRequest,
+    mode: TurnInputMode,
+    submission_id: String,
+    handoff_id: uuid::Uuid,
+) -> CodexResult<TurnInputSubmission> {
+    handle_inner(
+        session,
+        request.into(),
+        mode,
+        submission_id,
+        Some(handoff_id),
+    )
+    .await
+}
+
+#[tracing::instrument(
+    name = "codex.turn_input",
+    level = "trace",
+    skip_all,
+    fields(conversation.id = %session.thread_id, turn.id)
+)]
+async fn handle_inner(
+    session: &Arc<Session>,
+    request: WithTurnExtensionData<TurnInputRequest>,
+    mode: TurnInputMode,
+    submission_id: String,
+    realtime_handoff_id: Option<uuid::Uuid>,
+) -> CodexResult<TurnInputSubmission> {
+    session.conversation.check_history_recovery()?;
+    if request.request.start.service_tier.is_some()
+        && crate::agent::host::host_child_uses_shared_service_tier(session)
+    {
+        return Err(CodexErr::InvalidRequest(
+            "per-turn service tier overrides are unavailable for a child using the shared service tier"
+                .into(),
+        ));
+    }
+    if let SubmittedTurnInput::ResponseItem(item)
+    | SubmittedTurnInput::AnnotatedResponseItem(AnnotatedResponseItem { item, .. }) =
+        &request.request.input
+    {
+        validate_injected_response_item(item)?;
+    }
+    // Native agent follow-ups do not use the request's additional context.
+    if !(matches!(mode, TurnInputMode::StartOrSteer)
+        && matches!(
+            request.request.input,
+            SubmittedTurnInput::InterAgentCommunication(_)
+        ))
+    {
+        request
+            .request
+            .additional_context
+            .iter()
+            .flat_map(BTreeMap::values)
+            .try_for_each(AdditionalContextEntry::validate)
+            .map_err(|message| CodexErr::InvalidRequest(message.to_owned()))?;
+    }
+    let result = match mode {
+        TurnInputMode::StartOrSteer => {
+            start_or_steer(session, request, submission_id, realtime_handoff_id).await
+        }
+        TurnInputMode::StartIfIdle => {
+            let kind = match &request.request.input {
+                SubmittedTurnInput::UserInput { content, .. } if !content.is_empty() => {
+                    TurnStartKind::User
+                }
+                SubmittedTurnInput::UserInput { .. }
+                | SubmittedTurnInput::ResponseItem(_)
+                | SubmittedTurnInput::AnnotatedResponseItem(_)
+                | SubmittedTurnInput::InterAgentCommunication(_) => TurnStartKind::Automatic,
+            };
+            start_if_idle(
+                session,
+                request,
+                submission_id,
+                kind,
+                /*expected_previous_turn_id*/ None,
+                realtime_handoff_id,
+            )
+            .await
+        }
+        TurnInputMode::ContinueIfIdle {
+            expected_previous_turn_id,
+        } => {
+            let mut request = request;
+            match &request.request.input {
+                SubmittedTurnInput::ResponseItem(_)
+                | SubmittedTurnInput::AnnotatedResponseItem(_) => {}
+                SubmittedTurnInput::UserInput { content, .. } if content.is_empty() => {
+                    request.request.start = session.agent_message_wake_options().await;
+                }
+                SubmittedTurnInput::UserInput { .. }
+                | SubmittedTurnInput::InterAgentCommunication(_) => {
+                    return Err(CodexErr::InvalidRequest(
+                        "continuation requires internal response input or an empty wake"
+                            .to_string(),
+                    ));
+                }
+            }
+            start_if_idle(
+                session,
+                request,
+                submission_id,
+                TurnStartKind::Recovery,
+                Some(expected_previous_turn_id),
+                realtime_handoff_id,
+            )
+            .await
+        }
+        TurnInputMode::Steer { expected_turn_id } => {
+            steer(
+                session,
+                request,
+                expected_turn_id,
+                submission_id,
+                realtime_handoff_id,
+            )
+            .await
+        }
+    };
+    // Link this request's trace to the accepted turn, which may have an older trace.
+    if let Ok(
+        TurnInputSubmission::Started { turn_id, .. } | TurnInputSubmission::Steered { turn_id, .. },
+    ) = &result
+    {
+        tracing::Span::current().record("turn.id", turn_id);
+    }
+    result
+}
+
+#[tracing::instrument(
+    name = "codex.turn_input",
+    level = "trace",
+    skip_all,
+    fields(conversation.id = %session.thread_id, turn.id)
+)]
+pub(super) async fn handle_recovery(
+    session: &Arc<Session>,
+    thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
+    start_options: TurnStartOptions,
+    submission_id: String,
+) -> CodexResult<TurnInputSubmission> {
+    session.conversation.check_history_recovery()?;
+    let WithTurnExtensionData {
+        request: thread_settings,
+        turn_extension_init,
+    } = thread_settings.into();
+    let request = TurnInputRequest::user_input(Vec::new())
+        .with_thread_settings(thread_settings)
+        .on_start(start_options);
+    let result = start_if_idle(
+        session,
+        WithTurnExtensionData {
+            request,
+            turn_extension_init,
+        },
+        submission_id,
+        TurnStartKind::Recovery,
+        /*expected_previous_turn_id*/ None,
+        /*realtime_handoff_id*/ None,
+    )
+    .await;
+    if let Ok(TurnInputSubmission::Started { turn_id, .. }) = &result {
+        tracing::Span::current().record("turn.id", turn_id);
+    }
+    result
+}
+
+fn user_input_metadata(
+    request: &mut TurnInputRequest,
+    realtime_handoff_id: Option<uuid::Uuid>,
+) -> UserInputMetadata {
+    const DICTATION_KEY: &str = "codex_app_used_dictation";
+    // Capture provenance on this input before applying mutable turn metadata.
+    let metadata = &mut request.responsesapi_client_metadata;
+    let replacement = metadata
+        .replacement
+        .as_mut()
+        .and_then(|map| map.remove(DICTATION_KEY));
+    let patch = metadata
+        .patch
+        .as_mut()
+        .and_then(|map| map.remove(DICTATION_KEY));
+    UserInputMetadata {
+        used_dictation: patch.or(replacement).and_then(|value| value.parse().ok()),
+        origin: UserInputOrigin::from_turn_trigger(request.start.turn_trigger.as_deref()),
+        response_item_uuid: request.user_item_uuid,
+        realtime_handoff_id,
+        extension_data: request.user_input_extension_data.clone(),
+        ..Default::default()
+    }
+}
+
+pub(super) async fn start_or_steer(
+    session: &Arc<Session>,
+    request: WithTurnExtensionData<TurnInputRequest>,
+    submission_id: String,
+    realtime_handoff_id: Option<uuid::Uuid>,
+) -> CodexResult<TurnInputSubmission> {
+    if matches!(
+        request.request.input,
+        SubmittedTurnInput::InterAgentCommunication(_)
+    ) {
+        return agent::submit(session, request, submission_id).await;
+    }
+    let WithTurnExtensionData {
+        mut request,
+        turn_extension_init,
+    } = request;
+    let input_metadata = user_input_metadata(&mut request, realtime_handoff_id);
+    let TurnInputRequest {
+        mut input,
+        thread_settings,
+        start,
+        mut additional_context,
+        responsesapi_client_metadata,
+        ..
+    } = request;
+    let has_explicit_input = match &input {
+        SubmittedTurnInput::UserInput { content, .. } => !content.is_empty(),
+        SubmittedTurnInput::ResponseItem(ResponseItem::FunctionCallOutput {
+            call_id: None,
+            ..
+        })
+        | SubmittedTurnInput::AnnotatedResponseItem(AnnotatedResponseItem {
+            item: ResponseItem::FunctionCallOutput { call_id: None, .. },
+            ..
+        }) => true,
+        _ => {
+            return Err(CodexErr::InvalidRequest(
+                "only user input, agent messages, or standalone function-call outputs can start or steer a turn"
+                    .to_string(),
+            ));
+        }
+    };
+    let settings = PreparedTurnInputSettings::prepare(
+        session,
+        WithTurnExtensionData {
+            request: thread_settings,
+            turn_extension_init,
+        },
+        start,
+    )
+    .await?;
+    let sender_messages = capture_sender_user_messages(session, &mut input).await;
+    match session
+        .steer_input(
+            &mut input,
+            sender_messages.as_ref(),
+            &mut additional_context,
+            /*expected_turn_id*/ None,
+            settings.required_active_final_output_json_schema(),
+            responsesapi_client_metadata.clone(),
+            input_metadata.clone(),
+        )
+        .await
+    {
+        Ok((turn_id, root_turn_id)) => {
+            settings.apply_steered(session, submission_id).await?;
+            Ok(TurnInputSubmission::Steered {
+                turn_id,
+                root_turn_id,
+            })
+        }
+        Err(NotSubmittedReason::NoActiveTurn) => {
+            // MAv1 sends explicit input to spawned agents as part of an existing
+            // parent's work. Client RPCs are gated separately by the host.
+            let is_delegated_input = settings.start_options.parent_turn_id.is_some()
+                && matches!(
+                    session
+                        .state
+                        .lock()
+                        .await
+                        .session_configuration
+                        .session_source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                );
+            let _admission = if is_delegated_input {
+                None
+            } else {
+                let Some(admission) = session.services.extensions.admit_turn_start() else {
+                    return Ok(TurnInputSubmission::NotSubmitted {
+                        reason: NotSubmittedReason::ServerDraining,
+                    });
+                };
+                Some(admission)
+            };
+            let Some(turn_context) = settings
+                .apply_started(session, submission_id.clone(), TurnStartKind::User)
+                .await?
+            else {
+                unreachable!("explicit user input can enter Plan mode");
+            };
+            turn_context
+                .turn_metadata_state
+                .apply_start_responsesapi_client_metadata(responsesapi_client_metadata);
+            session
+                .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+                .await;
+            if let Some(context) = additional_context {
+                turn_context
+                    .extension_data
+                    .insert(SubmittedAdditionalContext(context));
+            }
+            let mut task_input = Vec::new();
+            if has_explicit_input {
+                task_input.push(
+                    pending_turn_input(
+                        session,
+                        input,
+                        sender_messages.as_ref(),
+                        &turn_context.sub_id,
+                        input_metadata,
+                    )
+                    .await,
+                );
+            }
+            Ok(session
+                .spawn_task(turn_context, task_input, RegularTask::new())
+                .await)
+        }
+        Err(reason) => Ok(TurnInputSubmission::NotSubmitted { reason }),
+    }
+}
+
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the previous turn check and idle reservation must be atomic"
+)]
+async fn start_if_idle(
+    session: &Arc<Session>,
+    request: WithTurnExtensionData<TurnInputRequest>,
+    submission_id: String,
+    kind: TurnStartKind,
+    expected_previous_turn_id: Option<String>,
+    realtime_handoff_id: Option<uuid::Uuid>,
+) -> CodexResult<TurnInputSubmission> {
+    let WithTurnExtensionData {
+        mut request,
+        turn_extension_init,
+    } = request;
+    let input_metadata = user_input_metadata(&mut request, realtime_handoff_id);
+    let TurnInputRequest {
+        mut input,
+        thread_settings,
+        start,
+        additional_context,
+        responsesapi_client_metadata,
+        ..
+    } = request;
+    if expected_previous_turn_id.is_none()
+        && session.input_queue.has_trigger_turn_mailbox_items().await
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::PendingTriggerTurn,
+        });
+    }
+    // Preserve current-Plan rejection before reservation and settings errors.
+    // The commit-time decision also checks the proposed mode.
+    if kind == TurnStartKind::Automatic
+        && !kind.permits_mode(session.collaboration_mode().await.mode)
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::PlanMode,
+        });
+    }
+
+    let _admission = session.services.extensions.admit_turn_start();
+    // A one-shot review delegate completes its already-running parent's work.
+    // Its explicit input carries parent lineage; automatic starts do not qualify.
+    if _admission.is_none()
+        && !(kind == TurnStartKind::User
+            && start.parent_turn_id.is_some()
+            && matches!(
+                session
+                    .state
+                    .lock()
+                    .await
+                    .session_configuration
+                    .session_source,
+                SessionSource::SubAgent(SubAgentSource::Review)
+            ))
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ServerDraining,
+        });
+    }
+
+    let turn_state = {
+        let mut active_turn = session.active_turn.lock().await;
+        if let Some(expected) = expected_previous_turn_id {
+            let state = session.state.lock().await;
+            // A registered successor already owns this work, even if it is still running.
+            // An unregistered reservation can still fail to start and must be retried.
+            if state.last_started_turn_id.as_ref() != Some(&expected)
+                && (state.last_started_turn_id.is_some() || active_turn.is_none())
+            {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::Superseded,
+                });
+            }
+        }
+        if active_turn.is_some() {
+            return Ok(TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::NotIdle,
+            });
+        }
+        // Idle observers can retry a failed turn. Check before reserving so a permanent
+        // stop cannot create a loop of new turns that never reach the provider.
+        if kind != TurnStartKind::User {
+            session.check_rollout_budget()?;
+        }
+        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+        Arc::clone(&active_turn.turn_state)
+    };
+
+    if session.input_queue.has_trigger_turn_mailbox_items().await {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        session.maybe_start_turn_for_pending_work().await;
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::PendingTriggerTurn,
+        });
+    }
+
+    let settings = match PreparedTurnInputSettings::prepare(
+        session,
+        WithTurnExtensionData {
+            request: thread_settings,
+            turn_extension_init,
+        },
+        start,
+    )
+    .await
+    {
+        Ok(settings) => settings,
+        Err(error) => {
+            session.clear_reserved_idle_turn(&turn_state).await;
+            return Err(error);
+        }
+    };
+    let turn_context = match settings
+        .apply_started(session, submission_id.clone(), kind)
+        .await
+    {
+        Ok(Some(turn_context)) => turn_context,
+        Ok(None) => {
+            session.clear_reserved_idle_turn(&turn_state).await;
+            return Ok(TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::PlanMode,
+            });
+        }
+        Err(error) => {
+            session.clear_reserved_idle_turn(&turn_state).await;
+            return Err(error);
+        }
+    };
+    turn_context
+        .turn_metadata_state
+        .apply_start_responsesapi_client_metadata(responsesapi_client_metadata);
+    session
+        .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+        .await;
+
+    let mut additional_context = additional_context.map(SubmittedAdditionalContext);
+    let mut task_input = Vec::new();
+    let sender_messages = capture_sender_user_messages(session, &mut input).await;
+    match kind {
+        TurnStartKind::User => {
+            session.clear_connector_selection().await;
+            task_input.push(
+                pending_turn_input(
+                    session,
+                    input,
+                    sender_messages.as_ref(),
+                    &turn_context.sub_id,
+                    input_metadata,
+                )
+                .await,
+            );
+        }
+        TurnStartKind::Automatic | TurnStartKind::Recovery => {
+            // Empty automatic user input resumes sampling without a new message.
+            if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
+                // Automatic turns drain their queued input before sampling. Keep the
+                // context and the input it describes together for the first request.
+                session
+                    .input_queue
+                    .extend_pending_input_for_turn_state(
+                        turn_state.as_ref(),
+                        vec![InputQueueEntry {
+                            input: pending_turn_input(
+                                session,
+                                input,
+                                sender_messages.as_ref(),
+                                &turn_context.sub_id,
+                                input_metadata,
+                            )
+                            .await,
+                            additional_context: additional_context.take(),
+                        }],
+                    )
+                    .await;
+            }
+        }
+    }
+    if let Some(context) = additional_context {
+        turn_context.extension_data.insert(context);
+    }
+    Ok(session
+        .start_task(turn_context, task_input, RegularTask::new())
+        .await)
+}
+
+async fn steer(
+    session: &Arc<Session>,
+    request: WithTurnExtensionData<TurnInputRequest>,
+    expected_turn_id: String,
+    submission_id: String,
+    realtime_handoff_id: Option<uuid::Uuid>,
+) -> CodexResult<TurnInputSubmission> {
+    let WithTurnExtensionData {
+        mut request,
+        turn_extension_init,
+    } = request;
+    let input_metadata = user_input_metadata(&mut request, realtime_handoff_id);
+    let TurnInputRequest {
+        mut input,
+        thread_settings,
+        start,
+        mut additional_context,
+        responsesapi_client_metadata,
+        ..
+    } = request;
+    if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
+        return Err(CodexErr::InvalidRequest(
+            "only user input can steer a turn".to_string(),
+        ));
+    }
+    let settings = PreparedTurnInputSettings::prepare(
+        session,
+        WithTurnExtensionData {
+            request: thread_settings,
+            turn_extension_init,
+        },
+        start,
+    )
+    .await?;
+    match session
+        .steer_input(
+            &mut input,
+            /*sender_messages*/ None,
+            &mut additional_context,
+            Some(expected_turn_id.as_str()),
+            settings.required_active_final_output_json_schema(),
+            responsesapi_client_metadata,
+            input_metadata,
+        )
+        .await
+    {
+        Ok((turn_id, root_turn_id)) => {
+            settings.apply_steered(session, submission_id).await?;
+            Ok(TurnInputSubmission::Steered {
+                turn_id,
+                root_turn_id,
+            })
+        }
+        Err(reason) => Ok(TurnInputSubmission::NotSubmitted { reason }),
+    }
+}
+
+impl Session {
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "deliver context atomically to its originating turn"
+    )]
+    pub(crate) async fn inject_untrusted_context_for_turn(
+        &self,
+        turn_id: &str,
+        key: &str,
+        value: String,
+    ) {
+        let active = self.active_turn.lock().await;
+        let Some(turn) = active.as_ref().filter(|turn| turn.finishing.is_none()) else {
+            return;
+        };
+        let Some(task) = turn
+            .task
+            .as_ref()
+            .filter(|task| task.turn_context.sub_id == turn_id)
+        else {
+            return;
+        };
+        let input = self.state.lock().await.additional_context.extend(
+            BTreeMap::from([(
+                key.to_owned(),
+                AdditionalContextEntry::new(value, AdditionalContextKind::Untrusted),
+            )]),
+            self.additional_context_format(),
+            &task.turn_context.session_telemetry,
+            &self.context_ids,
+        );
+        if !input.is_empty() {
+            self.input_queue
+                .extend_pending_input_for_turn_state(
+                    &turn.turn_state,
+                    input.into_iter().map(TurnInput::ResponseItem).collect(),
+                )
+                .await;
+        }
+    }
+
+    pub(super) fn additional_context_format(&self) -> AdditionalContextFormat {
+        if self.enabled(Feature::UntrustedAsToolOutput) {
+            AdditionalContextFormat::ToolOutputs
+        } else {
+            AdditionalContextFormat::Messages
+        }
+    }
+
+    /// Called under the active-turn lock when registering a task (or a realtime transcript turn).
+    pub(crate) async fn record_started_turn(
+        &self,
+        turn_id: &str,
+        attribution: Option<codex_history::TurnAttribution>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.last_started_turn_id = Some(turn_id.to_owned());
+        if let Some(attribution) = attribution {
+            state.turn_attribution = Some(attribution);
+        }
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "The admission lock keeps the previous turn stable while capturing its attribution."
+    )]
+    pub(crate) async fn reserve_pending_work_turn(&self) -> Option<PendingWorkTurnReservation> {
+        let mut active_turn = self.active_turn.lock().await;
+        if active_turn.is_some() || self.turn_starts_closed() {
+            return None;
+        }
+        let has_trigger_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
+        if !has_trigger_turn
+            && !self.has_outstanding_durable_sleep()
+            && !self.should_wake_on_agent_messages().await
+        {
+            return None;
+        }
+        // Triggered mail and durable sleep bypass start_if_idle. Leave their mail
+        // pending rather than consuming it to start a turn that the work gate will refuse.
+        if let Err(error) = self.check_rollout_budget() {
+            tracing::debug!(%error, "rollout budget stopped a pending-work wake");
+            return None;
+        }
+        // Explicit follow-ups and native child results finish already-admitted work.
+        // Injected mail has no terminal-result receipt and still respects drain.
+        let admission = if has_trigger_turn
+            || self
+                .input_queue
+                .has_mailbox_items_matching(crate::PendingAgentMessage::is_terminal_result)
+                .await
+        {
+            None
+        } else {
+            Some(self.services.extensions.admit_turn_start()?)
+        };
+        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+        let previous_options = if has_trigger_turn {
+            Default::default()
+        } else {
+            self.agent_message_wake_options().await
+        };
+        Some(PendingWorkTurnReservation {
+            turn_state: Arc::clone(&active_turn.turn_state),
+            previous_options,
+            admission,
+        })
+    }
+
+    async fn agent_message_wake_options(&self) -> TurnStartOptions {
+        let state = self.state.lock().await;
+        let mut options = state
+            .turn_attribution
+            .as_ref()
+            .map(codex_history::TurnAttribution::start_options)
+            .unwrap_or_default();
+        options.cyber_access_program = state
+            .reference_context_item()
+            .and_then(|context| context.cyber_access_program);
+        options
+    }
+
+    /// Revalidates a reserved wake and selects its settings before any mail is consumed.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "capture wake settings and cancel rejected reservations under the admission lock"
+    )]
+    pub(crate) async fn pending_work_turn_configuration(
+        &self,
+        turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+    ) -> Option<SessionConfiguration> {
+        // Discovery can outlive an interrupt or a settings update. Keep cancellation
+        // atomic with admission so newly arriving mail can retry a rejected wake.
+        let mut active = self.active_turn.lock().await;
+        if active
+            .as_ref()
+            .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, turn_state))
+        {
+            return None;
+        }
+        let has_trigger_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
+        let state = self.state.lock().await;
+        let configuration = &state.session_configuration;
+        if (self.enabled(Feature::WakeOnAgentMessages)
+            && !has_trigger_turn
+            && !self.has_outstanding_durable_sleep()
+            && !TurnStartKind::Automatic
+                .permits_mode(configuration.step_settings.collaboration_mode.mode))
+            || configuration
+                .step_settings
+                .validate(&configuration.step_settings_constraints(&configuration.environments))
+                .is_err()
+        {
+            *active = None;
+            return None;
+        }
+        Some(configuration.clone())
+    }
+
+    pub(crate) async fn should_wake_on_agent_messages(&self) -> bool {
+        if !self.features.enabled(Feature::WakeOnAgentMessages) || self.is_interrupted() {
+            return false;
+        }
+
+        let state = self.state.lock().await;
+        let config = &state.session_configuration;
+        !config.session_source.is_non_root_agent()
+            && TurnStartKind::Automatic.permits_mode(config.step_settings.collaboration_mode.mode)
+    }
+
+    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
+        let mut active_turn_guard = self.active_turn.lock().await;
+        if let Some(active_turn) = active_turn_guard.as_ref()
+            && active_turn.task.is_none()
+            && Arc::ptr_eq(&active_turn.turn_state, turn_state)
+        {
+            *active_turn_guard = None;
+        }
+    }
+
+    /// Inject additional user input or a standalone tool output into the active turn.
+    ///
+    /// Returns the active turn id when accepted.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "sender evidence is prepared separately before acquiring the admission lock"
+    )]
+    async fn steer_input(
+        &self,
+        input: &mut SubmittedTurnInput,
+        sender_messages: Option<&GuardianSenderMessages>,
+        additional_context: &mut Option<BTreeMap<String, AdditionalContextEntry>>,
+        expected_turn_id: Option<&str>,
+        required_final_output_json_schema: Option<&Value>,
+        responsesapi_client_metadata: ResponsesApiClientMetadataUpdate,
+        input_metadata: UserInputMetadata,
+    ) -> Result<(String, String), NotSubmittedReason> {
+        let mut active = loop {
+            let active = self.active_turn.lock().await;
+            let Some(interrupt) = active
+                .as_ref()
+                .and_then(|turn| turn.sampling_interrupt.as_ref())
+                .filter(|interrupt| interrupt.is_requested())
+            else {
+                break active;
+            };
+            if expected_turn_id.is_some() {
+                return Err(NotSubmittedReason::NoActiveTurn);
+            }
+            // Start-or-steer can open a new turn once the old terminal event is published.
+            let finished = interrupt.finished.clone();
+            drop(active);
+            tokio::select! {
+                () = finished.cancelled() => {}
+                () = self.services.local_agent_runtime.shutdown.cancelled() => return Err(NotSubmittedReason::ServerDraining),
+            }
+        };
+        let Some(active_turn) = active.as_mut() else {
+            return Err(NotSubmittedReason::NoActiveTurn);
+        };
+
+        let Some(active_task) = active_turn.task.as_ref() else {
+            return Err(NotSubmittedReason::NoActiveTurn);
+        };
+        let active_turn_id = &active_task.turn_context.sub_id;
+
+        if let Some(expected_turn_id) = expected_turn_id
+            && expected_turn_id != active_turn_id
+        {
+            return Err(NotSubmittedReason::ExpectedTurnMismatch {
+                expected: expected_turn_id.to_string(),
+                actual: active_turn_id.clone(),
+            });
+        }
+
+        match active_task.kind {
+            crate::state::TaskKind::Regular => {}
+            crate::state::TaskKind::Review => {
+                return Err(NotSubmittedReason::ActiveTurnNotSteerable {
+                    turn_kind: NonSteerableTurnKind::Review,
+                });
+            }
+            crate::state::TaskKind::Compact => {
+                return Err(NotSubmittedReason::ActiveTurnNotSteerable {
+                    turn_kind: NonSteerableTurnKind::Compact,
+                });
+            }
+        }
+
+        if matches!(input, SubmittedTurnInput::UserInput { content, .. } if content.is_empty()) {
+            return Err(NotSubmittedReason::EmptyInput);
+        }
+        // Compare JSON values directly instead of serialized schema text.
+        // Value equality ignores object key order while preserving array and
+        // scalar distinctions; broader JSON Schema equivalence is out of scope.
+        if let Some(required_schema) = required_final_output_json_schema
+            && active_task.turn_context.final_output_json_schema.as_ref() != Some(required_schema)
+        {
+            return Err(NotSubmittedReason::ActiveTurnOutputSchemaMismatch);
+        }
+        active_task
+            .turn_context
+            .turn_metadata_state
+            .update_responsesapi_client_metadata(responsesapi_client_metadata);
+
+        let input = match input {
+            SubmittedTurnInput::UserInput { content, client_id } => TurnInput::UserInput {
+                content: std::mem::take(content),
+                client_id: client_id.clone(),
+                metadata: super::UserInputMetadata {
+                    acceptance_order: Some(self.reserve_user_input_order().await),
+                    ..input_metadata
+                },
+            },
+            input => {
+                pending_turn_input(
+                    self,
+                    input.clone(),
+                    sender_messages,
+                    active_turn_id,
+                    input_metadata,
+                )
+                .await
+            }
+        };
+        self.bind_realtime_handoffs_to_turn(std::slice::from_ref(&input), active_turn_id)
+            .await;
+        self.input_queue
+            .extend_pending_input_and_notify_for_turn_state(
+                active_turn.turn_state.as_ref(),
+                vec![InputQueueEntry {
+                    input,
+                    additional_context: additional_context.take().map(SubmittedAdditionalContext),
+                }],
+            )
+            .await;
+        Ok((
+            active_turn_id.clone(),
+            active_task.turn_context.root_turn_id(),
+        ))
+    }
+}
+
+async fn capture_sender_user_messages(
+    session: &Session,
+    input: &mut SubmittedTurnInput,
+) -> Option<GuardianSenderMessages> {
+    let (SubmittedTurnInput::ResponseItem(item)
+    | SubmittedTurnInput::AnnotatedResponseItem(AnnotatedResponseItem { item, .. })) = input
+    else {
+        return None;
+    };
+    if !matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }) {
+        return None;
+    }
+    session.assign_missing_response_item_id(item);
+    session
+        .services
+        .local_agent_runtime
+        .capture_sender_user_messages(item, session.thread_id)
+        .await
+}
+
+async fn pending_turn_input(
+    session: &Session,
+    input: SubmittedTurnInput,
+    sender_messages: Option<&GuardianSenderMessages>,
+    turn_id: &str,
+    input_metadata: UserInputMetadata,
+) -> TurnInput {
+    let retain = match &input {
+        SubmittedTurnInput::AnnotatedResponseItem(input) => input.annotations.retain,
+        _ => false,
+    };
+    match input {
+        SubmittedTurnInput::UserInput { content, client_id } => TurnInput::UserInput {
+            content,
+            client_id,
+            metadata: super::UserInputMetadata {
+                acceptance_order: Some(session.reserve_user_input_order().await),
+                ..input_metadata
+            },
+        },
+        SubmittedTurnInput::ResponseItem(item)
+        | SubmittedTurnInput::AnnotatedResponseItem(AnnotatedResponseItem { item, .. })
+            if matches!(
+                &item,
+                ResponseItem::FunctionCallOutput { call_id: None, .. }
+            ) =>
+        {
+            let mut metadata = if let Some(fragment) = sender_messages {
+                let config = session.get_config().await;
+                let text = if let Some(budget) = &config.guardian_sync_elastic_budget {
+                    fragment.render_elastic(budget)
+                } else {
+                    const FIXED_SENDER_CONTEXT_BYTES: usize = 3_600;
+                    let text = fragment.render().into_text().unwrap_or_default();
+                    if text.len() <= FIXED_SENDER_CONTEXT_BYTES {
+                        text
+                    } else {
+                        "Host: Sender context exceeds the evidence budget. Do not infer permission from missing evidence.\n".to_owned()
+                    }
+                };
+                let mut messages = SenderUserMessages {
+                    receiver_turn_id: turn_id.to_owned(),
+                    receiver_message_id: fragment.delivery.clone(),
+                    text,
+                };
+                messages.bound();
+                Some(CodexHarnessMetadata {
+                    user_input_order: Some(session.reserve_user_input_order().await),
+                    sender_user_messages: Some(Box::new(messages)),
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
+            if retain
+                && session.enabled(Feature::RetainClientToolOutputs)
+                && matches!(item, ResponseItem::FunctionCallOutput { name: Some(_), .. })
+            {
+                metadata.get_or_insert_default().retain_across_windows = Some(true);
+            }
+            TurnInput::FunctionCallOutput(ResponseItemEnvelope { item, metadata })
+        }
+        SubmittedTurnInput::ResponseItem(item)
+        | SubmittedTurnInput::AnnotatedResponseItem(AnnotatedResponseItem { item, .. }) => {
+            TurnInput::ResponseItem(item.into())
+        }
+        SubmittedTurnInput::InterAgentCommunication(communication) => {
+            TurnInput::InterAgentCommunication(communication.into())
+        }
+    }
+}

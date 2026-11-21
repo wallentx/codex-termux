@@ -12,17 +12,21 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
     let mut processor = EventProcessorWithJsonOutput::new(Some(output_path.clone()));
 
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
-        codex_app_server_protocol::ItemCompletedNotification {
-            item: ThreadItem::AgentMessage {
+        codex_app_server_protocol::ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "msg-1".to_string(),
                 text: "partial answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-        },
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        ),
     ));
 
     assert_eq!(collected.status, CodexStatus::Running);
@@ -33,10 +37,12 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
             thread_id: "thread-1".to_string(),
             turn: codex_app_server_protocol::Turn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Failed,
                 error: Some(codex_app_server_protocol::TurnError {
+                    misalignment: None,
                     message: "turn failed".to_string(),
                     additional_details: None,
                     codex_error_info: None,
@@ -51,7 +57,8 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
     assert_eq!(status, CodexStatus::InitiateShutdown);
     assert_eq!(processor.final_message(), None);
 
-    EventProcessor::print_final_output(&mut processor);
+    let output = BoundOutput::open(&output_path).expect("bind output");
+    EventProcessor::print_final_output(&mut processor, Some(output)).expect("print final output");
 
     assert_eq!(
         std::fs::read_to_string(&output_path).expect("read output file"),
@@ -91,16 +98,21 @@ fn mcp_tool_call_result_preserves_meta_in_jsonl_event() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
 
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
-        codex_app_server_protocol::ItemCompletedNotification {
-            item: ThreadItem::McpToolCall {
+        codex_app_server_protocol::ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            ThreadItemPayload::McpToolCall {
                 id: "mcp-1".to_string(),
                 server: "search service".to_string(),
+                environment_id: None,
                 tool: "web_run".to_string(),
                 status: McpToolCallStatus::Completed,
                 arguments: json!({"search_query": [{"q": "OpenAI Codex CLI documentation"}]}),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
+                read_only_hint: None,
                 result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
                     content: vec![json!({"type": "text", "text": "search result"})],
                     structured_content: None,
@@ -109,10 +121,9 @@ fn mcp_tool_call_result_preserves_meta_in_jsonl_event() {
                 error: None,
                 duration_ms: Some(42),
             },
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-        },
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        ),
     ));
 
     assert_eq!(collected.status, CodexStatus::Running);

@@ -11,17 +11,108 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_utils_path_uri::PathUri;
+use futures::SinkExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::Request as HandshakeRequest;
+use tokio_tungstenite::tungstenite::handshake::server::Response as HandshakeResponse;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 use super::exec_server_test_support::accept_exec_server_environment;
+use super::exec_server_test_support::read_exec_server_json;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const INTERNAL_ERROR_CODE: i64 = -32603;
+
+#[test_case::test_case(None; "absent_websocket_request_id")]
+#[test_case::test_case(Some("caller-sample-id"); "supplied_websocket_request_id")]
+#[tokio::test]
+async fn environment_info_probes_executor_even_when_metadata_is_cached(
+    websocket_request_id: Option<&'static str>,
+) -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let exec_server_url = format!("ws://{}", listener.local_addr()?);
+    let exec_server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut websocket = accept_hdr_async(
+            stream,
+            move |request: &HandshakeRequest, response: HandshakeResponse| {
+                assert_eq!(
+                    request.headers().get("x-request-id"),
+                    websocket_request_id.map(HeaderValue::from_static).as_ref()
+                );
+                Ok(response)
+            },
+        )
+        .await?;
+        let initialize = read_exec_server_json(&mut websocket).await?;
+        assert_eq!(initialize["method"], "initialize");
+        let response = json!({
+            "id": initialize["id"],
+            "result": {
+                "sessionId": "test-session",
+                "environmentInfo": {"shell": {"name": "bash", "path": "/bin/bash"}},
+            },
+        });
+        websocket
+            .send(Message::Text(response.to_string().into()))
+            .await?;
+        let initialized = read_exec_server_json(&mut websocket).await?;
+        assert_eq!(initialized["method"], "initialized");
+
+        for _ in 0..2 {
+            let request = read_exec_server_json(&mut websocket).await?;
+            assert_eq!(request["method"], "environment/info");
+            let response = json!({
+                "id": request["id"],
+                "error": {"code": INTERNAL_ERROR_CODE, "message": "executor unavailable"},
+            });
+            websocket
+                .send(Message::Text(response.to_string().into()))
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let mut app_server = TestAppServer::builder().without_auto_env().build().await?;
+    app_server.initialize().await?;
+    add_environment(
+        &mut app_server,
+        &exec_server_url,
+        /*connect_timeout_ms*/ None,
+        websocket_request_id,
+    )
+    .await?;
+
+    for _ in 0..2 {
+        let request_id = app_server
+            .send_raw_request(
+                "environment/info",
+                Some(json!({"environmentId": "remote-a"})),
+            )
+            .await?;
+        let error = timeout(
+            RPC_TIMEOUT,
+            app_server.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert_eq!(error, JSONRPCError {
+            id: RequestId::Integer(request_id),
+            error: JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: "failed to get info for environment `remote-a`: exec-server rejected request (-32603): executor unavailable".to_string(),
+                data: None,
+            },
+        });
+    }
+    timeout(RPC_TIMEOUT, exec_server).await???;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn environment_info_returns_remote_environment_info() -> Result<()> {
@@ -50,6 +141,7 @@ async fn environment_info_returns_remote_environment_info() -> Result<()> {
         &mut app_server,
         &exec_server_url,
         /*connect_timeout_ms*/ None,
+        /*websocket_request_id*/ None,
     )
     .await?;
 
@@ -102,6 +194,7 @@ async fn environment_info_accepts_missing_cwd() -> Result<()> {
         &mut app_server,
         &exec_server_url,
         /*connect_timeout_ms*/ None,
+        /*websocket_request_id*/ None,
     )
     .await?;
 
@@ -176,7 +269,13 @@ async fn environment_info_reports_connection_failure() -> Result<()> {
         .build()
         .await?;
     timeout(RPC_TIMEOUT, app_server.initialize()).await??;
-    add_environment(&mut app_server, &exec_server_url, Some(50)).await?;
+    add_environment(
+        &mut app_server,
+        &exec_server_url,
+        Some(50),
+        /*websocket_request_id*/ None,
+    )
+    .await?;
 
     let request_id = app_server
         .send_raw_request(
@@ -203,16 +302,18 @@ async fn add_environment(
     app_server: &mut TestAppServer,
     exec_server_url: &str,
     connect_timeout_ms: Option<u64>,
+    websocket_request_id: Option<&str>,
 ) -> Result<()> {
+    let mut params = json!({
+        "environmentId": "remote-a",
+        "execServerUrl": exec_server_url,
+        "connectTimeoutMs": connect_timeout_ms,
+    });
+    if let Some(websocket_request_id) = websocket_request_id {
+        params["websocketRequestId"] = websocket_request_id.into();
+    }
     let request_id = app_server
-        .send_raw_request(
-            "environment/add",
-            Some(json!({
-                "environmentId": "remote-a",
-                "execServerUrl": exec_server_url,
-                "connectTimeoutMs": connect_timeout_ms,
-            })),
-        )
+        .send_raw_request("environment/add", Some(params))
         .await?;
     let response: JSONRPCResponse = timeout(
         RPC_TIMEOUT,

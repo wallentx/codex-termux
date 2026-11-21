@@ -1,0 +1,20 @@
+//! Supplies Guardian categories for host-owned approval actions.
+
+use crate::tools::sandboxing::ApprovalAction;
+use codex_protocol::openai_models::GuardianScope;
+
+impl ApprovalAction {
+    pub(crate) fn guardian_scope(&self) -> GuardianScope {
+        match self {
+            Self::ExecCommand { .. } | Self::WriteStdin { .. } => GuardianScope::Shell,
+            Self::ApplyPatch { .. } => GuardianScope::FileChanges,
+            Self::McpToolCall {
+                server,
+                connector_id,
+                ..
+            } => GuardianScope::for_mcp_connector(server, connector_id.as_deref()),
+            Self::NetworkAccess { .. } => GuardianScope::Network,
+            Self::RequestPermissions { .. } => GuardianScope::Permissions,
+        }
+    }
+}

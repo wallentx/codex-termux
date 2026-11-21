@@ -1,14 +1,15 @@
-//! Bounded, best-effort previews for the v2 `/agent` status output.
+//! Bounded, best-effort previews for the v2 `/subagents` status output.
 
 use super::ThreadBufferedEvent;
 use super::ThreadEventStore;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::plain_lines;
+use crate::style::accent_color;
 use crate::text_formatting::truncate_text;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SubAgentActivityKind;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use std::collections::HashSet;
@@ -32,7 +33,7 @@ impl AgentStatusHistoryCell {
 impl HistoryCell for AgentStatusHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = vec![
-            "/agent".magenta().into(),
+            "/subagents".magenta().into(),
             "Sub-agents running".bold().into(),
             "".into(),
         ];
@@ -85,21 +86,19 @@ impl AgentStatusThreadPreview {
         let mut activity = Vec::new();
         for event in events {
             let item = match event {
-                ThreadBufferedEvent::Notification(ServerNotification::ItemCompleted(event)) => {
-                    &event.item
-                }
-                ThreadBufferedEvent::Notification(ServerNotification::ItemStarted(event)) => {
-                    &event.item
-                }
-                ThreadBufferedEvent::Notification(_)
-                | ThreadBufferedEvent::Request(_)
+                ThreadBufferedEvent::Notification(notification) => match notification.as_ref() {
+                    ServerNotification::ItemCompleted(event) => &event.item,
+                    ServerNotification::ItemStarted(event) => &event.item,
+                    _ => continue,
+                },
+                ThreadBufferedEvent::Request(_)
                 | ThreadBufferedEvent::HistoryEntryResponse(_)
                 | ThreadBufferedEvent::FeedbackSubmission(_) => continue,
             };
             if !seen_item_ids.insert(item.id().to_string()) {
                 continue;
             }
-            if let Some(summary) = activity_summary(item) {
+            if let Some(summary) = activity_summary(&item.payload) {
                 activity.push(summary);
                 if activity.len() == AGENT_STATUS_PREVIEW_ITEMS {
                     break;
@@ -114,7 +113,11 @@ impl AgentStatusThreadPreview {
     }
 
     fn title_line(&self) -> Line<'static> {
-        vec!["  • ".dim(), format!("`{}`", self.agent_path).cyan()].into()
+        vec![
+            "  • ".dim(),
+            format!("`{}`", self.agent_path).fg(accent_color()),
+        ]
+        .into()
     }
 
     fn preview_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -132,24 +135,24 @@ impl AgentStatusThreadPreview {
     }
 }
 
-fn activity_summary(item: &ThreadItem) -> Option<String> {
+fn activity_summary(item: &ThreadItemPayload) -> Option<String> {
     let summary = match item {
-        ThreadItem::AgentMessage { text, .. } | ThreadItem::Plan { text, .. } => text,
-        ThreadItem::Reasoning { summary, .. } => summary.last()?,
-        ThreadItem::CommandExecution { command, .. } => {
+        ThreadItemPayload::AgentMessage { text, .. } | ThreadItemPayload::Plan { text, .. } => text,
+        ThreadItemPayload::Reasoning { summary, .. } => summary.last()?,
+        ThreadItemPayload::CommandExecution { command, .. } => {
             let command = truncate_text(
                 command,
                 AGENT_STATUS_PREVIEW_GRAPHEMES.saturating_sub("$ ".len()),
             );
             return bounded_summary(&format!("$ {command}"));
         }
-        ThreadItem::FileChange { changes, .. } => {
+        ThreadItemPayload::FileChange { changes, .. } => {
             return bounded_summary(&format!("Updated {} file(s)", changes.len()));
         }
-        ThreadItem::McpToolCall { server, tool, .. } => {
+        ThreadItemPayload::McpToolCall { server, tool, .. } => {
             return bounded_summary(&format!("MCP {server}/{tool}"));
         }
-        ThreadItem::DynamicToolCall {
+        ThreadItemPayload::DynamicToolCall {
             namespace, tool, ..
         } => {
             let tool = namespace
@@ -158,8 +161,12 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
                 .unwrap_or_else(|| tool.clone());
             return bounded_summary(&format!("Tool {tool}"));
         }
-        ThreadItem::CollabAgentToolCall { tool, .. } => {
+        ThreadItemPayload::CollabAgentToolCall { tool, .. } => {
             let action = match tool {
+                CollabAgentTool::SendMessage
+                | CollabAgentTool::FollowupTask
+                | CollabAgentTool::InterruptAgent
+                | CollabAgentTool::ListAgents => return None,
                 CollabAgentTool::SpawnAgent => "Spawned an agent",
                 CollabAgentTool::SendInput => "Sent input to an agent",
                 CollabAgentTool::ResumeAgent => "Resumed an agent",
@@ -168,28 +175,38 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
             };
             return Some(action.to_string());
         }
-        ThreadItem::SubAgentActivity {
+        ThreadItemPayload::SubAgentActivity {
             kind, agent_path, ..
         } => {
             let action = match kind {
                 SubAgentActivityKind::Started => "Started",
                 SubAgentActivityKind::Interacted => "Contacted",
                 SubAgentActivityKind::Interrupted => "Interrupted",
+                SubAgentActivityKind::Completed => "Completed",
             };
             return bounded_summary(&format!("{action} {agent_path}"));
         }
-        ThreadItem::WebSearch(item) => {
+        ThreadItemPayload::WebSearch(item) => {
             return bounded_summary(&format!("Web search: {}", item.query));
         }
-        ThreadItem::ImageView { path, .. } => {
+        ThreadItemPayload::ImageView { path, .. } => {
             let path = path.render_for_ui();
             return bounded_summary(&format!("Viewed {path}"));
         }
-        ThreadItem::ImageGeneration(_) => return Some("Generated an image".to_string()),
-        ThreadItem::EnteredReviewMode { .. } => return Some("Entered review mode".to_string()),
-        ThreadItem::ExitedReviewMode { .. } => return Some("Exited review mode".to_string()),
-        ThreadItem::ContextCompaction { .. } => return Some("Compacted context".to_string()),
-        ThreadItem::UserMessage { .. } | ThreadItem::HookPrompt { .. } | ThreadItem::Sleep(_) => {
+        ThreadItemPayload::ImageGeneration(_) => return Some("Generated an image".to_string()),
+        ThreadItemPayload::EnteredReviewMode { .. } => {
+            return Some("Entered review mode".to_string());
+        }
+        ThreadItemPayload::ExitedReviewMode { .. } => {
+            return Some("Exited review mode".to_string());
+        }
+        ThreadItemPayload::ContextCompaction { .. } => {
+            return Some("Compacted context".to_string());
+        }
+        ThreadItemPayload::UserMessage { .. }
+        | ThreadItemPayload::HookPrompt { .. }
+        | ThreadItemPayload::FunctionCallOutput { .. }
+        | ThreadItemPayload::Sleep(_) => {
             return None;
         }
     };

@@ -17,6 +17,7 @@
 use crate::app_server_session::thread_blocks_direct_input;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::Thread;
+use codex_app_server_protocol::ThreadStatus;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SubAgentSource;
 use std::collections::HashMap;
@@ -31,6 +32,8 @@ pub(crate) struct LoadedSubagentThread {
     pub(crate) agent_role: Option<String>,
     pub(crate) agent_path: Option<String>,
     pub(crate) blocks_direct_input: bool,
+    pub(crate) is_running: bool,
+    pub(crate) is_closed: bool,
 }
 
 /// Walks the spawn tree rooted at `primary_thread_id` and returns every descendant subagent.
@@ -87,6 +90,8 @@ pub(crate) fn find_loaded_subagent_threads_for_primary(
                 .remove(&thread_id)
                 .map(|thread| LoadedSubagentThread {
                     blocks_direct_input: thread_blocks_direct_input(&thread),
+                    is_running: matches!(&thread.status, ThreadStatus::Active { .. }),
+                    is_closed: matches!(&thread.status, ThreadStatus::NotLoaded),
                     thread_id,
                     agent_nickname: thread.agent_nickname,
                     agent_role: thread.agent_role,
@@ -107,7 +112,7 @@ fn thread_spawn_agent_path(source: &SessionSource) -> Option<String> {
     }
 }
 
-fn thread_spawn_parent_thread_id(source: &SessionSource) -> Option<ThreadId> {
+pub(super) fn thread_spawn_parent_thread_id(source: &SessionSource) -> Option<ThreadId> {
     match source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
@@ -130,21 +135,30 @@ mod tests {
 
     fn test_thread(thread_id: ThreadId, source: SessionSource) -> Thread {
         Thread {
+            originator: None,
+            environments: None,
             id: thread_id.to_string(),
             extra: None,
             session_id: thread_id.to_string(),
             forked_from_id: None,
+            attached_to_thread_id: None,
             parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,
+            section: None,
+            section_entered_at: None,
+            project_id: None,
+            daybreak_enabled: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 0,
             updated_at: 0,
             recency_at: Some(0),
             status: ThreadStatus::Idle,
             path: None,
-            cwd: test_path_buf("/tmp").abs(),
+            cwd: test_path_buf("/tmp").abs().into(),
             cli_version: "0.0.0".to_string(),
             source,
             can_accept_direct_input: None,
@@ -196,6 +210,9 @@ mod tests {
         child.agent_nickname = Some("Scout".to_string());
         child.agent_role = Some("explorer".to_string());
         child.can_accept_direct_input = Some(true);
+        child.status = ThreadStatus::Active {
+            active_flags: Vec::new(),
+        };
 
         let mut grandchild = test_thread(
             grandchild_thread_id,
@@ -204,6 +221,7 @@ mod tests {
         grandchild.agent_nickname = Some("Atlas".to_string());
         grandchild.agent_role = Some("worker".to_string());
         grandchild.can_accept_direct_input = Some(false);
+        grandchild.status = ThreadStatus::NotLoaded;
         let unrelated_child = test_thread(
             unrelated_child_id,
             thread_spawn_source(unrelated_parent_id, /*depth*/ 1, "Other", "researcher"),
@@ -228,6 +246,8 @@ mod tests {
                     agent_nickname: Some("Scout".to_string()),
                     agent_role: Some("explorer".to_string()),
                     agent_path: None,
+                    is_running: true,
+                    is_closed: false,
                 },
                 LoadedSubagentThread {
                     blocks_direct_input: true,
@@ -235,6 +255,8 @@ mod tests {
                     agent_nickname: Some("Atlas".to_string()),
                     agent_role: Some("worker".to_string()),
                     agent_path: None,
+                    is_running: false,
+                    is_closed: true,
                 },
             ]
         );

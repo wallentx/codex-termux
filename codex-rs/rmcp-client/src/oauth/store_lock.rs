@@ -1,8 +1,12 @@
 //! Cross-process serialization for MCP OAuth stores shared by multiple credentials.
 //!
 //! File and Secrets each keep credentials for multiple MCP servers in one aggregate document.
-//! Their lock therefore protects the complete read-modify-write operation. Direct keyring entries
-//! are already stored independently per credential and do not use this lock.
+//! Writers hold an exclusive lock across the complete read-modify-write operation. Readers share
+//! the same lock so concurrent MCP startup and status checks do not serialize behind one another.
+//! Direct keyring entries are already stored independently per credential and do not use this lock.
+//! Blocking acquisitions report contention and wait time; released guards report hold time.
+//! Guards retain the operation and originating client captured at acquisition.
+//! Nonblocking probes are excluded, and telemetry never changes the lock policy or deadline.
 
 use std::fs;
 use std::fs::File;
@@ -13,6 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_utils_home_dir::find_codex_home;
 
 const OAUTH_LOCK_DIR: &str = "mcp-oauth-locks";
@@ -47,11 +52,69 @@ impl std::fmt::Display for OAuthStore {
 
 /// Serializes one complete operation on an aggregate OAuth credential store.
 pub(super) struct OAuthStoreLock {
+    // Fields drop in declaration order: close the file before recording hold telemetry.
     _file: File,
+    _hold: Option<LockHoldTelemetry>,
+}
+
+struct LockHoldTelemetry {
+    acquired_at: Instant,
+    tags: [(&'static str, &'static str); 4],
+}
+
+impl Drop for LockHoldTelemetry {
+    fn drop(&mut self) {
+        let _ = codex_otel::record_global_duration(
+            "codex.auth_storage.lock_hold.duration",
+            self.acquired_at.elapsed(),
+            &self.tags,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OAuthStoreLockMode {
+    Shared,
+    Exclusive(OAuthStoreWriteOperation),
+}
+
+/// Identifies the mutation owning an exclusive aggregate-store lock.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum OAuthStoreWriteOperation {
+    Save,
+    Delete,
+    RetireRefreshToken,
 }
 
 impl OAuthStoreLock {
-    pub(super) fn acquire(store: OAuthStore) -> Result<Self, OAuthStoreLockFailure> {
+    pub(super) fn acquire_for_write(
+        store: OAuthStore,
+        operation: OAuthStoreWriteOperation,
+    ) -> Result<Self, OAuthStoreLockFailure> {
+        Self::acquire_with_timeout(
+            store,
+            STORE_LOCK_ACQUIRE_TIMEOUT,
+            OAuthStoreLockMode::Exclusive(operation),
+        )
+    }
+
+    pub(super) fn acquire_for_read(store: OAuthStore) -> Result<Self, OAuthStoreLockFailure> {
+        Self::acquire_with_timeout(
+            store,
+            STORE_LOCK_ACQUIRE_TIMEOUT,
+            OAuthStoreLockMode::Shared,
+        )
+    }
+
+    pub(super) fn try_acquire_for_read(store: OAuthStore) -> Result<Self, OAuthStoreLockFailure> {
+        Self::acquire_with_timeout(store, Duration::ZERO, OAuthStoreLockMode::Shared)
+    }
+
+    fn acquire_with_timeout(
+        store: OAuthStore,
+        acquire_timeout: Duration,
+        mode: OAuthStoreLockMode,
+    ) -> Result<Self, OAuthStoreLockFailure> {
         // This lock intentionally follows the existing local File/Secrets credential-store
         // authority. Those stores are CODEX_HOME-backed today: if CODEX_HOME is unset they use
         // the default home (`~/.codex`), and if an embedder has no local home/filesystem authority
@@ -59,13 +122,14 @@ impl OAuthStoreLock {
         // provide its own matching lock authority instead of using this local path.
         let codex_home = find_codex_home()
             .map_err(|source| OAuthStoreLockFailure::CodexHome { store, source })?;
-        Self::acquire_in(&codex_home, store, STORE_LOCK_ACQUIRE_TIMEOUT)
+        Self::acquire_in_with_mode(&codex_home, store, acquire_timeout, mode)
     }
 
-    pub(super) fn acquire_in(
+    fn acquire_in_with_mode(
         codex_home: &Path,
         store: OAuthStore,
         acquire_timeout: Duration,
+        mode: OAuthStoreLockMode,
     ) -> Result<Self, OAuthStoreLockFailure> {
         let path = oauth_store_lock_path(codex_home, store);
         if let Some(parent) = path.parent() {
@@ -87,14 +151,58 @@ impl OAuthStoreLock {
                 path: path.clone(),
                 source,
             })?;
+        let tags = [
+            (
+                "store",
+                match store {
+                    OAuthStore::File => "file",
+                    OAuthStore::Secrets => "secrets",
+                },
+            ),
+            (
+                "lock_mode",
+                match mode {
+                    OAuthStoreLockMode::Shared => "shared",
+                    OAuthStoreLockMode::Exclusive(_) => "exclusive",
+                },
+            ),
+            (
+                "operation",
+                match mode {
+                    OAuthStoreLockMode::Shared => "load",
+                    OAuthStoreLockMode::Exclusive(OAuthStoreWriteOperation::Save) => "save",
+                    OAuthStoreLockMode::Exclusive(OAuthStoreWriteOperation::Delete) => "delete",
+                    OAuthStoreLockMode::Exclusive(OAuthStoreWriteOperation::RetireRefreshToken) => {
+                        "retire_refresh_token"
+                    }
+                },
+            ),
+            (
+                codex_otel::ORIGINATOR_TAG,
+                AuthStorageOriginator::current().as_str(),
+            ),
+        ];
         let started = Instant::now();
         let mut reported_contention = false;
 
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
+        let result = loop {
+            let result = match mode {
+                OAuthStoreLockMode::Shared => file.try_lock_shared(),
+                OAuthStoreLockMode::Exclusive(_) => file.try_lock(),
+            };
+            match result {
+                Ok(()) => {
+                    break Ok(Self {
+                        _file: file,
+                        _hold: (!acquire_timeout.is_zero()).then(|| LockHoldTelemetry {
+                            acquired_at: Instant::now(),
+                            tags,
+                        }),
+                    });
+                }
                 Err(std::fs::TryLockError::WouldBlock) if started.elapsed() >= acquire_timeout => {
-                    return Err(OAuthStoreLockFailure::Timeout {
+                    reported_contention = true;
+                    break Err(OAuthStoreLockFailure::Timeout {
                         store,
                         path,
                         acquire_timeout,
@@ -113,14 +221,43 @@ impl OAuthStoreLock {
                     std::thread::sleep(STORE_LOCK_RETRY_SLEEP.min(acquire_timeout));
                 }
                 Err(error) => {
-                    return Err(OAuthStoreLockFailure::Lock {
+                    break Err(OAuthStoreLockFailure::Lock {
                         store,
                         path,
                         source: io::Error::from(error),
                     });
                 }
             }
+        };
+        if !acquire_timeout.is_zero() {
+            let outcome = match &result {
+                Ok(_) => "acquired",
+                Err(OAuthStoreLockFailure::Timeout { .. }) => "timeout",
+                Err(
+                    OAuthStoreLockFailure::CodexHome { .. }
+                    | OAuthStoreLockFailure::CreateDir { .. }
+                    | OAuthStoreLockFailure::Open { .. }
+                    | OAuthStoreLockFailure::Lock { .. },
+                ) => "error",
+            };
+            let _ = codex_otel::record_global_operation(
+                "codex.auth_storage.lock_acquire",
+                "codex.auth_storage.lock_wait.duration",
+                started.elapsed(),
+                &[
+                    tags[0],
+                    tags[1],
+                    tags[2],
+                    tags[3],
+                    ("outcome", outcome),
+                    (
+                        "contended",
+                        if reported_contention { "true" } else { "false" },
+                    ),
+                ],
+            );
         }
+        result
     }
 }
 

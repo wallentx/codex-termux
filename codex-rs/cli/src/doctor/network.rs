@@ -1,0 +1,224 @@
+use std::env;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+
+use codex_arg0::Arg0DispatchPaths;
+use codex_core::config::Config;
+#[cfg(target_os = "macos")]
+use codex_http_client::MacosSystemProxyConfiguration;
+use codex_http_client::RouteAwareClientPool;
+use codex_http_client::RouteAwareRequestError;
+use codex_http_client::RouteFailureClass;
+#[cfg(target_os = "macos")]
+use codex_http_client::macos_system_proxy_configuration;
+use codex_login::default_client::create_client_without_request_logging;
+use codex_tui::Cli as TuiCli;
+use codex_utils_cli::CliConfigOverrides;
+use http::HeaderMap;
+use http::Method;
+
+use super::CheckStatus;
+use super::DoctorCheck;
+use super::DoctorProgress;
+use super::push_proxy_env_details;
+use super::read_probe_file;
+
+pub(super) async fn checks(
+    overrides: CliConfigOverrides,
+    interactive: &TuiCli,
+    arg0_paths: &Arg0DispatchPaths,
+    progress: &Arc<dyn DoctorProgress>,
+) -> Vec<DoctorCheck> {
+    progress.begin("config");
+    let config_started = Instant::now();
+    let config = match super::load_config(overrides, interactive, arg0_paths).await {
+        Ok(config) => config,
+        Err(error) => {
+            let check = super::config_load_failure(&error)
+                .detail("network diagnostics: effective network configuration is unavailable");
+            progress.finish("config", check.status);
+            return vec![check];
+        }
+    };
+    let config_duration = config_started.elapsed();
+    let mut config_check = super::config_check(&config).detail(format!(
+        "configuration load ms: {}",
+        config_duration.as_millis()
+    ));
+    config_check.duration_ms = config_duration.as_millis().try_into().unwrap_or(u64::MAX);
+    progress.finish("config", config_check.status);
+    let auth_manager = codex_login::AuthManager::shared_from_config(
+        &config, /*enable_codex_api_key_env*/ true,
+    )
+    .await
+    .ok();
+    let plan = super::provider_reachability_plan(&config);
+    #[cfg(target_os = "macos")]
+    let url = plan.endpoints.first().map(|endpoint| endpoint.url.clone());
+    let (network, websocket, reachability) = tokio::join!(
+        async { super::run_sync_check("network", progress.clone(), || check(Some(&config))) },
+        super::run_async_check(
+            "websocket",
+            progress.clone(),
+            super::websocket_reachability_check(&config, auth_manager)
+        ),
+        super::run_async_check(
+            "provider reachability",
+            progress.clone(),
+            super::provider_reachability_check(plan)
+        ),
+    );
+    #[cfg(target_os = "macos")]
+    let reachability = with_system_proxy_remediation(reachability, &config, url.as_deref());
+    vec![config_check, network, websocket, reachability]
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) const SYSTEM_PROXY_REMEDIATION: &str = "A macOS system proxy is configured but unused. If your organization requires it, ask your administrator whether to enable the experimental System proxy setting in `/experimental` or with `codex features enable respect_system_proxy`. Restart Codex after changing this setting.";
+
+pub(super) fn check(config: Option<&Config>) -> DoctorCheck {
+    let mut details = Vec::new();
+    push_proxy_env_details(&mut details);
+    #[cfg(target_os = "macos")]
+    {
+        let request_url = config
+            .and_then(|config| config.model_provider.base_url.as_deref())
+            .or_else(|| config.map(|config| config.chatgpt_base_url.as_str()))
+            .unwrap_or("https://chatgpt.com/backend-api/");
+        let configuration = match macos_system_proxy_configuration(request_url) {
+            MacosSystemProxyConfiguration::Automatic => "automatic (PAC)",
+            MacosSystemProxyConfiguration::Manual => "manual",
+            MacosSystemProxyConfiguration::Direct => "direct",
+            MacosSystemProxyConfiguration::Unavailable => "unavailable",
+        };
+        details.push(format!("system proxy: {configuration}"));
+    }
+    if let Some(config) = config {
+        let enabled = |value| if value { "enabled" } else { "disabled" };
+        details.push(format!(
+            "respect system proxy: {}",
+            enabled(config.respect_system_proxy)
+        ));
+        if config.permissions.network.is_some() {
+            details.push("managed proxy: configured".to_string());
+        } else {
+            details.push("managed proxy: not configured".to_string());
+        }
+    }
+
+    let mut status = CheckStatus::Ok;
+    let mut summary = "network-related environment looks readable".to_string();
+    for name in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
+        if let Some(raw) = env::var_os(name) {
+            let path = PathBuf::from(raw);
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    if let Err(error) = read_probe_file(&path) {
+                        status = CheckStatus::Warning;
+                        summary = "custom CA env var points at an unreadable file".to_string();
+                        details.push(format!("{name}: {} ({error})", path.display()));
+                    } else {
+                        details.push(format!("{name}: readable file {}", path.display()));
+                    }
+                }
+                Ok(_) => {
+                    status = CheckStatus::Warning;
+                    summary = "custom CA env var does not point at a file".to_string();
+                    details.push(format!("{name}: not a file {}", path.display()));
+                }
+                Err(error) => {
+                    status = CheckStatus::Warning;
+                    summary = "custom CA env var points at an unreadable path".to_string();
+                    details.push(format!("{name}: {} ({error})", path.display()));
+                }
+            }
+        }
+    }
+
+    DoctorCheck::new("network.env", "network", status, summary).details(details)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn with_system_proxy_remediation(
+    mut check: DoctorCheck,
+    config: &Config,
+    request_url: Option<&str>,
+) -> DoctorCheck {
+    if check.status == CheckStatus::Fail
+        && !config.respect_system_proxy
+        && config.permissions.network.is_none()
+        && config
+            .config_layer_stack
+            .requirements()
+            .feature_requirements
+            .as_ref()
+            .and_then(|requirements| requirements.value.entries.get("respect_system_proxy"))
+            .is_none_or(|enabled| *enabled)
+        && !super::PROXY_ENV_VARS
+            .iter()
+            .any(|name| !name.eq_ignore_ascii_case("NO_PROXY") && super::env_var_present(name))
+        && request_url.is_some_and(|url| {
+            matches!(
+                macos_system_proxy_configuration(url),
+                MacosSystemProxyConfiguration::Automatic | MacosSystemProxyConfiguration::Manual
+            )
+        })
+    {
+        check.remediation = Some(SYSTEM_PROXY_REMEDIATION.to_string());
+    }
+    check
+}
+
+pub(super) async fn probe_status(
+    client: &RouteAwareClientPool,
+    url: &str,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<u16, String> {
+    let response = if env::var("CODEX_SANDBOX").as_deref() == Ok("seatbelt") {
+        create_client_without_request_logging()
+            .request(method, url)
+            .headers(headers)
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+    } else {
+        client
+            .request(method, url)
+            .headers(headers)
+            // Allow five seconds for PAC resolution before the three-second HTTP budget.
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+    }
+    .map_err(request_error)?;
+    let status = response.status().as_u16();
+    if status == 407 {
+        return Err("proxy authentication required (HTTP 407)".to_string());
+    }
+    Ok(status)
+}
+
+pub(super) fn request_error(error: RouteAwareRequestError) -> String {
+    match error.failure_class() {
+        Some(RouteFailureClass::TlsError) => "TLS handshake or certificate validation failed",
+        Some(RouteFailureClass::ProxyAuthenticationRequired) => "proxy authentication required",
+        Some(RouteFailureClass::InvalidProxyConfig) => "invalid proxy configuration",
+        Some(RouteFailureClass::ProxyResolutionUnavailable) => {
+            "system proxy configuration unavailable"
+        }
+        Some(RouteFailureClass::ConnectTimeout) => "request timed out",
+        Some(RouteFailureClass::UnsupportedProxyScheme) => "unsupported proxy configuration",
+        Some(RouteFailureClass::ResolverError) => "proxy resolution failed",
+        None if error.is_timeout() => "request timed out",
+        None if error.is_connect() => "connect failed",
+        None => "request failed",
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+#[path = "network_tests.rs"]
+mod tests;

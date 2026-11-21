@@ -1,19 +1,22 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::Environment;
+use codex_config::ScopedSkillsConfig;
+
 use crate::ExecServerError;
+use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
+use crate::client_api::ExecServerTransportParams;
 use crate::environment::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use crate::environment::LOCAL_ENVIRONMENT_ID;
 use crate::environment::REMOTE_ENVIRONMENT_ID;
 
-/// Lists the concrete environments available to Codex.
+/// Lists the remote environment transports available to Codex.
 ///
 /// Implementations own a startup snapshot containing both the available
-/// environment list in configured order and the default environment
-/// selection. Providers should only return provider-owned remote environments;
-/// `include_local` controls whether `EnvironmentManager` should add the local
-/// environment to the snapshot.
+/// environment transport list in configured order and the default environment
+/// selection. Providers return transport descriptions before the effective HTTP
+/// policy is available; `include_local` controls whether `EnvironmentManager`
+/// should add the local environment when the snapshot is built.
 pub trait EnvironmentProvider: Send + Sync {
     /// Returns the provider-owned environment startup snapshot.
     fn snapshot(&self) -> EnvironmentProviderFuture<'_>;
@@ -22,11 +25,30 @@ pub trait EnvironmentProvider: Send + Sync {
 pub type EnvironmentProviderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<EnvironmentProviderSnapshot, ExecServerError>> + Send + 'a>>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EnvironmentProviderSnapshot {
-    pub environments: Vec<(String, Environment)>,
+    pub(crate) environments: Vec<EnvironmentProviderEntry>,
     pub default: EnvironmentDefault,
     pub include_local: bool,
+}
+
+/// Keeps each configured environment's requirements with its transport.
+#[derive(Clone, Debug)]
+pub(crate) struct EnvironmentProviderEntry {
+    pub(crate) id: String,
+    pub(crate) transport: ExecServerTransportParams,
+    pub(crate) skills: ScopedSkillsConfig,
+}
+
+impl std::fmt::Debug for EnvironmentProviderSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let environment_ids: Vec<_> = self.environments.iter().map(|entry| &entry.id).collect();
+        f.debug_struct("EnvironmentProviderSnapshot")
+            .field("environments", &environment_ids)
+            .field("default", &self.default)
+            .field("include_local", &self.include_local)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,15 +79,19 @@ impl DefaultEnvironmentProvider {
         let (exec_server_url, disabled) = normalize_exec_server_url(self.exec_server_url.clone());
 
         if let Some(exec_server_url) = exec_server_url {
-            environments.push((
-                REMOTE_ENVIRONMENT_ID.to_string(),
-                Environment::remote_inner(exec_server_url, /*local_runtime_paths*/ None),
-            ));
+            environments.push(EnvironmentProviderEntry {
+                id: REMOTE_ENVIRONMENT_ID.to_string(),
+                transport: ExecServerTransportParams::websocket_url(
+                    exec_server_url,
+                    DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
+                ),
+                skills: ScopedSkillsConfig::default(),
+            });
         }
 
         let has_remote = environments
             .iter()
-            .any(|(id, _environment)| id == REMOTE_ENVIRONMENT_ID);
+            .any(|entry| entry.id == REMOTE_ENVIRONMENT_ID);
         let include_local = !disabled && !has_remote;
         let default = if disabled {
             EnvironmentDefault::Disabled
@@ -114,7 +140,10 @@ mod tests {
             default,
             include_local,
         } = snapshot;
-        let environments: HashMap<_, _> = environments.into_iter().collect();
+        let environments: HashMap<_, _> = environments
+            .into_iter()
+            .map(|entry| (entry.id, entry.transport))
+            .collect();
 
         assert!(include_local);
         assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
@@ -134,7 +163,10 @@ mod tests {
             default,
             include_local,
         } = snapshot;
-        let environments: HashMap<_, _> = environments.into_iter().collect();
+        let environments: HashMap<_, _> = environments
+            .into_iter()
+            .map(|entry| (entry.id, entry.transport))
+            .collect();
 
         assert!(include_local);
         assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
@@ -154,7 +186,10 @@ mod tests {
             default,
             include_local,
         } = snapshot;
-        let environments: HashMap<_, _> = environments.into_iter().collect();
+        let environments: HashMap<_, _> = environments
+            .into_iter()
+            .map(|entry| (entry.id, entry.transport))
+            .collect();
 
         assert!(!include_local);
         assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
@@ -171,12 +206,18 @@ mod tests {
             default,
             include_local,
         } = snapshot;
-        let environments: HashMap<_, _> = environments.into_iter().collect();
+        let environments: HashMap<_, _> = environments
+            .into_iter()
+            .map(|entry| (entry.id, entry.transport))
+            .collect();
 
         assert!(!include_local);
         assert!(!environments.contains_key(LOCAL_ENVIRONMENT_ID));
-        let remote_environment = &environments[REMOTE_ENVIRONMENT_ID];
-        assert!(remote_environment.is_remote());
+        assert!(matches!(
+            &environments[REMOTE_ENVIRONMENT_ID],
+            ExecServerTransportParams::WebSocketUrl { websocket_url, .. }
+                if websocket_url == "ws://127.0.0.1:8765"
+        ));
         assert_eq!(
             default,
             EnvironmentDefault::EnvironmentId(REMOTE_ENVIRONMENT_ID.to_string())

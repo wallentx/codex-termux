@@ -1,24 +1,21 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
-use app_test_support::to_response;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::PlanDeltaNotification;
-use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadStartParams;
-use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
-use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -26,8 +23,6 @@ use codex_protocol::config_types::Settings;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
-use std::collections::BTreeMap;
-use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tokio::time::timeout;
@@ -51,27 +46,34 @@ async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    MockResponsesConfig::new(&server.uri())
+        .enable_feature(Feature::CollaborationModes)
+        .write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let turn = start_plan_mode_turn(&mut mcp).await?;
-    let (_, completed_items, plan_deltas, turn_completed) =
+    let (started_items, completed_items, plan_deltas, turn_completed) =
         collect_turn_notifications(&mut mcp).await?;
     wait_for_responses_request_count(&server, /*expected_count*/ 1).await?;
 
     assert_eq!(turn_completed.turn.id, turn.id);
     assert_eq!(turn_completed.turn.status, TurnStatus::Completed);
 
-    let expected_plan = ThreadItem::Plan {
-        id: format!("{}-plan", turn.id),
+    let expected_plan_id = started_items
+        .iter()
+        .find_map(|item| match item {
+            ThreadItemPayload::Plan { id, .. } => Some(id),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("plan start notification missing"))?;
+    let expected_plan = ThreadItemPayload::Plan {
+        id: expected_plan_id.clone(),
         text: "# Final plan\n- first\n- second\n".to_string(),
     };
-    let expected_plan_id = format!("{}-plan", turn.id);
     let streamed_plan = plan_deltas
         .iter()
         .map(|delta| delta.delta.as_str())
@@ -80,12 +82,12 @@ async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
     assert!(
         plan_deltas
             .iter()
-            .all(|delta| delta.item_id == expected_plan_id)
+            .all(|delta| &delta.item_id == expected_plan_id)
     );
     let plan_items = completed_items
         .iter()
         .filter_map(|item| match item {
-            ThreadItem::Plan { .. } => Some(item.clone()),
+            ThreadItemPayload::Plan { .. } => Some(item.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -93,7 +95,7 @@ async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
     assert!(
         completed_items
             .iter()
-            .any(|item| matches!(item, ThreadItem::AgentMessage { .. })),
+            .any(|item| matches!(item, ThreadItemPayload::AgentMessage { .. })),
         "agent message items should still be emitted alongside the plan item"
     );
 
@@ -112,13 +114,14 @@ async fn plan_mode_without_proposed_plan_does_not_emit_plan_item() -> Result<()>
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    MockResponsesConfig::new(&server.uri())
+        .enable_feature(Feature::CollaborationModes)
+        .write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let _turn = start_plan_mode_turn(&mut mcp).await?;
     let (_, completed_items, plan_deltas, _) = collect_turn_notifications(&mut mcp).await?;
@@ -126,7 +129,7 @@ async fn plan_mode_without_proposed_plan_does_not_emit_plan_item() -> Result<()>
 
     let has_plan_item = completed_items
         .iter()
-        .any(|item| matches!(item, ThreadItem::Plan { .. }));
+        .any(|item| matches!(item, ThreadItemPayload::Plan { .. }));
     assert!(!has_plan_item);
     assert!(plan_deltas.is_empty());
 
@@ -134,18 +137,13 @@ async fn plan_mode_without_proposed_plan_does_not_emit_plan_item() -> Result<()>
 }
 
 async fn start_plan_mode_turn(mcp: &mut TestAppServer) -> Result<codex_app_server_protocol::Turn> {
-    let thread_req = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams {
+    let thread = mcp
+        .start_thread(ThreadStartParams {
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
-        .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let thread = to_response::<ThreadStartResponse>(thread_resp)?.thread;
+        .await?
+        .thread;
 
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Plan,
@@ -155,31 +153,29 @@ async fn start_plan_mode_turn(mcp: &mut TestAppServer) -> Result<codex_app_serve
             developer_instructions: None,
         },
     };
-    let turn_req = mcp
-        .send_turn_start_request(TurnStartParams {
-            thread_id: thread.id,
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "Plan this".to_string(),
-                text_elements: Vec::new(),
-            }],
-            collaboration_mode: Some(collaboration_mode),
-            ..Default::default()
+    let response: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id,
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "Plan this".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                collaboration_mode: Some(collaboration_mode),
+                ..Default::default()
+            },
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    Ok(to_response::<TurnStartResponse>(turn_resp)?.turn)
+    Ok(response.turn)
 }
 
 async fn collect_turn_notifications(
     mcp: &mut TestAppServer,
 ) -> Result<(
-    Vec<ThreadItem>,
-    Vec<ThreadItem>,
+    Vec<ThreadItemPayload>,
+    Vec<ThreadItemPayload>,
     Vec<PlanDeltaNotification>,
     TurnCompletedNotification,
 )> {
@@ -198,14 +194,14 @@ async fn collect_turn_notifications(
                     .params
                     .ok_or_else(|| anyhow!("item/started notifications must include params"))?;
                 let payload: ItemStartedNotification = serde_json::from_value(params)?;
-                started_items.push(payload.item);
+                started_items.push(payload.item.payload);
             }
             "item/completed" => {
                 let params = notification
                     .params
                     .ok_or_else(|| anyhow!("item/completed notifications must include params"))?;
                 let payload: ItemCompletedNotification = serde_json::from_value(params)?;
-                completed_items.push(payload.item);
+                completed_items.push(payload.item.payload);
             }
             "item/plan/delta" => {
                 let params = notification
@@ -254,43 +250,4 @@ async fn wait_for_responses_request_count(
     })
     .await??;
     Ok(())
-}
-
-fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let features = BTreeMap::from([(Feature::CollaborationModes, true)]);
-    let feature_entries = features
-        .into_iter()
-        .map(|(feature, enabled)| {
-            let key = FEATURES
-                .iter()
-                .find(|spec| spec.id == feature)
-                .map(|spec| spec.key)
-                .expect("feature should have a config key");
-            format!("{key} = {enabled}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[features]
-{feature_entries}
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
 }

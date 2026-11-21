@@ -1,53 +1,80 @@
 use super::*;
 
+use crate::responses_metadata::ANALYTICS_ENABLED_KEY;
+use crate::responses_metadata::AUTO_REVIEW_ENABLED_KEY;
+use crate::responses_metadata::CONTEXT_WINDOW_ID_KEY;
+use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_metadata::FORKED_FROM_ORDINAL_EXCLUSIVE_KEY;
 use crate::responses_metadata::INSTALLATION_ID_KEY;
+use crate::responses_metadata::LEGACY_CODE_MODE_TOOL_NAMES_KEY;
+use crate::responses_metadata::NODE_REPL_AUTO_REVIEW_REQUIRED_KEY;
+use crate::responses_metadata::NODE_REPL_DISABLED_KEY;
+use crate::responses_metadata::PARENT_TURN_ID_KEY;
+use crate::responses_metadata::ROOT_TURN_ID_KEY;
+use crate::responses_metadata::SANDBOX_MODE_KEY;
+use crate::responses_metadata::TOOL_NAMESPACES_INFO_KEY;
+use crate::responses_metadata::TURN_TRIGGER_KEY;
 use crate::responses_metadata::WINDOW_ID_KEY;
-use crate::sandbox_tags::permission_profile_sandbox_tag;
+use crate::responses_metadata::WINDOW_NUMBER_KEY;
+use crate::responses_metadata::validate_extra_metadata;
+use crate::session::step_context::StepContext;
+use crate::session::tests::make_session_and_context;
+use crate::session::tests::update_turn_settings_for_test;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_analytics::TurnAnalyticsMetadata;
+use codex_git_utils::GitSha;
+use codex_git_utils::get_head_commit_hash;
+use codex_models_manager::model_info::model_info_from_slug;
+use codex_protocol::AgentPath;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_sandboxing::SandboxType;
+use codex_sandboxing::get_platform_sandbox;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::process::Command;
 
-fn test_mcp_turn_metadata_context() -> McpTurnMetadataContext<'static> {
-    McpTurnMetadataContext {
+fn test_mcp_turn_metadata_context() -> ExecutionMetadata<'static> {
+    ExecutionMetadata {
         model: "gpt-5.4",
         reasoning_effort: Some(ReasoningEffortConfig::High),
+        node_repl_disabled: false,
+        auto_review_enabled: true,
+        node_repl_auto_review_required: true,
     }
 }
 
-fn test_responses_metadata_json(
+fn test_turn_responses_metadata(
     state: &TurnMetadataState,
     window_id: &str,
-    request_kind: CodexResponsesRequestKind,
-) -> String {
-    state
-        .to_responses_metadata(
-            "installation-a".to_string(),
-            window_id.to_string(),
-            request_kind,
-        )
-        .turn_metadata_json()
-        .expect("turn metadata json")
+) -> CodexResponsesMetadata {
+    state.to_responses_metadata(
+        "installation-a".to_string(),
+        window_id.to_string(),
+        CodexResponsesRequestKind::Turn,
+    )
 }
 
 fn test_turn_responses_metadata_json(state: &TurnMetadataState, window_id: &str) -> String {
-    test_responses_metadata_json(state, window_id, CodexResponsesRequestKind::Turn)
+    test_turn_responses_metadata(state, window_id)
+        .turn_metadata_json()
+        .expect("turn metadata json")
 }
 
 fn test_compaction_responses_metadata_json(
@@ -55,11 +82,14 @@ fn test_compaction_responses_metadata_json(
     window_id: &str,
     compaction: CompactionTurnMetadata,
 ) -> String {
-    test_responses_metadata_json(
-        state,
-        window_id,
-        CodexResponsesRequestKind::Compaction(compaction),
-    )
+    state
+        .to_responses_metadata(
+            "installation-a".to_string(),
+            window_id.to_string(),
+            CodexResponsesRequestKind::Compaction(compaction),
+        )
+        .turn_metadata_json()
+        .expect("turn metadata json")
 }
 
 fn test_turn_metadata_header(state: &TurnMetadataState) -> String {
@@ -109,30 +139,60 @@ async fn create_clean_git_repo(repo_name: &str) -> (TempDir, AbsolutePathBuf) {
     (temp_dir, repo_path)
 }
 
+async fn wait_for_git_enrichment(state: &TurnMetadataState) -> Value {
+    state.admit_git_enrichment();
+    tokio::time::timeout(Duration::from_secs(2), state.wait_for_git_enrichment())
+        .await
+        .expect("git enrichment should complete");
+    serde_json::from_str(&test_turn_metadata_header(state)).expect("json")
+}
+
 #[tokio::test]
-async fn detached_memory_responses_metadata_omits_turn_identity() {
+async fn detached_memory_responses_metadata_starts_an_independent_root_turn() {
     let (_temp_dir, repo_path) = create_clean_git_repo("repo-東京").await;
 
-    let header = detached_memory_responses_metadata(
+    let thread_manager = crate::ThreadManager::with_models_provider_for_tests(
+        codex_login::CodexAuth::from_api_key("test"),
+        crate::config::test_config().await.model_provider,
+    );
+
+    let metadata = detached_memory_responses_metadata(
+        &thread_manager,
         String::new(),
         String::new(),
         String::new(),
         String::new(),
         &SessionSource::Unknown,
         &repo_path,
+        &PermissionProfile::read_only(),
         Some("none"),
     )
-    .await
-    .turn_metadata_json()
-    .expect("header");
+    .await;
+    let header = metadata.turn_metadata_json().expect("header");
     assert!(header.is_ascii());
     assert!(!header.contains("東京"));
     let parsed: Value = serde_json::from_str(&header).expect("valid json");
     assert_eq!(parsed["request_kind"].as_str(), Some("memory"));
+    assert_eq!(
+        parsed["thread_source"].as_str(),
+        Some("memory_consolidation")
+    );
+    assert_eq!(parsed[SANDBOX_MODE_KEY].as_str(), Some("read-only"));
     assert!(parsed.get("session_id").is_none());
     assert!(parsed.get("thread_id").is_none());
     assert!(parsed.get("forked_from_thread_id").is_none());
-    assert!(parsed.get("turn_id").is_none());
+    let turn_id = parsed["turn_id"].as_str().expect("memory turn ID");
+    uuid::Uuid::parse_str(turn_id).expect("memory turn ID is a UUID");
+    assert_eq!(parsed[ROOT_TURN_ID_KEY], parsed["turn_id"]);
+    let client_metadata = metadata.client_metadata(/*include_internal*/ true);
+    assert_eq!(
+        client_metadata.get("turn_id").map(String::as_str),
+        Some(turn_id)
+    );
+    assert_eq!(
+        client_metadata.get(ROOT_TURN_ID_KEY).map(String::as_str),
+        Some(turn_id)
+    );
     assert!(parsed.get(WINDOW_ID_KEY).is_none());
 
     let expected_repo_path = repo_path.to_string_lossy().into_owned();
@@ -159,25 +219,158 @@ async fn detached_memory_responses_metadata_omits_empty_workspace_metadata() {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
 
+    let thread_manager = crate::ThreadManager::with_models_provider_for_tests(
+        codex_login::CodexAuth::from_api_key("test"),
+        crate::config::test_config().await.model_provider,
+    );
+
     let header = detached_memory_responses_metadata(
+        &thread_manager,
         String::new(),
         String::new(),
         String::new(),
         String::new(),
         &SessionSource::Unknown,
         &cwd,
+        &PermissionProfile::read_only(),
         /*sandbox*/ None,
     )
     .await
     .turn_metadata_json()
     .expect("detached memory should emit its request kind");
     let parsed: Value = serde_json::from_str(&header).expect("valid json");
+    let turn_id = parsed["turn_id"].as_str().expect("memory turn ID");
+    uuid::Uuid::parse_str(turn_id).expect("memory turn ID is a UUID");
 
-    assert_eq!(parsed, serde_json::json!({"request_kind": "memory"}));
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "turn_id": turn_id,
+            "root_turn_id": turn_id,
+            "request_kind": "memory",
+            "sandbox_mode": "read-only",
+            "thread_source": "memory_consolidation",
+            "turn_trigger": "memory_consolidation",
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_workspaces_times_out_pending_git_discovery() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let cwd = temp_dir.path().abs();
+
+    let workspaces = tokio::time::timeout(
+        Duration::from_secs(2),
+        memory_workspaces(&cwd, std::future::pending()),
+    )
+    .await
+    .expect("memory metadata should stop waiting for Git discovery");
+
+    assert!(workspaces.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn memory_workspaces_keep_observed_refs_when_status_exceeds_the_deadline() {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let head = get_head_commit_hash(&repo).await.expect("read HEAD");
+    let url = "https://example.invalid/repo.git";
+    assert!(
+        Command::new("git")
+            .args(["remote", "add", "origin", url])
+            .current_dir(&repo)
+            .status()
+            .await
+            .expect("add remote")
+            .success()
+    );
+
+    // Only status reads the index; block it without delaying HEAD or remote discovery.
+    let index = repo.join(".git/index");
+    std::fs::remove_file(&index).expect("remove index");
+    assert!(
+        Command::new("mkfifo")
+            .arg(index.as_path())
+            .status()
+            .await
+            .expect("create index FIFO")
+            .success()
+    );
+
+    let started = tokio::time::Instant::now();
+    let workspaces = memory_workspaces(
+        &repo,
+        std::future::ready(Some(repo.as_path().to_path_buf())),
+    )
+    .await;
+    assert!(started.elapsed() >= MEMORY_GIT_METADATA_TIMEOUT);
+    assert_eq!(
+        serde_json::to_value(workspaces).expect("serialize workspaces"),
+        serde_json::json!({
+            (repo.to_string_lossy().into_owned()): {
+                "associated_remote_urls": {"origin": url},
+                "latest_git_commit_hash": head.0,
+            }
+        }),
+    );
+}
+
+#[test_case::test_case(true, false; "pending remotes")]
+#[test_case::test_case(false, true; "pending HEAD")]
+#[tokio::test(start_paused = true)]
+async fn git_collection_keeps_independently_observed_refs_until_the_deadline(
+    head_ready: bool,
+    remotes_ready: bool,
+) {
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    let url = "https://example.invalid/repo.git";
+    let (send_head, head_probe) = tokio::sync::oneshot::channel();
+    let (send_remotes, remotes_probe) = tokio::sync::oneshot::channel();
+    let (send_status, status_probe) = tokio::sync::oneshot::channel();
+    if head_ready {
+        send_head.send(GitSha::new(head)).expect("send HEAD");
+    }
+    if remotes_ready {
+        let remotes =
+            BTreeMap::from([("origin".to_string(), url.try_into().expect("valid remote"))]);
+        send_remotes.send(remotes).expect("send remotes");
+    }
+
+    let start = tokio::time::Instant::now();
+    let mut latest = None;
+    let collect = collect_workspace_git_metadata(
+        async { GitHeadState::Commit(head_probe.await.expect("HEAD probe")) },
+        |updates| async move {
+            if let Ok(urls) = remotes_probe.await {
+                updates.send_replace(urls);
+            }
+        },
+        async { status_probe.await.ok() },
+        |workspace| latest = Some(workspace),
+    );
+    let _ = tokio::time::timeout(MEMORY_GIT_METADATA_TIMEOUT, collect).await;
+
+    assert_eq!(start.elapsed(), MEMORY_GIT_METADATA_TIMEOUT);
+    assert!(send_status.is_closed());
+    let workspace = latest.expect("workspace before deadline");
+    assert_eq!(
+        workspace.latest_git_commit_hash.as_deref(),
+        head_ready.then_some(head)
+    );
+    assert_eq!(
+        workspace
+            .associated_remote_urls
+            .as_ref()
+            .and_then(|urls| urls.get("origin"))
+            .map(SanitizedGitUrl::as_str),
+        remotes_ready.then_some(url),
+    );
+    assert_eq!(workspace.has_changes, None);
 }
 
 #[test]
-fn turn_metadata_state_uses_platform_sandbox_tag() {
+fn turn_metadata_state_includes_sandbox_metadata() {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
     let permission_profile = PermissionProfile::read_only();
@@ -194,23 +387,28 @@ fn turn_metadata_state_uses_platform_sandbox_tag() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ true,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
     let json: Value = serde_json::from_str(&header).expect("json");
     let sandbox_name = json.get("sandbox").and_then(Value::as_str);
+    let sandbox_mode = json.get(SANDBOX_MODE_KEY).and_then(Value::as_str);
+    let auto_review_enabled = json.get(AUTO_REVIEW_ENABLED_KEY).and_then(Value::as_bool);
     let session_id = json.get("session_id").and_then(Value::as_str);
     let thread_id = json.get("thread_id").and_then(Value::as_str);
 
     assert!(json.get("request_kind").is_none());
-    let expected_sandbox = permission_profile_sandbox_tag(
-        &permission_profile,
-        WindowsSandboxLevel::Disabled,
-        /*enforce_managed_network*/ false,
-    );
+    let expected_sandbox = get_platform_sandbox(/*windows_sandbox_enabled*/ false)
+        .map(SandboxType::as_metric_tag)
+        .unwrap_or("none");
     assert_eq!(sandbox_name, Some(expected_sandbox));
+    assert_eq!(sandbox_mode, Some("read-only"));
+    assert_eq!(auto_review_enabled, Some(true));
     assert_eq!(session_id, Some("session-a"));
     assert_eq!(thread_id, Some("thread-a"));
+    assert_eq!(json["agent_name"].as_str(), Some("/root"));
     assert!(json.get("forked_from_thread_id").is_none());
     assert!(json.get("parent_thread_id").is_none());
     assert!(json.get("subagent_kind").is_none());
@@ -237,6 +435,8 @@ fn turn_metadata_state_includes_root_fork_lineage() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
@@ -266,7 +466,7 @@ fn turn_metadata_state_includes_thread_spawn_subagent_parent_without_fork() {
         &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
             depth: 1,
-            agent_path: None,
+            agent_path: Some(AgentPath::root().join("worker").expect("agent path")),
             agent_nickname: None,
             agent_role: None,
         }),
@@ -276,6 +476,8 @@ fn turn_metadata_state_includes_thread_spawn_subagent_parent_without_fork() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
@@ -287,10 +489,11 @@ fn turn_metadata_state_includes_thread_spawn_subagent_parent_without_fork() {
         Some("22222222-2222-4222-8222-222222222222")
     );
     assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
+    assert_eq!(json["agent_name"].as_str(), Some("/root/worker"));
 }
 
 #[test]
-fn turn_metadata_state_includes_forked_thread_spawn_subagent_lineage() {
+fn turn_metadata_state_omits_fork_lineage_for_context_inheriting_subagent() {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
     let permission_profile = PermissionProfile::read_only();
@@ -315,20 +518,31 @@ fn turn_metadata_state_includes_forked_thread_spawn_subagent_lineage() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
     let json: Value = serde_json::from_str(&header).expect("json");
 
-    assert_eq!(
-        json["forked_from_thread_id"].as_str(),
-        Some("33333333-3333-4333-8333-333333333333")
-    );
+    assert!(json.get("forked_from_thread_id").is_none());
+    assert!(json.get(FORKED_FROM_ORDINAL_EXCLUSIVE_KEY).is_none());
     assert_eq!(
         json["parent_thread_id"].as_str(),
         Some("33333333-3333-4333-8333-333333333333")
     );
     assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
+    // V1 subagents have no canonical agent path and are intentionally unsupported by
+    // agent-name-addressed history and notes; their metadata falls back to the root agent.
+    assert_eq!(json["agent_name"].as_str(), Some("/root"));
+
+    let mcp_metadata = state
+        .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
+        .expect("MCP request metadata");
+    assert_eq!(
+        mcp_metadata["forked_from_thread_id"].as_str(),
+        Some("33333333-3333-4333-8333-333333333333")
+    );
 }
 
 #[test]
@@ -341,10 +555,6 @@ fn turn_metadata_state_includes_known_parent_for_non_thread_spawn_subagents_with
     let sources = [
         (SubAgentSource::Review, "review"),
         (SubAgentSource::Other("guardian".to_string()), "guardian"),
-        (
-            SubAgentSource::Other("agent_job:job-1".to_string()),
-            "agent_job:job-1",
-        ),
     ];
 
     for (subagent_source, subagent_kind) in sources {
@@ -360,6 +570,8 @@ fn turn_metadata_state_includes_known_parent_for_non_thread_spawn_subagents_with
             &permission_profile,
             WindowsSandboxLevel::Disabled,
             /*enforce_managed_network*/ false,
+            /*auto_review_enabled*/ false,
+            &model_info_from_slug("gpt-5.4"),
         );
 
         let header = test_turn_metadata_header(&state);
@@ -371,6 +583,7 @@ fn turn_metadata_state_includes_known_parent_for_non_thread_spawn_subagents_with
             Some("44444444-4444-4444-8444-444444444444")
         );
         assert_eq!(json["subagent_kind"].as_str(), Some(subagent_kind));
+        assert_eq!(json["agent_name"].as_str(), Some("/root"));
     }
 }
 
@@ -392,6 +605,8 @@ fn turn_metadata_state_includes_turn_started_at_unix_ms_after_start() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
     state.set_turn_started_at_unix_ms(/*turn_started_at_unix_ms*/ 1_700_000_000_123);
 
@@ -422,24 +637,36 @@ fn turn_metadata_state_includes_model_and_reasoning_effort_only_in_request_meta(
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
     let header_json: Value = serde_json::from_str(&header).expect("json");
+    assert_eq!(header_json["agent_name"].as_str(), Some("/root"));
     assert!(header_json.get("model").is_none());
     assert!(header_json.get("reasoning_effort").is_none());
 
     let meta = state
         .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
         .expect("turn metadata should be present");
+    assert!(meta.get("agent_name").is_none());
     assert!(meta.get("request_kind").is_none());
     assert_eq!(meta["model"].as_str(), Some("gpt-5.4"));
     assert_eq!(meta["reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(meta[AUTO_REVIEW_ENABLED_KEY].as_bool(), Some(true));
+    assert_eq!(
+        meta[NODE_REPL_AUTO_REVIEW_REQUIRED_KEY].as_bool(),
+        Some(true)
+    );
 
     let meta_without_reasoning_effort = state
-        .current_meta_value_for_mcp_request(McpTurnMetadataContext {
+        .current_meta_value_for_mcp_request(ExecutionMetadata {
             model: "gpt-5.4",
             reasoning_effort: None,
+            node_repl_disabled: false,
+            auto_review_enabled: false,
+            node_repl_auto_review_required: false,
         })
         .expect("turn metadata should be present");
     assert_eq!(
@@ -451,6 +678,101 @@ fn turn_metadata_state_includes_model_and_reasoning_effort_only_in_request_meta(
             .get("reasoning_effort")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn execution_metadata_applies_captured_settings_to_responses_metadata() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let config = Arc::make_mut(&mut turn.config);
+    config.approvals_reviewer = codex_protocol::config_types::ApprovalsReviewer::AutoReview;
+    config.permissions.approval_policy =
+        crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::OnRequest);
+    update_turn_settings_for_test(&mut turn, |settings| {
+        let model_info = Arc::make_mut(&mut settings.model_info);
+        model_info.slug = "captured-step-model".to_string();
+        model_info.node_repl_auto_review_required = true;
+        model_info.node_repl_disabled = true;
+    });
+    let step_context = StepContext::for_test(Arc::new(turn));
+
+    let mut metadata = step_context.turn.turn_metadata_state.to_responses_metadata(
+        "installation-a".to_string(),
+        "window-a".to_string(),
+        CodexResponsesRequestKind::Turn,
+    );
+    ExecutionMetadata::from_settings(&step_context.settings).apply_to(&mut metadata);
+    let metadata = metadata.turn_metadata_value().expect("turn metadata");
+
+    assert_eq!(metadata["model"], "captured-step-model");
+    assert_eq!(metadata[AUTO_REVIEW_ENABLED_KEY], true);
+    assert_eq!(metadata[NODE_REPL_AUTO_REVIEW_REQUIRED_KEY], true);
+    assert_eq!(metadata[NODE_REPL_DISABLED_KEY], true);
+}
+
+#[tokio::test]
+async fn guardian_affinity_requires_the_captured_parent_and_stays_out_of_metadata() {
+    let uri = "wss://metadata-affinity.chatgpt.com/backend-api/codex/responses"
+        .parse()
+        .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::SET_COOKIE,
+        http::HeaderValue::from_static("__oailb=private-parent-pin; Path=/; Secure; Max-Age=3600"),
+    );
+    let affinity =
+        codex_http_client::ChatGptRoutingAffinity::from_response(&uri, &headers).unwrap();
+    for (subagent, request_parent, expected) in [
+        (Some("guardian"), "parent", true),
+        (Some("guardian"), "other-parent", false),
+        (None, "parent", false),
+    ] {
+        let (session, mut turn) = make_session_and_context().await;
+        Arc::get_mut(&mut turn.turn_metadata_state)
+            .unwrap()
+            .subagent_header = subagent.map(str::to_owned);
+        turn.turn_metadata_state
+            .update_responsesapi_client_metadata(
+                codex_protocol::turn_input::ResponsesApiClientMetadataUpdate {
+                    replacement: Some(HashMap::from([(
+                        "parent_response_id".to_owned(),
+                        request_parent.to_owned(),
+                    )])),
+                    patch: None,
+                },
+            );
+        session
+            .services
+            .thread_extension_data
+            .insert(crate::guardian::PendingReviewRouting(Some(Arc::new(
+                crate::guardian::ParentResponse {
+                    id: "parent".to_owned(),
+                    routing_affinity: Some(affinity.clone()),
+                },
+            ))));
+        let step = StepContext::for_test(Arc::new(turn));
+        let metadata = session
+            .responses_metadata(&step, CodexResponsesRequestKind::Turn)
+            .await;
+        assert_eq!(
+            metadata
+                .parent_routing_affinity
+                .as_ref()
+                .and_then(|pin| pin.cookie_header(&uri)),
+            expected.then(|| http::HeaderValue::from_static("__oailb=private-parent-pin"))
+        );
+        assert!(
+            !metadata
+                .turn_metadata_json()
+                .unwrap()
+                .contains("private-parent-pin")
+        );
+        assert!(
+            !serde_json::to_string(&metadata.client_metadata(/*include_internal*/ true))
+                .unwrap()
+                .contains("private-parent-pin")
+        );
+        assert!(!format!("{:?}", metadata.compatibility_headers()).contains("private-parent-pin"));
+    }
 }
 
 #[test]
@@ -471,6 +793,8 @@ fn turn_metadata_state_marks_user_input_requested_during_turn_only_for_mcp_reque
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
 
     let header = test_turn_metadata_header(&state);
@@ -506,6 +830,46 @@ fn turn_metadata_state_marks_user_input_requested_during_turn_only_for_mcp_reque
     );
 }
 
+#[tokio::test]
+async fn child_metadata_snapshot_excludes_parent_review_and_routing_fields() {
+    let (_, turn) = make_session_and_context().await;
+    let state = &turn.turn_metadata_state;
+    let client_metadata = HashMap::from([
+        ("cost_center".to_string(), "before".to_string()),
+        ("thread_id".to_string(), "parent-thread".to_string()),
+        ("turn_id".to_string(), "parent-turn".to_string()),
+        (
+            "mcp_request_meta".to_string(),
+            r#"{"selected_connector_ids":["parent-connector"]}"#.to_string(),
+        ),
+        (
+            "parent_response_id".to_string(),
+            "parent-response".to_string(),
+        ),
+        (
+            "misalignment_override".to_string(),
+            r#"{"review_target":"parent-only"}"#.to_string(),
+        ),
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
+    let snapshot = state.client_metadata_for_child();
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        patch: Some(HashMap::from([(
+            "cost_center".to_string(),
+            "after".to_string(),
+        )])),
+        ..Default::default()
+    });
+    assert_eq!(
+        [snapshot, state.client_metadata_for_child()],
+        ["before", "after"]
+            .map(|value| HashMap::from([("cost_center".to_string(), value.to_string(),)])),
+    );
+}
+
 #[test]
 fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -524,8 +888,18 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
-    state.set_responsesapi_client_metadata(HashMap::from([
+    let client_metadata = HashMap::from([
+        (
+            LEGACY_CODE_MODE_TOOL_NAMES_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
+        (
+            TOOL_NAMESPACES_INFO_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
         (
             "turn_started_at_unix_ms".to_string(),
             "client-supplied".to_string(),
@@ -538,16 +912,48 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
             "parent_thread_id".to_string(),
             "client-supplied".to_string(),
         ),
+        ("parent_turn_id".to_string(), "client-supplied".to_string()),
+        (ROOT_TURN_ID_KEY.to_string(), "client-supplied".to_string()),
         ("subagent_kind".to_string(), "client-supplied".to_string()),
-    ]));
+        (
+            "history_initialization".to_string(),
+            "client-supplied".to_string(),
+        ),
+        (
+            SANDBOX_MODE_KEY.to_string(),
+            "danger-full-access".to_string(),
+        ),
+        (AUTO_REVIEW_ENABLED_KEY.to_string(), "true".to_string()),
+        (
+            NODE_REPL_AUTO_REVIEW_REQUIRED_KEY.to_string(),
+            "true".to_string(),
+        ),
+        (NODE_REPL_DISABLED_KEY.to_string(), "true".to_string()),
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
 
     let header = test_turn_metadata_header(&state);
     let json: Value = serde_json::from_str(&header).expect("json");
 
+    assert!(json.get(LEGACY_CODE_MODE_TOOL_NAMES_KEY).is_none());
+    assert!(json.get(TOOL_NAMESPACES_INFO_KEY).is_none());
     assert!(json.get("turn_started_at_unix_ms").is_none());
     assert!(json.get("forked_from_thread_id").is_none());
     assert!(json.get("parent_thread_id").is_none());
+    assert!(json.get("parent_turn_id").is_none());
+    assert!(json.get(ROOT_TURN_ID_KEY).is_none());
     assert!(json.get("subagent_kind").is_none());
+    assert!(json.get("history_initialization").is_none());
+    assert_eq!(json[SANDBOX_MODE_KEY].as_str(), Some("read-only"));
+    assert_eq!(json[AUTO_REVIEW_ENABLED_KEY].as_bool(), Some(false));
+    assert_eq!(
+        json[NODE_REPL_AUTO_REVIEW_REQUIRED_KEY].as_bool(),
+        Some(false)
+    );
+    assert_eq!(json[NODE_REPL_DISABLED_KEY].as_bool(), Some(false));
 }
 
 #[test]
@@ -578,18 +984,44 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
-    state.set_responsesapi_client_metadata(HashMap::from([
+    state.set_responses_api_metadata(BTreeMap::from([
+        ("codex_security_surface".to_string(), "sdk".to_string()),
+        (ANALYTICS_ENABLED_KEY.to_string(), "false".to_string()),
+        ("source".to_string(), " Configured_Source ".to_string()),
+        (
+            WINDOW_NUMBER_KEY.to_string(),
+            "configured-value".to_string(),
+        ),
+        (
+            FORKED_FROM_ORDINAL_EXCLUSIVE_KEY.to_string(),
+            "configured-value".to_string(),
+        ),
+    ]));
+    state.set_parent_turn_id("parent-turn-a".to_string());
+    state.set_root_turn_id("root-turn-a".to_string());
+    state.set_turn_trigger("goal".to_string());
+    let client_metadata = HashMap::from([
+        (
+            "codex_security_surface".to_string(),
+            "client-supplied".to_string(),
+        ),
         ("fiber_run_id".to_string(), "fiber-123".to_string()),
+        (ANALYTICS_ENABLED_KEY.to_string(), "true".to_string()),
         ("origin".to_string(), "東京".to_string()),
         ("workspace_kind".to_string(), "projectless".to_string()),
+        ("source".to_string(), "client-source".to_string()),
         ("model".to_string(), "client-supplied".to_string()),
+        ("codex_version".to_string(), "client-supplied".to_string()),
         (
             "reasoning_effort".to_string(),
             "client-supplied".to_string(),
         ),
         ("session_id".to_string(), "client-supplied".to_string()),
         ("thread_id".to_string(), "client-supplied".to_string()),
+        ("agent_name".to_string(), "client-supplied".to_string()),
         ("installation_id".to_string(), "client-supplied".to_string()),
         (
             "x-codex-installation-id".to_string(),
@@ -611,47 +1043,78 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
             "parent_thread_id".to_string(),
             "client-supplied".to_string(),
         ),
+        ("parent_turn_id".to_string(), "client-supplied".to_string()),
+        (ROOT_TURN_ID_KEY.to_string(), "client-supplied".to_string()),
         ("subagent_kind".to_string(), "client-supplied".to_string()),
+        (
+            LEGACY_CODE_MODE_TOOL_NAMES_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
+        (
+            TOOL_NAMESPACES_INFO_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
         ("turn_id".to_string(), "client-supplied".to_string()),
         (WINDOW_ID_KEY.to_string(), "client-supplied".to_string()),
+        (WINDOW_NUMBER_KEY.to_string(), "client-supplied".to_string()),
+        (
+            CONTEXT_WINDOW_ID_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
+        (
+            FORKED_FROM_ORDINAL_EXCLUSIVE_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
         ("thread_source".to_string(), "client-supplied".to_string()),
+        (TURN_TRIGGER_KEY.to_string(), "client-supplied".to_string()),
         ("request_kind".to_string(), "client-supplied".to_string()),
         (
             "turn_started_at_unix_ms".to_string(),
             "client-supplied".to_string(),
         ),
-    ]));
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
     state.set_turn_started_at_unix_ms(/*turn_started_at_unix_ms*/ 1_700_000_000_123);
-
     let header = test_turn_metadata_header(&state);
     assert!(header.is_ascii());
     assert!(!header.contains("東京"));
     let json: Value = serde_json::from_str(&header).expect("json");
 
     assert_eq!(json["fiber_run_id"].as_str(), Some("fiber-123"));
+    assert!(json.get(ANALYTICS_ENABLED_KEY).is_none());
     assert_eq!(json["origin"].as_str(), Some("東京"));
     assert_eq!(json["workspace_kind"].as_str(), Some("projectless"));
+    assert_eq!(json["codex_security_surface"].as_str(), Some("sdk"));
     assert_eq!(json["model"].as_str(), Some("client-supplied"));
     assert_eq!(json["reasoning_effort"].as_str(), Some("client-supplied"));
     assert_eq!(json["session_id"].as_str(), Some("session-a"));
     assert_eq!(json["thread_id"].as_str(), Some("thread-a"));
+    assert!(json.get(LEGACY_CODE_MODE_TOOL_NAMES_KEY).is_none());
+    assert_eq!(json["agent_name"].as_str(), Some("/root"));
+    assert!(json.get(TOOL_NAMESPACES_INFO_KEY).is_none());
     assert!(json.get(INSTALLATION_ID_KEY).is_none());
     assert!(json.get("x-codex-installation-id").is_none());
     assert!(json.get("x-codex-parent-thread-id").is_none());
     assert!(json.get("x-openai-subagent").is_none());
-    assert_eq!(
-        json["forked_from_thread_id"].as_str(),
-        Some("44444444-4444-4444-8444-444444444444")
-    );
+    assert!(json.get("forked_from_thread_id").is_none());
+    assert!(json.get(FORKED_FROM_ORDINAL_EXCLUSIVE_KEY).is_none());
     assert_eq!(
         json["parent_thread_id"].as_str(),
         Some("55555555-5555-4555-8555-555555555555")
     );
+    assert_eq!(json["parent_turn_id"].as_str(), Some("parent-turn-a"));
+    assert_eq!(json[ROOT_TURN_ID_KEY].as_str(), Some("root-turn-a"));
     assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
     assert_eq!(json["thread_source"].as_str(), Some("automation"));
+    assert_eq!(json[TURN_TRIGGER_KEY].as_str(), Some("goal"));
     assert_eq!(json["turn_id"].as_str(), Some("turn-a"));
     assert!(json.get("request_kind").is_none());
     assert!(json.get(WINDOW_ID_KEY).is_none());
+    assert!(json.get(WINDOW_NUMBER_KEY).is_none());
+    assert!(json.get(CONTEXT_WINDOW_ID_KEY).is_none());
     assert_eq!(
         json["turn_started_at_unix_ms"].as_i64(),
         Some(1_700_000_000_123)
@@ -662,8 +1125,16 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         serde_json::from_str(&model_request_header).expect("model request json");
     assert_eq!(model_request_json["request_kind"].as_str(), Some("turn"));
     assert_eq!(
+        model_request_json[ROOT_TURN_ID_KEY].as_str(),
+        Some("root-turn-a")
+    );
+    assert_eq!(
         model_request_json["thread_source"].as_str(),
         Some("automation")
+    );
+    assert_eq!(
+        model_request_json["codex_security_surface"].as_str(),
+        Some("sdk")
     );
     assert_eq!(
         model_request_json[INSTALLATION_ID_KEY].as_str(),
@@ -674,17 +1145,129 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         Some("thread-a:1")
     );
 
+    let compatibility_headers =
+        test_turn_responses_metadata(&state, "thread-a:1").compatibility_headers();
+    let compatibility_metadata: Value = serde_json::from_str(
+        compatibility_headers
+            .get("x-codex-turn-metadata")
+            .expect("compatibility turn metadata header")
+            .to_str()
+            .expect("valid compatibility header"),
+    )
+    .expect("compatibility metadata json");
+    assert!(
+        compatibility_metadata
+            .get(LEGACY_CODE_MODE_TOOL_NAMES_KEY)
+            .is_none()
+    );
+    assert!(
+        compatibility_metadata
+            .get(TOOL_NAMESPACES_INFO_KEY)
+            .is_none()
+    );
+
     let meta = state
         .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
         .expect("turn metadata should be present");
     assert_eq!(meta["model"].as_str(), Some("gpt-5.4"));
+    assert_eq!(meta["codex_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(meta["reasoning_effort"].as_str(), Some("high"));
+    assert!(meta.get(LEGACY_CODE_MODE_TOOL_NAMES_KEY).is_none());
+    assert!(meta.get(TOOL_NAMESPACES_INFO_KEY).is_none());
+    assert!(meta.get(PARENT_TURN_ID_KEY).is_none());
+    assert!(meta.get(ROOT_TURN_ID_KEY).is_none());
     assert!(meta.get(WINDOW_ID_KEY).is_none());
+    assert!(meta.get("codex_security_surface").is_none());
+    assert!(meta.get(ANALYTICS_ENABLED_KEY).is_none());
+    let extension_meta = state
+        .current_meta_value_for_extension_request(test_mcp_turn_metadata_context())
+        .expect("extension metadata should be present");
+    assert_eq!(extension_meta["codex_security_surface"], "sdk");
+    assert_eq!(extension_meta["source"], " Configured_Source ");
+    assert_eq!(extension_meta[TURN_TRIGGER_KEY], "goal");
+    assert_eq!(extension_meta["model"], "gpt-5.4");
+    assert!(extension_meta.get(TOOL_NAMESPACES_INFO_KEY).is_none());
     assert_eq!(state.workspace_kind().as_deref(), Some("projectless"));
+    assert_eq!(
+        (state.turn_trigger(), state.codex_turn_source()),
+        (
+            Some("goal".to_string()),
+            Some(" Configured_Source ".to_string())
+        )
+    );
+    assert_eq!(model_request_json["source"], " Configured_Source ");
+
+    for (configured, client, expected) in [
+        (None, None, None),
+        (
+            None,
+            Some(" New_Source ".to_string()),
+            Some(" New_Source ".to_string()),
+        ),
+        (None, Some(String::new()), Some(String::new())),
+        (None, Some("é".repeat(/*n*/ 64)), Some("é".repeat(/*n*/ 64))),
+        (None, Some("é".repeat(/*n*/ 65)), None),
+        (
+            Some("x".repeat(/*n*/ 129)),
+            Some("client-source".to_string()),
+            None,
+        ),
+    ] {
+        state.set_responses_api_metadata(
+            configured
+                .map(|source| ("source".to_string(), source))
+                .into_iter()
+                .collect(),
+        );
+        state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+            replacement: Some(
+                client
+                    .map(|source| ("source".to_string(), source))
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        assert_eq!(state.codex_turn_source(), expected);
+    }
 }
 
 #[test]
-fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
+fn turn_metadata_state_bounds_trigger_only_for_analytics() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    for (characters, included) in [(64, true), (65, false)] {
+        let state = TurnMetadataState::new(
+            "session-a".to_string(),
+            "thread-a".to_string(),
+            /*forked_from_thread_id*/ None,
+            /*parent_thread_id*/ None,
+            &SessionSource::Exec,
+            /*thread_source*/ None,
+            "turn-a".to_string(),
+            temp_dir.path().abs(),
+            &PermissionProfile::read_only(),
+            WindowsSandboxLevel::Disabled,
+            /*enforce_managed_network*/ false,
+            /*auto_review_enabled*/ false,
+            &model_info_from_slug("gpt-5.4"),
+        );
+        let trigger = "é".repeat(characters);
+        state.set_turn_trigger(trigger.clone());
+        let metadata: Value =
+            serde_json::from_str(&test_turn_metadata_header(&state)).expect("json");
+        assert_eq!(
+            (state.turn_trigger(), metadata[TURN_TRIGGER_KEY].as_str()),
+            (included.then(|| trigger.clone()), Some(trigger.as_str()))
+        );
+    }
+}
+
+#[test_case::test_case(r#"{"review_target":"RB._~:-opaque"}"#, None; "target")]
+#[test_case::test_case(r#"{"timestamp":1750000000}"#, Some(r#"{"timestamp":1750000000}"#); "legacy_timestamp")]
+fn turn_metadata_state_overlays_compaction_only_on_compaction_requests(
+    continuation: &str,
+    compaction_override: Option<&str>,
+) {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
     let permission_profile = PermissionProfile::read_only();
@@ -700,11 +1283,39 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
     );
-    state.set_responsesapi_client_metadata(HashMap::from([(
-        "compaction".to_string(),
-        "client-supplied".to_string(),
-    )]));
+    state.set_responses_api_metadata(BTreeMap::from([
+        ("codex_security_surface".to_string(), "sdk".to_string()),
+        (
+            "misalignment_override".to_string(),
+            r#"{"review_target":"RC"}"#.to_string(),
+        ),
+    ]));
+    let ordinary_json: Value =
+        serde_json::from_str(&test_turn_responses_metadata_json(&state, "thread-a:1"))
+            .expect("json");
+    assert!(ordinary_json.get("misalignment_override").is_none());
+    let client_metadata = HashMap::from([
+        ("compaction".to_string(), "client-supplied".to_string()),
+        (
+            "misalignment_override".to_string(),
+            continuation.to_string(),
+        ),
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
+
+    let mcp_metadata = state
+        .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
+        .expect("MCP metadata");
+    assert_eq!(
+        mcp_metadata["misalignment_override"].as_str(),
+        compaction_override
+    );
 
     let compact_header = test_compaction_responses_metadata_json(
         &state,
@@ -720,6 +1331,11 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
     assert_eq!(compact_json["request_kind"].as_str(), Some("compaction"));
     assert_eq!(compact_json["turn_id"].as_str(), Some("turn-a"));
     assert_eq!(compact_json[WINDOW_ID_KEY].as_str(), Some("thread-a:2"));
+    assert_eq!(compact_json["codex_security_surface"].as_str(), Some("sdk"));
+    assert_eq!(
+        compact_json["misalignment_override"].as_str(),
+        compaction_override
+    );
     assert_eq!(
         compact_json["compaction"],
         serde_json::json!({
@@ -733,19 +1349,358 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
 
     let regular_header = test_turn_responses_metadata_json(&state, "thread-a:3");
     let regular_json: Value = serde_json::from_str(&regular_header).expect("json");
+    assert_eq!(regular_json["misalignment_override"], continuation);
     assert_eq!(regular_json["request_kind"].as_str(), Some("turn"));
     assert_eq!(regular_json[WINDOW_ID_KEY].as_str(), Some("thread-a:3"));
+    assert_eq!(regular_json["codex_security_surface"].as_str(), Some("sdk"));
     assert!(regular_json.get("compaction").is_none());
 }
 
+#[test]
+fn responses_api_metadata_rejects_reserved_keys() {
+    for reserved_key in [
+        "thread_source",
+        TURN_TRIGGER_KEY,
+        WINDOW_ID_KEY,
+        CONTEXT_WINDOW_ID_KEY,
+    ] {
+        assert_eq!(
+            validate_extra_metadata(
+                BTreeMap::from([(reserved_key.to_string(), "sdk".to_string())]).iter()
+            ),
+            Err("responses_api_metadata contains a reserved key")
+        );
+    }
+}
+
+#[test]
+fn responses_api_metadata_accepts_previously_valid_reserved_keys() {
+    for legacy_key in [
+        WINDOW_NUMBER_KEY,
+        FORKED_FROM_ORDINAL_EXCLUSIVE_KEY,
+        ANALYTICS_ENABLED_KEY,
+    ] {
+        assert_eq!(
+            validate_extra_metadata(
+                BTreeMap::from([(legacy_key.to_string(), "legacy-value".to_string())]).iter()
+            ),
+            Ok(())
+        );
+    }
+}
+
 #[tokio::test]
-async fn turn_metadata_state_preserves_lineage_after_git_enrichment() {
+async fn preparing_model_request_metadata_does_not_wait_for_pending_git_enrichment() {
+    let (session, turn) = make_session_and_context().await;
+    let (_updates, workspaces) = watch::channel(BTreeMap::new());
+    turn.turn_metadata_state
+        .set_git_enrichment(TurnGitEnrichment {
+            workspaces: Some(workspaces),
+            task: None,
+            admission: None,
+        });
+    let step = StepContext::for_test(Arc::new(turn));
+
+    let metadata = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.responses_metadata(&step, CodexResponsesRequestKind::Turn),
+    )
+    .await
+    .expect("generation must continue while optional Git discovery is pending");
+    assert!(metadata.workspaces.is_empty());
+}
+
+#[tokio::test]
+async fn turn_git_status_waits_for_admission() {
+    let (admission, request) = oneshot::channel();
+    let started = AtomicBool::new(false);
+    let status =
+        collect_git_status_after_admission(GitCollectionAdmission::Pending(request), async {
+            started.store(true, Ordering::SeqCst);
+            None
+        });
+    tokio::pin!(status);
+    assert!(futures::poll!(status.as_mut()).is_pending());
+    assert!(!started.load(Ordering::SeqCst));
+    admission.send(()).expect("admit");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), status)
+            .await
+            .expect("Git status should finish after admission")
+            .is_none()
+    );
+    assert!(started.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn git_enrichment_publishes_refs_before_status_is_available() {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let url = "https://example.invalid/repo.git";
+    assert!(
+        Command::new("git")
+            .args(["remote", "add", "origin", url])
+            .current_dir(&repo)
+            .status()
+            .await
+            .expect("add remote")
+            .success()
+    );
+    let head = get_head_commit_hash(&repo).await.expect("read HEAD");
+    let refs = serde_json::json!({
+        "associated_remote_urls": {"origin": url},
+        "latest_git_commit_hash": head.0,
+    });
+    let mut clean = refs.clone();
+    clean["has_changes"] = Value::Bool(false);
+
+    let updates =
+        collect_with_status_after_refs(&repo, get_worktree_status_in_repo(&repo, &repo)).await;
+    assert!(
+        updates
+            .first()
+            .expect("early refs")
+            .get("has_changes")
+            .is_none()
+    );
+    assert_eq!(updates.last(), Some(&clean));
+    assert_eq!(
+        collect_with_status_after_refs(&repo, std::future::ready(None))
+            .await
+            .last(),
+        Some(&refs),
+    );
+}
+
+#[tokio::test]
+async fn git_enrichment_keeps_verified_remotes_while_ambiguous_lookups_are_pending() {
+    let urls = BTreeMap::from([(
+        "origin".to_string(),
+        SanitizedGitUrl::try_from("https://example.invalid/repo").unwrap(),
+    )]);
+    let initial = urls.clone();
+    let mut all_urls = urls.clone();
+    all_urls.insert(
+        "upstream".to_string(),
+        SanitizedGitUrl::try_from("https://example.invalid/upstream").unwrap(),
+    );
+    let final_update = all_urls.clone();
+    let (resume_lookup, wait_for_publication) = oneshot::channel();
+    let mut resume_lookup = Some(resume_lookup);
+    let mut observed = Vec::new();
+    let collect = collect_workspace_git_metadata(
+        std::future::ready(GitHeadState::Unavailable),
+        |verified| async move {
+            verified.send_replace(initial);
+            wait_for_publication.await.unwrap();
+            verified.send_replace(final_update);
+        },
+        std::future::ready(None),
+        |workspace| {
+            observed.push(workspace.associated_remote_urls);
+            if let Some(ack) = resume_lookup.take() {
+                ack.send(()).unwrap();
+            }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), collect)
+        .await
+        .unwrap();
+    assert_eq!(observed, vec![Some(urls), Some(all_urls)]);
+}
+
+#[tokio::test]
+async fn git_enrichment_publishes_verified_status_while_remotes_are_pending() {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let head = get_head_commit_hash(&repo).await.expect("read HEAD");
+    let (release_remotes, wait_for_status) = tokio::sync::oneshot::channel();
+    let mut release_remotes = Some(release_remotes);
+    let collect = collect_workspace_git_metadata(
+        get_head_state(&repo),
+        |updates| {
+            let repo = &repo;
+            async move {
+                wait_for_status.await.expect("verified worktree status");
+                observe_git_remote_urls(repo, &updates).await;
+            }
+        },
+        get_worktree_status_in_repo(&repo, &repo),
+        |workspace| {
+            if let Some(dirty) = workspace.has_changes
+                && let Some(release) = release_remotes.take()
+            {
+                assert_eq!(workspace.latest_git_commit_hash.as_ref(), Some(&head.0));
+                assert_eq!(workspace.associated_remote_urls, None);
+                assert!(!dirty);
+                release.send(()).expect("release remote lookup");
+            }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), collect)
+        .await
+        .expect("verified status should be published before remotes return");
+}
+
+#[test_case::test_case(true; "confirmed unborn HEAD")]
+#[test_case::test_case(false; "HEAD still pending")]
+#[tokio::test(start_paused = true)]
+async fn git_enrichment_requires_confirmed_head_for_unborn_status(head_ready: bool) {
+    let mut published_dirty = None;
+    let collect = collect_workspace_git_metadata(
+        async {
+            if !head_ready {
+                std::future::pending::<()>().await;
+            }
+            GitHeadState::Missing
+        },
+        |_| std::future::ready(()),
+        std::future::ready(Some(GitWorktreeStatus {
+            head_commit_hash: None,
+            has_changes: true,
+        })),
+        |workspace| published_dirty = workspace.has_changes,
+    );
+    let _ = tokio::time::timeout(MEMORY_GIT_METADATA_TIMEOUT, collect).await;
+    assert_eq!(published_dirty, head_ready.then_some(true));
+}
+
+#[tokio::test]
+async fn git_enrichment_keeps_dirty_status_when_an_unborn_repo_contains_a_head_file() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let repo = temp_dir.path().abs();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .await
+            .expect("git init")
+            .success()
+    );
+    std::fs::write(repo.join("HEAD"), "untracked").expect("write HEAD file");
+    let mut workspaces = BTreeMap::new();
+    collect_git_workspaces(
+        &repo,
+        std::future::ready(Some(repo.as_path().to_path_buf())),
+        GitCollectionAdmission::Immediate,
+        |observed| workspaces = observed,
+    )
+    .await;
+    let workspace = workspaces
+        .get(repo.to_string_lossy().as_ref())
+        .expect("workspace");
+    assert_eq!(workspace.latest_git_commit_hash, None);
+    assert_eq!(workspace.has_changes, Some(true));
+}
+
+#[tokio::test]
+async fn git_enrichment_recovers_commit_and_status_when_independent_head_lookup_fails() {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let head = get_head_commit_hash(&repo).await.expect("read HEAD");
+    std::fs::write(repo.join("untracked"), "dirty").expect("write untracked file");
+    let mut latest = None;
+    collect_workspace_git_metadata(
+        std::future::ready(GitHeadState::Unavailable),
+        |_| std::future::ready(()),
+        get_worktree_status_in_repo(&repo, &repo),
+        |workspace| latest = Some(workspace),
+    )
+    .await;
+    let workspace = latest.expect("workspace");
+    assert_eq!(
+        workspace.latest_git_commit_hash.as_deref(),
+        Some(head.0.as_str())
+    );
+    assert_eq!(workspace.has_changes, Some(true));
+}
+
+#[tokio::test]
+async fn git_enrichment_rejects_a_committed_status_when_head_is_missing() {
+    let head = GitSha::new("0123456789abcdef0123456789abcdef01234567");
+    let mut latest = None;
+    collect_workspace_git_metadata(
+        std::future::ready(GitHeadState::Missing),
+        |_| std::future::ready(()),
+        std::future::ready(Some(GitWorktreeStatus {
+            head_commit_hash: Some(head),
+            has_changes: false,
+        })),
+        |workspace| latest = Some(workspace),
+    )
+    .await;
+    assert!(latest.is_none());
+}
+
+#[test_case::test_case(false; "new HEAD is clean")]
+#[test_case::test_case(true; "new HEAD is dirty")]
+#[tokio::test]
+async fn git_enrichment_does_not_pair_old_head_with_new_status(expected_has_changes: bool) {
+    let (_temp_dir, repo) = create_clean_git_repo("repo").await;
+    let head = get_head_commit_hash(&repo)
+        .await
+        .expect("read original HEAD");
+    let status = async {
+        assert!(
+            Command::new("git")
+                .args(["commit", "--allow-empty", "-qm", "new HEAD"])
+                .current_dir(&repo)
+                .status()
+                .await
+                .expect("commit")
+                .success()
+        );
+        if expected_has_changes {
+            std::fs::write(repo.join("untracked.txt"), "dirty\n").expect("dirty worktree");
+        }
+        let new_head = get_head_commit_hash(&repo).await.expect("read new HEAD");
+        let status = get_worktree_status_in_repo(&repo, &repo)
+            .await
+            .expect("read successful status for the new HEAD");
+        assert_eq!(status.head_commit_hash, Some(new_head));
+        assert_eq!(status.has_changes, expected_has_changes);
+        Some(status)
+    };
+    assert_eq!(
+        collect_with_status_after_refs(&repo, status).await,
+        vec![serde_json::json!({"latest_git_commit_hash": head.0})],
+    );
+}
+
+async fn collect_with_status_after_refs(
+    repo: &AbsolutePathBuf,
+    status: impl Future<Output = Option<GitWorktreeStatus>>,
+) -> Vec<Value> {
+    let (send_refs_ready, refs_ready) = tokio::sync::oneshot::channel();
+    let mut send_refs_ready = Some(send_refs_ready);
+    let mut updates = Vec::new();
+    let status = async {
+        refs_ready.await.expect("refs published");
+        status.await
+    };
+    let collect = collect_workspace_git_metadata(
+        get_head_state(repo),
+        |updates| async move { observe_git_remote_urls(repo, &updates).await },
+        status,
+        |workspace| {
+            updates.push(serde_json::to_value(workspace).expect("serialize workspace"));
+            if let Some(ready) = send_refs_ready.take() {
+                ready.send(()).expect("release status scan");
+            }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), collect)
+        .await
+        .expect("refs should be published while status is pending");
+    updates
+}
+
+#[tokio::test]
+async fn turn_metadata_state_preserves_subagent_parent_after_git_enrichment() {
     let (_temp_dir, repo_path) = create_clean_git_repo("repo").await;
 
     let permission_profile = PermissionProfile::read_only();
     let parent_thread_id =
         ThreadId::from_string("66666666-6666-4666-8666-666666666666").expect("thread id");
-    let state = TurnMetadataState::new(
+    let state = Arc::new(TurnMetadataState::new(
         "session-a".to_string(),
         "thread-a".to_string(),
         Some(parent_thread_id),
@@ -763,34 +1718,238 @@ async fn turn_metadata_state_preserves_lineage_after_git_enrichment() {
         &permission_profile,
         WindowsSandboxLevel::Disabled,
         /*enforce_managed_network*/ false,
-    );
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
+    ));
 
-    state.spawn_git_enrichment_task();
+    state.spawn_git_enrichment_task(Arc::default());
+    let json = wait_for_git_enrichment(&state).await;
 
-    let json = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let header = test_turn_metadata_header(&state);
-            let json: Value = serde_json::from_str(&header).expect("json");
-            if json
-                .get("workspaces")
-                .and_then(Value::as_object)
-                .is_some_and(|workspaces| !workspaces.is_empty())
-            {
-                return json;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("git enrichment should complete");
-
-    assert_eq!(
-        json["forked_from_thread_id"].as_str(),
-        Some("66666666-6666-4666-8666-666666666666")
-    );
+    assert!(json.get("forked_from_thread_id").is_none());
     assert_eq!(
         json["parent_thread_id"].as_str(),
         Some("66666666-6666-4666-8666-666666666666")
     );
     assert_eq!(json["subagent_kind"].as_str(), Some("thread_spawn"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_metadata_state_coalesces_concurrent_git_enrichment() {
+    let (_temp_dir, repo_path) = create_clean_git_repo("repo").await;
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git rev-parse HEAD");
+    let head = String::from_utf8(head.stdout)
+        .expect("commit hash")
+        .trim()
+        .to_string();
+    let permission_profile = PermissionProfile::read_only();
+    let state = Arc::new(TurnMetadataState::new(
+        "session-a".to_string(),
+        "thread-a".to_string(),
+        /*forked_from_thread_id*/ None,
+        /*parent_thread_id*/ None,
+        &SessionSource::Exec,
+        /*thread_source*/ None,
+        "turn-a".to_string(),
+        repo_path.clone(),
+        &permission_profile,
+        WindowsSandboxLevel::Disabled,
+        /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
+    ));
+    let git_root_discovery = Arc::default();
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let tasks = (0..8)
+        .map(|_| {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            let git_root_discovery = Arc::clone(&git_root_discovery);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                state.spawn_git_enrichment_task(git_root_discovery);
+                state
+                    .git_enrichment
+                    .lock()
+                    .expect("enrichment task lock")
+                    .task
+                    .as_ref()
+                    .expect("enrichment task")
+                    .abort_handle()
+                    .id()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut task_ids = Vec::new();
+    for task in tasks {
+        task_ids.push(task.await.expect("spawn task"));
+    }
+    assert!(task_ids.iter().all(|task_id| *task_id == task_ids[0]));
+
+    let json = wait_for_git_enrichment(state.as_ref()).await;
+    assert_eq!(
+        json["workspaces"],
+        serde_json::json!({
+            repo_path.to_string_lossy().as_ref(): {
+                "latest_git_commit_hash": head,
+                "has_changes": false,
+            }
+        })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_turn_metadata_aborts_unused_git_enrichment() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let state = Arc::new(TurnMetadataState::new(
+        "session-a".to_string(),
+        "thread-a".to_string(),
+        /*forked_from_thread_id*/ None,
+        /*parent_thread_id*/ None,
+        &SessionSource::Exec,
+        /*thread_source*/ None,
+        "turn-a".to_string(),
+        temp_dir.path().abs(),
+        &PermissionProfile::read_only(),
+        WindowsSandboxLevel::Disabled,
+        /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
+    ));
+    let weak_state = Arc::downgrade(&state);
+    state.spawn_git_enrichment_task(Arc::default());
+    let task = state
+        .git_enrichment
+        .lock()
+        .expect("enrichment task lock")
+        .task
+        .as_ref()
+        .expect("enrichment task")
+        .abort_handle();
+
+    // Drop the history-only context before its task can run. A strong task-owned
+    // reference would retain the metadata even after every caller has left.
+    drop(state);
+    assert!(weak_state.upgrade().is_none());
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping turn metadata should abort its enrichment task");
+}
+
+#[tokio::test]
+async fn git_enrichment_discovers_the_repository_when_it_starts() {
+    let (workspace, repo_path) = create_clean_git_repo("repo").await;
+    let saved_git = workspace.path().join("saved-git");
+    std::fs::rename(repo_path.join(".git"), &saved_git).expect("move Git metadata");
+    let state = Arc::new(TurnMetadataState::new(
+        "session-a".to_string(),
+        "thread-a".to_string(),
+        /*forked_from_thread_id*/ None,
+        /*parent_thread_id*/ None,
+        &SessionSource::Exec,
+        /*thread_source*/ None,
+        "turn-a".to_string(),
+        repo_path.clone(),
+        &PermissionProfile::read_only(),
+        WindowsSandboxLevel::Disabled,
+        /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
+    ));
+    std::fs::rename(saved_git, repo_path.join(".git")).expect("restore Git metadata");
+
+    state.spawn_git_enrichment_task(Arc::default());
+    let metadata = wait_for_git_enrichment(&state).await;
+    assert_eq!(
+        metadata["workspaces"]
+            .as_object()
+            .expect("workspace metadata")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec![&repo_path.to_string_lossy().into_owned()],
+    );
+}
+
+#[tokio::test]
+async fn turn_metadata_state_git_enrichment_cancellation_is_retryable_and_errors_stay_empty() {
+    let (_temp_dir, repo_path) = create_clean_git_repo("repo").await;
+    let permission_profile = PermissionProfile::read_only();
+    let state = Arc::new(TurnMetadataState::new(
+        "session-a".to_string(),
+        "thread-a".to_string(),
+        /*forked_from_thread_id*/ None,
+        /*parent_thread_id*/ None,
+        &SessionSource::Exec,
+        /*thread_source*/ None,
+        "turn-a".to_string(),
+        repo_path,
+        &permission_profile,
+        WindowsSandboxLevel::Disabled,
+        /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
+    ));
+    let git_root_discovery = Arc::default();
+    state.spawn_git_enrichment_task(Arc::clone(&git_root_discovery));
+    state.cancel_git_enrichment_task();
+    assert!(
+        state
+            .git_enrichment
+            .lock()
+            .expect("enrichment task lock")
+            .task
+            .is_none()
+    );
+    tokio::time::timeout(Duration::from_secs(2), state.wait_for_git_enrichment())
+        .await
+        .expect("cancelled git enrichment should unblock waiters");
+    assert!(state.current_workspaces().is_empty());
+
+    state.spawn_git_enrichment_task(git_root_discovery);
+    let json = wait_for_git_enrichment(&state).await;
+    assert_eq!(
+        json["workspaces"].as_object().map(serde_json::Map::len),
+        Some(1)
+    );
+
+    let invalid_repo = TempDir::new().expect("invalid repo");
+    std::fs::create_dir(invalid_repo.path().join(".git")).expect("invalid git directory");
+    std::fs::write(
+        invalid_repo.path().join(".git/HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .expect("invalid git HEAD");
+    let invalid_state = Arc::new(TurnMetadataState::new(
+        "session-a".to_string(),
+        "thread-a".to_string(),
+        /*forked_from_thread_id*/ None,
+        /*parent_thread_id*/ None,
+        &SessionSource::Exec,
+        /*thread_source*/ None,
+        "turn-b".to_string(),
+        invalid_repo.path().abs(),
+        &permission_profile,
+        WindowsSandboxLevel::Disabled,
+        /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ false,
+        &model_info_from_slug("gpt-5.4"),
+    ));
+    invalid_state.spawn_git_enrichment_task(Arc::default());
+    invalid_state.admit_git_enrichment();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        invalid_state.wait_for_git_enrichment(),
+    )
+    .await
+    .expect("failed git enrichment should complete");
+    assert!(invalid_state.current_workspaces().is_empty());
 }

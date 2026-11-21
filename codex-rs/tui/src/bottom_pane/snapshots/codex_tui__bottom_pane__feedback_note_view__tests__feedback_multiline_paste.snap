@@ -1,0 +1,15 @@
+---
+source: tui/src/bottom_pane/feedback_note_view_tests.rs
+expression: "render(&view, 60)"
+---
+▌ Tell us more (bug)
+▌
+▌ Feedback sent to OpenAI can be used to improve ChatGPT.
+▌ Learn more.
+▌ You can also save feedback to a ZIP file, which is not
+▌ sent to OpenAI.
+▌
+▌ foo
+▌ bar
+
+⌃s save ZIP · enter send to OpenAI · esc cancel

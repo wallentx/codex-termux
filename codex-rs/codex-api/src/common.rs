@@ -1,44 +1,132 @@
 use crate::error::ApiError;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::ToolResultBody;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_protocol::turn_input::CyberAccessProgram;
+use codex_protocol::turn_input::PromptCacheTtl;
 use futures::Stream;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use serde_json::value::RawValue;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+#[cfg(test)]
+#[path = "common_tests.rs"]
+mod tests;
 
 pub const WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY: &str = "ws_request_header_traceparent";
 pub const WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY: &str = "ws_request_header_tracestate";
 
-/// Canonical input payload for the compaction endpoint.
-#[derive(Debug, Clone, Serialize)]
-pub struct CompactionInput<'a> {
-    pub model: &'a str,
-    pub input: &'a [ResponseItem],
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub instructions: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Value>>,
-    pub parallel_tool_calls: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<Reasoning>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<TextControls>,
+/// Maximum outgoing Responses message size for attaching optional tool observations.
+pub const MAX_RESPONSE_MESSAGE_BYTES: usize = 15 * 1024 * 1024;
+
+/// Adds authorized connector results to the selected rows without re-encoding the ordinary request.
+/// Borrowed raw JSON leaves routing field order, tool schemas, and unrelated inputs intact.
+pub(crate) fn with_tool_results(
+    json: &str,
+    results: &[(usize, usize, Arc<ToolResultBody>)],
+) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Input<'a> {
+        #[serde(borrow)]
+        input: Vec<Item<'a>>,
+    }
+    #[derive(Deserialize)]
+    struct Item<'a> {
+        #[serde(borrow)]
+        internal_chat_message_metadata_passthrough: Option<Metadata<'a>>,
+    }
+    #[derive(Deserialize)]
+    struct Metadata<'a> {
+        #[serde(borrow)]
+        executed_tool_calls: Option<Vec<&'a RawValue>>,
+    }
+
+    let mut remaining = MAX_RESPONSE_MESSAGE_BYTES.checked_sub(json.len())?;
+    if results.is_empty() || remaining == 0 {
+        return None;
+    }
+    let input: Input<'_> = serde_json::from_str(json).ok()?;
+    let mut enriched = String::new();
+    let mut cursor = 0;
+    for (item, call, body) in results {
+        let row = input
+            .input
+            .get(*item)?
+            .internal_chat_message_metadata_passthrough
+            .as_ref()?
+            .executed_tool_calls
+            .as_ref()?
+            .get(*call)?
+            .get();
+        // Native ExecutedToolCall rows always contain name and arguments.
+        let row_fields = row.strip_prefix('{')?.strip_suffix('}')?;
+        if row_fields.is_empty() {
+            return None;
+        }
+        let close = row.as_ptr() as usize - json.as_ptr() as usize + row.len() - 1;
+        if close <= cursor {
+            return None;
+        }
+        const FIELD: &str = r#","tool_result":"#;
+        const CALL_ID_FIELD: &str = r#","tool_result_call_id":"#;
+        let call_id_field_bytes = body
+            .nested_call_id_json()
+            .map_or(0, |_| CALL_ID_FIELD.len());
+        let Some(next_remaining) =
+            remaining.checked_sub(FIELD.len() + body.compact_bytes() + call_id_field_bytes)
+        else {
+            continue;
+        };
+        enriched.push_str(&json[cursor..close]);
+        enriched.push_str(FIELD);
+        enriched.push_str(body.as_json());
+        if let Some(id) = body.nested_call_id_json() {
+            enriched.push_str(CALL_ID_FIELD);
+            enriched.push_str(id);
+        }
+        cursor = close;
+        remaining = next_remaining;
+    }
+    if enriched.is_empty() {
+        return None;
+    }
+    enriched.push_str(&json[cursor..]);
+    Some(enriched)
+}
+
+/// Explicit per-request access selection using the Responses API wire values.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct AccessPrograms {
+    cyber: &'static str,
+}
+
+impl From<CyberAccessProgram> for AccessPrograms {
+    fn from(program: CyberAccessProgram) -> Self {
+        Self {
+            cyber: match program {
+                CyberAccessProgram::Standard => "standard",
+                CyberAccessProgram::DaybreakBlue => "daybreak_blue",
+                CyberAccessProgram::DaybreakRed => "daybreak_red",
+            },
+        }
+    }
 }
 
 /// Canonical input payload for the memory summarize endpoint.
@@ -70,9 +158,50 @@ pub struct MemorySummarizeOutput {
     pub memory_summary: String,
 }
 
+/// The latest server response ID received in this turn, shared with tool-review extensions.
+#[derive(Clone, Debug)]
+pub struct ResponseId(pub String);
+
+/// A bounded reason for removing a replayed reasoning item from model input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReasoningRemovalReason {
+    OrganizationMismatch,
+    EndUserMismatch,
+    ModelMismatch,
+    PrefixMismatch,
+    TurnBoundary,
+    Other,
+}
+
+impl ReasoningRemovalReason {
+    /// Every metric category, including unrecognized API reasons.
+    pub const ALL: [Self; 6] = [
+        Self::OrganizationMismatch,
+        Self::EndUserMismatch,
+        Self::ModelMismatch,
+        Self::PrefixMismatch,
+        Self::TurnBoundary,
+        Self::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OrganizationMismatch => "organization_mismatch",
+            Self::EndUserMismatch => "end_user_mismatch",
+            Self::ModelMismatch => "model_mismatch",
+            Self::PrefixMismatch => "prefix_mismatch",
+            Self::TurnBoundary => "turn_boundary",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ResponseEvent {
-    Created,
+    Created {
+        /// Existing server response ID, when supplied by the stream.
+        response_id: Option<String>,
+    },
     SafetyBuffering(SafetyBuffering),
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),
@@ -83,6 +212,8 @@ pub enum ResponseEvent {
     ModelVerifications(Vec<ModelVerification>),
     /// Emitted when the server includes moderation metadata for first-party turn presentation.
     TurnModerationMetadata(TurnModerationMetadataEvent),
+    /// Action-bound Guardian evidence for request-scoped consumers, not model history.
+    GuardianAssessment(crate::guardian_assessment::GuardianAssessment),
     /// Emitted when `X-Reasoning-Included: true` is present on the response,
     /// meaning the server already accounted for past reasoning tokens and the
     /// client should not re-estimate them.
@@ -90,6 +221,10 @@ pub enum ResponseEvent {
     Completed {
         response_id: String,
         token_usage: Option<TokenUsage>,
+        usage_metadata: Option<ResponseUsageMetadata>,
+        /// Reported reasoning removals by bounded reason. Missing or non-array
+        /// reports are unavailable; an empty map means no removals were reported.
+        reasoning_removals: Option<BTreeMap<ReasoningRemovalReason, i64>>,
         /// Did the model affirmatively end its turn? Some providers do not set this,
         /// so we rely on fallback logic when this is `None`.
         end_turn: Option<bool>,
@@ -145,12 +280,30 @@ pub enum ReasoningContext {
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct Reasoning {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_reasoning_effort"
+    )]
     pub effort: Option<ReasoningEffortConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<ReasoningSummaryConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ReasoningContext>,
+}
+
+fn serialize_reasoning_effort<S>(
+    effort: &Option<ReasoningEffortConfig>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let Some(ReasoningEffortConfig::Custom(value)) = effort
+        && let Ok(value) = value.parse::<u64>()
+    {
+        return serializer.serialize_u64(value);
+    }
+    effort.serialize(serializer)
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -212,84 +365,141 @@ impl From<VerbosityConfig> for OpenAiVerbosity {
     }
 }
 
+/// Serialized tool definitions for Responses API requests.
+///
+/// Keeping the tool list as raw JSON avoids rebuilding a generic JSON value
+/// tree, while the shared allocation keeps request clones cheap.
+#[derive(Debug, Clone)]
+pub struct ResponsesApiTools(Arc<RawValue>);
+
+impl ResponsesApiTools {
+    pub(crate) fn as_raw_value(&self) -> &RawValue {
+        &self.0
+    }
+}
+
+impl From<Arc<RawValue>> for ResponsesApiTools {
+    fn from(value: Arc<RawValue>) -> Self {
+        Self(value)
+    }
+}
+
+impl PartialEq for ResponsesApiTools {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0.get() == other.0.get()
+    }
+}
+
+impl Serialize for ResponsesApiTools {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PromptCacheOptions {
+    pub ttl: PromptCacheTtl,
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponsesApiRequest {
+    // Keep routing fields first: serde serializes struct fields in declaration order, and
+    // gateways may inspect request bodies incrementally before potentially multi-megabyte input.
     pub model: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub instructions: String,
+    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub input: Vec<ResponseItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<serde_json::Value>>,
+    pub tools: Option<ResponsesApiTools>,
     pub tool_choice: String,
     pub parallel_tool_calls: bool,
     pub reasoning: Option<Reasoning>,
     pub store: bool,
-    pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
     pub include: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_metadata: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_programs: Option<AccessPrograms>,
+    #[serde(skip_serializing_if = "codex_protocol::RequestCountry::is_omitted")]
+    pub request_country: codex_protocol::RequestCountry,
 }
 
-impl From<&ResponsesApiRequest> for ResponseCreateWsRequest {
-    fn from(request: &ResponsesApiRequest) -> Self {
+impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
+    fn from(request: &'a ResponsesApiRequest) -> Self {
         Self {
-            model: request.model.clone(),
-            instructions: request.instructions.clone(),
+            model: &request.model,
             previous_response_id: None,
-            input: request.input.clone(),
-            tools: request.tools.clone(),
-            tool_choice: request.tool_choice.clone(),
+            input: &request.input,
+            tool_results: Vec::new(),
+            tools: request.tools.as_ref().map(ResponsesApiTools::as_raw_value),
+            tool_choice: &request.tool_choice,
             parallel_tool_calls: request.parallel_tool_calls,
-            reasoning: request.reasoning.clone(),
+            reasoning: request.reasoning.as_ref(),
             store: request.store,
             stream: request.stream,
-            stream_options: request.stream_options.clone(),
-            include: request.include.clone(),
-            service_tier: request.service_tier.clone(),
-            prompt_cache_key: request.prompt_cache_key.clone(),
-            text: request.text.clone(),
+            stream_options: request.stream_options.as_ref(),
+            include: &request.include,
+            service_tier: request.service_tier.as_deref(),
+            prompt_cache_key: request.prompt_cache_key.as_deref(),
+            prompt_cache_options: request.prompt_cache_options,
+            text: request.text.as_ref(),
             generate: None,
             client_metadata: request.client_metadata.clone(),
+            access_programs: request.access_programs,
+            request_country: &request.request_country,
         }
     }
 }
 
 #[derive(Debug, Serialize)]
-pub struct ResponseCreateWsRequest {
-    pub model: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub instructions: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
-    pub input: Vec<ResponseItem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Value>>,
-    pub tool_choice: String,
-    pub parallel_tool_calls: bool,
-    pub reasoning: Option<Reasoning>,
-    pub store: bool,
+pub struct ResponseCreateWsRequest<'a> {
+    // Keep routing fields first: serde serializes struct fields in declaration order, and
+    // gateways may inspect request bodies incrementally before potentially multi-megabyte input.
+    pub model: &'a str,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_options: Option<StreamOptions>,
-    pub include: Vec<String>,
+    pub service_tier: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
+    pub previous_response_id: Option<String>,
+    pub input: &'a [ResponseItem],
+    /// Observations for this wire frame only. Canonical request serialization omits them.
+    #[serde(skip)]
+    pub tool_results: Vec<(usize, usize, Arc<ToolResultBody>)>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
+    pub tools: Option<&'a RawValue>,
+    pub tool_choice: &'a str,
+    pub parallel_tool_calls: bool,
+    pub reasoning: Option<&'a Reasoning>,
+    pub store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<TextControls>,
+    pub stream_options: Option<&'a StreamOptions>,
+    pub include: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<&'a TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_metadata: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_programs: Option<AccessPrograms>,
+    #[serde(skip_serializing_if = "codex_protocol::RequestCountry::is_omitted")]
+    pub request_country: &'a codex_protocol::RequestCountry,
 }
 
 pub fn response_create_client_metadata(
@@ -317,9 +527,9 @@ pub fn response_create_client_metadata(
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 #[allow(clippy::large_enum_variant)]
-pub enum ResponsesWsRequest {
+pub enum ResponsesWsRequest<'a> {
     #[serde(rename = "response.create")]
-    ResponseCreate(ResponseCreateWsRequest),
+    ResponseCreate(ResponseCreateWsRequest<'a>),
 }
 
 pub fn create_text_param_for_request(
@@ -342,10 +552,25 @@ pub fn create_text_param_for_request(
     })
 }
 
+/// Distinguishes draining a live response from abandoning obsolete work.
+#[derive(Clone, Copy)]
+pub enum ResponseInterrupt {
+    /// Drain normally, without validating or waiting for interruption acknowledgements.
+    Drain,
+    /// Skip undispatched work or retire its transport at the cleanup deadline.
+    /// Undispatched work ends without a completion event and leaves the socket reusable.
+    Cancel { deadline: tokio::time::Instant },
+}
+
 pub struct ResponseStream {
+    /// Routing pin from the connection that produced these responses. Never model metadata.
+    pub routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
     /// Server-assigned `x-request-id` response header, when present.
     pub upstream_request_id: Option<String>,
+    /// Requests a graceful interrupt. Keep consuming events through completion.
+    /// Only `Cancel` validates and waits for an interruption acknowledgement.
+    pub interrupt: Option<oneshot::Sender<ResponseInterrupt>>,
 }
 
 impl Stream for ResponseStream {

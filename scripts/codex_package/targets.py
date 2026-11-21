@@ -1,13 +1,18 @@
 """Supported package targets and default binary discovery."""
 
+import os
 import platform
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-
-SCRIPT_DIR = Path(__file__).resolve().parents[1]
-REPO_ROOT = SCRIPT_DIR.parent
+_repo_root = os.environ.get("CODEX_REPO_ROOT")
+if _repo_root is None:
+    raise RuntimeError(
+        "CODEX_REPO_ROOT must point to the repository root; "
+        "run `just assemble-codex-package` to set it automatically"
+    )
+REPO_ROOT = Path(_repo_root)
 
 
 @dataclass(frozen=True)
@@ -40,8 +45,8 @@ class PackageVariant:
 class PackageInputs:
     entrypoint_bin: Path
     code_mode_host_bin: Path
+    exec_server_bin: Path
     rg_bin: Path
-    zsh_bin: Path | None
     bwrap_bin: Path | None
     codex_command_runner_bin: Path | None
     codex_windows_sandbox_setup_bin: Path | None

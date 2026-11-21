@@ -1,3 +1,4 @@
+use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerEnvVar;
 use codex_config::McpServerTransportConfig;
@@ -9,6 +10,11 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::path::Path;
 use tracing::warn;
+
+#[path = "agent_plugin_config.rs"]
+mod agent_plugin_config;
+
+pub use agent_plugin_config::parse_agent_plugin_mcp_config;
 
 #[derive(Clone, Copy, Debug)]
 enum PluginMcpSource<'a> {
@@ -57,7 +63,17 @@ impl PluginMcpFile {
     }
 }
 
+/// Parses wrapped or plain plugin MCP declarations without runtime normalization.
+pub fn parse_plugin_mcp_declarations(
+    contents: &str,
+) -> Result<BTreeMap<String, JsonValue>, serde_json::Error> {
+    serde_json::from_str::<PluginMcpFile>(contents).map(PluginMcpFile::into_mcp_servers)
+}
+
 /// Parses the two supported plugin MCP file shapes and normalizes each server.
+///
+/// Native plugin HTTP servers share the regular MCP transport configuration;
+/// relative helper commands therefore use the session's local process cwd.
 ///
 /// Invalid individual servers are returned as errors without discarding valid
 /// siblings. A malformed top-level document fails the whole parse.
@@ -84,6 +100,21 @@ pub fn parse_executor_plugin_mcp_config(
     )
 }
 
+/// Normalizes already-parsed declarations for one executor installation.
+pub fn normalize_executor_plugin_mcp_declarations(
+    plugin_root: &PathUri,
+    declarations: BTreeMap<String, JsonValue>,
+    environment_id: &str,
+) -> PluginMcpConfigParseOutcome {
+    normalize_plugin_mcp_declarations(
+        declarations,
+        PluginMcpSource::Environment {
+            root: plugin_root,
+            environment_id,
+        },
+    )
+}
+
 impl PluginMcpSource<'_> {
     fn display(self) -> String {
         match self {
@@ -97,10 +128,17 @@ fn parse_plugin_mcp_config_from(
     contents: &str,
     source: PluginMcpSource<'_>,
 ) -> Result<PluginMcpConfigParseOutcome, serde_json::Error> {
-    let parsed = serde_json::from_str::<PluginMcpFile>(contents)?;
+    let declarations = parse_plugin_mcp_declarations(contents)?;
+    Ok(normalize_plugin_mcp_declarations(declarations, source))
+}
+
+fn normalize_plugin_mcp_declarations(
+    declarations: BTreeMap<String, JsonValue>,
+    source: PluginMcpSource<'_>,
+) -> PluginMcpConfigParseOutcome {
     let mut outcome = PluginMcpConfigParseOutcome::default();
 
-    for (name, config_value) in parsed.into_mcp_servers() {
+    for (name, config_value) in declarations {
         match normalize_plugin_mcp_server(config_value, source) {
             Ok(config) => {
                 outcome.servers.insert(name, config);
@@ -111,7 +149,7 @@ fn parse_plugin_mcp_config_from(
         }
     }
 
-    Ok(outcome)
+    outcome
 }
 
 fn normalize_plugin_mcp_server(
@@ -147,6 +185,12 @@ fn normalize_plugin_mcp_server(
 
     let mut config = serde_json::from_value::<McpServerConfig>(JsonValue::Object(object))
         .map_err(|err| err.to_string())?;
+    if matches!(config.auth, McpServerAuth::EmaAuth) {
+        return Err(
+            "plugin MCP declarations cannot select ema_auth; configure enterprise authentication in host policy"
+                .to_string(),
+        );
+    }
     if matches!(source, PluginMcpSource::Environment { .. }) {
         bind_environment_env_vars(&mut config)?;
     }
@@ -175,21 +219,12 @@ fn bind_environment_env_vars(config: &mut McpServerConfig) -> Result<(), String>
     let is_local_environment = config.is_local_environment();
     let env_vars = match &mut config.transport {
         McpServerTransportConfig::Stdio { env_vars, .. } => env_vars,
-        // Never resolve executor-owned environment references in the host process.
-        // Remove this rejection once the owning executor resolves these fields.
+        // Bearer credentials resolve on the executor; other header variables do not yet.
         McpServerTransportConfig::StreamableHttp {
-            bearer_token_env_var,
-            env_http_headers,
-            ..
+            env_http_headers, ..
         } => {
             if is_local_environment {
                 return Ok(());
-            }
-            if bearer_token_env_var.is_some() {
-                return Err(
-                    "`bearer_token_env_var` requires executor-side environment resolution for an executor-owned HTTP MCP"
-                        .to_string(),
-                );
             }
             if env_http_headers
                 .as_ref()
@@ -258,16 +293,26 @@ fn normalize_plugin_mcp_server_value(
     }
 
     if let Some(JsonValue::Object(mut oauth)) = object.remove("oauth") {
-        if oauth.remove("callbackPort").is_some() {
-            let plugin_display = source.display();
-            warn!(
-                plugin = %plugin_display,
-                "plugin MCP server OAuth callbackPort is ignored; Codex uses global MCP OAuth callback settings"
-            );
+        if let Some(callback_url) = oauth.remove("callbackUrl") {
+            oauth
+                .entry("callback_url".to_string())
+                .or_insert(callback_url);
+        }
+
+        if let Some(callback_port) = oauth.remove("callbackPort") {
+            oauth
+                .entry("callback_port".to_string())
+                .or_insert(callback_port);
         }
 
         if let Some(client_id) = oauth.remove("clientId") {
             oauth.entry("client_id".to_string()).or_insert(client_id);
+        }
+
+        if let Some(client_secret) = oauth.remove("clientSecret") {
+            oauth
+                .entry("client_secret".to_string())
+                .or_insert(client_secret);
         }
 
         if !oauth.is_empty() {

@@ -4,7 +4,8 @@
 //! configuration, authentication, terminal, state paths, and bounded reachability
 //! probes without attempting repair or starting long-lived services. Each check
 //! returns a redacted, serializable row so the same data can back the human
-//! summary and `--json` support report.
+//! summary and `--json` support report. PATH entries are untrusted data: checks
+//! may inspect them, but must not execute the programs they select.
 //!
 //! A failing check should describe the problem and remediation, but it should not
 //! mutate user state. That keeps the command safe to run before filing a support
@@ -21,7 +22,6 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -30,15 +30,22 @@ use anyhow::Context;
 use clap::Parser;
 use codex_api::ApiError;
 use codex_api::ResponsesWebsocketClient;
+use codex_api::TransportError;
 use codex_api::is_azure_responses_provider;
 use codex_arg0::Arg0DispatchPaths;
+use codex_config::ConfigLoadError;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
-use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::LoaderOverrides;
 use codex_core::config::find_codex_home;
 use codex_features::FEATURES;
+use codex_features::Feature;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_http_client::RouteAwareClientPool;
 use codex_install_context::CodexPackageLayout;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
@@ -49,7 +56,7 @@ use codex_login::CODEX_ACCESS_TOKEN_ENV_VAR;
 use codex_login::CODEX_API_KEY_ENV_VAR;
 use codex_login::CodexAuth;
 use codex_login::OPENAI_API_KEY_ENV_VAR;
-use codex_login::default_client::build_reqwest_client;
+use codex_login::default_client::create_client_without_request_logging;
 use codex_login::default_client::default_headers;
 use codex_login::load_auth_dot_json;
 use codex_model_provider::create_model_provider;
@@ -63,18 +70,31 @@ use codex_tui::Cli as TuiCli;
 use codex_utils_cli::CliConfigOverrides;
 use http::HeaderMap;
 use http::HeaderValue;
+use http::Method;
 use serde::Serialize;
 use supports_color::Stream;
 
 mod background;
+mod desktop;
+mod disk;
+mod filesystem_paths;
 mod git;
+mod network;
 mod output;
 mod progress;
 mod runtime;
+mod sandbox;
+mod security;
 mod system;
 mod thread_inventory;
 mod title;
 mod updates;
+#[cfg(target_os = "windows")]
+mod windows_dev_drive;
+
+#[cfg(test)]
+#[path = "doctor/desktop_tests.rs"]
+mod desktop_tests;
 
 use background::background_server_check;
 use git::git_check;
@@ -85,6 +105,7 @@ use progress::DoctorProgress;
 use progress::doctor_progress;
 use runtime::runtime_check;
 use runtime::search_check;
+use sandbox::sandbox_check;
 use system::system_check;
 use thread_inventory::thread_inventory_check;
 use title::terminal_title_check;
@@ -116,10 +137,6 @@ const COLOR_ENV_VARS: &[&str] = &[
 const TERMINAL_DIMENSION_ENV_VARS: &[&str] = &["COLUMNS", "LINES"];
 const TERMINFO_ENV_VARS: &[&str] = &["TERMINFO", "TERMINFO_DIRS"];
 const LOCALE_ENV_VARS: &[&str] = &["LC_ALL", "LC_CTYPE", "LANG"];
-#[cfg(windows)]
-const NPM_COMMAND: &str = "npm.cmd";
-#[cfg(not(windows))]
-const NPM_COMMAND: &str = "npm";
 const REMOTE_TERMINAL_ENV_VARS: &[&str] = &[
     "SSH_TTY",
     "SSH_CONNECTION",
@@ -133,25 +150,31 @@ const REMOTE_TERMINAL_ENV_VARS: &[&str] = &[
     "DISPLAY",
     "WT_SESSION",
 ];
-const TMUX_OPTION_NAMES: &[&str] = &[
-    "extended-keys",
-    "xterm-keys",
-    "allow-passthrough",
-    "set-clipboard",
-    "focus-events",
-];
 const NARROW_TERMINAL_COLUMNS: u16 = 80;
 const NARROW_TERMINAL_ROWS: u16 = 24;
 
 /// Options for building a local Codex diagnostic report.
 ///
-/// The command always runs the full bounded diagnostic set. Human output includes
-/// detailed diagnostics by default; --summary keeps the terminal output compact.
+/// The command runs the full diagnostic set unless `--network-only` is selected.
+/// Human output includes detailed diagnostics by default; --summary keeps the terminal output
+/// compact.
 #[derive(Debug, Parser)]
 pub struct DoctorCommand {
+    /// Internal isolated filesystem probe; exits before loading configuration.
+    #[arg(long, hide = true)]
+    probe_filesystem_path: Option<PathBuf>,
+
     /// Emit a redacted machine-readable report.
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Run config, network environment, provider HTTP, and Responses WebSocket checks.
+    #[arg(long, default_value_t = false)]
+    network_only: bool,
+
+    /// Limit database integrity scans when collecting a feedback attachment.
+    #[arg(long, hide = true, default_value_t = false)]
+    feedback: bool,
 
     /// Only show grouped check rows and the final count summary.
     #[arg(long, default_value_t = false)]
@@ -310,6 +333,9 @@ pub async fn run_doctor(
     interactive: &TuiCli,
     arg0_paths: &Arg0DispatchPaths,
 ) -> anyhow::Result<()> {
+    if let Some(path) = &command.probe_filesystem_path {
+        std::process::exit(filesystem_paths::probe_exit_code(path));
+    }
     let report = build_report(&command, root_config_overrides, interactive, arg0_paths).await;
 
     if command.json {
@@ -338,8 +364,15 @@ async fn build_report(
     arg0_paths: &Arg0DispatchPaths,
 ) -> DoctorReport {
     let progress = doctor_progress(command.json);
+    if command.network_only {
+        let checks =
+            network::checks(root_config_overrides, interactive, arg0_paths, &progress).await;
+        progress.settle();
+        return report_from_checks(checks);
+    }
     let mut checks = Vec::new();
     checks.push(run_sync_check("system", progress.clone(), system_check));
+    checks.push(run_async_check("endpoint protection", progress.clone(), security::check()).await);
     checks.push(run_sync_check("installation", progress.clone(), || {
         installation_check(!command.summary)
     }));
@@ -347,12 +380,45 @@ async fn build_report(
     checks.push(run_sync_check("search", progress.clone(), search_check));
 
     progress.begin("config");
+    let config_started = Instant::now();
     let config_result = load_config(root_config_overrides, interactive, arg0_paths).await;
+    let config_duration = config_started.elapsed();
+    let cwd = config_result
+        .as_ref()
+        .map(|config| config.cwd.as_path().to_path_buf())
+        .unwrap_or_else(|_| {
+            let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Some(requested_cwd) = &interactive.cwd {
+                cwd.push(requested_cwd);
+            }
+            cwd
+        });
+    checks.push(run_sync_check("disk", progress.clone(), || {
+        disk::check(config_result.as_ref().ok(), &cwd)
+    }));
+    #[cfg(target_os = "windows")]
+    checks.push(run_sync_check("dev drive", progress.clone(), || {
+        windows_dev_drive::check(&cwd)
+    }));
     match &config_result {
         Ok(config) => {
-            let auth_manager =
+            // Other checks below do synchronous work inside join!. Keep the
+            // probe deadlines independent of those checks' scheduler delays.
+            let filesystem_paths_check = run_async_check(
+                "filesystem paths",
+                progress.clone(),
+                filesystem_paths::check(config),
+            )
+            .await;
+            let auth_manager_result =
                 AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
+            let auth_manager = auth_manager_result.as_ref().ok().cloned();
             let reachability_plan = provider_reachability_plan(config);
+            #[cfg(target_os = "macos")]
+            let reachability_url = reachability_plan
+                .endpoints
+                .first()
+                .map(|endpoint| endpoint.url.clone());
             let (
                 config_check,
                 auth_check,
@@ -369,14 +435,37 @@ async fn build_report(
                 background_server_check,
                 reachability_check,
             ) = tokio::join!(
-                async { run_sync_check("config", progress.clone(), || config_check(config)) },
-                async { run_sync_check("auth", progress.clone(), || auth_check(config)) },
-                async { run_sync_check("updates", progress.clone(), || updates_check(config)) },
-                async { run_sync_check("network", progress.clone(), network_check) },
+                async {
+                    run_sync_check("config", progress.clone(), || {
+                        config_check(config).detail(format!(
+                            "configuration load ms: {}",
+                            config_duration.as_millis()
+                        ))
+                    })
+                },
+                async {
+                    run_sync_check("auth", progress.clone(), || match &auth_manager_result {
+                        Ok(_) => auth_check(config),
+                        Err(error) => DoctorCheck::new(
+                            "auth.load",
+                            "auth",
+                            CheckStatus::Fail,
+                            "authentication could not be initialized",
+                        )
+                        .detail(error.to_string())
+                        .remediation(
+                            "Fix the reported authentication error, then rerun codex doctor.",
+                        ),
+                    })
+                },
+                run_async_check("updates", progress.clone(), updates_check(config)),
+                async {
+                    run_sync_check("network", progress.clone(), || network::check(Some(config)))
+                },
                 run_async_check(
                     "websocket",
                     progress.clone(),
-                    websocket_reachability_check(config, Some(auth_manager)),
+                    websocket_reachability_check(config, auth_manager),
                 ),
                 run_async_check("MCP", progress.clone(), mcp_check(config)),
                 async {
@@ -389,13 +478,15 @@ async fn build_report(
                         terminal_check(command.no_color)
                     })
                 },
-                run_async_check("git", progress.clone(), git_check(config.cwd.as_path())),
+                async {
+                    run_sync_check("git", progress.clone(), || git_check(config.cwd.as_path()))
+                },
                 async {
                     run_sync_check("terminal title", progress.clone(), || {
                         terminal_title_check(config)
                     })
                 },
-                run_async_check("state", progress.clone(), state_check(config)),
+                run_async_check("state", progress.clone(), state_check(config, command)),
                 run_async_check(
                     "thread inventory",
                     progress.clone(),
@@ -412,6 +503,12 @@ async fn build_report(
                     provider_reachability_check(reachability_plan),
                 ),
             );
+            #[cfg(target_os = "macos")]
+            let reachability_check = network::with_system_proxy_remediation(
+                reachability_check,
+                config,
+                reachability_url.as_deref(),
+            );
             checks.extend([
                 config_check,
                 auth_check,
@@ -420,6 +517,7 @@ async fn build_report(
                 websocket_check,
                 mcp_check,
                 sandbox_check,
+                filesystem_paths_check,
                 terminal_check,
                 git_check,
                 terminal_title_check,
@@ -431,10 +529,6 @@ async fn build_report(
         }
         Err(err) => {
             let reachability_plan = default_reachability_plan();
-            let fallback_cwd = interactive
-                .cwd
-                .clone()
-                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             let (
                 config_check,
                 network_check,
@@ -443,25 +537,18 @@ async fn build_report(
                 state_check,
                 reachability_check,
             ) = tokio::join!(
+                async { run_sync_check("config", progress.clone(), || config_load_failure(err)) },
                 async {
-                    run_sync_check("config", progress.clone(), || {
-                        DoctorCheck::new(
-                            "config.load",
-                            "config",
-                            CheckStatus::Fail,
-                            "config could not be loaded",
-                        )
-                        .detail(err.to_string())
-                        .remediation("Fix the reported config error, then rerun codex doctor.")
+                    run_sync_check("network", progress.clone(), || {
+                        network::check(/*config*/ None)
                     })
                 },
-                async { run_sync_check("network", progress.clone(), network_check) },
                 async {
                     run_sync_check("terminal", progress.clone(), || {
                         terminal_check(command.no_color)
                     })
                 },
-                run_async_check("git", progress.clone(), git_check(fallback_cwd.as_path())),
+                async { run_sync_check("git", progress.clone(), || git_check(&cwd)) },
                 async { run_sync_check("state", progress.clone(), fallback_state_check) },
                 run_async_check(
                     "provider reachability",
@@ -480,8 +567,23 @@ async fn build_report(
         }
     }
 
+    progress.begin("desktop");
+    if let Some(desktop) = desktop::collect().await {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Some(application) = desktop.application.as_ref() {
+            updates::append_desktop_update(&mut checks, config_result.as_ref().ok(), application)
+                .await;
+        }
+        progress.finish("desktop", overall_status(&desktop.checks));
+        checks.extend(desktop.checks);
+    }
+
     progress.settle();
 
+    report_from_checks(checks)
+}
+
+fn report_from_checks(checks: Vec<DoctorCheck>) -> DoctorReport {
     let overall_status = overall_status(&checks);
     DoctorReport {
         schema_version: 1,
@@ -492,19 +594,50 @@ async fn build_report(
     }
 }
 
+fn config_load_failure(err: &anyhow::Error) -> DoctorCheck {
+    let check = DoctorCheck::new(
+        "config.load",
+        "config",
+        CheckStatus::Fail,
+        "config could not be loaded",
+    )
+    .remediation("Fix the reported config error, then rerun codex doctor.");
+    // Error messages can echo config values. Report only typed metadata,
+    // including errors wrapped by io::Error, whose source skips the wrapper.
+    let config_error = err.chain().find_map(|cause| {
+        cause.downcast_ref::<ConfigLoadError>().or_else(|| {
+            cause
+                .downcast_ref::<std::io::Error>()?
+                .get_ref()?
+                .downcast_ref::<ConfigLoadError>()
+        })
+    });
+    if let Some(error) = config_error {
+        let error = error.config_error();
+        return check
+            .detail("error: invalid configuration")
+            .detail(format!("file: {}", error.path.display()))
+            .detail(format!("line: {}", error.range.start.line))
+            .detail(format!("column: {}", error.range.start.column));
+    }
+    let io_error = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    match io_error {
+        Some(error) => check.detail(format!("error: {}", error.kind())),
+        None => check.detail("error: configuration load failed"),
+    }
+}
+
 async fn load_config(
-    root_config_overrides: CliConfigOverrides,
+    mut root_config_overrides: CliConfigOverrides,
     interactive: &TuiCli,
     arg0_paths: &Arg0DispatchPaths,
 ) -> anyhow::Result<Config> {
-    let mut cli_kv_overrides = root_config_overrides
-        .parse_overrides()
-        .map_err(anyhow::Error::msg)?;
     if interactive.web_search {
-        cli_kv_overrides.push((
-            "web_search".to_string(),
-            toml::Value::String("live".to_string()),
-        ));
+        root_config_overrides
+            .raw_overrides
+            .push("web_search=\"live\"".to_string());
     }
 
     let overrides = ConfigOverrides {
@@ -512,12 +645,17 @@ async fn load_config(
         ..config_overrides_from_interactive(interactive, arg0_paths)
     };
 
-    ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides)
-        .harness_overrides(overrides)
-        .build()
-        .await
-        .context("failed to load Codex config")
+    let config = crate::cloud_config::config_builder(
+        &root_config_overrides,
+        LoaderOverrides::default(),
+        overrides,
+    )
+    .await?
+    .build()
+    .await
+    .context("failed to load Codex config")?;
+    config.config_layer_stack.ensure_config_server_applied()?;
+    Ok(config)
 }
 
 fn config_overrides_from_interactive(
@@ -545,7 +683,6 @@ fn config_overrides_from_interactive(
             .flatten(),
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: interactive.oss.then_some(true),
         additional_writable_roots: interactive.add_dir.clone(),
         ..Default::default()
@@ -798,6 +935,10 @@ fn installation_check(show_details: bool) -> DoctorCheck {
         env::var_os("CODEX_MANAGED_BY_BUN").is_some()
     ));
     details.push(format!(
+        "managed by Vite+: {}",
+        env::var_os("CODEX_MANAGED_BY_VITE_PLUS").is_some()
+    ));
+    details.push(format!(
         "managed by pnpm: {}",
         env::var_os("CODEX_MANAGED_BY_PNPM").is_some()
     ));
@@ -825,41 +966,15 @@ fn installation_check(show_details: bool) -> DoctorCheck {
     }
 
     if doctor_managed_by_npm(current_exe.as_deref()) {
-        match npm_global_root_check() {
-            NpmRootCheck::Match { package_root } => {
-                details.push(format!("npm update target: {}", package_root.display()));
-            }
-            NpmRootCheck::Mismatch {
-                running_package_root,
-                npm_package_root,
-            } => {
-                status = CheckStatus::Fail;
-                summary =
-                    "npm install -g @openai/codex would update a different install".to_string();
-                remediation = Some(format!(
-                    "Fix PATH or npm prefix so the running package root ({}) matches the npm global package root ({}).",
-                    running_package_root.display(),
-                    npm_package_root.display()
-                ));
-                details.push(format!(
-                    "running package root: {}",
-                    running_package_root.display()
-                ));
-                details.push(format!("npm package root: {}", npm_package_root.display()));
-            }
-            NpmRootCheck::MissingPackageRoot => {
-                status = status.max(CheckStatus::Warning);
-                summary = "npm-managed launch is missing package-root provenance".to_string();
-                remediation = Some(
-                    "Reinstall or update Codex so the JS shim provides CODEX_MANAGED_PACKAGE_ROOT."
-                        .to_string(),
-                );
-            }
-            NpmRootCheck::NpmUnavailable(error) => {
-                status = status.max(CheckStatus::Warning);
-                summary = "npm-managed launch could not inspect npm global root".to_string();
-                details.push(format!("npm root -g failed: {error}"));
-            }
+        details
+            .push("npm update target: not inspected (PATH helpers are not executed)".to_string());
+        if env::var_os("CODEX_MANAGED_PACKAGE_ROOT").is_none() {
+            status = status.max(CheckStatus::Warning);
+            summary = "npm-managed launch is missing package-root provenance".to_string();
+            remediation = Some(
+                "Reinstall or update Codex so the JS shim provides CODEX_MANAGED_PACKAGE_ROOT."
+                    .to_string(),
+            );
         }
     }
 
@@ -889,6 +1004,7 @@ fn doctor_managed_by_npm(current_exe: Option<&Path>) -> bool {
 fn inherited_managed_env_for_cargo_binary(current_exe: Option<&Path>) -> bool {
     if env::var_os("CODEX_MANAGED_BY_NPM").is_none()
         && env::var_os("CODEX_MANAGED_BY_BUN").is_none()
+        && env::var_os("CODEX_MANAGED_BY_VITE_PLUS").is_none()
         && env::var_os("CODEX_MANAGED_BY_PNPM").is_none()
     {
         return false;
@@ -942,6 +1058,9 @@ fn describe_install_context(context: &InstallContext) -> String {
         InstallMethod::Bun => {
             describe_method_with_package_layout("bun", context.package_layout.as_ref())
         }
+        InstallMethod::VitePlus => {
+            describe_method_with_package_layout("vite+", context.package_layout.as_ref())
+        }
         InstallMethod::Pnpm => {
             describe_method_with_package_layout("pnpm", context.package_layout.as_ref())
         }
@@ -977,62 +1096,6 @@ fn display_optional_path(path: Option<&Path>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum NpmRootCheck {
-    Match {
-        package_root: PathBuf,
-    },
-    Mismatch {
-        running_package_root: PathBuf,
-        npm_package_root: PathBuf,
-    },
-    MissingPackageRoot,
-    NpmUnavailable(String),
-}
-
-fn npm_global_root_check() -> NpmRootCheck {
-    let Some(running_package_root) = env::var_os("CODEX_MANAGED_PACKAGE_ROOT").map(PathBuf::from)
-    else {
-        return NpmRootCheck::MissingPackageRoot;
-    };
-
-    let output = match run_command(NPM_COMMAND, ["root", "-g"]) {
-        Ok(output) => output,
-        Err(err) => return NpmRootCheck::NpmUnavailable(err),
-    };
-    let Some(npm_root) = output.lines().map(str::trim).find(|line| !line.is_empty()) else {
-        return NpmRootCheck::NpmUnavailable("empty output from npm root -g".to_string());
-    };
-
-    compare_npm_package_roots(&running_package_root, &PathBuf::from(npm_root))
-}
-
-fn compare_npm_package_roots(running_package_root: &Path, npm_root: &Path) -> NpmRootCheck {
-    let npm_package_root = npm_root.join("@openai").join("codex");
-    let running = normalize_path_for_compare(running_package_root);
-    let target = normalize_path_for_compare(&npm_package_root);
-    if running == target {
-        NpmRootCheck::Match {
-            package_root: npm_package_root,
-        }
-    } else {
-        NpmRootCheck::Mismatch {
-            running_package_root: running_package_root.to_path_buf(),
-            npm_package_root,
-        }
-    }
-}
-
-fn normalize_path_for_compare(path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let raw = canonical.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        raw.to_ascii_lowercase()
-    } else {
-        raw
-    }
-}
-
 fn display_list<T: AsRef<str>>(items: &[T]) -> String {
     if items.is_empty() {
         "none".to_string()
@@ -1046,41 +1109,21 @@ fn display_list<T: AsRef<str>>(items: &[T]) -> String {
 }
 
 fn codex_path_entries() -> Vec<String> {
-    #[cfg(windows)]
-    let result = run_command("where", ["codex"]);
-    #[cfg(not(windows))]
-    let result = run_command("which", ["-a", "codex"]);
-
-    result
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
+    let Ok(candidates) = which::which_all("codex") else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    candidates
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .map(|path| path.display().to_string())
         .collect()
-}
-
-fn run_command<I, S>(program: &str, args: I) -> Result<String, String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            return Err(format!("exited with status {}", output.status));
-        }
-        return Err(stderr);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn config_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
+    details
+        .push("configuration scope: invocation config, including cloud-managed policy".to_string());
+    details.push("active thread overrides: not inspected".to_string());
     details.push(format!("CODEX_HOME: {}", config.codex_home.display()));
     details.push(format!("cwd: {}", config.cwd.display()));
     details.push(format!(
@@ -1088,8 +1131,19 @@ fn config_check(config: &Config) -> DoctorCheck {
         config.model.as_deref().unwrap_or("<default>")
     ));
     details.push(format!("model provider: {}", config.model_provider_id));
+    details.push(format!(
+        "configured TUI mode: {}",
+        if config.tui_fullscreen_transcript {
+            "fullscreen"
+        } else {
+            "scrollback"
+        }
+    ));
     details.push(format!("log dir: {}", config.log_dir.display()));
-    details.push(format!("sqlite home: {}", config.sqlite_home.display()));
+    details.push(format!(
+        "sqlite home: {}",
+        config.sqlite_config().home().display()
+    ));
     details.push(format!("mcp servers: {}", config.mcp_servers.get().len()));
     feature_flag_details(config, &mut details);
     config_toml_details(config, &mut details);
@@ -1339,6 +1393,7 @@ fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
         AuthMode::AgentIdentity => "agent_identity",
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
+        AuthMode::BedrockAccessKeys => "bedrock_access_keys",
     }
 }
 
@@ -1350,6 +1405,8 @@ fn stored_auth_mode_value(auth: &AuthDotJson) -> AuthMode {
         AuthMode::PersonalAccessToken
     } else if auth.bedrock_api_key.is_some() {
         AuthMode::BedrockApiKey
+    } else if auth.bedrock_access_keys.is_some() {
+        AuthMode::BedrockAccessKeys
     } else if auth.openai_api_key.is_some() {
         AuthMode::ApiKey
     } else {
@@ -1432,44 +1489,19 @@ fn stored_auth_issues(
                 issues.push("Bedrock API key auth is missing a Bedrock API key");
             }
         }
-    }
-    issues
-}
-
-fn network_check() -> DoctorCheck {
-    let mut details = Vec::new();
-    push_proxy_env_details(&mut details);
-
-    let mut status = CheckStatus::Ok;
-    let mut summary = "network-related environment looks readable".to_string();
-    for name in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
-        if let Some(raw) = env::var_os(name) {
-            let path = PathBuf::from(raw);
-            match std::fs::metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    if let Err(err) = read_probe_file(&path) {
-                        status = CheckStatus::Warning;
-                        summary = "custom CA env var points at an unreadable file".to_string();
-                        details.push(format!("{name}: {} ({err})", path.display()));
-                    } else {
-                        details.push(format!("{name}: readable file {}", path.display()));
-                    }
+        AuthMode::BedrockAccessKeys => match auth.bedrock_access_keys.as_ref() {
+            Some(access_keys) => {
+                if access_keys.access_key_id.trim().is_empty() {
+                    issues.push("Bedrock access key auth is missing an access key ID");
                 }
-                Ok(_) => {
-                    status = CheckStatus::Warning;
-                    summary = "custom CA env var does not point at a file".to_string();
-                    details.push(format!("{name}: not a file {}", path.display()));
-                }
-                Err(err) => {
-                    status = CheckStatus::Warning;
-                    summary = "custom CA env var points at an unreadable path".to_string();
-                    details.push(format!("{name}: {} ({err})", path.display()));
+                if access_keys.secret_access_key.trim().is_empty() {
+                    issues.push("Bedrock access key auth is missing a secret access key");
                 }
             }
-        }
+            None => issues.push("Bedrock access key auth is missing AWS access keys"),
+        },
     }
-
-    DoctorCheck::new("network.env", "network", status, summary).details(details)
+    issues
 }
 
 fn push_proxy_env_details(details: &mut Vec<String>) {
@@ -1512,6 +1544,7 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
     let mut details = Vec::new();
     let mut transport_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut disabled = 0usize;
+    let mut invalid_config = Vec::new();
     let mut missing_env = Vec::new();
     let mut unreachable_required_http = Vec::new();
     let mut unreachable_optional_http = Vec::new();
@@ -1535,43 +1568,44 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
                 }
                 let command_is_empty = command.trim().is_empty();
                 if command_is_empty {
-                    missing_env.push(format!("{name}: stdio command is empty"));
+                    invalid_config.push(format!("{name}: stdio command is empty"));
                 }
                 if server.is_local_environment() {
                     let host_native_cwd = cwd.as_ref().map(|cwd| Path::new(cwd.as_str()));
                     if let Some(cwd) = host_native_cwd
                         && !cwd.exists()
                     {
-                        missing_env.push(format!("{name}: cwd does not exist ({})", cwd.display()));
+                        invalid_config
+                            .push(format!("{name}: cwd does not exist ({})", cwd.display()));
                     }
                     if !command_is_empty
                         && let Err(err) =
                             stdio_command_resolves(command, host_native_cwd, env.as_ref())
                     {
-                        missing_env.push(format!(
+                        invalid_config.push(format!(
                             "{name}: stdio command {command:?} is not resolvable ({err})"
                         ));
                     }
                 } else {
                     match cwd {
                         Some(cwd) if cwd.to_inferred_path_uri().is_none() => {
-                            missing_env
+                            invalid_config
                                 .push(format!("{name}: remote stdio cwd is not absolute ({cwd})"));
                         }
-                        None => missing_env
+                        None => invalid_config
                             .push(format!("{name}: remote stdio requires an explicit cwd")),
                         Some(_) => {}
                     }
                 }
                 if let Some(env) = env {
                     for key in env.keys().filter(|key| key.trim().is_empty()) {
-                        missing_env.push(format!("{name}: empty env key {key}"));
+                        invalid_config.push(format!("{name}: empty env key {key}"));
                     }
                 }
                 for env_var in env_vars {
                     if env_var.is_remote_source() {
                         if server.is_local_environment() {
-                            missing_env.push(format!(
+                            invalid_config.push(format!(
                                 "{name}: env_vars entry `{}` uses source `remote`, which requires remote MCP stdio",
                                 env_var.name()
                             ));
@@ -1621,7 +1655,25 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
     for (transport, count) in transport_counts {
         details.push(format!("{transport} servers: {count}"));
     }
-    details.extend(missing_env.iter().cloned());
+    let mut hints = Vec::new();
+    if !invalid_config.is_empty() {
+        hints.push("Correct the listed MCP server configuration errors.");
+    }
+    if !missing_env.is_empty() {
+        hints.push("Set the missing MCP env vars.");
+    }
+    if !unreachable_required_http.is_empty() || !unreachable_optional_http.is_empty() {
+        hints.push("Check that the MCP server is running and its URL is reachable.");
+    }
+    let required_missing = servers.iter().any(|(name, server)| {
+        server.required
+            && invalid_config
+                .iter()
+                .chain(&missing_env)
+                .any(|detail| detail.starts_with(&format!("{name}:")))
+    });
+    details.extend(invalid_config);
+    details.extend(missing_env);
     details.extend(
         unreachable_required_http
             .iter()
@@ -1633,15 +1685,9 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
             .map(|detail| format!("optional reachability failed: {detail}")),
     );
 
-    let required_missing = servers.iter().any(|(name, server)| {
-        server.required
-            && missing_env
-                .iter()
-                .any(|missing| missing.starts_with(&format!("{name}:")))
-    });
     let status = if required_missing || !unreachable_required_http.is_empty() {
         CheckStatus::Fail
-    } else if !missing_env.is_empty() || !unreachable_optional_http.is_empty() {
+    } else if !hints.is_empty() {
         CheckStatus::Warning
     } else {
         CheckStatus::Ok
@@ -1654,44 +1700,10 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
 
     let mut check = DoctorCheck::new("mcp.config", "mcp", status, summary).details(details);
     if status != CheckStatus::Ok {
-        check = check.remediation("Set the missing MCP env vars or disable the affected server.");
+        hints.push("Alternatively, disable the affected server.");
+        check = check.remediation(hints.join(" "));
     }
     check
-}
-
-fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> DoctorCheck {
-    let mut details = Vec::new();
-    details.push(format!(
-        "approval policy: {:?}",
-        config.permissions.approval_policy.value()
-    ));
-    let file_system_sandbox = config.permissions.file_system_sandbox_policy();
-    details.push(format!("filesystem sandbox: {}", file_system_sandbox.kind));
-    details.push(format!(
-        "network sandbox: {}",
-        config.permissions.network_sandbox_policy()
-    ));
-    push_path_detail(
-        &mut details,
-        "codex-linux-sandbox helper",
-        arg0_paths.codex_linux_sandbox_exe.as_deref(),
-    );
-    push_path_detail(
-        &mut details,
-        "execve wrapper helper",
-        arg0_paths.main_execve_wrapper_exe.as_deref(),
-    );
-
-    let mut status = CheckStatus::Ok;
-    let mut summary = "sandbox configuration is readable".to_string();
-    if let Some(helper) = arg0_paths.codex_linux_sandbox_exe.as_deref()
-        && !helper.exists()
-    {
-        status = CheckStatus::Warning;
-        summary = "Linux sandbox helper path does not exist".to_string();
-    }
-
-    DoctorCheck::new("sandbox.helpers", "sandbox", status, summary).details(details)
 }
 
 #[derive(Clone, Debug)]
@@ -1716,7 +1728,7 @@ impl TerminalCheckInputs {
         let terminal_size = crossterm::terminal::size().map_err(|err| err.to_string());
         let info = terminal_info();
         let tmux_details = if matches!(info.multiplexer, Some(Multiplexer::Tmux { .. })) {
-            tmux_diagnostic_details()
+            vec!["tmux options: not inspected (PATH helpers are not executed)".to_string()]
         } else {
             Vec::new()
         };
@@ -1751,6 +1763,7 @@ fn terminal_check(no_color_flag: bool) -> DoctorCheck {
 
 #[cfg(windows)]
 fn windows_console_details() -> Vec<String> {
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     use windows_sys::Win32::System::Console::GetConsoleCP;
@@ -1774,8 +1787,8 @@ fn windows_console_details() -> Vec<String> {
         GetStdHandle(STD_ERROR_HANDLE)
     }));
 
-    fn console_mode_detail(label: &str, handle: isize) -> String {
-        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+    fn console_mode_detail(label: &str, handle: HANDLE) -> String {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return format!("{label}: unavailable");
         }
         let mut mode = 0_u32;
@@ -1832,16 +1845,20 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
     let locale_warning = locale.as_deref().is_some_and(is_non_utf8_locale);
     let mut issues = Vec::new();
     if matches!(name, TerminalName::Dumb) {
-        issues.push(
+        let issue = if inputs.stdin_is_terminal || inputs.stdout_is_terminal {
             DoctorIssue::new(
                 CheckStatus::Fail,
                 "TERM=dumb - colors and cursor control are disabled",
             )
-            .measured("TERM=dumb")
             .expected("TERM=xterm-256color or another real terminal type")
             .remedy("set TERM to a real value, for example xterm-256color")
-            .field("TERM"),
-        );
+        } else {
+            DoctorIssue::new(
+                CheckStatus::Warning,
+                "TERM=dumb - colors and cursor control are disabled in this non-interactive run",
+            )
+        };
+        issues.push(issue.measured("TERM=dumb").field("TERM"));
     }
     if locale_warning {
         let measured = locale.unwrap_or_else(|| "unknown".to_string());
@@ -1869,6 +1886,7 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
         );
     }
     issues.extend(terminal_size_issues(&inputs));
+    issues.sort_by_key(|issue| std::cmp::Reverse(issue.severity));
 
     let status = issues
         .iter()
@@ -1890,6 +1908,7 @@ fn terminal_name(info: &TerminalInfo) -> &'static str {
     match info.name {
         TerminalName::AppleTerminal => "Apple Terminal",
         TerminalName::Ghostty => "Ghostty",
+        TerminalName::Rex => "Rex",
         TerminalName::Iterm2 => "iTerm2",
         TerminalName::WarpTerminal => "Warp",
         TerminalName::VsCode => "VS Code",
@@ -2115,107 +2134,100 @@ fn terminal_size_issues(inputs: &TerminalCheckInputs) -> Vec<DoctorIssue> {
     issues
 }
 
-fn tmux_diagnostic_details() -> Vec<String> {
-    let mut details = Vec::new();
-    push_tmux_display_detail(&mut details, "tmux client termtype", "#{client_termtype}");
-    push_tmux_display_detail(&mut details, "tmux client termname", "#{client_termname}");
-    for option in TMUX_OPTION_NAMES {
-        let value = tmux_option_value(option).unwrap_or_else(|| "unavailable".to_string());
-        details.push(format!("tmux {option}: {value}"));
-    }
-    details
-}
-
-fn push_tmux_display_detail(details: &mut Vec<String>, label: &str, format: &str) {
-    if let Some(value) = tmux_display_message(format) {
-        details.push(format!("{label}: {value}"));
-    }
-}
-
-fn tmux_option_value(option: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["show-options", "-gqv", option])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    non_empty_trimmed(String::from_utf8(output.stdout).ok()?)
-}
-
-fn tmux_display_message(format: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", format])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    non_empty_trimmed(String::from_utf8(output.stdout).ok()?)
-}
-
-fn non_empty_trimmed(value: String) -> Option<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-async fn state_check(config: &Config) -> DoctorCheck {
+async fn state_check(config: &Config, command: &DoctorCommand) -> DoctorCheck {
     let mut details = Vec::new();
     path_readiness(&mut details, "CODEX_HOME", &config.codex_home);
     path_readiness(&mut details, "log dir", &config.log_dir);
-    path_readiness(&mut details, "sqlite home", &config.sqlite_home);
-    let mut integrity_failures = Vec::new();
-    for db in codex_state::runtime_db_paths(&config.sqlite_home) {
+    path_readiness(&mut details, "sqlite home", config.sqlite_config().home());
+
+    let mut status = CheckStatus::Ok;
+    let mut failed_databases = Vec::new();
+    for db in config.sqlite_config().runtime_db_paths() {
         path_readiness(&mut details, db.label, &db.path);
-        sqlite_integrity_detail(&mut details, &mut integrity_failures, db.label, &db.path).await;
+        // Feedback collection gives each database its own budget; direct runs scan fully.
+        let deadline = command
+            .feedback
+            .then(|| Instant::now() + Duration::from_secs(1));
+        let db_status = sqlite_integrity_detail(
+            config.sqlite_config(),
+            &mut details,
+            db.label,
+            &db.path,
+            deadline,
+        )
+        .await;
+        if db_status == CheckStatus::Fail {
+            failed_databases.push(db.path.display().to_string());
+        }
+        status = status.max(db_status);
     }
     rollout_stats_details(&mut details, &config.codex_home);
     standalone_release_cache_details(&mut details);
 
-    let status = if integrity_failures.is_empty() {
-        CheckStatus::Ok
-    } else {
-        CheckStatus::Fail
-    };
-    let summary = if status == CheckStatus::Ok {
-        "state paths and databases are inspectable"
-    } else {
-        "state database integrity check failed"
+    let summary = match status {
+        CheckStatus::Ok => "state paths and databases are inspectable".to_string(),
+        CheckStatus::Warning => {
+            "some database integrity checks exceeded their time limit".to_string()
+        }
+        CheckStatus::Fail => "state database integrity check failed".to_string(),
     };
     let mut check = DoctorCheck::new("state.paths", "state", status, summary).details(details);
     if status == CheckStatus::Fail {
-        check = check.remediation(
-            "Move the damaged SQLite database aside, then restart the interactive CLI or app server so it can rebuild that runtime database from saved data. Other entry points may not rebuild automatically.",
+        let noun = if failed_databases.len() == 1 {
+            "database"
+        } else {
+            "databases"
+        };
+        check = check.issue(
+            DoctorIssue::new(
+                CheckStatus::Fail,
+                format!(
+                    "{} {noun} failed integrity check",
+                    failed_databases.join(", ")
+                ),
+            )
+            .remedy(
+                "Move the damaged SQLite database aside, then restart the interactive CLI or app server so it can rebuild that runtime database from saved data. Other entry points may not rebuild automatically.",
+            ),
         );
     }
     check
 }
 
 async fn sqlite_integrity_detail(
+    sqlite: &codex_state::SqliteConfig,
     details: &mut Vec<String>,
-    integrity_failures: &mut Vec<String>,
     label: &str,
     path: &Path,
-) {
+    deadline: Option<Instant>,
+) -> CheckStatus {
     if !path.is_file() {
         details.push(format!("{label} integrity: skipped (missing)"));
-        return;
+        return CheckStatus::Ok;
     }
 
-    match codex_state::sqlite_integrity_check(path).await {
-        Ok(rows) if rows.iter().all(|row| row == "ok") => {
-            details.push(format!("{label} integrity: ok"));
-        }
-        Ok(rows) => {
-            let message = format!("{label} integrity: {}", rows.join("; "));
-            integrity_failures.push(message.clone());
-            details.push(message);
-        }
+    let (rows, timed_out) = match codex_state::sqlite_integrity_check(sqlite, path, deadline).await
+    {
+        Ok(codex_state::SqliteIntegrityCheck::Complete(rows)) => (rows, false),
+        Ok(codex_state::SqliteIntegrityCheck::TimedOut(rows)) => (rows, true),
         Err(err) => {
-            let message = format!("{label} integrity: {err}");
-            integrity_failures.push(message.clone());
-            details.push(message);
+            details.push(format!("{label} integrity: {err}"));
+            return CheckStatus::Fail;
         }
+    };
+    if timed_out {
+        details.push(format!(
+            "{label} integrity: incomplete (1 second time limit)"
+        ));
+    }
+    if rows.iter().any(|row| row != "ok") {
+        details.push(format!("{label} integrity: {}", rows.join("; ")));
+        CheckStatus::Fail
+    } else if timed_out {
+        CheckStatus::Warning
+    } else {
+        details.push(format!("{label} integrity: ok"));
+        CheckStatus::Ok
     }
 }
 
@@ -2296,6 +2308,7 @@ fn collect_rollout_stats_inner(path: &Path, stats: &mut RolloutStats) {
 }
 
 fn is_rollout_file(path: &Path) -> bool {
+    let path = codex_rollout::plain_rollout_path(path);
     path.extension() == Some(OsStr::new("jsonl"))
         && path
             .file_name()
@@ -2331,15 +2344,39 @@ async fn websocket_reachability_check(
         provider.websocket_connect_timeout().as_millis()
     ));
 
-    let runtime_provider = create_model_provider(provider.clone(), auth_manager);
-    let auth = runtime_provider.auth().await;
-    details.push(format!(
-        "auth mode: {}",
-        auth.as_ref().map(auth_mode_name).unwrap_or("none")
-    ));
-
-    let api_provider = match runtime_provider.api_provider().await {
-        Ok(api_provider) => api_provider,
+    let setup = async {
+        let runtime_auth = if config.features.enabled(Feature::RuntimeAgentInstances)
+            && let Some(credentials) = &auth_manager
+        {
+            let installation_id = codex_core::resolve_installation_id(&config.codex_home).await?;
+            codex_core::build_runtime_auth_manager(
+                config,
+                Arc::clone(credentials),
+                &installation_id,
+            )
+            .map(|runtime| (runtime, config.runtime_auth_mode))
+        } else {
+            None
+        };
+        let runtime_provider = match auth_manager {
+            Some(credentials) => codex_model_provider::ProviderAuthContext {
+                credentials,
+                runtime_auth,
+            }
+            .model_provider(provider.clone()),
+            None => create_model_provider(provider.clone(), /*auth_manager*/ None),
+        };
+        codex_model_provider::resolve_request(
+            runtime_provider.as_ref(),
+            /*scope*/ None,
+            Some(&config.workspace_routing_context()),
+            config.http_client_factory(),
+        )
+        .await
+    }
+    .await;
+    let setup = match setup {
+        Ok(setup) => setup,
         Err(err) => {
             return websocket_probe_warning(
                 "Responses WebSocket provider setup failed",
@@ -2348,6 +2385,11 @@ async fn websocket_reachability_check(
             );
         }
     };
+    details.push(format!(
+        "auth mode: {}",
+        setup.auth.as_ref().map(auth_mode_name).unwrap_or("none")
+    ));
+    let api_provider = setup.api_provider;
     match api_provider.websocket_url_for_path("responses") {
         Ok(url) => {
             details.push(format!("endpoint: {url}"));
@@ -2366,24 +2408,13 @@ async fn websocket_reachability_check(
         }
     }
 
-    let api_auth = match runtime_provider.api_auth().await {
-        Ok(api_auth) => api_auth,
-        Err(err) => {
-            return websocket_probe_warning(
-                "Responses WebSocket auth could not be resolved",
-                details,
-                format!("auth resolution failed: {err}"),
-            );
-        }
-    };
-
     let mut extra_headers = HeaderMap::new();
     extra_headers.insert(
         OPENAI_BETA_HEADER,
         HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
     );
-    let client = ResponsesWebsocketClient::new(api_provider, api_auth);
-    let http_client_factory = config.http_client_factory();
+    let client = ResponsesWebsocketClient::new(api_provider, setup.api_auth);
+    let http_client_factory = setup.http_client_factory;
     match tokio::time::timeout(
         provider.websocket_connect_timeout(),
         client.probe_handshake(
@@ -2399,16 +2430,15 @@ async fn websocket_reachability_check(
             details.push(format!("handshake result: HTTP {}", probe.status));
             details.push(format!("reasoning header: {}", probe.reasoning_included));
             details.push(format!(
-                "models etag present: {}",
-                probe.models_etag_present
-            ));
-            details.push(format!(
                 "server model present: {}",
                 probe.server_model_present
             ));
             if let Some(close) = probe.immediate_close {
                 details.push(format!("immediate close code: {}", close.code));
-                details.push(format!("immediate close reason: {}", close.reason));
+                details.push(format!(
+                    "immediate close reason: {}",
+                    close_reason_detail(&close.reason)
+                ));
                 return DoctorCheck::new(
                     "network.websocket_reachability",
                     "websocket",
@@ -2431,7 +2461,7 @@ async fn websocket_reachability_check(
         Ok(Err(err)) => websocket_probe_warning(
             "Responses WebSocket failed; HTTPS fallback may still work",
             details,
-            websocket_error_detail(&err),
+            websocket_error_detail(&err.error),
         ),
         Err(_) => websocket_probe_warning(
             "Responses WebSocket timed out; HTTPS fallback may still work",
@@ -2459,19 +2489,75 @@ fn websocket_probe_warning(
 
 fn websocket_error_detail(err: &ApiError) -> String {
     match err {
-        ApiError::Transport(transport) => format!("handshake transport error: {transport}"),
-        ApiError::Api { status, message } => {
-            format!("handshake API error: {status} {message}")
+        ApiError::Transport(transport) => {
+            let detail = match transport {
+                // Policy denials contain only fixed descriptions, without wire values.
+                TransportError::Policy(denied) => denied.to_string(),
+                TransportError::Http { status, .. } => format!("http {status}: [redacted]"),
+                TransportError::RetryLimit => "retry limit reached".to_string(),
+                TransportError::Timeout => "timeout".to_string(),
+                TransportError::Connection(_) => "connection failed: [redacted]".to_string(),
+                TransportError::Network(_) => "network error: [redacted]".to_string(),
+                TransportError::Build(_) => "request build error: [redacted]".to_string(),
+                TransportError::ResponseTooLarge { max_bytes } => {
+                    format!("response body exceeds the {max_bytes} byte limit")
+                }
+            };
+            format!("handshake transport error: {detail}")
         }
-        ApiError::Stream(message) => format!("handshake stream error: {message}"),
-        ApiError::ContextWindowExceeded
+        ApiError::Api { status, .. } => format!("handshake API error: {status} [redacted]"),
+        ApiError::Stream(_) => "handshake stream error: [redacted]".to_string(),
+        ApiError::ResponseIncomplete(_) => {
+            "handshake error: incomplete response: [redacted]".to_string()
+        }
+        // These variants format fixed text; retry metadata is typed and never printed.
+        ApiError::ContentFilter
+        | ApiError::WebsocketMessageTooLarge
+        | ApiError::ContextWindowExceeded
+        | ApiError::SpendLimitExceeded(_)
         | ApiError::QuotaExceeded
         | ApiError::UsageNotIncluded
-        | ApiError::Retryable { .. }
-        | ApiError::RateLimit(_)
-        | ApiError::InvalidRequest { .. }
-        | ApiError::CyberPolicy { .. }
-        | ApiError::ServerOverloaded => format!("handshake error: {err}"),
+        | ApiError::SessionBudgetExceeded
+        | ApiError::FlexUnavailable
+        | ApiError::ServerOverloaded { .. }
+        | ApiError::PolicyCapacityUnavailable { .. } => format!("handshake error: {err}"),
+        ApiError::Retryable { .. } => "handshake error: retryable error: [redacted]".to_string(),
+        ApiError::RateLimitExceeded { .. } => {
+            "handshake error: rate limit exceeded: [redacted]".to_string()
+        }
+        ApiError::RateLimit(_) => "handshake error: rate limit: [redacted]".to_string(),
+        ApiError::InvalidRequest { .. } => {
+            "handshake error: invalid request: [redacted]".to_string()
+        }
+        ApiError::InvalidAudioInput { .. } => {
+            "handshake error: invalid audio input: [redacted]".to_string()
+        }
+        ApiError::ModelNotFound { .. } => {
+            "handshake error: model not found: [redacted]".to_string()
+        }
+        ApiError::InvalidPrompt { .. } => "handshake error: invalid prompt: [redacted]".to_string(),
+        ApiError::InferenceHookDenied { .. } => {
+            "handshake error: inference hook denied: [redacted]".to_string()
+        }
+        ApiError::ContentPolicyViolation { .. } => {
+            "handshake error: content policy violation".to_string()
+        }
+        ApiError::AccessProgramNotEnabled { .. } => {
+            "handshake error: access program not enabled".to_string()
+        }
+        ApiError::CyberPolicy { .. } => "handshake error: cyber policy: [redacted]".to_string(),
+        ApiError::BioPolicy { .. } => "handshake error: bio policy: [redacted]".to_string(),
+        ApiError::MisalignmentPolicyViolation { .. } => {
+            "handshake error: misalignment policy violation: [redacted]".to_string()
+        }
+    }
+}
+
+fn close_reason_detail(reason: &str) -> &'static str {
+    if reason.is_empty() {
+        "empty"
+    } else {
+        "present (redacted)"
     }
 }
 
@@ -2484,6 +2570,7 @@ fn auth_mode_name(auth: &CodexAuth) -> &'static str {
         AuthMode::AgentIdentity => "agent_identity",
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
+        AuthMode::BedrockAccessKeys => "bedrock_access_keys",
     }
 }
 
@@ -2538,6 +2625,7 @@ fn fallback_state_check() -> DoctorCheck {
 struct ReachabilityPlan {
     description: String,
     endpoints: Vec<ReachabilityEndpoint>,
+    http_client_factory: HttpClientFactory,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2566,6 +2654,12 @@ impl ProviderAuthReachabilityMode {
 }
 
 fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
+    let query_params = config.model_provider.query_params.as_ref().map(|params| {
+        params
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().to_owned()))
+            .collect::<HashMap<_, _>>()
+    });
     let stored_auth = load_auth_dot_json(
         &config.codex_home,
         config.cli_auth_credentials_store_mode,
@@ -2575,18 +2669,22 @@ fn provider_reachability_plan(config: &Config) -> ReachabilityPlan {
     .flatten();
     let mode = provider_auth_reachability_mode_from_auth(
         config.model_provider.requires_openai_auth,
+        config.model_provider.env_key.as_deref(),
+        config.model_provider.base_url.as_deref(),
         env_var_present,
         stored_auth.as_ref(),
     );
-    provider_reachability_plan_from_parts(
+    let mut plan = provider_reachability_plan_from_parts(
         mode,
         &config.model_provider_id,
         &config.model_provider.name,
         config.model_provider.base_url.as_deref(),
-        config.model_provider.query_params.as_ref(),
+        query_params.as_ref(),
         config.model_provider.is_amazon_bedrock(),
         &config.chatgpt_base_url,
-    )
+    );
+    plan.http_client_factory = config.http_client_factory();
+    plan
 }
 
 fn default_reachability_plan() -> ReachabilityPlan {
@@ -2603,20 +2701,28 @@ fn default_reachability_plan() -> ReachabilityPlan {
 
 fn provider_auth_reachability_mode_from_auth(
     requires_openai_auth: bool,
+    provider_env_key: Option<&str>,
+    provider_base_url: Option<&str>,
     env_var_present: impl Fn(&str) -> bool,
     stored_auth: Option<&AuthDotJson>,
 ) -> ProviderAuthReachabilityMode {
     if !requires_openai_auth {
         return ProviderAuthReachabilityMode::NotRequired;
     }
-    if env_var_present(OPENAI_API_KEY_ENV_VAR) || env_var_present(CODEX_API_KEY_ENV_VAR) {
+    if provider_base_url.is_some_and(|url| !url.trim().is_empty())
+        && provider_env_key
+            .is_some_and(|env_key| !env_key.trim().is_empty() && env_var_present(env_key))
+        || env_var_present(CODEX_API_KEY_ENV_VAR)
+    {
         return ProviderAuthReachabilityMode::ApiKey;
     }
     if env_var_present(CODEX_ACCESS_TOKEN_ENV_VAR) {
         return ProviderAuthReachabilityMode::Chatgpt;
     }
     match stored_auth.map(stored_auth_mode_value) {
-        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey) => ProviderAuthReachabilityMode::ApiKey,
+        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey | AuthMode::BedrockAccessKeys) => {
+            ProviderAuthReachabilityMode::ApiKey
+        }
         Some(
             AuthMode::Chatgpt
             | AuthMode::ChatgptAuthTokens
@@ -2645,35 +2751,29 @@ fn provider_reachability_plan_from_parts(
             should_probe_models_route(provider_name, url, is_amazon_bedrock)
                 .then(|| provider_url_for_path(url, "models", provider_query_params))
         });
-    let endpoints = match mode {
-        ProviderAuthReachabilityMode::ApiKey => vec![ReachabilityEndpoint {
+    let endpoints = match (mode, provider_base_url) {
+        (ProviderAuthReachabilityMode::ApiKey, _) | (_, Some(_)) => vec![ReachabilityEndpoint {
             label: format!("{provider_id} API"),
-            url: provider_base_url
-                .unwrap_or("https://api.openai.com/v1")
-                .to_string(),
+            url: provider_url_for_path(
+                provider_base_url.unwrap_or("https://api.openai.com/v1"),
+                "responses",
+                provider_query_params,
+            ),
             required: true,
             route_probe_url: provider_route_probe_url,
         }],
-        ProviderAuthReachabilityMode::Chatgpt => vec![ReachabilityEndpoint {
+        (ProviderAuthReachabilityMode::Chatgpt, None) => vec![ReachabilityEndpoint {
             label: "ChatGPT".to_string(),
-            url: chatgpt_base_url.to_string(),
+            url: provider_url_for_path(chatgpt_base_url, "codex/responses", provider_query_params),
             required: true,
             route_probe_url: None,
         }],
-        ProviderAuthReachabilityMode::NotRequired => provider_base_url
-            .map(|url| {
-                vec![ReachabilityEndpoint {
-                    label: format!("{provider_id} API"),
-                    url: url.to_string(),
-                    required: true,
-                    route_probe_url: provider_route_probe_url,
-                }]
-            })
-            .unwrap_or_default(),
+        (ProviderAuthReachabilityMode::NotRequired, None) => Vec::new(),
     };
     ReachabilityPlan {
         description: mode.description().to_string(),
         endpoints,
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     }
 }
 
@@ -2724,15 +2824,20 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
         .details(details);
     }
 
+    let client = RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
+        plan.http_client_factory,
+        ClientRouteClass::Api,
+    )
+    .with_legacy_custom_ca_fallback();
     let mut failures = Vec::new();
     let mut optional_failures = Vec::new();
     let mut route_failures = Vec::new();
     let mut route_warnings = Vec::new();
     let mut issues = Vec::new();
     for endpoint in plan.endpoints {
-        match http_probe_url(&endpoint.url).await {
+        match network::probe_status(&client, &endpoint.url, Method::HEAD, default_headers()).await {
             Ok(status) => details.push(format!(
-                "{} base URL: {} reachable ({status})",
+                "{} inference URL: {} reachable (HTTP {status})",
                 endpoint.label, endpoint.url
             )),
             Err(err) => {
@@ -2742,7 +2847,7 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
                     "optional"
                 };
                 details.push(format!(
-                    "{} base URL: {} {err} ({requirement})",
+                    "{} inference URL: {} {err} ({requirement})",
                     endpoint.label, endpoint.url
                 ));
                 if endpoint.required {
@@ -2757,7 +2862,7 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
         let Some(route_probe_url) = endpoint.route_probe_url.as_deref() else {
             continue;
         };
-        match provider_route_probe_url(route_probe_url).await {
+        match provider_route_probe_url(&client, route_probe_url).await {
             RouteProbeOutcome::Ok(status) => {
                 details.push(format!(
                     "{} route probe: {route_probe_url} route exists ({status})",
@@ -2835,8 +2940,8 @@ enum RouteProbeOutcome {
     TransportError(String),
 }
 
-async fn provider_route_probe_url(url: &str) -> RouteProbeOutcome {
-    match http_get_probe_status_with_timeout(url, Duration::from_secs(3)).await {
+async fn provider_route_probe_url(client: &RouteAwareClientPool, url: &str) -> RouteProbeOutcome {
+    match network::probe_status(client, url, Method::GET, default_headers()).await {
         Ok(status) if (200..300).contains(&status) || matches!(status, 401 | 403) => {
             RouteProbeOutcome::Ok(format!("HTTP {status}"))
         }
@@ -2866,10 +2971,6 @@ fn provider_reachability_outcome(
     }
 }
 
-async fn http_probe_url(url: &str) -> Result<String, String> {
-    http_probe_url_with_timeout(url, Duration::from_secs(3)).await
-}
-
 async fn mcp_http_probe_url(url: &str) -> Result<String, String> {
     mcp_http_probe_url_with_timeout(url, Duration::from_secs(3)).await
 }
@@ -2885,7 +2986,7 @@ async fn mcp_http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 }
 
 async fn http_probe_url_with_timeout(url: &str, timeout: Duration) -> Result<String, String> {
-    let response = build_reqwest_client()
+    let response = create_client_without_request_logging()
         .head(url)
         .timeout(timeout)
         .send()
@@ -2911,7 +3012,7 @@ async fn http_get_probe_url_with_timeout(url: &str, timeout: Duration) -> Result
 }
 
 async fn http_get_probe_status_with_timeout(url: &str, timeout: Duration) -> Result<u16, String> {
-    let response = build_reqwest_client()
+    let response = create_client_without_request_logging()
         .get(url)
         .timeout(timeout)
         .send()
@@ -3156,6 +3257,176 @@ mod tests {
     }
 
     #[test]
+    fn websocket_probe_human_output() {
+        let report = |websocket: DoctorCheck| DoctorReport {
+            schema_version: 1,
+            generated_at: "0s since unix epoch".to_string(),
+            overall_status: websocket.status,
+            codex_version: "0.0.0".to_string(),
+            checks: vec![
+                DoctorCheck::new(
+                    "network.environment",
+                    "network",
+                    CheckStatus::Ok,
+                    "network environment is readable",
+                )
+                .detail("HTTPS proxy: not set"),
+                websocket,
+                DoctorCheck::new(
+                    "network.provider_reachability",
+                    "reachability",
+                    CheckStatus::Ok,
+                    "active provider endpoints are reachable over HTTP",
+                )
+                .detail("OpenAI endpoint: HTTP 200"),
+            ],
+        };
+        let options = HumanOutputOptions {
+            show_details: true,
+            show_all: true,
+            ascii: true,
+            color_enabled: false,
+        };
+        let success = render_human_report(
+            &report(
+                DoctorCheck::new(
+                    "network.websocket_reachability",
+                    "websocket",
+                    CheckStatus::Ok,
+                    "Responses WebSocket handshake succeeded",
+                )
+                .detail("handshake result: HTTP 101")
+                .detail("reasoning header: true")
+                .detail("server model present: true"),
+            ),
+            options,
+        );
+        let immediate_close = render_human_report(
+            &report(
+                DoctorCheck::new(
+                    "network.websocket_reachability",
+                    "websocket",
+                    CheckStatus::Warning,
+                    "Responses WebSocket closed immediately after handshake",
+                )
+                .detail("handshake result: HTTP 101")
+                .detail("immediate close code: 1008")
+                .detail(format!(
+                    "immediate close reason: {}",
+                    close_reason_detail("private-close-reason")
+                ))
+                .remediation(
+                    "Check proxy, VPN, firewall, DNS, custom CA, and WebSocket policy support.",
+                ),
+            ),
+            options,
+        );
+        let generic_failure = render_human_report(
+            &report(websocket_probe_warning(
+                "Responses WebSocket failed; HTTPS fallback may still work",
+                vec!["endpoint: wss://example.com/responses".to_string()],
+                websocket_error_detail(&ApiError::Stream("private-stream-error".to_string())),
+            )),
+            options,
+        );
+        let rendered = format!(
+            "successful handshake\n{success}\nimmediate close\n{immediate_close}\nstream failure\n{generic_failure}"
+        );
+
+        assert!(!rendered.contains("private-close-reason"));
+        assert!(!rendered.contains("private-stream-error"));
+        insta::assert_snapshot!("websocket_probe_human_output", rendered);
+    }
+
+    #[test]
+    fn websocket_error_detail_preserves_categories_without_wire_values() {
+        let secret = "private-wire-value";
+        let message = || secret.to_string();
+        let cases = [
+            ApiError::Transport(TransportError::Http {
+                status: http::StatusCode::FORBIDDEN,
+                url: Some(format!("https://example.com/?token={secret}")),
+                headers: Some(HeaderMap::from_iter([(
+                    http::header::SET_COOKIE,
+                    HeaderValue::from_static(secret),
+                )])),
+                body: Some(message()),
+                retry_after: None,
+            }),
+            ApiError::Transport(TransportError::Network(message())),
+            ApiError::Transport(TransportError::Build(message())),
+            ApiError::Api {
+                status: http::StatusCode::UNAUTHORIZED,
+                message: message(),
+            },
+            ApiError::Stream(message()),
+            ApiError::ResponseIncomplete(Box::new(
+                codex_protocol::error::ResponseIncompleteError {
+                    partial_output: vec![],
+                    reason: message(),
+                    response_id: Some(message()),
+                    token_usage: None,
+                },
+            )),
+            ApiError::Retryable {
+                message: message(),
+                retry_after: None,
+            },
+            ApiError::RateLimitExceeded {
+                message: message(),
+                retry_after: None,
+            },
+            ApiError::RateLimit(message()),
+            ApiError::InvalidRequest { message: message() },
+            ApiError::InvalidAudioInput {
+                message: message(),
+                per_recording: true,
+            },
+            ApiError::ModelNotFound {
+                message: message(),
+                status: Some(http::StatusCode::NOT_FOUND),
+            },
+            ApiError::InvalidPrompt { message: message() },
+            ApiError::ContentPolicyViolation {
+                message: message(),
+                status: None,
+            },
+            ApiError::AccessProgramNotEnabled { message: message() },
+            ApiError::CyberPolicy { message: message() },
+            ApiError::BioPolicy { message: message() },
+            ApiError::MisalignmentPolicyViolation {
+                message: message(),
+                misalignment: None,
+            },
+        ];
+        let details = cases.iter().map(websocket_error_detail).collect::<Vec<_>>();
+        assert!(!details.join("\n").contains(secret));
+        assert_eq!(
+            details,
+            [
+                "handshake transport error: http 403 Forbidden: [redacted]",
+                "handshake transport error: network error: [redacted]",
+                "handshake transport error: request build error: [redacted]",
+                "handshake API error: 401 Unauthorized [redacted]",
+                "handshake stream error: [redacted]",
+                "handshake error: incomplete response: [redacted]",
+                "handshake error: retryable error: [redacted]",
+                "handshake error: rate limit exceeded: [redacted]",
+                "handshake error: rate limit: [redacted]",
+                "handshake error: invalid request: [redacted]",
+                "handshake error: invalid audio input: [redacted]",
+                "handshake error: model not found: [redacted]",
+                "handshake error: invalid prompt: [redacted]",
+                "handshake error: content policy violation",
+                "handshake error: access program not enabled",
+                "handshake error: cyber policy: [redacted]",
+                "handshake error: bio policy: [redacted]",
+                "handshake error: misalignment policy violation: [redacted]",
+            ]
+        );
+    }
+
+    #[test]
     fn run_sync_check_notifies_progress() {
         let progress_impl = Arc::new(RecordingProgress::default());
         let progress: Arc<dyn DoctorProgress> = progress_impl.clone();
@@ -3185,31 +3456,6 @@ mod tests {
         assert_eq!(
             progress_impl.events(),
             vec!["begin test".to_string(), "finish test Warning".to_string()]
-        );
-    }
-
-    #[test]
-    fn compare_npm_package_roots_detects_match() {
-        let running = PathBuf::from("/prefix/lib/node_modules/@openai/codex");
-        let npm_root = PathBuf::from("/prefix/lib/node_modules");
-        assert_eq!(
-            compare_npm_package_roots(&running, &npm_root),
-            NpmRootCheck::Match {
-                package_root: npm_root.join("@openai").join("codex")
-            }
-        );
-    }
-
-    #[test]
-    fn compare_npm_package_roots_detects_mismatch() {
-        let running = PathBuf::from("/old/lib/node_modules/@openai/codex");
-        let npm_root = PathBuf::from("/new/lib/node_modules");
-        assert_eq!(
-            compare_npm_package_roots(&running, &npm_root),
-            NpmRootCheck::Mismatch {
-                running_package_root: running,
-                npm_package_root: npm_root.join("@openai").join("codex"),
-            }
         );
     }
 
@@ -3259,7 +3505,7 @@ mod tests {
         let arg0_paths = Arg0DispatchPaths {
             codex_self_exe: Some(PathBuf::from("/bin/codex")),
             codex_linux_sandbox_exe: Some(PathBuf::from("/bin/codex-linux-sandbox")),
-            main_execve_wrapper_exe: Some(PathBuf::from("/bin/codex-execve-wrapper")),
+            ..Default::default()
         };
 
         let overrides = config_overrides_from_interactive(&interactive, &arg0_paths);
@@ -3278,10 +3524,6 @@ mod tests {
         assert_eq!(
             overrides.codex_linux_sandbox_exe,
             arg0_paths.codex_linux_sandbox_exe
-        );
-        assert_eq!(
-            overrides.main_execve_wrapper_exe,
-            arg0_paths.main_execve_wrapper_exe
         );
     }
 
@@ -3437,12 +3679,30 @@ mod tests {
 
         assert_eq!(check.status, CheckStatus::Warning);
         assert_eq!(check.summary, "MCP configuration has optional issues");
+        insta::assert_snapshot!(check.remediation.unwrap(), @"Check that the MCP server is running and its URL is reachable. Alternatively, disable the affected server.");
         assert!(
             check
                 .details
                 .iter()
                 .any(|detail| detail.contains("optional reachability failed: optional:"))
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_check_reports_both_missing_token_and_unreachable_url() {
+        let server = toml::from_str(
+            r#"
+                url = "http://127.0.0.1:9/mcp"
+                bearer_token_env_var = "CODEX_DOCTOR_MISSING_MCP_TOKEN"
+                required = true
+            "#,
+        )
+        .expect("required MCP config");
+        let check =
+            mcp_check_from_servers(&HashMap::from([("required".to_string(), server)])).await;
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        insta::assert_snapshot!(check.remediation.unwrap(), @"Set the missing MCP env vars. Check that the MCP server is running and its URL is reachable. Alternatively, disable the affected server.");
     }
 
     #[tokio::test]
@@ -3543,6 +3803,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(
@@ -3562,6 +3823,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(
@@ -3583,6 +3845,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: Some("at-test".to_string()),
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(stored_auth_mode(&auth), "personal_access_token");
@@ -3606,11 +3869,14 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(
             provider_auth_reachability_mode_from_auth(
                 /*requires_openai_auth*/ true,
+                /*provider_env_key*/ None,
+                /*provider_base_url*/ None,
                 |_| false,
                 Some(&api_key_auth),
             ),
@@ -3619,8 +3885,46 @@ mod tests {
         assert_eq!(
             provider_auth_reachability_mode_from_auth(
                 /*requires_openai_auth*/ true,
-                |name| name == OPENAI_API_KEY_ENV_VAR,
+                /*provider_env_key*/ None,
+                /*provider_base_url*/ None,
+                |name| name == CODEX_API_KEY_ENV_VAR,
                 /*stored_auth*/ None,
+            ),
+            ProviderAuthReachabilityMode::ApiKey
+        );
+
+        let chatgpt_auth = AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
+            openai_api_key: None,
+            ..api_key_auth
+        };
+        assert_eq!(
+            provider_auth_reachability_mode_from_auth(
+                /*requires_openai_auth*/ true,
+                /*provider_env_key*/ None,
+                Some("https://custom.example/v1"),
+                |name| name == OPENAI_API_KEY_ENV_VAR,
+                Some(&chatgpt_auth),
+            ),
+            ProviderAuthReachabilityMode::Chatgpt
+        );
+        assert_eq!(
+            provider_auth_reachability_mode_from_auth(
+                /*requires_openai_auth*/ true,
+                Some(OPENAI_API_KEY_ENV_VAR),
+                Some("https://custom.example/v1"),
+                |name| name == OPENAI_API_KEY_ENV_VAR,
+                Some(&chatgpt_auth),
+            ),
+            ProviderAuthReachabilityMode::ApiKey
+        );
+        assert_eq!(
+            provider_auth_reachability_mode_from_auth(
+                /*requires_openai_auth*/ true,
+                /*provider_env_key*/ None,
+                /*provider_base_url*/ None,
+                |name| name == CODEX_API_KEY_ENV_VAR,
+                Some(&chatgpt_auth),
             ),
             ProviderAuthReachabilityMode::ApiKey
         );
@@ -3642,10 +3946,11 @@ mod tests {
                 description: "provider auth".to_string(),
                 endpoints: vec![ReachabilityEndpoint {
                     label: "azure API".to_string(),
-                    url: "https://example.openai.azure.com/openai/v1".to_string(),
+                    url: "https://example.openai.azure.com/openai/v1/responses".to_string(),
                     required: true,
                     route_probe_url: None,
                 }],
+                http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             }
         );
     }
@@ -3654,28 +3959,38 @@ mod tests {
     fn provider_reachability_adds_models_route_probe_for_openai_compatible_base_urls() {
         let query_params = HashMap::from([("api-version".to_string(), "2026-01-01".to_string())]);
 
-        assert_eq!(
-            provider_reachability_plan_from_parts(
-                ProviderAuthReachabilityMode::NotRequired,
-                "custom",
-                "Custom",
-                Some("https://example.com/openai/v1/"),
-                Some(&query_params),
-                /*is_amazon_bedrock*/ false,
-                "https://chatgpt.com/backend-api/",
-            ),
-            ReachabilityPlan {
-                description: "provider auth".to_string(),
-                endpoints: vec![ReachabilityEndpoint {
-                    label: "custom API".to_string(),
-                    url: "https://example.com/openai/v1/".to_string(),
-                    required: true,
-                    route_probe_url: Some(
-                        "https://example.com/openai/v1/models?api-version=2026-01-01".to_string()
+        for (mode, description) in [
+            (ProviderAuthReachabilityMode::NotRequired, "provider auth"),
+            (ProviderAuthReachabilityMode::Chatgpt, "ChatGPT auth"),
+        ] {
+            assert_eq!(
+                provider_reachability_plan_from_parts(
+                    mode,
+                    "custom",
+                    "Custom",
+                    Some("https://example.com/openai/v1/"),
+                    Some(&query_params),
+                    /*is_amazon_bedrock*/ false,
+                    "https://chatgpt.com/backend-api/",
+                ),
+                ReachabilityPlan {
+                    description: description.to_string(),
+                    endpoints: vec![ReachabilityEndpoint {
+                        label: "custom API".to_string(),
+                        url: "https://example.com/openai/v1/responses?api-version=2026-01-01"
+                            .to_string(),
+                        required: true,
+                        route_probe_url: Some(
+                            "https://example.com/openai/v1/models?api-version=2026-01-01"
+                                .to_string()
+                        ),
+                    }],
+                    http_client_factory: HttpClientFactory::new(
+                        OutboundProxyPolicy::ReqwestDefault
                     ),
-                }],
-            }
-        );
+                }
+            );
+        }
     }
 
     #[test]
@@ -3709,9 +4024,22 @@ mod tests {
             plan.endpoints,
             vec![ReachabilityEndpoint {
                 label: "openai API".to_string(),
-                url: "https://api.openai.com/v1".to_string(),
+                url: "https://api.openai.com/v1/responses".to_string(),
                 required: true,
                 route_probe_url: Some("https://api.openai.com/v1/models".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn provider_reachability_chatgpt_uses_inference_endpoint() {
+        assert_eq!(
+            default_reachability_plan().endpoints,
+            vec![ReachabilityEndpoint {
+                label: "ChatGPT".to_string(),
+                url: "https://chatgpt.com/backend-api/codex/responses".to_string(),
+                required: true,
+                route_probe_url: None,
             }]
         );
     }
@@ -3812,7 +4140,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_rollout_stats_counts_nested_rollout_files() {
+    fn rollout_stats_details_count_plain_and_compressed_files() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let nested = temp
             .path()
@@ -3826,14 +4154,40 @@ mod tests {
             "12345",
         )
         .expect("write rollout file");
+        // Storage totals include both physical files if both representations exist.
+        std::fs::write(
+            nested.join("rollout-2026-05-13T00-00-00-test.jsonl.zst"),
+            "1234567",
+        )
+        .expect("write compressed sibling");
+        std::fs::write(
+            nested.join("rollout-2026-05-13T01-00-00-compressed.jsonl.zst"),
+            "123",
+        )
+        .expect("write compressed rollout");
         std::fs::write(nested.join("not-a-rollout.jsonl"), "ignored").expect("write ignored jsonl");
+        std::fs::write(nested.join("not-a-rollout.jsonl.zst"), "ignored")
+            .expect("write ignored compressed file");
+        std::fs::write(
+            nested.join("rollout-2026-05-13T01-00-00-compressed.jsonl.zst.tmp"),
+            "ignored",
+        )
+        .expect("write compression temp file");
 
-        let stats = collect_rollout_stats(&temp.path().join("sessions"));
+        let archived = temp.path().join("archived_sessions");
+        std::fs::create_dir(&archived).expect("create archived rollout dir");
+        std::fs::write(
+            archived.join("rollout-2026-05-13T02-00-00-archived.jsonl.zst"),
+            "1234",
+        )
+        .expect("write archived compressed rollout");
 
-        assert_eq!(stats.files, 1);
-        assert_eq!(stats.total_bytes, 5);
-        assert_eq!(stats.average_bytes(), 5);
-        assert_eq!(stats.error, None);
+        let mut details = Vec::new();
+        rollout_stats_details(&mut details, temp.path());
+        insta::assert_snapshot!(details.join("\n"), @r"
+        active rollout files: 3 files, 15 total bytes, 5 average bytes
+        archived rollout files: 1 files, 4 total bytes, 4 average bytes
+        ");
     }
 
     #[tokio::test]
@@ -3851,41 +4205,59 @@ mod tests {
                 .expect("write response");
         });
 
-        let status = http_probe_url(&format!("http://{addr}/mcp")).await;
+        let status =
+            http_probe_url_with_timeout(&format!("http://{addr}/mcp"), Duration::from_secs(3))
+                .await;
         server.join().expect("probe server thread should finish");
 
         assert_eq!(status, Ok("HTTP 405".to_string()));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn mcp_http_probe_falls_back_to_get_when_head_times_out() {
+        use std::io::BufRead as _;
+
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let addr = listener.local_addr().expect("listener address");
-        let server = std::thread::spawn(move || {
+        let (head_received_tx, head_received_rx) = tokio::sync::oneshot::channel();
+        let (probe_done_tx, probe_done_rx) = std::sync::mpsc::channel::<()>();
+        // A blocking task inhibits Tokio's automatic clock advancement while real socket I/O
+        // is pending. Keep it alive until the client has consumed the GET response, too.
+        let server = tokio::task::spawn_blocking(move || {
             let (mut head_stream, _) = listener.accept().expect("accept HEAD probe request");
-            let head = std::thread::spawn(move || {
-                let mut request = [0; 1024];
-                let _ = head_stream.read(&mut request);
-                std::thread::sleep(Duration::from_millis(50));
-            });
+            let mut head_request = String::new();
+            std::io::BufReader::new(&mut head_stream)
+                .read_line(&mut head_request)
+                .expect("read HEAD request line");
+            assert_eq!(head_request, "HEAD /mcp HTTP/1.1\r\n");
+            head_received_tx.send(()).expect("signal HEAD receipt");
 
             let (mut get_stream, _) = listener.accept().expect("accept GET probe request");
-            let mut request = [0; 1024];
-            let _ = get_stream.read(&mut request);
+            let mut get_request = String::new();
+            std::io::BufReader::new(&mut get_stream)
+                .read_line(&mut get_request)
+                .expect("read GET request line");
+            assert_eq!(get_request, "GET /mcp HTTP/1.1\r\n");
             get_stream
                 .write_all(
                     b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .expect("write response");
-            head.join().expect("HEAD holder should finish");
+            // Dropping the sender also releases this wait if the probe panics.
+            let _ = probe_done_rx.recv();
+            drop(head_stream);
         });
 
-        let status = mcp_http_probe_url_with_timeout(
-            &format!("http://{addr}/mcp"),
-            Duration::from_millis(10),
-        )
-        .await;
-        server.join().expect("probe server thread should finish");
+        let url = format!("http://{addr}/mcp");
+        let probe = mcp_http_probe_url_with_timeout(&url, Duration::from_millis(10));
+        let expire_head = async {
+            head_received_rx.await.expect("server should receive HEAD");
+            // Cross the unchanged 10 ms deadline only after HEAD is waiting for a response.
+            tokio::time::advance(Duration::from_millis(11)).await;
+        };
+        let (status, ()) = tokio::join!(probe, expire_head);
+        drop(probe_done_tx);
+        server.await.expect("probe server task should finish");
 
         assert_eq!(status, Ok("HTTP 405".to_string()));
     }
@@ -3908,6 +4280,7 @@ mod tests {
             check.summary,
             "MCP configuration has failing required inputs or reachability"
         );
+        insta::assert_snapshot!(check.remediation.unwrap(), @"Correct the listed MCP server configuration errors. Alternatively, disable the affected server.");
         assert!(check.details.iter().any(|detail| {
             detail.contains(
                 "required: stdio command \"definitely-missing-codex-doctor-mcp\" is not resolvable",
@@ -4068,6 +4441,7 @@ mod tests {
     fn terminal_inputs() -> TerminalCheckInputs {
         TerminalCheckInputs {
             info: TerminalInfo {
+                backend: None,
                 name: TerminalName::Unknown,
                 term_program: None,
                 version: None,
@@ -4097,24 +4471,57 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_warns_for_dumb_terminal() {
-        let mut inputs = terminal_inputs();
-        inputs.info.name = TerminalName::Dumb;
-        inputs.info.term = Some("dumb".to_string());
-        set_terminal_env(&mut inputs, "TERM", "dumb");
+    fn terminal_check_dumb_requires_interactive_stream() {
+        for (stdin, stdout, stderr, expected) in [
+            (false, false, false, CheckStatus::Warning),
+            (false, false, true, CheckStatus::Warning),
+            (false, true, false, CheckStatus::Fail),
+            (true, false, false, CheckStatus::Fail),
+        ] {
+            let mut inputs = terminal_inputs();
+            inputs.info.name = TerminalName::Dumb;
+            inputs.info.term = Some("dumb".to_string());
+            set_terminal_env(&mut inputs, "TERM", "dumb");
+            inputs.stdin_is_terminal = stdin;
+            inputs.stdout_is_terminal = stdout;
+            inputs.stderr_is_terminal = stderr;
 
-        let check = terminal_check_from_inputs(inputs);
+            let check = terminal_check_from_inputs(inputs);
 
-        assert_eq!(check.status, CheckStatus::Fail);
-        assert_eq!(
-            check.summary,
-            "TERM=dumb - colors and cursor control are disabled"
-        );
-        assert_eq!(check.issues.len(), 1);
-        assert_eq!(
-            check.issues[0].remedy.as_deref(),
-            Some("set TERM to a real value, for example xterm-256color")
-        );
+            assert_eq!(check.status, expected);
+            assert_eq!(check.issues.len(), 1);
+            assert_eq!(
+                check.issues[0].remedy.as_deref(),
+                (expected == CheckStatus::Fail)
+                    .then_some("set TERM to a real value, for example xterm-256color")
+            );
+            assert_eq!(
+                check.issues[0].expected.as_deref(),
+                (expected == CheckStatus::Fail)
+                    .then_some("TERM=xterm-256color or another real terminal type")
+            );
+            if !stdin && !stdout && !stderr {
+                let report = DoctorReport {
+                    schema_version: 1,
+                    generated_at: "0s since unix epoch".to_string(),
+                    overall_status: overall_status(std::slice::from_ref(&check)),
+                    codex_version: "0.0.0".to_string(),
+                    checks: vec![check],
+                };
+                insta::assert_snapshot!(
+                    "doctor_dumb_non_interactive_human",
+                    render_human_report(
+                        &report,
+                        HumanOutputOptions {
+                            show_details: true,
+                            show_all: true,
+                            ascii: true,
+                            color_enabled: false,
+                        }
+                    )
+                );
+            }
+        }
     }
 
     #[test]
@@ -4172,10 +4579,15 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_warns_for_unreadable_terminfo_path() {
+    fn terminal_check_prioritizes_unreadable_terminfo_over_warnings() {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let missing = tempdir.path().join("missing-terminfo");
         let mut inputs = terminal_inputs();
+        inputs.info.name = TerminalName::Dumb;
+        inputs.stdin_is_terminal = false;
+        inputs.stdout_is_terminal = false;
+        set_terminal_env(&mut inputs, "TERM", "dumb");
+        set_terminal_env(&mut inputs, "LANG", "C");
         set_terminal_env(&mut inputs, "TERMINFO", &missing.to_string_lossy());
 
         let check = terminal_check_from_inputs(inputs);
@@ -4195,6 +4607,21 @@ mod tests {
             check.issues[0].remedy.as_deref(),
             Some("check that $TERMINFO points to a readable directory")
         );
+        insta::assert_snapshot!(render_human_report(
+            &DoctorReport {
+                schema_version: 1,
+                generated_at: "0s since unix epoch".to_string(),
+                overall_status: check.status,
+                codex_version: "0.0.0".to_string(),
+                checks: vec![check],
+            },
+            HumanOutputOptions {
+                show_details: false,
+                show_all: false,
+                ascii: true,
+                color_enabled: false,
+            }
+        ));
     }
 
     #[test]
@@ -4234,7 +4661,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_keeps_tmux_probe_failures_non_fatal() {
+    fn terminal_check_allows_missing_tmux_details() {
         let mut inputs = terminal_inputs();
         inputs.info.multiplexer = Some(Multiplexer::Tmux { version: None });
 

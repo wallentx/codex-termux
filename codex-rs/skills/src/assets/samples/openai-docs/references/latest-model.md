@@ -1,40 +1,18 @@
-# Latest model guide
+# Latest model fallback
 
-This file is a curated helper. Every recommendation here must be verified against current OpenAI docs before it is repeated to a user.
+This is a compact, non-authoritative fallback, not a source for current availability, prices, aliases, or defaults. First search for and fetch current official model guidance at `https://developers.openai.com/api/docs/guides/latest-model` and the relevant official model page. The fetched official documentation wins if this snapshot has drifted. Disclose any use of this fallback.
 
-## Current model map
+## Source model descriptions
 
-| Model ID | Use for |
+| Model ID | Official source description |
 | --- | --- |
-| `gpt-5.6` | Latest/default GPT-5.6 alias; routes to Sol |
-| `gpt-5.6-sol` | Flagship GPT-5.6 tier for hardest quality-first, coding, and reasoning workflows |
-| `gpt-5.6-terra` | Mini-like GPT-5.6 tier for balanced cost, latency, and quality |
-| `gpt-5.6-luna` | Nano-like GPT-5.6 tier for high-throughput, simple, or strict-latency tasks |
-| `gpt-5.5` | Previous default text and reasoning model; use for existing GPT-5.5 integrations |
-| `gpt-5.4` | Older default text and reasoning model; use for existing GPT-5.4 integrations |
-| `gpt-5.4-mini` | Older lower-cost testing and lighter production workflows |
-| `gpt-5.4-nano` | Older high-throughput simple tasks and classification |
-| `gpt-4.1-mini` | Cheaper no-reasoning text |
-| `gpt-4.1-nano` | Fastest and cheapest no-reasoning text |
-| `gpt-5.3-codex` | Agentic coding, code editing, and tool-heavy coding workflows |
-| `gpt-5.1-codex-mini` | Cheaper coding workflows |
-| `gpt-image-2` | Best image generation and edit quality |
-| `gpt-image-1.5` | Less expensive image generation and edit quality |
-| `gpt-image-1-mini` | Cost-optimized image generation |
-| `gpt-4o-mini-tts` | Text-to-speech |
-| `gpt-4o-mini-transcribe` | Speech-to-text, fast and cost-efficient |
-| `gpt-realtime-1.5` | Realtime voice and multimodal sessions |
-| `gpt-realtime-mini` | Cheaper realtime sessions |
-| `gpt-audio` | Chat Completions audio input and output |
-| `gpt-audio-mini` | Cheaper Chat Completions audio workflows |
-| `sora-2` | Faster iteration and draft video generation |
-| `sora-2-pro` | Higher-quality production video |
-| `omni-moderation-latest` | Text and image moderation |
-| `text-embedding-3-large` | Higher-quality retrieval embeddings; default in this skill because no best-specific row exists |
-| `text-embedding-3-small` | Lower-cost embeddings |
+| `gpt-6.2-astra` | Demanding reasoning and coding tasks. |
+| `gpt-6.2-sol` | Everyday coding and agent workflows. |
+| `gpt-6.1-terra` | Mini model for latency-sensitive API examples. |
+| `gpt-6-luna` | Nano model for focused, high-volume tasks. |
 
-## Maintenance notes
+Legacy Chat Completions function-tool examples use `gpt-5.6-terra`. For an explicit GPT-6.2 Astra or Sol target, use the [GPT-6.2 migration quickstart](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra#gpt-6.2-astra-migration-quickstart). Both models support Responses and Chat Completions. Tool calling requires Responses.
 
-- GPT-5.6 Pro is a Responses reasoning mode on the base model, not a separate `gpt-5.6-pro` slug. Verify the live model guide before recommending its request shape.
-- This file will drift unless it is periodically re-verified against current OpenAI docs.
-- If this file conflicts with current docs, the docs win.
+Codex CLI examples use `gpt-6.2-sol` when the account has access. Configuration examples shared with the IDE extension use `gpt-6.1-sol`. Check [Codex availability by plan](https://developers.openai.com/codex/pricing#feature-availability) for the user's surface.
+
+Verify GPT-6 Pro against current official Responses and model documentation before describing model IDs, reasoning modes, request parameters, or account availability; do not invent a separate `gpt-6-pro` model slug.

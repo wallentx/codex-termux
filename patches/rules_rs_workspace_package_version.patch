@@ -1,0 +1,13 @@
+# Expose the resolved Cargo workspace package version in the generated metadata.
+
+diff --git a/rs/private/cargo_workspace_graph.bzl b/rs/private/cargo_workspace_graph.bzl
+--- a/rs/private/cargo_workspace_graph.bzl
++++ b/rs/private/cargo_workspace_graph.bzl
+@@ -654,6 +654,7 @@ def workspace_dep_data(
+             "edition": package.get("edition", "2015"),
+             "package_name": package["name"],
+             "shared_libraries": shared_libraries,
++            "version": package["version"],
+         }
+         lint_config = lint_configs.get(bazel_package)
+         if lint_config:

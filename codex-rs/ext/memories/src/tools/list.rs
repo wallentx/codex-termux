@@ -39,12 +39,16 @@ pub(super) struct ListTool<B> {
     pub(super) metrics_client: Option<MetricsClient>,
 }
 
-impl<B> ToolExecutor<ToolCall> for ListTool<B>
+impl<'call, B> ToolExecutor<ToolCall<'call>> for ListTool<B>
 where
     B: MemoriesBackend,
 {
     fn tool_name(&self) -> ToolName {
         memory_tool_name(LIST_TOOL_NAME)
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
     }
 
     fn spec(&self) -> ToolSpec {
@@ -54,7 +58,10 @@ where
         )
     }
 
-    fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(self.handle_call(call))
     }
 }
@@ -65,7 +72,7 @@ where
 {
     async fn handle_call(
         &self,
-        call: ToolCall,
+        call: ToolCall<'_>,
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
     {
         let backend = self.backend.clone();

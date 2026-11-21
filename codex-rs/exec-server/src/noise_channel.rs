@@ -3,7 +3,8 @@
 //! The harness initiates hybrid IK and pins the exec-server static key returned
 //! by the registry. The first handshake message lets the exec-server authenticate
 //! the harness static key; the exec-server then asks the registry whether that
-//! key is authorized before completing the handshake.
+//! key is authorized before opening a transport. A denied request can receive an
+//! authenticated rejection without creating a transport on either peer.
 //!
 //! "Hybrid" means the session keys include both X25519 and ML-KEM-768 key
 //! agreement. Once the two-message handshake finishes, AES-GCM protects the
@@ -33,6 +34,7 @@ use serde::Serialize;
 pub(crate) const NOISE_CHANNEL_SUITE: &str = "Noise_hybridIK_X25519+MLKEM768_AESGCM_SHA256";
 
 const PROLOGUE_DOMAIN: &[u8] = b"codex-exec-server-relay-noise/v1";
+const REGISTRY_AUTH_REJECTED: &[u8] = b"codex-registry-authentication-rejected/v1";
 
 type Handshake = HybridHandshake<X25519, MlKem768, MlKem768, AesGcm, Sha256>;
 type Transport = TransportState<AesGcm, Sha256>;
@@ -145,17 +147,23 @@ impl InitiatorHandshake {
                 "handshake payload is too large",
             ));
         }
-        let mut output = [0u8; MAX_MESSAGE_LEN];
+        let mut output = vec![0u8; payload.len() + overhead];
         let output_len = handshake.write_message(payload, &mut output)?;
-        Ok((Self { handshake }, output[..output_len].to_vec()))
+        output.truncate(output_len);
+        Ok((Self { handshake }, output))
     }
 
     /// Consume the executor response and enter transport mode.
-    /// The v1 response does not carry an application payload.
+    /// Successful responses have no payload. A fixed authenticated rejection
+    /// fails this request without opening an application transport.
     pub(crate) fn finish(mut self, response: &[u8]) -> Result<NoiseTransport, NoiseChannelError> {
         ensure_noise_frame_len(response.len(), "handshake response is too large")?;
-        let mut payload = [0u8; MAX_MESSAGE_LEN];
+        let overhead = self.handshake.get_next_message_overhead()?;
+        let mut payload = vec![0u8; response.len().saturating_sub(overhead)];
         let payload_len = self.handshake.read_message(response, &mut payload)?;
+        if &payload[..payload_len] == REGISTRY_AUTH_REJECTED {
+            return Err(NoiseChannelError::RegistryAuthenticationRejected);
+        }
         if payload_len != 0 {
             return Err(NoiseChannelError::InvalidMessage(
                 "handshake response payload must be empty",
@@ -190,7 +198,8 @@ impl PendingResponderHandshake {
             .with_s(identity.dh.clone())
             .with_s_kem(identity.kem.clone());
         let mut handshake = Handshake::new(params)?;
-        let mut payload = [0u8; MAX_MESSAGE_LEN];
+        let overhead = handshake.get_next_message_overhead()?;
+        let mut payload = vec![0u8; request.len().saturating_sub(overhead)];
         let payload_len = handshake.read_message(request, &mut payload)?;
         // Clatter exposes this key only after the first IK message authenticates.
         let remote = handshake
@@ -203,23 +212,38 @@ impl PendingResponderHandshake {
             x25519_public_key: STANDARD.encode(remote.dh()),
             mlkem768_public_key: STANDARD.encode(remote.kem().as_slice()),
         };
+        payload.truncate(payload_len);
         Ok(Self {
             handshake,
             initiator_public_key,
-            payload: payload[..payload_len].to_vec(),
+            payload,
         })
     }
 
     /// Finish the handshake after the registry authorizes the harness key.
     pub(crate) fn complete(mut self) -> Result<(NoiseTransport, Vec<u8>), NoiseChannelError> {
-        let mut response = [0u8; MAX_MESSAGE_LEN];
+        let overhead = self.handshake.get_next_message_overhead()?;
+        let mut response = vec![0u8; overhead];
         let response_len = self.handshake.write_message(&[], &mut response)?;
+        response.truncate(response_len);
         Ok((
             NoiseTransport {
                 transport: self.handshake.finalize()?,
             },
-            response[..response_len].to_vec(),
+            response,
         ))
+    }
+
+    /// Authenticate a terminal registry 401 to the harness without authorizing
+    /// its key or constructing a transport. Older peers reject nonempty payloads.
+    pub(crate) fn reject_registry_authentication(mut self) -> Result<Vec<u8>, NoiseChannelError> {
+        let overhead = self.handshake.get_next_message_overhead()?;
+        let mut response = vec![0u8; overhead + REGISTRY_AUTH_REJECTED.len()];
+        let response_len = self
+            .handshake
+            .write_message(REGISTRY_AUTH_REJECTED, &mut response)?;
+        response.truncate(response_len);
+        Ok(response)
     }
 }
 
@@ -288,6 +312,8 @@ fn ensure_noise_frame_len(
 
 #[derive(Debug, thiserror::Error)]
 pub enum NoiseChannelError {
+    #[error("environment registry authentication rejected")]
+    RegistryAuthenticationRejected,
     #[error("Noise channel key generation failed: {0}")]
     KeyGeneration(String),
     #[error("invalid Noise channel public key: {0}")]

@@ -9,6 +9,7 @@ use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::registry::AnyToolResult;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::ToolDispatchInvocation;
 use codex_rollout_trace::ToolDispatchPayload;
@@ -16,7 +17,7 @@ use codex_rollout_trace::ToolDispatchRequester;
 use codex_rollout_trace::ToolDispatchResult;
 use codex_rollout_trace::ToolDispatchTraceContext;
 
-/// Keeps registry early-return paths paired with trace end events.
+/// Keeps registry results and abandoned dispatches paired with trace end events.
 pub(crate) struct ToolDispatchTrace {
     context: ToolDispatchTraceContext,
 }
@@ -31,39 +32,39 @@ impl ToolDispatchTrace {
         Self { context }
     }
 
-    pub(crate) fn record_completed(
-        &self,
+    pub(crate) fn record_result(
+        self,
         invocation: &ToolInvocation,
-        call_id: &str,
-        payload: &ToolPayload,
-        result: &dyn ToolOutput,
+        result: &AnyToolResult,
+        status: ExecutionStatus,
     ) {
         if !self.context.is_enabled() {
             return;
         }
 
-        let Some(result_payload) = tool_dispatch_result(invocation, call_id, payload, result)
-        else {
+        let Some(result_payload) = tool_dispatch_result(
+            invocation,
+            &result.call_id,
+            &result.payload,
+            result.result.as_ref(),
+        ) else {
             return;
-        };
-        let status = if result.success_for_logging() {
-            ExecutionStatus::Completed
-        } else {
-            ExecutionStatus::Failed
         };
         self.context.record_completed(status, result_payload);
     }
 
-    pub(crate) fn record_failed(&self, error: &FunctionCallError) {
+    pub(crate) fn record_failed(self, error: &FunctionCallError) {
         self.context.record_failed(error);
     }
 }
 
 fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchInvocation> {
     let requester = match &invocation.source {
-        ToolCallSource::Direct => ToolDispatchRequester::Model {
-            model_visible_call_id: invocation.call_id.clone(),
-        },
+        ToolCallSource::Direct | ToolCallSource::DirectPlaintextMessage => {
+            ToolDispatchRequester::Model {
+                model_visible_call_id: invocation.call_id.clone(),
+            }
+        }
         ToolCallSource::CodeMode {
             cell_id,
             runtime_tool_call_id,
@@ -78,7 +79,12 @@ fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchI
         codex_turn_id: invocation.turn.sub_id.clone(),
         tool_call_id: invocation.call_id.clone(),
         tool_name: invocation.tool_name.name.clone(),
-        tool_namespace: invocation.tool_name.namespace.clone(),
+        tool_namespace: invocation
+            .tool_name
+            .namespace
+            .as_ref()
+            .filter(|_| !invocation.tool_name.is_default_namespace())
+            .cloned(),
         requester,
         payload: tool_dispatch_payload(&invocation.payload),
     })
@@ -91,9 +97,11 @@ fn tool_dispatch_result(
     result: &dyn ToolOutput,
 ) -> Option<ToolDispatchResult> {
     match invocation.source {
-        ToolCallSource::Direct => Some(ToolDispatchResult::DirectResponse {
-            response_item: result.to_response_item(call_id, payload),
-        }),
+        ToolCallSource::Direct | ToolCallSource::DirectPlaintextMessage => {
+            Some(ToolDispatchResult::DirectResponse {
+                response_item: result.to_response_item(call_id, payload),
+            })
+        }
         ToolCallSource::CodeMode { .. } => Some(ToolDispatchResult::CodeModeResponse {
             value: result.code_mode_result(payload),
         }),

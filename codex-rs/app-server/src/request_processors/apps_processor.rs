@@ -1,93 +1,35 @@
 use super::*;
 use crate::app_info::app_info_to_api;
-use crate::app_info::connector_metadata_to_api;
+use codex_connectors::AppToolPolicyEvaluator;
 
 mod installed;
+mod read;
+
+pub(super) use read::APP_READ_MAX_IDS;
 
 pub(crate) struct AppsRequestProcessor {
-    auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
-    workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
     shutdown_token: CancellationToken,
     _shutdown_drop_guard: DropGuard,
 }
 
 impl AppsRequestProcessor {
     pub(crate) fn new(
-        auth_manager: Arc<AuthManager>,
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
-        workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
         shutdown_token: CancellationToken,
     ) -> Self {
         let shutdown_drop_guard = shutdown_token.clone().drop_guard();
         Self {
-            auth_manager,
             thread_manager,
             outgoing,
             config_manager,
-            workspace_settings_cache,
             shutdown_token,
             _shutdown_drop_guard: shutdown_drop_guard,
         }
-    }
-
-    pub(crate) async fn apps_read(
-        &self,
-        params: AppsReadParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let AppsReadParams {
-            app_ids,
-            include_tools,
-        } = params;
-        if app_ids.len() > APP_READ_MAX_IDS {
-            return Err(invalid_params(format!(
-                "app/read accepts at most {APP_READ_MAX_IDS} appIds"
-            )));
-        }
-
-        let mut seen_app_ids = HashSet::new();
-        let app_ids = app_ids
-            .into_iter()
-            .filter(|app_id| seen_app_ids.insert(app_id.clone()))
-            .collect::<Vec<_>>();
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        let auth = self.auth_manager.auth().await;
-        if !config
-            .features
-            .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
-            || !self
-                .workspace_codex_plugins_enabled(&config, auth.as_ref())
-                .await
-        {
-            return Ok(Some(
-                AppsReadResponse {
-                    apps: Vec::new(),
-                    missing_app_ids: app_ids,
-                }
-                .into(),
-            ));
-        }
-        let auth = auth
-            .as_ref()
-            .ok_or_else(|| internal_error("app/read requires ChatGPT auth".to_string()))?;
-
-        let connectors::ConnectorMetadataReadResult {
-            apps,
-            missing_app_ids,
-        } = connectors::read_connector_metadata(&config, auth, &app_ids, include_tools)
-            .await
-            .map_err(|err| internal_error(format!("failed to read app metadata: {err}")))?;
-        Ok(Some(
-            AppsReadResponse {
-                apps: apps.into_iter().map(connector_metadata_to_api).collect(),
-                missing_app_ids,
-            }
-            .into(),
-        ))
     }
 
     pub(crate) async fn apps_list(
@@ -119,13 +61,27 @@ impl AppsRequestProcessor {
         };
         let mut config = self.load_latest_config(fallback_cwd).await?;
 
-        if let Some(thread) = thread {
+        if let Some(thread) = thread.as_ref() {
             let _ = config
                 .features
                 .set_enabled(Feature::Apps, thread.enabled(Feature::Apps));
         }
 
-        let auth = self.auth_manager.auth().await;
+        let mcp_manager = thread
+            .as_ref()
+            .map(|thread| thread.mcp_manager())
+            .unwrap_or_else(|| self.thread_manager.mcp_manager());
+        self.thread_manager
+            .runtime_auth_for_mcp_manager(&config, &mcp_manager)
+            .map_err(|error| internal_error(error.to_string()))?;
+        let auth_manager = mcp_manager.auth_manager();
+        if params.force_refetch && !auth_manager.has_external_auth() {
+            auth_manager
+                .reload_with_cached_auth()
+                .await
+                .map_err(|error| internal_error(error.to_string()))?;
+        }
+        let auth = auth_manager.auth().await;
         if !config
             .features
             .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
@@ -138,23 +94,10 @@ impl AppsRequestProcessor {
             return Ok(Some(response));
         }
 
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
-        {
-            let response = AppsListResponse {
-                data: Vec::new(),
-                next_cursor: None,
-            };
-            record_legacy_apps_installed_duration(installed_start, reload);
-            return Ok(Some(response));
-        }
-
         let request = request_id.clone();
         let outgoing = Arc::clone(&self.outgoing);
         let environment_manager = self.thread_manager.environment_manager();
-        let mcp_manager = self.thread_manager.mcp_manager();
-        let plugins_manager = self.thread_manager.plugins_manager();
+        let plugins_manager = mcp_manager.plugins_manager();
         let shutdown_token = self.shutdown_token.child_token();
         tokio::spawn(async move {
             tokio::select! {
@@ -262,10 +205,33 @@ impl AppsRequestProcessor {
                 loaded_plugins.capability_summaries(),
             );
         let plugin_apps = connector_snapshot.connector_ids().to_vec();
-        let (mut accessible_connectors, mut all_connectors) = tokio::join!(
-            connectors::list_cached_accessible_connectors_from_mcp_tools(&config),
-            connectors::list_cached_all_connectors(&config, &plugin_apps)
-        );
+        let mut config = config;
+        let auth = match mcp_manager
+            .auth_manager()
+            .auth_with_http_client_factory()
+            .await
+        {
+            Some((auth, factory)) => {
+                config.application_network_policy = factory.network_policy().clone();
+                Some(auth)
+            }
+            None => None,
+        };
+        let runtime = mcp_manager
+            .runtime_auth_for_config(&config)
+            .map(|(slot, mode)| {
+                slot.get()
+                    .cloned()
+                    .map(|runtime| (runtime, mode))
+                    .ok_or_else(|| {
+                        internal_error("runtime authentication is not initialized".to_string())
+                    })
+            })
+            .transpose()?;
+        let mut accessible_connectors =
+            connectors::list_cached_accessible_connectors_from_mcp_tools(&config, auth.as_ref());
+        let mut all_connectors =
+            connectors::list_cached_all_connectors(&config, auth.as_ref(), &plugin_apps);
         let cached_all_connectors = all_connectors.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -289,6 +255,8 @@ impl AppsRequestProcessor {
         tokio::spawn(async move {
             let result = connectors::list_all_connectors_with_options(
                 &all_config,
+                auth.as_ref(),
+                runtime.as_ref(),
                 force_refetch,
                 &all_plugin_apps,
             )
@@ -303,12 +271,13 @@ impl AppsRequestProcessor {
         let mut codex_apps_ready = true;
         let mut last_notified_apps = None;
         let mut sent_app_list_update = false;
+        let app_policy = AppToolPolicyEvaluator::new(&config.config_layer_stack);
 
         if accessible_connectors.is_some() || all_connectors.is_some() {
-            let merged = connectors::with_app_enabled_state(
-                merge_loaded_apps(all_connectors.as_deref(), accessible_connectors.as_deref()),
-                &config,
-            );
+            let merged = app_policy.apply_app_enabled_state(merge_loaded_apps(
+                all_connectors.as_deref(),
+                accessible_connectors.as_deref(),
+            ));
             if !force_refetch {
                 last_notified_apps = Some(merged);
             } else if should_send_app_list_updated_notification(
@@ -367,10 +336,10 @@ impl AppsRequestProcessor {
                 } else {
                     accessible_connectors.as_deref()
                 };
-            let merged = connectors::with_app_enabled_state(
-                merge_loaded_apps(all_connectors_for_update, accessible_connectors_for_update),
-                &config,
-            );
+            let merged = app_policy.apply_app_enabled_state(merge_loaded_apps(
+                all_connectors_for_update,
+                accessible_connectors_for_update,
+            ));
             if should_send_app_list_updated_notification(
                 merged.as_slice(),
                 accessible_loaded,
@@ -420,26 +389,32 @@ impl AppsRequestProcessor {
             .map_err(|err| internal_error(format!("failed to reload config: {err}")))
     }
 
-    async fn workspace_codex_plugins_enabled(
+    async fn load_apps_config(
         &self,
-        config: &Config,
-        auth: Option<&CodexAuth>,
-    ) -> bool {
-        match workspace_settings::codex_plugins_enabled_for_workspace(
-            config,
-            auth,
-            Some(&self.workspace_settings_cache),
-        )
-        .await
-        {
-            Ok(enabled) => enabled,
-            Err(err) => {
-                warn!(
-                    "failed to fetch workspace Codex plugins setting; allowing Codex plugins: {err:#}"
-                );
-                true
-            }
-        }
+        thread_id: Option<&str>,
+    ) -> Result<(Config, Arc<McpManager>), JSONRPCErrorError> {
+        let Some(thread_id) = thread_id else {
+            let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+            self.thread_manager
+                .runtime_auth_for_config(&config)
+                .map_err(|error| internal_error(error.to_string()))?;
+            return Ok((config, self.thread_manager.mcp_manager()));
+        };
+        let (_, thread) = self.load_thread(thread_id).await?;
+        let thread_config = thread.config().await;
+        let config = self
+            .config_manager
+            .load_latest_config_with_session_layers(
+                &thread_config.config_layer_stack,
+                &thread_config.cwd,
+            )
+            .await
+            .map_err(|err| internal_error(format!("failed to reload config: {err}")))?;
+        let mcp_manager = thread.mcp_manager();
+        self.thread_manager
+            .runtime_auth_for_mcp_manager(&config, &mcp_manager)
+            .map_err(|error| internal_error(error.to_string()))?;
+        Ok((config, mcp_manager))
     }
 }
 
@@ -458,8 +433,6 @@ fn record_legacy_apps_installed_duration(started_at: Instant, reload: bool) {
         );
     }
 }
-const APP_READ_MAX_IDS: usize = 100;
-
 enum AppListLoadResult {
     Accessible(Result<AccessibleConnectorsStatus, String>),
     Directory(Result<Vec<AppInfo>, String>),

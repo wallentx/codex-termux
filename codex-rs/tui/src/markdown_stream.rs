@@ -5,8 +5,8 @@
 //! after each newline-bearing delta to obtain the completed prefix for re-rendering, leaving the
 //! trailing incomplete line in the buffer for the next delta.
 //!
-//! On finalization, `finalize_and_drain_source()` flushes whatever remains (the last line, which
-//! may lack a trailing newline).
+//! On finalization, `finalize_and_take_source()` transfers the complete source buffer to the
+//! controller (including a final line that may lack a trailing newline).
 
 #[cfg(test)]
 use ratatui::text::Line;
@@ -20,7 +20,7 @@ use crate::markdown;
 /// Newline-gated accumulator that buffers raw markdown source and commits only completed lines.
 ///
 /// The buffer tracks how many source bytes have already been committed via
-/// `committed_source_len`, so each `commit_complete_source()` call returns only the newly
+/// `committed_source_len`, so each `commit_complete_source()` call returns the range of the newly
 /// completed portion. This design lets the stream controller re-render the entire accumulated
 /// source while only appending new content.
 ///
@@ -81,34 +81,39 @@ impl MarkdownStreamCollector {
 
     /// Commit newly completed raw markdown source up to the last newline.
     ///
-    /// This returns only source that has not been returned by a previous commit. Calling it after a
-    /// delta without a newline returns `None`, which prevents the live stream from rendering
+    /// This returns the range of source that has not been returned by a previous commit. Calling it
+    /// after a delta without a newline returns `None`, which prevents the live stream from rendering
     /// incomplete markdown blocks that may change meaning when the rest of the line arrives.
-    pub fn commit_complete_source(&mut self) -> Option<String> {
+    pub fn commit_complete_source(&mut self) -> Option<std::ops::Range<usize>> {
         let commit_end = self.buffer.rfind('\n').map(|idx| idx + 1)?;
-        if commit_end <= self.committed_source_len {
+        let commit_start = self.committed_source_len;
+        if commit_end <= commit_start {
             return None;
         }
 
-        let out = self.buffer[self.committed_source_len..commit_end].to_string();
         self.committed_source_len = commit_end;
-        Some(out)
+        Some(commit_start..commit_end)
     }
 
-    /// Finalize the stream and return any remaining raw source.
+    /// Return the newline-terminated source that is safe to render.
+    pub fn committed_source(&self) -> &str {
+        &self.buffer[..self.committed_source_len]
+    }
+
+    /// Return the incomplete line without advancing the scrollback commit boundary.
+    pub fn pending_source(&self) -> &str {
+        &self.buffer[self.committed_source_len..]
+    }
+
+    /// Finalize the stream and transfer its complete raw source.
     ///
     /// Ensures the returned source chunk is newline-terminated when non-empty so callers can
     /// safely run markdown block parsing on the final chunk. This method clears the collector;
     /// callers should not invoke it until the stream is truly complete or interrupted output is
     /// being intentionally consolidated.
-    pub fn finalize_and_drain_source(&mut self) -> String {
-        if self.committed_source_len >= self.buffer.len() {
-            self.clear();
-            return String::new();
-        }
-
-        let mut out = self.buffer[self.committed_source_len..].to_string();
-        if !out.ends_with('\n') {
+    pub fn finalize_and_take_source(&mut self) -> String {
+        let mut out = std::mem::take(&mut self.buffer);
+        if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
         self.clear();
@@ -220,6 +225,8 @@ pub(crate) fn simulate_stream_markdown_for_tests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::highlight::foreground_style_for_scopes;
+    use pretty_assertions::assert_eq;
     use ratatui::style::Color;
 
     #[tokio::test]
@@ -242,20 +249,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_stream_blockquote_simple_is_green() {
+    async fn e2e_stream_blockquote_simple_follows_theme() {
         let out = super::simulate_stream_markdown_for_tests(&["> Hello\n"], /*finalize*/ true);
         assert_eq!(out.len(), 1);
         let l = &out[0];
         assert_eq!(
             l.style.fg,
-            Some(Color::Green),
-            "expected blockquote line fg green, got {:?}",
+            foreground_style_for_scopes(&["markup.quote"])
+                .unwrap()
+                .fg
+                .map(|color| crate::style::readable_color_on(color, /*background*/ None)),
+            "expected themed blockquote foreground, got {:?}",
             l.style.fg
         );
     }
 
     #[tokio::test]
-    async fn e2e_stream_blockquote_nested_is_green() {
+    async fn e2e_stream_blockquote_nested_follows_theme() {
         let out = super::simulate_stream_markdown_for_tests(
             &["> Level 1\n>> Level 2\n"],
             /*finalize*/ true,
@@ -264,35 +274,39 @@ mod tests {
         let non_blank: Vec<_> = out
             .into_iter()
             .filter(|l| {
-                let s = l
-                    .spans
-                    .iter()
-                    .map(|sp| sp.content.clone())
-                    .collect::<Vec<_>>()
-                    .join("");
+                let s = l.to_string();
                 let t = s.trim();
                 // Ignore quote-only blank lines like ">" inserted at paragraph boundaries.
                 !(t.is_empty() || t == ">")
             })
             .collect();
         assert_eq!(non_blank.len(), 2);
-        assert_eq!(non_blank[0].style.fg, Some(Color::Green));
-        assert_eq!(non_blank[1].style.fg, Some(Color::Green));
+        let expected_color = foreground_style_for_scopes(&["markup.quote"])
+            .unwrap()
+            .fg
+            .map(|color| crate::style::readable_color_on(color, /*background*/ None));
+        assert_eq!(
+            [non_blank[0].style.fg, non_blank[1].style.fg],
+            [expected_color; 2]
+        );
     }
 
     #[tokio::test]
-    async fn e2e_stream_blockquote_with_list_items_is_green() {
+    async fn e2e_stream_blockquote_with_list_items_follows_theme() {
         let out = super::simulate_stream_markdown_for_tests(
             &["> - item 1\n> - item 2\n"],
             /*finalize*/ true,
         );
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].style.fg, Some(Color::Green));
-        assert_eq!(out[1].style.fg, Some(Color::Green));
+        let expected_color = foreground_style_for_scopes(&["markup.quote"])
+            .unwrap()
+            .fg
+            .map(|color| crate::style::readable_color_on(color, /*background*/ None));
+        assert_eq!([out[0].style.fg, out[1].style.fg], [expected_color; 2]);
     }
 
     #[tokio::test]
-    async fn e2e_stream_nested_mixed_lists_ordered_marker_is_light_blue() {
+    async fn e2e_stream_nested_mixed_lists_ordered_marker_uses_terminal_palette() {
         let md = [
             "1. First\n",
             "   - Second level\n",
@@ -311,19 +325,19 @@ mod tests {
         });
         let idx = find_idx.expect("expected third-level ordered line");
         let line = &out[idx];
-        // Expect at least one span on this line to be styled light blue
-        let has_light_blue = line
+        // Expect at least one span on this line to use the terminal's LightBlue color.
+        let has_accent = line
             .spans
             .iter()
-            .any(|s| s.style.fg == Some(ratatui::style::Color::LightBlue));
+            .any(|s| s.style.fg == Some(Color::LightBlue));
         assert!(
-            has_light_blue,
-            "expected an ordered-list marker span with light blue fg on: {line:?}"
+            has_accent,
+            "expected an ordered-list marker span with LightBlue on: {line:?}"
         );
     }
 
     #[tokio::test]
-    async fn e2e_stream_blockquote_wrap_preserves_green_style() {
+    async fn e2e_stream_blockquote_wrap_preserves_theme_style() {
         let long = "> This is a very long quoted line that should wrap across multiple columns to verify style preservation.";
         let out = super::simulate_stream_markdown_for_tests(&[long, "\n"], /*finalize*/ true);
         // Wrap to a narrow width to force multiple output lines.
@@ -334,27 +348,20 @@ mod tests {
         // Filter out purely blank lines
         let non_blank: Vec<_> = wrapped
             .into_iter()
-            .filter(|l| {
-                let s = l
-                    .spans
-                    .iter()
-                    .map(|sp| sp.content.clone())
-                    .collect::<Vec<_>>()
-                    .join("");
-                !s.trim().is_empty()
-            })
+            .filter(|l| !l.to_string().trim().is_empty())
             .collect();
         assert!(
             non_blank.len() >= 2,
             "expected wrapped blockquote to span multiple lines"
         );
+        let expected_color = foreground_style_for_scopes(&["markup.quote"])
+            .unwrap()
+            .fg
+            .map(|color| crate::style::readable_color_on(color, /*background*/ None));
         for (i, l) in non_blank.iter().enumerate() {
             assert_eq!(
-                l.spans[0].style.fg,
-                Some(Color::Green),
-                "wrapped line {} should preserve green style, got {:?}",
-                i,
-                l.spans[0].style.fg
+                l.spans[0].style.fg, expected_color,
+                "wrapped line {i} should preserve the adapted quote style"
             );
         }
     }
@@ -582,7 +589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_stream_deep_nested_third_level_marker_is_light_blue() {
+    async fn e2e_stream_deep_nested_third_level_marker_uses_terminal_palette() {
         let md = "1. First\n   - Second level\n     1. Third level (ordered)\n        - Fourth level (bullet)\n          - Fifth level to test indent consistency\n";
         let streamed = super::simulate_stream_markdown_for_tests(&[md], /*finalize*/ true);
         let streamed_strs = lines_to_plain_strings(&streamed);
@@ -602,7 +609,7 @@ mod tests {
         });
 
         // The marker (including indent and "1.") is expected to be in the first span
-        // and colored LightBlue; following content should be default color.
+        // and colored with LightBlue; following content should be default color.
         assert!(
             !line.spans.is_empty(),
             "expected non-empty spans for the third-level line"
@@ -791,8 +798,8 @@ mod tests {
             "   This paragraph belongs to the same list item.".to_string(),
             "".to_string(),
             "4. Second loose item with a nested list after a blank line.".to_string(),
-            "    - Nested bullet under a loose item".to_string(),
-            "    - Another nested bullet".to_string(),
+            "    • Nested bullet under a loose item".to_string(),
+            "    • Another nested bullet".to_string(),
         ];
         assert_eq!(
             streamed_strs, expected,
@@ -861,17 +868,18 @@ mod tests {
         ];
         let mut collector =
             super::MarkdownStreamCollector::new(/*width*/ None, &super::test_cwd());
-        let mut raw_source = String::new();
+        let mut committed_source = String::new();
 
         for delta in deltas {
             collector.push_delta(delta);
             if delta.contains('\n')
-                && let Some(chunk) = collector.commit_complete_source()
+                && let Some(range) = collector.commit_complete_source()
             {
-                raw_source.push_str(&chunk);
+                committed_source.push_str(&collector.committed_source()[range]);
             }
         }
-        raw_source.push_str(&collector.finalize_and_drain_source());
+        assert_eq!(collector.committed_source(), committed_source);
+        let raw_source = collector.finalize_and_take_source();
 
         let mut rendered = Vec::new();
         crate::markdown::append_markdown_agent(&raw_source, /*width*/ None, &mut rendered);
@@ -885,5 +893,13 @@ mod tests {
             !rendered_strs.iter().any(|line| line.trim() == "| A | B |"),
             "did not expect raw table header after markdown-fence unwrapping: {rendered_strs:?}"
         );
+    }
+
+    #[test]
+    fn finalizing_empty_collector_returns_empty_source() {
+        let mut collector =
+            super::MarkdownStreamCollector::new(/*width*/ None, &super::test_cwd());
+
+        assert_eq!(collector.finalize_and_take_source(), String::new());
     }
 }

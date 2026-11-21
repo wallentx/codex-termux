@@ -1,41 +1,241 @@
+use base64::Engine;
 use codex_api::ImageBackground;
 use codex_api::ImageEditRequest;
 use codex_api::ImageGenerationRequest;
 use codex_api::ImageQuality;
-use codex_api::ImageUrl;
-use codex_core::context::extension_image_generation_output_hint;
+use codex_exec_server::FileSystemEnvironmentAccessor;
+use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
+use codex_extension_items::image_generation::ImageGenerationFailure;
+use codex_extension_items::image_generation::ImageGenerationInputImage;
 use codex_protocol::ResponseItemId;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::UsageLimitReachedError;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_tools::ResponsesApiNamespaceTool;
+use codex_tools::ToolEnvironment;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
+use sha2::Digest;
+use sha2::Sha256;
 
 use super::GeneratedImageOutput;
 use super::ImageRequest;
 use super::ImagegenArgs;
+use super::PreparedImageRequest;
 use super::imagegen_tool_spec;
 use super::request_for_call_args;
+use super::usage_limit_failure;
 use crate::IMAGE_GEN_NAMESPACE;
 use crate::IMAGEGEN_TOOL_NAME;
+use crate::artifact::image_generation_artifact_path;
+use crate::artifact::image_generation_output_hint;
 
 const RESULT: &str = "cG5n";
 
 #[test]
+fn test_usage_limit_failure_without_an_exhausted_window_reset() {
+    for (limit_id, expected) in [
+        (
+            Some("imagegen_premium"),
+            Some(ImageGenerationFailure::UsageLimitExceeded {
+                limit_id: "imagegen_premium".to_string(),
+                resets_at: None,
+            }),
+        ),
+        (Some("premium"), None),
+        (None, None),
+    ] {
+        let error = CodexErr::UsageLimitReached(UsageLimitReachedError {
+            plan_type: None,
+            resets_at: None,
+            limit_window_minutes: None,
+            rate_limits: Some(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "limit_id": limit_id,
+                    "primary": {"used_percent": 100.0},
+                    "secondary": {"used_percent": 50.0, "resets_at": 3000}
+                }))
+                .expect("rate limit snapshot"),
+            )),
+            promo_message: None,
+            rate_limit_reached_type: None,
+        });
+
+        assert_eq!(usage_limit_failure(&error), expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn referenced_files_record_the_exact_bytes_read_for_each_request() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = AbsolutePathBuf::from_absolute_path(directory.path()).expect("absolute root");
+    let first = root.join("first.png");
+    let second = root.join("second.png");
+    let access = FileSystemEnvironmentAccessor::unrestricted(&LOCAL_FS);
+    let environment =
+        ToolEnvironment::new("test".to_string(), PathUri::from_abs_path(&root), &access);
+    let args = ImagegenArgs {
+        gif: None,
+        prompt: "combine the references".to_string(),
+        transparent_background: false,
+        referenced_image_paths: Some(vec![second.clone(), first.clone()]),
+        num_last_images_to_include: None,
+    };
+    let png = |color| {
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba(color));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encode PNG");
+        bytes.into_inner()
+    };
+    let second_bytes = png([0, 255, 0, 255]);
+    std::fs::write(second.as_path(), &second_bytes).expect("write second image");
+    std::fs::write(root.join("unused.png").as_path(), png([0, 0, 255, 255]))
+        .expect("write unused image");
+
+    // Reusing a path after replacing its contents must produce a new observation.
+    for first_bytes in [png([255, 0, 0, 255]), png([255, 255, 0, 255])] {
+        std::fs::write(first.as_path(), &first_bytes).expect("write first image");
+        let inputs = [(&second, &second_bytes), (&first, &first_bytes)];
+        let expected = PreparedImageRequest {
+            request: ImageRequest::Edit(ImageEditRequest {
+                output: None,
+                images: inputs
+                    .iter()
+                    .map(|(_, bytes)| ImageReference::Inline {
+                        image_url: format!(
+                            "data:image/png;base64,{}",
+                            base64::engine::general_purpose::STANDARD.encode(bytes)
+                        ),
+                    })
+                    .collect(),
+                prompt: args.prompt.clone(),
+                background: Some(ImageBackground::Opaque),
+                model: "gpt-image-2".to_string(),
+                n: None,
+                quality: Some(ImageQuality::Auto),
+                size: Some("auto".to_string()),
+            }),
+            input_images: inputs
+                .iter()
+                .map(|(path, bytes)| ImageGenerationInputImage {
+                    path: (*path).clone(),
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                })
+                .collect(),
+        };
+        assert_eq!(
+            request_for_call_args(&args, &[], std::slice::from_ref(&environment))
+                .await
+                .expect("edit request"),
+            expected
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_or_invalid_reference_does_not_build_an_edit_request() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = AbsolutePathBuf::from_absolute_path(directory.path()).expect("absolute root");
+    let invalid = root.join("invalid.png");
+    std::fs::write(invalid.as_path(), b"not an image").expect("write invalid image");
+    let access = FileSystemEnvironmentAccessor::unrestricted(&LOCAL_FS);
+    let environment =
+        ToolEnvironment::new("test".to_string(), PathUri::from_abs_path(&root), &access);
+    for path in [root.join("missing.png"), invalid] {
+        let args = ImagegenArgs {
+            gif: None,
+            prompt: "edit the reference".to_string(),
+            transparent_background: false,
+            referenced_image_paths: Some(vec![path]),
+            num_last_images_to_include: None,
+        };
+        assert!(
+            request_for_call_args(&args, &[], std::slice::from_ref(&environment))
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn artifact_path_sanitizes_session_and_call_ids() {
+    let save_root = AbsolutePathBuf::current_dir().expect("current directory should be absolute");
+
+    assert_eq!(
+        image_generation_artifact_path(
+            &save_root,
+            "../session",
+            "../call",
+            super::GeneratedImageFormat::Png
+        ),
+        save_root
+            .join("generated_images")
+            .join("___session")
+            .join("___call.png")
+    );
+}
+
+#[test]
 fn uses_reserved_image_gen_namespace() {
-    let ToolSpec::Namespace(spec) = imagegen_tool_spec() else {
+    let ToolSpec::Namespace(spec) = imagegen_tool_spec(/*gif_enabled*/ false) else {
         panic!("imagegen should advertise a namespace tool");
     };
     assert_eq!(spec.name, IMAGE_GEN_NAMESPACE);
-    let ResponsesApiNamespaceTool::Function(function) = &spec.tools[0];
+    let ResponsesApiNamespaceTool::Function(function) = &spec.tools[0] else {
+        panic!("imagegen should advertise a function tool");
+    };
     assert_eq!(function.name, IMAGEGEN_TOOL_NAME);
+}
+
+#[test]
+fn imagegen_code_mode_declaration_describes_generated_image_result() {
+    let spec = imagegen_tool_spec(/*gif_enabled*/ false);
+    let definitions = codex_tools::collect_code_mode_tool_definitions(
+        [&spec],
+        /*code_mode_input_schema_max_bytes*/ None,
+    );
+    let [definition] = definitions.as_slice() else {
+        panic!("imagegen should produce one code-mode declaration");
+    };
+    let (_, return_type) = definition
+        .description
+        .rsplit_once("): Promise<")
+        .expect("imagegen declaration should return a promise");
+    assert_eq!(
+        return_type,
+        "{ image_url: string; output_hint?: string; }>; };\n```"
+    );
+}
+
+#[test]
+fn imagegen_output_schema_does_not_change_direct_api_serialization() {
+    let spec = imagegen_tool_spec(/*gif_enabled*/ false);
+    let mut without_output_schema = spec.clone();
+    let ToolSpec::Namespace(namespace) = &mut without_output_schema else {
+        panic!("imagegen should advertise a namespace tool");
+    };
+    let ResponsesApiNamespaceTool::Function(function) = &mut namespace.tools[0] else {
+        panic!("imagegen should advertise a function tool");
+    };
+    function.output_schema = None;
+
+    assert_eq!(
+        serde_json::to_value(spec).expect("tool spec should serialize"),
+        serde_json::to_value(without_output_schema).expect("tool spec should serialize")
+    );
 }
 
 #[tokio::test]
@@ -43,7 +243,9 @@ async fn omitted_references_generate_with_fixed_defaults() {
     assert_eq!(
         request_for_call_args(
             &ImagegenArgs {
+                gif: None,
                 prompt: "paint a moonlit lake".to_string(),
+                transparent_background: false,
                 referenced_image_paths: None,
                 num_last_images_to_include: None,
             },
@@ -52,14 +254,18 @@ async fn omitted_references_generate_with_fixed_defaults() {
         )
         .await
         .expect("generation request should build"),
-        ImageRequest::Generate(ImageGenerationRequest {
-            prompt: "paint a moonlit lake".to_string(),
-            background: Some(ImageBackground::Auto),
-            model: "gpt-image-2".to_string(),
-            n: None,
-            quality: Some(ImageQuality::Auto),
-            size: Some("auto".to_string()),
-        })
+        PreparedImageRequest {
+            request: ImageRequest::Generate(ImageGenerationRequest {
+                output: None,
+                prompt: "paint a moonlit lake".to_string(),
+                background: Some(ImageBackground::Opaque),
+                model: "gpt-image-2".to_string(),
+                n: None,
+                quality: Some(ImageQuality::Auto),
+                size: Some("auto".to_string()),
+            }),
+            input_images: Vec::new(),
+        }
     );
 }
 
@@ -67,6 +273,8 @@ async fn omitted_references_generate_with_fixed_defaults() {
 async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
     let history = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -80,20 +288,26 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "mcp_image".to_string(),
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "mcp-call".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "mcp-call".to_string(),
+            call_id: Some("mcp-call".to_string()),
+            name: None,
+            namespace: None,
             output: image_output("mcp"),
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: Some("completed".to_string()),
             call_id: "code-mode-call".to_string(),
@@ -110,6 +324,7 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::ImageGenerationCall {
+            encrypted_content: None,
             id: Some(ResponseItemId::with_suffix("ig", "generated-call")),
             status: "completed".to_string(),
             revised_prompt: None,
@@ -118,8 +333,10 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "orphan-call".to_string(),
-            output: image_output("orphan"),
+            call_id: None,
+            name: Some("notifications".to_string()),
+            namespace: Some("slack".to_string()),
+            output: image_output("standalone"),
             internal_chat_message_metadata_passthrough: None,
         },
     ];
@@ -127,19 +344,136 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
     assert_eq!(
         request_for_call_args(
             &ImagegenArgs {
+                gif: None,
                 prompt: "change the lighting".to_string(),
+                transparent_background: false,
                 referenced_image_paths: None,
-                num_last_images_to_include: Some(4),
+                num_last_images_to_include: Some(5),
             },
             &history,
             &[],
         )
         .await
         .expect("history-backed edit request should build"),
-        ImageRequest::Edit(expected_edit_request(
-            "change the lighting",
-            &["user-2", "mcp", "code-mode", "generated"],
-        ))
+        PreparedImageRequest {
+            request: ImageRequest::Edit(expected_edit_request(
+                "change the lighting",
+                &["user-2", "mcp", "code-mode", "generated", "standalone"],
+            )),
+            input_images: Vec::new(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn recent_image_fallback_passes_file_backed_image_to_edit_request() {
+    let request = request_for_call_args(
+        &ImagegenArgs {
+            gif: None,
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: None,
+            num_last_images_to_include: Some(1),
+        },
+        &[ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                input_image("older-inline-image"),
+                ContentItem::InputImage {
+                    image: ImageReference::File {
+                        file_id: "newer-file-backed-image".to_string(),
+                    },
+                    detail: None,
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        &[],
+    )
+    .await
+    .expect("a selected file-backed image should be passed through");
+
+    assert_eq!(
+        request,
+        PreparedImageRequest {
+            request: ImageRequest::Edit(ImageEditRequest {
+                output: None,
+                images: vec![ImageReference::File {
+                    file_id: "newer-file-backed-image".to_string(),
+                }],
+                prompt: "change the lighting".to_string(),
+                background: Some(ImageBackground::Opaque),
+                model: "gpt-image-2".to_string(),
+                n: None,
+                quality: Some(ImageQuality::Auto),
+                size: Some("auto".to_string()),
+            }),
+            input_images: Vec::new(),
+        }
+    );
+}
+
+/// Tool-output file references must count toward the window instead of exposing an older image.
+#[tokio::test]
+async fn recent_image_fallback_passes_file_backed_tool_output_to_edit_request() {
+    let request = request_for_call_args(
+        &ImagegenArgs {
+            gif: None,
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: None,
+            num_last_images_to_include: Some(1),
+        },
+        &[
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("older-inline-output".to_string()),
+                name: None,
+                namespace: None,
+                output: image_output("older-inline-image"),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "newer-file-backed-output".to_string(),
+                name: Some("view_image".to_string()),
+                output: FunctionCallOutputPayload::from_content_items(vec![
+                    FunctionCallOutputContentItem::InputImage {
+                        image: ImageReference::File {
+                            file_id: "newer-file-backed-image".to_string(),
+                        },
+                        detail: None,
+                    },
+                ]),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ],
+        &[],
+    )
+    .await
+    .expect("a selected file-backed tool output should be passed through");
+
+    assert_eq!(
+        request,
+        PreparedImageRequest {
+            request: ImageRequest::Edit(ImageEditRequest {
+                output: None,
+                images: vec![ImageReference::File {
+                    file_id: "newer-file-backed-image".to_string(),
+                }],
+                prompt: "change the lighting".to_string(),
+                background: Some(ImageBackground::Opaque),
+                model: "gpt-image-2".to_string(),
+                n: None,
+                quality: Some(ImageQuality::Auto),
+                size: Some("auto".to_string()),
+            }),
+            input_images: Vec::new(),
+        }
     );
 }
 
@@ -147,7 +481,9 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
 async fn conflicting_image_selectors_return_tool_error() {
     let error = request_for_call_args(
         &ImagegenArgs {
+            gif: None,
             prompt: "change the lighting".to_string(),
+            transparent_background: false,
             referenced_image_paths: Some(vec![
                 "/tmp/image.png"
                     .try_into()
@@ -171,7 +507,9 @@ async fn conflicting_image_selectors_return_tool_error() {
 async fn too_many_referenced_image_paths_return_tool_error() {
     let error = request_for_call_args(
         &ImagegenArgs {
+            gif: None,
             prompt: "change the lighting".to_string(),
+            transparent_background: false,
             referenced_image_paths: Some(
                 (0..6)
                     .map(|index| {
@@ -199,11 +537,15 @@ async fn too_many_referenced_image_paths_return_tool_error() {
 async fn recent_image_fallback_requires_requested_count() {
     let error = request_for_call_args(
         &ImagegenArgs {
+            gif: None,
             prompt: "change the lighting".to_string(),
+            transparent_background: false,
             referenced_image_paths: None,
             num_last_images_to_include: Some(2),
         },
         &[ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![input_image("only-image")],
@@ -224,7 +566,7 @@ async fn recent_image_fallback_requires_requested_count() {
 #[test]
 fn generated_output_returns_image_input_and_output_hint() {
     let output_hint =
-        extension_image_generation_output_hint("/tmp", "/tmp/call-1.png").expect("hint should fit");
+        image_generation_output_hint("/tmp", "/tmp/call-1.png").expect("hint should fit");
     let output = GeneratedImageOutput {
         result: RESULT.to_string(),
         output_hint: Some(output_hint.clone()),
@@ -244,7 +586,9 @@ fn generated_output_returns_image_input_and_output_hint() {
         content_items,
         vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url: format!("data:image/png;base64,{RESULT}"),
+                image: ImageReference::Inline {
+                    image_url: format!("data:image/png;base64,{RESULT}")
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             FunctionCallOutputContentItem::InputText { text: output_hint },
@@ -273,8 +617,15 @@ fn generated_output_omits_oversized_output_hint() {
     let long_path = "x".repeat(1024);
     let output = GeneratedImageOutput {
         result: RESULT.to_string(),
-        output_hint: extension_image_generation_output_hint("/tmp", long_path),
+        output_hint: image_generation_output_hint("/tmp", long_path),
     };
+
+    assert_eq!(
+        output.code_mode_result(&function_payload()),
+        serde_json::json!({
+            "image_url": format!("data:image/png;base64,{RESULT}"),
+        })
+    );
 
     let ResponseInputItem::FunctionCallOutput {
         output: response_output,
@@ -289,7 +640,9 @@ fn generated_output_omits_oversized_output_hint() {
     assert_eq!(
         content_items,
         vec![FunctionCallOutputContentItem::InputImage {
-            image_url: format!("data:image/png;base64,{RESULT}"),
+            image: ImageReference::Inline {
+                image_url: format!("data:image/png;base64,{RESULT}")
+            },
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }]
     );
@@ -297,28 +650,33 @@ fn generated_output_omits_oversized_output_hint() {
 
 fn input_image(image: &str) -> ContentItem {
     ContentItem::InputImage {
-        image_url: format!("data:image/png;base64,{image}"),
+        image: ImageReference::Inline {
+            image_url: format!("data:image/png;base64,{image}"),
+        },
         detail: None,
     }
 }
 
 fn image_output(image: &str) -> FunctionCallOutputPayload {
     FunctionCallOutputPayload::from_content_items(vec![FunctionCallOutputContentItem::InputImage {
-        image_url: format!("data:image/png;base64,{image}"),
+        image: ImageReference::Inline {
+            image_url: format!("data:image/png;base64,{image}"),
+        },
         detail: None,
     }])
 }
 
 fn expected_edit_request(prompt: &str, images: &[&str]) -> ImageEditRequest {
     ImageEditRequest {
+        output: None,
         images: images
             .iter()
-            .map(|image| ImageUrl {
+            .map(|image| ImageReference::Inline {
                 image_url: format!("data:image/png;base64,{image}"),
             })
             .collect(),
         prompt: prompt.to_string(),
-        background: Some(ImageBackground::Auto),
+        background: Some(ImageBackground::Opaque),
         model: "gpt-image-2".to_string(),
         n: None,
         quality: Some(ImageQuality::Auto),

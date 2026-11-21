@@ -1,77 +1,174 @@
-//! Turn separators and runtime-metrics labels for transcript history.
+//! Subtle completion timestamps, elapsed durations, and runtime metrics for transcript history.
 
 use super::*;
+use crate::clock_format::ClockFormat;
+use chrono::DateTime;
+use chrono::Datelike;
+use chrono::Local;
+use chrono::NaiveDate;
+use codex_app_server_protocol::Turn;
+use std::collections::HashMap;
 
-#[derive(Debug)]
-/// A visual divider between turns, optionally showing how long the assistant "worked for".
+/// Completion metadata shown after the assistant's final response.
 ///
-/// This separator is only emitted for turns that performed concrete work (e.g., running commands,
-/// applying patches, making MCP tool calls), so purely conversational turns do not show an empty
-/// divider.
+/// The timestamp records when the turn actually finished, including when restored from history.
+/// Times use the host's clock preference; other local days include the date and other years the year.
+/// Known durations are always shown; sub-second durations display as less than one second.
+/// Absent metadata occupies no transcript rows.
+/// The display date is fixed at construction so crossing midnight cannot invalidate cached heights;
+/// restoring the conversation constructs new cells and refreshes whether the timestamp needs a date.
+#[derive(Debug)]
 pub struct FinalMessageSeparator {
+    pub(crate) turn_id: Option<String>,
     elapsed_seconds: Option<u64>,
     runtime_metrics: Option<RuntimeMetricsSummary>,
+    completed_at: Option<DateTime<Local>>,
+    display_date: NaiveDate,
+    clock_format: ClockFormat,
 }
 impl FinalMessageSeparator {
-    /// Creates a separator; completed turns should pass protocol turn duration when available.
+    /// Full-screen transcripts also use untimed separators to identify completed turns.
+    pub(crate) fn from_turn_once(
+        turn: &Turn,
+        rendered_completion_turn_ids: &mut HashMap<String, bool>,
+        fallback_elapsed: Option<std::time::Duration>,
+        fallback_completed_at: Option<DateTime<Local>>,
+    ) -> Option<Self> {
+        let elapsed_seconds = turn
+            .duration_ms
+            .and_then(|duration| u64::try_from(duration).ok())
+            .map(|duration| duration / 1_000)
+            .or_else(|| fallback_elapsed.map(|elapsed| elapsed.as_secs()));
+        let completed_at = turn
+            .completed_at
+            .and_then(|timestamp| DateTime::from_timestamp(timestamp, /*nsecs*/ 0))
+            .map(|timestamp| timestamp.with_timezone(&Local))
+            .or(fallback_completed_at);
+        let has_label = completed_at.is_some() || elapsed_seconds.is_some();
+        if rendered_completion_turn_ids
+            .get(&turn.id)
+            .is_some_and(|labeled| *labeled || !has_label)
+        {
+            return None;
+        }
+        rendered_completion_turn_ids.insert(turn.id.clone(), has_label);
+        let cell = Self {
+            turn_id: Some(turn.id.clone()),
+            ..Self::new(elapsed_seconds, /*runtime_metrics*/ None)
+        };
+        Some(match completed_at {
+            Some(completed_at) => cell.with_completed_at(completed_at, ClockFormat::system()),
+            None => cell,
+        })
+    }
+
+    /// Creates completion metadata using the protocol turn duration when available.
     pub(crate) fn new(
         elapsed_seconds: Option<u64>,
         runtime_metrics: Option<RuntimeMetricsSummary>,
     ) -> Self {
         Self {
+            turn_id: None,
             elapsed_seconds,
             runtime_metrics,
+            completed_at: None,
+            display_date: Local::now().date_naive(),
+            clock_format: ClockFormat::TwelveHour,
         }
+    }
+
+    pub(crate) fn with_completed_at(
+        mut self,
+        completed_at: DateTime<Local>,
+        clock_format: ClockFormat,
+    ) -> Self {
+        self.completed_at = Some(completed_at);
+        self.clock_format = clock_format;
+        self
+    }
+
+    pub(crate) fn with_runtime_metrics(
+        mut self,
+        runtime_metrics: Option<RuntimeMetricsSummary>,
+    ) -> Self {
+        self.runtime_metrics = runtime_metrics;
+        self
+    }
+
+    pub(crate) fn has_timing(&self) -> bool {
+        self.completed_at.is_some() || self.elapsed_seconds.is_some()
+    }
+
+    pub(crate) fn display_label(&self) -> Option<String> {
+        self.label(self.display_date)
+    }
+
+    fn label(&self, today: NaiveDate) -> Option<String> {
+        let mut label_parts = Vec::new();
+        if let Some(elapsed_seconds) = self.elapsed_seconds {
+            let hours = elapsed_seconds / 3_600;
+            let minutes = (elapsed_seconds % 3_600) / 60;
+            let seconds = elapsed_seconds % 60;
+            let elapsed = if hours > 0 {
+                format!("{hours}h {minutes}m {seconds}s")
+            } else if minutes > 0 {
+                format!("{minutes}m {seconds}s")
+            } else if seconds == 0 {
+                "<1s".to_string()
+            } else {
+                format!("{seconds}s")
+            };
+            label_parts.push(format!("Worked for {elapsed}"));
+        }
+        if let Some(completed_at) = self.completed_at {
+            let date_format = if completed_at.date_naive() == today {
+                ""
+            } else if completed_at.year() == today.year() {
+                "%b %-d at "
+            } else {
+                "%b %-d, %Y at "
+            };
+            label_parts.push(format!(
+                "{}{}",
+                completed_at.format(date_format),
+                completed_at.format(self.clock_format.time_format()),
+            ));
+        }
+        if let Some(metrics_label) = self.runtime_metrics.and_then(runtime_metrics_label) {
+            label_parts.push(metrics_label);
+        }
+        (!label_parts.is_empty()).then(|| label_parts.join(" • "))
     }
 }
 impl HistoryCell for FinalMessageSeparator {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut label_parts = Vec::new();
-        if let Some(elapsed_seconds) = self
-            .elapsed_seconds
-            .filter(|seconds| *seconds > 60)
-            .map(crate::status_indicator_widget::fmt_elapsed_compact)
-        {
-            label_parts.push(format!("Worked for {elapsed_seconds}"));
+        if width == 0 {
+            return Vec::new();
         }
-        if let Some(metrics_label) = self.runtime_metrics.and_then(runtime_metrics_label) {
-            label_parts.push(metrics_label);
-        }
-
-        if label_parts.is_empty() {
-            return vec![Line::from_iter(["─".repeat(width as usize).dim()])];
-        }
-
-        let label = format!("─ {} ─", label_parts.join(" • "));
-        let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
-        vec![
-            Line::from_iter([
-                label,
-                "─".repeat((width as usize).saturating_sub(label_width)),
-            ])
-            .dim(),
-        ]
+        self.display_label()
+            .map(|label| {
+                let indent = if width > 2 { "  " } else { "" };
+                let options = textwrap::Options::new(usize::from(width))
+                    .initial_indent(indent)
+                    .subsequent_indent(indent);
+                textwrap::wrap(&label, options)
+                    .into_iter()
+                    .map(|line| Line::from(line.into_owned()).dim())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        let mut label_parts = Vec::new();
-        if let Some(elapsed_seconds) = self
-            .elapsed_seconds
-            .filter(|seconds| *seconds > 60)
-            .map(crate::status_indicator_widget::fmt_elapsed_compact)
-        {
-            label_parts.push(format!("Worked for {elapsed_seconds}"));
-        }
-        if let Some(metrics_label) = self.runtime_metrics.and_then(runtime_metrics_label) {
-            label_parts.push(metrics_label);
-        }
-        if label_parts.is_empty() {
-            Vec::new()
-        } else {
-            vec![Line::from(label_parts.join(" • "))]
-        }
+        self.display_label()
+            .map(|label| vec![Line::from(label)])
+            .unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+#[path = "separators_tests.rs"]
+mod tests;
 
 pub(crate) fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<String> {
     let mut parts = Vec::new();

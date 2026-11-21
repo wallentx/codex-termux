@@ -1,11 +1,21 @@
 ---
 source: core/tests/suite/additional_context.rs
-expression: "context_snapshot::format_labeled_requests_snapshot(\"additional context is inserted before the user turn input.\",\n&[(\"Request\", &request)], &additional_context_snapshot_options(),)"
+expression: "context_snapshot::format_labeled_requests_snapshot(\"additional context is inserted before the user turn input.\",\n&[(\"Request\", &request)],\n&ContextSnapshotOptions::default().rewrite_known_segments(),)"
 ---
 Scenario: additional context is inserted before the user turn input.
 
-## Request
-00:message/developer:<PERMISSIONS_INSTRUCTIONS>
-01:message/developer:<automation_info>run one</automation_info>
-02:message/user:<external_browser_info>tab one</external_browser_info>
-03:message/user:inspect the active tab
+## Window 1
+-- request 1 (turn; Request) --
+00:message/developer:
+    <MODEL_INSTRUCTIONS>
+01:message/developer[2]:
+    [01] <PERMISSIONS_INSTRUCTIONS>
+    [02] <tools>
+        Deferred tool namespaces:
+        - multi_agent_v1: Tools for spawning and managing sub-agents.
+        </tools>
+02:message/developer:
+    <automation_info>run one</automation_info>
+03:function_call_output/agent.browser_info:tab one
+04:message/user:
+    inspect the active tab

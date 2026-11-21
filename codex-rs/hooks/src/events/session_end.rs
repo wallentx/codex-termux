@@ -10,9 +10,9 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
-use crate::engine::CommandShell;
+use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
-use crate::engine::command_runner::CommandRunResult;
+use crate::engine::HandlerRunResult;
 use crate::engine::dispatcher;
 use crate::schema::NullableString;
 use crate::schema::SessionEndCommandInput;
@@ -48,12 +48,11 @@ pub(crate) fn preview(handlers: &[ConfiguredHandler]) -> Vec<HookRunSummary> {
 }
 
 pub(crate) async fn run(
-    handlers: &[ConfiguredHandler],
-    shell: &CommandShell,
+    engine: &ClaudeHooksEngine,
     request: SessionEndRequest,
 ) -> SessionEndOutcome {
     let matched = dispatcher::select_handlers(
-        handlers,
+        &engine.handlers,
         HookEventName::SessionEnd,
         Some(SESSION_END_REASON),
     );
@@ -61,14 +60,14 @@ pub(crate) async fn run(
         return SessionEndOutcome::default();
     }
 
-    let input_json = match serde_json::to_string(&SessionEndCommandInput {
+    let input = match serde_json::to_value(SessionEndCommandInput {
         session_id: request.session_id.to_string(),
         transcript_path: NullableString::from_path(request.transcript_path.clone()),
         cwd: request.cwd.display().to_string(),
         hook_event_name: "SessionEnd".to_string(),
         reason: SESSION_END_REASON.to_string(),
     }) {
-        Ok(input_json) => input_json,
+        Ok(input) => input,
         Err(error) => {
             return SessionEndOutcome {
                 hook_events: common::serialization_failure_hook_events(
@@ -81,9 +80,9 @@ pub(crate) async fn run(
     };
 
     let results = dispatcher::execute_handlers(
-        shell,
+        engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id),
         parse_completed,
@@ -96,7 +95,7 @@ pub(crate) async fn run(
 
 fn parse_completed(
     handler: &ConfiguredHandler,
-    run_result: CommandRunResult,
+    run_result: HandlerRunResult,
     turn_id: Option<String>,
 ) -> dispatcher::ParsedHandler<()> {
     let (status, entries) = match (run_result.error.as_deref(), run_result.exit_code) {

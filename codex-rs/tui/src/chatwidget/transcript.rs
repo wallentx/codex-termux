@@ -1,22 +1,73 @@
 //! Transcript and active-cell bookkeeping for `ChatWidget`.
 
 use super::HistoryCell;
+use super::HistoryRenderMode;
+use std::cell::Cell;
+use std::sync::Arc;
+
+/// Identifies the render state that determines an active cell's viewport height.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ActiveCellLayoutCacheKey {
+    pub(super) cell_identity: usize,
+    pub(super) revision: u64,
+    pub(super) width: u16,
+    pub(super) render_mode: HistoryRenderMode,
+    pub(super) syntax_theme_revision: u64,
+}
+
+/// Retains the active cell's semantic and actual wrapped heights independently.
+///
+/// History cells may override their desired height, so it cannot be substituted for the rendered
+/// row count used to keep overflowing content anchored to the bottom of the viewport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ActiveCellLayoutCache {
+    pub(super) key: ActiveCellLayoutCacheKey,
+    pub(super) desired_height: Option<u16>,
+    pub(super) rendered_height: Option<usize>,
+}
+
+pub(super) struct StatusCopySource {
+    pub(super) handle: crate::status::StatusHistoryHandle,
+    pub(super) fields: Vec<(String, Arc<str>)>,
+}
+
+/// Completion status and observation order for each replayed assistant item in one turn.
+type ReplayedCloudItems = std::collections::HashMap<String, (bool, i64)>;
 
 #[derive(Default)]
 pub(super) struct TranscriptState {
     pub(super) active_cell: Option<Box<dyn HistoryCell>>,
+    /// Shared retained rows for concurrently running dynamic tools, removed on completion.
+    pub(super) dynamic_calls:
+        std::collections::HashMap<String, crate::history_cell::DynamicToolCallCell>,
     /// Monotonic-ish counter used to invalidate transcript overlay caching.
     pub(super) active_cell_revision: u64,
-    /// Raw markdown of the most recently completed agent response.
+    /// One bounded entry shared by layout and paint across unchanged active-cell frames.
+    pub(super) active_cell_layout: Cell<Option<ActiveCellLayoutCache>>,
+    /// Markdown of the most recently completed agent message for whole-response copying.
     pub(super) last_agent_markdown: Option<String>,
+    /// Original source of that response, before display sanitization, for exact block copying.
+    pub(super) last_agent_source: Option<String>,
+    pub(super) last_agent_copy_item: Option<(String, String)>,
+    /// Latest `/status` card and fields, retained across copying until a later turn or command.
+    pub(super) last_status_copy_targets: Option<StatusCopySource>,
+    pub(super) last_completed_agent_message: Option<(String, String)>,
+    /// Whether each assistant item projected from Cloud history was finished, keyed by turn.
+    pub(super) replayed_cloud_text: Option<std::collections::HashMap<String, ReplayedCloudItems>>,
+    pub(super) recording_finished_cloud_text: bool,
+    /// Turn and item IDs for the agent message currently supplying streamed deltas.
+    pub(super) active_streamed_agent_message: Option<(String, String)>,
+    /// Turn/item identity and raw source of the latest interleaved stream flush.
+    pub(super) last_flushed_agent_message: Option<(String, String)>,
     /// Raw markdown of the most recently completed proposed plan.
     pub(super) latest_proposed_plan_markdown: Option<String>,
-    /// Whether this turn already produced a copyable response.
-    pub(super) saw_copy_source_this_turn: bool,
-    /// Whether the next streamed assistant content should be preceded by a final message separator.
-    pub(super) needs_final_message_separator: bool,
-    /// Whether the current turn performed "work" (exec commands, MCP tool calls, patch applications).
-    pub(super) had_work_activity: bool,
+    /// Observation order shared by assistant replies and proposed plans.
+    pub(super) response_order: i64,
+    /// Negative positions for replies prepended by older history pages.
+    pub(super) older_response_order: i64,
+    pub(super) historical_copy_order: Option<i64>,
+    /// Last completed response from this turn, independent of provisional copy text.
+    pub(super) committed_turn_response: Option<(i64, String)>,
     /// Whether the current turn emitted a plan update.
     pub(super) saw_plan_update_this_turn: bool,
     /// Whether the current turn emitted a proposed plan item that has not been superseded by a
@@ -38,27 +89,59 @@ impl TranscriptState {
         }
     }
 
+    pub(super) fn has_replayed_cloud_text(&self, turn_id: &str, item_id: &str) -> bool {
+        self.replayed_cloud_text
+            .as_ref()
+            .and_then(|turns| turns.get(turn_id))
+            .and_then(|items| items.get(item_id))
+            .is_some_and(|(finished, _)| *finished)
+    }
+
     pub(super) fn bump_active_cell_revision(&mut self) {
         // Wrapping avoids overflow; wraparound would require 2^64 bumps and at
         // worst causes a one-time cache-key collision.
         self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+        self.active_cell_layout.set(None);
     }
 
-    pub(super) fn record_agent_markdown(&mut self, markdown: String) {
-        self.last_agent_markdown = Some(markdown);
-        self.saw_copy_source_this_turn = true;
+    /// Remove the active cell and invalidate its layout before its address can be reused.
+    pub(super) fn take_active_cell(&mut self) -> Option<Box<dyn HistoryCell>> {
+        let active_cell = self.active_cell.take();
+        if active_cell.is_some() {
+            self.active_cell_layout.set(None);
+        }
+        active_cell
+    }
+
+    pub(super) fn record_agent_markdown(&mut self, markdown: String, source: String) {
+        self.last_status_copy_targets = None;
+        self.last_agent_markdown =
+            Some(crate::markdown_render::followup_labels(&markdown).into_owned());
+        self.last_agent_source = Some(source);
+        self.last_agent_copy_item = None;
+        self.historical_copy_order = None;
+        self.committed_turn_response = self
+            .last_agent_markdown
+            .clone()
+            .map(|text| (self.response_order, text));
     }
 
     pub(super) fn reset_copy_history(&mut self) {
+        self.last_status_copy_targets = None;
         self.last_agent_markdown = None;
-        self.saw_copy_source_this_turn = false;
+        self.last_agent_source = None;
+        self.last_agent_copy_item = None;
+        self.historical_copy_order = None;
+        self.committed_turn_response = None;
     }
 
     pub(super) fn reset_turn_flags(&mut self) {
-        self.saw_copy_source_this_turn = false;
+        self.committed_turn_response = None;
+        self.last_completed_agent_message = None;
+        self.active_streamed_agent_message = None;
+        self.last_flushed_agent_message = None;
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
-        self.had_work_activity = false;
         self.latest_proposed_plan_markdown = None;
         self.plan_delta_buffer.clear();
         self.plan_item_active = false;

@@ -1,9 +1,26 @@
+use super::thread_input::DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR;
+use super::thread_input::can_accept_direct_input;
+use super::thread_input::ensure_direct_input_allowed;
 use super::*;
+use codex_app_server_protocol::ThreadGoalMutationOrigin;
+use codex_core::context::UserGoalUpdate;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalService;
 use codex_goal_extension::GoalServiceError;
 use codex_goal_extension::GoalSetRequest;
 use codex_goal_extension::GoalTokenBudgetUpdate;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_rollout::RolloutRecorder;
+use codex_rollout::WriterLockCoordinator;
+
+#[path = "thread_goal_user_context.rs"]
+mod user_context;
+
+enum GoalAccess {
+    Read,
+    Mutate,
+}
 
 #[derive(Clone)]
 pub(crate) struct ThreadGoalRequestProcessor {
@@ -13,6 +30,8 @@ pub(crate) struct ThreadGoalRequestProcessor {
     thread_state_manager: ThreadStateManager,
     state_db: Option<StateDbHandle>,
     goal_service: Arc<GoalService>,
+    config_manager: ConfigManager,
+    writer_locks: Arc<WriterLockCoordinator>,
 }
 
 impl ThreadGoalRequestProcessor {
@@ -23,7 +42,9 @@ impl ThreadGoalRequestProcessor {
         thread_state_manager: ThreadStateManager,
         state_db: Option<StateDbHandle>,
         goal_service: Arc<GoalService>,
+        config_manager: ConfigManager,
     ) -> Self {
+        let writer_locks = Arc::new(WriterLockCoordinator::new(&config.codex_home));
         Self {
             thread_manager,
             outgoing,
@@ -31,6 +52,8 @@ impl ThreadGoalRequestProcessor {
             thread_state_manager,
             state_db,
             goal_service,
+            config_manager,
+            writer_locks,
         }
     }
 
@@ -63,18 +86,11 @@ impl ThreadGoalRequestProcessor {
             .map(|()| None)
     }
 
-    pub(crate) async fn emit_resume_goal_snapshot_and_continue(
-        &self,
-        thread_id: ThreadId,
-        thread: &CodexThread,
-    ) {
+    pub(crate) async fn emit_resume_goal_snapshot(&self, thread_id: ThreadId) {
         if !self.config.features.enabled(Feature::Goals) {
             return;
         }
         self.emit_thread_goal_snapshot(thread_id).await;
-        // App-server owns resume response and snapshot ordering, so wait until
-        // those are sent before letting extensions react to the idle thread.
-        thread.emit_thread_idle_lifecycle_if_idle().await;
     }
 
     pub(crate) async fn pending_resume_goal_state(
@@ -124,9 +140,36 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
+        let _goal_resume_guard = self.thread_state_manager.lock_goal_resume(thread_id).await;
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
+            .await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
             .await?;
+        // Active goals can immediately inject an objective or start an idle turn.
+        // Stopping a goal must remain possible after managed policy changes.
+        let existing_goal = self
+            .goal_service
+            .get_thread_goal(&state_db, thread_id)
+            .await
+            .map_err(goal_service_error)?;
+        let resulting_status = params
+            .status
+            .map(ThreadGoalStatus::to_core)
+            .or_else(|| existing_goal.as_ref().map(|goal| goal.status))
+            .unwrap_or(codex_protocol::protocol::ThreadGoalStatus::Active);
+        if resulting_status == codex_protocol::protocol::ThreadGoalStatus::Active
+            && let Ok(thread) = self.thread_manager.get_thread(thread_id).await
+        {
+            self.config_manager
+                .check_thread_model_provider(thread.config().await.as_ref())
+                .await
+                .map_err(|error| config_load_error(&error))?;
+        }
+        let max_goal_token_budget = match self.thread_manager.get_thread(thread_id).await {
+            Ok(thread) => thread.config().await.max_goal_token_budget,
+            Err(_) => self.config.max_goal_token_budget,
+        };
 
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
@@ -134,7 +177,7 @@ impl ThreadGoalRequestProcessor {
             thread_state.listener_command_tx()
         };
         let status = params.status.map(ThreadGoalStatus::to_core);
-        let objective = params.objective.as_deref();
+        let objective = params.objective.as_deref().map(str::trim);
 
         let outcome = self
             .goal_service
@@ -150,7 +193,23 @@ impl ThreadGoalRequestProcessor {
                         Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
                         None => GoalTokenBudgetUpdate::Keep,
                     },
+                    max_goal_token_budget,
                 },
+                Box::pin(async {
+                    if params.origin == Some(ThreadGoalMutationOrigin::User)
+                        && (objective.is_some() || status.is_some())
+                    {
+                        self.record_user_goal_update(
+                            thread_id,
+                            UserGoalUpdate::Set {
+                                objective: objective.map(str::to_owned),
+                                status,
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                }),
             )
             .await
             .map_err(goal_service_error)?;
@@ -158,11 +217,21 @@ impl ThreadGoalRequestProcessor {
 
         let persist_result = match self.thread_manager.get_thread(thread_id).await {
             Ok(thread) => {
-                // Live goal-first threads can be listed before any user turn is written.
-                // Use the live path so JSONL and SQLite preview metadata stay in sync.
-                thread
+                let needs_settings_checkpoint = match thread.rollout_path() {
+                    Some(path) => codex_rollout::existing_rollout_path(&path).await.is_none(),
+                    None => false,
+                };
+                match thread
                     .append_rollout_items(&[outcome.thread_goal_updated_item()])
                     .await
+                {
+                    // Automatic and legacy callers still need goal-first settings persisted,
+                    // even though they do not record a user instruction.
+                    Ok(()) if needs_settings_checkpoint => {
+                        thread.checkpoint_thread_settings().await
+                    }
+                    result => result,
+                }
             }
             Err(_) => Ok(()),
         };
@@ -191,7 +260,9 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
+            .await?;
         let goal = self
             .goal_service
             .get_thread_goal(&state_db, thread_id)
@@ -211,7 +282,10 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
-        let state_db = self.state_db_for_materialized_thread(thread_id).await?;
+        let _goal_resume_guard = self.thread_state_manager.lock_goal_resume(thread_id).await;
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
+            .await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
             .await?;
 
@@ -222,7 +296,17 @@ impl ThreadGoalRequestProcessor {
         };
         let cleared = self
             .goal_service
-            .clear_thread_goal(&state_db, thread_id)
+            .clear_thread_goal(
+                &state_db,
+                thread_id,
+                Box::pin(async {
+                    if params.origin == Some(ThreadGoalMutationOrigin::User) {
+                        self.record_user_goal_update(thread_id, UserGoalUpdate::Clear)
+                            .await?;
+                    }
+                    Ok(())
+                }),
+            )
             .await
             .map_err(goal_service_error)?;
 
@@ -239,8 +323,12 @@ impl ThreadGoalRequestProcessor {
     async fn state_db_for_materialized_thread(
         &self,
         thread_id: ThreadId,
+        access: GoalAccess,
     ) -> Result<StateDbHandle, JSONRPCErrorError> {
         if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            if matches!(access, GoalAccess::Mutate) {
+                ensure_direct_input_allowed(thread.as_ref()).await?;
+            }
             if thread.rollout_path().is_none() {
                 return Err(invalid_request(format!(
                     "ephemeral thread does not support goals: {thread_id}"
@@ -250,7 +338,7 @@ impl ThreadGoalRequestProcessor {
                 return Ok(state_db);
             }
         } else {
-            codex_rollout::find_thread_path_by_id_str(
+            let rollout_path = codex_rollout::find_thread_path_by_id_str(
                 &self.config.codex_home,
                 &thread_id.to_string(),
                 self.state_db.as_deref(),
@@ -260,6 +348,38 @@ impl ThreadGoalRequestProcessor {
                 internal_error(format!("failed to locate thread id {thread_id}: {err}"))
             })?
             .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?;
+            if matches!(access, GoalAccess::Mutate) {
+                let session_meta = codex_rollout::read_session_meta_line(&rollout_path)
+                    .await
+                    .map_err(|err| {
+                        internal_error(format!("failed to read thread ownership: {err}"))
+                    })?;
+                if session_meta.meta.id != thread_id {
+                    return Err(invalid_request(
+                        "thread metadata does not match requested id",
+                    ));
+                }
+                if matches!(
+                    session_meta.meta.source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                ) {
+                    // Match resume's latest version metadata, including legacy TurnContext
+                    // fallback, rather than trusting only the initial session header.
+                    let history = RolloutRecorder::get_rollout_history(&rollout_path)
+                        .await
+                        .map_err(|err| {
+                            internal_error(format!("failed to read thread ownership: {err}"))
+                        })?;
+                    if !can_accept_direct_input(
+                        history.get_multi_agent_version(),
+                        &session_meta.meta.source,
+                    ) {
+                        return Err(invalid_request(
+                            DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR,
+                        ));
+                    }
+                }
+            }
         }
 
         self.state_db
@@ -290,6 +410,19 @@ impl ThreadGoalRequestProcessor {
             })?
             .ok_or_else(|| invalid_request(format!("thread not found: {thread_id}")))?,
         };
+
+        if let Ok(Some(metadata)) = state_db.get_thread(thread_id).await
+            && codex_rollout::plain_rollout_path(metadata.rollout_path.as_path())
+                == codex_rollout::plain_rollout_path(rollout_path.as_path())
+            && let Some(existing_path) =
+                codex_rollout::existing_rollout_path(metadata.rollout_path.as_path()).await
+            && codex_rollout::read_session_meta_line(existing_path.as_path())
+                .await
+                .is_ok_and(|session_meta| session_meta.meta.id == thread_id)
+        {
+            return Ok(());
+        }
+
         reconcile_rollout(
             Some(state_db),
             rollout_path.as_path(),
@@ -304,7 +437,10 @@ impl ThreadGoalRequestProcessor {
     }
 
     pub(crate) async fn emit_thread_goal_snapshot(&self, thread_id: ThreadId) {
-        let state_db = match self.state_db_for_materialized_thread(thread_id).await {
+        let state_db = match self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
+            .await
+        {
             Ok(state_db) => state_db,
             Err(err) => {
                 warn!(

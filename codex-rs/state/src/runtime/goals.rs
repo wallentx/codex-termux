@@ -1,5 +1,7 @@
 use super::*;
 use crate::model::ThreadGoalRow;
+use crate::sqlite::SqlitePoolWriteExt;
+use crate::sqlite::SqliteWriteQueryExt;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -69,7 +71,7 @@ WHERE thread_id = ?
         &self,
         goal: &crate::ThreadGoal,
     ) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_immediate().await?;
         sqlx::query(
             r#"
 INSERT INTO thread_goals (
@@ -147,7 +149,7 @@ SELECT EXISTS(
     ) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id = ?")
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute_with_busy_retry(self.pool.as_ref())
             .await?;
 
         Ok(())
@@ -204,7 +206,7 @@ RETURNING
         .bind(token_budget)
         .bind(now_ms)
         .bind(now_ms)
-        .fetch_one(self.pool.as_ref())
+        .fetch_one_write(self.pool.as_ref())
         .await?;
 
         thread_goal_from_row(&row)
@@ -262,7 +264,7 @@ RETURNING
         .bind(token_budget)
         .bind(now_ms)
         .bind(now_ms)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional_write(self.pool.as_ref())
         .await?;
 
         row.map(|row| thread_goal_from_row(&row)).transpose()
@@ -315,7 +317,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?
             }
             (Some(status), None) => {
@@ -346,7 +348,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?
             }
             (None, Some(token_budget)) => {
@@ -374,7 +376,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?
             }
             (None, None) => {
@@ -394,7 +396,7 @@ WHERE thread_id = ?
                     .bind(thread_id.to_string())
                     .bind(expected_goal_id)
                     .bind(expected_goal_id)
-                    .execute(self.pool.as_ref())
+                    .execute_with_busy_retry(self.pool.as_ref())
                     .await?
                 } else {
                     let goal = self.get_thread_goal(thread_id).await?;
@@ -459,7 +461,7 @@ WHERE thread_id = ?
         .bind(now_ms)
         .bind(thread_id.to_string())
         .bind(status.as_str())
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?;
 
         if result.rows_affected() == 0 {
@@ -490,7 +492,7 @@ RETURNING
             "#,
         )
         .bind(thread_id.to_string())
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional_write(self.pool.as_ref())
         .await?;
 
         row.map(|row| thread_goal_from_row(&row)).transpose()
@@ -598,7 +600,10 @@ RETURNING
             "#,
         );
 
-        let row = builder.build().fetch_optional(self.pool.as_ref()).await?;
+        let row = builder
+            .build()
+            .fetch_optional_write(self.pool.as_ref())
+            .await?;
 
         let Some(row) = row else {
             return Ok(GoalAccountingOutcome::Unchanged(
@@ -634,12 +639,16 @@ mod tests {
     use super::*;
     use crate::runtime::test_support::test_thread_metadata;
     use crate::runtime::test_support::unique_temp_dir;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
-        StateRuntime::init(unique_temp_dir(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize")
+        StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(unique_temp_dir().as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize")
     }
 
     fn test_thread_id() -> ThreadId {
@@ -647,11 +656,8 @@ mod tests {
     }
 
     async fn upsert_test_thread(runtime: &StateRuntime, thread_id: ThreadId) {
-        let metadata = test_thread_metadata(
-            runtime.codex_home(),
-            thread_id,
-            runtime.codex_home().join("workspace"),
-        );
+        let sqlite_home = runtime.sqlite().home();
+        let metadata = test_thread_metadata(sqlite_home, thread_id, sqlite_home.join("workspace"));
         runtime
             .upsert_thread(&metadata)
             .await

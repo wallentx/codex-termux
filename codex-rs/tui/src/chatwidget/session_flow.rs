@@ -1,14 +1,89 @@
 //! Session configuration and thread-header orchestration for `ChatWidget`.
+//! Confirmed model-picker changes can offer the flourish only on their original task; the app
+//! checks the previous model when it applies the final selection.
 
 use super::*;
+use crate::history_cell::ForkedThreadHistoryCell;
+use crate::style::accent_color;
 
 impl ChatWidget {
+    pub(crate) fn accept_startup_approval_policy(
+        &mut self,
+        app_policy: &mut Constrained<codex_protocol::protocol::AskForApproval>,
+        server_policy: AskForApproval,
+    ) -> codex_config::ConstraintResult<()> {
+        let server_policy = server_policy.to_core();
+        if app_policy.can_set(&server_policy).is_err() {
+            let local = app_policy.clone();
+            *app_policy = Constrained::new(server_policy, move |candidate| {
+                if *candidate == server_policy {
+                    Ok(())
+                } else {
+                    local.can_set(candidate)
+                }
+            })?;
+            self.config.permissions.approval_policy = app_policy.clone();
+        }
+        Ok(())
+    }
+
+    /// Offer the flourish only for a successful primary thread/start without initial work.
+    pub(crate) fn mark_fresh_task_for_sparkle(
+        &mut self,
+        started: &crate::app_server_session::AppServerStartedThread,
+    ) {
+        if started.turns.is_empty()
+            && started.session.forked_from_id.is_none()
+            && !started.blocks_direct_input
+            && self.initial_user_message.is_none()
+            && !self.is_user_turn_pending_or_running()
+        {
+            self.bottom_pane
+                .mark_fresh_task_for_sparkle(&started.session.model, &self.local_settings.tui);
+        } else {
+            self.bottom_pane.dismiss_composer_sparkle();
+        }
+    }
+
+    pub(crate) fn set_sparkle_terminal_focus(&mut self, focused: bool) {
+        self.bottom_pane.set_sparkle_terminal_focus(focused);
+    }
+
+    pub(crate) fn prepare_composer_sparkle_key(&self, key: KeyEvent) {
+        self.bottom_pane.prepare_composer_sparkle_key(key);
+    }
+
+    pub(crate) fn sparkle_thread_for_picker_action(&self, model: &str) -> Option<ThreadId> {
+        self.thread_id()
+            .filter(|_| BottomPane::is_sparkle_model(model))
+    }
+
+    pub(crate) fn on_sparkle_model_selected_from_picker(&mut self, model: &str) {
+        if self.current_model() == model {
+            self.bottom_pane
+                .select_sparkle_model(model, &self.local_settings.tui);
+        }
+    }
+
+    pub(crate) fn custom_statusline_enabled(&self) -> bool {
+        self.statusline_feature_enabled
+    }
+
     fn on_session_configured_with_display_and_fork_parent_title(
         &mut self,
         session: ThreadSessionState,
         display: SessionConfiguredDisplay,
         fork_parent_title: Option<String>,
     ) {
+        self.windows_sandbox_host =
+            if !self.windows_sandbox_local_server && self.remote_connection.is_some() {
+                crate::app::WindowsSandboxHost::Remote
+            } else {
+                session.windows_sandbox_host
+            };
+        self.invalidate_permission_discovery();
+        self.permission_discovery = None;
+        self.permission_profiles_menu_opened = false;
         self.transcript.reset_copy_history();
         let history_metadata = session.message_history.unwrap_or_default();
         self.bottom_pane.set_history_metadata(
@@ -19,14 +94,51 @@ impl ChatWidget {
         self.set_skills(/*skills*/ None);
         self.session_network_proxy = session.network_proxy.clone();
         let previous_thread_id = self.thread_id;
+        if previous_thread_id != Some(session.thread_id) || self.cloud_picker_selection.is_some() {
+            self.dismiss_stale_model_picker();
+        }
+        let cwd_changed = self.current_cwd != session.cwd;
+        let connector_scope_changed = previous_thread_id != Some(session.thread_id) || cwd_changed;
         self.thread_id = Some(session.thread_id);
+        self.read_only_history = session.read_only_history;
+        self.thread_settings_confirmed = session.thread_settings_confirmed;
+        self.sync_context_window_visibility();
+        self.daybreak_enabled = self.config.features.enabled(Feature::CliDaybreak)
+            && session.daybreak_enabled
+            && !matches!(display, SessionConfiguredDisplay::SideConversation);
+        #[cfg(target_os = "windows")]
+        if self.windows_sandbox_local_server
+            && matches!(self.codex_op_target, CodexOpTarget::AppEvent)
+        {
+            self.windows_sandbox_config = Default::default();
+            self.set_windows_sandbox_mode(/*mode*/ None);
+            self.app_event_tx.send(AppEvent::RefreshWindowsSandbox {
+                thread_id: session.thread_id,
+            });
+        }
+        self.realtime_conversation_available_for_thread =
+            codex_realtime_webrtc::RealtimeWebrtcSession::is_supported();
+        self.bottom_pane
+            .set_voice_command_enabled(self.realtime_conversation_available_for_thread);
         self.bottom_pane
             .set_queue_submissions(/*queue_submissions*/ false);
         if previous_thread_id != self.thread_id {
+            if (previous_thread_id.is_some() || cwd_changed)
+                && self.status_account_display == Some(StatusAccountDisplay::ApiKey)
+            {
+                self.refresh_account_scoped_models();
+            }
+            self.backend_banner_notice_model = None;
+            self.automatic_model_switch_state =
+                backend_banners::AutomaticModelSwitchState::default();
             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
+            self.clear_thread_usage_state();
         }
-        self.refresh_plan_mode_nudge();
+        let has_turn_history =
+            previous_thread_id == self.thread_id && self.turn_lifecycle.has_turn_history;
         self.turn_lifecycle.reset_thread();
+        self.turn_lifecycle.has_turn_history = has_turn_history;
+        self.safety_recourse = None;
         self.clear_safety_buffering();
         self.thread_name = session.thread_name.clone();
         self.current_goal_status_indicator = None;
@@ -34,13 +146,29 @@ impl ChatWidget {
         self.update_collaboration_mode_indicator();
         self.forked_from = session.forked_from_id;
         self.current_rollout_path = session.rollout_path.clone();
-        self.current_cwd = Some(session.cwd.to_path_buf());
-        self.config.cwd = session.cwd.clone();
-        let runtime_workspace_roots = session.runtime_workspace_roots.clone();
-        self.config.workspace_roots = runtime_workspace_roots.clone();
-        self.config
-            .permissions
-            .set_workspace_roots(runtime_workspace_roots);
+        self.primary_environment_cwd
+            .clone_from(&session.primary_environment_cwd);
+        self.current_cwd = session.cwd.clone();
+        if let Ok(native_cwd) = session.cwd.to_abs_path() {
+            self.config.cwd = native_cwd;
+        }
+        self.config.model_provider_id = session.model_provider_id.clone();
+        if previous_thread_id.is_none()
+            && let Some(event) = crate::app::provider::refresh_list_if_present(self)
+        {
+            self.app_event_tx.send(AppEvent::Provider(event));
+        }
+        self.set_daybreak_enabled(self.daybreak_enabled);
+        if connector_scope_changed {
+            self.invalidate_connector_scope();
+        }
+        self.current_workspace_roots
+            .clone_from(&session.runtime_workspace_roots);
+        crate::session_state::sync_local_workspace_roots(
+            &mut self.config,
+            &self.current_workspace_roots,
+        );
+        self.config.service_tier = session.service_tier.clone();
         self.effective_service_tier = session.service_tier.clone();
         if let Err(err) = self
             .config
@@ -53,7 +181,10 @@ impl ChatWidget {
                 Constrained::allow_only(session.approval_policy.to_core());
         }
         let permission_snapshot = PermissionProfileSnapshot::from_session_snapshot(
-            session.permission_profile.clone(),
+            crate::session_state::display_profile_for_roots(
+                session.permission_profile.clone(),
+                &session.runtime_workspace_roots,
+            ),
             session.active_permission_profile.clone(),
         );
         let permission_sync = self
@@ -74,7 +205,6 @@ impl ChatWidget {
             }
         }
         self.config.approvals_reviewer = session.approvals_reviewer;
-        self.config.personality = session.personality;
         self.status_line_project_root_name_cache = None;
         let forked_from_id = session.forked_from_id;
         let default_model = session.model.clone();
@@ -100,32 +230,43 @@ impl ChatWidget {
                     mask.reasoning_effort = Some(session.reasoning_effort.clone());
                 }
                 self.update_collaboration_mode_indicator();
-                self.refresh_plan_mode_nudge();
             }
         }
+        let effort = self.effective_reasoning_effort();
+        self.bottom_pane
+            .set_active_reasoning_effort_baseline(effort.as_ref());
         self.refresh_model_display();
         self.refresh_status_surfaces();
+        if previous_thread_id != self.thread_id
+            && self.should_prefetch_rate_limits()
+            && (self.current_model() == crate::model_catalog::LUNA_RESERVE_MODEL
+                || self.backend_banner_fallback().is_some())
+        {
+            // Reconcile this task with retained account state before sending its initial/queued
+            // prompt. Do not wait for the next usage poll after /new, /resume or a thread switch.
+            self.hold_rate_limit_recovery();
+            self.app_event_tx
+                .send(AppEvent::ApplyBackendBannerFallback {
+                    thread_id: session.thread_id,
+                });
+        }
         self.sync_service_tier_commands();
-        self.sync_personality_command_enabled();
+        self.sync_worktrees_enabled();
         self.sync_plugins_command_enabled();
         self.sync_goal_command_enabled();
         self.refresh_plugin_mentions();
         let model_for_header = self.current_model().to_string();
-        if matches!(
-            display,
-            SessionConfiguredDisplay::Normal | SessionConfiguredDisplay::PromptEdit
-        ) {
+        if display == SessionConfiguredDisplay::Normal {
             let startup_tooltip_override = self.startup_tooltip_override.take();
-            let show_fast_status = self
-                .should_show_fast_status(&model_for_header, self.effective_service_tier.as_deref());
             let session_info_cell = history_cell::new_session_info(
                 &self.config,
+                &self.local_settings,
                 &model_for_header,
+                self.model_catalog.display_name(&session.model),
                 &session,
                 self.show_welcome_banner,
                 startup_tooltip_override,
                 self.plan_type,
-                show_fast_status,
             );
             self.apply_session_info_cell(session_info_cell);
         } else if self
@@ -137,12 +278,20 @@ impl ChatWidget {
             self.transcript.active_cell = None;
             self.bump_active_cell_revision();
         }
-        self.transcript.saw_copy_source_this_turn = false;
-        self.refresh_skills_for_current_cwd(/*force_reload*/ true);
-        if self.connectors_enabled() {
-            self.prefetch_connectors();
+        // Emit notices after replacing or removing the placeholder header.
+        if self.daybreak_enabled && previous_thread_id != self.thread_id {
+            self.add_info_message("Daybreak is on for new turns.".into(), /*hint*/ None);
         }
+        self.transcript.committed_turn_response = None;
+        self.refresh_skills_for_current_cwd(/*force_reload*/ true);
+        self.refresh_connector_mentions(/*force_refresh*/ false);
+        let initial_user_message_pending = self.initial_user_message.is_some();
         self.submit_initial_user_message_if_pending();
+        if self.mcp_startup_status.is_none()
+            && (!initial_user_message_pending || self.is_user_turn_pending_or_running())
+        {
+            self.maybe_send_next_queued_input();
+        }
         if display == SessionConfiguredDisplay::Normal
             && let Some(forked_from_id) = forked_from_id
         {
@@ -172,16 +321,6 @@ impl ChatWidget {
         );
     }
 
-    pub(crate) fn handle_prompt_edit_thread_session(&mut self, session: ThreadSessionState) {
-        self.instruction_source_paths = session.instruction_source_paths.clone();
-        let fork_parent_title = session.fork_parent_title.clone();
-        self.on_session_configured_with_display_and_fork_parent_title(
-            session,
-            SessionConfiguredDisplay::PromptEdit,
-            fork_parent_title,
-        );
-    }
-
     pub(crate) fn handle_side_thread_session(&mut self, session: ThreadSessionState) {
         self.instruction_source_paths = session.instruction_source_paths.clone();
         let fork_parent_title = session.fork_parent_title.clone();
@@ -204,9 +343,9 @@ impl ChatWidget {
             vec![
                 "• ".dim(),
                 "Thread forked from ".into(),
-                name.cyan(),
+                name.fg(accent_color()),
                 " (".into(),
-                forked_from_id_text.cyan(),
+                forked_from_id_text.fg(accent_color()),
                 ")".into(),
             ]
             .into()
@@ -214,19 +353,73 @@ impl ChatWidget {
             vec![
                 "• ".dim(),
                 "Thread forked from ".into(),
-                forked_from_id_text.cyan(),
+                forked_from_id_text.fg(accent_color()),
             ]
             .into()
         };
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-            PlainHistoryCell::new(vec![line]),
+            ForkedThreadHistoryCell(PlainHistoryCell::new(vec![line])),
         )));
+    }
+
+    /// Clear history-derived state while preserving this thread's settings and goal.
+    pub(crate) fn reset_after_prompt_revert(
+        &mut self,
+        rollout_path: Option<PathBuf>,
+        retained_turns: &[Turn],
+    ) {
+        self.current_rollout_path = rollout_path;
+        self.clear_background_terminals();
+        self.input_queue.clear();
+        self.reset_realtime_conversation();
+        // Finish any output not yet drained from the old runtime without live completion actions.
+        self.on_task_complete(
+            /*last_agent_message*/ None, /*completion*/ None, /*from_replay*/ true,
+        );
+        self.turn_lifecycle.reset_thread();
+        self.review = Default::default();
+        self.transcript.take_active_cell();
+        self.transcript.reset_copy_history();
+        self.transcript.reset_turn_flags();
+        for turn in retained_turns {
+            let mut replaying_delegation = false;
+            for item in turn.item_payloads() {
+                if matches!(item, ThreadItemPayload::UserMessage { content, .. }
+                    if realtime::realtime_delegation_input(content).is_some())
+                {
+                    replaying_delegation = true;
+                }
+                if replaying_delegation && realtime::is_private_realtime_agent_item(item) {
+                    continue;
+                }
+                let (markdown, source) = match item {
+                    ThreadItemPayload::AgentMessage { text, .. } => (
+                        parse_assistant_markdown(text, self.config.cwd.as_path()).visible_markdown,
+                        text,
+                    ),
+                    ThreadItemPayload::Plan { text, .. } => (text.clone(), text),
+                    _ => continue,
+                };
+                if !markdown.trim().is_empty() {
+                    self.transcript
+                        .record_agent_markdown(markdown, source.clone());
+                }
+            }
+        }
+        self.transcript.last_plan_progress = None;
+        self.last_rendered_user_message_display = None;
+        self.last_rendered_user_message_client_id = None;
+        self.clear_pending_rate_limit_reset_hint();
+        self.set_token_info(/*info*/ None);
+        self.bottom_pane.clear_pending_questions();
+        self.bottom_pane.set_task_running(/*running*/ false);
+        self.refresh_status_surfaces();
     }
 
     pub(crate) fn emit_prompt_edit_thread_event(&mut self) {
         let line: Line<'static> = vec![
             "• ".dim(),
-            "You’re continuing from this point in a new conversation".into(),
+            "Conversation reverted to this point. File changes are unchanged.".into(),
         ]
         .into();
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
@@ -234,16 +427,22 @@ impl ChatWidget {
         )));
     }
 
-    pub(super) fn on_thread_name_updated(
+    /// Show a provisional or manually chosen name before its server notification arrives.
+    pub(crate) fn display_thread_name(&mut self, thread_id: ThreadId, name: String) {
+        if self.thread_id == Some(thread_id) {
+            self.thread_name = Some(name);
+            self.refresh_status_surfaces();
+            self.request_redraw();
+        }
+    }
+
+    /// Update name metadata silently, including late and replayed notifications.
+    pub(crate) fn on_thread_name_updated(
         &mut self,
         thread_id: ThreadId,
         thread_name: Option<String>,
     ) {
         if self.thread_id == Some(thread_id) {
-            if let Some(name) = thread_name.as_deref() {
-                let cell = Self::rename_confirmation_cell(name, self.thread_id);
-                self.add_boxed_history(Box::new(cell));
-            }
             self.thread_name = thread_name;
             self.refresh_status_surfaces();
             self.request_redraw();

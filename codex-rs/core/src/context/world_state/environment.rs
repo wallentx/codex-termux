@@ -1,22 +1,47 @@
+use super::Placement;
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
+use super::WorldStateUpdateContent;
 use crate::context::ContextualUserFragment;
 use crate::context::environment_context::FileSystemContext;
 use crate::context::environment_context::NetworkContext;
 use crate::context::environment_context::push_xml_escaped_text;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::environment_selection::TurnEnvironmentState;
 use crate::session::turn_context::TurnContext;
-use crate::session::turn_context::TurnEnvironment;
+use crate::shell::ShellType;
+use codex_features::Feature;
+use codex_protocol::AgentPath;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
+use codex_protocol::protocol::NetworkAccess;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::LazyLock;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::sync::Mutex;
+
+static POWERSHELL_VERSIONS: LazyLock<Mutex<BTreeMap<PathBuf, Option<String>>>> =
+    LazyLock::new(Mutex::default);
 
 /// Environment values visible to the model.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EnvironmentsState {
     environments: BTreeMap<String, EnvironmentState>,
+    // Keep each environment named and its rules grouped together, even when there is only one.
+    per_environment: bool,
+    shell_version: Option<String>,
     current_date: Option<String>,
+    current_date_is_utc: bool,
     timezone: Option<String>,
     network: Option<NetworkContext>,
     filesystem: Option<FileSystemContext>,
@@ -24,23 +49,51 @@ pub(crate) struct EnvironmentsState {
 }
 
 impl EnvironmentsState {
-    pub(crate) fn from_turn_context_with_environments(
+    pub(crate) async fn from_turn_context_with_environments(
         turn_context: &TurnContext,
         environments: &TurnEnvironmentSnapshot,
+        current_date: Option<String>,
     ) -> Self {
-        let workspace_roots = environments
-            .primary()
-            .map(TurnEnvironment::workspace_roots)
-            .unwrap_or_default();
+        let per_environment = turn_context
+            .config
+            .features
+            .enabled(Feature::PerEnvironmentContext);
+        let shell_version = if turn_context
+            .config
+            .features
+            .enabled(Feature::PowerShellShellVersion)
+            && let Some(environment) = environments.single_local_environment()
+            && let Some(shell) = environment.shell.as_ref()
+            && shell.shell_type == ShellType::PowerShell
+        {
+            powershell_version(&shell.shell_path).await
+        } else {
+            None
+        };
         Self {
-            environments: environment_states(environments),
-            current_date: turn_context.current_date.clone(),
-            timezone: turn_context.timezone.clone(),
+            environments: environment_states(environments, per_environment),
+            per_environment,
+            shell_version,
+            current_date_is_utc: current_date.is_some()
+                && turn_context
+                    .config
+                    .features
+                    .enabled(Feature::UtcEnvironmentDate),
+            current_date,
+            timezone: turn_context
+                .timezone
+                .clone()
+                .filter(|_| turn_context.config.include_environment_context_time),
             network: network_from_turn_context(turn_context),
-            filesystem: Some(FileSystemContext::from_permission_profile(
-                turn_context.config.permissions.permission_profile(),
-                workspace_roots,
-            )),
+            filesystem: environments
+                .primary()
+                .filter(|_| !per_environment)
+                .map(|environment| {
+                    FileSystemContext::from_permission_profile(
+                        environment.permission_profile(),
+                        environment.workspace_roots(),
+                    )
+                }),
             subagents: None,
         }
     }
@@ -52,6 +105,18 @@ impl EnvironmentsState {
         self
     }
 
+    fn rendered_network(&self) -> Option<String> {
+        self.network.as_ref().map(|network| {
+            let network = network.render();
+            if self.per_environment {
+                // This shared list does not include each environment's own domain restrictions.
+                format!("<thread_network_requirements>{network}</thread_network_requirements>")
+            } else {
+                network
+            }
+        })
+    }
+
     fn rendered_full(&self) -> RenderedEnvironments {
         RenderedEnvironments {
             updates: self
@@ -61,10 +126,15 @@ impl EnvironmentsState {
                     (id.clone(), EnvironmentUpdate::Current(environment.clone()))
                 })
                 .collect(),
-            legacy_single: is_legacy_single(&self.environments),
+            legacy_single: !self.per_environment && is_legacy_single(&self.environments),
+            include_primary: self.environments.len() > 1,
+            shell_version: self.shell_version.clone(),
+            shell_version_removed: false,
             current_date: self.current_date.clone(),
+            current_date_removed: false,
+            current_date_is_utc: self.current_date_is_utc,
             timezone: self.timezone.clone(),
-            network: self.network.clone(),
+            network: self.rendered_network(),
             filesystem: self.filesystem.clone(),
             subagents: self.subagents.clone(),
         }
@@ -75,8 +145,12 @@ impl WorldStateSection for EnvironmentsState {
     const ID: &'static str = "environments";
     type Snapshot = EnvironmentsSnapshot;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        EnvironmentsSnapshot {
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Self::Snapshot>,
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = EnvironmentsSnapshot {
+            per_environment: self.per_environment,
             environments: self
                 .environments
                 .iter()
@@ -86,42 +160,51 @@ impl WorldStateSection for EnvironmentsState {
                         EnvironmentSnapshot {
                             cwd: environment.cwd.inferred_native_path_string(),
                             status: environment.status,
+                            error: environment.error.clone(),
                             shell: environment.shell.clone(),
+                            is_primary: self.environments.len() > 1 && environment.is_primary,
+                            filesystem: environment.filesystem.clone(),
+                            network_access: environment.network_access,
                         },
                     )
                 })
                 .collect(),
+            shell_version: self.shell_version.clone(),
             current_date: self.current_date.clone(),
+            current_date_is_utc: self.current_date_is_utc,
             timezone: self.timezone.clone(),
-            network: self.network.as_ref().map(NetworkContext::render),
+            network: self.rendered_network(),
             filesystem: self.filesystem.as_ref().map(FileSystemContext::render),
             subagents: self.subagents.clone(),
-        }
-    }
-
-    fn render_diff(
-        &self,
-        previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        let current = self.snapshot();
+        };
         let empty = EnvironmentsSnapshot::default();
         let previous = match previous {
             PreviousSectionState::Known(previous) => previous,
             PreviousSectionState::Absent | PreviousSectionState::Unknown => &empty,
         };
-        let turn_context_values_changed = current.current_date != previous.current_date
+        let shell_version_added =
+            current.shell_version.is_some() && previous.shell_version.is_none();
+        let format_changed = current.per_environment != previous.per_environment;
+        let turn_context_values_changed = format_changed
+            || current.shell_version != previous.shell_version
+            || current.current_date != previous.current_date
+            || current.current_date_is_utc != previous.current_date_is_utc
             || current.timezone != previous.timezone
             || current.network != previous.network
             || current.filesystem != previous.filesystem;
+        let multiple_environments = self.environments.len() > 1;
+        let previous_multiple_environments = previous.environments.len() > 1;
         let mut updates = self
             .environments
             .iter()
             .filter(|(id, _)| {
                 let environment = &current.environments[*id];
-                previous
-                    .environments
-                    .get(*id)
-                    .is_none_or(|previous| !environment.has_same_diff_value(previous))
+                previous.environments.get(*id).is_none_or(|previous| {
+                    format_changed
+                        || multiple_environments != previous_multiple_environments
+                        || (shell_version_added && previous.shell.is_none())
+                        || !environment.has_same_diff_value(previous)
+                })
             })
             .map(|(id, environment)| (id.clone(), EnvironmentUpdate::Current(environment.clone())))
             .collect::<BTreeMap<_, _>>();
@@ -132,25 +215,46 @@ impl WorldStateSection for EnvironmentsState {
                 .filter(|id| !self.environments.contains_key(*id))
                 .map(|id| (id.clone(), EnvironmentUpdate::Unavailable)),
         );
-        let legacy_single = is_legacy_single(&self.environments)
+        let legacy_single = !self.per_environment
+            && is_legacy_single(&self.environments)
             && updates
                 .values()
                 .all(|update| matches!(update, EnvironmentUpdate::Current(_)));
-        (!updates.is_empty() || turn_context_values_changed).then(|| {
-            Box::new(RenderedEnvironments {
+        let fragment = (!updates.is_empty() || turn_context_values_changed).then(|| {
+            let environment = Box::new(RenderedEnvironments {
                 updates,
                 legacy_single,
+                include_primary: multiple_environments || previous_multiple_environments,
+                shell_version: self.shell_version.clone(),
+                shell_version_removed: self.shell_version.is_none()
+                    && previous.shell_version.is_some(),
                 current_date: self.current_date.clone(),
+                current_date_removed: self.current_date.is_none()
+                    && previous.current_date.is_some(),
+                current_date_is_utc: if self.current_date.is_some() {
+                    self.current_date_is_utc
+                } else {
+                    previous.current_date_is_utc
+                },
                 timezone: self.timezone.clone(),
-                network: self.network.clone(),
+                network: self.rendered_network(),
                 filesystem: self.filesystem.clone(),
                 subagents: self.subagents.clone(),
-            }) as Box<dyn ContextualUserFragment>
-        })
+            });
+            WorldStateUpdate {
+                placement: Placement::Mergeable,
+                content: WorldStateUpdateContent::Environment(environment),
+            }
+        });
+        (Some(current), fragment.into_iter().collect())
     }
 }
 
 impl ContextualUserFragment for EnvironmentsState {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("environments.environment_context".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -163,19 +267,24 @@ impl ContextualUserFragment for EnvironmentsState {
         environment_context_markers()
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         self.rendered_full().body()
     }
 }
 
-struct RenderedEnvironments {
+pub(crate) struct RenderedEnvironments {
     updates: BTreeMap<String, EnvironmentUpdate>,
     legacy_single: bool,
+    include_primary: bool,
+    shell_version: Option<String>,
+    shell_version_removed: bool,
     current_date: Option<String>,
+    current_date_removed: bool,
+    current_date_is_utc: bool,
     timezone: Option<String>,
-    network: Option<NetworkContext>,
+    network: Option<String>,
     filesystem: Option<FileSystemContext>,
-    subagents: Option<String>,
+    pub(crate) subagents: Option<String>,
 }
 
 enum EnvironmentUpdate {
@@ -184,6 +293,10 @@ enum EnvironmentUpdate {
 }
 
 impl ContextualUserFragment for RenderedEnvironments {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("environments.environment_context".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -196,7 +309,7 @@ impl ContextualUserFragment for RenderedEnvironments {
         environment_context_markers()
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let mut rendered = "\n".to_string();
         if self.legacy_single {
             if let Some(EnvironmentUpdate::Current(environment)) = self.updates.values().next() {
@@ -210,6 +323,13 @@ impl ContextualUserFragment for RenderedEnvironments {
                         rendered.push_str("    <environment id=\"");
                         push_xml_escaped_text(&mut rendered, id);
                         rendered.push('"');
+                        if self.include_primary {
+                            rendered.push_str(if environment.is_primary {
+                                " primary=\"true\""
+                            } else {
+                                " primary=\"false\""
+                            });
+                        }
                         rendered.push_str(">\n");
                         push_environment_values(&mut rendered, environment, "      ");
                         rendered.push_str("    </environment>\n");
@@ -223,11 +343,26 @@ impl ContextualUserFragment for RenderedEnvironments {
             }
             rendered.push_str("  </environments>\n");
         }
-        push_optional_element(&mut rendered, "current_date", self.current_date.as_deref());
+        if self.shell_version_removed {
+            rendered.push_str("  <shell_version status=\"unavailable\" />\n");
+        } else {
+            let shell_version = self.shell_version.as_deref();
+            push_optional_element(&mut rendered, "shell_version", shell_version);
+        }
+        let date_element = if self.current_date_is_utc {
+            "current_date_utc"
+        } else {
+            "current_date"
+        };
+        if self.current_date_removed {
+            rendered.push_str(&format!("  <{date_element} status=\"unavailable\" />\n"));
+        } else {
+            push_optional_element(&mut rendered, date_element, self.current_date.as_deref());
+        }
         push_optional_element(&mut rendered, "timezone", self.timezone.as_deref());
         if let Some(network) = &self.network {
             rendered.push_str("  ");
-            rendered.push_str(&network.render());
+            rendered.push_str(network);
             rendered.push('\n');
         }
         if let Some(filesystem) = &self.filesystem {
@@ -244,7 +379,7 @@ impl ContextualUserFragment for RenderedEnvironments {
             }
             rendered.push_str("  </subagents>\n");
         }
-        rendered
+        input_text(rendered)
     }
 }
 
@@ -257,11 +392,30 @@ fn push_environment_values(rendered: &mut String, environment: &EnvironmentState
         rendered.push_str(indent);
         rendered.push_str("<status>starting</status>\n");
     }
+    if environment.status == EnvironmentStatus::Failed {
+        rendered.push_str(indent);
+        rendered.push_str("<status>failed</status>\n");
+    }
+    if let Some(error) = &environment.error {
+        rendered.push_str(indent);
+        rendered.push_str("<error>");
+        push_xml_escaped_text(rendered, error);
+        rendered.push_str("</error>\n");
+    }
     if let Some(shell) = &environment.shell {
         rendered.push_str(indent);
         rendered.push_str("<shell>");
         push_xml_escaped_text(rendered, shell);
         rendered.push_str("</shell>\n");
+    }
+    if let Some(access) = environment.network_access {
+        rendered.push_str(indent);
+        rendered.push_str(&format!("<network access=\"{access}\" />\n"));
+    }
+    if let Some(filesystem) = &environment.filesystem {
+        rendered.push_str(indent);
+        rendered.push_str(filesystem);
+        rendered.push('\n');
     }
 }
 
@@ -283,12 +437,23 @@ struct EnvironmentState {
     cwd: PathUri,
     status: EnvironmentStatus,
     shell: Option<String>,
+    error: Option<String>,
+    is_primary: bool,
+    filesystem: Option<String>,
+    network_access: Option<NetworkAccess>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
 pub(crate) struct EnvironmentsSnapshot {
     environments: BTreeMap<String, EnvironmentSnapshot>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    per_environment: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shell_version: Option<String>,
     current_date: Option<String>,
+    // Changing the time basis must emit an update even when the date stays the same.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    current_date_is_utc: bool,
     timezone: Option<String>,
     network: Option<String>,
     filesystem: Option<String>,
@@ -300,12 +465,24 @@ struct EnvironmentSnapshot {
     cwd: String,
     status: EnvironmentStatus,
     shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    is_primary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filesystem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network_access: Option<NetworkAccess>,
 }
 
 impl EnvironmentSnapshot {
     fn has_same_diff_value(&self, other: &Self) -> bool {
         self.cwd == other.cwd
             && self.status == other.status
+            && self.error == other.error
+            && self.is_primary == other.is_primary
+            && self.filesystem == other.filesystem
+            && self.network_access == other.network_access
             && self
                 .shell
                 .as_ref()
@@ -319,21 +496,87 @@ impl EnvironmentSnapshot {
 enum EnvironmentStatus {
     Starting,
     Available,
+    Failed,
 }
 
-fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, EnvironmentState> {
+async fn powershell_version(shell_path: &Path) -> Option<String> {
+    if let Some(version) = {
+        let versions = POWERSHELL_VERSIONS.lock().await;
+        versions.get(shell_path).cloned()
+    } {
+        return version;
+    }
+
+    let mut command = Command::new(shell_path);
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString()",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    let version = tokio::time::timeout(Duration::from_secs(2), command.output())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .filter(|output| output.status.success() && output.stdout.len() <= 64)
+        .and_then(|output| {
+            let mut components = std::str::from_utf8(&output.stdout).ok()?.trim().split('.');
+            let major = components.next()?.parse::<u16>().ok()?;
+            let minor = components.next()?.parse::<u16>().ok()?;
+            Some(format!("{major}.{minor}"))
+        });
+    POWERSHELL_VERSIONS
+        .lock()
+        .await
+        .insert(shell_path.to_owned(), version.clone());
+    version
+}
+
+fn environment_states(
+    snapshot: &TurnEnvironmentSnapshot,
+    per_environment: bool,
+) -> BTreeMap<String, EnvironmentState> {
     let mut environments = snapshot
         .turn_environments()
-        .map(|environment| {
+        .enumerate()
+        .map(|(index, environment)| {
             (
-                environment.environment_id.clone(),
+                environment.selection.environment_id.clone(),
                 EnvironmentState {
                     cwd: environment.cwd().clone(),
                     status: EnvironmentStatus::Available,
+                    error: None,
                     shell: environment
                         .shell
                         .as_ref()
                         .map(|shell| shell.name().to_string()),
+                    is_primary: index == 0,
+                    // These are this captured environment's rules, not the primary's defaults.
+                    filesystem: per_environment.then(|| {
+                        FileSystemContext::from_permission_profile(
+                            environment.permission_profile(),
+                            environment.workspace_roots(),
+                        )
+                        .render()
+                    }),
+                    network_access: per_environment.then(|| {
+                        if environment
+                            .permission_profile()
+                            .network_sandbox_policy()
+                            .is_enabled()
+                        {
+                            NetworkAccess::Enabled
+                        } else {
+                            NetworkAccess::Restricted
+                        }
+                    }),
                 },
             )
         })
@@ -344,8 +587,39 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
             .or_insert_with(|| EnvironmentState {
                 cwd: environment.selection.cwd.clone(),
                 status: EnvironmentStatus::Starting,
+                error: None,
                 shell: None,
+                is_primary: false,
+                filesystem: None,
+                network_access: None,
             });
+    }
+    // Bound the additional model context even when many selected environments fail.
+    const MAX_ERROR_BYTES: usize = 256;
+    const MAX_TOTAL_ERROR_BYTES: usize = 512;
+    let mut remaining_error_bytes = MAX_TOTAL_ERROR_BYTES;
+    for environment in &snapshot.environments {
+        if let TurnEnvironmentState::Failed {
+            selection, error, ..
+        } = environment
+        {
+            let detail = error
+                [..error.floor_char_boundary(remaining_error_bytes.min(MAX_ERROR_BYTES))]
+                .to_string();
+            remaining_error_bytes -= detail.len();
+            environments.insert(
+                selection.environment_id.clone(),
+                EnvironmentState {
+                    cwd: selection.cwd.clone(),
+                    status: EnvironmentStatus::Failed,
+                    shell: None,
+                    error: (!detail.is_empty()).then_some(detail),
+                    is_primary: false,
+                    filesystem: None,
+                    network_access: None,
+                },
+            );
+        }
     }
     environments
 }
@@ -393,3 +667,22 @@ mod tests;
 #[cfg(test)]
 #[path = "environment_render_tests.rs"]
 mod render_tests;
+
+pub(crate) fn format_agent_paths(paths: impl Iterator<Item = AgentPath>) -> String {
+    const MAX_AGENTS: usize = 8;
+    const MAX_BYTES: usize = 1_024;
+    let mut lines = Vec::new();
+    let mut rendered_bytes = "  <subagents>\n  </subagents>\n".len();
+    for path in paths {
+        if lines.len() == MAX_AGENTS {
+            break;
+        }
+        let line = format!(r#"<agent name="{path}" />"#);
+        let line_bytes = "    \n".len() + line.len();
+        if rendered_bytes + line_bytes <= MAX_BYTES {
+            rendered_bytes += line_bytes;
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}

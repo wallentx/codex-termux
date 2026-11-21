@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
+use codex_utils_absolute_path::test_support::PathExt;
 use uuid::Uuid;
 
 use super::LocalThreadStoreConfig;
@@ -12,7 +13,7 @@ use super::LocalThreadStoreConfig;
 pub(super) fn test_config(codex_home: &Path) -> LocalThreadStoreConfig {
     LocalThreadStoreConfig {
         codex_home: codex_home.to_path_buf(),
-        sqlite_home: codex_home.to_path_buf(),
+        sqlite: codex_state::SqliteConfig::new_for_testing(codex_home.abs()),
         default_model_provider_id: "test-provider".to_string(),
     }
 }
@@ -71,6 +72,7 @@ pub(super) fn write_session_file_with(
         first_user_message,
         model_provider,
         /*forked_from_id*/ None,
+        /*attached_thread*/ false,
         history_mode,
     )
 }
@@ -84,6 +86,7 @@ pub(super) fn write_session_file_with_fork(
     first_user_message: &str,
     model_provider: Option<&str>,
     forked_from_id: Option<Uuid>,
+    attached_thread: bool,
     history_mode: ThreadHistoryMode,
 ) -> std::io::Result<PathBuf> {
     fs::create_dir_all(&day_dir)?;
@@ -96,6 +99,7 @@ pub(super) fn write_session_file_with_fork(
             "session_id": uuid,
             "id": uuid,
             "forked_from_id": forked_from_id,
+            "attached_thread": attached_thread,
             "timestamp": ts,
             "cwd": root,
             "originator": "test_originator",

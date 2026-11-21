@@ -1,4 +1,6 @@
 use super::shared::v2_enum_from_core;
+use crate::JsonSchema;
+use crate::TS;
 use codex_protocol::approvals::ExecPolicyAmendment as CoreExecPolicyAmendment;
 use codex_protocol::approvals::NetworkApprovalContext as CoreNetworkApprovalContext;
 use codex_protocol::approvals::NetworkApprovalProtocol as CoreNetworkApprovalProtocol;
@@ -18,14 +20,12 @@ use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionG
 use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
-use codex_utils_path_uri::PathConvention;
-use schemars::JsonSchema;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use ts_rs::TS;
 
 v2_enum_from_core! {
     pub enum NetworkApprovalProtocol from CoreNetworkApprovalProtocol {
@@ -69,6 +69,13 @@ pub struct AdditionalFileSystemPermissions {
     pub entries: Option<Vec<FileSystemSandboxEntry>>,
 }
 
+fn permission_path_uri(path: LegacyAppPathString) -> io::Result<PathUri> {
+    if let Ok(path) = AbsolutePathBuf::try_from(path.clone()) {
+        return Ok(path.into());
+    }
+    PathUri::try_from(path).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+}
+
 // TODO(anp): Remove this conversion once core permission paths use PathUri.
 impl From<CoreFileSystemPermissions> for AdditionalFileSystemPermissions {
     fn from(value: CoreFileSystemPermissions) -> Self {
@@ -109,9 +116,27 @@ impl From<CoreFileSystemPermissions> for AdditionalFileSystemPermissions {
                 entries: Some(entries),
             }
         } else {
+            let mut read = Vec::new();
+            let mut write = Vec::new();
+            let legacy_compatible = value.glob_scan_max_depth.is_none()
+                && value.entries.iter().all(|entry| {
+                    let CoreFileSystemPath::Path { path } = &entry.path else {
+                        return false;
+                    };
+                    let legacy_path = LegacyAppPathString::from(path.clone());
+                    if legacy_path.to_inferred_path_uri().as_ref() != Some(path) {
+                        return false;
+                    }
+                    match entry.access {
+                        CoreFileSystemAccessMode::Read => read.push(legacy_path),
+                        CoreFileSystemAccessMode::Write => write.push(legacy_path),
+                        CoreFileSystemAccessMode::Deny => return false,
+                    }
+                    true
+                });
             Self {
-                read: None,
-                write: None,
+                read: (legacy_compatible && !read.is_empty()).then_some(read),
+                write: (legacy_compatible && !write.is_empty()).then_some(write),
                 glob_scan_max_depth: value.glob_scan_max_depth,
                 entries: Some(
                     value
@@ -144,11 +169,7 @@ impl TryFrom<AdditionalFileSystemPermissions> for CoreFileSystemPermissions {
                 .map(|paths| {
                     paths
                         .into_iter()
-                        .map(|path| {
-                            path.to_path_uri(PathConvention::native())
-                                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?
-                                .to_abs_path()
-                        })
+                        .map(permission_path_uri)
                         .collect::<io::Result<Vec<_>>>()
                 })
                 .transpose()?;
@@ -157,15 +178,11 @@ impl TryFrom<AdditionalFileSystemPermissions> for CoreFileSystemPermissions {
                 .map(|paths| {
                     paths
                         .into_iter()
-                        .map(|path| {
-                            path.to_path_uri(PathConvention::native())
-                                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?
-                                .to_abs_path()
-                        })
+                        .map(permission_path_uri)
                         .collect::<io::Result<Vec<_>>>()
                 })
                 .transpose()?;
-            CoreFileSystemPermissions::from_read_write_roots(read, write)
+            CoreFileSystemPermissions::from_read_write_path_uris(read, write)
         };
         permissions.glob_scan_max_depth = value.glob_scan_max_depth;
         Ok(permissions)
@@ -312,9 +329,7 @@ pub enum FileSystemPath {
 impl From<CoreFileSystemPath> for FileSystemPath {
     fn from(value: CoreFileSystemPath) -> Self {
         match value {
-            CoreFileSystemPath::Path { path } => Self::Path {
-                path: LegacyAppPathString::from_abs_path(&path),
-            },
+            CoreFileSystemPath::Path { path } => Self::Path { path: path.into() },
             CoreFileSystemPath::GlobPattern { pattern } => Self::GlobPattern { pattern },
             CoreFileSystemPath::Special { value } => Self::Special {
                 value: value.into(),
@@ -330,10 +345,7 @@ impl TryFrom<FileSystemPath> for CoreFileSystemPath {
     fn try_from(value: FileSystemPath) -> Result<Self, Self::Error> {
         Ok(match value {
             FileSystemPath::Path { path } => Self::Path {
-                path: path
-                    .to_path_uri(PathConvention::native())
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?
-                    .to_abs_path()?,
+                path: permission_path_uri(path)?,
             },
             FileSystemPath::GlobPattern { pattern } => Self::GlobPattern { pattern },
             FileSystemPath::Special { value } => Self::Special {
@@ -368,6 +380,7 @@ impl TryFrom<FileSystemSandboxEntry> for CoreFileSystemSandboxEntry {
         Ok(Self {
             path: value.path.try_into()?,
             access: value.access.to_core(),
+            missing_path_behavior: None,
         })
     }
 }
@@ -543,7 +556,9 @@ pub enum SandboxPolicy {
     #[ts(rename_all = "camelCase")]
     WorkspaceWrite {
         #[serde(default)]
-        writable_roots: Vec<AbsolutePathBuf>,
+        #[schemars(with = "Vec<AbsolutePathBuf>")]
+        #[ts(as = "Vec<AbsolutePathBuf>")]
+        writable_roots: Vec<LegacyAppPathString>,
         #[serde(default)]
         network_access: bool,
         #[serde(default)]
@@ -572,7 +587,7 @@ enum SandboxPolicyDeserialize {
     #[serde(rename_all = "camelCase")]
     WorkspaceWrite {
         #[serde(default)]
-        writable_roots: Vec<AbsolutePathBuf>,
+        writable_roots: Vec<LegacyAppPathString>,
         #[serde(default)]
         read_only_access: Option<LegacyReadOnlyAccess>,
         #[serde(default)]
@@ -636,8 +651,67 @@ impl<'de> Deserialize<'de> for SandboxPolicy {
 }
 
 impl SandboxPolicy {
-    pub fn to_core(&self) -> codex_protocol::protocol::SandboxPolicy {
-        match self {
+    /// Projects a server policy without resolving cwd-dependent permissions on the client.
+    pub fn permission_profile_template(
+        &self,
+    ) -> io::Result<codex_protocol::models::PermissionProfile> {
+        self.permission_profile(/*cwd*/ None)
+    }
+
+    /// Projects the server policy into a permission profile for display in a client.
+    pub fn permission_profile_for_cwd(
+        &self,
+        cwd: &PathUri,
+    ) -> io::Result<codex_protocol::models::PermissionProfile> {
+        self.permission_profile(Some(cwd))
+    }
+
+    fn permission_profile(
+        &self,
+        cwd: Option<&PathUri>,
+    ) -> io::Result<codex_protocol::models::PermissionProfile> {
+        use codex_protocol::models::PermissionProfile;
+        use codex_protocol::permissions::NetworkSandboxPolicy;
+        if let Self::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+        } = self
+        {
+            let roots = writable_roots
+                .iter()
+                .cloned()
+                .map(PathUri::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io::Error::other)?;
+            if cwd.is_none_or(|cwd| cwd.to_abs_path().is_err())
+                || roots.iter().any(|root| root.to_abs_path().is_err())
+            {
+                return Ok(PermissionProfile::workspace_write_with_path_uris(
+                    &roots,
+                    if *network_access {
+                        NetworkSandboxPolicy::Enabled
+                    } else {
+                        NetworkSandboxPolicy::Restricted
+                    },
+                    *exclude_tmpdir_env_var,
+                    *exclude_slash_tmp,
+                ));
+            }
+        }
+        let policy = self.try_to_core()?;
+        Ok(match cwd {
+            Some(cwd) => {
+                PermissionProfile::from_legacy_sandbox_policy_for_cwd(&policy, &cwd.to_path_buf())
+            }
+            None => PermissionProfile::from_legacy_sandbox_policy_template(&policy),
+        })
+    }
+
+    /// Converts the policy for enforcement on this host, validating every writable root.
+    pub fn try_to_core(&self) -> io::Result<codex_protocol::protocol::SandboxPolicy> {
+        Ok(match self {
             SandboxPolicy::DangerFullAccess => {
                 codex_protocol::protocol::SandboxPolicy::DangerFullAccess
             }
@@ -660,12 +734,24 @@ impl SandboxPolicy {
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
             } => codex_protocol::protocol::SandboxPolicy::WorkspaceWrite {
-                writable_roots: writable_roots.clone(),
+                writable_roots: writable_roots
+                    .iter()
+                    .map(|root| {
+                        let path = root.as_path();
+                        if !path.is_absolute() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("writable root is not absolute: {}", path.display()),
+                            ));
+                        }
+                        AbsolutePathBuf::from_absolute_path_checked(path)
+                    })
+                    .collect::<io::Result<_>>()?,
                 network_access: *network_access,
                 exclude_tmpdir_env_var: *exclude_tmpdir_env_var,
                 exclude_slash_tmp: *exclude_slash_tmp,
             },
-        }
+        })
     }
 }
 
@@ -692,7 +778,7 @@ impl From<codex_protocol::protocol::SandboxPolicy> for SandboxPolicy {
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
             } => SandboxPolicy::WorkspaceWrite {
-                writable_roots,
+                writable_roots: writable_roots.into_iter().map(Into::into).collect(),
                 network_access,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
@@ -766,7 +852,7 @@ pub struct PermissionsRequestApprovalParams {
     /// Unix timestamp (in milliseconds) when this approval request started.
     #[ts(type = "number")]
     pub started_at_ms: i64,
-    pub cwd: AbsolutePathBuf,
+    pub cwd: LegacyAppPathString,
     pub reason: Option<String>,
     pub permissions: RequestPermissionProfile,
 }

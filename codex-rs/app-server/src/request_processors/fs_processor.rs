@@ -13,8 +13,8 @@ use codex_app_server_protocol::FsGetMetadataResponse;
 use codex_app_server_protocol::FsReadDirectoryEntry;
 use codex_app_server_protocol::FsReadDirectoryParams;
 use codex_app_server_protocol::FsReadDirectoryResponse;
+use codex_app_server_protocol::FsReadFileBytes;
 use codex_app_server_protocol::FsReadFileParams;
-use codex_app_server_protocol::FsReadFileResponse;
 use codex_app_server_protocol::FsRemoveParams;
 use codex_app_server_protocol::FsRemoveResponse;
 use codex_app_server_protocol::FsUnwatchParams;
@@ -64,16 +64,14 @@ impl FsRequestProcessor {
     pub(crate) async fn read_file(
         &self,
         params: FsReadFileParams,
-    ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
+    ) -> Result<FsReadFileBytes, JSONRPCErrorError> {
         let path = PathUri::from_abs_path(&params.path);
-        let bytes = self
+        let data = self
             .file_system()?
-            .read_file(&path, /*sandbox*/ None)
+            .read_file(&path, Default::default(), /*sandbox*/ None)
             .await
             .map_err(map_fs_error)?;
-        Ok(FsReadFileResponse {
-            data_base64: STANDARD.encode(bytes),
-        })
+        Ok(FsReadFileBytes { data })
     }
 
     pub(crate) async fn write_file(
@@ -87,7 +85,7 @@ impl FsRequestProcessor {
         })?;
         let path = PathUri::from_abs_path(&params.path);
         self.file_system()?
-            .write_file(&path, bytes, /*sandbox*/ None)
+            .write_file(&path, bytes, Default::default(), /*sandbox*/ None)
             .await
             .map_err(map_fs_error)?;
         Ok(FsWriteFileResponse {})
@@ -103,6 +101,7 @@ impl FsRequestProcessor {
                 &path,
                 CreateDirectoryOptions {
                     recursive: params.recursive.unwrap_or(true),
+                    follow_symlinks: true,
                 },
                 /*sandbox*/ None,
             )
@@ -118,7 +117,7 @@ impl FsRequestProcessor {
         let path = PathUri::from_abs_path(&params.path);
         let metadata = self
             .file_system()?
-            .get_metadata(&path, /*sandbox*/ None)
+            .get_metadata(&path, Default::default(), /*sandbox*/ None)
             .await
             .map_err(map_fs_error)?;
         Ok(FsGetMetadataResponse {
@@ -127,6 +126,7 @@ impl FsRequestProcessor {
             is_symlink: metadata.is_symlink,
             created_at_ms: metadata.created_at_ms,
             modified_at_ms: metadata.modified_at_ms,
+            size_bytes: metadata.is_file.then_some(metadata.size),
         })
     }
 
@@ -163,6 +163,7 @@ impl FsRequestProcessor {
                 RemoveOptions {
                     recursive: params.recursive.unwrap_or(true),
                     force: params.force.unwrap_or(true),
+                    follow_symlinks: true,
                 },
                 /*sandbox*/ None,
             )

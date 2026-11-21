@@ -11,6 +11,26 @@ fn run_apply_patch_in_dir(dir: &Path, patch: &str) -> anyhow::Result<assert_cmd:
     Ok(cmd.arg(patch).assert())
 }
 
+fn assert_apply_patch_updates_file(
+    file_name: &str,
+    original: &[u8],
+    patch: &str,
+    expected: &[u8],
+) -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let target_path = tmp.path().join(file_name);
+    fs::write(&target_path, original)?;
+
+    run_apply_patch_in_dir(tmp.path(), patch)?
+        .success()
+        .stdout(format!(
+            "Success. Updated the following files:\nM {file_name}\n"
+        ));
+
+    assert_eq!(fs::read(target_path)?, expected);
+    Ok(())
+}
+
 fn apply_patch_command(dir: &Path) -> anyhow::Result<Command> {
     let mut cmd = Command::new(codex_utils_cargo_bin::cargo_bin("apply_patch")?);
     cmd.current_dir(dir);
@@ -62,6 +82,103 @@ fn test_apply_patch_cli_applies_multiple_chunks() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_rejects_overlapping_end_of_file_chunks() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let target_path = tmp.path().join("overlapping.txt");
+    let expected_target_path = resolved_under(tmp.path(), "overlapping.txt")?;
+    fs::write(&target_path, "one\n")?;
+
+    let patch = "*** Begin Patch\n*** Update File: overlapping.txt\n@@\n-one\n+first\n@@\n-one\n+second\n*** End of File\n*** End Patch";
+
+    run_apply_patch_in_dir(tmp.path(), patch)?
+        .failure()
+        .stderr(format!(
+            "Failed to find expected lines in {}:\none\n",
+            expected_target_path.display()
+        ));
+
+    assert_eq!(fs::read_to_string(target_path)?, "one\n");
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_preserves_crlf_from_target_file() -> anyhow::Result<()> {
+    let patch = "*** Begin Patch\n*** Update File: crlf.txt\n@@\n-one\n+uno\n@@\n two\n+\n+between\n three\n*** End Patch";
+
+    assert_apply_patch_updates_file(
+        "crlf.txt",
+        b"one\r\ntwo\r\nthree\r\n",
+        patch,
+        b"uno\r\ntwo\r\n\r\nbetween\r\nthree\r\n",
+    )
+}
+
+#[test]
+fn test_apply_patch_cli_appends_after_trailing_blank_crlf_line() -> anyhow::Result<()> {
+    let patch = "*** Begin Patch\n*** Update File: trailing_blank.txt\n@@\n+new\n*** End Patch";
+
+    assert_apply_patch_updates_file(
+        "trailing_blank.txt",
+        b"a\r\n\r\n",
+        patch,
+        b"a\r\n\r\nnew\r\n",
+    )
+}
+
+#[test]
+fn test_apply_patch_cli_preserves_cr_from_target_file() -> anyhow::Result<()> {
+    let patch = "*** Begin Patch\n*** Update File: cr.txt\n@@\n-one\n+uno\n@@\n two\n+\n+between\n three\n*** End Patch";
+
+    assert_apply_patch_updates_file(
+        "cr.txt",
+        b"one\rtwo\rthree\r",
+        patch,
+        b"uno\rtwo\r\rbetween\rthree\r",
+    )
+}
+
+#[test]
+fn test_apply_patch_cli_preserves_change_order_with_repeated_lines() -> anyhow::Result<()> {
+    let patch =
+        "*** Begin Patch\n*** Update File: repeated.txt\n@@\n-a\n-b\n+b\n+b\n+a\n*** End Patch";
+
+    assert_apply_patch_updates_file("repeated.txt", b"a\nb\n", patch, b"b\nb\na\n")
+}
+
+#[test]
+fn test_apply_patch_cli_preserves_repeated_context_line_ending() -> anyhow::Result<()> {
+    let patch =
+        "*** Begin Patch\n*** Update File: repeated_context.txt\n@@\n-same\n same\n*** End Patch";
+
+    assert_apply_patch_updates_file("repeated_context.txt", b"same\r\nsame\n", patch, b"same\n")
+}
+
+#[test]
+fn test_apply_patch_cli_preserves_untouched_mixed_line_endings() -> anyhow::Result<()> {
+    let patch = "*** Begin Patch\n*** Update File: mixed.txt\n@@\n one\n two\n-three\n+THREE\n four\n*** End Patch";
+
+    assert_apply_patch_updates_file(
+        "mixed.txt",
+        b"one\r\ntwo\rthree\nfour\r\n",
+        patch,
+        b"one\r\ntwo\rTHREE\r\nfour\r\n",
+    )
+}
+
+#[test]
+fn test_apply_patch_cli_uses_crlf_for_new_trailing_newline() -> anyhow::Result<()> {
+    let patch =
+        "*** Begin Patch\n*** Update File: no_trailing_newline.txt\n@@\n-one\n+ONE\n*** End Patch";
+
+    assert_apply_patch_updates_file(
+        "no_trailing_newline.txt",
+        b"one\r\ntwo",
+        patch,
+        b"ONE\r\ntwo\r\n",
+    )
 }
 
 #[test]

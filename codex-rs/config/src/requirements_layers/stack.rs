@@ -10,13 +10,17 @@
 //! - `rules.prefix_rules` append high-priority rules first.
 //! - `hooks` append high-priority event groups first while failing closed on
 //!   active managed-dir conflicts.
+//! - `otel` replaces exact managed values, treats exporters atomically, and
+//!   merges span attributes and fields within each tracestate member by key.
 //! - `permissions.filesystem.deny_read` is a high-priority-first union across
 //!   layers.
+//! - `auto_review.required_on_models` is a high-priority-first union across layers.
 
 use crate::ConfigRequirementsToml;
 use crate::ConfigRequirementsWithSources;
 use crate::RequirementSource;
 use crate::Sourced;
+use crate::config_requirements::merge_otel_requirements;
 use crate::merge::merge_toml_values;
 use std::cell::OnceCell;
 use std::io;
@@ -27,6 +31,7 @@ use super::hooks::HookDirectoryField;
 use super::hooks::HookMergeState;
 use super::layer::ComposableRequirementsLayer;
 use super::layer::RequirementsLayerEntry;
+use super::models::AutoReviewModelsMergeState;
 use super::permissions::DenyReadMergeState;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -49,6 +54,30 @@ pub enum RequirementsCompositionError {
     },
 }
 
+impl From<RequirementsCompositionError> for crate::CloudConfigBundleLoadError {
+    fn from(error: RequirementsCompositionError) -> Self {
+        // Parser messages can contain the submitted TOML, including credentials.
+        let reason = match error {
+            RequirementsCompositionError::Parse { layer_source, .. } => {
+                format!("invalid requirements in {layer_source}")
+            }
+            RequirementsCompositionError::Conflict {
+                existing_source,
+                incoming_source,
+                ..
+            } => {
+                format!("conflicting requirements from {existing_source} and {incoming_source}")
+            }
+            RequirementsCompositionError::ComposedParse { .. } => "invalid requirements".to_owned(),
+        };
+        Self::new(
+            crate::CloudConfigBundleLoadErrorCode::InvalidBundle,
+            /*status_code*/ None,
+            format!("invalid cloud config bundle: {reason}"),
+        )
+    }
+}
+
 impl From<RequirementsCompositionError> for io::Error {
     fn from(error: RequirementsCompositionError) -> Self {
         io::Error::new(io::ErrorKind::InvalidData, error)
@@ -61,8 +90,8 @@ pub fn compose_requirements(
     compose_requirements_with_hostname_resolver(layers, crate::host_name)
 }
 
-#[cfg(test)]
-pub(super) fn compose_requirements_for_hostname(
+/// Composes requirements using an explicitly supplied execution-host hostname.
+pub fn compose_requirements_for_hostname(
     layers: impl IntoIterator<Item = RequirementsLayerEntry>,
     hostname: Option<&str>,
 ) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError> {
@@ -144,12 +173,19 @@ impl RequirementsLayerStack {
         self,
     ) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError> {
         let Self {
-            layers,
+            mut layers,
             hook_directory_field,
         } = self;
 
+        let network = super::network::compose(&mut layers)?;
         let mut merged_toml = TomlValue::Table(toml::map::Map::new());
         for layer in &layers {
+            // An endpoint and its credentials must come from the same requirements layer.
+            if layer.regular_toml.get("config_server").is_some()
+                && let Some(table) = merged_toml.as_table_mut()
+            {
+                table.remove("config_server");
+            }
             merge_toml_values(&mut merged_toml, &layer.regular_toml);
         }
 
@@ -161,10 +197,30 @@ impl RequirementsLayerStack {
             })?;
         let mut output = ConfigRequirementsWithSources::default();
         populate_merged_regular_fields_with_sources(&mut output, requirements, &layers);
+        output.permissions_network = network;
+
+        // Merge OTEL requirements so higher-priority exact values replace
+        // lower-priority values while exporters stay atomic.
+        let mut otel = None;
+        let mut otel_sources = Vec::new();
+        for layer in &layers {
+            if let Some(incoming) = layer.domain_fields.otel.as_deref()
+                && merge_otel_requirements(&mut otel, incoming)
+            {
+                otel_sources.push(layer.source.clone());
+            }
+        }
+        output.otel = otel.map(|value| {
+            Box::new(Sourced::new(
+                value,
+                RequirementSource::composite(otel_sources.into_iter().rev()),
+            ))
+        });
         let mut rules = None;
         let mut hooks = HookMergeState::new(hook_directory_field);
         let mut hooks_output = None;
         let mut deny_read = DenyReadMergeState::default();
+        let mut auto_review_models = AutoReviewModelsMergeState::default();
         // Regular TOML fields are folded low-to-high like config. These custom
         // fields append or union values, so process them high-to-low to keep
         // priority order visible in the output.
@@ -177,10 +233,12 @@ impl RequirementsLayerStack {
                 &layer.source,
             )?;
             deny_read.merge(domain_fields.permissions.clone(), &layer.source);
+            auto_review_models.merge(domain_fields.auto_review.clone(), &layer.source);
         }
         output.rules = rules;
         output.hooks = hooks_output;
         deny_read.apply_to(&mut output.permissions);
+        auto_review_models.apply_to(&mut output.auto_review);
 
         let output_is_empty = output.clone().into_toml().is_empty();
         Ok((!output_is_empty).then_some(output))
@@ -206,6 +264,20 @@ fn populate_merged_regular_fields_with_sources(
     // Destructure without `..` so every new requirements field must choose
     // whether it belongs in the regular TOML merge path or in a special merger.
     let ConfigRequirementsToml {
+        config_server,
+        allowed_login_methods,
+        allowed_chatgpt_workspaces,
+        cli_auth_credentials_store,
+        chatgpt_base_url,
+        sqlite_home,
+        unsafe_enforce_sqlite_journal_mode,
+        log_dir,
+        model_catalog_json,
+        model_provider,
+        model_providers,
+        check_for_update_on_startup,
+        allow_login_shell,
+        feedback,
         allowed_approval_policies,
         allowed_approvals_reviewers,
         allowed_sandbox_modes,
@@ -214,24 +286,52 @@ fn populate_merged_regular_fields_with_sources(
         remote_sandbox_config: _,
         allowed_web_search_modes,
         allow_managed_hooks_only,
+        allow_browser_and_computer_use,
         allow_appshots,
         allow_remote_control,
         computer_use,
+        browser_use,
+        in_app_browser,
         windows,
         feature_requirements,
         hooks: _,
         mcp_servers,
         plugins,
         marketplaces,
+        otel: _,
         apps,
         rules: _,
         enforce_residency,
-        network,
+        network: _,
+        application,
         permissions,
+        auto_review,
         models,
+        additional_developer_instructions,
         guardian_policy_config,
+        guardian_extra_policy,
     } = requirements;
 
+    set_sourced!(config_server, &["config_server"]);
+    set_sourced!(allowed_login_methods, &["allowed_login_methods"]);
+    set_sourced!(allowed_chatgpt_workspaces, &["allowed_chatgpt_workspaces"]);
+    set_sourced!(cli_auth_credentials_store, &["cli_auth_credentials_store"]);
+    set_sourced!(chatgpt_base_url, &["chatgpt_base_url"]);
+    set_sourced!(sqlite_home, &["sqlite_home"]);
+    set_sourced!(
+        unsafe_enforce_sqlite_journal_mode,
+        &["unsafe_enforce_sqlite_journal_mode"]
+    );
+    set_sourced!(log_dir, &["log_dir"]);
+    set_sourced!(model_catalog_json, &["model_catalog_json"]);
+    set_sourced!(model_provider, &["model_provider"]);
+    set_sourced!(model_providers, &["model_providers"]);
+    set_sourced!(
+        check_for_update_on_startup,
+        &["check_for_update_on_startup"]
+    );
+    set_sourced!(allow_login_shell, &["allow_login_shell"]);
+    set_sourced!(feedback, &["feedback"]);
     set_sourced!(allowed_approval_policies, &["allowed_approval_policies"]);
     set_sourced!(
         allowed_approvals_reviewers,
@@ -245,9 +345,16 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(default_permissions, &["default_permissions"]);
     set_sourced!(allowed_web_search_modes, &["allowed_web_search_modes"]);
     set_sourced!(allow_managed_hooks_only, &["allow_managed_hooks_only"]);
+    set_sourced!(
+        allow_browser_and_computer_use,
+        &["allow_browser_and_computer_use"]
+    );
     set_sourced!(allow_appshots, &["allow_appshots"]);
     set_sourced!(allow_remote_control, &["allow_remote_control"]);
+    set_sourced!(auto_review, &["auto_review"]);
     set_sourced!(computer_use, &["computer_use"]);
+    set_sourced!(browser_use, &["browser_use"]);
+    set_sourced!(in_app_browser, &["in_app_browser"]);
     set_sourced!(windows, &["windows"]);
     set_sourced!(feature_requirements, &["features", "feature_requirements"]);
     set_sourced!(mcp_servers, &["mcp_servers"]);
@@ -255,9 +362,35 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(marketplaces, &["marketplaces"]);
     set_sourced!(apps, &["apps"]);
     set_sourced!(enforce_residency, &["enforce_residency"]);
-    set_sourced!(network, &["experimental_network"]);
-    set_sourced!(permissions, &["permissions"]);
+    set_sourced!(application, &["application"]);
+    let permission_sources = |contributes: fn(&toml::Table) -> bool| {
+        RequirementSource::composite(
+            layers
+                .iter()
+                .rev()
+                .filter(|layer| {
+                    layer
+                        .regular_toml
+                        .get("permissions")
+                        .and_then(TomlValue::as_table)
+                        .is_some_and(contributes)
+                })
+                .map(|layer| layer.source.clone()),
+        )
+    };
+    output.permissions = permissions.map(|value| {
+        let source = if value.filesystem.is_some() {
+            permission_sources(|table| table.contains_key("filesystem"))
+        } else {
+            permission_sources(|table| table.keys().any(|key| key != "network"))
+        };
+        Sourced::new(value, source)
+    });
     set_sourced!(models, &["models"]);
+    set_sourced!(
+        additional_developer_instructions,
+        &["additional_developer_instructions"]
+    );
 
     if let Some(guardian_policy_config) =
         guardian_policy_config.filter(|value| !value.trim().is_empty())
@@ -265,6 +398,14 @@ fn populate_merged_regular_fields_with_sources(
         output.guardian_policy_config = Some(Sourced::new(
             guardian_policy_config,
             source_for_top_level_keys(layers, &["guardian_policy_config"]),
+        ));
+    }
+    if let Some(guardian_extra_policy) =
+        guardian_extra_policy.filter(|value| !value.trim().is_empty())
+    {
+        output.guardian_extra_policy = Some(Sourced::new(
+            guardian_extra_policy,
+            source_for_top_level_keys(layers, &["guardian_extra_policy"]),
         ));
     }
 }
@@ -284,7 +425,8 @@ fn source_for_top_level_keys(
     };
     let winning_source = (*winning_source).clone();
 
-    if !winning_value.is_table() {
+    // The config_server block is replaced as a whole, including its source attribution.
+    if keys == ["config_server"] || !winning_value.is_table() {
         return winning_source;
     }
 

@@ -1,0 +1,586 @@
+use codex_protocol::ThreadId;
+use sqlx::FromRow;
+use sqlx::QueryBuilder;
+use sqlx::Sqlite;
+
+use super::super::rollout_lineage::LineageWalk;
+use super::super::rollout_lineage::RolloutLineageSegment;
+use super::page_segments::PageSegments;
+use super::read::CursorScope;
+use super::read::HistoryCursor;
+use super::read::RolloutHistoryPosition;
+use super::read::StoredSummaryColumns;
+use super::read::StoredThreadItemRow;
+use super::read::StoredTurnRow;
+use super::read::parse_cursor;
+use super::read::serialize_cursor;
+use super::read::stored_thread_item_row;
+use super::read::stored_turn_row;
+use super::thread_history_error;
+use crate::ItemSortKey;
+use crate::ListItemsParams;
+use crate::ListItemsPosition;
+use crate::SortDirection;
+use crate::StoredTurnItemsView;
+use crate::ThreadStoreError;
+use crate::ThreadStoreResult;
+
+pub(super) struct SegmentPage<T> {
+    pub rows: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum UpdateOrdinalBoundary {
+    After(u64),
+    Before(u64),
+}
+
+#[derive(Clone, Copy)]
+enum HistoryOrdinalColumn {
+    Rollout,
+    UpdatedAt,
+}
+
+impl HistoryOrdinalColumn {
+    fn push(self, query: &mut QueryBuilder<Sqlite>) {
+        query.push(match self {
+            Self::Rollout => "rollout_ordinal",
+            Self::UpdatedAt => "updated_at_ordinal",
+        });
+    }
+}
+
+fn push_update_ordinal_boundary(
+    query: &mut QueryBuilder<Sqlite>,
+    boundary: UpdateOrdinalBoundary,
+) -> ThreadStoreResult<()> {
+    match boundary {
+        UpdateOrdinalBoundary::After(ordinal) => {
+            query
+                .push(" AND updated_at_ordinal > ")
+                .push_bind(sqlite_integer(ordinal)?);
+        }
+        UpdateOrdinalBoundary::Before(ordinal) => {
+            query
+                .push(" AND updated_at_ordinal < ")
+                .push_bind(sqlite_integer(ordinal)?);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_page_size(page_size: usize) -> ThreadStoreResult<()> {
+    if page_size == 0 {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "page size must be positive".to_string(),
+        });
+    }
+    let limit = page_size.checked_add(1).ok_or_else(page_size_too_large)?;
+    i64::try_from(limit).map_err(|_| page_size_too_large())?;
+    Ok(())
+}
+
+pub(super) async fn page_turn_rows(
+    pool: &sqlx::SqlitePool,
+    requested_thread_id: ThreadId,
+    lineage: &mut LineageWalk<'_>,
+    cursor: Option<&str>,
+    page_size: usize,
+    direction: SortDirection,
+    items_view: StoredTurnItemsView,
+) -> ThreadStoreResult<SegmentPage<StoredTurnRow>> {
+    let cursor = parse_cursor(cursor, requested_thread_id, CursorScope::Turns)?;
+    let ordinal_column = HistoryOrdinalColumn::Rollout;
+    let mut rows = Vec::new();
+    let mut segments = PageSegments::from_cursor(lineage, direction, cursor).await?;
+    while rows.len() <= page_size {
+        let Some(range) = segments.next().await? else {
+            break;
+        };
+        let segment = range.segment;
+        let remaining = remaining_limit(page_size, rows.len())?;
+        let mut query = QueryBuilder::<Sqlite>::new("");
+        if matches!(items_view, StoredTurnItemsView::Summary) {
+            query.push("WITH page_turns AS (");
+        }
+        query.push(
+            r#"SELECT
+    turn_id,
+    root_turn_id,
+    rollout_ordinal,
+    status,
+    error_json,
+    started_at,
+    completed_at,
+    duration_ms,
+    first_user_item_id,
+    final_agent_item_id
+FROM thread_turns
+WHERE thread_id =
+            "#,
+        );
+        query.push_bind(segment.rollout_id().to_string());
+        push_segment_range(&mut query, segment, ordinal_column)?;
+        for newer_segment in range.newer {
+            query
+                .push(" AND NOT EXISTS (SELECT 1 FROM thread_turns AS newer_turn WHERE newer_turn.thread_id = ")
+                .push_bind(newer_segment.rollout_id().to_string())
+                .push(" AND newer_turn.turn_id = thread_turns.turn_id AND newer_turn.rollout_ordinal >= ")
+                .push_bind(sqlite_integer(newer_segment.start_ordinal())?);
+            if let Some(end_ordinal) = newer_segment.end_ordinal() {
+                query
+                    .push(" AND newer_turn.rollout_ordinal < ")
+                    .push_bind(sqlite_integer(end_ordinal)?);
+            }
+            query.push(")");
+        }
+        push_cursor_clause(&mut query, direction, range.cursor.as_ref(), ordinal_column)?;
+        push_order_and_limit(&mut query, direction, remaining, ordinal_column);
+        if matches!(items_view, StoredTurnItemsView::Summary) {
+            query.push(
+                r#"
+)
+SELECT
+    page_turns.*,
+    first_user.turn_id AS summary_first_user_turn_id,
+    first_user.item_id AS summary_first_user_item_id,
+    first_user.rollout_ordinal AS summary_first_user_rollout_ordinal,
+    first_user.updated_at_ordinal AS summary_first_user_updated_at_ordinal,
+    first_user.created_at_ms AS summary_first_user_created_at_ms,
+    first_user.started_at_ms AS summary_first_user_started_at_ms,
+    first_user.completed_at_ms AS summary_first_user_completed_at_ms,
+    first_user.item_json AS summary_first_user_item_json,
+    final_agent.turn_id AS summary_final_agent_turn_id,
+    final_agent.item_id AS summary_final_agent_item_id,
+    final_agent.rollout_ordinal AS summary_final_agent_rollout_ordinal,
+    final_agent.updated_at_ordinal AS summary_final_agent_updated_at_ordinal,
+    final_agent.created_at_ms AS summary_final_agent_created_at_ms,
+    final_agent.started_at_ms AS summary_final_agent_started_at_ms,
+    final_agent.completed_at_ms AS summary_final_agent_completed_at_ms,
+    final_agent.item_json AS summary_final_agent_item_json
+FROM page_turns
+LEFT JOIN thread_items AS first_user
+  ON first_user.thread_id =
+                "#,
+            );
+            push_summary_item_join(&mut query, segment, "first_user", "first_user_item_id")?;
+            query.push(
+                r#"
+LEFT JOIN thread_items AS final_agent
+  ON final_agent.thread_id =
+                "#,
+            );
+            push_summary_item_join(&mut query, segment, "final_agent", "final_agent_item_id")?;
+            let order = match direction {
+                SortDirection::Asc => "ASC",
+                SortDirection::Desc => "DESC",
+            };
+            query
+                .push(" ORDER BY page_turns.rollout_ordinal ")
+                .push(order);
+        }
+        rows.extend(
+            query
+                .build()
+                .fetch_all(pool)
+                .await
+                .map_err(thread_history_error)?
+                .into_iter()
+                .map(|row| {
+                    let summary_items = if matches!(items_view, StoredTurnItemsView::Summary) {
+                        StoredSummaryColumns::from_row(&row)?.into_stored_items()?
+                    } else {
+                        Vec::new()
+                    };
+                    let mut turn = stored_turn_row(row)?;
+                    turn.summary_items = summary_items;
+                    Ok(turn)
+                })
+                .collect::<ThreadStoreResult<Vec<_>>>()?,
+        );
+    }
+    finish_page(requested_thread_id, CursorScope::Turns, rows, page_size)
+}
+
+fn push_summary_item_join(
+    query: &mut QueryBuilder<Sqlite>,
+    segment: &RolloutLineageSegment,
+    alias: &str,
+    item_id_column: &str,
+) -> ThreadStoreResult<()> {
+    query
+        .push_bind(segment.rollout_id().to_string())
+        .push(" AND ")
+        .push(alias)
+        .push(".turn_id = page_turns.turn_id AND ")
+        .push(alias)
+        .push(".item_id = page_turns.")
+        .push(item_id_column)
+        .push(" AND ")
+        .push(alias)
+        .push(".rollout_ordinal >= ")
+        .push_bind(sqlite_integer(segment.start_ordinal())?);
+    if let Some(end_ordinal) = segment.end_ordinal() {
+        query
+            .push(" AND ")
+            .push(alias)
+            .push(".rollout_ordinal < ")
+            .push_bind(sqlite_integer(end_ordinal)?);
+    }
+    Ok(())
+}
+
+pub(super) async fn page_item_rows(
+    pool: &sqlx::SqlitePool,
+    lineage: &mut LineageWalk<'_>,
+    params: &ListItemsParams,
+) -> ThreadStoreResult<SegmentPage<StoredThreadItemRow>> {
+    let (cursor, anchor_item_id) = match params.position.as_ref() {
+        Some(ListItemsPosition::Cursor(cursor)) => (Some(cursor.as_str()), None),
+        Some(ListItemsPosition::ItemAnchor { item_id }) => (None, Some(item_id.as_str())),
+        None => (None, None),
+    };
+    let update_boundary = match (
+        params.after_updated_at_ordinal,
+        params.before_updated_at_ordinal,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "after and before update ordinals are mutually exclusive".to_string(),
+            });
+        }
+        (Some(ordinal), None) => Some(UpdateOrdinalBoundary::After(ordinal)),
+        (None, Some(ordinal)) => Some(UpdateOrdinalBoundary::Before(ordinal)),
+        (None, None) => None,
+    };
+    // Keep update replay eager, including when its rows are sorted by creation time.
+    if update_boundary.is_some() {
+        lineage.resolve_all().await?;
+    }
+    if anchor_item_id.is_some()
+        && (params.sort_key != ItemSortKey::CreatedAtOrdinal || update_boundary.is_some())
+    {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "item anchors require creation-order paging without an update boundary"
+                .to_string(),
+        });
+    }
+    if matches!(params.sort_key, ItemSortKey::UpdatedAtOrdinal) {
+        let Some(update_boundary) = update_boundary else {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "update-ordinal item sorting requires an update boundary".to_string(),
+            });
+        };
+        return page_updated_item_rows(pool, lineage, params, cursor, update_boundary).await;
+    }
+    let cursor = if let Some(anchor_item_id) = anchor_item_id {
+        let turn_id = params
+            .turn_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                message: "turnId is required when cursor is an item anchor".to_string(),
+            })?;
+        if anchor_item_id.is_empty() {
+            return Err(invalid_item_anchor());
+        }
+        let mut anchor = None;
+        for segment in lineage.resolve_all().await?.iter().rev() {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT rollout_ordinal FROM thread_items WHERE thread_id = ",
+            );
+            query.push_bind(segment.rollout_id().to_string());
+            query.push(" AND item_id = ").push_bind(anchor_item_id);
+            push_segment_range(&mut query, segment, HistoryOrdinalColumn::Rollout)?;
+            query.push(" AND turn_id = ").push_bind(turn_id);
+            if let Some(ordinal) = query
+                .build_query_scalar::<i64>()
+                .fetch_optional(pool)
+                .await
+                .map_err(thread_history_error)?
+            {
+                anchor = Some(ordinal);
+                break;
+            }
+        }
+        Some(HistoryCursor {
+            requested_thread_id: params.thread_id,
+            rollout_ordinal: u64::try_from(anchor.ok_or_else(invalid_item_anchor)?)
+                .map_err(thread_history_error)?,
+            include_anchor: false,
+            scope: CursorScope::ItemsByCreatedAtOrdinal,
+        })
+    } else {
+        parse_cursor(
+            cursor,
+            params.thread_id,
+            CursorScope::ItemsByCreatedAtOrdinal,
+        )?
+    };
+    let ordinal_column = HistoryOrdinalColumn::Rollout;
+    let mut rows = Vec::new();
+    let mut segments = PageSegments::from_cursor(lineage, params.sort_direction, cursor).await?;
+    while rows.len() <= params.page_size {
+        let Some(range) = segments.next().await? else {
+            break;
+        };
+        let segment = range.segment;
+        let remaining = remaining_limit(params.page_size, rows.len())?;
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+SELECT turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms, started_at_ms, completed_at_ms, item_json
+FROM thread_items"#,
+        );
+        if params.item_ids.is_some() {
+            // Seek each requested ID instead of scanning the turn in rollout order.
+            query.push(" INDEXED BY sqlite_autoindex_thread_items_1");
+        } else if params.turn_id.is_some() && update_boundary.is_none() {
+            // A thread-wide index can scan earlier turns when a turn's final page is underfilled.
+            query.push(" INDEXED BY idx_thread_items_by_turn_page");
+        }
+        query
+            .push(" WHERE thread_id = ")
+            .push_bind(segment.rollout_id().to_string());
+        push_segment_range(&mut query, segment, ordinal_column)?;
+        if let Some(update_boundary) = update_boundary {
+            push_segment_range(&mut query, segment, HistoryOrdinalColumn::UpdatedAt)?;
+            push_update_ordinal_boundary(&mut query, update_boundary)?;
+        }
+        if let Some(turn_id) = params.turn_id.as_deref() {
+            query.push(" AND turn_id = ").push_bind(turn_id);
+        }
+        if let Some(item_ids) = params.item_ids.as_deref() {
+            query.push(" AND item_id IN (");
+            let mut ids = query.separated(", ");
+            for item_id in item_ids {
+                ids.push_bind(item_id);
+            }
+            ids.push_unseparated(")");
+        }
+        push_cursor_clause(
+            &mut query,
+            params.sort_direction,
+            range.cursor.as_ref(),
+            ordinal_column,
+        )?;
+        push_order_and_limit(&mut query, params.sort_direction, remaining, ordinal_column);
+        rows.extend(
+            query
+                .build()
+                .fetch_all(pool)
+                .await
+                .map_err(thread_history_error)?
+                .into_iter()
+                .map(stored_thread_item_row)
+                .collect::<ThreadStoreResult<Vec<_>>>()?,
+        );
+    }
+    finish_page(
+        params.thread_id,
+        CursorScope::ItemsByCreatedAtOrdinal,
+        rows,
+        params.page_size,
+    )
+}
+
+async fn page_updated_item_rows(
+    pool: &sqlx::SqlitePool,
+    lineage: &mut LineageWalk<'_>,
+    params: &ListItemsParams,
+    cursor: Option<&str>,
+    update_boundary: UpdateOrdinalBoundary,
+) -> ThreadStoreResult<SegmentPage<StoredThreadItemRow>> {
+    let cursor = parse_cursor(
+        cursor,
+        params.thread_id,
+        CursorScope::ItemsByUpdatedAtOrdinal,
+    )?;
+    let ordinal_column = HistoryOrdinalColumn::UpdatedAt;
+    let mut rows = Vec::new();
+    let mut segments = PageSegments::from_cursor(lineage, params.sort_direction, cursor).await?;
+    while rows.len() <= params.page_size {
+        let Some(range) = segments.next().await? else {
+            break;
+        };
+        let segment = range.segment;
+        let remaining = remaining_limit(params.page_size, rows.len())?;
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+SELECT turn_id, item_id, updated_at_ordinal AS rollout_ordinal, updated_at_ordinal, created_at_ms, started_at_ms, completed_at_ms, item_json
+FROM thread_items
+WHERE thread_id =
+        "#,
+        );
+        query.push_bind(segment.rollout_id().to_string());
+        push_segment_range(&mut query, segment, ordinal_column)?;
+        push_update_ordinal_boundary(&mut query, update_boundary)?;
+        if let Some(turn_id) = params.turn_id.as_deref() {
+            query.push(" AND turn_id = ").push_bind(turn_id);
+        }
+        push_cursor_clause(
+            &mut query,
+            params.sort_direction,
+            range.cursor.as_ref(),
+            ordinal_column,
+        )?;
+        push_order_and_limit(&mut query, params.sort_direction, remaining, ordinal_column);
+        rows.extend(
+            query
+                .build()
+                .fetch_all(pool)
+                .await
+                .map_err(thread_history_error)?
+                .into_iter()
+                .map(stored_thread_item_row)
+                .collect::<ThreadStoreResult<Vec<_>>>()?,
+        );
+    }
+    finish_page(
+        params.thread_id,
+        CursorScope::ItemsByUpdatedAtOrdinal,
+        rows,
+        params.page_size,
+    )
+}
+
+fn push_segment_range(
+    query: &mut QueryBuilder<Sqlite>,
+    segment: &RolloutLineageSegment,
+    ordinal_column: HistoryOrdinalColumn,
+) -> ThreadStoreResult<()> {
+    query.push(" AND ");
+    ordinal_column.push(query);
+    query
+        .push(" >= ")
+        .push_bind(sqlite_integer(segment.start_ordinal())?);
+    if let Some(end_ordinal) = segment.end_ordinal() {
+        query.push(" AND ");
+        ordinal_column.push(query);
+        query.push(" < ").push_bind(sqlite_integer(end_ordinal)?);
+    }
+    Ok(())
+}
+
+fn push_cursor_clause(
+    query: &mut QueryBuilder<Sqlite>,
+    direction: SortDirection,
+    cursor: Option<&HistoryCursor>,
+    ordinal_column: HistoryOrdinalColumn,
+) -> ThreadStoreResult<()> {
+    if let Some(cursor) = cursor {
+        let comparator = match (direction, cursor.include_anchor) {
+            (SortDirection::Asc, true) => ">=",
+            (SortDirection::Asc, false) => ">",
+            (SortDirection::Desc, true) => "<=",
+            (SortDirection::Desc, false) => "<",
+        };
+        query.push(" AND ");
+        ordinal_column.push(query);
+        query
+            .push(" ")
+            .push(comparator)
+            .push(" ")
+            .push_bind(sqlite_integer(cursor.rollout_ordinal)?);
+    }
+    Ok(())
+}
+
+fn push_order_and_limit(
+    query: &mut QueryBuilder<Sqlite>,
+    direction: SortDirection,
+    limit: i64,
+    ordinal_column: HistoryOrdinalColumn,
+) {
+    let order = match direction {
+        SortDirection::Asc => "ASC",
+        SortDirection::Desc => "DESC",
+    };
+    query.push(" ORDER BY ");
+    ordinal_column.push(query);
+    query.push(" ").push(order).push(" LIMIT ").push_bind(limit);
+}
+
+fn remaining_limit(page_size: usize, row_count: usize) -> ThreadStoreResult<i64> {
+    let limit = page_size
+        .checked_add(1)
+        .and_then(|limit| limit.checked_sub(row_count))
+        .ok_or_else(page_size_too_large)?;
+    i64::try_from(limit).map_err(|_| page_size_too_large())
+}
+
+fn finish_page<T: HasPosition>(
+    requested_thread_id: ThreadId,
+    scope: CursorScope,
+    mut rows: Vec<T>,
+    page_size: usize,
+) -> ThreadStoreResult<SegmentPage<T>> {
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
+    let backwards_cursor = rows
+        .first()
+        .map(|row| {
+            serialize_cursor(
+                requested_thread_id,
+                scope.clone(),
+                row.position().rollout_ordinal,
+                /*include_anchor*/ true,
+            )
+        })
+        .transpose()?;
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|row| {
+                serialize_cursor(
+                    requested_thread_id,
+                    scope,
+                    row.position().rollout_ordinal,
+                    /*include_anchor*/ false,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(SegmentPage {
+        rows,
+        next_cursor,
+        backwards_cursor,
+    })
+}
+
+trait HasPosition {
+    fn position(&self) -> RolloutHistoryPosition;
+}
+
+impl HasPosition for StoredTurnRow {
+    fn position(&self) -> RolloutHistoryPosition {
+        self.position
+    }
+}
+
+impl HasPosition for StoredThreadItemRow {
+    fn position(&self) -> RolloutHistoryPosition {
+        self.position
+    }
+}
+
+fn sqlite_integer(value: u64) -> ThreadStoreResult<i64> {
+    i64::try_from(value).map_err(|_| ThreadStoreError::InvalidRequest {
+        message: "rollout ordinal exceeds SQLite integer range".to_string(),
+    })
+}
+
+fn page_size_too_large() -> ThreadStoreError {
+    ThreadStoreError::InvalidRequest {
+        message: "page size is too large".to_string(),
+    }
+}
+
+fn invalid_item_anchor() -> ThreadStoreError {
+    ThreadStoreError::InvalidRequest {
+        message: "cursor.itemId does not identify an item in the requested history scope"
+            .to_string(),
+    }
+}

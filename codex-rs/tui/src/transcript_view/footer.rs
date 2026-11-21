@@ -1,0 +1,349 @@
+//! Project transcript interactions and page-loading feedback into the existing footer.
+//! Loading never inserts transcript rows; the owner schedules motion only while a page is pending.
+//! Surface owners supply the latest shortcut because legacy pagers reserve Escape for editing.
+//! Known navigation labels style keys separately from prose; transcript and query text stay untouched.
+
+use super::*;
+use crate::bottom_pane::TranscriptFooter;
+use crate::footer_hint::first_fitting_line;
+use crate::key_hint::key_label_spans;
+use crate::motion::MotionMode;
+use crate::motion::shimmer_text;
+use crate::style::accent_color;
+use crossterm::event::KeyCode;
+use unicode_width::UnicodeWidthStr;
+
+impl TranscriptView {
+    pub(crate) fn footer_with_navigation(
+        &self,
+        width: u16,
+        motion: MotionMode,
+        latest_navigation: &str,
+    ) -> Option<TranscriptFooter> {
+        if let Some(mode) = &self.copy_mode {
+            return Some(TranscriptFooter {
+                text: vec![
+                    Line::from(format!("Copy {}", mode.label.to_lowercase())).bold(),
+                    navigation_line("↑/↓/j/k select · g/G ends · enter copy · esc close"),
+                ]
+                .into(),
+                cursor_column: None,
+                is_interactive: true,
+            });
+        }
+        // A mouse-down anchor owns the gesture, but has no text to copy yet. Compare
+        // source positions so movement across wrapping or padding is not a selection.
+        let has_selected_text = self.selection.as_ref().is_some_and(|selection| {
+            (selection.start.key, selection.start.offset)
+                != (selection.end.key, selection.end.offset)
+        });
+        if let Some((query, cursor)) = self.search_footer(width) {
+            return Some(TranscriptFooter {
+                text: vec![
+                    query,
+                    if has_selected_text {
+                        selection_hint(width)
+                    } else {
+                        self.search.status_line(width, self.history)
+                    },
+                ]
+                .into(),
+                cursor_column: Some(cursor),
+                is_interactive: true,
+            });
+        }
+        if self.select_mode.is_some() {
+            let hints = if let Some(mark) = self.table_mark() {
+                let (full, short, minimal) =
+                    if mark.kind == super::select_mode::table::TableMarkKind::Text {
+                        (
+                            "arrows/hjkl move in cell · o swap · y copy · v/esc clear",
+                            "arrows move · y copy · esc clear",
+                            "y copy · esc clear",
+                        )
+                    } else {
+                        (
+                            "arrows/hjkl extend cells · v mark text · o swap · y copy · esc clear",
+                            "arrows move · v mark text · y copy",
+                            "v mark text · y copy",
+                        )
+                    };
+                [full, short, minimal, "esc clear"].map(str::to_owned)
+            } else if !has_selected_text
+                && self.select_cursor_is_on_table()
+                && let Some(mark) = self
+                    .disclosure
+                    .keymap
+                    .primary_hint(crate::keymap::KeymapContext::Pager, "mark_markdown")
+            {
+                let mark = mark.display_label();
+                [
+                    format!(
+                        "arrows/hjkl move · v mark text · V mark lines · {mark} mark cell · / find · q close"
+                    ),
+                    format!("arrows move · {mark} mark cell · v mark text"),
+                    format!("{mark} mark cell · q close"),
+                    format!("{mark} mark cell"),
+                ]
+            } else if has_selected_text {
+                let copy = crate::key_hint::ctrl(KeyCode::Char('c')).display_label();
+                [
+                    format!(
+                        "arrows/hjkl/w/b/e/shift+arrows move · home/end/0/$/g/G/⌃home/⌃end ends · pgup/pgdn/⌃b/⌃f/⌃u/⌃d page · v/space/V mark · o swap · / find · y/{copy} copy · enter copy & latest · esc clear · q close"
+                    ),
+                    format!(
+                        "arrows/hjkl move · o swap · y/{copy} copy · enter copy & latest · esc clear · q close"
+                    ),
+                    format!("y/{copy} copy · enter copy & latest · esc clear · q close"),
+                    "enter copy · q close".to_owned(),
+                ]
+            } else {
+                [
+                    "arrows/hjkl/w/b/e move · home/end/0/$/g/G/⌃home/⌃end ends · pgup/pgdn/⌃b/⌃f/⌃u/⌃d page · v/space/V/shift+arrows mark · / find · n/N next · enter/q/esc close"
+                        .to_owned(),
+                    "arrows/hjkl/w/b/e move · 0/$/g/G ends · v/space/V mark · / find · enter/q/esc close"
+                        .to_owned(),
+                    "arrows/hjkl move · v/space/V mark · / find · enter/q/esc close".to_owned(),
+                    "v mark · enter/q close".to_owned(),
+                ]
+            };
+            return Some(TranscriptFooter {
+                text: first_fitting_line(
+                    hints.iter().map(String::as_str).map(navigation_line),
+                    width,
+                )
+                .into(),
+                cursor_column: None,
+                is_interactive: true,
+            });
+        }
+        let pending = self.is_loading_history() || self.history == TranscriptHistoryState::Failed;
+        if has_selected_text {
+            return Some(TranscriptFooter {
+                text: if self.tail_visible && !pending {
+                    selection_hint(width)
+                } else {
+                    first_fitting_line(
+                        [
+                            self.status_line_with_navigation(
+                                &format!(
+                                    "{} copy · enter copy & follow · esc clear",
+                                    crate::key_hint::ctrl(KeyCode::Char('c')).display_label()
+                                ),
+                                motion,
+                            ),
+                            selection_hint(width),
+                        ],
+                        width,
+                    )
+                }
+                .into(),
+                cursor_column: None,
+                is_interactive: true,
+            });
+        }
+        if self.search.is_reading() && !pending && !self.is_activity_focused() {
+            return Some(TranscriptFooter {
+                text: self.search.status_line(width, self.history).into(),
+                cursor_column: None,
+                is_interactive: false,
+            });
+        }
+        if self.is_activity_focused() && !pending {
+            return self.disclosure_footer(width);
+        }
+        // Selection can pause following without hiding the current final row.
+        let can_return =
+            self.selection.is_none() && self.can_return_to_latest() && !self.tail_visible;
+        (pending || self.unseen_activity || can_return).then(|| {
+            let navigation = if self.can_return_to_latest() {
+                latest_navigation
+            } else {
+                ""
+            };
+            let mut status = self.status_line_with_navigation(navigation, motion);
+            // Loading must not resize the composer or move its caret. Shorten secondary text
+            // before clipping either shortcut; failed loads prioritize their retry action.
+            if status.width() > usize::from(width) {
+                status = if self.is_loading_history() {
+                    let loading = if navigation.is_empty() {
+                        if "↑ Loading…".width() <= usize::from(width) {
+                            "Loading…"
+                        } else {
+                            "…"
+                        }
+                    } else if "↑ Loading… · ".width() + navigation.width() <= usize::from(width)
+                    {
+                        "Loading… · "
+                    } else {
+                        "… "
+                    };
+                    let mut spans = vec!["↑ ".fg(accent_color())];
+                    spans.extend(shimmer_text(loading, motion));
+                    spans.extend(navigation_line(navigation).spans);
+                    Line::from(spans)
+                } else if self.history == TranscriptHistoryState::Failed {
+                    let mut spans = vec!["Retry: ".dim()];
+                    spans.extend(key_label_spans(&JumpTarget::Beginning.hint_label()));
+                    Line::from(spans)
+                } else if navigation.is_empty() {
+                    Line::from("New activity").dim()
+                } else if self.unseen_activity {
+                    let mut spans = vec!["New · ".dim()];
+                    spans.extend(navigation_line(navigation).spans);
+                    Line::from(spans)
+                } else {
+                    navigation_line(navigation)
+                };
+            }
+            let retry = if self.history == TranscriptHistoryState::Failed {
+                format!(
+                    "{} retry",
+                    crate::key_hint::ctrl(KeyCode::Home).display_label()
+                )
+            } else {
+                navigation.to_owned()
+            };
+            TranscriptFooter {
+                text: first_fitting_line(
+                    [status, navigation_line(&retry), navigation_line(navigation)],
+                    width,
+                )
+                .into(),
+                cursor_column: None,
+                is_interactive: false,
+            }
+        })
+    }
+
+    pub(crate) fn status_line_with_navigation(
+        &self,
+        navigation: &str,
+        motion: MotionMode,
+    ) -> Line<'static> {
+        if self.is_loading_history() {
+            let mut spans = vec!["↑ ".fg(accent_color())];
+            spans.extend(shimmer_text("Loading earlier messages…", motion));
+            if self.unseen_activity {
+                spans.push(" · New activity".dim());
+            }
+            if !navigation.is_empty() {
+                spans.push(" · ".dim());
+                spans.extend(navigation_line(navigation).spans);
+            }
+            return Line::from(spans);
+        }
+        if self.selection.is_some() && self.history == TranscriptHistoryState::Failed {
+            let mut spans = navigation_line(navigation).spans;
+            spans.push(" · Retry: ".dim());
+            spans.extend(key_label_spans(&JumpTarget::Beginning.hint_label()));
+            return Line::from(spans);
+        }
+        let history = match self.history {
+            TranscriptHistoryState::Failed => {
+                let mut spans = vec!["Retry history: ".dim()];
+                spans.extend(key_label_spans(&JumpTarget::Beginning.hint_label()));
+                spans.push(".  ".dim());
+                spans
+            }
+            TranscriptHistoryState::Partial => vec!["Earlier messages available.  ".dim()],
+            TranscriptHistoryState::LoadingOlder
+            | TranscriptHistoryState::LoadingBeginning
+            | TranscriptHistoryState::Complete
+            | TranscriptHistoryState::Idle => Vec::new(),
+        };
+        let activity = if self.unseen_activity {
+            if history.is_empty() && navigation.is_empty() {
+                "New activity"
+            } else {
+                "New activity · "
+            }
+        } else {
+            ""
+        };
+        let mut spans = vec![activity.dim()];
+        spans.extend(history);
+        spans.extend(navigation_line(navigation).spans);
+        Line::from(spans)
+    }
+
+    pub(crate) fn is_loading_history(&self) -> bool {
+        matches!(
+            self.history,
+            TranscriptHistoryState::LoadingOlder | TranscriptHistoryState::LoadingBeginning
+        )
+    }
+}
+
+fn selection_hint(width: u16) -> Line<'static> {
+    first_fitting_line(
+        [
+            &format!(
+                "{} copy · enter copy & follow · esc clear",
+                crate::key_hint::ctrl(KeyCode::Char('c')).display_label()
+            ),
+            "enter copy & follow · esc clear",
+            "enter copy+↓ · esc",
+            "esc clear",
+        ]
+        .map(navigation_line),
+        width,
+    )
+}
+
+/// Style only the explicit key-label prefixes of trusted navigation hints.
+///
+/// Callers supply UI-authored hints, including runtime key chords followed by a known action.
+/// Unknown segments remain dim prose; this must never be applied to transcript or query content.
+pub(super) fn navigation_line(navigation: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, hint) in navigation.split(" · ").enumerate() {
+        if index > 0 {
+            spans.push(" · ".dim());
+        }
+        let action = [
+            " copy & follow",
+            " copy & latest",
+            " clear selection",
+            " copy+↓",
+            " extend cells",
+            " mark cell",
+            " mark text",
+            " mark lines",
+            " move in cell",
+            " move",
+            " ends",
+            " page",
+            " mark",
+            " find",
+            " swap",
+            " previous",
+            " accept",
+            " cancel",
+            " older",
+            " newer",
+            " latest",
+            " retry",
+            " select",
+            " copy",
+            " clear",
+            " next",
+            " close",
+        ]
+        .into_iter()
+        .find(|action| hint.ends_with(*action));
+        if let Some(action) = action {
+            spans.extend(key_label_spans(&hint[..hint.len() - action.len()]));
+            spans.push(action.dim());
+        } else if hint == "esc" {
+            spans.extend(key_label_spans(hint));
+        } else {
+            spans.push(hint.to_owned().dim());
+        }
+    }
+    Line::from(spans)
+}
+
+#[cfg(test)]
+#[path = "footer_tests.rs"]
+mod tests;

@@ -1,10 +1,8 @@
 use anyhow::Result;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
-use app_test_support::to_response;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
@@ -22,16 +20,21 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_features::Feature;
 use codex_protocol::ThreadId as CoreThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::collections::HashMap;
-use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
+
+use super::analytics::captured_analytics_events;
+use super::analytics::mount_analytics_capture;
+use super::analytics::wait_for_analytics_event;
 
 // Bazel CI can spend tens of seconds starting app-server subprocesses or
 // processing turn RPCs under load.
@@ -53,17 +56,14 @@ async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result
     .await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        /*supports_websockets*/ false,
-    )?;
+    MockResponsesConfig::new(&server.uri())
+        .with_provider_config("supports_websockets = false")
+        .write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
@@ -71,16 +71,21 @@ async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result
             ..Default::default()
         })
         .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(thread_req)).await??;
 
     let client_metadata = HashMap::from([
+        (
+            "parent_response_id".to_string(),
+            "client-correlation".to_string(),
+        ),
         ("fiber_run_id".to_string(), "fiber-start-123".to_string()),
         ("origin".to_string(), "gaas".to_string()),
+        (
+            "context_window_id".to_string(),
+            "client-supplied".to_string(),
+        ),
+        ("turn_trigger".to_string(), "client-supplied".to_string()),
     ]);
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
@@ -90,16 +95,13 @@ async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],
+            turn_trigger: Some("user".to_string()),
             responsesapi_client_metadata: Some(client_metadata.clone()),
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_req)).await??;
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -113,15 +115,36 @@ async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result
         .as_deref()
         .map(parse_json_header)
         .expect("x-codex-turn-metadata header should be present");
+    let body = request.body_json();
+    let body_turn_metadata = parse_json_header(
+        body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("turn metadata"),
+    );
+    assert_eq!(
+        (
+            metadata["parent_response_id"].as_str(),
+            body_turn_metadata["parent_response_id"].as_str(),
+            body["client_metadata"].get("parent_response_id"),
+        ),
+        (Some("client-correlation"), Some("client-correlation"), None),
+    );
     assert_eq!(metadata["fiber_run_id"].as_str(), Some("fiber-start-123"));
     assert_eq!(metadata["origin"].as_str(), Some("gaas"));
     assert_eq!(metadata["thread_source"].as_str(), Some("automation"));
+    assert_eq!(metadata["turn_trigger"].as_str(), Some("user"));
     assert_eq!(metadata["turn_id"].as_str(), Some(turn.id.as_str()));
     assert!(metadata.get("installation_id").is_some());
     assert!(metadata.get("session_id").is_some());
     assert_eq!(
         metadata["window_id"].as_str(),
         request.header("x-codex-window-id").as_deref()
+    );
+    assert_eq!(metadata["window_number"].as_u64(), Some(0));
+    assert!(
+        metadata["context_window_id"]
+            .as_str()
+            .is_some_and(|window_id| uuid::Uuid::parse_str(window_id).is_ok())
     );
 
     Ok(())
@@ -143,11 +166,9 @@ async fn turn_start_sends_fork_lineage_in_turn_metadata_for_thread_fork_v2() -> 
     .await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        /*supports_websockets*/ false,
-    )?;
+    MockResponsesConfig::new(&server.uri())
+        .with_provider_config("supports_websockets = false")
+        .write(codex_home.path())?;
 
     let source_thread_id = create_fake_rollout(
         codex_home.path(),
@@ -161,9 +182,8 @@ async fn turn_start_sends_fork_lineage_in_turn_metadata_for_thread_fork_v2() -> 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let ThreadForkResponse { thread, .. } =
         fork_fake_rollout_thread(&mut mcp, source_thread_id.clone()).await?;
@@ -179,12 +199,8 @@ async fn turn_start_sends_fork_lineage_in_turn_metadata_for_thread_fork_v2() -> 
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_req)).await??;
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -202,6 +218,7 @@ async fn turn_start_sends_fork_lineage_in_turn_metadata_for_thread_fork_v2() -> 
         metadata["forked_from_thread_id"].as_str(),
         Some(source_thread_id.as_str())
     );
+    assert!(metadata.get("forked_from_ordinal_exclusive").is_none());
     assert_eq!(metadata["thread_id"].as_str(), Some(thread.id.as_str()));
     assert_eq!(metadata["turn_id"].as_str(), Some(turn.id.as_str()));
 
@@ -231,11 +248,9 @@ async fn review_start_sends_parent_lineage_in_turn_metadata_for_thread_fork_v2()
     .await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        /*supports_websockets*/ false,
-    )?;
+    MockResponsesConfig::new(&server.uri())
+        .with_provider_config("supports_websockets = false")
+        .write(codex_home.path())?;
 
     let source_thread_id = create_fake_rollout(
         codex_home.path(),
@@ -249,9 +264,8 @@ async fn review_start_sends_parent_lineage_in_turn_metadata_for_thread_fork_v2()
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let ThreadForkResponse { thread, .. } =
         fork_fake_rollout_thread(&mut mcp, source_thread_id.clone()).await?;
@@ -265,14 +279,9 @@ async fn review_start_sends_parent_lineage_in_turn_metadata_for_thread_fork_v2()
             },
         })
         .await?;
-    let review_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(review_req)),
-    )
-    .await??;
     let ReviewStartResponse {
         review_thread_id, ..
-    } = to_response::<ReviewStartResponse>(review_resp)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(review_req)).await??;
     assert_eq!(review_thread_id, thread.id);
 
     timeout(
@@ -321,6 +330,8 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
         &server,
         responses::sse(vec![
             responses::ev_response_created("resp-1"),
+            responses::ev_web_search_call_added_partial("resumed-search", "in_progress"),
+            responses::ev_web_search_call_done("resumed-search", "completed", "test query"),
             responses::ev_assistant_message("msg-1", "Done"),
             responses::ev_completed("resp-1"),
         ]),
@@ -328,11 +339,11 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
     .await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        /*supports_websockets*/ false,
-    )?;
+    MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_provider_config("supports_websockets = false")
+        .write(codex_home.path())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let root_thread_id = CoreThreadId::new();
     let root_thread_id_str = root_thread_id.to_string();
@@ -353,9 +364,8 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_req = mcp
         .send_thread_resume_request(ThreadResumeParams {
@@ -363,12 +373,8 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
             ..Default::default()
         })
         .await?;
-    let resume_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(resume_req)),
-    )
-    .await??;
-    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    let ThreadResumeResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_req)).await??;
     assert_eq!(thread.id, subagent_thread_id);
     assert_eq!(thread.session_id, root_thread_id_str);
     assert_eq!(thread.parent_thread_id, Some(parent_thread_id_str.clone()));
@@ -387,12 +393,8 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_req)).await??;
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -419,11 +421,42 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
     assert_eq!(metadata["turn_id"].as_str(), Some(turn.id.as_str()));
     assert!(metadata.get("forked_from_thread_id").is_none());
 
+    let turn_event =
+        wait_for_analytics_event(&server, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
+    let params = &turn_event["event_params"];
+    assert_eq!(
+        (
+            params["total_tool_call_count"].as_u64(),
+            params["web_search_count"].as_u64()
+        ),
+        (Some(1), Some(1))
+    );
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    let events = captured_analytics_events(&server).await;
+    let count = |event_type: &str| {
+        events
+            .iter()
+            .filter(|event| {
+                event["event_type"] == event_type
+                    && event["event_params"]["thread_id"] == thread.id
+                    && event["event_params"]["turn_id"] == turn.id
+            })
+            .count()
+    };
+    assert_eq!(
+        (count("codex_turn_event"), count("codex_web_search_event")),
+        (1, 1)
+    );
+
     Ok(())
 }
 
+#[test_case::test_case(false; "replacement")]
+#[test_case::test_case(true; "patch")]
 #[tokio::test]
-async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() -> Result<()> {
+async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2(
+    patch_steer: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let codex_home = TempDir::new()?;
@@ -443,30 +476,33 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
     let request_log =
         responses::mount_response_sequence(&server, vec![first_response, second_response]).await;
 
-    create_config_toml(
-        codex_home.path(),
-        &server.uri(),
-        /*supports_websockets*/ false,
-    )?;
+    MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_provider_config("supports_websockets = false")
+        .write(codex_home.path())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams::default())
         .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(thread_req)).await??;
 
-    let start_metadata =
-        HashMap::from([("fiber_run_id".to_string(), "fiber-start-123".to_string())]);
+    let start_metadata = HashMap::from([
+        ("fiber_run_id".to_string(), "fiber-start-123".to_string()),
+        ("codex_app_used_dictation".to_string(), "false".to_string()),
+        ("source".to_string(), "snapshot-source".to_string()),
+        ("start_only".to_string(), "start-value".to_string()),
+        (
+            "misalignment_override".to_string(),
+            r#"{"review_target":"RB._~:-opaque"}"#.to_string(),
+        ),
+    ]);
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
@@ -475,16 +511,17 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
                 text: "Run sleep".to_string(),
                 text_elements: Vec::new(),
             }],
-            responsesapi_client_metadata: Some(start_metadata.clone()),
+            turn_trigger: Some("user".to_string()),
+            responsesapi_client_metadata: Some(start_metadata),
+            responsesapi_client_metadata_patch: Some(HashMap::from([(
+                "source".to_string(),
+                "initial-source".to_string(),
+            )])),
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_req)).await??;
     let turn_id = turn.id.clone();
 
     timeout(
@@ -496,8 +533,19 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
 
     let steer_metadata = HashMap::from([
         ("fiber_run_id".to_string(), "fiber-steer-456".to_string()),
+        ("codex_app_used_dictation".to_string(), "true".to_string()),
         ("origin".to_string(), "gaas".to_string()),
+        ("source".to_string(), "steer-source".to_string()),
+        (
+            "misalignment_override".to_string(),
+            r#"{"review_target":"RC"}"#.to_string(),
+        ),
     ]);
+    let (responsesapi_client_metadata, responsesapi_client_metadata_patch) = if patch_steer {
+        (None, Some(steer_metadata))
+    } else {
+        (Some(steer_metadata), None)
+    };
     let steer_req = mcp
         .send_turn_steer_request(TurnSteerParams {
             thread_id: thread.id.clone(),
@@ -506,17 +554,14 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
                 text: "Focus on the failure".to_string(),
                 text_elements: Vec::new(),
             }],
-            responsesapi_client_metadata: Some(steer_metadata.clone()),
+            responsesapi_client_metadata,
+            responsesapi_client_metadata_patch,
             additional_context: None,
             expected_turn_id: turn_id.clone(),
         })
         .await?;
-    let steer_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(steer_req)),
-    )
-    .await??;
-    let _turn: TurnSteerResponse = to_response::<TurnSteerResponse>(steer_resp)?;
+    let _turn: TurnSteerResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(steer_req)).await??;
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -536,6 +581,9 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
         Some("fiber-start-123")
     );
     assert_eq!(first_metadata["turn_id"].as_str(), Some(turn_id.as_str()));
+    assert_eq!(first_metadata["turn_trigger"].as_str(), Some("user"));
+    assert_eq!(first_metadata["source"].as_str(), Some("initial-source"));
+    assert!(first_metadata.get("codex_app_used_dictation").is_none());
 
     let second_metadata = requests[1]
         .header("x-codex-turn-metadata")
@@ -548,7 +596,222 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
     );
     assert_eq!(second_metadata["origin"].as_str(), Some("gaas"));
     assert_eq!(second_metadata["turn_id"].as_str(), Some(turn_id.as_str()));
+    assert_eq!(second_metadata["turn_trigger"].as_str(), Some("user"));
+    assert_eq!(second_metadata["source"].as_str(), Some("steer-source"));
+    assert!(second_metadata.get("codex_app_used_dictation").is_none());
+    assert_eq!(
+        second_metadata["start_only"].as_str(),
+        patch_steer.then_some("start-value")
+    );
+    assert_eq!(
+        second_metadata["misalignment_override"],
+        first_metadata["misalignment_override"],
+    );
 
+    let event = wait_for_analytics_event(&server, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
+    let params = &event["event_params"];
+    assert_eq!(
+        json!([
+            params["thread_id"],
+            params["turn_id"],
+            params["turn_trigger"],
+            params["codex_turn_source"],
+            params["used_dictation"],
+        ]),
+        json!([thread.id, turn_id, "user", "steer-source", true]),
+    );
+
+    Ok(())
+}
+
+#[test_case::test_case(false, "none"; "legacy")]
+#[test_case::test_case(true, "none"; "v2 fresh")]
+#[test_case::test_case(true, "all"; "v2 fork")]
+#[tokio::test]
+async fn subagents_inherit_spawn_metadata_without_live_parent_updates(
+    multi_agent_v2: bool,
+    fork_turns: &str,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let spawn_args = if multi_agent_v2 {
+        json!({"task_name": "worker", "message": "Inspect the example", "fork_turns": fork_turns})
+    } else {
+        json!({"message": "Inspect the example"})
+    };
+    let namespace = if multi_agent_v2 {
+        "collaboration"
+    } else {
+        "multi_agent_v1"
+    };
+    let parent_wait = responses::ev_completed("parent-wait");
+    let child_wait = responses::ev_response_created("child-spawn");
+    let server = responses::start_websocket_server(vec![
+        vec![
+            vec![responses::ev_completed("parent-warm")],
+            vec![
+                responses::ev_function_call_with_namespace(
+                    "spawn-worker",
+                    namespace,
+                    "spawn_agent",
+                    &spawn_args.to_string(),
+                ),
+                responses::ev_completed("parent-spawn"),
+            ],
+            vec![parent_wait.clone()],
+        ],
+        vec![
+            vec![responses::ev_completed("child-warm")],
+            vec![
+                child_wait.clone(),
+                responses::ev_function_call_with_namespace(
+                    "spawn-grandchild",
+                    namespace,
+                    "spawn_agent",
+                    &spawn_args.to_string(),
+                ),
+                responses::ev_completed("child-spawn"),
+            ],
+            vec![responses::ev_completed("child-done")],
+        ],
+        vec![
+            vec![responses::ev_completed("grandchild-warm")],
+            vec![responses::ev_completed("grandchild-done")],
+        ],
+    ])
+    .await;
+    let _hold_parent = server.gate_response_event(&parent_wait);
+    let release_child = server.gate_response_event(&child_wait);
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri().replacen("ws://", "http://", 1))
+        .with_model(if multi_agent_v2 {
+            "gpt-5.6-sol"
+        } else {
+            "gpt-5.6-luna"
+        })
+        .with_provider_config("supports_websockets = true")
+        .with_provider_config("supports_standalone_web_search = true")
+        .enable_feature(Feature::StandaloneWebSearch)
+        .with_root_config("web_search = \"live\"")
+        .with_extra_config(&format!(
+            "[agents]\nmax_depth = 3\n[features.multi_agent_v2]\nenabled = {multi_agent_v2}"
+        ))
+        .write(codex_home.path())?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let thread_req = app_server
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(thread_req)).await??;
+    let turn_req = app_server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "Delegate the example".to_string(),
+                text_elements: Vec::new(),
+            }],
+            responsesapi_client_metadata: Some(HashMap::from([
+                ("cost_center".to_string(), "before".to_string()),
+                ("thread_id".to_string(), "spoofed-thread".to_string()),
+                ("turn_id".to_string(), "spoofed-turn".to_string()),
+                ("parent_response_id".to_string(), "root-only".to_string()),
+                (
+                    "mcp_request_meta".to_string(),
+                    r#"{"selected_connector_ids":["parent-connector"]}"#.to_string(),
+                ),
+                (
+                    "misalignment_override".to_string(),
+                    r#"{"review_target":"root-only"}"#.to_string(),
+                ),
+            ])),
+            ..Default::default()
+        })
+        .await?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(turn_req)).await??;
+    let child_first = timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 1),
+    )
+    .await?;
+
+    let steer_req = app_server
+        .send_turn_steer_request(TurnSteerParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            expected_turn_id: turn.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "Update cost attribution".to_string(),
+                text_elements: Vec::new(),
+            }],
+            responsesapi_client_metadata: Some(HashMap::from([(
+                "cost_center".to_string(),
+                "after".to_string(),
+            )])),
+            responsesapi_client_metadata_patch: None,
+            additional_context: None,
+        })
+        .await?;
+    let _: TurnSteerResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(steer_req)).await??;
+    release_child.send(()).expect("child response is waiting");
+    let child_next = timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 2),
+    )
+    .await?;
+    let grandchild = timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request(/*connection_index*/ 2, /*request_index*/ 1),
+    )
+    .await?;
+
+    for request in [&child_first, &grandchild] {
+        let body = request.body_json();
+        let tools = body["input"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .rev()
+                    .find(|item| item["type"] == "additional_tools")
+            })
+            .unwrap_or(&body);
+        assert!(tools.to_string().contains("### `web__run`"));
+    }
+    let metadata = [child_first, child_next, grandchild].map(|request| {
+        let body = request.body_json();
+        let metadata = parse_json_header(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("canonical turn metadata"),
+        );
+        assert_eq!(metadata["thread_id"], body["client_metadata"]["thread_id"]);
+        assert_eq!(metadata["turn_id"], body["client_metadata"]["turn_id"]);
+        assert_ne!(metadata["thread_id"], json!(thread.id));
+        assert_ne!(metadata["turn_id"], json!(turn.id));
+        assert_ne!(metadata["thread_id"], json!("spoofed-thread"));
+        assert_ne!(metadata["turn_id"], json!("spoofed-turn"));
+        metadata
+    });
+    assert_eq!(
+        metadata.each_ref().map(|metadata| (
+            metadata["cost_center"].as_str(),
+            metadata["misalignment_override"].as_str(),
+            metadata["parent_response_id"].as_str(),
+            metadata["mcp_request_meta"].as_str(),
+        )),
+        [(Some("before"), None, None, None); 3],
+    );
+    assert_eq!(metadata[0]["turn_id"], metadata[1]["turn_id"]);
+    assert_eq!(metadata[0]["parent_turn_id"], json!(turn.id));
+    assert_eq!(metadata[2]["parent_turn_id"], metadata[0]["turn_id"]);
+    assert_ne!(metadata[2]["thread_id"], metadata[0]["thread_id"]);
+    assert_ne!(metadata[2]["turn_id"], metadata[0]["turn_id"]);
     Ok(())
 }
 
@@ -571,17 +834,14 @@ async fn turn_start_forwards_client_metadata_to_responses_websocket_request_body
     .await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &websocket_server.uri().replacen("ws://", "http://", 1),
-        /*supports_websockets*/ true,
-    )?;
+    MockResponsesConfig::new(&websocket_server.uri().replacen("ws://", "http://", 1))
+        .with_provider_config("supports_websockets = true")
+        .write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .build()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
@@ -589,14 +849,14 @@ async fn turn_start_forwards_client_metadata_to_responses_websocket_request_body
             ..Default::default()
         })
         .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(thread_req)).await??;
 
     let client_metadata = HashMap::from([
+        (
+            "parent_response_id".to_string(),
+            "client-correlation".to_string(),
+        ),
         ("fiber_run_id".to_string(), "fiber-start-123".to_string()),
         ("origin".to_string(), "gaas".to_string()),
     ]);
@@ -608,16 +868,13 @@ async fn turn_start_forwards_client_metadata_to_responses_websocket_request_body
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],
+            turn_trigger: Some("user".to_string()),
             responsesapi_client_metadata: Some(client_metadata),
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_req)).await??;
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -643,46 +900,31 @@ async fn turn_start_forwards_client_metadata_to_responses_websocket_request_body
         .as_str()
         .map(parse_json_header)
         .expect("websocket x-codex-turn-metadata client metadata should be present");
+    assert_eq!(
+        (
+            metadata["parent_response_id"].as_str(),
+            request["client_metadata"].get("parent_response_id"),
+        ),
+        (Some("client-correlation"), None),
+    );
     assert_eq!(metadata["fiber_run_id"].as_str(), Some("fiber-start-123"));
     assert_eq!(metadata["origin"].as_str(), Some("gaas"));
     assert_eq!(metadata["thread_source"].as_str(), Some("automation"));
+    assert_eq!(metadata["turn_trigger"].as_str(), Some("user"));
     assert_eq!(metadata["turn_id"].as_str(), Some(turn.id.as_str()));
     assert!(metadata.get("session_id").is_some());
     assert_eq!(
         metadata["window_id"].as_str(),
         request["client_metadata"]["x-codex-window-id"].as_str()
     );
+    assert!(
+        metadata["context_window_id"]
+            .as_str()
+            .is_some_and(|window_id| uuid::Uuid::parse_str(window_id).is_ok())
+    );
 
     websocket_server.shutdown().await;
     Ok(())
-}
-
-fn create_config_toml(
-    codex_home: &Path,
-    server_uri: &str,
-    supports_websockets: bool,
-) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-supports_websockets = {supports_websockets}
-"#
-        ),
-    )
 }
 
 async fn fork_fake_rollout_thread(
@@ -696,12 +938,7 @@ async fn fork_fake_rollout_thread(
             ..Default::default()
         })
         .await?;
-    let fork_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(fork_req)),
-    )
-    .await??;
-    to_response::<ThreadForkResponse>(fork_resp)
+    timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_req)).await?
 }
 
 fn parse_json_header(value: &str) -> serde_json::Value {

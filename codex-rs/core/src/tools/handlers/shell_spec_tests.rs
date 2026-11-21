@@ -6,18 +6,13 @@ fn windows_shell_guidance_description() -> String {
     format!("\n\n{}", windows_shell_guidance())
 }
 
-fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
-    serde_json::to_value(tool)
-        .expect("tool spec should serialize")
-        .pointer(&format!("/parameters/properties/{parameter_name}"))
-        .is_some()
-}
-
 #[test]
 fn exec_command_tool_matches_expected_spec() {
-    let tool = create_exec_command_tool(CommandToolOptions {
-        allow_login_shell: true,
-        exec_permission_approvals_enabled: false,
+    let tool = create_exec_command_tool(ExecCommandHandlerOptions {
+        include_windows_shell_guidance: cfg!(windows),
+        has_powershell: crate::shell::default_user_shell().shell_type
+            == crate::shell::ShellType::PowerShell,
+        ..Default::default()
     });
 
     let description = if cfg!(windows) {
@@ -30,7 +25,7 @@ fn exec_command_tool_matches_expected_spec() {
             .to_string()
     };
     let yield_time_ms_description = if cfg!(windows) {
-        "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 2000-30000 ms. Set a shorter value only when intentionally starting a long-lived or interactive process and you want a session ID promptly."
+        "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms."
     } else {
         "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
     };
@@ -73,7 +68,11 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "login".to_string(),
             JsonSchema::boolean(Some(
-                    "True runs the shell with -l/-i semantics; false disables them. Defaults to true.".to_string(),
+                    if crate::shell::default_user_shell().shell_type == crate::shell::ShellType::PowerShell {
+                        "Login-shell startup. In PowerShell, false skips profiles. Keep them enabled for profile-defined commands, even unattended. Omit to inherit."
+                    } else {
+                        "Request login-shell startup. Omit to inherit."
+                    }.to_string(),
                 )),
         ),
     ]);
@@ -93,24 +92,29 @@ fn exec_command_tool_matches_expected_spec() {
                 Some(vec!["cmd".to_string()]),
                 Some(false.into())
             ),
-            output_schema: Some(unified_exec_output_schema()),
+            output_schema: Some(unified_exec_output_schema().into()),
         })
     );
 }
 
 #[test]
-fn exec_command_tool_can_hide_shell_parameter() {
-    let tool = create_exec_command_tool_with_environment_id(
-        CommandToolOptions {
-            allow_login_shell: true,
-            exec_permission_approvals_enabled: false,
-        },
-        /*include_environment_id*/ false,
-        /*include_shell_parameter*/ false,
-    );
-
-    assert!(!has_parameter(&tool, "shell"));
-    assert!(has_parameter(&tool, "cmd"));
+fn login_description_follows_the_reported_shell() {
+    for (has_powershell, expected) in [
+        (false, "Request login-shell startup. Omit to inherit."),
+        (
+            true,
+            "Login-shell startup. In PowerShell, false skips profiles. Keep them enabled for profile-defined commands, even unattended. Omit to inherit.",
+        ),
+    ] {
+        let ToolSpec::Function(tool) = create_exec_command_tool(ExecCommandHandlerOptions {
+            has_powershell,
+            ..Default::default()
+        }) else {
+            panic!("expected a function tool")
+        };
+        let schema = serde_json::to_value(tool.parameters).unwrap();
+        assert_eq!(schema["properties"]["login"]["description"], expected);
+    }
 }
 
 #[test]
@@ -158,7 +162,7 @@ fn write_stdin_tool_matches_expected_spec() {
                 Some(vec!["session_id".to_string()]),
                 Some(false.into())
             ),
-            output_schema: Some(unified_exec_output_schema()),
+            output_schema: Some(unified_exec_output_schema().into()),
         })
     );
 }
@@ -195,80 +199,6 @@ fn request_permissions_tool_includes_full_permission_schema() {
             parameters: JsonSchema::object(
                 properties,
                 Some(vec!["permissions".to_string()]),
-                Some(false.into())
-            ),
-            output_schema: None,
-        })
-    );
-}
-
-#[test]
-fn shell_command_tool_matches_expected_spec() {
-    let tool = create_shell_command_tool(CommandToolOptions {
-        allow_login_shell: true,
-        exec_permission_approvals_enabled: false,
-    });
-
-    let description = if cfg!(windows) {
-        r#"Runs a Powershell command (Windows) and returns its output.
-
-Examples of valid command strings:
-
-- ls -a (show hidden): "Get-ChildItem -Force"
-- recursive find by name: "Get-ChildItem -Recurse -Filter *.py"
-- recursive grep: "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"
-- ps aux | grep python: "Get-Process | Where-Object { $_.ProcessName -like '*python*' }"
-- setting an env var: "$env:FOO='bar'; echo $env:FOO"
-- running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -""#
-            .to_string()
-            + &windows_shell_guidance_description()
-    } else {
-        r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
-            .to_string()
-    };
-
-    let mut properties = BTreeMap::from([
-        (
-            "command".to_string(),
-            JsonSchema::string(Some(
-                "Shell script to run in the user's default shell.".to_string(),
-            )),
-        ),
-        (
-            "workdir".to_string(),
-            JsonSchema::string(Some(
-                "Working directory for the command. Defaults to the turn cwd.".to_string(),
-            )),
-        ),
-        (
-            "timeout_ms".to_string(),
-            JsonSchema::number(Some(
-                "Maximum command runtime. Defaults to 10000 ms.".to_string(),
-            )),
-        ),
-        (
-            "login".to_string(),
-            JsonSchema::boolean(Some(
-                "True runs with login shell semantics; false disables them. Defaults to true."
-                    .to_string(),
-            )),
-        ),
-    ]);
-    properties.extend(create_approval_parameters(
-        /*exec_permission_approvals_enabled*/ false,
-    ));
-
-    assert_eq!(
-        tool,
-        ToolSpec::Function(ResponsesApiTool {
-            name: "shell_command".to_string(),
-            description,
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema::object(
-                properties,
-                Some(vec!["command".to_string()]),
                 Some(false.into())
             ),
             output_schema: None,

@@ -4,6 +4,7 @@ use chrono::DateTime;
 #[cfg(test)]
 use chrono::Utc;
 use codex_protocol::config_types::MultiAgentMode;
+use codex_utils_path_uri::LegacyAppPathString;
 
 #[cfg(test)]
 pub(crate) async fn read_summary_from_rollout(
@@ -131,7 +132,7 @@ fn map_git_info(git_info: &CoreGitInfo) -> ConversationGitInfo {
     ConversationGitInfo {
         sha: git_info.commit_hash.as_ref().map(|sha| sha.0.clone()),
         branch: git_info.branch.clone(),
-        origin_url: git_info.repository_url.clone(),
+        origin_url: git_info.repository_url.clone().map(String::from),
     }
 }
 
@@ -172,11 +173,27 @@ pub(crate) fn thread_response_active_permission_profile(
     active_permission_profile.map(Into::into)
 }
 
+pub(super) fn thread_cwd_for_api(
+    cwd: &AbsolutePathBuf,
+) -> Result<LegacyAppPathString, JSONRPCErrorError> {
+    cwd.to_str()
+        .map(LegacyAppPathString::from_string)
+        .ok_or_else(|| internal_error("cannot encode thread cwd: path contains invalid UTF-8"))
+}
+
 pub(crate) fn thread_settings_from_config_snapshot(
     config_snapshot: &ThreadConfigSnapshot,
-) -> ThreadSettings {
-    ThreadSettings {
-        cwd: config_snapshot.cwd().clone(),
+) -> Result<ThreadSettings, JSONRPCErrorError> {
+    Ok(ThreadSettings {
+        disabled_plugin_ids: config_snapshot.disabled_plugin_ids.clone(),
+        cwd: thread_cwd_for_api(config_snapshot.cwd())?,
+        environments: Some(
+            config_snapshot
+                .environment_selections()
+                .iter()
+                .map(Into::into)
+                .collect(),
+        ),
         approval_policy: config_snapshot.approval_policy.into(),
         approvals_reviewer: config_snapshot.approvals_reviewer.into(),
         sandbox_policy: config_snapshot.sandbox_policy().into(),
@@ -191,48 +208,7 @@ pub(crate) fn thread_settings_from_config_snapshot(
         collaboration_mode: config_snapshot.collaboration_mode.clone(),
         multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         personality: config_snapshot.personality,
-    }
-}
-
-pub(crate) fn thread_settings_from_core_snapshot(
-    snapshot: codex_protocol::protocol::ThreadSettingsSnapshot,
-) -> ThreadSettings {
-    let codex_protocol::protocol::ThreadSettingsSnapshot {
-        model,
-        model_provider_id,
-        service_tier,
-        approval_policy,
-        approvals_reviewer,
-        permission_profile,
-        active_permission_profile,
-        cwd,
-        reasoning_effort,
-        reasoning_summary,
-        personality,
-        collaboration_mode,
-    } = snapshot;
-    let sandbox_policy = codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
-        &permission_profile,
-        cwd.as_path(),
-    )
-    .into();
-    ThreadSettings {
-        sandbox_policy,
-        cwd,
-        approval_policy: approval_policy.into(),
-        approvals_reviewer: approvals_reviewer.into(),
-        active_permission_profile: thread_response_active_permission_profile(
-            active_permission_profile,
-        ),
-        model,
-        model_provider: model_provider_id,
-        service_tier,
-        effort: reasoning_effort,
-        summary: reasoning_summary,
-        collaboration_mode,
-        multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
-        personality,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -300,21 +276,29 @@ pub(crate) fn summary_to_thread(
 
     let thread_id = conversation_id.to_string();
     Thread {
+        originator: None,
+        environments: None,
         id: thread_id.clone(),
         extra: None,
         session_id: thread_id,
         forked_from_id: None,
+        attached_to_thread_id: None,
         parent_thread_id: None,
         preview,
         ephemeral: false,
+        section: None,
+        section_entered_at: None,
+        project_id: None,
         history_mode: ThreadHistoryMode::Legacy,
         model_provider,
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
+        model: None,
+        reasoning_effort: None,
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
         recency_at: updated_at.map(|dt| dt.timestamp()),
         status: ThreadStatus::NotLoaded,
         path: (!path.as_os_str().is_empty()).then_some(path),
-        cwd,
+        cwd: cwd.into(),
         cli_version,
         agent_nickname: source.get_nickname(),
         agent_role: source.get_agent_role(),
@@ -323,6 +307,7 @@ pub(crate) fn summary_to_thread(
         thread_source: None,
         git_info,
         name: None,
+        daybreak_enabled: None,
         turns: Vec::new(),
     }
 }

@@ -28,7 +28,7 @@ mod search;
 pub(crate) fn memory_tools<B>(
     backend: B,
     metrics_client: Option<MetricsClient>,
-) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>
+) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>>
 where
     B: MemoriesBackend,
 {
@@ -67,7 +67,7 @@ pub(super) fn memory_function_tool<I: JsonSchema, O: JsonSchema>(
         defer_loading: None,
         parameters: parse_tool_input_schema(&schema::input_schema_for::<I>())
             .unwrap_or_else(|err| panic!("generated input schema for {name} should parse: {err}")),
-        output_schema: Some(schema::output_schema_for::<O>()),
+        output_schema: Some(schema::output_schema_for::<O>().into()),
     };
 
     ToolSpec::Namespace(ResponsesApiNamespace {
@@ -77,7 +77,7 @@ pub(super) fn memory_function_tool<I: JsonSchema, O: JsonSchema>(
     })
 }
 
-fn parse_args<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> Result<T, FunctionCallError> {
+fn parse_args<T: for<'de> Deserialize<'de>>(call: &ToolCall<'_>) -> Result<T, FunctionCallError> {
     let arguments = call.function_arguments()?;
     let value = if arguments.trim().is_empty() {
         Value::Object(serde_json::Map::new())

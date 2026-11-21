@@ -228,7 +228,7 @@ async fn preserves_large_image_in_original_mode() {
     assert_eq!(processed.bytes.as_ref(), original_bytes);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread")]
 async fn data_url_processing_preserves_supported_source_bytes() {
     let image = ImageBuffer::from_pixel(64, 32, Rgba([10u8, 20, 30, 255]));
     let original_bytes = image_bytes(&image, ImageFormat::Png);
@@ -236,8 +236,12 @@ async fn data_url_processing_preserves_supported_source_bytes() {
         .replacen("data:", "DATA:", 1)
         .replacen(";base64,", ";BASE64,", 1);
 
-    let processed = load_data_url_for_prompt(&image_url, PromptImageMode::ResizeToFit)
-        .expect("process data URL image");
+    let processed = load_data_url_for_prompt_uncached(
+        &image_url,
+        PromptImageMode::ResizeToFit,
+        PromptImageDecoder::Legacy,
+    )
+    .expect("process data URL image");
 
     assert_eq!(processed.width, 64);
     assert_eq!(processed.height, 32);
@@ -251,8 +255,12 @@ async fn data_url_processing_converts_gif_to_png() {
     let gif_bytes = image_bytes(&image, ImageFormat::Gif);
     let image_url = data_url_from_bytes("image/gif", &gif_bytes);
 
-    let processed = load_data_url_for_prompt(&image_url, PromptImageMode::ResizeToFit)
-        .expect("process GIF data URL");
+    let processed = load_data_url_for_prompt(
+        &image_url,
+        PromptImageMode::ResizeToFit,
+        PromptImageDecoder::Legacy,
+    )
+    .expect("process GIF data URL");
 
     assert_eq!(processed.mime, "image/png");
     assert_eq!(
@@ -270,29 +278,47 @@ fn data_url_processing_rejects_malformed_input() {
         "data:image/png;base64,not base64",
     ] {
         assert!(matches!(
-            load_data_url_for_prompt(image_url, PromptImageMode::ResizeToFit),
+            load_data_url_for_prompt(
+                image_url,
+                PromptImageMode::ResizeToFit,
+                PromptImageDecoder::Legacy,
+            ),
             Err(ImageProcessingError::InvalidDataUrl { .. })
         ));
     }
 }
 
+/// The shared detail modes apply the policies used by external byte-oriented callers.
 #[tokio::test(flavor = "multi_thread")]
-async fn resize_with_limits_respects_dimension_and_patch_budgets() {
-    let image = ImageBuffer::from_pixel(2048, 2048, Rgba([200u8, 10, 10, 255]));
-    let original_bytes = image_bytes(&image, ImageFormat::Png);
-    let limits = PromptImageResizeLimits {
-        max_dimension: 2048,
-        max_patches: 2_500,
-    };
+async fn detail_modes_apply_expected_budgets() {
+    for (mode, input_dimensions, expected_dimensions) in [
+        (PromptImageMode::HIGH_DETAIL, (2048, 2048), (1600, 1600)),
+        (PromptImageMode::ORIGINAL_DETAIL, (6401, 100), (6000, 94)),
+    ] {
+        let image = ImageBuffer::from_pixel(
+            input_dimensions.0,
+            input_dimensions.1,
+            Rgba([200u8, 10, 10, 255]),
+        );
+        let original_bytes = image_bytes(&image, ImageFormat::Png);
+        let processed = load_for_prompt_bytes(Path::new("in-memory-image"), original_bytes, mode)
+            .expect("process image with detail mode");
 
-    let processed = load_for_prompt_bytes(
-        Path::new("in-memory-image"),
-        original_bytes,
-        PromptImageMode::ResizeWithLimits(limits),
-    )
-    .expect("process image with explicit limits");
-
-    assert_eq!((processed.width, processed.height), (1600, 1600));
+        assert_eq!(
+            (
+                processed.source_width,
+                processed.source_height,
+                processed.width,
+                processed.height,
+            ),
+            (
+                input_dimensions.0,
+                input_dimensions.1,
+                expected_dimensions.0,
+                expected_dimensions.1,
+            )
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -307,6 +333,34 @@ async fn fails_cleanly_for_invalid_images() {
         err,
         ImageProcessingError::Decode { .. } | ImageProcessingError::UnsupportedImageFormat { .. }
     ));
+}
+
+#[test]
+fn rejects_png_with_readable_dimensions_and_corrupt_pixels() {
+    let image = ImageBuffer::from_pixel(100, 100, Rgba([10u8, 20, 30, 255]));
+    let mut bytes = image_bytes(&image, ImageFormat::Png);
+    let idat = bytes
+        .windows(4)
+        .position(|chunk_type| chunk_type == b"IDAT")
+        .expect("PNG has an IDAT chunk");
+    // Damage the compressed pixel data while keeping the PNG header intact.
+    bytes[idat + 4] ^= 0xff;
+
+    let dimensions = ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Png)
+        .into_dimensions()
+        .expect("dimensions should still be readable");
+    assert_eq!(dimensions, (100, 100));
+
+    let error = load_for_prompt_bytes(
+        Path::new("corrupt.png"),
+        bytes,
+        PromptImageMode::ORIGINAL_DETAIL,
+    )
+    .expect_err("even a PNG small enough to pass through must have decodable pixels");
+    assert!(
+        matches!(error, ImageProcessingError::Decode { .. }),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -340,16 +394,35 @@ async fn reprocesses_updated_file_contents() {
     assert_ne!(second.bytes, first.bytes);
 }
 
+#[test]
+fn legacy_cache_entry_cannot_bypass_sanitization() {
+    let image = ImageBuffer::from_pixel(7, 11, Rgba([42, 64, 128, 255]));
+    let bytes = image_bytes_with_metadata(&image, ImageFormat::Jpeg, TEST_RGB_ICC_PROFILE);
+    let path = Path::new("oriented.jpg");
+    let mode = PromptImageMode::Original;
+
+    let legacy = load_for_prompt_bytes(path, bytes.clone(), mode).expect("load legacy image");
+    let sanitized =
+        load_for_prompt_bytes_with_decoder(path, bytes, mode, PromptImageDecoder::Sanitizer)
+            .expect("sanitize image after warming the legacy cache");
+
+    assert_eq!((legacy.width, legacy.height), (7, 11));
+    assert_eq!((sanitized.width, sanitized.height), (11, 7));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bounds_cache_by_encoded_byte_size() {
     let cache = ImageCache::new(NonZeroUsize::new(4).expect("non-zero cache capacity"));
     let key = |digest_byte| ImageCacheKey {
         digest: [digest_byte; 20],
         mode: PromptImageMode::Original,
+        decoder: PromptImageDecoder::Legacy,
     };
     let image = |size| EncodedImage {
         bytes: vec![0; size].into(),
         mime: "image/png".to_string(),
+        source_width: 1,
+        source_height: 1,
         width: 1,
         height: 1,
     };

@@ -1,0 +1,32 @@
+---
+source: core/tests/suite/scenarios_agent_message_board_remote.rs
+expression: "context_snapshot::format_context_snapshot(\"Remote board tools and active-turn notifications share the existing session identity.\",\n&bodies.iter().map(SnapshotEntry::body).collect::<Vec<_>>(),\n&ContextSnapshotOptions::default().rewrite_known_segments(),)"
+---
+Scenario: Remote board tools and active-turn notifications share the existing session identity.
+
+## Window 1
+-- request 1 (request) --
+00:message/developer:
+    <MODEL_INSTRUCTIONS>
+01:message/user:
+    This turn will be interrupted during notification setup.
+02:message/developer:
+    <turn_aborted>
+    The previous turn was interrupted on purpose. Any running unified exec processes may still be running in...mands were aborted, they may have partially executed. [hash=cee256d92b55ad65]
+    </turn_aborted>
+03:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+04:message/developer:
+    <MULTI_AGENT_ROLE>
+05:message/developer:
+    <MULTI_AGENT_MODE>
+06:message/user:
+    <ENVIRONMENT_CONTEXT>
+07:message/user:
+    Post the remote decision.
+-- request 2 (request) --
+08:function_call/collaboration.post:{"new_channel_name":"design","text":"A remote decision."}
+09:function_call/collaboration.wait_agent:{}
+10:function_call_output:{"author":"/root","channel_name":"design","created_at":"2026-09-18T12:00:00Z","message_id":"<UUID 1>","thread_id":"<UUID 1>"}
+11:function_call_output:{"message":"Wait completed.","timed_out":false}
+12:agent_message

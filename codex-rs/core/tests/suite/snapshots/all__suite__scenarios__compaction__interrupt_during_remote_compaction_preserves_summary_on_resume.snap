@@ -1,0 +1,74 @@
+---
+source: core/tests/suite/scenarios_compaction_tests.rs
+expression: "context_snapshot::format_context_snapshot(\"A child interrupted during mid-turn and post-turn remote compaction keeps both checkpoints, delivers its completed answer, and handles each Resume in a separate turn.\",\n&entries, &ContextSnapshotOptions::default().rewrite_known_segments(),)"
+---
+Scenario: A child interrupted during mid-turn and post-turn remote compaction keeps both checkpoints, delivers its completed answer, and handles each Resume in a separate turn.
+
+## Window 1
+-- request 1 (request) --
+00:message/developer:
+    <MODEL_INSTRUCTIONS>
+01:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+02:message/developer:
+    <MULTI_AGENT_ROLE>
+03:message/developer:
+    <MULTI_AGENT_MODE>
+04:message/user:
+    <ENVIRONMENT_CONTEXT>
+05:message/user:
+    Find and fix the bug.
+-- request 2 (request) --
+06:function_call/update_plan:{"plan":[{"status":"in_progress","step":"Fix escaping in parser.rs"}]}
+07:function_call_output:Plan updated
+08:compaction_trigger
+
+## Window 2 (after request 2: input diverged at item 06)
+-- request 3 (request) --
+00:message/developer:
+    <MODEL_INSTRUCTIONS>
+01:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+02:message/developer:
+    <MULTI_AGENT_ROLE>
+03:message/developer:
+    <MULTI_AGENT_MODE>
+04:message/user:
+    <ENVIRONMENT_CONTEXT>
+05:message/user:
+    Find and fix the bug.
+06:compaction:encrypted=true; chars=28; hash=f898585a8fffdd12
+07:message/developer:
+    <turn_aborted>
+    The previous turn was interrupted on purpose. Any running unified exec processes may still be running in...mands were aborted, they may have partially executed. [hash=cee256d92b55ad65]
+    </turn_aborted>
+08:message/user:
+    Resume.
+-- request 4 (request) --
+09:message/assistant:
+    Fixed escaping in parser.rs; all tests pass.
+10:compaction_trigger
+
+## Window 3 (after request 4: input diverged at item 01)
+-- request 5 (request) --
+00:message/developer:
+    <MODEL_INSTRUCTIONS>
+01:message/user:
+    Find and fix the bug.
+02:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+03:message/developer:
+    <MULTI_AGENT_ROLE>
+04:message/developer:
+    <MULTI_AGENT_MODE>
+05:message/user:
+    <ENVIRONMENT_CONTEXT>
+06:message/user:
+    Resume.
+07:compaction:encrypted=true; chars=31; hash=19888c8bed116fb6
+08:message/developer:
+    <turn_aborted>
+    The previous turn was interrupted on purpose. Any running unified exec processes may still be running in...mands were aborted, they may have partially executed. [hash=cee256d92b55ad65]
+    </turn_aborted>
+09:message/user:
+    Resume.

@@ -6,6 +6,7 @@ use codex_otel::OtelProvider;
 use codex_otel::OtelSettings;
 use codex_otel::StatsigMetricsSettings;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Path;
 
 const WFP_SETUP_SERVICE_NAME: &str = "codex-windows-sandbox-setup";
@@ -46,7 +47,11 @@ fn build_wfp_metrics_provider(
     // depends on this crate, so the parent process passes only the resolved
     // Statsig environment in the elevation payload. Other exporters are
     // intentionally omitted from this helper path.
-    OtelProvider::from(&OtelSettings {
+    OtelProvider::try_new_http_metrics(&OtelSettings {
+        headers_helper: None,
+        http_client_factory: codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
         environment: otel.environment.clone(),
         service_name: WFP_SETUP_SERVICE_NAME.to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -55,7 +60,7 @@ fn build_wfp_metrics_provider(
         trace_exporter: OtelExporter::None,
         metrics_exporter: OtelExporter::Statsig,
         runtime_metrics: false,
-        span_attributes: BTreeMap::new(),
+        span_attributes: HashMap::new(),
         tracestate: BTreeMap::new(),
     })
     .map_err(|err| anyhow::anyhow!("failed to initialize WFP setup metrics provider: {err}"))
@@ -128,7 +133,8 @@ pub fn install_wfp_filters<F>(
     offline_username: &str,
     otel: Option<&StatsigMetricsSettings>,
     mut log: F,
-) where
+) -> Result<()>
+where
     F: FnMut(&str),
 {
     let metric = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -147,9 +153,7 @@ pub fn install_wfp_filters<F>(
         }
         Ok(Err(err)) => {
             let error = err.to_string();
-            log(&format!(
-                "WFP setup failed for {offline_username}: {error}; continuing elevated setup"
-            ));
+            log(&format!("WFP setup failed for {offline_username}: {error}"));
             WfpSetupMetric {
                 outcome: WfpSetupMetricOutcome::Failure,
                 target_account: offline_username.to_string(),
@@ -160,7 +164,7 @@ pub fn install_wfp_filters<F>(
         Err(panic_payload) => {
             let error = panic_payload_to_string(panic_payload);
             log(&format!(
-                "WFP setup panicked for {offline_username}: {error}; continuing elevated setup"
+                "WFP setup panicked for {offline_username}: {error}"
             ));
             WfpSetupMetric {
                 outcome: WfpSetupMetricOutcome::Failure,
@@ -172,4 +176,8 @@ pub fn install_wfp_filters<F>(
     };
 
     emit_wfp_setup_metric_safely(codex_home, otel, offline_username, &metric, &mut log);
+    match metric.error {
+        Some(error) => Err(anyhow::anyhow!(error)),
+        None => Ok(()),
+    }
 }

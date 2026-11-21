@@ -31,13 +31,17 @@ pub fn current_span_w3c_trace_context() -> Option<W3cTraceContext> {
 }
 
 pub fn span_w3c_trace_context(span: &Span) -> Option<W3cTraceContext> {
-    let context = span.context();
+    w3c_trace_context_from_context(&span.context())
+}
+
+/// Serializes a valid OpenTelemetry context into a W3C trace carrier.
+pub fn w3c_trace_context_from_context(context: &Context) -> Option<W3cTraceContext> {
     if !context.span().span_context().is_valid() {
         return None;
     }
 
     let mut headers = HashMap::new();
-    TraceContextPropagator::new().inject_context(&context, &mut headers);
+    TraceContextPropagator::new().inject_context(context, &mut headers);
     let tracestate = headers.remove("tracestate");
     let configured_tracestate_guard = tracestate_entries()
         .read()
@@ -137,7 +141,8 @@ pub(crate) fn context_from_trace_headers(
         headers.insert("tracestate".to_string(), tracestate.to_string());
     }
 
-    let context = TraceContextPropagator::new().extract(&headers);
+    // Invalid incoming headers must not fall back to an unrelated active span.
+    let context = TraceContextPropagator::new().extract_with_context(&Context::new(), &headers);
     if !context.span().span_context().is_valid() {
         return None;
     }
@@ -369,6 +374,12 @@ mod tests {
 
     #[test]
     fn invalid_traceparent_returns_none() {
+        let parent = context_from_trace_headers(
+            Some("00-11111111111111111111111111111111-2222222222222222-01"),
+            /*tracestate*/ None,
+        )
+        .expect("valid ambient context");
+        let _guard = parent.attach();
         assert!(
             context_from_trace_headers(Some("not-a-traceparent"), /*tracestate*/ None).is_none()
         );

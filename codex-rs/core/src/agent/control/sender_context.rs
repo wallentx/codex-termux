@@ -1,0 +1,151 @@
+//! Captures genuine sender instructions and assistant context for host-delivered task messages.
+//! Only turn-input admission calls this, before queueing; ordinary tool results and
+//! quoted delegation text cannot establish sender provenance. Unloaded senders are read
+//! through the host's authenticated thread store, without resuming their runtime.
+
+use crate::context::GuardianSenderMessages;
+use crate::context_manager::ContextManager;
+use codex_history::RolloutItem;
+use codex_protocol::SessionId;
+use codex_protocol::ThreadId;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_utils_output_truncation::TruncationPolicy;
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::LocalAgentRuntime;
+
+impl LocalAgentRuntime {
+    pub(crate) async fn capture_sender_user_messages(
+        &self,
+        item: &ResponseItem,
+        receiver_thread_id: ThreadId,
+    ) -> Option<GuardianSenderMessages> {
+        let ResponseItem::FunctionCallOutput {
+            id: Some(id),
+            call_id: None,
+            name: Some(name),
+            namespace: Some(namespace),
+            output,
+            ..
+        } = item
+        else {
+            return None;
+        };
+        if !matches!(
+            (namespace.as_str(), name.as_str()),
+            ("codex_app" | "codex_tui", "send_message_to_thread")
+                | ("codex_app", "create_thread")
+                | ("cloud_threads", "send_message")
+        ) {
+            return None;
+        }
+        // Recognized deliveries always get their own snapshot, even without usable provenance.
+        let source_thread_id = output.body.to_text().and_then(|text| {
+            let (source, input) = text
+                .strip_prefix("<codex_delegation>")?
+                .strip_suffix("</codex_delegation>")?
+                .trim()
+                .strip_prefix("<source_thread_id>")?
+                .split_once("</source_thread_id>")?;
+            let input = input.trim();
+            // Cloud deliveries include Dot attribution, but authority comes from the source thread.
+            let input = if let Some(rest) = input.strip_prefix("<source_orbit_id>") {
+                let (orbit_id, input) = rest.split_once("</source_orbit_id>")?;
+                if orbit_id.contains('<') {
+                    return None;
+                }
+                input.trim()
+            } else {
+                input
+            };
+            input.strip_prefix("<input>")?.strip_suffix("</input>")?;
+            ThreadId::from_string(source)
+                .ok()
+                .filter(|source| *source != receiver_thread_id)
+        });
+        let mut fragment = GuardianSenderMessages {
+            source: source_thread_id,
+            delivery: id.to_string(),
+            from_storage: false,
+            messages: Vec::new(),
+        };
+        if let Some(source_thread_id) = source_thread_id
+            && let Ok(manager) = self.upgrade()
+        {
+            let context = match manager.get_thread(source_thread_id).await {
+                Ok(sender) => sender
+                    .conversation_history_snapshot()
+                    .await
+                    .retained_context()
+                    .cloned(),
+                Err(_) => {
+                    // The store owns authorization, including cross-worker tenant boundaries.
+                    // Bound the read so unavailable storage cannot stall turn admission.
+                    let stored = tokio::time::timeout(
+                        Duration::from_secs(/*secs*/ 5),
+                        manager.load_latest_model_context(LoadThreadHistoryParams {
+                            thread_id: source_thread_id,
+                            include_archived: true,
+                        }),
+                    )
+                    .await;
+                    let capture = || {
+                        let stored = stored.ok()?.ok()?;
+                        if stored.thread_id != source_thread_id {
+                            return None;
+                        }
+                        let RolloutItem::SessionMeta(meta) = stored.items.first()? else {
+                            return None;
+                        };
+                        if meta.meta.id != source_thread_id || meta.meta.source.is_internal() {
+                            return None;
+                        }
+                        let history_mode = meta.meta.history_mode;
+                        let referenced_agent_fork = meta.meta.history_base.is_some()
+                            && meta.meta.session_id != SessionId::from(source_thread_id)
+                            && meta.meta.subagent_history_start_ordinal.is_none();
+                        let version = if referenced_agent_fork {
+                            if history_mode != ThreadHistoryMode::Paginated
+                                || meta.meta.forked_from_id.is_none()
+                            {
+                                return None;
+                            }
+                            Some(meta.meta.multi_agent_version?)
+                        } else {
+                            None
+                        };
+                        let mut history = Arc::new(stored.items);
+                        if let Some(version) = version {
+                            crate::agent::sanitize_referenced_agent_fork(
+                                source_thread_id,
+                                &mut history,
+                                version,
+                            )
+                            .ok()?;
+                        }
+                        let retention =
+                            codex_history::MessageRetention::saved(&history, source_thread_id);
+                        let context = ContextManager::reconstruct_rollout(
+                            &history,
+                            history_mode,
+                            |ids| ContextManager::new(ids, retention),
+                            // Tool bodies are not sender authorization evidence.
+                            TruncationPolicy::Bytes(0),
+                        )
+                        .retained_context;
+                        fragment.from_storage = true;
+                        Some(context)
+                    };
+                    capture()
+                }
+            };
+            if let Some(context) = context {
+                fragment.messages = codex_guardian_reviewer::guardian_sender_exchanges(&context);
+            }
+        }
+        Some(fragment)
+    }
+}

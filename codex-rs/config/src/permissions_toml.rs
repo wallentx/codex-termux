@@ -116,7 +116,16 @@ pub struct PermissionProfileToml {
     pub workspace_roots: Option<WorkspaceRootsToml>,
     pub filesystem: Option<FilesystemPermissionsToml>,
     pub network: Option<NetworkToml>,
+    pub credentials: Option<CredentialPermissionsToml>,
 }
+
+/// In `requirements.toml`, `[permissions.credentials]` sets shared credential policy and
+/// `[permissions.<profile>.credentials]` sets policy for a named profile.
+/// Omit the shared table until it contains a supported policy setting.
+/// In `config.toml`, credentials use the named-profile form alongside filesystem and network.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialPermissionsToml {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PermissionProfileResolutionError {
@@ -250,10 +259,6 @@ pub struct NetworkDomainPermissionsToml {
 }
 
 impl NetworkDomainPermissionsToml {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     pub fn allowed_domains(&self) -> Option<Vec<String>> {
         let allowed_domains: Vec<String> = self
             .entries
@@ -301,10 +306,6 @@ pub struct NetworkUnixSocketPermissionsToml {
 }
 
 impl NetworkUnixSocketPermissionsToml {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     pub fn allow_unix_sockets(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -339,6 +340,8 @@ pub struct NetworkToml {
     pub enabled: Option<bool>,
     pub proxy_url: Option<String>,
     pub enable_socks5: Option<bool>,
+    /// Route outbound TCP from managed Linux sandbox commands through the managed SOCKS5 proxy.
+    pub transparent_tcp: Option<bool>,
     pub socks_url: Option<String>,
     pub enable_socks5_udp: Option<bool>,
     pub allow_upstream_proxy: Option<bool>,
@@ -348,6 +351,9 @@ pub struct NetworkToml {
     pub mode: Option<NetworkMode>,
     pub domains: Option<NetworkDomainPermissionsToml>,
     pub unix_sockets: Option<NetworkUnixSocketPermissionsToml>,
+    /// Permits local servers and direct host-loopback connections and skips the proxy's
+    /// additional private-network destination checks. Proxy domain rules still apply.
+    /// Defaults to true for MXC, which cannot enforce false; otherwise defaults to false.
     pub allow_local_binding: Option<bool>,
     pub mitm: Option<NetworkMitmToml>,
 }
@@ -355,6 +361,10 @@ pub struct NetworkToml {
 #[derive(Serialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct NetworkMitmToml {
+    /// Set to 2 when using origin-scoped hooks or credential substitution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 2, max = 2))]
+    pub version: Option<u8>,
     #[schemars(with = "Option<BTreeMap<String, NetworkMitmHookToml>>")]
     pub hooks: Option<IndexMap<String, NetworkMitmHookToml>>,
     #[schemars(with = "Option<BTreeMap<String, NetworkMitmActionToml>>")]
@@ -364,13 +374,18 @@ pub struct NetworkMitmToml {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NetworkMitmTomlUnchecked {
+    version: Option<u8>,
     pub hooks: Option<IndexMap<String, NetworkMitmHookToml>>,
     pub actions: Option<IndexMap<String, NetworkMitmActionToml>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkMitmHookToml {
+    #[serde(default)]
+    pub schemes: Vec<String>,
+    #[serde(default)]
+    pub ports: Vec<u16>,
     pub host: String,
     pub methods: Vec<String>,
     pub path_prefixes: Vec<String>,
@@ -391,15 +406,18 @@ enum NetworkModeSchema {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkMitmActionToml {
+    pub body_secret_substitution: Option<codex_network_proxy::BodySecretSubstitutionConfig>,
+    pub aws_sigv4: Option<codex_network_proxy::AwsSigV4Config>,
     pub strip_request_headers: Vec<String>,
     pub inject_request_headers: Vec<NetworkMitmInjectedHeaderToml>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkMitmInjectedHeaderToml {
+    pub placeholder: Option<String>,
     pub name: String,
     pub secret_env_var: Option<String>,
     pub secret_file: Option<String>,
@@ -417,6 +435,7 @@ impl<'de> Deserialize<'de> for NetworkMitmToml {
     {
         let unchecked = NetworkMitmTomlUnchecked::deserialize(deserializer)?;
         let mitm = Self {
+            version: unchecked.version,
             hooks: unchecked.hooks,
             actions: unchecked.actions,
         };
@@ -428,8 +447,24 @@ impl<'de> Deserialize<'de> for NetworkMitmToml {
 
 impl NetworkMitmToml {
     pub fn validate_action_definitions(&self) -> Result<(), String> {
+        if let Some(version) = self.version
+            && version != 2
+        {
+            return Err(format!("unsupported network.mitm.version {version}"));
+        }
         if let Some(actions) = self.actions.as_ref() {
             for (action_name, action) in actions {
+                let uses_placeholder = action
+                    .inject_request_headers
+                    .iter()
+                    .any(|header| header.placeholder.is_some());
+                if self.version.is_none()
+                    && (uses_placeholder
+                        || action.aws_sigv4.is_some()
+                        || action.body_secret_substitution.is_some())
+                {
+                    return Err("scoped MITM actions require network.mitm.version = 2".to_string());
+                }
                 if action.is_empty() {
                     return Err(format!(
                         "network.mitm.actions.{action_name} must define at least one operation"
@@ -443,6 +478,39 @@ impl NetworkMitmToml {
         };
 
         for (hook_name, hook) in hooks {
+            let signing_count = hook
+                .action
+                .iter()
+                .filter(|name| {
+                    self.actions
+                        .as_ref()
+                        .and_then(|actions| actions.get(*name))
+                        .is_some_and(|action| action.aws_sigv4.is_some())
+                })
+                .count();
+            if signing_count > 1 {
+                return Err(format!(
+                    "network.mitm.hooks.{hook_name} must select at most one AWS signing action"
+                ));
+            }
+            let substitution_count = hook
+                .action
+                .iter()
+                .filter(|name| {
+                    self.actions
+                        .as_ref()
+                        .and_then(|actions| actions.get(*name))
+                        .is_some_and(|action| action.body_secret_substitution.is_some())
+                })
+                .count();
+            if substitution_count > 1 {
+                return Err(format!(
+                    "network.mitm.hooks.{hook_name} must select at most one body substitution action"
+                ));
+            }
+            if self.version.is_none() && (!hook.schemes.is_empty() || !hook.ports.is_empty()) {
+                return Err("scoped MITM hooks require network.mitm.version = 2".to_string());
+            }
             if hook.action.is_empty() {
                 return Err(format!(
                     "network.mitm.hooks.{hook_name}.action must not be empty"
@@ -471,7 +539,10 @@ impl NetworkMitmToml {
 
 impl NetworkMitmActionToml {
     pub fn is_empty(&self) -> bool {
-        self.strip_request_headers.is_empty() && self.inject_request_headers.is_empty()
+        self.body_secret_substitution.is_none()
+            && self.aws_sigv4.is_none()
+            && self.strip_request_headers.is_empty()
+            && self.inject_request_headers.is_empty()
     }
 }
 
@@ -482,6 +553,9 @@ impl NetworkToml {
         }
         if let Some(proxy_url) = self.proxy_url.as_ref() {
             config.proxy_url = proxy_url.clone();
+        }
+        if let Some(transparent_tcp) = self.transparent_tcp {
+            config.transparent_tcp = transparent_tcp;
         }
         if let Some(enable_socks5) = self.enable_socks5 {
             config.enable_socks5 = enable_socks5;
@@ -501,7 +575,7 @@ impl NetworkToml {
             config.dangerously_allow_non_loopback_proxy = dangerously_allow_non_loopback_proxy;
         }
         if let Some(dangerously_allow_all_unix_sockets) = self.dangerously_allow_all_unix_sockets {
-            config.dangerously_allow_all_unix_sockets = dangerously_allow_all_unix_sockets;
+            config.dangerously_allow_all_unix_sockets = Some(dangerously_allow_all_unix_sockets);
         }
         if let Some(mode) = self.mode {
             config.mode = mode;
@@ -520,11 +594,10 @@ impl NetworkToml {
                 };
                 proxy_unix_sockets.entries.insert(path.clone(), permission);
             }
-            config.unix_sockets =
-                (!proxy_unix_sockets.entries.is_empty()).then_some(proxy_unix_sockets);
+            config.unix_sockets = Some(proxy_unix_sockets);
         }
         if let Some(allow_local_binding) = self.allow_local_binding {
-            config.allow_local_binding = allow_local_binding;
+            config.allow_local_binding = Some(allow_local_binding);
         }
         if let Some(mitm) = self.mitm.as_ref() {
             config.mitm_hooks = mitm.to_runtime_hooks(mitm.actions.as_ref());
@@ -547,6 +620,8 @@ impl NetworkMitmHookToml {
         MitmHookConfig {
             host: self.host.clone(),
             matcher: MitmHookMatchConfig {
+                schemes: self.schemes.clone(),
+                ports: self.ports.clone(),
                 methods: self.methods.clone(),
                 path_prefixes: self.path_prefixes.clone(),
                 query: self.query.clone(),
@@ -568,6 +643,12 @@ impl NetworkMitmHookToml {
         let mut selected = MitmHookActionsConfig::default();
         for action_name in &self.action {
             if let Some(action) = actions_by_name.get(action_name) {
+                if action.body_secret_substitution.is_some() {
+                    selected.body_secret_substitution = action.body_secret_substitution.clone();
+                }
+                if action.aws_sigv4.is_some() {
+                    selected.aws_sigv4 = action.aws_sigv4.clone();
+                }
                 selected
                     .strip_request_headers
                     .extend(action.strip_request_headers.clone());
@@ -586,6 +667,7 @@ impl NetworkMitmHookToml {
 impl NetworkMitmInjectedHeaderToml {
     fn to_runtime(&self) -> InjectedHeaderConfig {
         InjectedHeaderConfig {
+            placeholder: self.placeholder.clone(),
             name: self.name.clone(),
             secret_env_var: self.secret_env_var.clone(),
             secret_file: self.secret_file.clone(),
@@ -606,3 +688,7 @@ pub fn overlay_network_domain_permissions(
         config.upsert_domain_permission(pattern.clone(), permission, normalize_host);
     }
 }
+
+#[cfg(test)]
+#[path = "permissions_toml_tests.rs"]
+mod tests;

@@ -82,17 +82,6 @@ impl CliConfigOverrides {
             })
             .collect()
     }
-
-    /// Apply all parsed overrides onto `target`. Intermediate objects will be
-    /// created as necessary. Values located at the destination path will be
-    /// replaced.
-    pub fn apply_on_value(&self, target: &mut Value) -> Result<(), String> {
-        let overrides = self.parse_overrides()?;
-        for (path, value) in overrides {
-            apply_single_override(target, &path, value);
-        }
-        Ok(())
-    }
 }
 
 fn canonicalize_override_key(key: &str) -> String {
@@ -103,50 +92,6 @@ fn canonicalize_override_key(key: &str) -> String {
     }
 }
 
-/// Apply a single override onto `root`, creating intermediate objects as
-/// necessary.
-fn apply_single_override(root: &mut Value, path: &str, value: Value) {
-    use toml::value::Table;
-
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut current = root;
-
-    for (i, part) in parts.iter().enumerate() {
-        let is_last = i == parts.len() - 1;
-
-        if is_last {
-            match current {
-                Value::Table(tbl) => {
-                    tbl.insert((*part).to_string(), value);
-                }
-                _ => {
-                    let mut tbl = Table::new();
-                    tbl.insert((*part).to_string(), value);
-                    *current = Value::Table(tbl);
-                }
-            }
-            return;
-        }
-
-        // Traverse or create intermediate table.
-        match current {
-            Value::Table(tbl) => {
-                current = tbl
-                    .entry((*part).to_string())
-                    .or_insert_with(|| Value::Table(Table::new()));
-            }
-            _ => {
-                *current = Value::Table(Table::new());
-                if let Value::Table(tbl) = current {
-                    current = tbl
-                        .entry((*part).to_string())
-                        .or_insert_with(|| Value::Table(Table::new()));
-                }
-            }
-        }
-    }
-}
-
 fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {
     let wrapped = format!("_x_ = {raw}");
     let table: toml::Table = toml::from_str(&wrapped)?;
@@ -154,6 +99,39 @@ fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {
         .get("_x_")
         .cloned()
         .ok_or_else(|| SerdeError::custom("missing sentinel key"))
+}
+
+/// Collects config overrides across command boundaries in argument order.
+///
+/// Clap keeps the deepest global argument's values instead of appending across
+/// scopes. Reparse with local config arguments after validating the typed CLI.
+pub fn collect_config_overrides(
+    command: clap::Command,
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
+) -> Result<CliConfigOverrides, clap::Error> {
+    let matches = localize_config_arg(command).try_get_matches_from(args)?;
+    let raw_overrides = std::iter::successors(Some(&matches), |scope| {
+        scope.subcommand().map(|(_, child)| child)
+    })
+    .filter_map(|scope| scope.get_many::<String>("raw_overrides"))
+    .flatten()
+    .cloned()
+    .collect();
+    Ok(CliConfigOverrides { raw_overrides })
+}
+
+fn localize_config_arg(mut command: clap::Command) -> clap::Command {
+    use clap::CommandFactory;
+
+    if !command
+        .get_arguments()
+        .any(|arg| arg.get_id() == "raw_overrides")
+    {
+        command = command.args(CliConfigOverrides::command().get_arguments().cloned());
+    }
+    command
+        .mut_arg("raw_overrides", |arg| arg.global(false))
+        .mut_subcommands(localize_config_arg)
 }
 
 #[cfg(test)]

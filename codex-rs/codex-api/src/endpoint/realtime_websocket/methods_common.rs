@@ -118,15 +118,19 @@ pub(super) fn session_update_message(
     session_mode: RealtimeSessionMode,
     output_modality: RealtimeOutputModality,
     voice: RealtimeVoice,
+    delegation_ack_filler: Option<bool>,
 ) -> RealtimeOutboundMessage {
     let session_mode = normalized_session_mode(wire_adapter, session_mode);
     match wire_adapter {
         RealtimeWireAdapter::V1 => RealtimeOutboundMessage::SessionUpdate {
             session: v1_session_update_session(instructions, voice),
         },
-        RealtimeWireAdapter::FramelessBidi => {
-            frameless_session_update_message(instructions, initial_items, voice)
-        }
+        RealtimeWireAdapter::FramelessBidi => frameless_session_update_message(
+            instructions,
+            initial_items,
+            voice,
+            delegation_ack_filler,
+        ),
         RealtimeWireAdapter::RealtimeV2 => RealtimeOutboundMessage::SessionUpdate {
             session: v2_session_update_session(instructions, session_mode, output_modality, voice),
         },
@@ -134,17 +138,16 @@ pub(super) fn session_update_message(
 }
 
 pub fn session_update_session_json(config: RealtimeSessionConfig) -> JsonResult<Value> {
+    let voice = config.voice_or_default();
     match config.event_parser {
         RealtimeWireAdapter::V1 | RealtimeWireAdapter::RealtimeV2 => {
             let mut session = match config.event_parser {
-                RealtimeWireAdapter::V1 => {
-                    v1_session_update_session(config.instructions, config.voice)
-                }
+                RealtimeWireAdapter::V1 => v1_session_update_session(config.instructions, voice),
                 RealtimeWireAdapter::RealtimeV2 => v2_session_update_session(
                     config.instructions,
                     config.session_mode,
                     config.output_modality,
-                    config.voice,
+                    voice,
                 ),
                 RealtimeWireAdapter::FramelessBidi => unreachable!(),
             };
@@ -156,7 +159,8 @@ pub fn session_update_session_json(config: RealtimeSessionConfig) -> JsonResult<
             config.model,
             config.instructions,
             config.initial_items,
-            config.voice,
+            voice,
+            config.delegation_ack_filler,
         )),
     }
 }

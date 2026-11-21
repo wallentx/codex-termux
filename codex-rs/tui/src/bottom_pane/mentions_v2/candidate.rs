@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use ratatui::style::Style;
 use ratatui::style::Styled;
-use ratatui::style::Stylize;
 use ratatui::text::Span;
+
+use crate::thread_label::ThreadLabelStyle;
 
 const TAG_WIDTH: usize = "Plugin".len();
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Selection {
     File(PathBuf),
     Tool {
@@ -20,6 +21,7 @@ pub(crate) enum Selection {
 pub(super) enum MentionType {
     Plugin,
     Skill,
+    Task,
     File,
     Directory,
 }
@@ -31,8 +33,9 @@ impl MentionType {
 
     pub(super) fn span(self, base_style: Style) -> Span<'static> {
         let style = match self {
-            Self::Plugin => base_style.magenta(),
+            Self::Plugin => base_style.fg(crate::style::accent_color()),
             Self::Skill => base_style.dim(),
+            Self::Task => base_style.cyan(),
             Self::File => base_style.cyan(),
             Self::Directory => base_style,
         };
@@ -43,6 +46,7 @@ impl MentionType {
         match self {
             Self::Plugin => "Plugin",
             Self::Skill => "Skill",
+            Self::Task => "Task",
             Self::File => "File",
             Self::Directory => "Dir",
         }
@@ -55,6 +59,7 @@ pub(crate) struct Candidate {
     pub(super) description: Option<String>,
     pub(super) search_terms: Vec<String>,
     pub(super) mention_type: MentionType,
+    pub(super) label_style: ThreadLabelStyle,
     pub(super) selection: Selection,
 }
 
@@ -63,6 +68,7 @@ pub(super) struct SearchResult {
     pub(super) display_name: String,
     pub(super) description: Option<String>,
     pub(super) mention_type: MentionType,
+    pub(super) label_style: ThreadLabelStyle,
     pub(super) selection: Selection,
     pub(super) match_indices: Option<Vec<usize>>,
     pub(super) score: i32,
@@ -74,6 +80,7 @@ impl Candidate {
             display_name: self.display_name.clone(),
             description: self.description.clone(),
             mention_type: self.mention_type,
+            label_style: self.label_style,
             selection: self.selection.clone(),
             match_indices,
             score,

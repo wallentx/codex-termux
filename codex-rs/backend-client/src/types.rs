@@ -44,20 +44,50 @@ pub struct RateLimitResetCreditDetails {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RateLimitsWithResetCredits {
     pub rate_limits: Vec<RateLimitSnapshot>,
+    /// Backend decision for ordinary included usage; absence is not permission to recover.
+    pub ordinary_usage_allowed: Option<bool>,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+    pub rate_limit_upsell: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub(crate) struct RateLimitStatusWithResetCredits {
     #[serde(flatten)]
     pub rate_limits: RateLimitStatusPayload,
+    // Capture the new optional metadata alongside the generated quota fields until the
+    // backend OpenAPI export includes it. This field owns additional_rate_limits on the wire.
+    pub additional_rate_limits: Option<Vec<AdditionalRateLimitWithNormalModel>>,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+    // Preserve the backend-owned banner contract without making optional UI data break usage.
+    pub rate_limit_upsell: Option<Value>,
+}
+
+/// Additional quota details plus the normal model whose picker metadata should be used.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct AdditionalRateLimitWithNormalModel {
+    #[serde(flatten)]
+    pub details: codex_backend_openapi_models::models::AdditionalRateLimitDetails,
+    pub normal_model_slug: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct CodexWorkspaceMessagesResponse {
     #[serde(default)]
     pub messages: Vec<CodexWorkspaceMessage>,
+}
+
+/// Authenticated Codex user settings used by CLI runtime policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct CodexUserSettingsResponse {
+    /// Server-computed effective commit-attribution policy.
+    ///
+    /// Older backend responses omit this field, which safely defaults to disabled.
+    #[serde(default)]
+    pub commit_attribution_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -106,6 +136,17 @@ pub struct AccountsCheckResponse {
 #[derive(Clone, Debug, Deserialize)]
 pub struct AccountEntry {
     pub id: String,
+    pub can_access_with_session: Option<bool>,
+    pub sso_connection_name: Option<String>,
+    #[serde(default)]
+    pub is_deactivated: bool,
+    #[serde(default)]
+    pub is_fedramp_compliant_workspace: bool,
+    /// Current subscription reported by the accounts endpoint, independent of token claims.
+    #[serde(default)]
+    pub plan_type: Option<codex_protocol::account::PlanType>,
+    pub workspace_backend_origin: Option<String>,
+    pub account_routing_override: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -140,11 +181,19 @@ impl Default for RawAccounts {
 #[derive(Deserialize)]
 struct ChatGptAccountEntry {
     account: ChatGptAccountInfo,
+    can_access_with_session: Option<bool>,
+    sso_connection_name: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChatGptAccountInfo {
     account_id: Option<String>,
+    #[serde(default)]
+    is_deactivated: bool,
+    #[serde(default)]
+    is_fedramp_compliant_workspace: bool,
+    #[serde(default)]
+    plan_type: Option<codex_protocol::account::PlanType>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -165,9 +214,17 @@ impl<'de> Deserialize<'de> for AccountsCheckResponse {
                 .account_ordering
                 .iter()
                 .filter_map(|account_id| {
-                    let account = accounts.remove(account_id)?.account;
+                    let entry = accounts.remove(account_id)?;
+                    let account = entry.account;
                     Some(AccountEntry {
                         id: account.account_id?,
+                        can_access_with_session: entry.can_access_with_session,
+                        sso_connection_name: entry.sso_connection_name,
+                        is_deactivated: account.is_deactivated,
+                        is_fedramp_compliant_workspace: account.is_fedramp_compliant_workspace,
+                        plan_type: account.plan_type,
+                        workspace_backend_origin: None,
+                        account_routing_override: None,
                         name: account.name,
                         profile_picture_url: account.profile_picture_url,
                         structure: account.structure,

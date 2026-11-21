@@ -1,16 +1,19 @@
 ---
 source: tui/src/chatwidget/tests/popups_and_settings.rs
+assertion_line: 3361
 expression: popup
 ---
   Select Model and Effort
-  Access legacy models by running codex -m <model_name> or in your config.toml
 
-  1. gpt-5.6-sol (default)  Latest frontier agentic coding model.
-  2. gpt-5.6-terra          Balanced agentic coding model for everyday work.
-  3. gpt-5.6-luna           Fast and affordable agentic coding model.
-  4. gpt-5.5                Frontier model for complex coding, research, and
-                            real-world work.
-› 5. gpt-5.2 (current)      Optimized for professional work and long-running
-                            agents.
+↑
+  4. GPT-6.1-Sol         Previous generation model for coding and everyday work.
+  5. GPT-6-Astra         Previous generation model for complex coding and
+                         professional work.
+  6. GPT-6-Sol           Legacy model for coding and everyday work.
+  7. GPT-6-Luna          Fast and affordable model for easier tasks.
+  8. GPT-5.6-Sol         Legacy model for coding and everyday work.
+  9. GPT-5.6-Terra       Legacy balanced model for agentic coding.
+      GPT-5.6-Luna       Legacy fast model for simpler tasks.
+›     GPT-5.5 (current)  Legacy coding model.
 
-  Press enter to confirm or esc to go back
+  enter select · esc back

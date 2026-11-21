@@ -1,6 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "BedrockProviderId": {
+      "enum": [
+        "amazon-bedrock",
+        "amazon-bedrock-runtime"
+      ],
+      "type": "string"
+    },
     "LoginAppBrand": {
       "enum": [
         "codex",
@@ -119,6 +126,17 @@
         "apiKey": {
           "type": "string"
         },
+        "providerId": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BedrockProviderId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Defaults to Amazon Bedrock Mantle when omitted."
+        },
         "region": {
           "type": "string"
         },
@@ -136,6 +154,52 @@
         "type"
       ],
       "title": "AmazonBedrockv2::LoginAccountParams",
+      "type": "object"
+    },
+    {
+      "description": "[UNSTABLE] Managed Amazon Bedrock AWS access key login is experimental.",
+      "properties": {
+        "accessKeyId": {
+          "type": "string"
+        },
+        "providerId": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BedrockProviderId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Defaults to Amazon Bedrock Mantle when omitted."
+        },
+        "region": {
+          "type": "string"
+        },
+        "secretAccessKey": {
+          "type": "string"
+        },
+        "sessionToken": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "enum": [
+            "amazonBedrockAccessKeys"
+          ],
+          "title": "AmazonBedrockAccessKeysv2::LoginAccountParamsType",
+          "type": "string"
+        }
+      },
+      "required": [
+        "accessKeyId",
+        "region",
+        "secretAccessKey",
+        "type"
+      ],
+      "title": "AmazonBedrockAccessKeysv2::LoginAccountParams",
       "type": "object"
     }
   ],

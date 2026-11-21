@@ -37,9 +37,22 @@ impl fmt::Debug for PersonalAccessTokenAuth {
 }
 
 impl PersonalAccessTokenAuth {
+    pub(super) async fn load_with_cached(
+        access_token: &str,
+        auth_route_config: &AuthRouteConfig,
+        cached: Option<&super::CodexAuth>,
+    ) -> std::io::Result<Self> {
+        if let Some(super::CodexAuth::PersonalAccessToken(cached)) = cached
+            && cached.access_token() == access_token
+        {
+            return Ok(cached.clone());
+        }
+        Self::load(access_token, auth_route_config).await
+    }
+
     pub(super) async fn load(
         access_token: &str,
-        auth_route_config: Option<&AuthRouteConfig>,
+        auth_route_config: &AuthRouteConfig,
     ) -> std::io::Result<Self> {
         let authapi_base_url = env::var(CODEX_AUTHAPI_BASE_URL_ENV_VAR)
             .ok()

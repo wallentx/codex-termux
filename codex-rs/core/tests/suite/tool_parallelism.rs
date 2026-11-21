@@ -1,21 +1,26 @@
 #![cfg(not(target_os = "windows"))]
 #![allow(clippy::unwrap_used)]
 
-use core_test_support::test_codex::local_selections;
+use codex_core::TurnInputRequest;
+use codex_features::Feature;
+use core_test_support::test_codex::local_requests;
 use std::fs;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_exec_command_call_with_args;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::ev_shell_command_call_with_args;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -38,30 +43,27 @@ async fn run_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
         turn_permission_fields(PermissionProfile::Disabled, test.cwd.path());
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -69,84 +71,45 @@ async fn run_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_turn_and_measure(test: &TestCodex, prompt: &str) -> anyhow::Result<Duration> {
-    let start = Instant::now();
-    run_turn(test, prompt).await?;
-    Ok(start.elapsed())
-}
-
 async fn build_codex_with_test_tool(server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
     let mut builder = test_codex().with_model("test-gpt-5.1-codex");
     builder.build(server).await
 }
 
-fn assert_parallel_duration(actual: Duration) {
-    // Allow headroom for slow CI scheduling; barrier synchronization already enforces overlap.
-    assert!(
-        actual < Duration::from_millis(1_600),
-        "expected parallel execution to finish quickly, got {actual:?}"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_file_tools_run_in_parallel() -> anyhow::Result<()> {
+async fn native_v2_tool_calls_with_the_same_id_run_in_parallel() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let test = build_codex_with_test_tool(&server).await?;
-
-    let warmup_args = json!({
-        "sleep_after_ms": 10,
-        "barrier": {
-            "id": "parallel-test-sync-warmup",
-            "participants": 2,
-            "timeout_ms": 1_000,
-        }
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            config.features.enable(Feature::MultiAgentV2).unwrap();
+        })
+        .build(&server)
+        .await?;
+    let args = json!({
+        "barrier": { "id": "parallel-test-sync", "participants": 2, "timeout_ms": 5_000 }
     })
     .to_string();
-
-    let parallel_args = json!({
-        "sleep_after_ms": 300,
-        "barrier": {
-            "id": "parallel-test-sync",
-            "participants": 2,
-            "timeout_ms": 1_000,
-        }
-    })
-    .to_string();
-
-    let warmup_first = sse(vec![
-        json!({"type": "response.created", "response": {"id": "resp-warm-1"}}),
-        ev_function_call("warm-call-1", "test_sync_tool", &warmup_args),
-        ev_function_call("warm-call-2", "test_sync_tool", &warmup_args),
-        ev_completed("resp-warm-1"),
-    ]);
-    let warmup_second = sse(vec![
-        ev_assistant_message("warm-msg-1", "warmup complete"),
-        ev_completed("resp-warm-2"),
-    ]);
-
-    let first_response = sse(vec![
-        json!({"type": "response.created", "response": {"id": "resp-1"}}),
-        ev_function_call("call-1", "test_sync_tool", &parallel_args),
-        ev_function_call("call-2", "test_sync_tool", &parallel_args),
+    let calls = sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call("shared", "test_sync_tool", &args),
+        ev_function_call("shared", "test_sync_tool", &args),
         ev_completed("resp-1"),
     ]);
-    let second_response = sse(vec![
+    let done = sse(vec![
         ev_assistant_message("msg-1", "done"),
         ev_completed("resp-2"),
     ]);
-    mount_sse_sequence(
-        &server,
-        vec![warmup_first, warmup_second, first_response, second_response],
-    )
-    .await;
+    let responses = mount_sse_sequence(&server, vec![calls, done]).await;
 
-    run_turn(&test, "warm up parallel tool").await?;
-
-    let duration = run_turn_and_measure(&test, "exercise sync tool").await?;
-    assert_parallel_duration(duration);
-
+    run_turn(&test, "exercise sync tool").await?;
+    // Either call can return "ok" only after both handlers reach the barrier.
+    assert_eq!(
+        responses.function_call_output_text("shared").as_deref(),
+        Some("ok")
+    );
     Ok(())
 }
 
@@ -158,29 +121,53 @@ async fn shell_tools_run_in_parallel() -> anyhow::Result<()> {
     let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder.build(&server).await?;
 
-    let shell_args = json!({
-        "command": "sleep 0.25",
-        // Avoid user-specific shell startup cost (e.g. zsh profile scripts) in timing assertions.
-        "login": false,
-        "timeout_ms": 1_000,
-    });
-    let args_one = serde_json::to_string(&shell_args)?;
-    let args_two = serde_json::to_string(&shell_args)?;
+    let shell_args = |call_id: &str| {
+        json!({
+            "cmd": format!(": > {call_id}.started; while [ ! -f release ]; do sleep 0.01; done; echo {call_id}"),
+            "login": false,
+            "yield_time_ms": 30_000,
+        })
+        .to_string()
+    };
+    let args_one = shell_args("call-1");
+    let args_two = shell_args("call-2");
 
     let first_response = sse(vec![
         json!({"type": "response.created", "response": {"id": "resp-1"}}),
-        ev_function_call("call-1", "shell_command", &args_one),
-        ev_function_call("call-2", "shell_command", &args_two),
+        ev_function_call("call-1", "exec_command", &args_one),
+        ev_function_call("call-2", "exec_command", &args_two),
         ev_completed("resp-1"),
     ]);
     let second_response = sse(vec![
         ev_assistant_message("msg-1", "done"),
         ev_completed("resp-2"),
     ]);
-    mount_sse_sequence(&server, vec![first_response, second_response]).await;
+    let responses = mount_sse_sequence(&server, vec![first_response, second_response]).await;
 
-    let duration = run_turn_and_measure(&test, "run shell_command twice").await?;
-    assert_parallel_duration(duration);
+    let release_commands = async {
+        let overlap = tokio::time::timeout(Duration::from_secs(5), async {
+            while !test.cwd.path().join("call-1.started").exists()
+                || !test.cwd.path().join("call-2.started").exists()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        fs::write(test.cwd.path().join("release"), "")?;
+        overlap.map_err(|_| anyhow::anyhow!("shell commands did not overlap"))
+    };
+    let (turn_result, overlap_result) =
+        tokio::join!(run_turn(&test, "run exec_command twice"), release_commands);
+    overlap_result?;
+    turn_result?;
+
+    for call_id in ["call-1", "call-2"] {
+        let output = responses
+            .function_call_output_text(call_id)
+            .expect("missing exec output");
+        assert!(output.contains("Process exited with code 0"), "{output}");
+        assert!(output.contains(&format!("Output:\n{call_id}")), "{output}");
+    }
 
     Ok(())
 }
@@ -197,16 +184,16 @@ async fn mixed_parallel_tools_run_in_parallel() -> anyhow::Result<()> {
     })
     .to_string();
     let shell_args = serde_json::to_string(&json!({
-        "command": "sleep 0.25",
+        "cmd": "sleep 0.25",
         // Avoid user-specific shell startup cost in timing assertions.
         "login": false,
-        "timeout_ms": 1_000,
+        "yield_time_ms": 1_000,
     }))?;
 
     let first_response = sse(vec![
         json!({"type": "response.created", "response": {"id": "resp-1"}}),
         ev_function_call("call-1", "test_sync_tool", &sync_args),
-        ev_function_call("call-2", "shell_command", &shell_args),
+        ev_function_call("call-2", "exec_command", &shell_args),
         ev_completed("resp-1"),
     ]);
     let second_response = sse(vec![
@@ -215,8 +202,13 @@ async fn mixed_parallel_tools_run_in_parallel() -> anyhow::Result<()> {
     ]);
     mount_sse_sequence(&server, vec![first_response, second_response]).await;
 
-    let duration = run_turn_and_measure(&test, "mix tools").await?;
-    assert_parallel_duration(duration);
+    let start = Instant::now();
+    run_turn(&test, "mix tools").await?;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1_600),
+        "expected parallel execution to finish quickly, got {elapsed:?}"
+    );
 
     Ok(())
 }
@@ -229,17 +221,17 @@ async fn tool_results_grouped() -> anyhow::Result<()> {
     let test = build_codex_with_test_tool(&server).await?;
 
     let shell_args = serde_json::to_string(&json!({
-        "command": "echo 'shell output'",
-        "timeout_ms": 1_000,
+        "cmd": "echo 'shell output'",
+        "yield_time_ms": 1_000,
     }))?;
 
     mount_sse_once(
         &server,
         sse(vec![
             json!({"type": "response.created", "response": {"id": "resp-1"}}),
-            ev_function_call("call-1", "shell_command", &shell_args),
-            ev_function_call("call-2", "shell_command", &shell_args),
-            ev_function_call("call-3", "shell_command", &shell_args),
+            ev_function_call("call-1", "exec_command", &shell_args),
+            ev_function_call("call-2", "exec_command", &shell_args),
+            ev_function_call("call-3", "exec_command", &shell_args),
             ev_completed("resp-1"),
         ]),
     )
@@ -315,17 +307,17 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
     // Use a non-login shell to avoid slow, user-specific shell init (e.g. zsh profiles)
     // from making this timing-based test flaky.
     let args = json!({
-        "command": command,
+        "cmd": command,
         "login": false,
-        "timeout_ms": 5_000,
+        "yield_time_ms": 5_000,
     });
 
     let first_chunk = sse(vec![
         ev_response_created(first_response_id),
-        ev_shell_command_call_with_args("call-1", &args),
-        ev_shell_command_call_with_args("call-2", &args),
-        ev_shell_command_call_with_args("call-3", &args),
-        ev_shell_command_call_with_args("call-4", &args),
+        ev_exec_command_call_with_args("call-1", &args),
+        ev_exec_command_call_with_args("call-2", &args),
+        ev_exec_command_call_with_args("call-3", &args),
+        ev_exec_command_call_with_args("call-4", &args),
     ]);
     let second_chunk = sse(vec![ev_completed(first_response_id)]);
     let follow_up = sse(vec![
@@ -363,30 +355,27 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.cwd.path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "stream delayed completion".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: session_model,
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let _ = first_gate_tx.send(());

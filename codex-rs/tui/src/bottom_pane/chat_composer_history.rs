@@ -55,8 +55,8 @@ pub(crate) struct HistoryEntry {
 impl HistoryEntry {
     /// Creates a text-only history entry and decodes persisted mention bindings.
     ///
-    /// Persistent history does not store attachment payloads or text-element metadata, so this
-    /// constructor intentionally leaves those fields empty. Local in-session submissions should be
+    /// Persistent history does not store attachments or original element metadata; selected task
+    /// elements are recovered from encoded links. Local in-session submissions should be
     /// recorded with the full `HistoryEntry` value built by the composer; using `new` for a local
     /// image or paste submission would make recall lose placeholder ownership.
     pub(crate) fn new(text: String) -> Self {
@@ -65,9 +65,14 @@ impl HistoryEntry {
 
     pub(crate) fn new_with_at_mentions(text: String, at_mentions_enabled: bool) -> Self {
         let decoded = decode_history_mentions_with_at_mentions(&text, at_mentions_enabled);
+        let text_elements = decoded
+            .task_mention_ranges
+            .into_iter()
+            .map(|range| TextElement::new(range.into(), /*placeholder*/ None))
+            .collect();
         Self {
             text: decoded.text,
-            text_elements: Vec::new(),
+            text_elements,
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
             mention_bindings: decoded
@@ -122,6 +127,7 @@ impl HistoryEntry {
 /// State machine that manages shell-style history navigation (Up/Down) inside
 /// the chat composer. This struct is intentionally decoupled from the
 /// rendering widget so the logic remains isolated and easier to test.
+#[derive(Clone)]
 pub(crate) struct ChatComposerHistory {
     /// Thread that owns persistent lookup responses for this metadata snapshot.
     thread_id: Option<ThreadId>,
@@ -280,20 +286,31 @@ impl ChatComposerHistory {
 
     /// Updates persistent history metadata when a new session is configured.
     ///
-    /// This clears fetched entries, local entries, navigation cursors, and active search state
-    /// because offsets only make sense within one history log snapshot. Reusing old offsets after a
-    /// log-id change would allow a stale async response to hydrate the wrong prompt.
+    /// Startup-local entries survive the first session configuration because they were recorded
+    /// before a thread existed. Later configurations clear local history, while every configuration
+    /// resets fetched entries, navigation cursors, and search state tied to the old history log.
     pub fn set_metadata(&mut self, thread_id: ThreadId, log_id: u64, entry_count: usize) {
-        self.thread_id = Some(thread_id);
+        let had_configured_thread = self.thread_id.replace(thread_id).is_some();
         self.persistent_log_id = Some(log_id);
         self.persistent_entry_count = entry_count;
         self.fetched_history.clear();
-        self.local_history.clear();
+        if had_configured_thread {
+            self.local_history.clear();
+        }
         self.replay_seeded_history.clear();
         self.history_cursor = None;
         self.pending_navigation_direction = None;
         self.last_history_text = None;
         self.search = None;
+    }
+
+    /// Return draft history recorded before the composer became associated with a thread.
+    pub(crate) fn startup_local_history(&self) -> &[HistoryEntry] {
+        if self.thread_id.is_none() {
+            &self.local_history
+        } else {
+            &[]
+        }
     }
 
     /// Records a current-session submission so it can be recalled with full draft metadata.
@@ -332,6 +349,15 @@ impl ChatComposerHistory {
 
         self.local_history.push(entry);
         true
+    }
+
+    /// Track the displayed text when a composer normalizes a recalled entry.
+    pub(super) fn record_recalled_text(&mut self, text: String) {
+        self.last_history_text = Some(text);
+    }
+
+    pub(super) fn is_navigating(&self) -> bool {
+        self.history_cursor.is_some()
     }
 
     /// Resets normal history navigation so the next Up key resumes from the newest entry.
@@ -537,7 +563,7 @@ impl ChatComposerHistory {
                     .map(HistoryEntryResponse::Found)
                     .unwrap_or(HistoryEntryResponse::Ignored);
             }
-            self.last_history_text = Some(entry.text.clone());
+            self.record_recalled_text(entry.text.clone());
             return HistoryEntryResponse::Found(entry);
         }
 
@@ -771,7 +797,7 @@ impl ChatComposerHistory {
 
     fn search_match(&mut self, offset: usize, entry: HistoryEntry) -> HistorySearchResult {
         self.history_cursor = Some(offset as isize);
-        self.last_history_text = Some(entry.text.clone());
+        self.record_recalled_text(entry.text.clone());
         if let Some(search) = self.search.as_mut() {
             search.selected_offset = Some(offset);
             search.record_match(offset, &entry);
@@ -800,7 +826,7 @@ impl ChatComposerHistory {
 
         let history_match = self.search.as_ref()?.unique_matches[next_index].clone();
         self.history_cursor = Some(history_match.offset as isize);
-        self.last_history_text = Some(history_match.entry.text.clone());
+        self.record_recalled_text(history_match.entry.text.clone());
         if let Some(search) = self.search.as_mut() {
             search.select_match(next_index);
         }
@@ -847,7 +873,7 @@ impl ChatComposerHistory {
                     continue;
                 }
                 self.pending_navigation_direction = None;
-                self.last_history_text = Some(entry.text.clone());
+                self.record_recalled_text(entry.text.clone());
                 return Some(entry);
             }
 
@@ -1000,6 +1026,30 @@ mod tests {
             history.local_history.last().unwrap(),
             &HistoryEntry::new("world".to_string())
         );
+    }
+
+    #[test]
+    fn initial_metadata_preserves_startup_history_but_session_changes_clear_it() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let mut history = ChatComposerHistory::new();
+        let startup_entry = HistoryEntry::new("cleared during startup".to_string());
+        history.record_local_submission(startup_entry.clone());
+
+        assert_eq!(
+            history.startup_local_history(),
+            std::slice::from_ref(&startup_entry)
+        );
+
+        history.set_metadata(test_thread_id(), /*log_id*/ 1, /*entry_count*/ 0);
+
+        assert!(history.startup_local_history().is_empty());
+        assert_eq!(history.navigate_up(&tx), Some(startup_entry));
+
+        history.record_local_submission(HistoryEntry::new("thread-owned draft".to_string()));
+        history.set_metadata(ThreadId::new(), /*log_id*/ 2, /*entry_count*/ 0);
+
+        assert_eq!(history.navigate_up(&tx), None);
     }
 
     #[test]
@@ -1555,7 +1605,7 @@ mod tests {
         );
 
         history.reset_navigation();
-        assert!(history.history_cursor.is_none());
+        assert!(!history.is_navigating());
         assert!(history.last_history_text.is_none());
 
         assert_eq!(

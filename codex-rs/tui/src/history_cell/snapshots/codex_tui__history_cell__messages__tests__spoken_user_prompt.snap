@@ -1,0 +1,18 @@
+---
+source: tui/src/history_cell/messages_tests.rs
+expression: "format!(\"{buf:?}\")"
+---
+Buffer {
+    area: Rect { x: 0, y: 0, width: 40, height: 3 },
+    content: [
+        "                                        ",
+        "› hello from voice                      ",
+        "                                        ",
+    ],
+    styles: [
+        x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+        x: 0, y: 1, fg: Red, bg: Rgb(68, 68, 68), underline: Reset, modifier: BOLD,
+        x: 2, y: 1, fg: Rgb(238, 238, 238), bg: Rgb(68, 68, 68), underline: Reset, modifier: NONE,
+        x: 18, y: 1, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+    ]
+}

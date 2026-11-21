@@ -29,9 +29,13 @@ pub const MAX_DIMENSION: u32 = 2048;
 /// This is a high sanity guard against pathological inputs, not a protocol
 /// requirement or target upload size.
 pub const MAX_PROMPT_IMAGE_INPUT_BYTES: usize = 1024 * 1024 * 1024;
+/// Use the same byte limit for input and output so a saved image fits on replay.
+/// At the pixel limit, 16-bit RGBA uses 81,920,000 bytes. Round up for PNG overhead.
+pub const MAX_SANITIZED_IMAGE_BYTES: usize = 79 * 1024 * 1024;
 const MAX_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 pub mod error;
+mod sanitizer;
 
 pub use crate::error::ImageProcessingError;
 
@@ -39,6 +43,8 @@ pub use crate::error::ImageProcessingError;
 pub struct EncodedImage {
     pub bytes: Arc<[u8]>,
     pub mime: String,
+    pub source_width: u32,
+    pub source_height: u32,
     pub width: u32,
     pub height: u32,
 }
@@ -62,10 +68,30 @@ pub enum PromptImageMode {
     ResizeWithLimits(PromptImageResizeLimits),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PromptImageDecoder {
+    #[default]
+    Legacy,
+    Sanitizer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PromptImageResizeLimits {
     pub max_dimension: u32,
     pub max_patches: usize,
+}
+
+impl PromptImageMode {
+    /// Resize policy for high-detail prompt images.
+    pub const HIGH_DETAIL: Self = Self::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 2048,
+        max_patches: 2_500,
+    });
+    /// Resize policy for original-detail prompt images.
+    pub const ORIGINAL_DETAIL: Self = Self::ResizeWithLimits(PromptImageResizeLimits {
+        max_dimension: 6000,
+        max_patches: 10_000,
+    });
 }
 
 struct ImageMetadata {
@@ -77,6 +103,7 @@ struct ImageMetadata {
 struct ImageCacheKey {
     digest: [u8; 20],
     mode: PromptImageMode,
+    decoder: PromptImageDecoder,
 }
 
 type ImageCache = BlockingLruCache<ImageCacheKey, EncodedImage>;
@@ -89,18 +116,41 @@ pub fn load_for_prompt_bytes(
     file_bytes: Vec<u8>,
     mode: PromptImageMode,
 ) -> Result<EncodedImage, ImageProcessingError> {
-    let path_buf = path.to_path_buf();
+    load_for_prompt_bytes_with_decoder(path, file_bytes, mode, PromptImageDecoder::Legacy)
+}
 
+fn load_for_prompt_bytes_with_decoder(
+    path: &Path,
+    file_bytes: Vec<u8>,
+    mode: PromptImageMode,
+    decoder: PromptImageDecoder,
+) -> Result<EncodedImage, ImageProcessingError> {
     let key = ImageCacheKey {
         digest: sha1_digest(&file_bytes),
         mode,
+        decoder,
     };
 
     if let Some(image) = IMAGE_CACHE.get(&key) {
         return Ok(image);
     }
 
-    let image = (move || {
+    let image = load_for_prompt_bytes_uncached(path, file_bytes, mode, decoder)?;
+    cache_image(&IMAGE_CACHE, key, image.clone(), MAX_IMAGE_CACHE_BYTES);
+    Ok(image)
+}
+
+fn load_for_prompt_bytes_uncached(
+    path: &Path,
+    file_bytes: Vec<u8>,
+    mode: PromptImageMode,
+    decoder: PromptImageDecoder,
+) -> Result<EncodedImage, ImageProcessingError> {
+    if decoder == PromptImageDecoder::Sanitizer {
+        return sanitizer::sanitize(path, &file_bytes, mode);
+    }
+    let path_buf = path.to_path_buf();
+    (move || {
         let guessed_format = image::guess_format(&file_bytes)
             .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
         let format = match guessed_format {
@@ -133,26 +183,7 @@ pub fn load_for_prompt_bytes(
 
         let (width, height) = dynamic.dimensions();
 
-        let target_dimensions = match mode {
-            PromptImageMode::ResizeToFit if width > MAX_DIMENSION || height > MAX_DIMENSION => {
-                let resized = dynamic.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle);
-                Some((resized.width(), resized.height(), resized))
-            }
-            PromptImageMode::ResizeWithLimits(limits) => {
-                let (target_width, target_height) =
-                    prompt_image_output_dimensions_for_limits(width, height, limits);
-                if (target_width, target_height) == (width, height) {
-                    None
-                } else {
-                    let resized =
-                        dynamic.resize_exact(target_width, target_height, FilterType::Triangle);
-                    Some((target_width, target_height, resized))
-                }
-            }
-            PromptImageMode::ResizeToFit | PromptImageMode::Original => None,
-        };
-
-        let encoded = if let Some((width, height, resized)) = target_dimensions {
+        let encoded = if let Some(resized) = resize_for_prompt(&dynamic, mode) {
             let target_format = format
                 .filter(|format| can_preserve_source_bytes(*format))
                 .unwrap_or(ImageFormat::Png);
@@ -161,8 +192,10 @@ pub fn load_for_prompt_bytes(
             EncodedImage {
                 bytes: bytes.into(),
                 mime,
-                width,
-                height,
+                source_width: width,
+                source_height: height,
+                width: resized.width(),
+                height: resized.height(),
             }
         } else {
             if let Some(format) = format.filter(|format| can_preserve_source_bytes(*format)) {
@@ -170,6 +203,8 @@ pub fn load_for_prompt_bytes(
                 EncodedImage {
                     bytes: file_bytes.into(),
                     mime,
+                    source_width: width,
+                    source_height: height,
                     width,
                     height,
                 }
@@ -179,6 +214,8 @@ pub fn load_for_prompt_bytes(
                 EncodedImage {
                     bytes: bytes.into(),
                     mime,
+                    source_width: width,
+                    source_height: height,
                     width,
                     height,
                 }
@@ -186,10 +223,7 @@ pub fn load_for_prompt_bytes(
         };
 
         Ok(encoded)
-    })()?;
-
-    cache_image(&IMAGE_CACHE, key, image.clone(), MAX_IMAGE_CACHE_BYTES);
-    Ok(image)
+    })()
 }
 
 fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte_capacity: usize) {
@@ -215,7 +249,25 @@ fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte
 pub fn load_data_url_for_prompt(
     image_url: &str,
     mode: PromptImageMode,
+    decoder: PromptImageDecoder,
 ) -> Result<EncodedImage, ImageProcessingError> {
+    let bytes = decode_data_url(image_url, decoder)?;
+    load_for_prompt_bytes_with_decoder(Path::new("<data-url-image>"), bytes, mode, decoder)
+}
+
+pub fn load_data_url_for_prompt_uncached(
+    image_url: &str,
+    mode: PromptImageMode,
+    decoder: PromptImageDecoder,
+) -> Result<EncodedImage, ImageProcessingError> {
+    let bytes = decode_data_url(image_url, decoder)?;
+    load_for_prompt_bytes_uncached(Path::new("<data-url-image>"), bytes, mode, decoder)
+}
+
+fn decode_data_url(
+    image_url: &str,
+    decoder: PromptImageDecoder,
+) -> Result<Vec<u8>, ImageProcessingError> {
     let rest = image_url
         .get(..DATA_URL_PREFIX.len())
         .filter(|prefix| prefix.eq_ignore_ascii_case(DATA_URL_PREFIX))
@@ -237,11 +289,18 @@ pub fn load_data_url_for_prompt(
         });
     }
 
-    if encoded.len() > MAX_PROMPT_IMAGE_INPUT_BYTES {
+    let (max_bytes, max_base64_bytes) = match decoder {
+        PromptImageDecoder::Legacy => (MAX_PROMPT_IMAGE_INPUT_BYTES, MAX_PROMPT_IMAGE_INPUT_BYTES),
+        PromptImageDecoder::Sanitizer => (
+            MAX_SANITIZED_IMAGE_BYTES,
+            MAX_SANITIZED_IMAGE_BYTES.div_ceil(3) * 4,
+        ),
+    };
+    if encoded.len() > max_base64_bytes {
         return Err(ImageProcessingError::ImageTooLarge {
             representation: "base64 payload",
             size: encoded.len(),
-            max: MAX_PROMPT_IMAGE_INPUT_BYTES,
+            max: max_base64_bytes,
         });
     }
     let file_bytes =
@@ -250,15 +309,33 @@ pub fn load_data_url_for_prompt(
             .map_err(|source| ImageProcessingError::InvalidDataUrl {
                 reason: format!("invalid base64 payload: {source}"),
             })?;
-    if file_bytes.len() > MAX_PROMPT_IMAGE_INPUT_BYTES {
+    if file_bytes.len() > max_bytes {
         return Err(ImageProcessingError::ImageTooLarge {
             representation: "decoded input",
             size: file_bytes.len(),
-            max: MAX_PROMPT_IMAGE_INPUT_BYTES,
+            max: max_bytes,
         });
     }
 
-    load_for_prompt_bytes(Path::new("<data-url-image>"), file_bytes, mode)
+    Ok(file_bytes)
+}
+
+fn resize_for_prompt(image: &DynamicImage, mode: PromptImageMode) -> Option<DynamicImage> {
+    let (width, height) = image.dimensions();
+    match mode {
+        PromptImageMode::ResizeToFit if width > MAX_DIMENSION || height > MAX_DIMENSION => {
+            Some(image.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle))
+        }
+        PromptImageMode::ResizeWithLimits(limits) => {
+            let (target_width, target_height) =
+                prompt_image_output_dimensions_for_limits(width, height, limits);
+            if (target_width, target_height) == (width, height) {
+                return None;
+            }
+            Some(image.resize_exact(target_width, target_height, FilterType::Triangle))
+        }
+        PromptImageMode::ResizeToFit | PromptImageMode::Original => None,
+    }
 }
 
 fn prompt_image_output_dimensions_for_limits(

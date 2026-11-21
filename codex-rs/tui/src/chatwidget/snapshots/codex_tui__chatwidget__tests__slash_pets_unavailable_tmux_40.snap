@@ -1,0 +1,15 @@
+---
+source: tui/src/chatwidget/tests/slash_commands.rs
+assertion_line: 3212
+expression: "render_bottom_popup(&chat, 40)"
+---
+  Pets unavailable
+  Pets are unavailable in this tmux
+  pane. Use fullscreen Codex with
+  allow-passthrough all, or run Codex
+  outside tmux.
+
+
+› 1. Close
+
+  enter select · esc back

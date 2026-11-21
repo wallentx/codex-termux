@@ -1,6 +1,11 @@
+use anyhow::Context;
+use anyhow::Result;
+use std::fs::File;
 use std::io::Write;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use codex_utils_string::take_bytes_at_char_boundary;
@@ -11,6 +16,22 @@ const LOG_COMMAND_PREVIEW_LIMIT: usize = 200;
 pub const LOG_FILE_PREFIX: &str = "sandbox";
 pub const LOG_FILE_SUFFIX: &str = "log";
 pub const MAX_LOG_FILES: usize = 90;
+
+// Service provisioning never appends to a caller-controlled existing log entry.
+// An initialized but empty slot also prevents falling back after an open failure.
+static SETUP_LOG: OnceLock<Mutex<Option<(File, OwnedHandle)>>> = OnceLock::new();
+static RUNTIME_LOG: OnceLock<(PathBuf, Mutex<Option<RollingFileAppender>>)> = OnceLock::new();
+
+/// Set the default sandbox log directory for this launcher process.
+pub fn init_runtime_log(codex_home: &Path) {
+    if codex_home.is_absolute() {
+        RUNTIME_LOG.get_or_init(|| {
+            let dir = crate::sandbox_dir(codex_home);
+            let _ = std::fs::create_dir_all(&dir);
+            (dir, Mutex::new(None))
+        });
+    }
+}
 
 fn exe_label() -> &'static str {
     static LABEL: OnceLock<String> = OnceLock::new();
@@ -61,8 +82,57 @@ pub fn log_writer(base_dir: &Path) -> Option<RollingFileAppender> {
         .ok()
 }
 
+/// Opens one fresh log for service provisioning and retains its parent directory.
+/// Subsequent setup diagnostics share this handle instead of reopening a pathname.
+pub fn setup_log_writer(base_dir: &Path) -> Result<File> {
+    let mut log = SETUP_LOG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("setup log lock poisoned"))?;
+    match log.as_ref() {
+        Some((file, _parent)) => file.try_clone().context("clone setup log"),
+        None => {
+            let (file, parent) = crate::file_write::create_temporary_file(base_dir, ".log")?;
+            let writer = file.try_clone().context("clone setup log")?;
+            *log = Some((file, parent));
+            Ok(writer)
+        }
+    }
+}
+
+/// Release setup's retained handles under the setup lock, after its writers finish.
+/// Keep the slot initialized so later diagnostics cannot reopen a caller-controlled path.
+pub(crate) fn release_setup_log() -> Result<()> {
+    if let Some(log) = SETUP_LOG.get() {
+        let mut log = log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("setup log lock poisoned"))?;
+        *log = None;
+    }
+    Ok(())
+}
+
 fn append_line(line: &str, base_dir: Option<&Path>) {
-    if let Some(dir) = base_dir
+    if let Some(log) = SETUP_LOG.get() {
+        if let Ok(mut log) = log.lock()
+            && let Some((file, _parent)) = log.as_mut()
+        {
+            let _ = writeln!(file, "{line}");
+        }
+        return;
+    }
+    if let Some((dir, cache)) = RUNTIME_LOG.get()
+        && base_dir == Some(dir.as_path())
+    {
+        if let Ok(mut cached) = cache.lock() {
+            if cached.is_none() {
+                *cached = log_writer(dir);
+            }
+            if let Some(writer) = cached.as_mut() {
+                let _ = writer.write_all(format!("{line}\n").as_bytes());
+            }
+        }
+    } else if let Some(dir) = base_dir
         && let Some(mut f) = log_writer(dir)
     {
         let _ = writeln!(f, "{line}");
@@ -98,9 +168,64 @@ pub fn log_note(msg: &str, base_dir: Option<&Path>) {
     append_line(&format!("[{ts} {}] {}", exe_label(), msg), base_dir);
 }
 
+/// Log a note in a launcher process configured with a sandbox log directory.
+pub fn log_runtime_note(msg: &str) {
+    if let Some((dir, _)) = RUNTIME_LOG.get() {
+        log_note(msg, Some(dir));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn setup_log_releases_handles_without_path_fallback() {
+        const CHILD_ENV: &str = "CODEX_TEST_SETUP_LOG_RELEASE_CHILD";
+        if std::env::var(CHILD_ENV).ok().as_deref() != Some("1") {
+            // SETUP_LOG is process-global; isolate this test from ordinary daily logging.
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "logging::tests::setup_log_releases_handles_without_path_fallback",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run isolated setup-log test");
+            assert!(output.status.success(), "isolated test failed: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("setup-log release verified"),
+                "isolated test did not run: {output:?}"
+            );
+            return;
+        }
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let directory = tempdir.path().join(".sandbox");
+        std::fs::create_dir(&directory).expect("create sandbox directory");
+        drop(setup_log_writer(&directory).expect("open retained setup log"));
+        let error =
+            std::fs::remove_dir_all(&directory).expect_err("setup handles prevent deletion");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+        );
+
+        release_setup_log().expect("release setup log");
+        std::fs::remove_dir_all(&directory).expect("delete sandbox after releasing handles");
+        std::fs::create_dir(&directory).expect("recreate caller-controlled directory");
+        release_setup_log().expect("repeated release is harmless");
+        log_note("must not reopen the directory", Some(&directory));
+        assert!(
+            std::fs::read_dir(&directory)
+                .expect("read directory")
+                .next()
+                .is_none()
+        );
+        println!("setup-log release verified");
+    }
 
     #[test]
     fn preview_does_not_panic_on_utf8_boundary() {

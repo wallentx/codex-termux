@@ -1,6 +1,7 @@
 use crate::message_processor::ConnectionSessionState;
 use crate::outgoing_message::OutgoingEnvelope;
 use codex_app_server_protocol::ExperimentalApi;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -16,6 +17,7 @@ pub use codex_app_server_transport::AppServerTransport;
 pub(crate) use codex_app_server_transport::CHANNEL_CAPACITY;
 pub(crate) use codex_app_server_transport::ConnectionId;
 pub(crate) use codex_app_server_transport::ConnectionOrigin;
+pub(crate) use codex_app_server_transport::DaemonShutdownAccess;
 pub(crate) use codex_app_server_transport::OutgoingMessage;
 pub(crate) use codex_app_server_transport::QueuedOutgoingMessage;
 pub(crate) use codex_app_server_transport::RemoteControlEnableError;
@@ -28,15 +30,15 @@ pub(crate) use codex_app_server_transport::TransportEvent;
 pub(crate) use codex_app_server_transport::acquire_app_server_startup_lock;
 pub use codex_app_server_transport::app_server_control_socket_path;
 pub(crate) use codex_app_server_transport::app_server_startup_lock_path;
-pub use codex_app_server_transport::auth;
-pub(crate) use codex_app_server_transport::prepare_control_socket_path;
 pub(crate) use codex_app_server_transport::start_control_socket_acceptor;
 pub(crate) use codex_app_server_transport::start_remote_control;
 pub(crate) use codex_app_server_transport::start_stdio_connection;
 pub(crate) use codex_app_server_transport::start_websocket_acceptor;
 pub use codex_app_server_transport::take_remote_control_disabled_env;
+pub use codex_app_server_transport::verified_local_daemon_socket;
 
 pub(crate) struct ConnectionState {
+    pub(crate) origin: ConnectionOrigin,
     pub(crate) outbound_initialized: Arc<AtomicBool>,
     pub(crate) outbound_experimental_api_enabled: Arc<AtomicBool>,
     pub(crate) outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
@@ -45,16 +47,22 @@ pub(crate) struct ConnectionState {
 
 impl ConnectionState {
     pub(crate) fn new(
-        _origin: ConnectionOrigin,
+        origin: ConnectionOrigin,
+        auth: Option<codex_app_server_transport::ConnectionAuth>,
         outbound_initialized: Arc<AtomicBool>,
         outbound_experimental_api_enabled: Arc<AtomicBool>,
         outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
+        let mut session = ConnectionSessionState::new(origin);
+        let mut rpc_gate = crate::connection_rpc_gate::ConnectionRpcGate::new();
+        rpc_gate.auth = auth;
+        session.rpc_gate = Arc::new(rpc_gate);
         Self {
+            origin,
             outbound_initialized,
             outbound_experimental_api_enabled,
             outbound_opted_out_notification_methods,
-            session: Arc::new(ConnectionSessionState::new()),
+            session: Arc::new(session),
         }
     }
 }
@@ -147,11 +155,25 @@ async fn send_message_to_connection(
     }
 
     let writer = connection_state.writer.clone();
+    let optional_progress = matches!(
+        &message,
+        OutgoingMessage::AppServerNotification(envelope)
+            if matches!(&envelope.notification, ServerNotification::ThreadSearchPartial(_))
+    );
     let queued_message = QueuedOutgoingMessage {
         message,
         write_complete_tx,
     };
-    if connection_state.can_disconnect() {
+    if optional_progress {
+        // Keep room for the required response that follows optional progress.
+        if writer.capacity() <= 1 {
+            return false;
+        }
+        if let Err(mpsc::error::TrySendError::Closed(_)) = writer.try_send(queued_message) {
+            return disconnect_connection(connections, connection_id);
+        }
+        false
+    } else if connection_state.can_disconnect() {
         match writer.try_send(queued_message) {
             Ok(()) => false,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -223,11 +245,12 @@ pub(crate) async fn route_outgoing_envelope(
                 })
                 .collect();
 
-            for connection_id in target_connections {
+            let messages = std::iter::repeat_n(message, target_connections.len());
+            for (connection_id, message) in target_connections.into_iter().zip(messages) {
                 let _ = send_message_to_connection(
                     connections,
                     connection_id,
-                    message.clone(),
+                    message,
                     /*write_complete_tx*/ None,
                 )
                 .await;

@@ -10,15 +10,20 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod cwd_junction;
+#[cfg(test)]
+#[path = "win/input_loop_tests.rs"]
+mod input_loop_tests;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_utils_pty::JobObject;
 use codex_windows_sandbox::ConsoleMode;
 use codex_windows_sandbox::ErrorPayload;
 use codex_windows_sandbox::ErrorStage;
 use codex_windows_sandbox::ExitPayload;
 use codex_windows_sandbox::FramedMessage;
 use codex_windows_sandbox::IPC_PROTOCOL_VERSION;
+use codex_windows_sandbox::LaunchDesktop;
 use codex_windows_sandbox::LocalSid;
 use codex_windows_sandbox::Message;
 use codex_windows_sandbox::OutputPayload;
@@ -46,7 +51,10 @@ use codex_windows_sandbox::token_mode_for_permission_profile;
 use codex_windows_sandbox::write_frame;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::os::windows::io::AsHandle;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
@@ -62,13 +70,8 @@ use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::System::Console::COORD;
+use windows_sys::Win32::System::Console::HPCON;
 use windows_sys::Win32::System::Console::ResizePseudoConsole;
-use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
-use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
-use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
-use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::GetProcessId;
 use windows_sys::Win32::System::Threading::INFINITE;
@@ -78,22 +81,27 @@ use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::TerminateProcess;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-// Kept in sync with codex_exec_server::CODEX_FS_HELPER_ARG1 without introducing
-// a dependency cycle.
-const FS_HELPER_ARG: &str = "--codex-run-as-fs-helper";
 const READ_ACL_MUTEX_NAME: &str = "Local\\CodexSandboxReadAcl";
+const TERMINATION_WAIT_MS: u32 = 5_000;
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
 
 struct IpcSpawnedProcess {
     log_dir: PathBuf,
     pi: PROCESS_INFORMATION,
+    job: Arc<JobObject>,
     stdout_handle: HANDLE,
     stderr_handle: HANDLE,
     stdin_handle: Option<HANDLE>,
     conpty_owner: Option<codex_windows_sandbox::ConptyInstance>,
-    hpc_handle: Option<HANDLE>,
+    hpc_handle: Option<HPCON>,
     _pipe_handles: Option<PipeSpawnHandles>,
 }
+
+struct NonOwningProcessHandle(HANDLE);
+
+// SAFETY: Process handles are opaque process-wide tokens that may be used from
+// any thread. This wrapper does not own the handle or extend its lifetime.
+unsafe impl Send for NonOwningProcessHandle {}
 
 /// Small RAII wrapper for raw Win32 handles.
 ///
@@ -115,38 +123,19 @@ impl OwnedWinHandle {
         // Transfer ownership to the caller. After this point the caller is responsible for
         // eventually closing the returned HANDLE.
         let handle = self.0;
-        self.0 = 0;
+        self.0 = std::ptr::null_mut();
         handle
     }
 }
 
 impl Drop for OwnedWinHandle {
     fn drop(&mut self) {
-        if self.0 != 0 && self.0 != INVALID_HANDLE_VALUE {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
             unsafe {
                 CloseHandle(self.0);
             }
         }
     }
-}
-
-unsafe fn create_job_kill_on_close() -> Result<HANDLE> {
-    let h_job = OwnedWinHandle::new(CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()));
-    if h_job.raw() == 0 {
-        return Err(anyhow::anyhow!("CreateJobObjectW failed"));
-    }
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let ok = SetInformationJobObject(
-        h_job.raw(),
-        JobObjectExtendedLimitInformation,
-        &mut limits as *mut _ as *mut _,
-        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-    );
-    if ok == 0 {
-        return Err(anyhow::anyhow!("SetInformationJobObject failed"));
-    }
-    Ok(h_job.into_raw())
 }
 
 /// Open a named pipe created by the parent process.
@@ -160,7 +149,7 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
             std::ptr::null_mut(),
             OPEN_EXISTING,
             0,
-            0,
+            std::ptr::null_mut(),
         )
     };
     if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
@@ -219,7 +208,7 @@ fn read_spawn_request(reader: &mut File) -> Result<SpawnRequest> {
 fn read_acl_mutex_exists() -> Result<bool> {
     let name = to_wide(OsStr::new(READ_ACL_MUTEX_NAME));
     let handle = unsafe { OpenMutexW(MUTEX_ALL_ACCESS, 0, name.as_ptr()) };
-    if handle == 0 {
+    if handle.is_null() {
         let err = unsafe { GetLastError() };
         if err == ERROR_FILE_NOT_FOUND {
             return Ok(false);
@@ -273,22 +262,42 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     if cap_psids.is_empty() {
         anyhow::bail!("runner: empty capability SID list");
     }
+    let network_proxy_restricting_sid = req
+        .network_proxy_restricting_sid
+        .as_deref()
+        .map(LocalSid::from_string)
+        .transpose()
+        .context("ConvertStringSidToSidW failed for network proxy restricting SID")?;
 
     // The token helpers still take raw SID pointers, but we keep ownership in `LocalSid`
     // wrappers for as long as possible. That way any failure after SID parsing but before the
     // child is fully spawned still releases the backing LocalAlloc memory automatically.
     let cap_psid_ptrs: Vec<*mut _> = cap_psids.iter().map(LocalSid::as_ptr).collect();
+    let additional_restricting_sid_ptrs: Vec<*mut _> = network_proxy_restricting_sid
+        .iter()
+        .map(LocalSid::as_ptr)
+        .collect();
     let base = OwnedWinHandle::new(unsafe { get_current_token_for_restriction()? });
-    let h_token = OwnedWinHandle::new(unsafe {
+    let h_token = unsafe {
         match token_mode {
             WindowsSandboxTokenMode::ReadOnlyCapability => {
-                create_readonly_token_with_caps_and_user_from(base.raw(), &cap_psid_ptrs)
+                create_readonly_token_with_caps_and_user_from(
+                    base.raw(),
+                    &cap_psid_ptrs,
+                    &additional_restricting_sid_ptrs,
+                )
             }
             WindowsSandboxTokenMode::WritableRootsCapability => {
-                create_workspace_write_token_with_caps_and_user_from(base.raw(), &cap_psid_ptrs)
+                create_workspace_write_token_with_caps_and_user_from(
+                    base.raw(),
+                    &cap_psid_ptrs,
+                    &additional_restricting_sid_ptrs,
+                )
             }
         }
-    }?);
+    }?;
+    // SAFETY: Both token helpers transfer ownership of the returned handle to the caller.
+    let h_token = unsafe { OwnedHandle::from_raw_handle(h_token) };
     unsafe {
         // These ACL adjustments need the raw SID values, but ownership stays with `cap_psids`.
         // We do not manually `LocalFree` anything here; the wrappers handle every return path.
@@ -299,19 +308,26 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     }
 
     let effective_cwd = effective_cwd(&req.cwd, Some(log_dir.as_path()));
+    let desktop = LaunchDesktop::open_private(
+        req.private_desktop_name
+            .as_deref()
+            .context("runner: missing parent-owned private desktop")?,
+    )?;
 
     let mut conpty_owner = None;
-    let mut hpc_handle: Option<HANDLE> = None;
+    let mut hpc_handle: Option<HPCON> = None;
     let mut pipe_handles = None;
-    let (pi, stdout_handle, stderr_handle, stdin_handle) = if req.tty {
+    let (pi, job, stdout_handle, stderr_handle, stdin_handle) = if req.tty {
         let (pi, mut conpty) = codex_windows_sandbox::spawn_conpty_process_as_user(
-            h_token.raw(),
+            h_token.as_handle(),
             &req.command,
             &effective_cwd,
             &req.env,
-            req.use_private_desktop,
-            Some(log_dir.as_path()),
+            desktop,
         )?;
+        let job = conpty
+            .job()
+            .context("spawned ConPTY is missing its process job")?;
         hpc_handle = conpty.raw_handle();
         let input_write = conpty.take_input_write();
         let output_read = conpty.take_output_read();
@@ -326,6 +342,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         };
         (
             pi,
+            job,
             output_read,
             windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
             stdin_handle,
@@ -337,18 +354,14 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
             StdinMode::Closed
         };
         let spawned_pipes: PipeSpawnHandles = spawn_process_with_pipes(
-            h_token.raw(),
+            h_token.as_handle(),
             &req.command,
             &effective_cwd,
             &req.env,
             stdin_mode,
             StderrMode::Separate,
-            if req.command.get(1).is_some_and(|arg| arg == FS_HELPER_ARG) {
-                ConsoleMode::NoWindow
-            } else {
-                ConsoleMode::Inherit
-            },
-            req.use_private_desktop,
+            ConsoleMode::NoWindow,
+            desktop,
             Some(log_dir.as_path()),
         )?;
         let pi = spawned_pipes.process;
@@ -357,12 +370,14 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
             .stderr_read
             .unwrap_or(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
         let stdin_handle = spawned_pipes.stdin_write;
+        let job = spawned_pipes.job();
         pipe_handles = Some(spawned_pipes);
-        (pi, stdout_handle, stderr_handle, stdin_handle)
+        (pi, job, stdout_handle, stderr_handle, stdin_handle)
     };
     Ok(IpcSpawnedProcess {
         log_dir,
         pi,
+        job,
         stdout_handle,
         stderr_handle,
         stdin_handle,
@@ -379,6 +394,8 @@ fn spawn_output_reader(
     stream: OutputStream,
     log_dir: Option<PathBuf>,
 ) -> std::thread::JoinHandle<()> {
+    // SAFETY: The spawn path transfers this pipe's read end to the reader.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     read_handle_loop(handle, move |chunk| {
         let msg = FramedMessage {
             version: IPC_PROTOCOL_VERSION,
@@ -400,28 +417,54 @@ fn spawn_output_reader(
     })
 }
 
+fn terminate_job_or_process(
+    job: &JobObject,
+    process: &NonOwningProcessHandle,
+    log_dir: Option<&Path>,
+) {
+    if let Err(job_err) = job.terminate() {
+        log_note(
+            &format!("runner failed to terminate process tree: {job_err}"),
+            log_dir,
+        );
+        if unsafe { TerminateProcess(process.0, 1) } == 0 {
+            log_note(
+                &format!("runner failed to terminate root process: {}", unsafe {
+                    GetLastError()
+                }),
+                log_dir,
+            );
+        }
+    }
+}
+
 /// Read stdin/terminate frames and forward to the child process.
 fn spawn_input_loop(
     mut reader: File,
     stdin_handle: Option<HANDLE>,
-    hpc_handle: Arc<StdMutex<Option<HANDLE>>>,
-    process_handle: Arc<StdMutex<Option<HANDLE>>>,
+    hpc_handle: Arc<StdMutex<Option<HPCON>>>,
+    job: Arc<JobObject>,
+    process: NonOwningProcessHandle,
     log_dir: Option<PathBuf>,
 ) -> std::thread::JoinHandle<()> {
+    // SAFETY: The spawn path transfers the pipe's write end to this input loop.
+    let stdin_handle = stdin_handle.map(|handle| unsafe { OwnedHandle::from_raw_handle(handle) });
     std::thread::spawn(move || {
         let mut stdin_handle = stdin_handle;
         loop {
             let msg = match read_frame(&mut reader) {
                 Ok(Some(v)) => v,
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) | Err(_) => {
+                    terminate_job_or_process(&job, &process, log_dir.as_deref());
+                    break;
+                }
             };
             match msg.message {
                 Message::Stdin { payload } => {
                     let Ok(bytes) = decode_bytes(&payload.data_b64) else {
                         continue;
                     };
-                    if let Some(handle) = stdin_handle {
+                    if let Some(handle) = &stdin_handle {
                         let mut offset = 0usize;
                         // `WriteFile` can report success after consuming only part of the buffer
                         // when the target is a pipe. Treat this like a normal partial write and
@@ -437,7 +480,7 @@ fn spawn_input_loop(
                             let mut written = 0u32;
                             let ok = unsafe {
                                 windows_sys::Win32::Storage::FileSystem::WriteFile(
-                                    handle,
+                                    handle.as_raw_handle(),
                                     chunk.as_ptr(),
                                     chunk_len as u32,
                                     &mut written,
@@ -452,9 +495,6 @@ fn spawn_input_loop(
                                     ),
                                     log_dir.as_deref(),
                                 );
-                                unsafe {
-                                    CloseHandle(handle);
-                                }
                                 stdin_handle = None;
                                 break;
                             }
@@ -463,9 +503,6 @@ fn spawn_input_loop(
                                     "runner stdin write made no progress; closing child stdin",
                                     log_dir.as_deref(),
                                 );
-                                unsafe {
-                                    CloseHandle(handle);
-                                }
                                 stdin_handle = None;
                                 break;
                             }
@@ -474,11 +511,7 @@ fn spawn_input_loop(
                     }
                 }
                 Message::CloseStdin { .. } => {
-                    if let Some(handle) = stdin_handle.take() {
-                        unsafe {
-                            CloseHandle(handle);
-                        }
-                    }
+                    drop(stdin_handle.take());
                 }
                 Message::Resize {
                     payload: ResizePayload { rows, cols },
@@ -498,24 +531,13 @@ fn spawn_input_loop(
                     }
                 }
                 Message::Terminate { .. } => {
-                    if let Ok(guard) = process_handle.lock()
-                        && let Some(handle) = guard.as_ref()
-                    {
-                        unsafe {
-                            let _ = TerminateProcess(*handle, 1);
-                        }
-                    }
+                    terminate_job_or_process(&job, &process, log_dir.as_deref());
                 }
                 Message::SpawnRequest { .. } => {}
                 Message::SpawnReady { .. } => {}
                 Message::Output { .. } => {}
                 Message::Exit { .. } => {}
                 Message::Error { .. } => {}
-            }
-        }
-        if let Some(handle) = stdin_handle {
-            unsafe {
-                CloseHandle(handle);
             }
         }
     })
@@ -579,18 +601,10 @@ pub fn main() -> Result<()> {
     let pi = ipc_spawn.pi;
     let stdout_handle = ipc_spawn.stdout_handle;
     let stderr_handle = ipc_spawn.stderr_handle;
+    let job = Arc::clone(&ipc_spawn.job);
     let mut conpty_owner = ipc_spawn.conpty_owner;
     let stdin_handle = ipc_spawn.stdin_handle;
     let hpc_handle = Arc::new(StdMutex::new(ipc_spawn.hpc_handle));
-
-    let h_job = unsafe { create_job_kill_on_close().ok() };
-    if let Some(job) = h_job {
-        unsafe {
-            let _ = AssignProcessToJobObject(job, pi.hProcess);
-        }
-    }
-
-    let process_handle = Arc::new(StdMutex::new(Some(pi.hProcess)));
 
     let msg = FramedMessage {
         version: IPC_PROTOCOL_VERSION,
@@ -635,32 +649,50 @@ pub fn main() -> Result<()> {
         pipe_read,
         stdin_handle,
         Arc::clone(&hpc_handle),
-        Arc::clone(&process_handle),
+        Arc::clone(&job),
+        NonOwningProcessHandle(pi.hProcess),
         log_dir_owned,
     );
 
     let timeout = req.timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
     let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
     let timed_out = wait_res == WAIT_TIMEOUT;
+    let child_stopped = if timed_out {
+        terminate_job_or_process(&job, &NonOwningProcessHandle(pi.hProcess), log_dir);
+        let termination_wait = unsafe { WaitForSingleObject(pi.hProcess, TERMINATION_WAIT_MS) };
+        if termination_wait == WAIT_TIMEOUT {
+            log_note(
+                "runner root process did not exit after termination",
+                log_dir,
+            );
+            false
+        } else {
+            true
+        }
+    } else {
+        if let Err(err) = job.preserve_descendants() {
+            log_note(
+                &format!("runner failed to preserve descendants after root exit: {err}"),
+                log_dir,
+            );
+        }
+        true
+    };
 
     let exit_code: i32;
     unsafe {
         if timed_out {
-            let _ = TerminateProcess(pi.hProcess, 1);
             exit_code = 128 + 64;
         } else {
             let mut raw_exit: u32 = 1;
             GetExitCodeProcess(pi.hProcess, &mut raw_exit);
             exit_code = raw_exit as i32;
         }
-        if pi.hThread != 0 {
+        if !pi.hThread.is_null() {
             CloseHandle(pi.hThread);
         }
-        if pi.hProcess != 0 {
+        if !pi.hProcess.is_null() {
             CloseHandle(pi.hProcess);
-        }
-        if let Some(job) = h_job {
-            CloseHandle(job);
         }
     }
 
@@ -669,9 +701,15 @@ pub fn main() -> Result<()> {
     }
     drop(conpty_owner.take());
 
-    let _ = out_thread.join();
-    if let Some(thread) = err_thread {
-        let _ = thread.join();
+    if child_stopped {
+        if out_thread.join().is_err() {
+            log_note("runner stdout reader thread panicked", log_dir);
+        }
+        if let Some(thread) = err_thread
+            && thread.join().is_err()
+        {
+            log_note("runner stderr reader thread panicked", log_dir);
+        }
     }
 
     let exit_msg = FramedMessage {

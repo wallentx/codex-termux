@@ -1,0 +1,59 @@
+---
+source: tui/src/bottom_pane/chat_composer/status_surface_tests.rs
+expression: "states.join(\"\\n---\\n\")"
+---
+
+
+
+
+
+
+
+
+
+› Ask Codex
+
+  MODEL · ~/project · Context 20% used
+  ? for shortcuts                     Plan mode (⇧tab to cycle)
+---
+
+
+
+
+
+
+
+
+
+› Ask Codex
+
+  MODEL · ~/project · Context 20% used
+  Copied selection                   Plan mode (⇧tab to cycle)
+---
+
+
+
+
+
+
+
+
+
+› Ask Codex
+
+  MODEL · ~/project · Context 20% used
+  Ctrl+X waiting for chord           Plan mode (⇧tab to cycle)
+---
+
+
+
+
+
+
+
+
+
+› Continue the task
+
+  MODEL · ~/project · Context 20% used
+  tab to queue message                                Plan mode

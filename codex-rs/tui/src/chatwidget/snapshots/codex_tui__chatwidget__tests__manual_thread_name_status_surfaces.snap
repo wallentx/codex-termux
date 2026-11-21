@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests/app_server.rs
+expression: "normalize_snapshot_paths(format!(\"transcript:\\n{transcript}\\nfooter:\\n{footer}\\ntitle: {title}\"))"
+---
+transcript:
+
+footer:
+› Ask Codex to do anything
+
+  GPT-5.6-Sol default · /tmp/project · review-fix
+  ? for shortcuts
+title: review-fix | project

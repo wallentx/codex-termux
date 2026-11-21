@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::Result;
+use axum::http::HeaderValue;
 use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
 use codex_app_server_protocol::AppsConfig;
@@ -8,9 +9,611 @@ use codex_app_server_protocol::ConfigLayerSource as ApiConfigLayerSource;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_config::test_support::CloudConfigBundleFixture;
+use codex_config::types::OtelExporterKind;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
+
+#[test]
+fn provider_batch_remapping_preserves_ordered_edits() {
+    let initial = serde_json::json!({
+        "features": { "network_proxy": { "credentials": {
+            "a": { "env": ["A_AUTH"], "patterns": ["alpha"], "url_prefixes": ["https://a.example"] },
+            "b": { "env": ["B_AUTH"], "patterns": ["bravo"], "url_prefixes": ["https://b.example"], "auth": ["bearer"] },
+        } } },
+    });
+    let retained = serde_json::json!({
+        "env": ["A_AUTH"], "patterns": ["bravo"], "url_prefixes": ["https://b.example"],
+    });
+    let mut changed_auth = retained.clone();
+    changed_auth["auth"] = serde_json::json!(["token"]);
+    for (path, value, strategy, expected_b) in [
+        (
+            "b.auth",
+            serde_json::json!(["token"]),
+            MergeStrategy::Upsert,
+            changed_auth,
+        ),
+        ("b.auth", JsonValue::Null, MergeStrategy::Replace, retained),
+        (
+            "b",
+            JsonValue::Null,
+            MergeStrategy::Replace,
+            serde_json::json!({ "env": ["A_AUTH"] }),
+        ),
+        (
+            "b",
+            serde_json::json!({ "patterns": ["replacement"], "url_prefixes": ["https://new.example"] }),
+            MergeStrategy::Replace,
+            serde_json::json!({ "env": ["A_AUTH"], "patterns": ["replacement"], "url_prefixes": ["https://new.example"] }),
+        ),
+        (
+            "",
+            JsonValue::Null,
+            MergeStrategy::Replace,
+            serde_json::json!({ "env": ["A_AUTH"] }),
+        ),
+    ] {
+        let mut config: TomlValue = serde_json::from_value(initial.clone()).unwrap();
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join(CONFIG_TOML_FILE);
+        std::fs::write(&file, toml::to_string(&config).unwrap()).unwrap();
+        let mut providers = CredentialProviderEdits::new(&config);
+        let mut persistence = Vec::new();
+        let path = if path.is_empty() {
+            "features.network_proxy.credentials".to_string()
+        } else {
+            format!("features.network_proxy.credentials.{path}")
+        };
+        for (key_path, value, strategy) in [
+            (
+                "features.network_proxy.credentials.a.env",
+                serde_json::json!(["B_AUTH"]),
+                MergeStrategy::Upsert,
+            ),
+            (path.as_str(), value, strategy),
+            (
+                "features.network_proxy.credentials.b.env",
+                serde_json::json!(["A_AUTH"]),
+                MergeStrategy::Upsert,
+            ),
+        ] {
+            persistence.extend(
+                providers
+                    .apply(
+                        &mut config,
+                        &parse_key_path(key_path).unwrap(),
+                        parse_value(value).unwrap().as_ref(),
+                        strategy,
+                    )
+                    .unwrap(),
+            );
+        }
+        persistence.extend(providers.remapping_edits(&config).unwrap());
+        ConfigEditsBuilder::for_config_path(&file)
+            .with_edits(persistence)
+            .apply_blocking()
+            .unwrap();
+        assert_eq!(
+            toml::from_str::<TomlValue>(&std::fs::read_to_string(&file).unwrap()).unwrap(),
+            config
+        );
+        let mut expected = serde_json::json!({ "b": expected_b });
+        if path != "features.network_proxy.credentials" {
+            expected["a"] = initial["features"]["network_proxy"]["credentials"]["a"].clone();
+            expected["a"]["env"] = serde_json::json!(["B_AUTH"]);
+        }
+        assert_eq!(
+            config["features"]["network_proxy"]["credentials"],
+            serde_json::from_value::<TomlValue>(expected).unwrap(),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_edits_preserve_another_writers_sibling_update() -> Result<()> {
+    let initial: TomlValue = toml::from_str(
+        r#"
+[features.network_proxy.credentials.a]
+env = ['A_AUTH']
+patterns = ['^alpha_[a-z]{8}$']
+url_prefixes = ['https://a.example']
+auth = ['bearer']
+[features.network_proxy.credentials.b]
+env = ['B_AUTH']
+patterns = ['^bravo_[a-z]{8}$']
+url_prefixes = ['https://b.example']
+auth = ['bearer']
+[features.network_proxy.credentials.c]
+env = ['C_AUTH']
+patterns = ['^charlie_[a-z]{8}$']
+url_prefixes = ['https://c.example']
+auth = ['bearer']
+"#,
+    )?;
+    for updates in [
+        vec![("a.auth", serde_json::json!(["token"]))],
+        vec![("a.env", serde_json::json!(["C_AUTH"]))],
+        vec![
+            ("a.env", serde_json::json!(["C_AUTH"])),
+            ("c.env", serde_json::json!(["A_AUTH"])),
+        ],
+    ] {
+        let tmp = tempdir()?;
+        let file = tmp.path().join(CONFIG_TOML_FILE);
+        std::fs::write(&file, toml::to_string(&initial)?)?;
+        let mut config = initial.clone();
+        let mut providers = CredentialProviderEdits::new(&config);
+        let mut persistence = Vec::new();
+        for (path, value) in updates {
+            persistence.extend(providers.apply(
+                &mut config,
+                &parse_key_path(&format!("features.network_proxy.credentials.{path}")).unwrap(),
+                parse_value(value).unwrap().as_ref(),
+                MergeStrategy::Upsert,
+            )?);
+        }
+        persistence.extend(providers.remapping_edits(&config)?);
+
+        // W1 has prepared its edits; W2 updates B before W1's persistence reread.
+        ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf())
+            .write_value(ConfigValueWriteParams {
+                file_path: None,
+                key_path: "features.network_proxy.credentials.b.auth".to_string(),
+                value: serde_json::json!(["token"]),
+                merge_strategy: MergeStrategy::Upsert,
+                expected_version: None,
+            })
+            .await?;
+        ConfigEditsBuilder::for_config_path(&file)
+            .with_edits(persistence)
+            .apply()
+            .await?;
+
+        config["features"]["network_proxy"]["credentials"]["b"]["auth"] =
+            TomlValue::Array(vec![TomlValue::String("token".to_string())]);
+        assert_eq!(
+            toml::from_str::<TomlValue>(&std::fs::read_to_string(&file)?)?,
+            config
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn provider_remapping_respects_lower_layer_eviction() -> Result<()> {
+    let tmp = tempdir()?;
+    let file = AbsolutePathBuf::try_from(tmp.path().join(CONFIG_TOML_FILE))?;
+    let complete = |id: &str| -> TomlValue {
+        toml::from_str(&format!(
+            "[features.network_proxy.credentials.{id}]\nenv = ['VENDOR_PASSWORD']\npatterns = ['^pin_[a-z]{{8}}$']\nurl_prefixes = ['https://old.example']\n"
+        )).unwrap()
+    };
+    // The middle layer must not let an evicted definition's fields reappear later.
+    for (lower_id, middle, user, valid, strategy, move_source) in [
+        ("a_working", None, "", false, MergeStrategy::Upsert, false),
+        ("a_working", None, "", false, MergeStrategy::Replace, false),
+        ("z_new", None, "", true, MergeStrategy::Upsert, false),
+        ("z_new", None, "", true, MergeStrategy::Replace, false),
+        (
+            "z_new",
+            Some("a_working"),
+            "",
+            false,
+            MergeStrategy::Upsert,
+            false,
+        ),
+        (
+            "z_new",
+            Some("a_working"),
+            "a_working",
+            false,
+            MergeStrategy::Upsert,
+            false,
+        ),
+        ("a_working", None, "", false, MergeStrategy::Upsert, true),
+        (
+            "a_working",
+            None,
+            "a_working",
+            false,
+            MergeStrategy::Upsert,
+            true,
+        ),
+    ] {
+        let mut user_config = if user.is_empty() {
+            TomlValue::Table(Default::default())
+        } else {
+            complete(user)
+        };
+        let original_user_config = user_config.clone();
+        let mut edits = CredentialProviderEdits::new(&user_config);
+        if move_source {
+            edits
+                .apply(
+                    &mut user_config,
+                    &parse_key_path("features.network_proxy.credentials.a_working.env").unwrap(),
+                    Some(&TomlValue::Array(vec![TomlValue::String(
+                        "OTHER_PASSWORD".into(),
+                    )])),
+                    MergeStrategy::Upsert,
+                )
+                .unwrap();
+        }
+        edits
+            .apply(
+                &mut user_config,
+                &parse_key_path("features.network_proxy.credentials.z_new.env").unwrap(),
+                Some(&TomlValue::Array(vec![TomlValue::String(
+                    "VENDOR_PASSWORD".into(),
+                )])),
+                strategy,
+            )
+            .unwrap();
+        let mut layers = vec![ConfigLayerEntry::new(
+            ConfigLayerSource::System { file: file.clone() },
+            complete(lower_id),
+        )];
+        if let Some(id) = middle {
+            layers.push(ConfigLayerEntry::new(
+                ConfigLayerSource::EnterpriseManaged {
+                    id: "test".into(),
+                    name: "test".into(),
+                },
+                complete(id),
+            ));
+        }
+        layers.push(ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: file.clone(),
+                profile: None,
+            },
+            user_config.clone(),
+        ));
+        let layers = ConfigLayerStack::new(layers, Default::default(), Default::default())?;
+        assert_eq!(
+            edits
+                .validate_remapping(&original_user_config, &user_config, &layers)
+                .is_ok(),
+            valid,
+            "{lower_id} / {middle:?} / {user}",
+        );
+    }
+    for pattern in ["[", "^pin_[a-z]{8}$"] {
+        for reverse in [false, true] {
+            let original = complete("a_working");
+            let mut config = original.clone();
+            let mut edits = CredentialProviderEdits::new(&config);
+            let mut updates = [
+                ("a_working.env", serde_json::json!(["OTHER_PASSWORD"])),
+                ("z_new.patterns", serde_json::json!([pattern])),
+            ];
+            if reverse {
+                updates.reverse();
+            }
+            for (path, value) in updates {
+                edits
+                    .apply(
+                        &mut config,
+                        &parse_key_path(&format!("features.network_proxy.credentials.{path}"))
+                            .unwrap(),
+                        parse_value(value).unwrap().as_ref(),
+                        MergeStrategy::Upsert,
+                    )
+                    .unwrap();
+            }
+            let layers = ConfigLayerStack::new(
+                vec![
+                    ConfigLayerEntry::new(
+                        ConfigLayerSource::System { file: file.clone() },
+                        complete("z_new"),
+                    ),
+                    ConfigLayerEntry::new(
+                        ConfigLayerSource::User {
+                            file: file.clone(),
+                            profile: None,
+                        },
+                        config.clone(),
+                    ),
+                ],
+                Default::default(),
+                Default::default(),
+            )?;
+            assert_eq!(
+                edits
+                    .validate_remapping(&original, &config, &layers)
+                    .is_ok(),
+                pattern != "[",
+                "{pattern}, reverse={reverse}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn provider_updates_preserve_working_definitions_and_drafts() -> Result<()> {
+    let tmp = tempdir()?;
+    let file = AbsolutePathBuf::try_from(tmp.path().join(CONFIG_TOML_FILE))?;
+    let pattern = "^pin_[a-z]{8}$";
+    for (lower_pattern, initial, path, value, valid, managed_pattern) in [
+        (
+            pattern,
+            serde_json::json!({}),
+            "a.patterns",
+            serde_json::json!(["["]),
+            false,
+            None,
+        ),
+        (
+            pattern,
+            serde_json::json!({}),
+            "a.auth",
+            serde_json::json!(["token"]),
+            true,
+            None,
+        ),
+        (
+            "[",
+            serde_json::json!({"a": {"patterns": [pattern]}}),
+            "a",
+            JsonValue::Null,
+            true,
+            None,
+        ),
+        (
+            pattern,
+            serde_json::json!({"a": {"patterns": ["["]}}),
+            "a.patterns",
+            serde_json::json!(["("]),
+            true,
+            None,
+        ),
+        (
+            pattern,
+            serde_json::json!({"b": {"env": ["NEW_PASSWORD"]}}),
+            "b.patterns",
+            serde_json::json!(["["]),
+            true,
+            None,
+        ),
+        (
+            pattern,
+            serde_json::json!({"b": {"env": ["NEW_PASSWORD"]}}),
+            "b",
+            serde_json::json!({"env": ["NEW_PASSWORD"], "patterns": [pattern]}),
+            true,
+            None,
+        ),
+        (
+            pattern,
+            serde_json::json!({"b": {"env": ["NEW_PASSWORD"]}}),
+            "",
+            serde_json::json!({"b": {"env": ["NEW_PASSWORD"], "patterns": [pattern]}}),
+            true,
+            None,
+        ),
+        (
+            "[",
+            serde_json::json!({"a": {"env": ["VENDOR_PASSWORD"]}}),
+            "a.env",
+            serde_json::json!([]),
+            false,
+            Some(pattern),
+        ),
+    ] {
+        let lower: TomlValue = serde_json::from_value(serde_json::json!({
+            "features": {"network_proxy": {"credentials": {"a": {
+                "env": ["VENDOR_PASSWORD"], "patterns": [lower_pattern],
+                "url_prefixes": ["https://api.vendor.example"],
+            }}}}
+        }))?;
+        let original: TomlValue = serde_json::from_value(serde_json::json!({
+            "features": {"network_proxy": {"credentials": initial}}
+        }))?;
+        let mut config = original.clone();
+        let mut edits = CredentialProviderEdits::new(&config);
+        let key_path = if path.is_empty() {
+            "features.network_proxy.credentials".to_string()
+        } else {
+            format!("features.network_proxy.credentials.{path}")
+        };
+        edits
+            .apply(
+                &mut config,
+                &parse_key_path(&key_path).unwrap(),
+                parse_value(value).unwrap().as_ref(),
+                MergeStrategy::Replace,
+            )
+            .unwrap();
+        let mut layers = vec![
+            ConfigLayerEntry::new(ConfigLayerSource::System { file: file.clone() }, lower),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: file.clone(),
+                    profile: None,
+                },
+                config.clone(),
+            ),
+        ];
+        if let Some(pattern) = managed_pattern {
+            layers.push(ConfigLayerEntry::new(
+                ConfigLayerSource::LegacyManagedConfigTomlFromFile { file: file.clone() },
+                serde_json::from_value(serde_json::json!({"features": {"network_proxy": {"credentials": {"a": {"patterns": [pattern]}}}}}))?,
+            ));
+        }
+        let layers = ConfigLayerStack::new(layers, Default::default(), Default::default())?;
+        assert_eq!(
+            edits
+                .validate_remapping(&original, &config, &layers)
+                .is_ok(),
+            valid,
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn provider_draft_remapping_uses_final_source_ownership() -> Result<()> {
+    let tmp = tempdir()?;
+    let file = AbsolutePathBuf::try_from(tmp.path().join(CONFIG_TOML_FILE))?;
+    let config = |providers| -> TomlValue {
+        serde_json::from_value(serde_json::json!({
+            "features": {"network_proxy": {"credentials": providers}}
+        }))
+        .unwrap()
+    };
+    let complete = serde_json::json!({
+        "env": ["VENDOR_PASSWORD"], "patterns": ["^pin_[a-z]{8}$"],
+        "url_prefixes": ["https://api.vendor.example"],
+    });
+    let lower = config(serde_json::json!({"b": complete}));
+    let inherited_draft = config(serde_json::json!({
+        "a": complete, "b": {"url_prefixes": []},
+    }));
+    let inherited_only_draft = config(serde_json::json!({
+        "b": {"env": ["VENDOR_PASSWORD"]},
+    }));
+    let mut multi_source = serde_json::json!({"a": complete, "c": complete});
+    multi_source["a"]["env"] = serde_json::json!(["VENDOR_PASSWORD", "VENDOR_ALIAS"]);
+    multi_source["c"]["env"] = serde_json::json!(["OTHER_PASSWORD"]);
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for (name, lower, original, updates, strategy, valid) in [
+        (
+            "automatic eviction reveals an inherited draft",
+            inherited_only_draft.clone(),
+            config(multi_source.clone()),
+            vec![("c.env", serde_json::json!(["VENDOR_ALIAS"]))],
+            MergeStrategy::Upsert,
+            false,
+        ),
+        (
+            "explicit deletion after remapping remains allowed",
+            inherited_only_draft.clone(),
+            config(multi_source),
+            vec![
+                ("c.env", serde_json::json!(["VENDOR_ALIAS"])),
+                ("a", JsonValue::Null),
+            ],
+            MergeStrategy::Upsert,
+            true,
+        ),
+        (
+            "inherited-only draft receives the source",
+            inherited_only_draft.clone(),
+            config(serde_json::json!({"a": complete})),
+            vec![("a.env", serde_json::json!(["OTHER_PASSWORD"]))],
+            MergeStrategy::Replace,
+            false,
+        ),
+        (
+            "deletion may reveal an inherited-only draft",
+            inherited_only_draft.clone(),
+            config(serde_json::json!({"a": complete})),
+            vec![("a", JsonValue::Null)],
+            MergeStrategy::Replace,
+            true,
+        ),
+        (
+            "deleting both providers may reveal an inherited draft",
+            inherited_only_draft,
+            config(serde_json::json!({"a": complete, "b": {}})),
+            vec![("a", JsonValue::Null), ("b", JsonValue::Null)],
+            MergeStrategy::Replace,
+            true,
+        ),
+        (
+            "inherited draft receives the source",
+            lower.clone(),
+            inherited_draft.clone(),
+            vec![("a.env", serde_json::json!(["OTHER_PASSWORD"]))],
+            MergeStrategy::Replace,
+            false,
+        ),
+        (
+            "whole provider deletion remains allowed",
+            lower.clone(),
+            inherited_draft.clone(),
+            vec![("a", JsonValue::Null)],
+            MergeStrategy::Replace,
+            true,
+        ),
+        (
+            "deletion with an unchanged draft edit",
+            lower.clone(),
+            inherited_draft.clone(),
+            vec![
+                ("a", JsonValue::Null),
+                ("b.url_prefixes", serde_json::json!([])),
+            ],
+            MergeStrategy::Replace,
+            true,
+        ),
+        (
+            "batch completes the recipient",
+            lower,
+            inherited_draft,
+            vec![
+                ("a.env", serde_json::json!(["OTHER_PASSWORD"])),
+                ("b.url_prefixes", serde_json::json!(["https://new.example"])),
+            ],
+            MergeStrategy::Replace,
+            true,
+        ),
+        (
+            "batch restores the draft source",
+            config(serde_json::json!({})),
+            config(serde_json::json!({"b": {"env": ["DRAFT_PASSWORD"]}})),
+            vec![
+                ("b", serde_json::json!({"patterns": ["^pin_[a-z]{8}$"]})),
+                ("b.env", serde_json::json!(["DRAFT_PASSWORD"])),
+            ],
+            MergeStrategy::Replace,
+            true,
+        ),
+    ] {
+        let mut config = original.clone();
+        let mut edits = CredentialProviderEdits::new(&config);
+        for (path, value) in updates {
+            edits
+                .apply(
+                    &mut config,
+                    &parse_key_path(&format!("features.network_proxy.credentials.{path}")).unwrap(),
+                    parse_value(value).unwrap().as_ref(),
+                    strategy.clone(),
+                )
+                .unwrap();
+        }
+        let layers = ConfigLayerStack::new(
+            vec![
+                ConfigLayerEntry::new(ConfigLayerSource::System { file: file.clone() }, lower),
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::User {
+                        file: file.clone(),
+                        profile: None,
+                    },
+                    config.clone(),
+                ),
+            ],
+            Default::default(),
+            Default::default(),
+        )?;
+        actual.push((
+            name,
+            edits
+                .validate_remapping(&original, &config, &layers)
+                .is_ok(),
+        ));
+        expected.push((name, valid));
+    }
+    assert_eq!(actual, expected);
+    Ok(())
+}
 
 #[test]
 fn toml_value_to_item_handles_nested_config_tables() {
@@ -107,6 +710,49 @@ personality = true
 }
 
 #[tokio::test]
+async fn psp_feature_configures_first_party_routing() -> Result<()> {
+    let tmp = tempdir()?;
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleLoader::default(),
+    );
+
+    let config = service
+        .load_with_overrides(
+            Some(
+                [(
+                    "features".to_string(),
+                    serde_json::json!({ "apps": true, "psp": true }),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Default::default(),
+        )
+        .await?;
+
+    assert!(config.features.enabled(codex_features::Feature::Psp));
+    assert_eq!(
+        config.http_client_factory(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .with_system_proxy_fallback()
+            .with_network_policy(config.application_network_policy.clone())
+            .with_chatgpt_cookies([HeaderValue::from_static("oai-chat-psp=true")])
+    );
+    assert_eq!(
+        config
+            .config_layer_stack
+            .effective_config()
+            .get("features")
+            .and_then(|features| features.get("psp")),
+        Some(&toml::Value::Boolean(true))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn clear_missing_nested_config_is_noop() -> Result<()> {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join(CONFIG_TOML_FILE);
@@ -131,36 +777,25 @@ async fn clear_missing_nested_config_is_noop() -> Result<()> {
 }
 
 #[tokio::test]
-async fn clear_user_value_if_matches_clears_matching_value() -> Result<()> {
-    let tmp = tempdir().expect("tempdir");
+async fn clearing_user_setting_falls_back_to_packaged_default_without_override() -> Result<()> {
+    let tmp = tempdir()?;
     let path = tmp.path().join(CONFIG_TOML_FILE);
-    std::fs::write(&path, "model = \"gpt-5.2\"\napproval_policy = \"never\"\n")?;
+    std::fs::write(&path, "hide_agent_reasoning = true\n")?;
 
     let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
-    service
-        .clear_user_value_if_matches("model", serde_json::json!("gpt-5.2"))
+    let response = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "hide_agent_reasoning".to_string(),
+            value: serde_json::Value::Null,
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
         .await?;
 
-    assert_eq!(
-        std::fs::read_to_string(&path)?,
-        "approval_policy = \"never\"\n"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn clear_user_value_if_matches_preserves_non_matching_value() -> Result<()> {
-    let tmp = tempdir().expect("tempdir");
-    let path = tmp.path().join(CONFIG_TOML_FILE);
-    let original = "model = \"gpt-5.2\"\napproval_policy = \"never\"\n";
-    std::fs::write(&path, original)?;
-
-    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
-    service
-        .clear_user_value_if_matches("model", serde_json::json!("gpt-5.3"))
-        .await?;
-
-    assert_eq!(std::fs::read_to_string(&path)?, original);
+    assert_eq!(response.status, WriteStatus::Ok);
+    assert_eq!(response.overridden_metadata, None);
+    assert_eq!(std::fs::read_to_string(&path)?, "");
     Ok(())
 }
 
@@ -283,6 +918,7 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
             value: serde_json::json!({
                 "app1": {
                     "enabled": false,
+                    "omit_tools_from": ["deferred"],
                 },
             }),
             merge_strategy: MergeStrategy::Replace,
@@ -318,12 +954,16 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
                 "app1".to_string(),
                 AppConfig {
                     enabled: false,
+                    omit_tools_from: Some(vec![
+                        codex_protocol::config_types::ToolExposureSurface::Deferred
+                    ]),
                     approvals_reviewer: None,
                     destructive_enabled: None,
                     open_world_enabled: None,
                     default_tools_approval_mode: Some(AppToolApproval::Prompt),
                     default_tools_enabled: None,
                     tools: None,
+                    links: None,
                 },
             )]),
         })
@@ -549,6 +1189,70 @@ async fn write_value_reports_override() {
 }
 
 #[tokio::test]
+async fn provider_setup_checks_versions_and_provider_write_uses_last_write_wins() -> Result<()> {
+    let tmp = tempdir()?;
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let layers = service.load_config_layers(/*cwd*/ None).await?;
+    let (write, _) = service.prepare_provider_config(
+        &layers,
+        codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID,
+        [("aws.region", Some("us-west-2"))],
+    )?;
+
+    let user_path = tmp.path().join(CONFIG_TOML_FILE);
+    let newer_config = "model = 'newer'";
+    std::fs::write(&user_path, newer_config)?;
+    let error = service.commit_provider_config(write).await.unwrap_err();
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigVersionConflict)
+    );
+    assert_eq!(std::fs::read_to_string(user_path)?, newer_config);
+    // An intervening writer changes both the requested field and an omitted sibling.
+    // The patch wins for the requested field and preserves the newer sibling value.
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        "model = 'before'\n[model_providers.gateway]\nname = 'Before'\nenv_key = 'BEFORE_KEY'",
+    )?;
+    let calls = std::sync::atomic::AtomicUsize::new(/*v*/ 0);
+    let config_path = tmp.path().join(CONFIG_TOML_FILE);
+    let loader = CloudConfigBundleLoader::from_getter(move || {
+        if calls.fetch_add(/*val*/ 1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            std::fs::write(&config_path, "model = 'newer'\n[model_providers.gateway]\nname = 'Another writer'\nenv_key = 'OTHER_KEY'").expect("intervening config write");
+        }
+        std::future::ready(Ok(None))
+    });
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        loader,
+    );
+    let response = service
+        .model_provider_config_write(serde_json::from_value(serde_json::json!({
+            "settings":{"type":"customGateway","providerId":"gateway","name":"Gateway", "baseUrl":"https://gateway.example.test"}
+        }))?)
+        .await?;
+    assert_eq!(
+        serde_json::to_value(response)?,
+        serde_json::json!({"provider": {
+            "id":"gateway", "name":"Gateway", "canEdit":true,
+            "baseUrl":"https://gateway.example.test",
+            "settings":{"type":"customGateway", "auth":{"mode":"environmentVariable", "envKey":"OTHER_KEY"}}
+        }})
+    );
+    let saved: serde_json::Value =
+        toml::from_str(&std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))?)?;
+    assert_eq!(
+        saved,
+        serde_json::json!({"model":"newer", "model_providers":{
+            "gateway":{"name":"Gateway", "base_url":"https://gateway.example.test", "env_key":"OTHER_KEY"}
+        }})
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn version_conflict_rejected() {
     let tmp = tempdir().expect("tempdir");
     let user_path = tmp.path().join(CONFIG_TOML_FILE);
@@ -597,6 +1301,142 @@ async fn write_value_defaults_to_user_config_path() {
 }
 
 #[tokio::test]
+async fn model_provider_settings_use_the_active_profile_layer() -> Result<()> {
+    use codex_app_server_protocol::CustomGatewaySettingsParams;
+    use codex_app_server_protocol::GatewayAuth;
+    use codex_app_server_protocol::ModelProviderConfigWriteParams;
+    use codex_app_server_protocol::ModelProviderListParams;
+    use codex_app_server_protocol::ProviderSettings;
+    use codex_app_server_protocol::ProviderSettingsPatch;
+
+    let home = tempdir()?;
+    let profile = home.path().join("work.config.toml");
+    let system = home.path().join("system.toml");
+    std::fs::write(
+        &system,
+        "model_provider = 'gcp'\n[model_providers.gateway]\nname = 'System'\nenv_key = 'SYSTEM_KEY'",
+    )?;
+    let overrides = LoaderOverrides {
+        system_config_path: Some(system.clone()),
+        user_config_path: Some(AbsolutePathBuf::from_absolute_path(&profile)?),
+        user_config_profile: Some("work".parse()?),
+        ..LoaderOverrides::without_managed_config_for_tests()
+    };
+    let service = |cli_overrides| {
+        ConfigManager::new_for_tests(
+            home.path().to_path_buf(),
+            cli_overrides,
+            overrides.clone(),
+            CloudConfigBundleLoader::default(),
+        )
+    };
+    let manager = service(vec![]);
+    let list = ModelProviderListParams {};
+    let initial = manager.model_provider_list(list.clone()).await?;
+    assert_eq!(initial.default_provider_id, "gcp");
+    assert!(initial.can_change_default);
+
+    std::fs::write(&profile, "model_provider = 'openai'")?;
+    let write = ModelProviderConfigWriteParams {
+        settings: ProviderSettingsPatch::CustomGateway(CustomGatewaySettingsParams {
+            name: Some("Gateway".to_owned()),
+            base_url: Some(Some("https://gateway.example.test".to_owned())),
+            ..Default::default()
+        }),
+    };
+    let created = manager.model_provider_config_write(write).await?;
+    let selected = manager.model_provider_list(list.clone()).await?;
+    assert_eq!(selected.default_provider_id, "openai");
+    assert!(selected.can_change_default);
+    assert!(selected.data[0].can_edit);
+
+    let write = ModelProviderConfigWriteParams {
+        settings: ProviderSettingsPatch::CustomGateway(CustomGatewaySettingsParams {
+            provider_id: Some(created.provider.id.clone()),
+            name: Some("Renamed".to_owned()),
+            ..Default::default()
+        }),
+    };
+    manager.model_provider_config_write(write).await?;
+    let saved: TomlValue = toml::from_str(&std::fs::read_to_string(&profile)?)?;
+    assert_eq!(
+        saved["model_providers"][&created.provider.id]["name"].as_str(),
+        Some("Renamed")
+    );
+    assert!(!home.path().join(CONFIG_TOML_FILE).exists());
+
+    let inherited = |mut settings: serde_json::Value| {
+        settings["type"] = "customGateway".into();
+        settings["providerId"] = "gateway".into();
+        serde_json::from_value(serde_json::json!({"settings":settings}))
+    };
+    let before = std::fs::read_to_string(&profile)?;
+    manager
+        .model_provider_config_write(inherited(serde_json::json!({"baseUrl":null}))?)
+        .await?;
+    assert_eq!(std::fs::read_to_string(&profile)?, before);
+
+    manager
+        .model_provider_config_write(inherited(serde_json::json!({"envKey":"USER_KEY"}))?)
+        .await?;
+    let cleared = manager
+        .model_provider_config_write(inherited(
+            serde_json::json!({"name":"Work", "envKey":null}),
+        )?)
+        .await?;
+    assert_eq!(
+        cleared.provider.settings,
+        ProviderSettings::CustomGateway {
+            auth: GatewayAuth::EnvironmentVariable {
+                env_key: "SYSTEM_KEY".to_owned()
+            }
+        }
+    );
+    let saved: serde_json::Value = toml::from_str(&std::fs::read_to_string(&profile)?)?;
+    assert_eq!(
+        saved["model_providers"]["gateway"],
+        serde_json::json!({"name":"Work"})
+    );
+    let pinned_manager = service(vec![(
+        "model_providers.gateway.env_key".to_owned(),
+        "CLI_KEY".into(),
+    )]);
+    let before = std::fs::read_to_string(&profile)?;
+    let err = pinned_manager
+        .model_provider_config_write(inherited(
+            serde_json::json!({"name":"Must not save", "envKey":"USER_KEY"}),
+        )?)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigLayerReadonly)
+    );
+    assert_eq!(std::fs::read_to_string(&profile)?, before);
+    let renamed = pinned_manager
+        .model_provider_config_write(inherited(serde_json::json!({"name":"Allowed"}))?)
+        .await?;
+    assert_eq!(
+        (renamed.provider.name.as_str(), renamed.provider.settings),
+        (
+            "Allowed",
+            ProviderSettings::CustomGateway {
+                auth: GatewayAuth::EnvironmentVariable {
+                    env_key: "CLI_KEY".to_owned()
+                }
+            }
+        )
+    );
+
+    let pinned = service(vec![("model_provider".to_owned(), "gcp".into())])
+        .model_provider_list(list)
+        .await?;
+    assert_eq!(pinned.default_provider_id, "gcp");
+    assert!(!pinned.can_change_default);
+    Ok(())
+}
+
+#[tokio::test]
 async fn write_value_defaults_to_selected_user_config_path() {
     let tmp = tempdir().expect("tempdir");
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"gpt-main\"").unwrap();
@@ -636,9 +1476,14 @@ async fn write_value_defaults_to_selected_user_config_path() {
 }
 
 #[tokio::test]
-async fn load_default_config_preserves_selected_user_config_path_after_load_error() {
+async fn load_default_config_preserves_managed_requirements_and_selected_user_config_path() {
     let tmp = tempdir().expect("tempdir");
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"gpt-main\"").unwrap();
+    std::fs::write(
+        tmp.path().join("requirements.toml"),
+        "allowed_login_methods = [\"api\"]\nallowed_chatgpt_workspaces = [\"managed-workspace\"]\n",
+    )
+    .unwrap();
     let selected_path = tmp.path().join("work.config.toml");
     std::fs::write(&selected_path, "not valid toml").unwrap();
     let selected_file =
@@ -668,6 +1513,204 @@ async fn load_default_config_preserves_selected_user_config_path_after_load_erro
         config.config_layer_stack.get_user_config_file(),
         Some(&selected_file)
     );
+    assert_eq!(
+        config
+            .config_layer_stack
+            .requirements()
+            .managed_auth_policy(),
+        codex_config::ManagedAuthPolicy {
+            allowed_login_methods: Some(vec![codex_protocol::config_types::ForcedLoginMethod::Api]),
+            allowed_chatgpt_workspaces: Some(vec!["managed-workspace".to_string()]),
+        }
+    );
+}
+
+#[tokio::test]
+async fn managed_auth_policy_survives_unusable_requirements_file_changes() -> Result<()> {
+    let tmp = tempdir()?;
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+    let requirements_path = tmp.path().join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        "allowed_login_methods = [\"api\"]\nallowed_chatgpt_workspaces = [\"startup\"]\n",
+    )?;
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml")),
+        CloudConfigBundleLoader::default(),
+    );
+    let startup = service.load_latest_config(/*fallback_cwd*/ None).await?;
+    let auth_manager = codex_login::AuthManager::shared_from_config(
+        &startup, /*enable_codex_api_key_env*/ false,
+    )
+    .await?;
+    std::fs::write(
+        &requirements_path,
+        "allowed_login_methods = [\"chatgpt\"]\nallowed_chatgpt_workspaces = []\n",
+    )?;
+    for refreshed in [
+        service.load_latest_config(/*fallback_cwd*/ None).await?,
+        service
+            .load_latest_config_with_session_layers(&startup.config_layer_stack, &startup.cwd)
+            .await?,
+    ] {
+        assert_eq!(refreshed.forced_login_method, None);
+        assert_eq!(refreshed.forced_chatgpt_workspace_id, None);
+    }
+    assert!(
+        auth_manager.is_login_method_allowed(codex_protocol::config_types::ForcedLoginMethod::Api)
+    );
+    assert!(
+        !auth_manager
+            .is_login_method_allowed(codex_protocol::config_types::ForcedLoginMethod::Chatgpt)
+    );
+    assert_eq!(
+        auth_manager.effective_chatgpt_workspaces(),
+        Some(vec!["startup".to_string()])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_remapping_validates_fragments_even_when_source_is_overridden() -> Result<()> {
+    for (managed_provider, strategy) in [
+        (None, MergeStrategy::Upsert),
+        (None, MergeStrategy::Replace),
+        (Some("z_new"), MergeStrategy::Upsert),
+        (Some("z_new"), MergeStrategy::Replace),
+        (Some("z_managed"), MergeStrategy::Upsert),
+        (Some("z_managed"), MergeStrategy::Replace),
+    ] {
+        let tmp = tempdir()?;
+        let initial = r#"[features.network_proxy.credentials.a_working]
+env = ["VENDOR_PASSWORD"]
+patterns = ["^pin_[a-z]{8}$"]
+url_prefixes = ["https://old.example"]
+"#;
+        std::fs::write(tmp.path().join(CONFIG_TOML_FILE), initial)?;
+        let managed_path = tmp.path().join("managed.toml");
+        if let Some(managed_provider) = managed_provider {
+            std::fs::write(
+                &managed_path,
+                format!(
+                    r#"[features.network_proxy.credentials.{managed_provider}]
+env = ["VENDOR_PASSWORD"]
+patterns = ["^pin_[a-z]{{8}}$"]
+url_prefix_from_env = "VENDOR_ENDPOINT"
+"#
+                ),
+            )?;
+        }
+        let service = ConfigManager::new_for_tests(
+            tmp.path().to_path_buf(),
+            vec![],
+            LoaderOverrides::with_managed_config_path_for_tests(managed_path),
+            CloudConfigBundleLoader::default(),
+        );
+        let result = service
+            .write_value(ConfigValueWriteParams {
+                file_path: None,
+                key_path: match strategy {
+                    MergeStrategy::Upsert => "features.network_proxy.credentials.z_new.env",
+                    MergeStrategy::Replace => "features.network_proxy.credentials",
+                }
+                .to_string(),
+                value: match strategy {
+                    MergeStrategy::Upsert => serde_json::json!(["VENDOR_PASSWORD"]),
+                    MergeStrategy::Replace => {
+                        serde_json::json!({"z_new": {"env": ["VENDOR_PASSWORD"]}})
+                    }
+                },
+                merge_strategy: strategy,
+                expected_version: None,
+            })
+            .await;
+        if managed_provider == Some("z_new") {
+            result?;
+        } else {
+            assert_eq!(
+                result.unwrap_err().write_error_code(),
+                Some(ConfigWriteErrorCode::ConfigValidationError)
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))?,
+                initial
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_refresh_resolves_preserved_layers_before_materialization() -> Result<()> {
+    use codex_core::config::ConfigOverrides;
+    use codex_features::Feature;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let tmp = tempdir()?;
+    let selected_path = tmp.path().join("work.config.toml");
+    std::fs::write(&selected_path, "log_dir = \"old-logs\"\n")?;
+    let mut loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    loader_overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(&selected_path)?);
+    loader_overrides.user_config_profile = Some("work".parse()?);
+    let service = ConfigManager::new(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        loader_overrides,
+        /*strict_config*/ true,
+        CloudConfigBundleLoader::default(),
+        Default::default(),
+        Arc::new(codex_config::NoopThreadConfigLoader),
+    );
+    let thread = service
+        .load_for_cwd(
+            Some(HashMap::from([(
+                "model_provider".to_string(),
+                serde_json::json!("openai"),
+            )])),
+            ConfigOverrides::default(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await?;
+    service
+        .extend_runtime_feature_enablement([
+            ("secret_auth_storage".to_string(), true),
+            ("mcp_oauth_refresh_coordination".to_string(), true),
+        ])
+        .expect("set runtime features");
+    std::fs::write(
+        &selected_path,
+        "model_provider = \"missing-provider\"\nlog_dir = \"new-logs\"\n\
+         [features]\nmcp_oauth_refresh_coordination = false\n",
+    )?;
+    // A throwaway host configuration is invalid; the actual thread's preserved
+    // provider is valid. Refresh must materialize only the final composed layers.
+    service
+        .load_latest_config(Some(tmp.path().to_path_buf()))
+        .await
+        .expect_err("host provider is unavailable");
+    let refreshed = service
+        .load_latest_config_with_session_layers(&thread.config_layer_stack, &thread.cwd)
+        .await?;
+    assert_eq!(refreshed.model_provider_id, "openai");
+    assert_eq!(refreshed.cwd, thread.cwd);
+    assert_eq!(refreshed.log_dir, tmp.path().join("new-logs"));
+    assert!(refreshed.features.enabled(Feature::SecretAuthStorage));
+    assert!(
+        !refreshed
+            .features
+            .enabled(Feature::McpOAuthRefreshCoordination)
+    );
+    std::fs::write(&selected_path, "approval_policy = false\n")?;
+    let error = service
+        .load_latest_config_with_session_layers(&thread.config_layer_stack, &thread.cwd)
+        .await
+        .expect_err("invalid final config is rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("work.config.toml"), "{error}");
+    Ok(())
 }
 
 #[tokio::test]
@@ -734,6 +1777,33 @@ async fn reserved_builtin_provider_override_rejected() {
 }
 
 #[tokio::test]
+async fn write_value_rejects_invalid_guardian_review_threshold() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let initial = "[features.guardianv2]\nenabled = true\nreview_threshold = 0.8\n";
+    std::fs::write(&path, initial)?;
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+
+    let error = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "features.guardianv2.review_threshold".to_string(),
+            value: serde_json::json!(2.0),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect_err("Guardian review thresholds above 1.0 must be rejected");
+
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigValidationError)
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, initial);
+    Ok(())
+}
+
+#[tokio::test]
 async fn write_value_rejects_feature_requirement_conflict() {
     let tmp = tempdir().expect("tempdir");
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "").unwrap();
@@ -745,7 +1815,7 @@ async fn write_value_rejects_feature_requirement_conflict() {
         CloudConfigBundleFixture::loader_with_enterprise_requirement(
             r#"
 [features]
-personality = true
+fast_mode = true
 "#,
         ),
     );
@@ -753,7 +1823,7 @@ personality = true
     let error = service
         .write_value(ConfigValueWriteParams {
             file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-            key_path: "features.personality".to_string(),
+            key_path: "features.fast_mode".to_string(),
             value: serde_json::json!(false),
             merge_strategy: MergeStrategy::Replace,
             expected_version: None,
@@ -768,12 +1838,374 @@ personality = true
     assert!(
         error
             .to_string()
-            .contains("invalid value for `features`: `features.personality=false`"),
+            .contains("invalid value for `features`: `features.fast_mode=false`"),
         "{error}"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).unwrap(),
         ""
+    );
+}
+
+#[tokio::test]
+async fn write_value_rejects_exact_managed_requirement() {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "allow_login_shell = true\n").unwrap();
+
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement("allow_login_shell = false"),
+    );
+
+    let error = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "allow_login_shell".to_string(),
+            value: serde_json::json!(true),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect_err("managed exact field should be read-only");
+
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigRequirementReadonly)
+    );
+    assert!(error.to_string().contains("`allow_login_shell`"));
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "allow_login_shell = true\n"
+    );
+}
+
+#[tokio::test]
+async fn write_value_rejects_managed_otel_values_and_preserves_unmanaged_siblings() {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "").expect("write user config");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"[otel]
+tool_result = { max_bytes = 1024 }
+log_user_prompt = false
+log_agent_responses = true
+log_guardian_assessments = false
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+span_attributes = { "service.name" = "managed-service" }
+tracestate = { managed = { tenant = "enterprise" }, empty = {} }"#,
+        ),
+    );
+    for (key_path, managed) in [
+        ("otel", true),
+        ("otel.log_user_prompt", true),
+        ("otel.log_agent_responses", true),
+        ("otel.log_guardian_assessments", true),
+        ("otel.exporter.otlp-http.endpoint", true),
+        ("otel.trace_exporter.otlp-grpc.endpoint", true),
+        ("otel.metrics_exporter.otlp-http.headers", true),
+        ("otel.span_attributes.\"service.name\"", true),
+        ("otel.tracestate.managed.tenant", true),
+        ("otel.environment", false),
+        ("otel.tool_result.max_bytes", true),
+        ("otel.span_attributes.\"service.version\"", false),
+        ("otel.tracestate.local.tenant", false),
+        ("otel.tracestate.managed.region", false),
+        ("otel.tracestate.empty.tenant", false),
+    ] {
+        let result = service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: key_path.to_string(),
+                value: serde_json::json!("user"),
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await;
+        assert_eq!(
+            result.err().and_then(|error| error.write_error_code()),
+            managed.then_some(ConfigWriteErrorCode::ConfigRequirementReadonly),
+            "OTEL path {key_path}"
+        );
+    }
+}
+
+fn toml_path(tmp: &Path, name: &str) -> String {
+    tmp.join(name).to_string_lossy().replace('\\', "\\\\")
+}
+
+#[tokio::test]
+async fn read_omits_origins_for_exact_managed_values() {
+    for has_user_values in [true, false] {
+        let tmp = tempdir().expect("tempdir");
+        let user_config = if has_user_values {
+            format!(
+                r#"model = "user-model"
+sqlite_home = "{}"
+allow_login_shell = true
+
+[feedback]
+enabled = true
+"#,
+                toml_path(tmp.path(), "user-sqlite"),
+            )
+        } else {
+            "model = \"user-model\"\n".to_string()
+        };
+        std::fs::write(tmp.path().join(CONFIG_TOML_FILE), user_config).unwrap();
+
+        let requirements = format!(
+            r#"sqlite_home = "{}"
+allow_login_shell = false
+
+[feedback]
+enabled = false
+"#,
+            toml_path(tmp.path(), "managed-sqlite"),
+        );
+        let service = ConfigManager::new_for_tests(
+            tmp.path().to_path_buf(),
+            vec![],
+            LoaderOverrides::without_managed_config_for_tests(),
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+        );
+
+        let response = service
+            .read(ConfigReadParams {
+                include_layers: false,
+                cwd: None,
+            })
+            .await
+            .expect("config read should succeed");
+
+        assert_eq!(
+            response.config.additional.get("sqlite_home"),
+            Some(&serde_json::json!(tmp.path().join("managed-sqlite")))
+        );
+        assert_eq!(
+            response.config.additional.get("allow_login_shell"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            response.config.additional.get("feedback"),
+            Some(&serde_json::json!({"enabled": false}))
+        );
+        for path in ["sqlite_home", "allow_login_shell", "feedback.enabled"] {
+            assert!(!response.origins.contains_key(path), "origin for {path}");
+        }
+        assert!(response.origins.contains_key("model"));
+    }
+}
+
+#[tokio::test]
+async fn read_projects_managed_otel_values_and_preserves_unmanaged_settings() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        r#"[otel]
+headers_helper = "get-otel-headers"
+headers_helper_refresh_interval_ms = 60000
+tool_result = { max_bytes = 1234 }
+log_user_prompt = true
+environment = "user"
+exporter = "statsig"
+span_attributes = { "service.name" = "user-service", "service.version" = "user-version" }
+tracestate = { managed = { tenant = "user-tenant", region = "us" }, local = { tenant = "preserved" }, empty = { tenant = "also-preserved" } }"#,
+    )
+    .expect("write user config");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"[otel]
+log_user_prompt = false
+exporter = "none"
+span_attributes = { "service.name" = "managed-service" }
+tracestate = { managed = { tenant = "enterprise" }, empty = {} }"#,
+        ),
+    );
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read should succeed");
+    let otel = response
+        .config
+        .additional
+        .get("otel")
+        .expect("effective OTEL config");
+    assert_eq!(
+        otel,
+        &serde_json::json!({
+            "headers_helper": "get-otel-headers",
+            "headers_helper_refresh_interval_ms": 60000,
+            "tool_result": { "max_bytes": 1234 },
+            "log_sse_deltas": null,
+            "log_user_prompt": false,
+            "log_agent_responses": null,
+            "log_guardian_assessments": null,
+            "environment": "user",
+            "exporter": "none",
+            "trace_exporter": null,
+            "metrics_exporter": null,
+            "span_attributes": {
+                "service.name": "managed-service",
+                "service.version": "user-version",
+            },
+            "tracestate": {
+                "managed": { "tenant": "enterprise", "region": "us" },
+                "local": { "tenant": "preserved" },
+                "empty": { "tenant": "also-preserved" },
+            },
+        }),
+    );
+    for (path, user_owned) in [
+        ("otel.log_user_prompt", false),
+        ("otel.exporter", false),
+        ("otel.span_attributes.service.name", false),
+        ("otel.tracestate.managed.tenant", false),
+        ("otel.tracestate.managed.region", true),
+        ("otel.environment", true),
+        ("otel.headers_helper", true),
+        ("otel.headers_helper_refresh_interval_ms", true),
+        ("otel.tool_result.max_bytes", true),
+        ("otel.span_attributes.service.version", true),
+        ("otel.tracestate.local.tenant", true),
+        ("otel.tracestate.empty.tenant", true),
+    ] {
+        assert_eq!(response.origins.contains_key(path), user_owned, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn read_projects_managed_otel_tool_result_and_omits_its_origin() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        r#"[otel]
+tool_result = { max_bytes = 1234 }"#,
+    )
+    .expect("write user config");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"[otel]
+tool_result = { max_bytes = 4096 }"#,
+        ),
+    );
+
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read should succeed");
+    assert_eq!(
+        response
+            .config
+            .additional
+            .get("otel")
+            .and_then(|otel| otel.get("tool_result")),
+        Some(&serde_json::json!({ "max_bytes": 4096 }))
+    );
+    assert!(!response.origins.contains_key("otel.tool_result.max_bytes"));
+}
+
+#[tokio::test]
+async fn read_keeps_omitted_otel_tool_result_unset() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        r#"[otel]
+environment = "user""#,
+    )
+    .expect("write user config");
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read should succeed");
+
+    assert_eq!(
+        response
+            .config
+            .additional
+            .get("otel")
+            .and_then(|otel| otel.get("tool_result")),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[tokio::test]
+async fn read_materializes_default_allow_login_shell() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "").unwrap();
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read should succeed");
+
+    assert_eq!(
+        response.config.additional.get("allow_login_shell"),
+        Some(&serde_json::json!(true))
+    );
+}
+
+#[tokio::test]
+async fn write_value_allows_unmanaged_setting_with_exact_requirement() {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "").unwrap();
+
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"
+allow_login_shell = false
+"#,
+        ),
+    );
+
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "windows.sandbox".to_string(),
+            value: serde_json::json!("elevated"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect("unmanaged setting should remain writable");
+
+    assert!(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .contains("sandbox = \"elevated\"")
     );
 }
 
@@ -880,6 +2312,368 @@ async fn write_value_reports_managed_override() {
 }
 
 #[tokio::test]
+async fn write_overrides_redact_managed_otel_exporter_headers() {
+    let tmp = tempdir().expect("tempdir");
+    let user_path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&user_path, "").expect("write user config");
+    let managed_path = tmp.path().join("managed_config.toml");
+    std::fs::write(
+        &managed_path,
+        r#"[otel]
+environment = "managed"
+exporter = { otlp-http = { endpoint = "https://collector.example", protocol = "json", headers = { Authorization = "admin-secret", "x.api.key" = "dotted-secret" } } }
+trace_exporter = { otlp-grpc = { endpoint = "https://trace.example", headers = { Authorization = "trace-secret" } } }
+metrics_exporter = { otlp-http = { endpoint = "https://metrics.example", protocol = "json", headers = { Authorization = "metrics-secret" } } }
+span_attributes = { "service.name" = "managed-service" }"#,
+    )
+    .expect("write managed config");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::with_managed_config_path_for_tests(managed_path),
+        CloudConfigBundleLoader::default(),
+    );
+    let exporter = serde_json::json!({
+        "otlp-http": {
+            "endpoint": "https://collector.example",
+            "headers": { "Authorization": "[redacted]", "x.api.key": "[redacted]" },
+            "protocol": "json"
+        }
+    });
+    let otel = serde_json::json!({
+        "environment": "managed",
+        "exporter": exporter.clone(),
+        "trace_exporter": {
+            "otlp-grpc": {
+                "endpoint": "https://trace.example",
+                "headers": { "Authorization": "[redacted]" }
+            }
+        },
+        "metrics_exporter": {
+            "otlp-http": {
+                "endpoint": "https://metrics.example",
+                "protocol": "json",
+                "headers": { "Authorization": "[redacted]" }
+            }
+        },
+        "span_attributes": { "service.name": "managed-service" }
+    });
+
+    for (key_path, expected) in [
+        ("otel", otel.clone()),
+        ("otel.exporter", exporter.clone()),
+        ("otel.exporter.otlp-http", exporter["otlp-http"].clone()),
+        (
+            "otel.exporter.otlp-http.headers",
+            exporter["otlp-http"]["headers"].clone(),
+        ),
+        (
+            "otel.exporter.otlp-http.headers.Authorization",
+            serde_json::json!("[redacted]"),
+        ),
+        (
+            "otel.exporter.otlp-http.headers.\"x.api.key\"",
+            serde_json::json!("[redacted]"),
+        ),
+        (
+            "otel.exporter.otlp-http.endpoint",
+            serde_json::json!("https://collector.example"),
+        ),
+        (
+            "otel.exporter.otlp-http.protocol",
+            serde_json::json!("json"),
+        ),
+        ("otel.trace_exporter", otel["trace_exporter"].clone()),
+        ("otel.metrics_exporter", otel["metrics_exporter"].clone()),
+        (
+            "otel.metrics_exporter.otlp-http.headers.Authorization",
+            serde_json::json!("[redacted]"),
+        ),
+        ("otel.environment", serde_json::json!("managed")),
+        (
+            "otel.span_attributes.\"service.name\"",
+            serde_json::json!("managed-service"),
+        ),
+    ] {
+        let response = service
+            .write_value(ConfigValueWriteParams {
+                file_path: None,
+                key_path: key_path.to_string(),
+                value: serde_json::Value::Null,
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await
+            .expect("no-op config clear should succeed");
+        assert_eq!(response.status, WriteStatus::OkOverridden, "{key_path}");
+        assert_eq!(
+            response
+                .overridden_metadata
+                .expect("managed override")
+                .effective_value,
+            expected,
+            "{key_path}"
+        );
+        assert_eq!(std::fs::read_to_string(&user_path).unwrap(), "");
+    }
+
+    let response = service
+        .batch_write(ConfigBatchWriteParams {
+            edits: vec![codex_app_server_protocol::ConfigEdit {
+                key_path: "otel.exporter.otlp-http.headers.Authorization".to_string(),
+                value: serde_json::Value::Null,
+                merge_strategy: MergeStrategy::Replace,
+            }],
+            file_path: None,
+            expected_version: None,
+            reload_user_config: false,
+        })
+        .await
+        .expect("no-op batch clear should succeed");
+    assert_eq!(response.status, WriteStatus::OkOverridden);
+    assert_eq!(
+        response
+            .overridden_metadata
+            .expect("managed batch override")
+            .effective_value,
+        serde_json::json!("[redacted]")
+    );
+    assert_eq!(std::fs::read_to_string(&user_path).unwrap(), "");
+
+    let read = service
+        .read(ConfigReadParams {
+            include_layers: true,
+            cwd: None,
+        })
+        .await
+        .expect("read public config");
+    let mut effective_exporter = exporter.clone();
+    effective_exporter["otlp-http"]["tls"] = serde_json::Value::Null;
+    assert_eq!(
+        read.config.additional["otel"]["exporter"],
+        effective_exporter
+    );
+    let managed_layer = read
+        .layers
+        .expect("config layers")
+        .into_iter()
+        .find(|layer| {
+            matches!(
+                layer.name,
+                ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
+            )
+        })
+        .expect("legacy managed layer");
+    assert_eq!(managed_layer.config["otel"]["exporter"], exporter);
+
+    let runtime = service
+        .load_latest_config(/*fallback_cwd*/ None)
+        .await
+        .expect("load runtime config");
+    let OtelExporterKind::OtlpHttp { headers, .. } = runtime.otel.exporter else {
+        panic!("unexpected runtime exporter");
+    };
+    assert_eq!(
+        headers.get("Authorization").map(|value| value.as_str()),
+        Some("admin-secret")
+    );
+    assert_eq!(
+        headers.get("x.api.key").map(|value| value.as_str()),
+        Some("dotted-secret")
+    );
+}
+
+/// Legacy managed feature toggles own their normalized enabled origin and override metadata.
+#[tokio::test]
+async fn multi_agent_v2_boolean_layer_owns_enabled_origin_and_overrides() {
+    let tmp = tempdir().expect("tempdir");
+    let user_path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &user_path,
+        "[features.multi_agent_v2]\nenabled = true\nsubagent_usage_hint_text = \"keep\"\n\n[features.network_proxy]\nenabled = true\ncredential_broker = true\n",
+    )
+    .expect("user config");
+
+    let managed_path = tmp.path().join("managed_config.toml");
+    std::fs::write(
+        &managed_path,
+        "[features]\nmulti_agent_v2 = false\nnetwork_proxy = false\n",
+    )
+    .expect("managed config");
+    let managed_file = AbsolutePathBuf::try_from(managed_path.clone()).expect("managed file");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::with_managed_config_path_for_tests(managed_path),
+        CloudConfigBundleLoader::default(),
+    );
+
+    let read = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("read config");
+    for path in [
+        "features.multi_agent_v2.enabled",
+        "features.network_proxy",
+        "features.network_proxy.enabled",
+    ] {
+        assert_eq!(
+            read.origins.get(path).expect("managed feature origin").name,
+            ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
+                file: managed_file.clone(),
+            },
+        );
+    }
+
+    let result = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(user_path.display().to_string()),
+            key_path: "features.multi_agent_v2.enabled".to_string(),
+            value: serde_json::json!(true),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await
+        .expect("write config");
+    assert_eq!(result.status, WriteStatus::OkOverridden);
+    let overridden = result.overridden_metadata.expect("overridden metadata");
+    assert_eq!(
+        overridden.overriding_layer.name,
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
+    );
+    assert_eq!(overridden.effective_value, serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn structured_feature_toggle_ignores_unrelated_managed_settings() -> Result<()> {
+    let tmp = tempdir()?;
+    let user_path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &user_path,
+        "[features.network_proxy]\nenabled = false\ncredential_broker = true\n",
+    )?;
+
+    let managed_path = tmp.path().join("managed_config.toml");
+    std::fs::write(
+        &managed_path,
+        "[features.network_proxy]\nproxy_url = 'http://127.0.0.1:4321'\n",
+    )?;
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
+        CloudConfigBundleLoader::default(),
+    );
+
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(user_path.display().to_string()),
+            key_path: "features.network_proxy".to_string(),
+            value: serde_json::Value::Null,
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+    assert_eq!(
+        toml::from_str::<TomlValue>(&std::fs::read_to_string(&user_path)?)?,
+        toml::from_str::<TomlValue>(
+            "[features.network_proxy]\nenabled = false\ncredential_broker = true\n"
+        )?
+    );
+
+    let result = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(user_path.display().to_string()),
+            key_path: "features.network_proxy".to_string(),
+            value: serde_json::json!(true),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+
+    assert_eq!(result.status, WriteStatus::Ok);
+    assert_eq!(result.overridden_metadata, None);
+
+    let selected_path = tmp.path().join("work.config.toml");
+    std::fs::write(&selected_path, "")?;
+    let mut loader_overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path);
+    loader_overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(&selected_path)?);
+    loader_overrides.user_config_profile = Some("work".parse()?);
+    let profile_service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        loader_overrides,
+        CloudConfigBundleLoader::default(),
+    );
+    profile_service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(selected_path.display().to_string()),
+            key_path: "features.network_proxy".to_string(),
+            value: serde_json::Value::Null,
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+    assert_eq!(
+        toml::from_str::<TomlValue>(&std::fs::read_to_string(&selected_path)?)?,
+        toml::from_str::<TomlValue>("[features]\nnetwork_proxy = false\n")?
+    );
+
+    service
+        .batch_write(ConfigBatchWriteParams {
+            edits: vec![
+                codex_app_server_protocol::ConfigEdit {
+                    key_path: "features.network_proxy.credential_broker".to_string(),
+                    value: serde_json::Value::Null,
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                codex_app_server_protocol::ConfigEdit {
+                    key_path: "features.network_proxy".to_string(),
+                    value: serde_json::Value::Null,
+                    merge_strategy: MergeStrategy::Replace,
+                },
+            ],
+            file_path: Some(user_path.display().to_string()),
+            expected_version: None,
+            reload_user_config: false,
+        })
+        .await?;
+    assert!(
+        toml::from_str::<TomlValue>(&std::fs::read_to_string(&user_path)?)?
+            .get("features")
+            .and_then(|features| features.get("network_proxy"))
+            .is_none()
+    );
+
+    let configured_provider = "[features.network_proxy]\nenabled = true\n\n\
+         [features.network_proxy.credentials.vendor]\n\
+         env = ['VENDOR_TOKEN']\n\
+         patterns = ['token_[a-z]{24}']\n\
+         url_prefixes = ['https://api.vendor.example']\n";
+    std::fs::write(&user_path, configured_provider)?;
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(user_path.display().to_string()),
+            key_path: "features.network_proxy".to_string(),
+            value: serde_json::Value::Null,
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+    let updated: TomlValue = toml::from_str(&std::fs::read_to_string(&user_path)?)?;
+    let feature = &updated["features"]["network_proxy"];
+    assert_eq!(
+        feature.get("enabled").and_then(TomlValue::as_bool),
+        Some(false)
+    );
+    assert!(feature.get("credentials").is_some());
+    Ok(())
+}
+
+#[tokio::test]
 async fn upsert_merges_tables_replace_overwrites() -> Result<()> {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join(CONFIG_TOML_FILE);
@@ -963,5 +2757,962 @@ beta = "b"
     )?;
     assert_eq!(replaced, expected_replace);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_writes_apply_path_sensitive_merge_rules() -> Result<()> {
+    let cases = [
+        (
+            r#"[shell_environment_policy]
+exclude = ["AWS_*"]
+"#,
+            "shell_environment_policy",
+            serde_json::json!({"filters": {"AWS_*": "include"}}),
+            r#"[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+        ),
+        (
+            r#"[shell_environment_policy]
+inherit = "core"
+exclude = ["AWS_*"]
+"#,
+            "shell_environment_policy.filters",
+            serde_json::json!({"AWS_*": "include"}),
+            r#"[shell_environment_policy]
+inherit = "core"
+
+[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+            "shell_environment_policy.exclude",
+            serde_json::json!(["AWS_*"]),
+            r#"[shell_environment_policy]
+exclude = ["AWS_*"]
+"#,
+        ),
+        (
+            r#"[shell_environment_policy]
+exclude = ["AWS_*"]
+include_only = ["PATH"]
+"#,
+            "shell_environment_policy.filters",
+            serde_json::json!({}),
+            r#"[shell_environment_policy.filters]
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+            "shell_environment_policy.exclude",
+            serde_json::json!([]),
+            r#"[shell_environment_policy]
+exclude = []
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"aws_*" = "exclude"
+"#,
+            "shell_environment_policy.filters",
+            serde_json::json!({"AWS_*": "include"}),
+            r#"[shell_environment_policy.filters]
+"aws_*" = "include"
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"aws_*" = "exclude"
+"#,
+            "shell_environment_policy.filters.AWS_*",
+            serde_json::json!("include"),
+            r#"[shell_environment_policy.filters]
+"aws_*" = "include"
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"секрет_*" = "exclude"
+"#,
+            "shell_environment_policy.filters.СЕКРЕТ_*",
+            serde_json::json!("include"),
+            r#"[shell_environment_policy.filters]
+"секрет_*" = "include"
+"#,
+        ),
+        (
+            r#"[permissions.dev.network.domains]
+"example.com" = "deny"
+"#,
+            "permissions.dev.network.domains",
+            serde_json::json!({"EXAMPLE.COM": "allow"}),
+            r#"[permissions.dev.network.domains]
+"example.com" = "allow"
+"#,
+        ),
+        (
+            r#"[memories]
+no_memories_if_mcp_or_web_search = false
+"#,
+            "memories",
+            serde_json::json!({"disable_on_external_context": true}),
+            r#"[memories]
+disable_on_external_context = true
+"#,
+        ),
+        (
+            r#"[features]
+multi_agent_v2 = true
+"#,
+            "features.multi_agent_v2.subagent_usage_hint_text",
+            serde_json::json!("Delegate carefully."),
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+        ),
+        (
+            r#"[features]
+multi_agent_v2 = true
+"#,
+            "features.multi_agent_v2",
+            serde_json::json!({"subagent_usage_hint_text": "Delegate carefully."}),
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+        ),
+        (
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+            "features.multi_agent_v2",
+            serde_json::json!(false),
+            r#"[features.multi_agent_v2]
+enabled = false
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+        ),
+        (
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+            "features.multi_agent_v2",
+            serde_json::Value::Null,
+            "",
+        ),
+        (
+            r#"[features]
+network_proxy = true
+"#,
+            "features.network_proxy.credential_broker",
+            serde_json::json!(true),
+            r#"[features.network_proxy]
+enabled = true
+credential_broker = true
+"#,
+        ),
+        (
+            r#"[features.network_proxy]
+enabled = true
+credential_broker = true
+"#,
+            "features.network_proxy",
+            serde_json::json!(false),
+            r#"[features.network_proxy]
+enabled = false
+credential_broker = true
+"#,
+        ),
+        (
+            r#"[desktop.features.multi_agent_v2]
+custom = true
+"#,
+            "desktop.features.multi_agent_v2",
+            serde_json::json!(false),
+            r#"[desktop.features]
+multi_agent_v2 = false
+"#,
+        ),
+        (
+            r#"[desktop.features]
+multi_agent_v2 = true
+"#,
+            "desktop.features.multi_agent_v2",
+            serde_json::json!({"custom": true}),
+            r#"[desktop.features.multi_agent_v2]
+custom = true
+"#,
+        ),
+    ];
+
+    for (base, key_path, value, expected) in cases {
+        let tmp = tempdir()?;
+        let path = tmp.path().join(CONFIG_TOML_FILE);
+        std::fs::write(&path, base)?;
+
+        let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+        service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: key_path.to_string(),
+                value,
+                merge_strategy: MergeStrategy::Upsert,
+                expected_version: None,
+            })
+            .await?;
+
+        let updated: TomlValue = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        let expected: TomlValue = toml::from_str(expected)?;
+        assert_eq!(updated, expected);
+
+        service
+            .read(ConfigReadParams {
+                include_layers: false,
+                cwd: None,
+            })
+            .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_shell_environment_filter_ignores_ascii_case() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &path,
+        r#"[shell_environment_policy.filters]
+"aws_*" = "exclude"
+"keep_*" = "include"
+"#,
+    )?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.filters.AWS_*".to_string(),
+            value: serde_json::Value::Null,
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await?;
+
+    assert_eq!(response.status, WriteStatus::Ok);
+    assert_eq!(response.overridden_metadata, None);
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        r#"[shell_environment_policy.filters]
+"keep_*" = "include"
+"#
+    );
+    service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn upsert_shell_environment_scalar_preserves_unrelated_formatting() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &path,
+        r#"[shell_environment_policy]
+inherit = "all"
+exclude = [
+    "AWS_*", # keep this comment
+]
+set = { KEEP = "1", OTHER = "2", GH_HOST = "github.stale.example" } # keep this inline table
+"#,
+    )?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.inherit".to_string(),
+            value: serde_json::json!("core"),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await?;
+
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        r#"[shell_environment_policy]
+inherit = "core"
+exclude = [
+    "AWS_*", # keep this comment
+]
+set = { KEEP = "1", OTHER = "2", GH_HOST = "github.stale.example" } # keep this inline table
+"#
+    );
+    for (value, expected_set) in [
+        (
+            serde_json::json!("github.trusted.example"),
+            "KEEP='1'\nOTHER='2'\nGH_HOST='github.stale.example'\ngh_host='github.trusted.example'",
+        ),
+        (
+            serde_json::Value::Null,
+            "KEEP='1'\nOTHER='2'\nGH_HOST='github.stale.example'",
+        ),
+    ] {
+        let response = service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: "shell_environment_policy.set.gh_host".to_string(),
+                value,
+                merge_strategy: MergeStrategy::Upsert,
+                expected_version: None,
+            })
+            .await?;
+        assert_eq!(response.status, WriteStatus::Ok);
+        assert_eq!(response.overridden_metadata, None);
+        let config: TomlValue = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(
+            config["shell_environment_policy"]["set"],
+            toml::from_str::<TomlValue>(expected_set)?
+        );
+    }
+    service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn upsert_shell_environment_filter_scalar_preserves_formatting_and_version() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &path,
+        r#"[shell_environment_policy]
+set = { KEEP = "1", OTHER = "2" } # keep this inline table
+
+[shell_environment_policy.filters]
+"AWS_*" = "exclude" # keep this edited comment
+"KEEP_*" = "include" # keep this untouched comment
+"#,
+    )?;
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+
+    let response = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.filters.aws_*".to_string(),
+            value: serde_json::json!("include"),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await?;
+
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        r#"[shell_environment_policy]
+set = { KEEP = "1", OTHER = "2" } # keep this inline table
+
+[shell_environment_policy.filters]
+"AWS_*" = "include" # keep this edited comment
+"KEEP_*" = "include" # keep this untouched comment
+"#
+    );
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.filters.AWS_*".to_string(),
+            value: serde_json::json!("exclude"),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: Some(response.version),
+        })
+        .await?;
+    service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn shell_environment_upsert_rejects_case_variant_filters_in_one_edit() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let initial = r#"[shell_environment_policy.filters]
+"KEEP_*" = "include"
+"#;
+    std::fs::write(&path, initial)?;
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+
+    let error = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.filters".to_string(),
+            value: serde_json::json!({"AWS_*": "include", "aws_*": "exclude"}),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await
+        .expect_err("one filter-map edit must not contain case-variant keys");
+
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigValidationError)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate shell environment filter")
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, initial);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shell_environment_representation_switch_reports_managed_override() -> Result<()> {
+    let cases = [
+        (
+            r#"[shell_environment_policy]
+exclude = ["AWS_*"]
+"#,
+            "shell_environment_policy.filters.AWS_*",
+            serde_json::json!("include"),
+            Some(serde_json::Value::Null),
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+            "shell_environment_policy.exclude",
+            serde_json::json!(["AWS_*"]),
+            Some(serde_json::Value::Null),
+        ),
+        (
+            "[shell_environment_policy.set]\nGH_HOST = 'github.managed.example'\n",
+            "shell_environment_policy.set.GH_HOST",
+            serde_json::json!("github.user.example"),
+            Some(serde_json::json!("github.managed.example")),
+        ),
+        (
+            "[shell_environment_policy.set]\nGH_HOST = 'github.managed.example'\n",
+            "shell_environment_policy.set.gh_host",
+            serde_json::json!("github.user.example"),
+            None,
+        ),
+        (
+            "[shell_environment_policy.set]\ngh_host = 'github.managed.example'\n",
+            "shell_environment_policy.set.gh_host",
+            serde_json::json!("github.user.example"),
+            Some(serde_json::json!("github.managed.example")),
+        ),
+        (
+            "[shell_environment_policy.set]\ngh_host = 'github.managed.example'\n",
+            "shell_environment_policy.set.GH_HOST",
+            serde_json::json!("github.user.example"),
+            None,
+        ),
+    ];
+
+    for (managed, key_path, value, expected_effective_value) in cases {
+        let tmp = tempdir()?;
+        let path = tmp.path().join(CONFIG_TOML_FILE);
+        std::fs::write(
+            &path,
+            "[shell_environment_policy.set]\n\
+             GH_HOST = 'github.original.example'\ngh_host = 'github.original-lower.example'\n",
+        )?;
+        let managed_path = tmp.path().join("managed_config.toml");
+        std::fs::write(&managed_path, managed)?;
+        let managed_file = AbsolutePathBuf::try_from(managed_path.clone())?;
+        let service = ConfigManager::new_for_tests(
+            tmp.path().to_path_buf(),
+            vec![],
+            LoaderOverrides::with_managed_config_path_for_tests(managed_path),
+            CloudConfigBundleLoader::default(),
+        );
+
+        let response = service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: key_path.to_string(),
+                value,
+                merge_strategy: MergeStrategy::Upsert,
+                expected_version: None,
+            })
+            .await?;
+
+        if let Some(expected_effective_value) = expected_effective_value {
+            assert_eq!(response.status, WriteStatus::OkOverridden);
+            let overridden = response
+                .overridden_metadata
+                .expect("managed setting should override the user edit");
+            assert_eq!(
+                overridden.overriding_layer.name,
+                ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
+            );
+            assert_eq!(overridden.effective_value, expected_effective_value);
+        } else {
+            assert_eq!(response.status, WriteStatus::Ok);
+            assert_eq!(response.overridden_metadata, None);
+        }
+        service
+            .read(ConfigReadParams {
+                include_layers: false,
+                cwd: None,
+            })
+            .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn allowed_login_methods_follow_current_forced_workspaces() -> Result<()> {
+    use codex_protocol::config_types::ForcedLoginMethod;
+
+    let tmp = tempdir()?;
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+    std::fs::write(
+        tmp.path().join("requirements.toml"),
+        "allowed_chatgpt_workspaces = ['managed']",
+    )?;
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml")),
+        CloudConfigBundleLoader::default(),
+    );
+    let config = service.load_latest_config(/*fallback_cwd*/ None).await?;
+    let auth = codex_login::AuthManager::shared_from_config(
+        &config, /*enable_codex_api_key_env*/ false,
+    )
+    .await?;
+    for (workspaces, expected) in [
+        (
+            Some(vec!["managed".to_string()]),
+            vec![ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt],
+        ),
+        (
+            Some(vec!["other".to_string()]),
+            vec![ForcedLoginMethod::Api],
+        ),
+        (Some(Vec::new()), vec![ForcedLoginMethod::Api]),
+        (
+            None,
+            vec![ForcedLoginMethod::Api, ForcedLoginMethod::Chatgpt],
+        ),
+    ] {
+        auth.set_forced_chatgpt_workspace_id(workspaces);
+        assert_eq!(auth.allowed_login_methods(), expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn permission_config_reload_merges_session_layers() -> Result<()> {
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerSource;
+    use codex_config::ConfigLayerStack;
+    let tmp = tempdir()?;
+    let service = ConfigManager::new(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        /*strict_config*/ false,
+        CloudConfigBundleLoader::default(),
+        codex_arg0::Arg0DispatchPaths::default(),
+        std::sync::Arc::new(codex_config::NoopThreadConfigLoader),
+    );
+
+    let mut config = service
+        .load_with_overrides(
+            /*request_overrides*/ None,
+            codex_core::config::ConfigOverrides {
+                cwd: Some(tmp.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut layers = config
+        .config_layer_stack
+        .all_layers_low_to_high()
+        .cloned()
+        .collect::<Vec<_>>();
+    for contents in [
+        "[permissions.first.filesystem]\n",
+        "[permissions.second]\nextends = ':workspace'\n",
+    ] {
+        layers.push(ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            toml::from_str(contents)?,
+        ));
+    }
+    layers.push(ConfigLayerEntry::new_disabled(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str("[permissions.disabled]\nextends = ':read-only'\n")?,
+        "disabled for test",
+    ));
+    config.config_layer_stack =
+        ConfigLayerStack::new(layers, Default::default(), Default::default())?;
+    let loaded = service
+        .load_permission_config_for_thread(&config, config.cwd.clone(), "first".to_string())
+        .await?;
+    assert_eq!(
+        loaded
+            .custom_permission_profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+    Ok(())
+}
+
+/// Cloud storage requirements override user config and reject leaf or whole-table writes without touching the file.
+#[tokio::test]
+async fn cloud_desktop_storage_requirements_control_reads_and_writes() {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let original = "[desktop]\ndefaultProjectParent = 'user'\nprojectlessWorkspaceRoot = 'user'\nlocaleOverride = 'en-US'\n";
+    std::fs::write(&path, original).unwrap();
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(format!(
+            "[application.storage]\ndefault_project_parent = \"{}\"\nprojectless_workspace_root = \"{}\"",
+            toml_path(tmp.path(), "projects"),
+            toml_path(tmp.path(), "chats"),
+        )),
+    );
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(response.config.desktop).unwrap(),
+        serde_json::json!({
+            "defaultProjectParent": tmp.path().join("projects"),
+            "projectlessWorkspaceRoot": tmp.path().join("chats"),
+            "localeOverride": "en-US",
+        })
+    );
+    for key in [
+        "desktop.defaultProjectParent",
+        "desktop.projectlessWorkspaceRoot",
+        "desktop",
+    ] {
+        let error = service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: key.into(),
+                value: serde_json::Value::Null,
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await
+            .expect_err("managed storage is read-only");
+        assert_eq!(
+            error.write_error_code(),
+            Some(ConfigWriteErrorCode::ConfigRequirementReadonly)
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "desktop.localeOverride".into(),
+            value: serde_json::json!("fr-FR"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect("unmanaged desktop settings stay writable");
+}
+
+#[tokio::test]
+async fn model_provider_default_set_reports_a_cli_override() -> Result<()> {
+    let tmp = tempdir()?;
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![("model_provider".into(), TomlValue::String("openai".into()))],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleLoader::default(),
+    );
+    let result = service
+        .model_provider_default_set(codex_app_server_protocol::ModelProviderDefaultSetParams {
+            provider_id: "amazon-bedrock".into(),
+        })
+        .await?;
+    assert_eq!(result.status, WriteStatus::OkOverridden);
+    assert_eq!(
+        result.overridden_metadata.unwrap().effective_value,
+        serde_json::json!("openai")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn model_provider_list_allows_user_overrides_of_system_defaults() -> Result<()> {
+    use codex_app_server_protocol::ModelProviderListParams;
+
+    let tmp = tempdir()?;
+    let system_path = tmp.path().join("system.toml");
+    std::fs::write(
+        &system_path,
+        "model_provider = 'team'\n[model_providers.team]\nname = 'System gateway'\nbase_url = 'https://system.example.test/v1'\nenv_key = 'SYSTEM_KEY'\n",
+    )?;
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+    let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+    overrides.system_config_path = Some(system_path);
+    for (cli_overrides, ignore_user_config, can_edit, can_change_default, name, auth_mode) in [
+        (
+            vec![],
+            false,
+            true,
+            true,
+            "System gateway",
+            "environmentVariable",
+        ),
+        (
+            vec![],
+            true,
+            false,
+            false,
+            "System gateway",
+            "environmentVariable",
+        ),
+        (
+            vec![("model_provider", "team")],
+            false,
+            true,
+            false,
+            "System gateway",
+            "environmentVariable",
+        ),
+        (
+            vec![(
+                "model_providers.team.base_url",
+                "https://system.example.test/v1",
+            )],
+            false,
+            true,
+            true,
+            "System gateway",
+            "environmentVariable",
+        ),
+        (
+            vec![
+                ("model_providers.team.name", "System gateway"),
+                (
+                    "model_providers.team.base_url",
+                    "https://system.example.test/v1",
+                ),
+                ("model_providers.team.env_key", "SYSTEM_KEY"),
+            ],
+            false,
+            false,
+            true,
+            "System gateway",
+            "environmentVariable",
+        ),
+        (
+            vec![("model_providers.team.name", "OpenAI")],
+            false,
+            false,
+            true,
+            "OpenAI",
+            "externallyConfigured",
+        ),
+        (
+            vec![("model_providers.team.name", " ")],
+            false,
+            false,
+            true,
+            " ",
+            "environmentVariable",
+        ),
+    ] {
+        overrides.ignore_user_config = ignore_user_config;
+        let cli_overrides = cli_overrides
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), TomlValue::String(value.to_owned())))
+            .collect();
+        let service = ConfigManager::new_for_tests(
+            tmp.path().to_path_buf(),
+            cli_overrides,
+            overrides.clone(),
+            CloudConfigBundleLoader::default(),
+        );
+        let response = service
+            .model_provider_list(ModelProviderListParams {})
+            .await?;
+        assert_eq!(response.can_change_default, can_change_default);
+        if ignore_user_config {
+            let error = service
+                .model_provider_default_set(
+                    codex_app_server_protocol::ModelProviderDefaultSetParams {
+                        provider_id: "openai".into(),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.write_error_code(),
+                Some(ConfigWriteErrorCode::ConfigLayerReadonly)
+            );
+        }
+        assert_eq!(response.default_provider_id, "team");
+        assert_eq!(
+            serde_json::to_value(response.data)?,
+            serde_json::json!([
+                {"id": "openai", "name": "OpenAI", "canEdit": false, "baseUrl":null, "settings":{"type":"openai"}},
+                {
+                    "id": "team", "name": name,
+                    "canEdit": can_edit, "baseUrl": "https://system.example.test/v1",
+                    "settings": {"type": "customGateway", "auth": {"mode": auth_mode, "envKey": "SYSTEM_KEY"}},
+                }
+            ])
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn model_provider_list_checks_builtin_configuration_fields() -> Result<()> {
+    use codex_app_server_protocol::ModelProviderListParams;
+    use codex_app_server_protocol::ModelProviderSummary;
+    use codex_app_server_protocol::ProviderSettings;
+
+    let home = tempdir()?;
+    std::fs::write(
+        home.path().join(CONFIG_TOML_FILE),
+        "[model_providers.amazon-bedrock.aws]\nregion = 'us-east-1'\n[model_providers.amazon-bedrock-runtime.aws]\nregion = 'us-east-1'\n[model_providers.gcp]\nproject_id = 'test-project'\n",
+    )?;
+    let credential_file = home.path().join("credentials.json").display().to_string();
+    for (id, name, settings) in [
+        (
+            "amazon-bedrock",
+            "Amazon Bedrock Mantle",
+            &[("aws.profile", "default"), ("aws.region", "us-east-1")][..],
+        ),
+        (
+            "amazon-bedrock-runtime",
+            "Amazon Bedrock Runtime",
+            &[("aws.profile", "default"), ("aws.region", "us-east-1")][..],
+        ),
+        (
+            "gcp",
+            "Google Cloud Vertex AI",
+            &[
+                ("project_id", "test-project"),
+                ("location", "global"),
+                ("credential_file", credential_file.as_str()),
+            ][..],
+        ),
+    ] {
+        for pinned_fields in [1, settings.len()] {
+            let overrides = settings
+                .iter()
+                .take(pinned_fields)
+                .map(|(field, value)| {
+                    (
+                        format!("model_providers.{id}.{field}"),
+                        TomlValue::String((*value).to_owned()),
+                    )
+                })
+                .collect();
+            let service = ConfigManager::new_for_tests(
+                home.path().to_path_buf(),
+                overrides,
+                LoaderOverrides::without_managed_config_for_tests(),
+                CloudConfigBundleLoader::default(),
+            );
+            let list = service
+                .model_provider_list(ModelProviderListParams {})
+                .await?;
+            assert_eq!(
+                list.data.into_iter().find(|provider| provider.id == id),
+                Some(ModelProviderSummary {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    can_edit: pinned_fields < settings.len(),
+                    base_url: None,
+                    settings: if id == "gcp" {
+                        ProviderSettings::Gcp {
+                            project_id: Some("test-project".to_owned()),
+                            location: (pinned_fields == settings.len())
+                                .then(|| "global".to_owned()),
+                            credential_file: (pinned_fields == settings.len())
+                                .then(|| credential_file.clone()),
+                        }
+                    } else {
+                        ProviderSettings::Bedrock {
+                            profile: Some("default".to_owned()),
+                            region: Some("us-east-1".to_owned()),
+                        }
+                    },
+                })
+            );
+        }
+    }
+    for id in ["amazon-bedrock", "amazon-bedrock-runtime"] {
+        for (section, overrides) in [
+            ("auth", vec![]),
+            (
+                "aws.credential_export",
+                vec![(
+                    format!("model_providers.{id}.aws.region"),
+                    "us-east-1".into(),
+                )],
+            ),
+        ] {
+            std::fs::write(
+                home.path().join(CONFIG_TOML_FILE),
+                format!("[model_providers.{id}.{section}]\ncommand = 'helper'\n"),
+            )?;
+            let service = ConfigManager::new_for_tests(
+                home.path().to_path_buf(),
+                overrides,
+                LoaderOverrides::without_managed_config_for_tests(),
+                CloudConfigBundleLoader::default(),
+            );
+            let list = service
+                .model_provider_list(ModelProviderListParams {})
+                .await?;
+            assert_eq!(
+                list.data
+                    .into_iter()
+                    .find(|provider| provider.id == id)
+                    .map(|provider| provider.can_edit),
+                Some(false)
+            );
+        }
+    }
     Ok(())
 }

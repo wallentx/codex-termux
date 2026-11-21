@@ -1,9 +1,10 @@
+use crate::McpServerKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
-use rmcp::model::Meta;
+use rmcp::model::MetaObject;
 use rmcp::model::Tool;
 
 use super::*;
@@ -11,7 +12,7 @@ use crate::tools::ToolInfo;
 
 fn tool_info(tool: Tool) -> ToolInfo {
     ToolInfo {
-        server_name: "codex_apps".to_string(),
+        server_key: McpServerKey::unscoped("codex_apps"),
         supports_parallel_tool_calls: false,
         server_origin: None,
         callable_name: tool.name.to_string(),
@@ -71,7 +72,7 @@ fn prepare_openai_file_params_for_model_masks_file_params() {
         .expect("object")
         .clone(),
     );
-    tool.meta = Some(Meta(
+    tool.meta = Some(MetaObject(
         serde_json::json!({
             "openai/fileParams": ["file", "files"]
         })
@@ -219,7 +220,7 @@ fn prepare_openai_file_params_for_model_derives_supported_optional_fields() {
             .clone(),
         ),
     );
-    tool.meta = Some(Meta(
+    tool.meta = Some(MetaObject(
         serde_json::json!({
             "openai/fileParams": [
                 "photoshop_image",

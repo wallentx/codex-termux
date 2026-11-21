@@ -1,14 +1,56 @@
 use crate::FeatureConfig;
+use crate::FeatureToml;
+use codex_network_proxy::CredentialProviderConfig;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_utils_redacted_string::RedactedString;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
+
+/// Connection settings for a remote message board.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteMessageBoardConfigToml {
+    pub url: String,
+    /// Board credential supplied directly by a runtime config override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<RedactedString>,
+    /// Read the credential from this environment variable instead of bearer_token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env_var: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolRegistryConfigToml {
+    /// Fail the turn when multiple tools share the same effective name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_on_tool_collisions: Option<bool>,
+    /// Include authoritative tool information in per-turn request metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_metadata_includes_tool_info: Option<bool>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CodeModeConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Default yield timeout for code-mode exec calls, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_exec_yield_time_ms: Option<u64>,
+    /// Show handler duration, code-mode host duration, and harness overhead
+    /// in each code-mode cell response.
+    /// Experimental: this option and the response format may change or be removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_show_cell_overhead: Option<bool>,
+    /// Maximum UTF-8 bytes per rendered tool input type, with a 16,000-byte minimum and default.
+    /// For ordinary MCP tools, this is also at least their server's explicitly configured input limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_input_schema_max_bytes: Option<NonZeroUsize>,
     /// Exact tool namespaces to omit from the code-mode nested tool surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded_tool_namespaces: Option<Vec<String>>,
@@ -23,9 +65,292 @@ impl FeatureConfig for CodeModeConfigToml {
     fn enabled(&self) -> Option<bool> {
         self.enabled
     }
+}
 
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = Some(enabled);
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodeModeHostConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Keep code mode fail-closed when the standalone host is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_in_process_fallback: Option<bool>,
+}
+
+impl FeatureConfig for CodeModeHostConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NonPrefixedMcpToolNamesConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// MCP servers whose tools should omit the legacy `mcp__` namespace prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_names: Option<Vec<String>>,
+}
+
+impl FeatureConfig for NonPrefixedMcpToolNamesConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+}
+
+/// Optional conversation sources available to the Guardian v2 classifier.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianV2TranscriptSource {
+    ToolCalls,
+    ToolOutputs,
+    Reasoning,
+}
+
+/// Bounds and optional sources for the Guardian v2 conversation transcript.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianV2TranscriptConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<GuardianV2TranscriptSource>>,
+    /// Include recent screenshots from messages and configured tool outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 100, max = 100000))]
+    pub max_message_entry_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 100, max = 100000))]
+    pub max_tool_entry_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 100, max = 100000))]
+    pub max_message_transcript_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 100, max = 100000))]
+    pub max_tool_transcript_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_recent_non_user_entries: Option<usize>,
+}
+
+/// Optional tool-call categories available to the Guardian v2 classifier.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianV2ReviewScopeConfigToml {
+    /// Restrict asynchronous classification and fast approvals to browser and computer-use tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub computer_use_only: Option<bool>,
+    /// Include sandboxed shell command calls in Guardian v2 classification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandboxed_exec_commands: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianElasticSectionConfigToml {
+    /// Exact Code Mode tool names for the transcript_selected_exec_results section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_tool_names: Vec<String>,
+    pub min_total_section_tokens: usize,
+    pub max_section_entry_tokens: usize,
+    /// Upper bound for the section's allocation.
+    /// Omit to use the global request budget as the upper bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_section_tokens: Option<usize>,
+}
+
+/// User-configurable prompt, approval, and context settings for Guardian v2.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianV2ConfigToml {
+    /// Enable elastic allocation for asynchronous Guardian requests. Defaults to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub async_elastic_budgeting: Option<bool>,
+    /// Section limits validated when asynchronous elastic budgeting is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub async_elastic_sections: Option<BTreeMap<String, GuardianElasticSectionConfigToml>>,
+    /// Enable elastic allocation for synchronous Guardian requests. Defaults to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_elastic_budgeting: Option<bool>,
+    /// Named section limits, decoded and validated by Guardian when the switch is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_elastic_sections: Option<BTreeMap<String, GuardianElasticSectionConfigToml>>,
+    /// Transcript encoding for synchronous Guardian review and asynchronous scoring. Defaults to line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_mode: Option<codex_protocol::TranscriptFormat>,
+    /// Deprecated and ignored; asynchronous classification always uses conversations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub async_classifier_mode: Option<codex_protocol::openai_models::AsyncClassifierMode>,
+    /// Reset retained async history when the next request exceeds this token estimate.
+    /// Defaults to 100,000. Fresh requests remain subject to the model's input limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub async_classifier_conversation_token_limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Legacy setting retained for config compatibility; the backend now controls Guardian billing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_guardian: Option<bool>,
+    /// Deprecated and ignored; thread-owned Guardian context is always enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_context: Option<bool>,
+    /// Persist reviewed actions and risk scores to rollout files for debugging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_scores: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier_instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub review_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_call_lag: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 100, max = 100000))]
+    pub max_action_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 100, max = 100000))]
+    pub max_classifier_instruction_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse_parent_compaction: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 100, max = 100000))]
+    pub max_parent_compaction_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_scope: Option<GuardianV2ReviewScopeConfigToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<GuardianV2TranscriptConfigToml>,
+}
+
+impl FeatureConfig for GuardianV2ConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+}
+
+pub(crate) fn deserialize_guardian_v2_feature<'de, D>(
+    deserializer: D,
+) -> Result<Option<FeatureToml<GuardianV2ConfigToml>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    const MIN_TOKENS: usize = 100;
+    const MAX_TOKENS: usize = 100_000;
+
+    let feature = Option::<FeatureToml<GuardianV2ConfigToml>>::deserialize(deserializer)?;
+    let Some(FeatureToml::Config(config)) = feature.as_ref() else {
+        return Ok(feature);
+    };
+
+    if let Some(threshold) = config.review_threshold
+        && (!threshold.is_finite() || !(0.0..=1.0).contains(&threshold))
+    {
+        return Err(serde::de::Error::custom(
+            "Guardian v2 review_threshold must be between 0.0 and 1.0",
+        ));
+    }
+
+    let transcript = config.transcript.as_ref();
+    if config.async_classifier_conversation_token_limit == Some(0) {
+        return Err(serde::de::Error::custom(
+            "Guardian v2 async_classifier_conversation_token_limit must be positive",
+        ));
+    }
+    let message_entry = transcript.and_then(|value| value.max_message_entry_tokens);
+    let tool_entry = transcript.and_then(|value| value.max_tool_entry_tokens);
+    let message_total = transcript.and_then(|value| value.max_message_transcript_tokens);
+    let tool_total = transcript.and_then(|value| value.max_tool_transcript_tokens);
+    for (field, tokens) in [
+        ("max_action_tokens", config.max_action_tokens),
+        (
+            "max_classifier_instruction_tokens",
+            config.max_classifier_instruction_tokens,
+        ),
+        (
+            "max_parent_compaction_tokens",
+            config.max_parent_compaction_tokens,
+        ),
+        ("transcript max_message_entry_tokens", message_entry),
+        ("transcript max_tool_entry_tokens", tool_entry),
+        ("transcript max_message_transcript_tokens", message_total),
+        ("transcript max_tool_transcript_tokens", tool_total),
+    ] {
+        if let Some(tokens) = tokens
+            && !(MIN_TOKENS..=MAX_TOKENS).contains(&tokens)
+        {
+            return Err(serde::de::Error::custom(format!(
+                "Guardian v2 {field} must be between {MIN_TOKENS} and {MAX_TOKENS} tokens"
+            )));
+        }
+    }
+
+    if transcript
+        .and_then(|value| value.max_recent_non_user_entries)
+        .is_some_and(|count| count == 0)
+    {
+        return Err(serde::de::Error::custom(
+            "Guardian v2 transcript max_recent_non_user_entries must be positive",
+        ));
+    }
+
+    for (kind, entry, total) in [
+        ("message", message_entry, message_total),
+        ("tool", tool_entry, tool_total),
+    ] {
+        if let (Some(entry), Some(total)) = (entry, total)
+            && entry > total
+        {
+            return Err(serde::de::Error::custom(format!(
+                "Guardian v2 transcript max_{kind}_entry_tokens must not exceed max_{kind}_transcript_tokens"
+            )));
+        }
+    }
+
+    Ok(feature)
+}
+
+/// User-configurable settings for Guardian V3.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianV3ConfigToml {
+    /// Keep each fresh root's Guardian board in memory until the runtime closes. Defaults to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_board_in_memory: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub housekeeper: Option<GuardianV3HousekeeperConfigToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<GuardianV3ReviewerConfigToml>,
+    /// Maximum estimated tokens per custom routing or retrieval prompt. Unset means uncapped. Ignored in project config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_instruction_tokens: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianV3HousekeeperConfigToml {
+    /// Guidance for grouping originals into channels and describing their topics. Ignored in project config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_instructions: Option<String>,
+    /// Time budget for routing one batch, in milliseconds. Defaults to 90,000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_timeout_ms: Option<NonZeroU32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardianV3ReviewerConfigToml {
+    /// Guidance for searching the Guardian board and managing channel subscriptions. Ignored in project config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_instructions: Option<String>,
+}
+
+impl FeatureConfig for GuardianV3ConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
     }
 }
 
@@ -55,6 +380,13 @@ pub struct MultiAgentV2ConfigToml {
     pub root_agent_usage_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_usage_hint_text: Option<String>,
+    /// Overrides inherited developer instructions for subagents without role-specific instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_developer_instructions: Option<String>,
+    /// Preserve the parent's model-visible history on full forks and append child instructions.
+    /// Defaults to true. Legacy compaction without a reusable context baseline still rebuilds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preserve_fork_prefix: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,6 +398,24 @@ pub struct MultiAgentV2ConfigToml {
     /// corresponding guidance to root and subagent usage hints.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expose_spawn_agent_model_overrides: Option<bool>,
+    /// Expose the multi-agent v2 `wait_agent` tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_agent_enabled: Option<bool>,
+    /// Let a subagent finish its current output item while cancelling tools immediately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupt_at_item_boundary: Option<bool>,
+    /// Hide native multi-agent tools while retaining the V2 runtime for host-provided tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_native_tools: Option<bool>,
+    /// Disable the model's direct-message tools; spawning and automatic child results remain available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_direct_message: Option<bool>,
+    /// Keep the message board in memory for a training session, including ephemeral sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_board_in_memory: Option<bool>,
+    /// Use a session-scoped remote board instead of local storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_board_remote: Option<RemoteMessageBoardConfigToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_code_mode_only: Option<bool>,
 }
@@ -74,9 +424,19 @@ impl FeatureConfig for MultiAgentV2ConfigToml {
     fn enabled(&self) -> Option<bool> {
         self.enabled
     }
+}
 
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = Some(enabled);
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextManagementConfigToml {
+    /// Enables experimental context management.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_mode: Option<bool>,
+}
+
+impl FeatureConfig for ContextManagementConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.experimental_mode
     }
 }
 
@@ -85,6 +445,12 @@ impl FeatureConfig for MultiAgentV2ConfigToml {
 pub struct TokenBudgetConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Whether to expose the built-in history and notes extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_history_notes_extension: Option<bool>,
+    /// Render the context window and its hints as an agent.thread_hint tool output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window_as_tool_output: Option<bool>,
     /// Number of tokens remaining before auto-compaction when the wrap-up reminder is emitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
@@ -112,20 +478,30 @@ impl FeatureConfig for TokenBudgetConfigToml {
     fn enabled(&self) -> Option<bool> {
         self.enabled
     }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = Some(enabled);
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RolloutBudgetConfigToml {
+    /// Stop when the shared budget is exhausted. Defaults to true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforce_limit: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    // TODO: Remove limit_tokens once clients write limit_budget and persisted thread configs have migrated.
+    /// Positive whole-token allowance. Set either limit_tokens or limit_budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub limit_tokens: Option<i64>,
+    /// Positive, finite allowance in budget units. Set either limit_tokens or limit_budget.
+    /// Spending exactly this amount is allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "positive_budget_limit_schema")]
+    pub limit_budget: Option<f64>,
+    /// Restate the balance when a thread starts or its context is compacted.
+    /// Defaults to true. Set false with an empty threshold list for no budget reminders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder_at_context_start: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Remaining weighted-token values that trigger reminders when crossed.
     pub reminder_at_remaining_tokens: Option<Vec<i64>>,
@@ -137,13 +513,17 @@ pub struct RolloutBudgetConfigToml {
     pub prefill_token_weight: Option<f64>,
 }
 
+fn positive_budget_limit_schema(
+    generator: &mut schemars::r#gen::SchemaGenerator,
+) -> schemars::schema::Schema {
+    let mut schema = f64::json_schema(generator).into_object();
+    schema.number().exclusive_minimum = Some(0.0);
+    schema.into()
+}
+
 impl FeatureConfig for RolloutBudgetConfigToml {
     fn enabled(&self) -> Option<bool> {
         self.enabled
-    }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = Some(enabled);
     }
 }
 
@@ -186,9 +566,31 @@ impl FeatureConfig for CurrentTimeReminderConfigToml {
     fn enabled(&self) -> Option<bool> {
         self.enabled
     }
+}
 
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = Some(enabled);
+/// How the sleep tool is selected when its feature gate is enabled.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepToolMode {
+    /// Preserve the existing model and legacy clock configuration defaults.
+    #[default]
+    ModelDriven,
+    /// Register sleep regardless of the model or legacy clock configuration.
+    AlwaysOn,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SleepToolConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SleepToolMode>,
+}
+
+impl FeatureConfig for SleepToolConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
     }
 }
 
@@ -210,6 +612,9 @@ pub struct NetworkProxyConfigToml {
     pub proxy_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_socks5: Option<bool>,
+    /// Route outbound TCP from managed Linux sandbox commands through the managed SOCKS5 proxy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transparent_tcp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socks_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,17 +631,20 @@ pub struct NetworkProxyConfigToml {
     pub domains: Option<BTreeMap<String, NetworkProxyDomainPermissionToml>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unix_sockets: Option<BTreeMap<String, NetworkProxyUnixSocketPermissionToml>>,
+    /// Permits local servers and direct host-loopback connections and skips the proxy's
+    /// additional private-network destination checks. Proxy domain rules still apply.
+    /// Defaults to true for MXC, which cannot enforce false; otherwise defaults to false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_local_binding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_broker: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<BTreeMap<String, CredentialProviderConfig>>,
 }
 
 impl FeatureConfig for NetworkProxyConfigToml {
     fn enabled(&self) -> Option<bool> {
         self.enabled
-    }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = Some(enabled);
     }
 }
 
@@ -259,4 +667,23 @@ pub enum NetworkProxyDomainPermissionToml {
 pub enum NetworkProxyUnixSocketPermissionToml {
     Allow,
     Deny,
+}
+
+/// Background compaction settings. A threshold alone does not enable the feature.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncCompactionConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Percentage of the model's full context window that starts background compaction.
+    /// Defaults to 65; valid values are 1–100, including when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub model_async_compact_threshold_percent: Option<u8>,
+}
+
+impl FeatureConfig for AsyncCompactionConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
 }

@@ -1,7 +1,13 @@
 use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::str::FromStr;
+use strum::IntoEnumIterator;
 
-use ratatui::text::Line;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use codex_protocol::ThreadId;
 
+use super::multi_select_picker::MultiSelectItem;
 use super::status_line_from_segments;
 use super::status_line_setup::StatusLineItem;
 
@@ -11,7 +17,9 @@ pub(crate) enum StatusSurfacePreviewItem {
     ProjectName,
     ProjectRoot,
     CurrentDir,
+    Hostname,
     Status,
+    ThreadName,
     ThreadTitle,
     GitBranch,
     PullRequestNumber,
@@ -27,13 +35,18 @@ pub(crate) enum StatusSurfacePreviewItem {
     UsedTokens,
     TotalInputTokens,
     TotalOutputTokens,
+    ThreadCredits,
+    EstimatedThreadCost,
     SessionId,
     FastMode,
+    Daybreak,
     RawOutput,
     WorkspaceHeadline,
     Model,
     ModelWithReasoning,
     Reasoning,
+    Profile,
+    Provider,
     TaskProgress,
 }
 
@@ -44,7 +57,9 @@ impl StatusSurfacePreviewItem {
             StatusSurfacePreviewItem::ProjectName => "my-project",
             StatusSurfacePreviewItem::ProjectRoot => "my-project",
             StatusSurfacePreviewItem::CurrentDir => "~/my-project/subdir",
+            StatusSurfacePreviewItem::Hostname => "my-host",
             StatusSurfacePreviewItem::Status => "Working",
+            StatusSurfacePreviewItem::ThreadName => "thread name",
             StatusSurfacePreviewItem::ThreadTitle => "thread title",
             StatusSurfacePreviewItem::GitBranch => "feat/awesome-feature",
             StatusSurfacePreviewItem::PullRequestNumber => "PR #123",
@@ -60,13 +75,18 @@ impl StatusSurfacePreviewItem {
             StatusSurfacePreviewItem::UsedTokens => "0 used",
             StatusSurfacePreviewItem::TotalInputTokens => "0 in",
             StatusSurfacePreviewItem::TotalOutputTokens => "0 out",
+            StatusSurfacePreviewItem::ThreadCredits => "5.2 credits",
+            StatusSurfacePreviewItem::EstimatedThreadCost => "~$1.82",
             StatusSurfacePreviewItem::SessionId => "550e8400-e29b-41d4",
-            StatusSurfacePreviewItem::FastMode => "Fast on",
+            StatusSurfacePreviewItem::FastMode => "Fast",
+            StatusSurfacePreviewItem::Daybreak => "Daybreak off",
             StatusSurfacePreviewItem::RawOutput => "raw output",
             StatusSurfacePreviewItem::WorkspaceHeadline => "Workspace headline",
             StatusSurfacePreviewItem::Model => "gpt-5.2-codex",
             StatusSurfacePreviewItem::ModelWithReasoning => "gpt-5.2-codex medium",
             StatusSurfacePreviewItem::Reasoning => "medium",
+            StatusSurfacePreviewItem::Profile => "profile: <name>",
+            StatusSurfacePreviewItem::Provider => "provider: <id>",
             StatusSurfacePreviewItem::TaskProgress => "Tasks 0/0",
         }
     }
@@ -77,7 +97,9 @@ impl StatusSurfacePreviewItem {
             Self::ProjectName,
             Self::ProjectRoot,
             Self::CurrentDir,
+            Self::Hostname,
             Self::Status,
+            Self::ThreadName,
             Self::ThreadTitle,
             Self::GitBranch,
             Self::PullRequestNumber,
@@ -93,13 +115,18 @@ impl StatusSurfacePreviewItem {
             Self::UsedTokens,
             Self::TotalInputTokens,
             Self::TotalOutputTokens,
+            Self::ThreadCredits,
+            Self::EstimatedThreadCost,
             Self::SessionId,
             Self::FastMode,
+            Self::Daybreak,
             Self::RawOutput,
             Self::WorkspaceHeadline,
             Self::Model,
             Self::ModelWithReasoning,
             Self::Reasoning,
+            Self::Profile,
+            Self::Provider,
             Self::TaskProgress,
         ]
         .into_iter()
@@ -114,12 +141,16 @@ struct PreviewValue {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StatusSurfacePreviewData {
+    pub(crate) thread_id: Option<ThreadId>,
+    pub(crate) pull_request_url: Option<String>,
     values: BTreeMap<StatusSurfacePreviewItem, PreviewValue>,
 }
 
 impl Default for StatusSurfacePreviewData {
     fn default() -> Self {
         let mut data = Self {
+            thread_id: None,
+            pull_request_url: None,
             values: BTreeMap::new(),
         };
         for item in StatusSurfacePreviewItem::iter() {
@@ -196,15 +227,52 @@ impl StatusSurfacePreviewData {
             .unwrap_or_else(|| fallback.to_string())
     }
 
-    pub(crate) fn rate_limit_item_description(
+    /// Builds canonical, configured-first rows for the status and title pickers.
+    pub(crate) fn picker_items<T>(
         &self,
-        item: StatusSurfacePreviewItem,
-        fallback: &str,
-    ) -> String {
-        self.live_value_for(item)
-            .and_then(rate_limit_preview_copy)
-            .map(|copy| copy.description.to_string())
-            .unwrap_or_else(|| fallback.to_string())
+        configured: Option<&[String]>,
+        description: impl Fn(T) -> &'static str,
+        preview_item: impl Fn(T) -> Option<StatusSurfacePreviewItem>,
+    ) -> Vec<MultiSelectItem>
+    where
+        T: Copy + Display + FromStr + IntoEnumIterator,
+    {
+        let selected = configured
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.parse::<T>().ok());
+        let mut seen = HashSet::new();
+        selected
+            .map(|item| (item, true))
+            .chain(T::iter().map(|item| (item, false)))
+            .filter_map(|(item, enabled)| {
+                let id = item.to_string();
+                if !seen.insert(id.clone()) {
+                    return None;
+                }
+                let copy = preview_item(item)
+                    .filter(|item| {
+                        matches!(
+                            item,
+                            StatusSurfacePreviewItem::FiveHourLimit
+                                | StatusSurfacePreviewItem::WeeklyLimit
+                        )
+                    })
+                    .and_then(|item| self.live_value_for(item))
+                    .and_then(rate_limit_preview_copy);
+                let (name, description) = copy.map_or_else(
+                    || (id.clone(), description(item).to_string()),
+                    |copy| (copy.name.to_string(), copy.description.to_string()),
+                );
+                Some(MultiSelectItem {
+                    id,
+                    name,
+                    description: Some(description),
+                    enabled,
+                    ..Default::default()
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn value_for(&self, item: StatusSurfacePreviewItem) -> Option<&str> {
@@ -222,7 +290,7 @@ impl StatusSurfacePreviewData {
         &self,
         items: I,
         use_theme_colors: bool,
-    ) -> Option<Line<'static>>
+    ) -> Option<HyperlinkLine>
     where
         I: IntoIterator<Item = StatusLineItem>,
     {
@@ -230,7 +298,13 @@ impl StatusSurfacePreviewData {
             self.value_for(item.preview_item())
                 .map(|value| (item, value.to_string()))
         });
-        status_line_from_segments(segments, use_theme_colors)
+        status_line_from_segments(
+            segments,
+            use_theme_colors,
+            self.thread_id,
+            self.live_value_for(StatusSurfacePreviewItem::PullRequestNumber)
+                .and(self.pull_request_url.as_deref()),
+        )
     }
 }
 

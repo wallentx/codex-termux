@@ -10,7 +10,6 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
 
 
 
-
 ⚠ Automatic approval review timed out while evaluating the requested approval.
 
 ✗ Review timed out before codex could run curl -sS -i -X POST --data-binary
@@ -21,4 +20,5 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
 
 › Ask Codex to do anything
 
-  gpt-5.6-sol default · /tmp/project
+  GPT-5.6-Sol default · /tmp/project
+  ? for shortcuts

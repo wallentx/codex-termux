@@ -1,7 +1,12 @@
+use codex_core::TurnInput;
+use codex_core::TurnInputRequest;
 use codex_core::context::ContextualUserFragment;
 use codex_core::context::InternalContextSource;
 use codex_core::context::InternalModelContextFragment;
+use codex_prompts::without_update_plan_instructions;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AdditionalContextEntry;
+use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::ThreadGoal;
 use codex_utils_template::Template;
 use std::sync::LazyLock;
@@ -9,6 +14,13 @@ use std::sync::LazyLock;
 static CONTINUATION_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     parse_embedded_template(
         include_str!("../templates/goals/continuation.md"),
+        "goals/continuation.md",
+    )
+});
+
+static CONTINUATION_PROMPT_WITHOUT_UPDATE_PLAN: LazyLock<Template> = LazyLock::new(|| {
+    parse_embedded_template(
+        &without_update_plan_instructions(include_str!("../templates/goals/continuation.md")),
         "goals/continuation.md",
     )
 });
@@ -27,7 +39,7 @@ static OBJECTIVE_UPDATED_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| 
     )
 });
 
-fn parse_embedded_template(source: &'static str, template_name: &str) -> Template {
+fn parse_embedded_template(source: &str, template_name: &str) -> Template {
     match Template::parse(source) {
         Ok(template) => template,
         Err(err) => panic!("embedded template {template_name} is invalid: {err}"),
@@ -42,8 +54,19 @@ pub(crate) fn objective_updated_steering_item(goal: &ThreadGoal) -> ResponseItem
     goal_context_input_item(objective_updated_prompt(goal))
 }
 
-pub(crate) fn continuation_steering_item(goal: &ThreadGoal) -> ResponseItem {
-    goal_context_input_item(continuation_prompt(goal))
+pub(crate) const GOAL_OBJECTIVE_CONTEXT: &str = "goal_objective";
+
+pub(crate) fn continuation_request(
+    goal: &ThreadGoal,
+    update_plan_enabled: bool,
+) -> TurnInputRequest {
+    let steering = goal_context_input_item(continuation_prompt(goal, update_plan_enabled));
+    TurnInputRequest::new(TurnInput::ResponseItem(steering)).with_additional_context(
+        std::collections::BTreeMap::from([(
+            GOAL_OBJECTIVE_CONTEXT.to_owned(),
+            AdditionalContextEntry::new(goal.objective.clone(), AdditionalContextKind::Untrusted),
+        )]),
+    )
 }
 
 fn goal_context_input_item(prompt: String) -> ResponseItem {
@@ -53,8 +76,7 @@ fn goal_context_input_item(prompt: String) -> ResponseItem {
     ))
 }
 
-fn continuation_prompt(goal: &ThreadGoal) -> String {
-    let objective = escape_xml_text(&goal.objective);
+fn continuation_prompt(goal: &ThreadGoal, update_plan_enabled: bool) -> String {
     let tokens_used = goal.tokens_used.to_string();
     let token_budget = goal
         .token_budget
@@ -65,9 +87,13 @@ fn continuation_prompt(goal: &ThreadGoal) -> String {
         .map(|budget| (budget - goal.tokens_used).max(0).to_string())
         .unwrap_or_else(|| "unbounded".to_string());
 
-    CONTINUATION_PROMPT_TEMPLATE
+    let template = if update_plan_enabled {
+        &*CONTINUATION_PROMPT_TEMPLATE
+    } else {
+        &*CONTINUATION_PROMPT_WITHOUT_UPDATE_PLAN
+    };
+    template
         .render([
-            ("objective", objective.as_str()),
             ("tokens_used", tokens_used.as_str()),
             ("token_budget", token_budget.as_str()),
             ("remaining_tokens", remaining_tokens.as_str()),

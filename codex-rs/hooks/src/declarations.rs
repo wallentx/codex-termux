@@ -69,6 +69,8 @@ mod tests {
                             timeout_sec: None,
                             r#async: false,
                             status_message: None,
+                            on_failure: None,
+                            additional_context_limit: None,
                         },
                     ],
                 }],

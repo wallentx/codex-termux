@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -16,6 +17,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
@@ -32,6 +34,7 @@ use wiremock::Respond;
 use wiremock::ResponseTemplate;
 use wiremock::http::HeaderName;
 use wiremock::http::HeaderValue;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
 
@@ -80,8 +83,54 @@ impl ResponseMock {
     }
 }
 
+pub fn assert_parent_turn(body: &Value, expected: Option<&str>) -> Result<()> {
+    assert_turn_id(body, "parent_turn_id", expected)
+}
+
+pub fn assert_root_turn(body: &Value, expected: Option<&str>) -> Result<()> {
+    assert_turn_id(body, "root_turn_id", expected)
+}
+
+fn assert_turn_id(body: &Value, key: &str, expected: Option<&str>) -> Result<()> {
+    let metadata = &body["client_metadata"];
+    let payload = metadata["x-codex-turn-metadata"]
+        .as_str()
+        .expect("canonical turn metadata");
+    let canonical: Value = serde_json::from_str(payload)?;
+    let expected = expected.map(Value::from);
+    let actual = (metadata.get(key), canonical.get(key));
+    assert_eq!(actual, (expected.as_ref(), expected.as_ref()));
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ResponsesRequest(wiremock::Request);
+
+pub async fn received_analytics_events(server: &MockServer, event_type: &str) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/codex/analytics-events/events")
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .flat_map(|payload| payload["events"].as_array().cloned().unwrap_or_default())
+        .filter(|event| event["event_type"] == event_type)
+        .collect()
+}
+
+pub async fn received_responses_requests(server: &MockServer) -> Vec<ResponsesRequest> {
+    server
+        .received_requests()
+        .await
+        .expect("wiremock request recording is enabled")
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path().ends_with("/responses")
+        })
+        .map(ResponsesRequest)
+        .collect()
+}
 
 fn is_zstd_encoding(value: &str) -> bool {
     value
@@ -107,6 +156,43 @@ pub fn strip_metadata(mut item: ResponseItem) -> ResponseItem {
 /// Returns response items without internal transport metadata for semantic assertions.
 pub fn strip_metadata_from_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
     items.iter().cloned().map(strip_metadata).collect()
+}
+
+/// Returns a response item without its Responses API item ID for semantic assertions.
+pub fn strip_response_item_id(mut item: ResponseItem) -> ResponseItem {
+    item.set_id(/*new_id*/ None);
+    item
+}
+
+/// Returns response items without their Responses API item IDs for semantic assertions.
+pub fn strip_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    items.iter().cloned().map(strip_response_item_id).collect()
+}
+
+/// Returns JSON without IDs on recognized Responses API items.
+pub fn strip_response_item_ids_from_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(strip_response_item_ids_from_json)
+                .collect(),
+        ),
+        Value::Object(mut map) => {
+            let is_response_item =
+                serde_json::from_value::<ResponseItem>(Value::Object(map.clone()))
+                    .is_ok_and(|item| !matches!(item, ResponseItem::Other));
+            if is_response_item {
+                map.remove("id");
+            }
+            Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, strip_response_item_ids_from_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
 }
 
 /// Returns JSON without internal transport metadata for semantic assertions.
@@ -156,10 +242,10 @@ impl ResponsesRequest {
     }
 
     pub fn instructions_text(&self) -> String {
-        self.body_json()["instructions"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        self.message_input_texts("developer")
+            .into_iter()
+            .next()
+            .expect("base instructions developer message")
     }
 
     /// Returns all `input_text` spans from `message` inputs for the provided role.
@@ -232,11 +318,42 @@ impl ResponsesRequest {
             .collect()
     }
 
+    /// Returns all `input_audio` `file_id` spans from `message` inputs for the provided role.
+    pub fn message_input_audio_file_ids(&self, role: &str) -> Vec<String> {
+        self.inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some(role))
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .flatten()
+            .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_audio"))
+            .filter_map(|span| {
+                span.get("file_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
     pub fn input(&self) -> Vec<Value> {
         self.body_json()["input"]
             .as_array()
             .expect("input array not found in request")
             .clone()
+    }
+
+    /// Returns whether an input item's content annotations exactly match the given sequence.
+    pub fn has_content_kinds(&self, kinds: &[&str]) -> bool {
+        self.input().into_iter().any(|item| {
+            item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                .as_array()
+                .is_some_and(|actual| {
+                    actual.len() == kinds.len()
+                        && actual
+                            .iter()
+                            .zip(kinds)
+                            .all(|(actual, expected)| actual.as_str() == Some(*expected))
+                })
+        })
     }
 
     pub fn inputs_of_type(&self, ty: &str) -> Vec<Value> {
@@ -502,14 +619,30 @@ pub struct WebSocketConnectionConfig {
 
 pub struct WebSocketTestServer {
     uri: String,
+    response_gates: Arc<Mutex<HashMap<String, oneshot::Receiver<()>>>>,
     connections: Arc<Mutex<Vec<Vec<WebSocketRequest>>>>,
     handshakes: Arc<Mutex<Vec<WebSocketHandshake>>>,
     request_log_updated: Arc<Notify>,
+    closed_connections: watch::Receiver<usize>,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl WebSocketTestServer {
+    /// Pause before the next matching event until the sender is released.
+    /// Install the gate before submitting the request that produces the event.
+    pub fn gate_response_event(&self, event: &Value) -> oneshot::Sender<()> {
+        let (release, gate) = oneshot::channel();
+        assert!(
+            self.response_gates
+                .lock()
+                .unwrap()
+                .insert(event.to_string(), gate)
+                .is_none()
+        );
+        release
+    }
+
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -526,12 +659,23 @@ impl WebSocketTestServer {
         connections.first().cloned().unwrap_or_default()
     }
 
+    pub async fn wait_for_connections(&self, expected: usize, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            while self.connections.lock().unwrap().len() < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     pub async fn wait_for_request(
         &self,
         connection_index: usize,
         request_index: usize,
     ) -> WebSocketRequest {
         loop {
+            let notified = self.request_log_updated.notified();
             if let Some(request) = self
                 .connections
                 .lock()
@@ -542,8 +686,19 @@ impl WebSocketTestServer {
             {
                 return request;
             }
-            self.request_log_updated.notified().await;
+            notified.await;
         }
+    }
+
+    /// Waits for the server to finish reading any frames preceding the socket close.
+    pub async fn wait_for_closed_connections(&self, expected: usize, timeout: Duration) -> bool {
+        let mut closed_connections = self.closed_connections.clone();
+        tokio::time::timeout(
+            timeout,
+            closed_connections.wait_for(|count| *count >= expected),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
     }
 
     pub fn handshakes(&self) -> Vec<WebSocketHandshake> {
@@ -723,6 +878,8 @@ pub fn ev_assistant_message(id: &str, text: &str) -> Value {
 
 pub fn user_message_item(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -929,21 +1086,6 @@ pub fn ev_custom_tool_call_with_namespace(
     })
 }
 
-pub fn ev_local_shell_call(call_id: &str, status: &str, command: Vec<&str>) -> Value {
-    serde_json::json!({
-        "type": "response.output_item.done",
-        "item": {
-            "type": "local_shell_call",
-            "call_id": call_id,
-            "status": status,
-            "action": {
-                "type": "exec",
-                "command": command,
-            }
-        }
-    })
-}
-
 /// Convenience: SSE event for an `apply_patch` custom tool call with raw patch
 /// text. This mirrors the payload produced by the Responses API when the model
 /// invokes `apply_patch` directly.
@@ -959,21 +1101,21 @@ pub fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value {
     })
 }
 
-pub fn ev_shell_command_call(call_id: &str, command: &str) -> Value {
-    let args = serde_json::json!({ "command": command });
-    ev_shell_command_call_with_args(call_id, &args)
+pub fn ev_exec_command_call(call_id: &str, command: &str) -> Value {
+    let args = serde_json::json!({ "cmd": command });
+    ev_exec_command_call_with_args(call_id, &args)
 }
 
-pub fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
-    let arguments = serde_json::to_string(args).expect("serialize shell command arguments");
-    ev_function_call(call_id, "shell_command", &arguments)
+pub fn ev_exec_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
+    let arguments = serde_json::to_string(args).expect("serialize exec command arguments");
+    ev_function_call(call_id, "exec_command", &arguments)
 }
 
-pub fn ev_apply_patch_shell_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
-    let args = serde_json::json!({ "command": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
+pub fn ev_apply_patch_exec_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
+    let args = serde_json::json!({ "cmd": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
     let arguments = serde_json::to_string(&args).expect("serialize apply_patch arguments");
 
-    ev_function_call(call_id, "shell_command", &arguments)
+    ev_function_call(call_id, "exec_command", &arguments)
 }
 
 pub fn sse_failed(id: &str, code: &str, message: &str) -> String {
@@ -1018,18 +1160,24 @@ where
     response_mock
 }
 
+/// Choose a response from the decoded request, including compressed requests.
+pub async fn mount_response_handler(
+    server: &MockServer,
+    respond: impl Fn(ResponsesRequest) -> ResponseTemplate + Send + Sync + 'static,
+) -> ResponseMock {
+    let (mock, requests) = base_mock();
+    mock.respond_with(move |request: &wiremock::Request| {
+        respond(ResponsesRequest(request.clone()))
+    })
+    .mount(server)
+    .await;
+    requests
+}
+
 fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
-        .and(response_mock.clone());
-    (mock, response_mock)
-}
-
-fn compact_mock() -> (MockBuilder, ResponseMock) {
-    let response_mock = ResponseMock::new();
-    let mock = Mock::given(method("POST"))
-        .and(path_regex(".*/responses/compact$"))
         .and(response_mock.clone());
     (mock, response_mock)
 }
@@ -1058,140 +1206,6 @@ where
 pub async fn mount_sse_once(server: &MockServer, body: String) -> ResponseMock {
     let (mock, response_mock) = base_mock();
     mock.respond_with(sse_response(body))
-        .up_to_n_times(1)
-        .mount(server)
-        .await;
-    response_mock
-}
-
-pub async fn mount_compact_json_once_match<M>(
-    server: &MockServer,
-    matcher: M,
-    body: serde_json::Value,
-) -> ResponseMock
-where
-    M: wiremock::Match + Send + Sync + 'static,
-{
-    let (mock, response_mock) = compact_mock();
-    mock.and(matcher)
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(body.clone()),
-        )
-        .up_to_n_times(1)
-        .mount(server)
-        .await;
-    response_mock
-}
-
-pub async fn mount_compact_json_once(server: &MockServer, body: serde_json::Value) -> ResponseMock {
-    mount_compact_response_once(
-        server,
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "application/json")
-            .set_body_json(body),
-    )
-    .await
-}
-
-/// Mount a `/responses/compact` mock that mirrors the default remote compaction shape:
-/// keep user+developer messages from the request, drop assistant/tool artifacts, and append one
-/// compaction item carrying the provided summary text.
-pub async fn mount_compact_user_history_with_summary_once(
-    server: &MockServer,
-    summary_text: &str,
-) -> ResponseMock {
-    mount_compact_user_history_with_summary_sequence(server, vec![summary_text.to_string()]).await
-}
-
-/// Same as [`mount_compact_user_history_with_summary_once`], but for multiple compact calls.
-/// Each incoming compact request receives the next summary text in order.
-pub async fn mount_compact_user_history_with_summary_sequence(
-    server: &MockServer,
-    summary_texts: Vec<String>,
-) -> ResponseMock {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    #[derive(Debug)]
-    struct UserHistorySummaryResponder {
-        num_calls: AtomicUsize,
-        summary_texts: Vec<String>,
-    }
-
-    impl Respond for UserHistorySummaryResponder {
-        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
-            let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
-            let summary_text = self
-                .summary_texts
-                .get(call_num)
-                .expect("missing summary text for compact request");
-            let body_bytes = decode_body_bytes(
-                &request.body,
-                request
-                    .headers
-                    .get("content-encoding")
-                    .and_then(|value| value.to_str().ok()),
-            );
-            let body_json: Value =
-                serde_json::from_slice(&body_bytes).expect("failed to parse compact request body");
-            let mut output = body_json
-                .get("input")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                // TODO(ccunningham): Update this mock to match future compaction model behavior:
-                // return user/developer/assistant messages since the last compaction item, then
-                // append a single newest compaction item.
-                // Match current remote compaction behavior: keep user/developer messages and
-                // omit assistant/tool history entries.
-                .filter(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("message")
-                        && matches!(
-                            item.get("role").and_then(Value::as_str),
-                            Some("user") | Some("developer")
-                        )
-                })
-                .collect::<Vec<Value>>();
-            let compaction_turn_id = body_json["client_metadata"]["turn_id"].as_str();
-            // Match Responses API: generated compaction items inherit the compact request turn.
-            let mut compaction_item = serde_json::json!({
-                "type": "compaction",
-                "encrypted_content": summary_text,
-            });
-            if let Some(turn_id) = compaction_turn_id {
-                compaction_item["internal_chat_message_metadata_passthrough"] =
-                    serde_json::json!({ "turn_id": turn_id });
-            }
-            output.push(compaction_item);
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(serde_json::json!({ "output": output }))
-        }
-    }
-
-    let num_calls = summary_texts.len();
-    let responder = UserHistorySummaryResponder {
-        num_calls: AtomicUsize::new(0),
-        summary_texts,
-    };
-    let (mock, response_mock) = compact_mock();
-    mock.respond_with(responder)
-        .up_to_n_times(num_calls as u64)
-        .expect(num_calls as u64)
-        .mount(server)
-        .await;
-    response_mock
-}
-
-pub async fn mount_compact_response_once(
-    server: &MockServer,
-    response: ResponseTemplate,
-) -> ResponseMock {
-    let (mock, response_mock) = compact_mock();
-    mock.respond_with(response)
         .up_to_n_times(1)
         .mount(server)
         .await;
@@ -1260,6 +1274,19 @@ pub async fn start_mock_server() -> MockServer {
     server
 }
 
+/// Start a server for tests that serve Responses over HTTP/SSE only.
+/// A 404 on WebSocket upgrade triggers retries; 426 selects the HTTP fallback immediately.
+pub async fn start_sse_server() -> MockServer {
+    let server = start_mock_server().await;
+    Mock::given(method("GET"))
+        .and(path_regex(".*/responses$"))
+        .and(header("upgrade", "websocket"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
+    server
+}
+
 /// Starts a lightweight WebSocket server for `/v1/responses` tests.
 ///
 /// Each connection consumes a queue of request/event sequences. For each
@@ -1290,6 +1317,9 @@ pub async fn start_websocket_server_with_headers(
     let connections_log = Arc::new(Mutex::new(Vec::new()));
     let handshakes_log = Arc::new(Mutex::new(Vec::new()));
     let request_log_updated = Arc::new(Notify::new());
+    let response_gates = Arc::new(Mutex::new(HashMap::new()));
+    let gates = Arc::clone(&response_gates);
+    let (closed_tx, closed_connections) = watch::channel(0);
     let requests = Arc::clone(&connections_log);
     let handshakes = Arc::clone(&handshakes_log);
     let request_log = Arc::clone(&request_log_updated);
@@ -1297,6 +1327,7 @@ pub async fn start_websocket_server_with_headers(
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {
+        let mut handlers = tokio::task::JoinSet::new();
         loop {
             let accept_res = tokio::select! {
                 _ = &mut shutdown_rx => return,
@@ -1369,78 +1400,105 @@ pub async fn start_websocket_server_with_headers(
                 log.push(Vec::new());
                 log.len() - 1
             };
-            let close_after_requests = connection.close_after_requests;
-            for request_events in connection.requests {
-                let Some(Ok(message)) = ws_stream.next().await else {
-                    break;
-                };
-                if let Some(body) = parse_ws_request_body(message) {
-                    let mut log = requests.lock().unwrap();
-                    if let Some(connection_log) = log.get_mut(connection_index) {
-                        connection_log.push(WebSocketRequest { body });
-                        let request_index = connection_log.len() - 1;
-                        let request = &connection_log[request_index];
-                        let request_body = request.body_json();
-                        eprintln!(
-                            "[ws test server +{}ms] connection={} received request={} type={:?} role={:?} text={:?} data={:?}",
-                            start.elapsed().as_millis(),
-                            connection_index,
-                            request_index,
-                            request_body.get("type").and_then(Value::as_str),
-                            request_body
-                                .get("item")
-                                .and_then(|item| item.get("role"))
-                                .and_then(Value::as_str),
-                            request_body
-                                .get("item")
-                                .and_then(|item| item.get("content"))
-                                .and_then(Value::as_array)
-                                .and_then(|content| content.first())
-                                .and_then(|content| content.get("text"))
-                                .and_then(Value::as_str),
-                            request_body
-                                .get("item")
-                                .and_then(|item| item.get("content"))
-                                .and_then(Value::as_array)
-                                .and_then(|content| content.first())
-                                .and_then(|content| content.get("data"))
-                                .and_then(Value::as_str),
+            let requests = Arc::clone(&requests);
+            let request_log = Arc::clone(&request_log);
+            let gates = Arc::clone(&gates);
+            let closed_tx = closed_tx.clone();
+            handlers.spawn(async move {
+                let close_after_requests = connection.close_after_requests;
+                let mut response_complete = false;
+                let mut batches = connection.requests.into_iter().peekable();
+                while let Some(request_events) = batches.peek() {
+                    let message = ws_stream.next().await;
+                    let Some(Ok(message)) = message else {
+                        break;
+                    };
+                    if let Some(body) = parse_ws_request_body(message) {
+                        let late_interrupt = response_complete && body["type"] == "response.interrupt";
+                        let mut log = requests.lock().unwrap();
+                        if let Some(connection_log) = log.get_mut(connection_index) {
+                            connection_log.push(WebSocketRequest { body });
+                            let request_index = connection_log.len() - 1;
+                            let request = &connection_log[request_index];
+                            let request_body = request.body_json();
+                            eprintln!(
+                                "[ws test server +{}ms] connection={} received request={} type={:?} role={:?} text={:?} data={:?}",
+                                start.elapsed().as_millis(),
+                                connection_index,
+                                request_index,
+                                request_body.get("type").and_then(Value::as_str),
+                                request_body
+                                    .get("item")
+                                    .and_then(|item| item.get("role"))
+                                    .and_then(Value::as_str),
+                                request_body
+                                    .get("item")
+                                    .and_then(|item| item.get("content"))
+                                    .and_then(Value::as_array)
+                                    .and_then(|content| content.first())
+                                    .and_then(|content| content.get("text"))
+                                    .and_then(Value::as_str),
+                                request_body
+                                    .get("item")
+                                    .and_then(|item| item.get("content"))
+                                    .and_then(Value::as_array)
+                                    .and_then(|content| content.first())
+                                    .and_then(|content| content.get("data"))
+                                    .and_then(Value::as_str),
+                            );
+                        }
+                        request_log.notify_waiters();
+                        // A late interrupt cannot consume the next response's script.
+                        if late_interrupt {
+                            continue;
+                        }
+                    }
+
+                    eprintln!(
+                        "[ws test server +{}ms] connection={} sending batch_size={} event_types={:?} audio_data={:?}",
+                        start.elapsed().as_millis(),
+                        connection_index,
+                        request_events.len(),
+                        request_events
+                            .iter()
+                            .map(|event| event.get("type").and_then(Value::as_str))
+                            .collect::<Vec<_>>(),
+                        request_events
+                            .iter()
+                            .find_map(|event| event.get("delta").and_then(Value::as_str)),
+                    );
+                    for event in request_events {
+                        let Ok(payload) = serde_json::to_string(event) else {
+                            continue;
+                        };
+                        let gate = gates.lock().unwrap().remove(&payload);
+                        if let Some(gate) = gate {
+                            let _ = gate.await;
+                        }
+                        if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                        response_complete = matches!(
+                            event["type"].as_str(),
+                            Some("response.completed" | "response.incomplete" | "response.failed")
                         );
                     }
-                    request_log.notify_waiters();
+                    batches.next();
                 }
 
-                eprintln!(
-                    "[ws test server +{}ms] connection={} sending batch_size={} event_types={:?} audio_data={:?}",
-                    start.elapsed().as_millis(),
-                    connection_index,
-                    request_events.len(),
-                    request_events
-                        .iter()
-                        .map(|event| event.get("type").and_then(Value::as_str))
-                        .collect::<Vec<_>>(),
-                    request_events
-                        .iter()
-                        .find_map(|event| event.get("delta").and_then(Value::as_str)),
-                );
-                for event in &request_events {
-                    let Ok(payload) = serde_json::to_string(event) else {
-                        continue;
-                    };
-                    if ws_stream.send(Message::Text(payload.into())).await.is_err() {
-                        break;
-                    }
+                if close_after_requests {
+                    let _ = ws_stream.close(None).await;
+                    closed_tx.send_modify(|count| *count += 1);
+                } else {
+                    std::future::pending::<()>().await;
                 }
-            }
-
-            if close_after_requests {
-                let _ = ws_stream.close(None).await;
-            } else {
-                let _ = shutdown_rx.await;
-                return;
-            }
+            });
 
             if connections.lock().unwrap().is_empty() {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {},
+                    _ = handlers.join_all() => {},
+                }
                 return;
             }
         }
@@ -1448,9 +1506,11 @@ pub async fn start_websocket_server_with_headers(
 
     WebSocketTestServer {
         uri,
+        response_gates,
         connections: connections_log,
         handshakes: handshakes_log,
         request_log_updated,
+        closed_connections,
         shutdown: shutdown_tx,
         task,
     }
@@ -1585,51 +1645,13 @@ pub async fn mount_response_sequence(
     response_mock
 }
 
-/// Mounts a sequence of responses for each POST to `/v1/responses/compact`.
-/// Panics if more requests are received than responses provided.
-pub async fn mount_compact_response_sequence(
-    server: &MockServer,
-    responses: Vec<ResponseTemplate>,
-) -> ResponseMock {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    struct SeqResponder {
-        num_calls: AtomicUsize,
-        responses: Vec<ResponseTemplate>,
-    }
-
-    impl Respond for SeqResponder {
-        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
-            let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
-            self.responses
-                .get(call_num)
-                .expect("missing response for compact call")
-                .clone()
-        }
-    }
-
-    let num_calls = responses.len();
-    let responder = SeqResponder {
-        num_calls: AtomicUsize::new(0),
-        responses,
-    };
-
-    let (mock, response_mock) = compact_mock();
-    mock.respond_with(responder)
-        .up_to_n_times(num_calls as u64)
-        .expect(num_calls as u64)
-        .mount(server)
-        .await;
-    response_mock
-}
-
 /// Validate invariants on the request body sent to `/v1/responses`.
 ///
-/// - No `function_call_output`/`custom_tool_call_output` with missing/empty `call_id`.
+/// - A `function_call_output` with missing/empty `call_id` must have a nonempty `name`.
+/// - No `custom_tool_call_output` with missing/empty `call_id`.
 /// - `tool_search_output` must have a `call_id` unless it is a server-executed legacy item.
-/// - Every `function_call_output` must match a prior `function_call` or
-///   `local_shell_call` with the same `call_id` in the same `input`.
+/// - Every `function_call_output` with a `call_id` must match a prior `function_call`
+///   or `local_shell_call` with the same `call_id` in the same `input`.
 /// - Every `custom_tool_call_output` must match a prior `custom_tool_call`.
 /// - Every `tool_search_output` must match a prior `tool_search_call`.
 /// - Additionally, enforce symmetry: every `function_call`/`custom_tool_call`/
@@ -1675,9 +1697,19 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
         items
             .iter()
             .filter(|item| item.get("type").and_then(Value::as_str) == Some(kind))
-            .map(|item| {
-                let id = get_call_id(item).expect(missing_msg);
-                id.to_string()
+            .filter_map(|item| {
+                if let Some(id) = get_call_id(item) {
+                    return Some(id.to_string());
+                }
+                if kind == "function_call_output"
+                    && item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                {
+                    return None;
+                }
+                panic!("{missing_msg}");
             })
             .collect()
     }

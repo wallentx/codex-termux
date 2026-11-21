@@ -1,0 +1,507 @@
+//! Local activity disclosure keyed by retained tool identities, independent of text selection.
+//! Controls appear only while activity is focused; copied text and full-transcript search remain source based.
+
+use crate::style::accent_color;
+use std::collections::HashSet;
+
+use crate::bottom_pane::TranscriptFooter;
+use crate::key_hint::KeyBindingListExt;
+use crate::keymap::ListAction;
+use crate::keymap::RuntimeKeymap;
+use codex_protocol::ThreadId;
+use crossterm::event::KeyEvent;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
+
+use super::*;
+
+pub(super) struct Disclosure {
+    pub(super) expanded: HashSet<String>,
+    pub(super) focused: Option<(EntryKey, Vec<String>)>,
+    pub(super) resume_after_approval: Option<(ThreadId, String)>,
+    // Resolve against the next layout, once a toggled live row has also been rebuilt.
+    pub(super) anchor_control: Option<EntryKey>,
+    pub(super) clamp_after_collapse: bool,
+    pub(super) live_ids: Vec<String>,
+    pub(super) keymap: RuntimeKeymap,
+}
+
+impl Default for Disclosure {
+    fn default() -> Self {
+        Self {
+            expanded: HashSet::new(),
+            focused: None,
+            resume_after_approval: None,
+            anchor_control: None,
+            clamp_after_collapse: false,
+            live_ids: Vec::new(),
+            keymap: RuntimeKeymap::defaults(),
+        }
+    }
+}
+
+impl Disclosure {
+    pub(super) fn is_expanded(&self, ids: &[String]) -> bool {
+        ids.iter().any(|id| self.expanded.contains(id))
+    }
+}
+
+impl TranscriptView {
+    pub(crate) fn sync_patch_approval(&mut self, current: Option<(ThreadId, &str)>) {
+        if let Some((thread_id, id)) = &self.disclosure.resume_after_approval
+            && current != Some((*thread_id, id.as_str()))
+        {
+            self.jump_to_latest();
+        }
+    }
+
+    pub(crate) fn is_activity_focused(&self) -> bool {
+        self.disclosure.focused.is_some() && !self.detailed && self.mode == HistoryRenderMode::Rich
+    }
+
+    pub(crate) fn clear_activity_focus(&mut self) {
+        self.disclosure.focused = None;
+    }
+
+    /// Live member identities survive the transition from active widget to committed history.
+    pub(crate) fn sync_live_activity(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        ids: Vec<String>,
+    ) -> bool {
+        let previous = std::mem::replace(&mut self.disclosure.live_ids, ids);
+        let ids = &self.disclosure.live_ids;
+        if previous != *ids {
+            self.live_key = None;
+        }
+        // A completed single search retains its reading position even after its control goes away.
+        if self.snapshot().is_none()
+            && let Position::Reading(anchor) = self.position
+            && anchor.key == EntryKey::Live
+            && let Some(index) = self.canonical_activity_index(cells, &previous).or_else(|| {
+                let id = previous
+                    .iter()
+                    .find_map(|id| id.strip_prefix("summary:web:"))?;
+                (anchor.index..cells.len()).rfind(|&index| {
+                    cells[index]
+                        .as_any()
+                        .downcast_ref::<crate::history_cell::WebSearchCell>()
+                        .is_some_and(|search| search.is_completed() && search.call_id() == id)
+                })
+            })
+            && let Some(cell) = cells.get(index)
+        {
+            self.position = Position::Reading(Anchor {
+                key: EntryKey::cell(cell),
+                index,
+                offset: 0,
+                row_bias: 0,
+            });
+        }
+        if self.snapshot().is_none()
+            && let Some((_, focused)) = &self.disclosure.focused
+            && focused.iter().any(|id| id.starts_with("summary:web:"))
+            && self.canonical_activity_index(cells, focused).is_none()
+        {
+            self.disclosure.focused = None;
+        }
+        let expanded = self.disclosure.is_expanded(ids);
+        if expanded {
+            self.disclosure.expanded.extend(ids.iter().cloned());
+        }
+        expanded
+    }
+
+    pub(super) fn activity_ids(&self, cells: &[Arc<dyn HistoryCell>], index: usize) -> Vec<String> {
+        cells.get(index).map_or_else(
+            || self.disclosure.live_ids.clone(),
+            |cell| match self.turn_row(cells, index) {
+                Some(row) if !self.is_search_expanded(EntryKey::cell(cell)) => row.ids().to_vec(),
+                _ => cell.activity_ids(),
+            },
+        )
+    }
+
+    /// Retired live entries and replaced groups keep the identities of their displayed revision.
+    pub(super) fn displayed_activity_ids(
+        &self,
+        cells: &[Arc<dyn HistoryCell>],
+        index: usize,
+    ) -> Arc<[String]> {
+        let key = cells.get(index).map_or(EntryKey::Live, EntryKey::cell);
+        if self.is_search_expanded(key) {
+            return self.activity_ids(cells, index).into();
+        }
+        self.snapshot()
+            .and_then(|snapshot| snapshot.activities.get(&key))
+            .cloned()
+            .unwrap_or_else(|| self.activity_ids(cells, index).into())
+    }
+
+    pub(super) fn render_disclosure(
+        &self,
+        ids: &[String],
+        layout: &TextLayout,
+        row: usize,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        let focused = self
+            .disclosure
+            .focused
+            .as_ref()
+            .is_some_and(|(_, focused)| ids.iter().any(|id| focused.contains(id)));
+        if !focused || !layout.disclosure {
+            return;
+        }
+        if layout.disclosure_row() == Some(row) {
+            let columns = layout.disclosure_columns();
+            buf.set_style(
+                Rect::new(
+                    area.x + columns.start,
+                    area.y,
+                    columns.end - columns.start,
+                    /*height*/ 1,
+                ),
+                Style::default()
+                    .fg(accent_color())
+                    .bold()
+                    .remove_modifier(Modifier::DIM),
+            );
+        } else if layout.is_turn_disclosure() {
+            buf.set_style(
+                area,
+                Style::default()
+                    .fg(crate::style::user_message_accent_color())
+                    .bold(),
+            );
+        } else if row == usize::from(layout.separated) {
+            buf.set_style(area, Style::default().underlined());
+        }
+    }
+
+    pub(crate) fn disclosure_hover_area(&self, point: ratatui::layout::Position) -> Option<Rect> {
+        self.disclosure_at(point).map(|(_, area)| area)
+    }
+
+    fn disclosure_at(&self, point: ratatui::layout::Position) -> Option<(&VisibleRow, Rect)> {
+        if self.is_select_mode()
+            || self.detailed
+            || self.mode != HistoryRenderMode::Rich
+            || !self.area.contains(point)
+        {
+            return None;
+        }
+        let visible = self.visible.get(usize::from(point.y - self.area.y))?;
+        if visible.layout.disclosure_row() != Some(visible.row) {
+            return None;
+        }
+        let columns = visible.layout.disclosure_columns();
+        let area = Rect::new(
+            self.area.x + columns.start,
+            point.y,
+            columns.end - columns.start,
+            /*height*/ 1,
+        );
+        area.contains(point).then_some((visible, area))
+    }
+
+    pub(super) fn toggle_disclosure_at(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        column: u16,
+        row: u16,
+    ) -> bool {
+        let Some((visible, _)) = self.disclosure_at((column, row).into()) else {
+            return false;
+        };
+        let Some(index) = self.canonical_activity_index(cells, &visible.activity_ids) else {
+            return false;
+        };
+        self.toggle_activity(cells, index);
+        true
+    }
+
+    pub(super) fn handle_disclosure_key(
+        &mut self,
+        key: KeyEvent,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<ViewAction> {
+        if self.detailed || self.mode != HistoryRenderMode::Rich || self.is_search_editing() {
+            return None;
+        }
+        if self.disclosure.keymap.app.focus_activity.is_pressed(key) {
+            if self.is_activity_focused() {
+                self.disclosure.focused = None;
+            } else {
+                self.end_selection(cells);
+                let visible = self
+                    .visible
+                    .iter()
+                    .rev()
+                    .find_map(|row| self.canonical_activity_index(cells, &row.activity_ids));
+                for index in visible.into_iter().chain((0..=cells.len()).rev()) {
+                    if !self.activity_ids(cells, index).is_empty()
+                        && self.focus_activity(cells, index)
+                    {
+                        break;
+                    }
+                }
+            }
+            return Some(ViewAction::Changed);
+        }
+        let focused = self
+            .disclosure
+            .focused
+            .as_ref()
+            .and_then(|(_, ids)| self.canonical_activity_index(cells, ids));
+        let Some(focused) = focused else {
+            self.disclosure.focused = None;
+            return None;
+        };
+        let Some(action) = self.disclosure.keymap.list.action_for(key) else {
+            // Ordinary text resumes composing; activity navigation never becomes a text editor.
+            self.disclosure.focused = None;
+            return None;
+        };
+        match action {
+            ListAction::Cancel => self.disclosure.focused = None,
+            ListAction::Accept => self.toggle_activity(cells, focused),
+            ListAction::MoveLeft | ListAction::MoveRight => {
+                let ids = self.activity_ids(cells, focused);
+                let expanded = self.disclosure.is_expanded(&ids)
+                    || self.is_search_expanded(self.entry_key(cells, focused));
+                if expanded != (action == ListAction::MoveRight) {
+                    self.toggle_activity(cells, focused);
+                }
+            }
+            ListAction::MoveUp
+            | ListAction::MoveDown
+            | ListAction::PageUp
+            | ListAction::PageDown
+            | ListAction::JumpTop
+            | ListAction::JumpBottom => {
+                let (mut range, backwards, steps) = match action {
+                    ListAction::MoveUp => (0..focused, true, 1),
+                    ListAction::PageUp => (0..focused, true, 5),
+                    ListAction::JumpTop => (0..cells.len() + 1, false, 1),
+                    ListAction::MoveDown => (focused + 1..cells.len() + 1, false, 1),
+                    ListAction::PageDown => (focused + 1..cells.len() + 1, false, 5),
+                    ListAction::JumpBottom => (0..cells.len() + 1, true, 1),
+                    ListAction::MoveLeft
+                    | ListAction::MoveRight
+                    | ListAction::Accept
+                    | ListAction::Cancel => unreachable!(),
+                };
+                let mut next = focused;
+                for _ in 0..steps {
+                    let candidate = if backwards {
+                        range
+                            .by_ref()
+                            .rev()
+                            .find(|index| !self.activity_ids(cells, *index).is_empty())
+                    } else {
+                        range
+                            .by_ref()
+                            .find(|index| !self.activity_ids(cells, *index).is_empty())
+                    };
+                    let Some(index) = candidate else { break };
+                    next = index;
+                }
+                loop {
+                    if self.focus_activity(cells, next) {
+                        break;
+                    }
+                    let candidate = if backwards {
+                        range.next_back()
+                    } else {
+                        range.next()
+                    };
+                    let Some(index) = candidate else { break };
+                    next = index;
+                }
+            }
+        }
+        Some(ViewAction::Changed)
+    }
+
+    pub(super) fn canonical_activity_index(
+        &self,
+        cells: &[Arc<dyn HistoryCell>],
+        ids: &[String],
+    ) -> Option<usize> {
+        if ids.is_empty() {
+            return None;
+        }
+        // A visible immutable cell resolves directly; replaced groups fall back to member IDs.
+        if let Some(row) = self.visible.iter().find(|row| {
+            row.index <= cells.len()
+                && row.activity_ids.iter().any(|id| ids.contains(id))
+                && cells.get(row.index).map_or(EntryKey::Live, EntryKey::cell) == row.key
+                && self
+                    .activity_ids(cells, row.index)
+                    .iter()
+                    .any(|id| ids.contains(id))
+        }) {
+            return Some(row.index);
+        }
+        (0..=cells.len()).find(|index| {
+            self.activity_ids(cells, *index)
+                .iter()
+                .any(|id| ids.contains(id))
+        })
+    }
+
+    fn focus_activity(&mut self, cells: &[Arc<dyn HistoryCell>], index: usize) -> bool {
+        let Some(layout) = self.layout(cells, index) else {
+            return false;
+        };
+        let Some(control) = layout.disclosure_row() else {
+            return false;
+        };
+        let ids = self.activity_ids(cells, index);
+        let row = if matches!(
+            self.turn_row(cells, index),
+            Some(turn_details::TurnRow::Prompt { .. })
+        ) {
+            control
+        } else {
+            usize::from(layout.separated)
+        };
+        let visible = self.visible.iter().any(|visible| {
+            visible.row == row && visible.activity_ids.iter().any(|id| ids.contains(id))
+        });
+        self.disclosure.focused = Some((self.entry_key(cells, index), ids));
+        if !visible {
+            self.jump_to_entry(cells, index);
+            if let Position::Reading(anchor) = &mut self.position {
+                anchor.offset = layout.position_at(row, /*column*/ 0);
+                anchor.row_bias = layout.row_for_offset(anchor.offset) as isize - row as isize;
+            }
+        }
+        true
+    }
+
+    fn toggle_activity(&mut self, cells: &[Arc<dyn HistoryCell>], index: usize) {
+        let ids = self.activity_ids(cells, index);
+        if ids.is_empty() {
+            return;
+        }
+        let key = cells.get(index).map_or(EntryKey::Live, EntryKey::cell);
+        let matched = self.is_search_expanded(key);
+        self.disclosure.anchor_control = None;
+        let previous_top = self.visible.first().map(|visible| {
+            let offset = visible.layout.position_at(visible.row, /*column*/ 0);
+            if !matched
+                && offset == 0
+                && visible.layout.disclosure_row() == Some(visible.row)
+                && visible.activity_ids.iter().any(|id| ids.contains(id))
+            {
+                self.disclosure.anchor_control = Some(key);
+            }
+            (
+                visible.key,
+                Arc::clone(&visible.activity_ids),
+                offset,
+                visible.layout.row_for_offset(offset) as isize - visible.row as isize,
+            )
+        });
+        self.end_selection(cells);
+        if self.search.has_active_query() && !matched {
+            if let Some(snapshot) = &mut self.held_reading {
+                snapshot.pinned.remove(&key);
+                if let Some(details) = &self.turn_details {
+                    for child in details.child_keys(index) {
+                        snapshot.pinned.remove(&child);
+                        snapshot.activities.remove(&child);
+                    }
+                }
+            }
+        } else {
+            self.release_live_reading();
+        }
+        // Source offsets only survive an unchanged cell. Regrouped/retired live entries resolve
+        // through their member IDs and anchor at their header, never a stale positional index.
+        let anchor = previous_top
+            .and_then(|(key, top_ids, offset, row_bias)| {
+                let unchanged = cells.iter().position(|cell| EntryKey::cell(cell) == key);
+                let top = unchanged.or_else(|| self.canonical_activity_index(cells, &top_ids))?;
+                let prompt = matches!(
+                    self.turn_row(cells, top),
+                    Some(turn_details::TurnRow::Prompt { .. })
+                );
+                let preserve_offset = unchanged.is_some() && (top != index || prompt);
+                Some(Anchor {
+                    key: cells.get(top).map_or(EntryKey::Live, EntryKey::cell),
+                    index: top,
+                    offset: if preserve_offset { offset } else { 0 },
+                    row_bias: if preserve_offset { row_bias } else { 0 },
+                })
+            })
+            .unwrap_or(Anchor {
+                key: cells.get(index).map_or(EntryKey::Live, EntryKey::cell),
+                index,
+                offset: 0,
+                row_bias: 0,
+            });
+        let collapsing = matched || self.disclosure.is_expanded(&ids);
+        if collapsing {
+            self.disclosure.expanded.retain(|id| !ids.contains(id));
+        } else {
+            self.disclosure.expanded.extend(ids.iter().cloned());
+        }
+        self.disclosure.clamp_after_collapse = collapsing;
+        self.disclosure.focused = Some((key, ids));
+        self.position = Position::Reading(anchor);
+        self.cache.clear();
+        self.live_key = None;
+        self.live_separated = None;
+        if matched {
+            self.invalidate_held_search();
+        }
+    }
+
+    pub(super) fn disclosure_footer(&self, width: u16) -> Option<TranscriptFooter> {
+        let (key, ids) = self.disclosure.focused.as_ref()?;
+        let toggle = if self.disclosure.is_expanded(ids) || self.is_search_expanded(*key) {
+            "collapse"
+        } else {
+            "expand"
+        };
+        let keymap = &self.disclosure.keymap;
+        let hints: Vec<_> = [
+            (ListAction::MoveUp, "previous"),
+            (ListAction::MoveDown, "next"),
+            (ListAction::Accept, toggle),
+            (ListAction::Cancel, "back"),
+        ]
+        .into_iter()
+        .filter_map(|(action, label)| {
+            keymap.list.primary_hint(action).map(|key| {
+                let mut spans = key.spans();
+                spans.push(format!(" {label}").dim());
+                Line::from(spans)
+            })
+        })
+        .collect();
+        // Drop navigation before the details/back controls, retaining whole remapped chords.
+        let text = crate::footer_hint::first_fitting_line(
+            (0..hints.len()).map(|start| {
+                let mut spans = Vec::new();
+                for (index, hint) in hints[start..].iter().enumerate() {
+                    if index > 0 {
+                        spans.push(" · ".dim());
+                    }
+                    spans.extend(hint.spans.clone());
+                }
+                Line::from(spans)
+            }),
+            width,
+        );
+        Some(TranscriptFooter {
+            text: text.into(),
+            cursor_column: None,
+            is_interactive: true,
+        })
+    }
+}

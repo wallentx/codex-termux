@@ -8,6 +8,7 @@ use tokio::process::Command;
 use tracing::trace;
 
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::shell_environment::is_non_inheritable_env_var;
 
 /// Experimental environment variable that will be set to some non-empty value
 /// if both of the following are true:
@@ -60,13 +61,30 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         mut env,
     } = request;
 
+    env.retain(|name, _| !is_non_inheritable_env_var(name));
+
+    // Both command arguments and environment variables can contain credentials.
     trace!(
-        "spawn_child_async: {program:?} {args:?} {arg0:?} {cwd:?} {network_sandbox_policy:?} {stdio_policy:?} {env:?}"
+        ?program,
+        ?cwd,
+        ?network_sandbox_policy,
+        ?stdio_policy,
+        arg_count = args.len(),
+        has_arg0_override = arg0.is_some(),
+        env_count = env.len(),
+        "spawn_child_async"
     );
 
-    let mut cmd = Command::new(&program);
+    let mut cmd = match stdio_policy {
+        StdioPolicy::RedirectForShellTool => {
+            Command::from(codex_utils_process::background_command(&program))
+        }
+        StdioPolicy::Inherit => Command::new(&program),
+    };
     #[cfg(unix)]
-    cmd.arg0(arg0.map_or_else(|| program.to_string_lossy().to_string(), String::from));
+    if let Some(arg0) = arg0 {
+        cmd.arg0(arg0);
+    }
     cmd.args(args);
     cmd.current_dir(cwd);
     if let Some(network) = network {
@@ -100,6 +118,9 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
                 // current parent dies."
                 codex_utils_pty::process_group::set_parent_death_signal(parent_pid)?;
             }
+            // Close descriptors accidentally inherited by the child.
+            #[cfg(target_os = "macos")]
+            codex_utils_pty::pty::close_inherited_fds_except(&[]);
             Ok(())
         });
     }
@@ -124,3 +145,7 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
 
     cmd.kill_on_drop(true).spawn()
 }
+
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod tests;

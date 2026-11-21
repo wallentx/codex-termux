@@ -60,8 +60,8 @@ impl PendingThreadApprovals {
         lines.push(
             Line::from(vec![
                 "    ".into(),
-                "/agent".cyan().bold(),
-                " to switch threads".dim(),
+                "/subagents".cyan().bold(),
+                " to review requests".dim(),
             ])
             .dim(),
         );
@@ -120,7 +120,7 @@ mod tests {
             snapshot_rows(&widget, /*width*/ 40).replace(' ', "."),
             @r"
         ..!.Approval.needed.in.Robie.[explorer].
-        ..../agent.to.switch.threads............
+        ..../subagents.to.review.requests.......
         "
         );
     }
@@ -142,7 +142,7 @@ mod tests {
         ..!.Approval.needed.in.Robie.[explorer].....
         ..!.Approval.needed.in.Inspector............
         ............................................
-        ..../agent.to.switch.threads................
+        ..../subagents.to.review.requests...........
         "
         );
     }

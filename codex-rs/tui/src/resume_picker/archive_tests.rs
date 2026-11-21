@@ -1,0 +1,452 @@
+use super::super::PickerLoadRequest;
+use super::super::PickerLoader;
+use super::super::PickerState;
+use super::super::ProviderFilter;
+use super::super::Row;
+use super::super::SessionPickerAction;
+use super::super::SessionPickerLaunchContext;
+use super::super::SessionSelection;
+use super::super::SessionStatus;
+use super::super::SessionTarget;
+use super::ArchiveState;
+use crate::key_hint::KeyBinding;
+use crate::tui::FrameRequester;
+use codex_app_server_client::TypedRequestError;
+use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::ThreadSortKey;
+use codex_protocol::ThreadId;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
+use pretty_assertions::assert_eq;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+fn archive_picker_state() -> (PickerState, Arc<Mutex<Vec<ThreadId>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let request_sink = Arc::clone(&requests);
+    let picker_loader: PickerLoader = Arc::new(move |request| {
+        if let PickerLoadRequest::Archive { thread_id, .. }
+        | PickerLoadRequest::Unarchive { thread_id, .. } = request
+        {
+            request_sink
+                .lock()
+                .expect("archive request sink")
+                .push(thread_id);
+        }
+    });
+    let state = PickerState::new(
+        crate::backend_id::BackendId::new(),
+        FrameRequester::test_dummy(),
+        picker_loader,
+        ProviderFilter::Any,
+        /*show_all*/ true,
+        /*filter_cwd*/ None,
+        SessionPickerAction::Resume,
+    );
+    (state, requests)
+}
+
+fn set_selected_session(state: &mut PickerState, thread_id: ThreadId) {
+    state.all_rows = vec![Row {
+        backend_id: None,
+        history_mode: None,
+        path: None,
+        preview: String::from("Selected session"),
+        thread_id: Some(thread_id),
+        thread_name: None,
+        created_at: None,
+        updated_at: None,
+        cwd: None,
+        git_branch: None,
+    }];
+    state.apply_filter();
+}
+
+#[tokio::test]
+async fn archive_shortcut_archives_selected_session_once() {
+    let (mut state, _requests) = archive_picker_state();
+    let (requests, mut actions) = tokio::sync::mpsc::unbounded_channel();
+    state.picker_loader = Arc::new(move |request| requests.send(request).unwrap());
+    let backend_id = crate::backend_id::BackendId::new();
+    let thread_id = ThreadId::new();
+    set_selected_session(&mut state, thread_id);
+    state.all_rows[0].backend_id = Some(backend_id);
+    state.apply_filter();
+    let shortcut = KeyEvent::new(KeyCode::Char('\u{0001}'), KeyModifiers::NONE);
+
+    assert!(state.handle_key(shortcut).await.unwrap().is_none());
+    assert!(state.handle_key(shortcut).await.unwrap().is_none());
+    assert_eq!(
+        state.archive_state,
+        ArchiveState::Pending {
+            backend_id,
+            thread_id
+        }
+    );
+    assert!(
+        matches!(actions.recv().await, Some(PickerLoadRequest::Archive { backend_id: owner, thread_id: archived }) if (owner, archived) == (backend_id, thread_id))
+    );
+    assert!(
+        state
+            .handle_key(KeyEvent::from(KeyCode::Enter))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    state.handle_archive_result(backend_id, thread_id, Ok(()));
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+    assert!(state.filtered_rows.is_empty());
+
+    state.status = SessionStatus::Archived;
+    set_selected_session(&mut state, thread_id);
+    state.all_rows[0].backend_id = Some(backend_id);
+    state.apply_filter();
+    state
+        .handle_key(KeyEvent::from(KeyCode::Enter))
+        .await
+        .unwrap();
+    assert!(
+        matches!(actions.recv().await, Some(PickerLoadRequest::Unarchive { backend_id: owner, thread_id: restored }) if (owner, restored) == (backend_id, thread_id))
+    );
+}
+
+#[test]
+fn archive_request_rejects_current_session() {
+    let (mut state, requests) = archive_picker_state();
+    let thread_id = ThreadId::new();
+    state.launch_context = SessionPickerLaunchContext::ExistingSession {
+        current_thread_id: Some((state.backend_id, thread_id)),
+    };
+    set_selected_session(&mut state, thread_id);
+
+    state.request_archive_for_selected_session();
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+    assert_eq!(
+        state.inline_error.as_deref(),
+        Some("Use /archive to archive the current session and exit.")
+    );
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn archive_failure_preserves_session_and_reports_server_error() {
+    let (mut state, requests) = archive_picker_state();
+    let thread_id = ThreadId::new();
+    set_selected_session(&mut state, thread_id);
+    state.request_archive_for_selected_session();
+    let error = TypedRequestError::Server {
+        method: String::from("thread/archive"),
+        source: JSONRPCErrorError {
+            code: -32600,
+            message: String::from("thread already has an active writer"),
+            data: None,
+        },
+    };
+
+    state.handle_archive_result(
+        state.backend_id,
+        thread_id,
+        Err(std::io::Error::other(error)),
+    );
+
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+    assert_eq!(
+        state.inline_error.as_deref(),
+        Some(
+            "Failed to archive session: thread/archive failed: thread already has an active writer (code -32600)"
+        )
+    );
+    assert_eq!(state.filtered_rows.len(), 1);
+
+    state.request_archive_for_selected_session();
+
+    assert_eq!(*requests.lock().unwrap(), vec![thread_id, thread_id]);
+}
+
+#[test]
+fn archive_shortcut_preserves_configured_list_binding() {
+    let (mut state, _requests) = archive_picker_state();
+    state.keymap.list.move_up.push(KeyBinding::new(
+        KeyCode::Char('\u{0001}'),
+        KeyModifiers::NONE,
+    ));
+
+    assert!(!state.archive_shortcut_available());
+}
+
+#[test]
+fn archive_footer_shows_shortcut_for_resume_sessions() {
+    let (mut state, _requests) = archive_picker_state();
+    set_selected_session(&mut state, ThreadId::new());
+    let footer = super::super::footer_hint_lines(&state, /*width*/ 220)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    insta::assert_snapshot!(footer, @"
+    enter resume   ⌃a archive   esc start new   ⌃c quit   tab focus sort/filter   ←/→ change option
+    ⌃o dense view   ⌃t transcript   ⌃e expand   ↑/↓ browse
+    ");
+}
+
+#[test]
+fn archived_status_preserves_directory_filter_and_hides_archive_shortcut() {
+    let requested_filters = Arc::new(Mutex::new(Vec::new()));
+    let request_sink = Arc::clone(&requested_filters);
+    let picker_loader: PickerLoader = Arc::new(move |request| {
+        if let PickerLoadRequest::Page(request) = request {
+            request_sink
+                .lock()
+                .expect("page request sink")
+                .push((request.status, request.cwd_filter));
+        }
+    });
+    let mut state = PickerState::new(
+        crate::backend_id::BackendId::new(),
+        FrameRequester::test_dummy(),
+        picker_loader,
+        ProviderFilter::Any,
+        /*show_all*/ false,
+        Some(PathBuf::from("/tmp/project")),
+        SessionPickerAction::Resume,
+    );
+
+    state.toggle_status();
+
+    assert_eq!(state.status, SessionStatus::Archived);
+    let params = super::super::thread_list_params(
+        /*cursor*/ None,
+        Some(codex_app_server_protocol::ThreadListCwdFilter::One(
+            "/tmp/project".to_string(),
+        )),
+        SessionStatus::Archived,
+        ProviderFilter::Any,
+        ThreadSortKey::UpdatedAt,
+        /*include_non_interactive*/ false,
+        /*use_state_db_only*/ false,
+    );
+    assert_eq!(params.archived, Some(true));
+
+    set_selected_session(&mut state, ThreadId::new());
+    assert!(!state.archive_shortcut_available());
+    let footer = super::super::footer_hint_lines(&state, /*width*/ 220)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(footer, @"
+    enter restore   esc start new   ⌃c quit   tab focus sort/filter   ←/→ change option
+    ⌃o dense view   ⌃t transcript   ⌃e expand   ↑/↓ browse
+    ");
+    insta::assert_snapshot!(
+        super::super::toolbar_line(&state, /*compact*/ true).to_string(),
+        @"Filter: Cwd   Archived  Sort: Updated "
+    );
+
+    state.change_filter_mode(super::super::ToolbarValueDirection::Next);
+
+    assert_eq!(
+        *requested_filters.lock().unwrap(),
+        vec![
+            (SessionStatus::Archived, Some(PathBuf::from("/tmp/project")),),
+            (SessionStatus::Archived, None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn archived_session_restore_resumes_after_completion() {
+    let (mut state, requests) = archive_picker_state();
+    let thread_id = ThreadId::new();
+    state.status = SessionStatus::Archived;
+    set_selected_session(&mut state, thread_id);
+
+    assert!(
+        state
+            .handle_key(KeyEvent::from(KeyCode::Enter))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(state.archive_state, ArchiveState::Restoring { thread_id });
+    assert_eq!(*requests.lock().unwrap(), vec![thread_id]);
+
+    assert!(
+        state
+            .handle_key(KeyEvent::from(KeyCode::Enter))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*requests.lock().unwrap(), vec![thread_id]);
+
+    let selection = state.handle_unarchive_result(
+        thread_id,
+        Ok(SessionTarget {
+            backend_id: state.backend_id,
+            path: None,
+            thread_id,
+            cwd: None,
+            history_mode: None,
+        }),
+    );
+
+    assert!(matches!(
+        selection,
+        Some(SessionSelection::Resume(SessionTarget {
+            backend_id: _,
+            path: None,
+            thread_id: resumed_thread_id,
+            cwd: None,
+            history_mode: None,
+        })) if resumed_thread_id == thread_id
+    ));
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+}
+
+#[test]
+fn archived_session_restore_failure_preserves_session_and_allows_retry() {
+    let (mut state, requests) = archive_picker_state();
+    let thread_id = ThreadId::new();
+    state.status = SessionStatus::Archived;
+    set_selected_session(&mut state, thread_id);
+    state.request_unarchive(thread_id, state.backend_id);
+
+    let selection =
+        state.handle_unarchive_result(thread_id, Err(std::io::Error::other("restore denied")));
+
+    assert!(selection.is_none());
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+    assert_eq!(
+        state.inline_error.as_deref(),
+        Some("Failed to restore archived session: restore denied")
+    );
+    assert_eq!(state.filtered_rows.len(), 1);
+
+    state.request_unarchive(thread_id, state.backend_id);
+
+    assert_eq!(*requests.lock().unwrap(), vec![thread_id, thread_id]);
+}
+
+#[tokio::test]
+async fn archive_cloud_preserves_same_id_current_local_row_and_transcript() {
+    let (mut state, _requests) = archive_picker_state();
+    let (requests, mut actions) = tokio::sync::mpsc::unbounded_channel();
+    state.picker_loader = Arc::new(move |request| requests.send(request).unwrap());
+    let thread_id = ThreadId::new();
+    let local = state.backend_id;
+    let cloud = crate::backend_id::BackendId::new();
+    state.launch_context = SessionPickerLaunchContext::ExistingSession {
+        current_thread_id: Some((local, thread_id)),
+    };
+    set_selected_session(&mut state, thread_id);
+    let local_row = state.all_rows[0].clone();
+    let mut cloud_row = local_row.clone();
+    cloud_row.backend_id = Some(cloud);
+    state.all_rows.push(cloud_row);
+    state.apply_filter();
+    state.selected = state
+        .filtered_rows
+        .iter()
+        .position(|row| row.backend_id == Some(cloud))
+        .unwrap();
+    state.transcript_cells.insert(
+        (local, thread_id),
+        super::super::SessionTranscriptState::Failed,
+    );
+    state.transcript_cells.insert(
+        (cloud, thread_id),
+        super::super::SessionTranscriptState::Failed,
+    );
+    for (backend_id, text) in [(local, "Local preview"), (cloud, "Cloud preview")] {
+        state.selected = state
+            .filtered_rows
+            .iter()
+            .position(|row| row.backend_id.unwrap_or(local) == backend_id)
+            .unwrap();
+        state.toggle_selected_expansion();
+        assert!(
+            matches!(actions.try_recv().unwrap(), PickerLoadRequest::Preview { backend_id: owner, thread_id: id } if (owner, id) == (backend_id, thread_id))
+        );
+        state
+            .handle_background_event(super::super::BackgroundEvent::Preview {
+                backend_id,
+                thread_id,
+                preview: Ok(vec![super::super::TranscriptPreviewLine {
+                    speaker: super::super::TranscriptPreviewSpeaker::User,
+                    text: text.into(),
+                }]),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(state.expanded_thread_id, Some((cloud, thread_id)));
+    state.pending_transcript_open = Some((local, thread_id));
+
+    state.request_archive_for_selected_session();
+    assert_eq!(
+        state.archive_state,
+        ArchiveState::Pending {
+            backend_id: cloud,
+            thread_id
+        }
+    );
+    assert!(
+        matches!(actions.try_recv().unwrap(), PickerLoadRequest::Archive {
+        backend_id, thread_id: id
+    } if (backend_id, id) == (cloud, thread_id))
+    );
+    assert!(actions.try_recv().is_err());
+    state.handle_archive_result(local, thread_id, Ok(()));
+    assert_eq!(state.all_rows.len(), 2);
+    assert_eq!(
+        state.archive_state,
+        ArchiveState::Pending {
+            backend_id: cloud,
+            thread_id
+        }
+    );
+    state.handle_archive_result(cloud, thread_id, Ok(()));
+
+    assert_eq!(state.all_rows, vec![local_row.clone()]);
+    assert_eq!(state.filtered_rows, vec![local_row]);
+    assert_eq!(
+        state.transcript_cells.keys().copied().collect::<Vec<_>>(),
+        vec![(local, thread_id)]
+    );
+    state
+        .handle_background_event(super::super::BackgroundEvent::Preview {
+            backend_id: cloud,
+            thread_id,
+            preview: Ok(vec![super::super::TranscriptPreviewLine {
+                speaker: super::super::TranscriptPreviewSpeaker::User,
+                text: "Late Cloud preview".into(),
+            }]),
+        })
+        .await
+        .unwrap();
+    assert!(!state.transcript_previews.contains_key(&(cloud, thread_id)));
+    assert_eq!(state.expanded_thread_id, None);
+    state.toggle_selected_expansion();
+    assert_eq!(state.expanded_thread_id, Some((local, thread_id)));
+    let lines = super::super::render_transcript_preview_lines(
+        &state.filtered_rows[0],
+        &state,
+        /*width*/ 80,
+    );
+    let rendered = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Local preview"));
+    assert!(!rendered.contains("Cloud preview"));
+    assert_eq!(state.pending_transcript_open, Some((local, thread_id)));
+    assert_eq!(state.archive_state, ArchiveState::Idle);
+}

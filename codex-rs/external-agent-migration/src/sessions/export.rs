@@ -1,7 +1,9 @@
 use super::ConversationMessage;
 use super::ImportedExternalAgentSession;
 use super::MessageRole;
-use super::records::read_session_import_with_cwd;
+use super::SessionRecordFormat;
+use super::records_cla;
+use super::records_cur;
 use super::summarize_for_label;
 use super::title::IMPORTED_SESSION_FALLBACK_TITLE;
 use super::title::SessionTitleCandidates;
@@ -10,33 +12,39 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_rollout::RolloutItem;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
-const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+pub(super) const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 
 #[cfg(test)]
 fn load_session_for_import(path: &Path) -> io::Result<Option<ImportedExternalAgentSession>> {
-    Ok(
-        load_session_for_import_with_content_sha256(path, /*fallback_cwd*/ None)?
-            .map(|(session, _content_sha256, _attributed_mcp_server_ids)| session),
-    )
+    Ok(load_session_for_import_with_content_sha256(
+        path,
+        SessionRecordFormat::Cla,
+        /*fallback_cwd*/ None,
+    )?
+    .map(|(session, _content_sha256, _attributed_mcp_server_ids)| session))
 }
 
 pub(crate) fn load_session_for_import_with_content_sha256(
     path: &Path,
+    record_format: SessionRecordFormat,
     fallback_cwd: Option<&Path>,
 ) -> io::Result<Option<(ImportedExternalAgentSession, String, BTreeSet<String>)>> {
-    let parsed = read_session_import_with_cwd(path, fallback_cwd)?;
+    let parsed = match record_format {
+        SessionRecordFormat::Cla => records_cla::read_session_import(path)?,
+        SessionRecordFormat::Cur => records_cur::read_session_import(path, fallback_cwd)?,
+    };
     let Some(cwd) = parsed.cwd else {
         return Ok(None);
     };
@@ -74,7 +82,7 @@ pub(crate) fn load_session_for_import_with_content_sha256(
     )))
 }
 
-fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<RolloutItem> {
+pub(super) fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<RolloutItem> {
     let mut items = Vec::new();
     let mut current_turn = None;
     let mut response_item_bytes = 0i64;
@@ -97,7 +105,9 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                 let turn_id = format!("external-import-turn-{user_turn_count}");
                 items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
                     TurnStartedEvent {
+                        turn_attribution: None,
                         turn_id: turn_id.clone(),
+                        root_turn_id: None,
                         trace_id: None,
                         started_at,
                         model_context_window: None,
@@ -112,7 +122,7 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                 )));
                 response_item_bytes =
                     response_item_bytes.saturating_add(message_byte_count(&message));
-                items.push(RolloutItem::ResponseItem(response_item(message)));
+                items.push(RolloutItem::ResponseItem(response_item(message).into()));
                 current_turn = Some((turn_id, started_at));
             }
             MessageRole::Assistant => {
@@ -124,12 +134,15 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                 last_model_visible_tokens = approx_tokens_from_byte_count_i64(response_item_bytes);
                 items.push(RolloutItem::EventMsg(EventMsg::AgentMessage(
                     AgentMessageEvent {
+                        moderation: None,
                         message: message.text.clone(),
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
+                        questions: None,
                     },
                 )));
-                items.push(RolloutItem::ResponseItem(response_item(message)));
+                items.push(RolloutItem::ResponseItem(response_item(message).into()));
             }
         }
     }
@@ -145,18 +158,27 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
 
 fn external_session_imported_marker_item() -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        moderation: None,
         message: EXTERNAL_SESSION_IMPORTED_MARKER.to_string(),
         phase: None,
         memory_citation: None,
+        delivery: None,
+        questions: None,
     }))
 }
 
 fn response_item(message: ConversationMessage) -> ResponseItem {
     let content = match message.role {
-        MessageRole::Assistant => ContentItem::OutputText { text: message.text },
+        MessageRole::Assistant => ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
+            text: message.text,
+        },
         MessageRole::User => ContentItem::InputText { text: message.text },
     };
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: match message.role {
             MessageRole::Assistant => "assistant".to_string(),
@@ -180,6 +202,7 @@ fn token_count_item(last_model_visible_tokens: i64) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
         info: Some(TokenUsageInfo {
             total_token_usage: usage.clone(),
+            last_usage_includes_reasoning: None,
             last_token_usage: usage,
             model_context_window: None,
         }),
@@ -193,6 +216,7 @@ fn turn_complete_item(
     completed_at: Option<i64>,
 ) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
         turn_id,
         last_agent_message: None,
         error: None,
@@ -206,7 +230,7 @@ fn turn_complete_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadItemPayload;
     use codex_app_server_protocol::build_turns_from_rollout_items;
     use serde_json::Value as JsonValue;
     use std::path::Path;
@@ -237,13 +261,16 @@ mod tests {
         assert_eq!(turns[0].items.len(), 2);
         assert_eq!(turns[1].items.len(), 2);
         assert_eq!(
-            turns[1].items[1],
-            ThreadItem::AgentMessage {
+            turns[1].item_payloads().next_back(),
+            Some(&ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "item-4".into(),
                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
                 phase: None,
                 memory_citation: None,
-            }
+                delivery: None,
+                questions: None,
+            })
         );
     }
 
@@ -269,12 +296,15 @@ mod tests {
 
         assert_eq!(turns.len(), 1);
         assert_eq!(
-            turns[0].items.last(),
-            Some(&ThreadItem::AgentMessage {
+            turns[0].item_payloads().next_back(),
+            Some(&ThreadItemPayload::AgentMessage {
+                moderation: None,
                 id: "item-3".into(),
                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             })
         );
         let last_turn_complete = imported
@@ -317,7 +347,8 @@ mod tests {
             .filter(|item| {
                 matches!(
                     item,
-                    RolloutItem::ResponseItem(ResponseItem::Message { .. })
+                    RolloutItem::ResponseItem(response_item)
+                        if matches!(&response_item.item, ResponseItem::Message { .. })
                 )
             })
             .count();

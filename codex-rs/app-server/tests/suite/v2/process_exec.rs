@@ -38,11 +38,11 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
             "-NonInteractive".to_string(),
             "-Command".to_string(),
             concat!(
-                "[IO.File]::WriteAllText($env:CODEX_PROCESS_EXEC_PROBE_FILE, 'process'); ",
+                "[IO.File]::WriteAllText($env:CODEX_PROCESS_EXEC_PROBE_FILE, ''); ",
                 "while (!(Test-Path -LiteralPath $env:CODEX_PROCESS_EXEC_RELEASE_FILE)) { ",
                 "Start-Sleep -Milliseconds 20 ",
                 "}; ",
-                "[Console]::Out.Write('process-out'); ",
+                "[Console]::Out.Write(('process-out|{0}|{1}' -f $env:OpenAI_Federation_Rule_Id, $env:OPENAI_IDENTITY_TOKEN_FILE)); ",
                 "[Console]::Error.Write('process-err')",
             )
             .to_string(),
@@ -52,9 +52,9 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
             "sh".to_string(),
             "-c".to_string(),
             concat!(
-                "printf process > \"$CODEX_PROCESS_EXEC_PROBE_FILE\"; ",
+                ": > \"$CODEX_PROCESS_EXEC_PROBE_FILE\"; ",
                 "while [ ! -e \"$CODEX_PROCESS_EXEC_RELEASE_FILE\" ]; do sleep 0.05; done; ",
-                "printf process-out; ",
+                "printf 'process-out|%s|%s' \"$OpenAI_Federation_Rule_Id\" \"$OPENAI_IDENTITY_TOKEN_FILE\"; ",
                 "printf process-err >&2",
             )
             .to_string(),
@@ -68,6 +68,14 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
         (
             "CODEX_PROCESS_EXEC_RELEASE_FILE".to_string(),
             Some(release_file.display().to_string()),
+        ),
+        (
+            "OpenAI_Federation_Rule_Id".to_string(),
+            Some("rule".to_string()),
+        ),
+        (
+            "OPENAI_IDENTITY_TOKEN_FILE".to_string(),
+            Some("/run/identity-token".to_string()),
         ),
     ]);
     let spawn_request_id = mcp
@@ -85,7 +93,6 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
     assert_eq!(response.result, serde_json::json!({}));
 
     wait_for_file(&probe_file).await?;
-    assert_eq!(std::fs::read_to_string(&probe_file)?, "process");
     std::fs::write(&release_file, "release")?;
 
     let exited = read_process_exited(&mut mcp).await?;
@@ -94,12 +101,97 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
         ProcessExitedNotification {
             process_handle,
             exit_code: 0,
-            stdout: "process-out".to_string(),
+            output_drain_timed_out: Some(false),
+            stdout: "process-out||".to_string(),
             stdout_cap_reached: false,
             stderr: "process-err".to_string(),
             stderr_cap_reached: false,
         }
     );
+    Ok(())
+}
+
+/// Held-open streams report the drain deadline separately from the child status, unless the requested prefix is complete.
+#[cfg(unix)]
+#[tokio::test]
+async fn process_spawn_preserves_exit_code_when_output_drain_times_out() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let (_server, mut mcp) = initialized_mcp(codex_home.path()).await?;
+    for (handle, cap, script, exit_code, timed_out, stdout, stderr, stdout_cap_reached) in [
+        (
+            "unlimited",
+            None,
+            "printf prefix; sleep 30 2>/dev/null &",
+            0,
+            true,
+            "prefix",
+            "",
+            false,
+        ),
+        (
+            "full",
+            Some(3),
+            "printf abcdef; sleep 30 2>/dev/null &",
+            0,
+            false,
+            "abc",
+            "",
+            true,
+        ),
+        (
+            "partial-stderr",
+            Some(3),
+            "printf abcdef; printf x >&2; sleep 30 >/dev/null &",
+            0,
+            true,
+            "abc",
+            "x",
+            true,
+        ),
+        (
+            "zero",
+            Some(0),
+            "sleep 30 2>/dev/null &",
+            0,
+            false,
+            "",
+            "",
+            false,
+        ),
+        (
+            "child-error",
+            None,
+            "printf prefix; sleep 30 2>/dev/null & exit 7",
+            7,
+            true,
+            "prefix",
+            "",
+            false,
+        ),
+    ] {
+        let command = vec!["sh".into(), "-c".into(), script.into()];
+        let request_id = mcp
+            .send_process_spawn_request(ProcessSpawnParams {
+                output_bytes_cap: Some(cap),
+                ..process_spawn_params(handle.into(), codex_home.path(), command)?
+            })
+            .await?;
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await?;
+        let exited = timeout(DEFAULT_READ_TIMEOUT, read_process_exited(&mut mcp)).await??;
+        assert_eq!(
+            exited,
+            ProcessExitedNotification {
+                process_handle: handle.into(),
+                exit_code,
+                output_drain_timed_out: Some(timed_out),
+                stdout: stdout.into(),
+                stdout_cap_reached,
+                stderr: stderr.into(),
+                stderr_cap_reached: false,
+            }
+        );
+    }
     Ok(())
 }
 
@@ -131,6 +223,7 @@ async fn process_spawn_returns_error_when_local_environment_is_disabled() -> Res
     Ok(())
 }
 
+/// Filling a capture cap must leave the child free to write the remainder and exit successfully.
 #[tokio::test]
 async fn process_spawn_reports_buffered_output_cap_reached() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -149,7 +242,8 @@ async fn process_spawn_reports_buffered_output_cap_reached() -> Result<()> {
         vec![
             "sh".to_string(),
             "-lc".to_string(),
-            "printf abcde; printf 12345 >&2".to_string(),
+            "printf abcde; dd if=/dev/zero bs=65536 count=32 2>/dev/null && printf 12345 >&2"
+                .to_string(),
         ]
     };
     let spawn_request_id = mcp
@@ -170,6 +264,7 @@ async fn process_spawn_reports_buffered_output_cap_reached() -> Result<()> {
         ProcessExitedNotification {
             process_handle,
             exit_code: 0,
+            output_drain_timed_out: Some(false),
             stdout: "abc".to_string(),
             stdout_cap_reached: true,
             stderr: "123".to_string(),
@@ -177,6 +272,54 @@ async fn process_spawn_reports_buffered_output_cap_reached() -> Result<()> {
         }
     );
 
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn process_spawn_exec_failure_releases_handle_for_retry() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let (_server, mut mcp) = initialized_mcp(codex_home.path()).await?;
+    let process_handle = "retry-after-exec-error".to_string();
+    let request_id = mcp
+        .send_process_spawn_request(process_spawn_params(
+            process_handle.clone(),
+            codex_home.path(),
+            vec!["/codex-missing-process-spawn-target".to_string()],
+        )?)
+        .await?;
+    let error = mcp
+        .read_stream_until_error_message(RequestId::Integer(request_id))
+        .await?;
+    assert!(error.error.message.starts_with("failed to spawn process:"));
+
+    let request_id = mcp
+        .send_process_spawn_request(process_spawn_params(
+            process_handle.clone(),
+            codex_home.path(),
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf retried; exit 19".to_string(),
+            ],
+        )?)
+        .await?;
+    let response = mcp
+        .read_stream_until_response_message(RequestId::Integer(request_id))
+        .await?;
+    assert_eq!(response.result, serde_json::json!({}));
+    assert_eq!(
+        read_process_exited(&mut mcp).await?,
+        ProcessExitedNotification {
+            process_handle,
+            exit_code: 19,
+            output_drain_timed_out: Some(false),
+            stdout: "retried".to_string(),
+            stdout_cap_reached: false,
+            stderr: String::new(),
+            stderr_cap_reached: false,
+        }
+    );
     Ok(())
 }
 
