@@ -11,6 +11,8 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 
+const HOSTED_MULTI_AGENT_SKILL_GUIDANCE: &str = "Before calling any multi-agent tool, read the full multi-agent skill using its listed package locator. Skip the read only if the full skill text is already in your current context. If the read fails, make note of the blocker.";
+
 pub(super) fn usage_hint_text(step_context: &StepContext) -> Option<MultiAgentRoleInstructions> {
     let turn_context = step_context.turn.as_ref();
     if turn_context.multi_agent_version != MultiAgentVersion::V2 {
@@ -52,9 +54,11 @@ pub(crate) fn resolve_usage_hints(
         if base.is_empty() {
             return None;
         }
+        if config.disable_native_tools {
+            return None;
+        }
         Some(MultiAgentRoleInstructions::Composed {
             base: base.to_owned(),
-            marked: message.catalog_override().is_some(),
             omit_update_plan_instructions,
             max_concurrency: config.max_concurrent_threads_per_session,
             wait_agent_enabled: config.wait_agent_enabled,
@@ -81,11 +85,14 @@ pub(crate) fn effective_multi_agent_mode(step_context: &StepContext) -> Option<M
         return None;
     }
 
-    let multi_agent_messages =
-        ResolvedModelMessages::from_model(&settings.model_info).multi_agent();
-    let hint = turn_context
-        .config
-        .multi_agent_v2
+    let config = &turn_context.config.multi_agent_v2;
+    let model_messages = if config.disable_native_tools {
+        ResolvedModelMessages::bundled()
+    } else {
+        ResolvedModelMessages::from_model(&settings.model_info)
+    };
+    let multi_agent_messages = model_messages.multi_agent();
+    let hint = config
         .multi_agent_mode_hint_text
         .as_deref()
         .or(multi_agent_messages.hint);
@@ -101,9 +108,18 @@ pub(crate) fn effective_multi_agent_mode(step_context: &StepContext) -> Option<M
                         MultiAgentMode::ExplicitRequestOnly,
                     )
                 };
-            match message {
-                ResolvedMessage::Catalog(text) => MultiAgentMode::Custom(text.to_owned()),
-                ResolvedMessage::Bundled(_) => builtin,
+            if config.disable_native_tools {
+                let policy = message
+                    .text()
+                    .replace("collaboration tools", "multi-agent tools");
+                MultiAgentMode::Custom(format!(
+                    "\n{policy}\n\n{HOSTED_MULTI_AGENT_SKILL_GUIDANCE}\n"
+                ))
+            } else {
+                match message {
+                    ResolvedMessage::Catalog(text) => MultiAgentMode::Custom(text.to_owned()),
+                    ResolvedMessage::Bundled(_) => builtin,
+                }
             }
         }
     };

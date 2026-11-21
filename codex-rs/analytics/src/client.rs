@@ -1,3 +1,5 @@
+use crate::event_transport::AnalyticsEventTransport;
+use crate::event_transport::retain_http_events;
 use crate::events::AppServerRpcTransport;
 use crate::events::GuardianReviewAnalyticsResult;
 use crate::events::GuardianReviewTrackContext;
@@ -63,8 +65,12 @@ use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::item_event_to_server_notification;
+use codex_features::RuntimeAuthMode;
+use codex_http_client::OPENAI_ORGANIZATION_HEADER;
+use codex_http_client::OPENAI_PROJECT_HEADER;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_model_provider::ChatgptBaseUrl;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::ThreadId;
@@ -74,6 +80,8 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use codex_runtime_agent_instance::RuntimeAuthSlot;
+use http::HeaderMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -116,21 +124,38 @@ pub struct AnalyticsEventsClient {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AnalyticsEventsDestination {
     Http {
-        url: String,
+        base_url: ChatgptBaseUrl,
+        api_key_headers: HeaderMap,
     },
     #[cfg(debug_assertions)]
-    CaptureFile {
-        path: PathBuf,
-    },
+    CaptureFile { path: PathBuf },
 }
 
 impl AnalyticsEventsDestination {
-    fn from_base_url(base_url: String) -> Self {
+    fn from_base_url(base_url: ChatgptBaseUrl, headers: HeaderMap) -> Self {
         let capture_file = analytics_capture_file_from_env();
-        Self::from_base_url_and_capture_file(base_url, capture_file)
+        let mut destination = Self::from_base_url_and_capture_file(base_url, capture_file);
+        match &mut destination {
+            Self::Http {
+                api_key_headers, ..
+            } => {
+                // Model-provider secrets and gateway headers do not belong on analytics requests.
+                for name in [OPENAI_ORGANIZATION_HEADER, OPENAI_PROJECT_HEADER] {
+                    if let Some(value) = headers.get(name) {
+                        api_key_headers.insert(name, value.clone());
+                    }
+                }
+            }
+            #[cfg(debug_assertions)]
+            Self::CaptureFile { .. } => {}
+        }
+        destination
     }
 
-    fn from_base_url_and_capture_file(base_url: String, capture_file: Option<PathBuf>) -> Self {
+    fn from_base_url_and_capture_file(
+        base_url: ChatgptBaseUrl,
+        capture_file: Option<PathBuf>,
+    ) -> Self {
         #[cfg(debug_assertions)]
         if let Some(path) = capture_file {
             if let Err(err) = crate::analytics_capture::initialize(&path) {
@@ -149,9 +174,20 @@ impl AnalyticsEventsDestination {
         #[cfg(not(debug_assertions))]
         let _ = capture_file;
 
-        let base_url = base_url.trim_end_matches('/');
         Self::Http {
-            url: format!("{base_url}/codex/analytics-events/events"),
+            base_url,
+            api_key_headers: HeaderMap::new(),
+        }
+    }
+
+    fn url_for_auth(&self, auth: &CodexAuth) -> Option<String> {
+        match self {
+            Self::Http { base_url, .. } => {
+                let base_url = base_url.resolve(auth).trim_end_matches('/');
+                Some(format!("{base_url}/codex/analytics-events/events"))
+            }
+            #[cfg(debug_assertions)]
+            Self::CaptureFile { .. } => None,
         }
     }
 }
@@ -169,7 +205,12 @@ fn analytics_capture_file_from_env() -> Option<PathBuf> {
 }
 
 impl AnalyticsEventsQueue {
-    fn new(auth_manager: Arc<AuthManager>, destination: AnalyticsEventsDestination) -> Self {
+    fn new(
+        auth_manager: Arc<AuthManager>,
+        destination: AnalyticsEventsDestination,
+        runtime_auth: Option<(RuntimeAuthSlot, RuntimeAuthMode)>,
+        event_transport: Option<Arc<dyn AnalyticsEventTransport>>,
+    ) -> Self {
         let (sender, mut receiver) = mpsc::channel(ANALYTICS_EVENTS_QUEUE_SIZE);
         let product_generation = Arc::new(AtomicU64::new(0));
         let worker_product_generation = Arc::clone(&product_generation);
@@ -206,23 +247,45 @@ impl AnalyticsEventsQueue {
                         {
                             reducer.flush_thread(evicted, &mut events);
                         }
-                        send_track_events(&auth_manager, &destination, events, &thread_products)
-                            .await;
+                        send_track_events(
+                            &auth_manager,
+                            &destination,
+                            events,
+                            &thread_products,
+                            runtime_auth.as_ref(),
+                            event_transport.as_ref(),
+                        )
+                        .await;
                         thread_products.register(thread_id, product_sku);
                         continue;
                     }
                     AnalyticsEventsQueueMessage::Flush(done_tx) => {
                         let mut events = Vec::new();
                         reducer.flush(&mut events);
-                        send_track_events(&auth_manager, &destination, events, &thread_products)
-                            .await;
+                        send_track_events(
+                            &auth_manager,
+                            &destination,
+                            events,
+                            &thread_products,
+                            runtime_auth.as_ref(),
+                            event_transport.as_ref(),
+                        )
+                        .await;
                         let _ = done_tx.send(());
                         continue;
                     }
                 };
                 let mut events = Vec::new();
                 reducer.ingest(input, &mut events).await;
-                send_track_events(&auth_manager, &destination, events, &thread_products).await;
+                send_track_events(
+                    &auth_manager,
+                    &destination,
+                    events,
+                    &thread_products,
+                    runtime_auth.as_ref(),
+                    event_transport.as_ref(),
+                )
+                .await;
             }
         });
         Self {
@@ -313,14 +376,87 @@ impl AnalyticsEventsClient {
 
     pub fn new(
         auth_manager: Arc<AuthManager>,
-        base_url: String,
+        base_url: impl Into<ChatgptBaseUrl>,
         analytics_enabled: Option<bool>,
     ) -> Self {
-        let destination = AnalyticsEventsDestination::from_base_url(base_url);
+        Self::new_with_runtime(
+            auth_manager,
+            base_url,
+            analytics_enabled,
+            /*runtime_auth*/ None,
+            /*api_key_headers*/ HeaderMap::new(),
+        )
+    }
+
+    /// Installs a host-owned transport for events selected by the host.
+    ///
+    /// The host owns envelope construction, policy, identity refresh, and bounded delivery.
+    /// Disabled analytics and local capture never invoke the transport. Rebinding through
+    /// `for_auth_context` resets it to HTTP so an old actor's transport cannot follow a new actor.
+    pub fn new_with_event_transport(
+        auth_manager: Arc<AuthManager>,
+        base_url: impl Into<ChatgptBaseUrl>,
+        analytics_enabled: Option<bool>,
+        event_transport: Arc<dyn AnalyticsEventTransport>,
+    ) -> Self {
+        let destination =
+            AnalyticsEventsDestination::from_base_url(base_url.into(), HeaderMap::new());
         Self {
-            queue: (analytics_enabled != Some(false))
-                .then(|| AnalyticsEventsQueue::new(Arc::clone(&auth_manager), destination)),
+            queue: (analytics_enabled != Some(false)).then(|| {
+                AnalyticsEventsQueue::new(
+                    auth_manager,
+                    destination,
+                    /*runtime_auth*/ None,
+                    Some(event_transport),
+                )
+            }),
         }
+    }
+
+    /// Share runtime identity for OpenAI delivery; file capture never authenticates.
+    pub fn new_with_runtime(
+        auth_manager: Arc<AuthManager>,
+        base_url: impl Into<ChatgptBaseUrl>,
+        analytics_enabled: Option<bool>,
+        runtime_auth: Option<(RuntimeAuthSlot, RuntimeAuthMode)>,
+        api_key_headers: HeaderMap,
+    ) -> Self {
+        let base_url = base_url.into();
+        let runtime_auth = runtime_auth.filter(|_| match &base_url {
+            ChatgptBaseUrl::Default => true,
+            ChatgptBaseUrl::Configured(url) => {
+                codex_http_client::classify_openai_api_url(url)
+                    != codex_http_client::OpenAiDestination::Other
+            }
+        });
+        let destination = AnalyticsEventsDestination::from_base_url(base_url, api_key_headers);
+        Self {
+            queue: (analytics_enabled != Some(false)).then(|| {
+                AnalyticsEventsQueue::new(
+                    Arc::clone(&auth_manager),
+                    destination,
+                    runtime_auth,
+                    /*event_transport*/ None,
+                )
+            }),
+        }
+    }
+
+    /// Give a resumed actor its own queue while preserving the caller's analytics setting.
+    pub fn for_auth_context(
+        &self,
+        auth_manager: Arc<AuthManager>,
+        base_url: String,
+        runtime_auth: Option<(RuntimeAuthSlot, RuntimeAuthMode)>,
+        api_key_headers: HeaderMap,
+    ) -> Self {
+        Self::new_with_runtime(
+            auth_manager,
+            base_url,
+            Some(self.queue.is_some()),
+            runtime_auth,
+            api_key_headers,
+        )
     }
 
     pub fn disabled() -> Self {
@@ -436,22 +572,29 @@ impl AnalyticsEventsClient {
         completed_at_ms: i64,
     ) {
         let thread_id = item.sender_thread_id.to_string();
-        let completed_item = TurnItem::CollabAgentToolCall(item.clone()).into();
+        let completed_item = codex_app_server_protocol::ThreadItemPayload::from(
+            TurnItem::CollabAgentToolCall(item.clone()),
+        );
         item.status = CollabAgentToolCallStatus::InProgress;
 
-        self.track_notification(&ServerNotification::ItemStarted(ItemStartedNotification {
-            item: TurnItem::CollabAgentToolCall(item).into(),
-            thread_id: thread_id.clone(),
-            turn_id: turn_id.clone(),
-            started_at_ms,
-        }));
+        self.track_notification(&ServerNotification::ItemStarted(
+            ItemStartedNotification::new(
+                thread_id.clone(),
+                turn_id.clone(),
+                codex_app_server_protocol::ThreadItemPayload::from(TurnItem::CollabAgentToolCall(
+                    item,
+                )),
+                started_at_ms,
+            ),
+        ));
         self.track_notification(&ServerNotification::ItemCompleted(
-            ItemCompletedNotification {
-                item: completed_item,
+            ItemCompletedNotification::new(
                 thread_id,
                 turn_id,
+                completed_item,
+                Some(started_at_ms),
                 completed_at_ms,
-            },
+            ),
         ));
     }
 
@@ -636,6 +779,16 @@ impl AnalyticsEventsClient {
         self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::TurnCodexError(
             Box::new(fact),
         )));
+    }
+
+    /// Record the provenance of one user input after it is added to turn history.
+    pub fn track_accepted_user_input(&self, turn_id: &str, used_dictation: Option<bool>) {
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::AcceptedUserInput {
+                turn_id: turn_id.to_owned(),
+                used_dictation,
+            },
+        ));
     }
 
     pub fn track_plugin_installed(&self, plugin: PluginTelemetryMetadata) {
@@ -935,7 +1088,7 @@ fn session_event_to_analytics_notification(
     match &notification {
         ServerNotification::ItemStarted(ItemStartedNotification { item, .. })
         | ServerNotification::ItemCompleted(ItemCompletedNotification { item, .. }) => {
-            tracked_tool_item_id(item)?;
+            tracked_tool_item_id(&item.payload)?;
         }
         _ => {}
     }
@@ -961,6 +1114,8 @@ async fn send_track_events(
     destination: &AnalyticsEventsDestination,
     mut events: Vec<TrackEventRequest>,
     thread_products: &ThreadProducts,
+    runtime_auth: Option<&(RuntimeAuthSlot, RuntimeAuthMode)>,
+    event_transport: Option<&Arc<dyn AnalyticsEventTransport>>,
 ) {
     if events.is_empty() {
         return;
@@ -989,14 +1144,23 @@ async fn send_track_events(
             http_client_factory.clone(),
         );
         let product_sku = product_sku.map(str::to_string);
+        let runtime_auth = runtime_auth.cloned();
+        let event_transport = event_transport.cloned();
         requests.spawn(async move {
             for events in track_event_request_batches(events) {
+                let events = match (&destination, event_transport.as_deref()) {
+                    (AnalyticsEventsDestination::Http { .. }, Some(transport)) => {
+                        retain_http_events(events, product_sku.as_deref(), transport).await
+                    }
+                    _ => events,
+                };
                 send_track_events_request(
                     &auth,
                     &destination,
                     events,
                     &factory,
                     product_sku.as_deref(),
+                    runtime_auth.as_ref(),
                 )
                 .await;
             }
@@ -1038,6 +1202,7 @@ async fn send_track_events_request(
     events: Vec<TrackEventRequest>,
     http_client_factory: &codex_http_client::HttpClientFactory,
     product_sku: Option<&str>,
+    runtime_auth: Option<&(RuntimeAuthSlot, RuntimeAuthMode)>,
 ) {
     if events.is_empty() {
         return;
@@ -1050,26 +1215,58 @@ async fn send_track_events_request(
         return;
     }
 
-    let url = match destination {
-        AnalyticsEventsDestination::Http { url } => url,
-        #[cfg(debug_assertions)]
-        AnalyticsEventsDestination::CaptureFile { .. } => return,
+    let Some(url) = destination.url_for_auth(auth) else {
+        return;
     };
-    let headers = match codex_model_provider::auth_provider_from_auth(auth).to_auth_headers() {
-        Ok(headers) => headers,
+    if runtime_auth.is_some()
+        && let Err(error) = codex_model_provider::validate_runtime_destination(Some(&url))
+    {
+        tracing::warn!("failed to authenticate events request: {error}");
+        return;
+    }
+    let runtime = match runtime_auth {
+        Some((slot, mode)) => {
+            let Some(manager) = slot.get() else {
+                tracing::warn!("runtime authentication has not been initialized for events");
+                return;
+            };
+            Some((Arc::clone(manager), *mode))
+        }
+        None => None,
+    };
+    let headers = match destination {
+        AnalyticsEventsDestination::Http {
+            api_key_headers, ..
+        } if auth.is_api_key_auth() => api_key_headers.clone(),
+        _ => HeaderMap::new(),
+    };
+    let resolved = async {
+        let resolved =
+            codex_model_provider::auth_provider_for_request(auth, runtime.as_ref(), &headers)
+                .await?;
+        let factory = resolved.bind_http_client_factory(http_client_factory.clone())?;
+        resolved
+            .auth
+            .apply_auth_headers(headers)
+            .await
+            .map(|headers| (headers, factory))
+    }
+    .await;
+    let (headers, factory) = match resolved {
+        Ok(resolved) => resolved,
         Err(error) => {
             tracing::warn!("failed to authenticate events request: {error}");
             return;
         }
     };
-    let client = match codex_login::default_client::create_client_for_route_async(
-        http_client_factory.clone(),
+    let client = codex_login::default_client::create_client_for_route_async(
+        factory,
         url.clone(),
         codex_http_client::ClientRouteClass::Api,
         codex_login::default_client::ClientRedirectPolicy::Default,
     )
-    .await
-    {
+    .await;
+    let client = match client {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(%error, "failed to build events client");
@@ -1077,7 +1274,7 @@ async fn send_track_events_request(
         }
     };
     let mut request = client
-        .post(url)
+        .post(&url)
         .timeout(ANALYTICS_EVENTS_TIMEOUT)
         .headers(headers)
         .header("Content-Type", "application/json")
@@ -1124,3 +1321,7 @@ fn capture_track_events_request(
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "client_runtime_auth_tests.rs"]
+mod runtime_auth_tests;

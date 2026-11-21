@@ -6,6 +6,7 @@ mod turn;
 mod turn_token_usage;
 
 pub(crate) use crate::tools::ExecutedToolCalls;
+pub(crate) use additional_context::AdditionalContextFormat;
 pub(crate) use additional_context::AdditionalContextStore;
 pub(crate) use auto_compact_window::AutoCompactWindowIds;
 pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
@@ -15,6 +16,7 @@ pub(crate) use session::SessionState;
 pub(crate) use turn::AcceptedUserInputResponse;
 pub(crate) use turn::ActiveTurn;
 pub(crate) use turn::MailboxDeliveryPhase;
+pub(crate) use turn::PendingApproval;
 pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;
 pub(crate) use turn::TaskKind;

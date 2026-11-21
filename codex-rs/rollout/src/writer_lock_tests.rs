@@ -1,5 +1,7 @@
 use std::fs;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use codex_protocol::ThreadId;
 use tempfile::TempDir;
@@ -27,6 +29,18 @@ fn writer_locks_reject_competing_owners_and_release_their_files() {
         .join(format!("{thread_id}.lock"));
     assert!(lock_path.exists());
 
+    // Another process is opening a writer. Distinct threads can start together,
+    // but even during this overlap the same thread must still have one owner.
+    let opening = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            home.path()
+                .join(WRITER_LOCK_DIR)
+                .join(COORDINATION_LOCK_FILE),
+        )
+        .expect("open coordination");
+    opening.lock_shared().expect("another writer is opening");
     let err = match secondary.acquire(thread_id) {
         Ok(_) => panic!("competing owner should fail"),
         Err(err) => err,
@@ -36,11 +50,21 @@ fn writer_locks_reject_competing_owners_and_release_their_files() {
         .acquire(other_thread_id)
         .expect("other thread should acquire its own lock");
 
-    drop(owner);
-    assert!(!lock_path.exists());
-    let next_owner = secondary
-        .acquire(thread_id)
-        .expect("released thread should accept another owner");
+    let next_owner = std::thread::scope(|scope| {
+        let _opening = opening;
+        let (closed, wait_for_close) = mpsc::channel();
+        scope.spawn(move || {
+            drop(owner);
+            let _ = closed.send(());
+        });
+        wait_for_close
+            .recv_timeout(Duration::from_secs(/*secs*/ 10))
+            .expect("writer should close while another writer is opening");
+        assert!(lock_path.exists());
+        secondary
+            .acquire(thread_id)
+            .expect("released thread should accept another owner")
+    });
     drop(next_owner);
     drop(other_owner);
 
@@ -114,6 +138,11 @@ fn publication_skips_live_writers_and_keeps_coordination_locked() {
         ),
         Ok(TryWriterLockOutcome::WouldBlock)
     ));
+    let error = writer
+        .acquire(ThreadId::default())
+        .err()
+        .expect("coordination contention must return an error instead of hanging");
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
     drop(publication);
     let released_lock = try_lock_writer_file(
         &coordination,

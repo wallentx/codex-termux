@@ -42,6 +42,7 @@ async fn invocation_for_payload(
         tool_name: codex_tools::ToolName::plain(tool_name),
         source: ToolCallSource::Direct,
         payload,
+        native_call: None,
         environments: Default::default(),
     }
 }
@@ -353,6 +354,7 @@ async fn exec_command_rejects_login_when_selected_environment_disallows_it() {
         call_id: "login-disallowed".to_string(),
         tool_name: codex_tools::ToolName::plain("exec_command"),
         source: ToolCallSource::Direct,
+        native_call: None,
         environments: Default::default(),
         payload: ToolPayload::Function {
             arguments: serde_json::json!({ "cmd": "echo hello", "login": true }).to_string(),
@@ -373,6 +375,7 @@ async fn exec_command_rejects_login_when_selected_environment_disallows_it() {
 #[tokio::test]
 #[cfg(not(windows))]
 async fn exec_command_reuses_foreign_windows_grant() {
+    use crate::environment_selection::EnvironmentAttachment;
     use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
     use codex_features::Feature;
     use codex_protocol::models::AdditionalPermissionProfile;
@@ -402,6 +405,13 @@ async fn exec_command_reuses_foreign_windows_grant() {
         )),
         ..Default::default()
     };
+    let (attachment, _guard, _) = EnvironmentAttachment::new(
+        codex_exec_server::REMOTE_ENVIRONMENT_ID,
+        Arc::new(
+            Environment::create_for_tests(Some("ws://127.0.0.1:1/remote-exec-server".to_string()))
+                .expect("remote environment"),
+        ),
+    );
     {
         let turn = Arc::get_mut(&mut turn).expect("turn should be uniquely owned");
         let TurnEnvironmentState::Ready(environment) = turn
@@ -416,10 +426,7 @@ async fn exec_command_reuses_foreign_windows_grant() {
         environment.selection.cwd = cwd.clone();
         environment.selection.workspace_roots = vec![cwd.clone()];
         environment.config_mut().workspace_roots = vec![cwd];
-        environment.environment = Arc::new(
-            Environment::create_for_tests(Some("ws://127.0.0.1:1/remote-exec-server".to_string()))
-                .expect("remote environment"),
-        );
+        environment.attachment = attachment;
     }
 
     let step_context = StepContext::for_test(Arc::clone(&turn));
@@ -438,6 +445,7 @@ async fn exec_command_reuses_foreign_windows_grant() {
             call_id: "foreign-windows-grant".to_string(),
             tool_name: codex_tools::ToolName::plain("exec_command"),
             source: ToolCallSource::Direct,
+            native_call: None,
             environments: Default::default(),
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
@@ -480,6 +488,7 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
             tool_name: codex_tools::ToolName::plain("exec_command"),
             source: crate::tools::context::ToolCallSource::Direct,
             payload,
+            native_call: None,
             environments: Default::default(),
         }),
         Some(crate::tools::registry::PreToolUsePayload {
@@ -487,6 +496,80 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
             tool_input: serde_json::json!({ "command": "printf exec command" }),
         })
     );
+}
+
+#[tokio::test]
+async fn exec_command_pre_tool_use_cwd_resolves_selected_environment() {
+    let (session, mut turn) = make_session_and_context().await;
+    let mut selected = turn.initial_environments.environments[0].clone();
+    let TurnEnvironmentState::Ready(environment) = &mut selected else {
+        panic!("ready environment");
+    };
+    environment.selection.environment_id = "other".to_string();
+    environment.selection.cwd = PathUri::parse("file:///C:/repo-B").unwrap();
+    turn.initial_environments.environments.push(selected);
+    let turn = Arc::new(turn);
+    let mut invocation = ToolInvocation {
+        session: session.into(),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "hook-cwd".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: String::new(),
+        },
+        native_call: None,
+        environments: Default::default(),
+    };
+    for (workdir, expected) in [
+        (None, "file:///C:/repo-B"),
+        (Some(""), "file:///C:/repo-B"),
+        (Some(r"nested\..\target"), "file:///C:/repo-B/target"),
+        (Some(r"D:\repo-C"), "file:///D:/repo-C"),
+    ] {
+        invocation.payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "cmd": "echo hello",
+                "environment_id": "other",
+                "workdir": workdir,
+            })
+            .to_string(),
+        };
+        let handler = ExecCommandHandler::default();
+        invocation.environments = handler.environments_for_input(&invocation).unwrap();
+        assert_eq!(
+            handler.pre_tool_use_cwd(&invocation).unwrap(),
+            Some(PathUri::parse(expected).unwrap()),
+        );
+    }
+}
+
+#[tokio::test]
+async fn exec_command_pre_tool_use_cwd_rejects_invalid_environment_and_path() {
+    for args in [
+        serde_json::json!({ "cmd": "echo hello", "environment_id": "missing" }),
+        serde_json::json!({ "cmd": "echo hello", "workdir": "\u{0}" }),
+    ] {
+        let mut invocation = invocation_for_payload(
+            "exec_command",
+            "invalid-cwd",
+            ToolPayload::Function {
+                arguments: args.to_string(),
+            },
+        )
+        .await;
+        let handler = ExecCommandHandler::default();
+        let cwd = handler
+            .environments_for_input(&invocation)
+            .and_then(|environments| {
+                invocation.environments = environments;
+                handler.pre_tool_use_cwd(&invocation)
+            });
+        assert!(matches!(cwd, Err(FunctionCallError::RespondToModel(_))));
+    }
 }
 
 #[tokio::test]
@@ -509,6 +592,7 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
             tool_name: codex_tools::ToolName::plain("write_stdin"),
             source: crate::tools::context::ToolCallSource::Direct,
             payload,
+            native_call: None,
             environments: Default::default(),
         }),
         None
@@ -524,20 +608,21 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         event_call_id: "call-43".to_string(),
         chunk_id: "chunk-1".to_string(),
         wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"three".to_vec(),
+        raw_output: "three".into(),
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
-        output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
+        tool_cwd: Some(PathUri::parse("file:///C:/workspace").expect("valid Windows cwd")),
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
     let handler = ExecCommandHandler::default();
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
         Some(crate::tools::registry::PostToolUsePayload {
+            tool_cwd: Some(PathUri::parse("file:///C:/workspace").expect("valid Windows cwd")),
             tool_name: HookToolName::bash(),
             tool_use_id: "call-43".to_string(),
             tool_input: serde_json::json!({ "command": "echo three" }),
@@ -555,14 +640,14 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         event_call_id: "call-44".to_string(),
         chunk_id: "chunk-1".to_string(),
         wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"three".to_vec(),
+        raw_output: "three".into(),
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
-        output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
+        tool_cwd: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
     let handler = ExecCommandHandler::default();
@@ -570,6 +655,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
         Some(crate::tools::registry::PostToolUsePayload {
+            tool_cwd: None,
             tool_name: HookToolName::bash(),
             tool_use_id: "call-44".to_string(),
             tool_input: serde_json::json!({ "command": "echo three" }),
@@ -587,14 +673,14 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         event_call_id: "event-45".to_string(),
         chunk_id: "chunk-1".to_string(),
         wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"three".to_vec(),
+        raw_output: "three".into(),
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: Some(45),
         exit_code: None,
         original_token_count: None,
-        output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
+        tool_cwd: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
     let handler = ExecCommandHandler::default();
@@ -614,14 +700,14 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         event_call_id: "exec-call-45".to_string(),
         chunk_id: "chunk-2".to_string(),
         wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"finished\n".to_vec(),
+        raw_output: "finished\n".into(),
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
-        output_omitted_bytes: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
+        tool_cwd: None,
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
     let handler = WriteStdinHandler;
@@ -629,6 +715,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
         Some(crate::tools::registry::PostToolUsePayload {
+            tool_cwd: None,
             tool_name: HookToolName::bash(),
             tool_use_id: "exec-call-45".to_string(),
             tool_input: serde_json::json!({ "command": "sleep 1; echo finished" }),
@@ -646,27 +733,27 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         event_call_id: "exec-call-a".to_string(),
         chunk_id: "chunk-a".to_string(),
         wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"alpha\n".to_vec(),
+        raw_output: "alpha\n".into(),
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
-        output_omitted_bytes: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
+        tool_cwd: Some(PathUri::parse("file:///C:/workspace/alpha").expect("valid Windows cwd")),
     };
     let output_b = ExecCommandToolOutput {
         event_call_id: "exec-call-b".to_string(),
         chunk_id: "chunk-b".to_string(),
         wall_time: std::time::Duration::from_millis(498),
-        raw_output: b"beta\n".to_vec(),
+        raw_output: "beta\n".into(),
         truncation_policy: TEST_TRUNCATION_POLICY,
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
         original_token_count: None,
-        output_omitted_bytes: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
+        tool_cwd: Some(PathUri::parse("file:///C:/workspace/beta").expect("valid Windows cwd")),
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
     let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;
@@ -681,17 +768,81 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         payloads,
         [
             Some(crate::tools::registry::PostToolUsePayload {
+                tool_cwd: Some(
+                    PathUri::parse("file:///C:/workspace/beta").expect("valid Windows cwd")
+                ),
                 tool_name: HookToolName::bash(),
                 tool_use_id: "exec-call-b".to_string(),
                 tool_input: serde_json::json!({ "command": "sleep 1; echo beta" }),
                 tool_response: serde_json::json!("beta\n"),
             }),
             Some(crate::tools::registry::PostToolUsePayload {
+                tool_cwd: Some(
+                    PathUri::parse("file:///C:/workspace/alpha").expect("valid Windows cwd")
+                ),
                 tool_name: HookToolName::bash(),
                 tool_use_id: "exec-call-a".to_string(),
                 tool_input: serde_json::json!({ "command": "sleep 2; echo alpha" }),
                 tool_response: serde_json::json!("alpha\n"),
             }),
         ]
+    );
+}
+
+#[test_case::test_case(false, false, "disabled"; "disabled")]
+#[test_case::test_case(true, false, "v1"; "v1")]
+#[test_case::test_case(true, true, "v2"; "v2")]
+#[test_case::test_case(false, true, "v2"; "v2 without v1")]
+#[tokio::test]
+async fn exec_command_telemetry_records_configured_snapshot_mode(
+    v1_enabled: bool,
+    v2_enabled: bool,
+    expected_mode: &str,
+) {
+    use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
+    use codex_features::Feature;
+
+    let (session, turn, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            for (feature, enabled) in [
+                (Feature::ShellSnapshot, v1_enabled),
+                (Feature::ShellSnapshotV2, v2_enabled),
+            ] {
+                if enabled {
+                    config
+                        .features
+                        .enable(feature)
+                        .expect("enable snapshot feature");
+                } else {
+                    config
+                        .features
+                        .disable(feature)
+                        .expect("disable snapshot feature");
+                }
+            }
+        },
+    )
+    .await;
+    let invocation = ToolInvocation {
+        session,
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "snapshot-metric".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: ToolCallSource::Direct,
+        // Non-login commands cannot use V2 but must stay in the configured cohort.
+        payload: ToolPayload::Function {
+            arguments: r#"{"cmd":"true","login":false}"#.to_string(),
+        },
+        native_call: None,
+        environments: Default::default(),
+    };
+    assert_eq!(
+        ExecCommandHandler::default().telemetry_tags(&invocation),
+        vec![("shell_snapshot_mode", expected_mode.to_string())],
     );
 }

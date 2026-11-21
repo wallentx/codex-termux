@@ -1,9 +1,12 @@
+use std::path::Path;
+
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use codex_utils_path_uri::PathUri;
 
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerSourcePath;
@@ -16,6 +19,13 @@ use codex_protocol::models::ContentItemMetadata;
 pub struct SubagentHookContext {
     pub agent_id: String,
     pub agent_type: String,
+}
+
+pub(crate) fn command_input_cwd(cwd: &Path, tool_cwd: Option<&PathUri>) -> String {
+    tool_cwd.map_or_else(
+        || cwd.display().to_string(),
+        PathUri::inferred_native_path_string,
+    )
 }
 
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {
@@ -61,6 +71,33 @@ pub(crate) fn flatten_additional_contexts<'a>(
     additional_contexts.into_iter().flatten().cloned().collect()
 }
 
+/// Preserve failure diagnostics while applying the handler's opt-in blocking policy.
+pub(crate) fn apply_failure_policy(
+    handler: &ConfiguredHandler,
+    status: &mut HookRunStatus,
+    entries: &mut Vec<HookOutputEntry>,
+) -> Option<String> {
+    if *status != HookRunStatus::Failed {
+        return None;
+    }
+    let reason = handler.failure_block_reason()?;
+    *status = HookRunStatus::Blocked;
+    entries.push(HookOutputEntry {
+        kind: HookOutputEntryKind::Feedback,
+        text: reason.clone(),
+    });
+    Some(reason)
+}
+
+pub(crate) fn failure_block_reason(hook_events: &[HookCompletedEvent]) -> Option<String> {
+    hook_events
+        .iter()
+        .filter(|event| event.run.status == HookRunStatus::Blocked)
+        .flat_map(|event| &event.run.entries)
+        .find(|entry| entry.kind == HookOutputEntryKind::Feedback)
+        .map(|entry| entry.text.clone())
+}
+
 pub(crate) fn serialization_failure_hook_events(
     handlers: Vec<ConfiguredHandler>,
     turn_id: Option<String>,
@@ -83,6 +120,7 @@ pub(crate) fn serialization_failure_hook_events(
                 kind: HookOutputEntryKind::Error,
                 text: error_message.clone(),
             }];
+            apply_failure_policy(&handler, &mut run.status, &mut run.entries);
             HookCompletedEvent {
                 turn_id: turn_id.clone(),
                 run,

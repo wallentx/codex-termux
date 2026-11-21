@@ -23,16 +23,19 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub(crate) fn warnings_active(&self) -> bool {
-        self.warnings_view.is_some()
-            && self.view_stack.is_empty()
-            && !self
-                .questions
-                .as_ref()
-                .is_some_and(|questions| questions.expanded)
+    pub(crate) fn active_warning(&self) -> Option<&warnings_view::WarningsView> {
+        self.warnings_view.as_ref().filter(|_| {
+            self.view_stack.is_empty() && !self.questions.as_ref().is_some_and(|q| q.expanded)
+        })
     }
 
-    pub(crate) fn warning_notice_contains(&self, position: ratatui::layout::Position) -> bool {
-        self.no_modal_or_popup_active() && self.composer.warning_notice_contains(position)
+    pub(crate) fn warnings_active(&self) -> bool {
+        self.active_warning().is_some()
+    }
+
+    pub(crate) fn warning_notice_area(&self) -> Option<ratatui::layout::Rect> {
+        self.composer
+            .warning_notice_area()
+            .filter(|_| self.no_modal_or_popup_active())
     }
 }

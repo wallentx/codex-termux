@@ -125,6 +125,7 @@ impl MitmPolicyContext {
 
 #[derive(Clone)]
 struct MitmRequestContext {
+    dial_policy: Option<crate::connect_policy::DialPolicy>,
     policy: MitmPolicyContext,
     mitm: Arc<MitmState>,
     upstream: UpstreamClient,
@@ -233,6 +234,10 @@ where
         )
     };
     let request_ctx = Arc::new(MitmRequestContext {
+        dial_policy: stream
+            .extensions()
+            .get::<crate::connect_policy::DialPolicy>()
+            .cloned(),
         policy: MitmPolicyContext {
             target_host,
             target_port,
@@ -281,6 +286,7 @@ async fn handle_mitm_request(
     request_ctx: Arc<MitmRequestContext>,
 ) -> Result<Response, std::convert::Infallible> {
     crate::aws_sigv4::preserve_signing_headers(&mut req);
+    crate::secret_substitution::preserve_body_substitution_headers(&mut req);
     let response = match (request_ctx.policy.scheme == Scheme::HTTPS)
         .then(RemoveRequestHeaderLayer::hop_by_hop)
         .into_layer(service_fn(move |req| {
@@ -291,6 +297,9 @@ async fn handle_mitm_request(
         .await
     {
         Ok(resp) => resp,
+        Err(err) if crate::connect_policy::ResolvedTargetsDenied::caused(err.as_ref()) => {
+            blocked_text_response(crate::reasons::REASON_POLICY_DENIED)
+        }
         Err(err) => {
             warn!("MITM request handling failed: {err}");
             text_response(StatusCode::BAD_GATEWAY, "mitm upstream error")
@@ -369,11 +378,23 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     };
 
     let mut upstream_req = Request::from_parts(parts, body);
+    if let Some(substitution) = hook_actions
+        .as_ref()
+        .and_then(|actions| actions.body_secret_substitution.as_ref())
+    {
+        let Ok(substituted) = substitution.apply(upstream_req).await else {
+            return Ok(request_ctx.policy.deny_hook(&method, client).await);
+        };
+        upstream_req = substituted;
+    }
     if let Some((signer, guest)) = signing {
         let Ok(signed) = signer.sign(upstream_req, &guest).await else {
             return Ok(request_ctx.policy.deny_hook(&method, client).await);
         };
         upstream_req = signed;
+    }
+    if let Some(policy) = &request_ctx.dial_policy {
+        upstream_req.extensions_mut().insert(policy.clone());
     }
     let upstream_resp = if request_ctx.policy.scheme == Scheme::HTTP {
         crate::brokered_tunnel::forward_http_request(upstream_req, &request_ctx.upstream).await?

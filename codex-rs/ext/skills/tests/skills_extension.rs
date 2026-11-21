@@ -21,6 +21,7 @@ use codex_exec_server::ExecutorSkill;
 use codex_exec_server::FileSystemEnvironmentAccessor;
 use codex_exec_server::LOCAL_FS;
 use codex_exec_server::SkillDiscoveryRoot;
+use codex_extension_api::AccessedSelectedCapabilityRoot;
 use codex_extension_api::ConversationHistory;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
@@ -39,7 +40,6 @@ use codex_extension_api::ToolCall;
 use codex_extension_api::ToolCallSource;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::TurnInputContext;
-use codex_extension_api::TurnStartInput;
 use codex_extension_api::WorldStateContributionInput;
 use codex_extension_api::WorldStateSectionContribution;
 use codex_models_manager::model_info::model_info_from_slug;
@@ -103,6 +103,9 @@ mod shadow_task_context_tests;
 #[path = "skills_extension/presentation_dedup_tests.rs"]
 mod presentation_dedup_tests;
 
+#[path = "skills_extension/catalog_delta_tests.rs"]
+mod catalog_delta_tests;
+
 static NEXT_CODEX_HOME_ID: AtomicUsize = AtomicUsize::new(0);
 const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `executor package` locators are owned by their execution environment, `cloud package` locators are opaque package identifiers, and `custom resource` locators use their provider's access mechanism.";
 const DEMO_SKILL_CONTENTS: &str =
@@ -151,11 +154,40 @@ async fn prepared_world_state(
         .step_store
         .get::<SelectedPluginSnapshot>()
         .unwrap_or_default();
+    let access = FileSystemEnvironmentAccessor::unrestricted(&LOCAL_FS);
+    let captured_roots = input
+        .step_store
+        .get::<Vec<codex_exec_server::ResolvedSelectedCapabilityRoot>>();
+    let captured_access = captured_roots
+        .as_ref()
+        .map(|roots| {
+            roots
+                .iter()
+                .map(|root| {
+                    FileSystemEnvironmentAccessor::unrestricted(root.environment().filesystem_ref())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let accessed_roots = match &captured_roots {
+        Some(roots) => roots
+            .iter()
+            .zip(&captured_access)
+            .map(|(root, fs)| AccessedSelectedCapabilityRoot {
+                root: root.selected_root(),
+                fs,
+            })
+            .collect::<Vec<_>>(),
+        None => ready_selected_capability_roots
+            .iter()
+            .map(|root| AccessedSelectedCapabilityRoot { root, fs: &access })
+            .collect(),
+    };
     prepare_step(
         registry,
         codex_extension_api::StepPreparationInput {
             turn_id: input.turn_id,
-            ready_selected_capability_roots,
+            ready_selected_capability_roots: &accessed_roots,
             executor_capability_discovery: discovery.as_deref(),
             executor_capability_discovery_v2: snapshots.as_deref().map(Vec::as_slice),
             selected_plugins: &selected_plugins,
@@ -204,7 +236,18 @@ async fn prepared_turn_input(
         codex_extension_api::StepPreparationInput {
             selected_plugins: &selected_plugins,
             turn_id: &input.turn_id,
-            ready_selected_capability_roots: &roots,
+            ready_selected_capability_roots: &roots
+                .iter()
+                .filter_map(|root| {
+                    let CapabilityRootLocation::Environment { environment_id, .. } = &root.location;
+                    let fs = input
+                        .environments
+                        .iter()
+                        .find(|environment| environment.environment_id == *environment_id)?
+                        .fs;
+                    Some(AccessedSelectedCapabilityRoot { root, fs })
+                })
+                .collect::<Vec<_>>(),
             executor_capability_discovery: discovery.as_deref(),
             executor_capability_discovery_v2: snapshots.as_deref().map(Vec::as_slice),
             session_store,
@@ -268,27 +311,17 @@ async fn skill_world_state_fragments(
     Ok((executor, cloud))
 }
 
-async fn start_registered_turn(
+async fn refresh_registered_catalogs_for_step(
     registry: &codex_extension_api::ExtensionRegistry<TestConfig>,
     session_store: &ExtensionData,
     thread_store: &ExtensionData,
     turn_id: &str,
 ) {
     let turn_store = ExtensionData::new(turn_id);
-    let mode = codex_protocol::config_types::CollaborationMode {
-        mode: codex_protocol::config_types::ModeKind::Default,
-        settings: codex_protocol::config_types::Settings {
-            model: "test".to_string(),
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    };
     for contributor in registry.turn_lifecycle_contributors() {
         contributor
-            .on_turn_start(TurnStartInput {
+            .refresh_catalog_for_step(codex_extension_api::CatalogRefreshInput {
                 turn_id,
-                collaboration_mode: &mode,
-                token_usage_at_turn_start: None,
                 session_store,
                 thread_store,
                 turn_store: &turn_store,
@@ -354,7 +387,7 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
         TurnInputContext {
             step_store: &ExtensionData::new("step"),
             turn_id: "turn-1".to_string(),
-            user_input: vec![UserInput::Text {
+            user_input: &[UserInput::Text {
                 text: "$demo".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -454,7 +487,10 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
     let published_snapshot = published_snapshot.unwrap();
     assert!(fragment.is_some());
     let mut expected = expected_catalog_metric_samples("host_world_state", /*count*/ 1);
-    assert!(startup_metrics.samples().is_empty());
+    let expected_discovery = vec![expected_catalog_entries(
+        "executor", "complete", /*count*/ 0,
+    )];
+    assert_eq!(startup_metrics.samples(), expected_discovery);
     assert_eq!(turn_metrics.samples(), expected);
 
     let sections = prepared_world_state(
@@ -480,7 +516,7 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
             .1
             .is_none()
     );
-    assert!(startup_metrics.samples().is_empty());
+    assert_eq!(startup_metrics.samples(), expected_discovery);
     assert_eq!(turn_metrics.samples(), expected);
 
     let second_skill_path =
@@ -525,7 +561,7 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
         "host_world_state",
         /*count*/ 2,
     ));
-    assert!(startup_metrics.samples().is_empty());
+    assert_eq!(startup_metrics.samples(), expected_discovery);
     assert_eq!(turn_metrics.samples(), expected);
 
     Ok(())
@@ -707,7 +743,7 @@ async fn executor_cloud_and_host_share_catalog_world_state_flow() -> TestResult 
         })
         .await;
     // Host rendering stays separate even when its identity matches a Cloud skill.
-    start_registered_turn(&registry, &session_store, &thread_store, "turn-1").await;
+    refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-1").await;
 
     let selected_roots = [SelectedCapabilityRoot {
         id: "skills".to_string(),
@@ -823,7 +859,7 @@ async fn nonempty_executor_empty_host_records_catalog_metrics() -> TestResult {
         })
         .await;
 
-    let selected_roots = vec![SelectedCapabilityRoot {
+    let selected_roots = [SelectedCapabilityRoot {
         id: "lint-fix".to_string(),
         location: CapabilityRootLocation::Environment {
             environment_id: "env-1".to_string(),
@@ -1028,7 +1064,7 @@ async fn shadow_selection_uses_host_catalog_when_instructions_are_disabled() -> 
         TurnInputContext {
             step_store: &step_store,
             turn_id: "turn-1".to_string(),
-            user_input: vec![UserInput::Text {
+            user_input: &[UserInput::Text {
                 text: "Fix lint errors.".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -1134,7 +1170,7 @@ async fn shadow_lru_selector_recovers_a_skill_invoked_on_an_earlier_turn() -> Te
             TurnInputContext {
                 step_store: &ExtensionData::new("step"),
                 turn_id: turn_id.to_string(),
-                user_input: vec![UserInput::Text {
+                user_input: &[UserInput::Text {
                     text: text.to_string(),
                     text_elements: Vec::new(),
                 }],
@@ -1336,7 +1372,7 @@ async fn selected_executor_catalog_caches_root_selections_per_turn_and_reuses_di
         TurnInputContext {
             step_store: &step_store,
             turn_id: "turn-1".to_string(),
-            user_input: vec![UserInput::Text {
+            user_input: &[UserInput::Text {
                 text: "$lint-fix please".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -1591,7 +1627,7 @@ async fn selected_executor_catalog_caches_root_selections_per_turn_and_reuses_di
         ("cache-turn-1", vec![first_root.clone()], true, 4),
         ("cache-turn-2", vec![first_root.clone()], true, 5),
         ("cache-turn-2", vec![first_root.clone()], false, 6),
-        ("cache-turn-2", vec![first_root], false, 6),
+        ("cache-turn-2", vec![first_root.clone()], false, 6),
     ] {
         let mut next_config = current_config.clone();
         next_config.bundled_skills_enabled = include_bundled_skills;
@@ -1629,6 +1665,46 @@ async fn selected_executor_catalog_caches_root_selections_per_turn_and_reuses_di
         assert_eq!(
             previous_list_calls + expected_new_calls,
             list_calls.load(Ordering::Relaxed)
+        );
+    }
+
+    // Keep the turn, root, and filesystem fixed while access changes and is restored.
+    let open = FileSystemEnvironmentAccessor::unrestricted(cache_environment.filesystem_ref());
+    let changed = FileSystemEnvironmentAccessor::new(
+        cache_environment.filesystem_ref(),
+        codex_exec_server::FileSystemSandboxContext::from_permission_profile(
+            codex_protocol::models::PermissionProfile::read_only(),
+            PathUri::parse("file:///skills")?,
+        ),
+    );
+    let turn_store = ExtensionData::new("cache-turn-2");
+    for (access, expected_new_calls) in [
+        (&open as &dyn codex_exec_server::EnvironmentAccess, 6),
+        (&changed, 7),
+        (&changed, 7),
+        (&open, 8),
+    ] {
+        prepare_step(
+            &registry,
+            codex_extension_api::StepPreparationInput {
+                turn_id: "cache-turn-2",
+                ready_selected_capability_roots: &[AccessedSelectedCapabilityRoot {
+                    root: &first_root,
+                    fs: access,
+                }],
+                executor_capability_discovery: None,
+                executor_capability_discovery_v2: None,
+                selected_plugins: &Default::default(),
+                session_store: &session_store,
+                thread_store: &thread_store,
+                turn_store: &turn_store,
+                step_store: &ExtensionData::new("permission-step"),
+            },
+        )
+        .await;
+        assert_eq!(
+            previous_list_calls + expected_new_calls,
+            list_calls.load(Ordering::Relaxed),
         );
     }
 
@@ -1688,7 +1764,6 @@ async fn overlapping_executor_catalogs_render_their_own_roots() -> TestResult {
     let root_b = root("skill-b")?;
     let mut builder = ExtensionRegistryBuilder::new();
     let provider = codex_skills_extension::ExecutorSkillProvider::new_with_restriction_product(
-        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         /*restriction_product*/ None,
     );
     install_with_providers(
@@ -1834,7 +1909,7 @@ async fn default_context_truncates_catalog_descriptions() -> TestResult {
             thread_store: &thread_store,
         })
         .await;
-    start_registered_turn(&registry, &session_store, &thread_store, "turn-1").await;
+    refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-1").await;
 
     let (executor, cloud) =
         skill_world_state_fragments(&registry, &session_store, &thread_store, "turn-1").await?;
@@ -2000,7 +2075,13 @@ async fn catalog_rebalances_only_to_avoid_omissions_and_retains_the_allocation()
                 );
                 let turn_id = format!("turn-{step}");
                 let turn_store = ExtensionData::new(&turn_id);
-                start_registered_turn(&registry, &session_store, &thread_store, &turn_id).await;
+                refresh_registered_catalogs_for_step(
+                    &registry,
+                    &session_store,
+                    &thread_store,
+                    &turn_id,
+                )
+                .await;
                 let sections = prepared_world_state(
                     &registry,
                     if ready { &selected_roots } else { &[] },
@@ -2184,7 +2265,7 @@ async fn extreme_budget_pressure_removes_descriptions_before_omitting_entries() 
             thread_store: &thread_store,
         })
         .await;
-    start_registered_turn(&registry, &session_store, &thread_store, "turn-1").await;
+    refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-1").await;
 
     let (executor, cloud) =
         skill_world_state_fragments(&registry, &session_store, &thread_store, "turn-1").await?;
@@ -2297,7 +2378,7 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
             thread_store: &thread_store,
         })
         .await;
-    start_registered_turn(&registry, &session_store, &thread_store, "turn-1").await;
+    refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-1").await;
 
     let step_store = ExtensionData::new("step");
     prepared_world_state(
@@ -2515,14 +2596,18 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cloud_discovery_is_gated_and_reports_failures() -> TestResult {
     for (cloud_skill_enabled, has_cloud_provider) in [(false, true), (true, true), (true, false)] {
         let list_calls = Arc::new(AtomicUsize::new(0));
         let mut providers = SkillProviders::new();
         if has_cloud_provider {
             providers = providers.with_cloud_provider(Arc::new(StaticSkillProvider {
-                catalog: SkillCatalog::default(),
+                catalog: SkillCatalog {
+                    is_partial: true,
+                    warnings: vec!["catalog diagnostic".to_string()],
+                    ..SkillCatalog::default()
+                },
                 read_requests: Arc::new(Mutex::new(Vec::new())),
                 list_calls: Some(Arc::clone(&list_calls)),
                 fail_first_list: true,
@@ -2554,30 +2639,8 @@ async fn cloud_discovery_is_gated_and_reports_failures() -> TestResult {
             })
             .await;
 
-        assert_eq!(
-            registry
-                .turn_lifecycle_contributors()
-                .iter()
-                .map(|contributor| contributor.turn_start_phase(&thread_store))
-                .collect::<Vec<_>>(),
-            vec![
-                codex_extension_api::TurnStartPhase::BeforeTaskRegistration,
-                if cloud_available {
-                    codex_extension_api::TurnStartPhase::RegularTaskStart
-                } else {
-                    codex_extension_api::TurnStartPhase::BeforeTaskRegistration
-                },
-            ]
-        );
-        assert_eq!(
-            registry
-                .turn_lifecycle_contributors()
-                .iter()
-                .map(|contributor| contributor.requires_mcp_runtime(&thread_store))
-                .collect::<Vec<_>>(),
-            vec![false, cloud_available]
-        );
-        start_registered_turn(&registry, &session_store, &thread_store, "turn-1").await;
+        refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-1")
+            .await;
         assert_eq!(
             list_calls.load(Ordering::Relaxed),
             usize::from(cloud_available)
@@ -2643,6 +2706,25 @@ async fn cloud_discovery_is_gated_and_reports_failures() -> TestResult {
         assert_eq!(warning.thread_id, thread_store.level_id());
         assert_eq!(warning.turn_id.as_deref(), Some("turn-1"));
         assert!(warning.message.contains("temporary cloud failure"));
+
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-2")
+            .await;
+        refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-3")
+            .await;
+        assert_eq!(list_calls.load(Ordering::Relaxed), 2);
+        for contributor in registry.turn_lifecycle_contributors() {
+            contributor
+                .refresh_cloud_catalog(codex_extension_api::CloudCatalogRefreshInput {
+                    session_store: &session_store,
+                    thread_store: &thread_store,
+                })
+                .await
+                .map_err(|error| format!("partial catalogs should be accepted: {error}"))?;
+        }
+        refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-4")
+            .await;
+        assert_eq!(list_calls.load(Ordering::Relaxed), 3);
     }
     Ok(())
 }
@@ -2662,9 +2744,7 @@ async fn v2_root_aliases_and_read_cache_use_the_captured_environment() -> TestRe
         .get_environment("local")
         .ok_or("replacement environment")?;
     let providers = SkillProviders::new().with_executor_provider(Arc::new(
-        ExecutorSkillProvider::new_with_restriction_product(
-            manager, /*restriction_product*/ None,
-        ),
+        ExecutorSkillProvider::new_with_restriction_product(/*restriction_product*/ None),
     ));
     let mut builder = ExtensionRegistryBuilder::new();
     install_with_providers(&mut builder, providers, skills_extension_config);
@@ -2929,7 +3009,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
         TurnInputContext {
             step_store: &step_store,
             turn_id: "turn-1".to_string(),
-            user_input: vec![UserInput::Mention {
+            user_input: &[UserInput::Mention {
                 name: "lint-fix".to_string(),
                 path: root_b_locator.to_string(),
             }],
@@ -3025,7 +3105,7 @@ async fn model_context_window_scales_executor_and_cloud_catalogs() -> TestResult
             thread_store: &thread_store,
         })
         .await;
-    start_registered_turn(&registry, &session_store, &thread_store, "turn-1").await;
+    refresh_registered_catalogs_for_step(&registry, &session_store, &thread_store, "turn-1").await;
     let mut model_info = model_info_from_slug("test-model");
     model_info.context_window = Some(10_000);
 
@@ -3034,7 +3114,7 @@ async fn model_context_window_scales_executor_and_cloud_catalogs() -> TestResult
         .await;
     assert!(thread_fragments.is_empty());
 
-    let selected_roots = vec![SelectedCapabilityRoot {
+    let selected_roots = [SelectedCapabilityRoot {
         id: "skills".to_string(),
         location: CapabilityRootLocation::Environment {
             environment_id: "env-1".to_string(),
@@ -3166,7 +3246,7 @@ async fn executor_catalog_emits_at_most_four_warnings() -> TestResult {
             thread_store: &thread_store,
         })
         .await;
-    let selected_roots = vec![SelectedCapabilityRoot {
+    let selected_roots = [SelectedCapabilityRoot {
         id: "skills".to_string(),
         location: CapabilityRootLocation::Environment {
             environment_id: "env-1".to_string(),
@@ -3197,7 +3277,7 @@ async fn executor_catalog_emits_at_most_four_warnings() -> TestResult {
         TurnInputContext {
             step_store: &step_store,
             turn_id: "turn-1".to_string(),
-            user_input: Vec::new(),
+            user_input: &[],
             environments: Vec::new(),
         },
         /*extension_metrics*/ None,
@@ -3265,7 +3345,7 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
     let snapshot = service
         .snapshot_for_config(
             &HostSkillsLoadInput::new(codex_home, Vec::new(), config_layer_stack),
-            Some(Arc::clone(&LOCAL_FS)),
+            Some(&codex_exec_server::FileSystemEnvironmentAccessor::unrestricted(&LOCAL_FS)),
         )
         .await;
     assert_eq!(snapshot.outcome().errors, Vec::new());
@@ -3304,7 +3384,7 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
         TurnInputContext {
             step_store: &ExtensionData::new("step"),
             turn_id: "turn-1".to_string(),
-            user_input: vec![UserInput::Text {
+            user_input: &[UserInput::Text {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -3390,7 +3470,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
         TurnInputContext {
             step_store: &ExtensionData::new("step"),
             turn_id: "turn-1".to_string(),
-            user_input: vec![UserInput::Text {
+            user_input: &[UserInput::Text {
                 text: "$hidden-skill".to_string(),
                 text_elements: Vec::new(),
             }],
@@ -3466,9 +3546,24 @@ struct RecordedHistogram {
 #[derive(Default)]
 struct RecordingMetrics {
     samples: Mutex<Vec<RecordedHistogram>>,
+    counters: Mutex<Vec<RecordedCounter>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedCounter {
+    name: String,
+    increment: i64,
+    tags: Vec<(String, String)>,
 }
 
 impl RecordingMetrics {
+    fn counters(&self) -> Vec<RecordedCounter> {
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn samples(&self) -> Vec<RecordedHistogram> {
         self.samples
             .lock()
@@ -3488,8 +3583,18 @@ impl ExtensionMetrics for RecordingMetrics {
         self.histogram(name, value, tags);
     }
 
-    fn counter(&self, name: &str, _inc: i64, _tags: &[(&str, &str)]) {
-        panic!("unexpected counter: {name}");
+    fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) {
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(RecordedCounter {
+                name: name.to_string(),
+                increment: inc,
+                tags: tags
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            });
     }
 
     fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) {
@@ -3504,6 +3609,17 @@ impl ExtensionMetrics for RecordingMetrics {
                     .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                     .collect(),
             });
+    }
+}
+
+fn expected_catalog_entries(stage: &str, status: &str, count: i64) -> RecordedHistogram {
+    RecordedHistogram {
+        name: "codex.skills.catalog.entries".to_string(),
+        value: count,
+        tags: vec![
+            ("stage".to_string(), stage.to_string()),
+            ("status".to_string(), status.to_string()),
+        ],
     }
 }
 
@@ -3534,7 +3650,7 @@ fn expected_catalog_metric_samples(catalog_surface: &str, count: i64) -> Vec<Rec
 }
 
 impl SkillProvider for StaticSkillProvider {
-    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(&'a self, _query: SkillListQuery<'a>) -> SkillProviderFuture<'a, SkillCatalog> {
         let list_call = self
             .list_calls
             .as_ref()
@@ -3596,6 +3712,8 @@ fn test_entry(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TestConfig {
     include_instructions: bool,
+    catalog_deltas_enabled: bool,
+    omit_descriptions: bool,
     bundled_skills_enabled: bool,
     cloud_skill_enabled: bool,
     shadow_selection_enabled: bool,
@@ -3604,6 +3722,8 @@ struct TestConfig {
 fn default_config() -> TestConfig {
     TestConfig {
         include_instructions: true,
+        catalog_deltas_enabled: false,
+        omit_descriptions: false,
         bundled_skills_enabled: true,
         cloud_skill_enabled: true,
         shadow_selection_enabled: false,
@@ -3613,6 +3733,8 @@ fn default_config() -> TestConfig {
 fn skills_extension_config(config: &TestConfig) -> SkillsExtensionConfig {
     SkillsExtensionConfig {
         include_instructions: config.include_instructions,
+        catalog_deltas_enabled: config.catalog_deltas_enabled,
+        omit_descriptions: config.omit_descriptions,
         max_context_tokens: None,
         bundled_skills_enabled: config.bundled_skills_enabled,
         cloud_skill_enabled: config.cloud_skill_enabled,
@@ -3682,7 +3804,7 @@ async fn shared_catalog_keeps_captured_executor_and_separates_bindings_in_one_tu
         Some(std::time::Duration::from_millis(100)),
     )?;
     let provider = Arc::new(ExecutorSkillProvider::new_with_restriction_product(
-        manager, /*restriction_product*/ None,
+        /*restriction_product*/ None,
     ));
     let mut builder = ExtensionRegistryBuilder::new();
     install_with_providers(

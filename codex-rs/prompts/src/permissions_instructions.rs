@@ -10,8 +10,9 @@ use crate::model_messages::permissions::READ_ONLY_TEMPLATE;
 use crate::model_messages::permissions::ResolvedApprovalMessages;
 use crate::model_messages::permissions::ResolvedPermissionMessages;
 use crate::model_messages::permissions::WORKSPACE_WRITE_TEMPLATE;
+use approval_instructions::ApprovalInstructions;
 use codex_context_fragments::ContextualUserFragment;
-use codex_execpolicy::Policy;
+use codex_execpolicy_rules::Policy;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::models::ContentItem;
@@ -24,11 +25,16 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::NetworkAccess;
 use codex_utils_template::Template;
+use path_warnings::OMITTED_PERMISSION_PATHS;
+use path_warnings::denied_reads_text;
+use path_warnings::omitted_paths_text;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 use writable_roots::writable_roots_text;
 
+mod approval_instructions;
+mod path_warnings;
 mod writable_roots;
 
 const REQUEST_PERMISSION_RULE: &str =
@@ -41,7 +47,6 @@ const GRANULAR_PROMPTED_CATEGORIES: &str =
 const GRANULAR_REJECTED_CATEGORIES: &str =
     "These approval categories are automatically rejected instead of prompting the user:";
 const MAX_PERMISSION_PATH_BYTES: usize = 32 * 1024;
-const OMITTED_PERMISSION_PATHS: &str = "Additional permission paths/globs are omitted. All restrictions still apply; do not use escalation or additional permissions to bypass omitted read denials.";
 
 static DANGER_FULL_ACCESS: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(DANGER_FULL_ACCESS_TEMPLATE.trim_end())
@@ -70,6 +75,18 @@ impl<'a> ApprovalPromptContext<'a> {
             messages: model_messages.approvals(),
             permission_messages: model_messages.permissions(),
         }
+    }
+
+    /// Resolves a plain heading for the standalone notification about newly saved prefixes.
+    pub fn approved_command_prefix_saved_heading(&self) -> Option<&'a str> {
+        self.permission_messages
+            .approved_command_prefix_saved
+            .filter(|text| {
+                text.len() <= 500
+                    && !text.trim().is_empty()
+                    && !text.chars().any(char::is_control)
+                    && !text.contains(['<', '>', '{', '}', '\u{2028}', '\u{2029}'])
+            })
     }
 }
 
@@ -147,11 +164,14 @@ impl PermissionsInstructions {
         {
             append_section(&mut text, &writable_roots);
         }
-        if let Some(denied_reads) = denied_reads_text(&denied_read_paths, &denied_read_globs) {
+        let path_messages = approval_context.permission_messages;
+        if let Some(denied_reads) =
+            denied_reads_text(&denied_read_paths, &denied_read_globs, path_messages)
+        {
             append_section(&mut text, &denied_reads);
         }
         if paths_omitted {
-            append_section(&mut text, OMITTED_PERMISSION_PATHS);
+            append_section(&mut text, &omitted_paths_text(path_messages));
         }
         if !text.ends_with('\n') {
             text.push('\n');
@@ -326,30 +346,31 @@ fn approval_text(
         }
         ResolvedMessage::Bundled(text) => text,
     };
+    let instructions = ApprovalInstructions::new(approval_context);
     let text = match approval_policy {
         AskForApproval::Never => return base.to_string(),
         AskForApproval::UnlessTrusted => {
             if request_permissions_tool_enabled {
-                format!("{base}\n\n{REQUEST_PERMISSIONS_TOOL}")
+                format!("{base}\n\n{}", instructions.tool())
             } else {
                 base.to_string()
             }
         }
         AskForApproval::OnRequest => {
-            let rule = if exec_permission_approvals_enabled {
-                REQUEST_PERMISSION_RULE
+            let mut sections = vec![if exec_permission_approvals_enabled {
+                REQUEST_PERMISSION_RULE.to_string()
             } else {
-                base
-            };
-            let mut sections = vec![rule.to_string()];
+                base.to_string()
+            }];
             if request_permissions_tool_enabled {
-                sections.push(REQUEST_PERMISSIONS_TOOL.to_string());
+                sections.push(instructions.tool());
             }
             sections.extend(render_prefixes());
             sections.join("\n\n")
         }
         AskForApproval::Granular(granular_config) => granular_instructions(
             granular_config,
+            approval_context,
             render_prefixes(),
             exec_permission_approvals_enabled,
             request_permissions_tool_enabled,
@@ -357,7 +378,7 @@ fn approval_text(
     };
 
     if approval_context.reviewer == ApprovalsReviewer::AutoReview {
-        format!("{text}\n\n{AUTO_REVIEW_SUFFIX}")
+        format!("{text}\n\n{}", instructions.auto_review())
     } else {
         text
     }
@@ -382,22 +403,6 @@ fn sandbox_text(
     }
 }
 
-fn denied_reads_text(paths: &[String], globs: &[String]) -> Option<String> {
-    let mut entries = paths
-        .iter()
-        .map(|root| format!("- path `{root}`"))
-        .collect::<Vec<_>>();
-    entries.extend(globs.iter().map(|glob| format!("- glob `{glob}`")));
-    if entries.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "## Denied filesystem reads\nThe active permission profile denies reading these paths/globs. Do not request escalation or additional permissions to read them; these denials are policy restrictions.\n{}",
-        entries.join("\n")
-    ))
-}
-
 fn approved_command_prefixes_text(prefixes: &[Vec<String>], template: &str) -> Option<String> {
     if template.is_empty() || prefixes.is_empty() {
         return None;
@@ -408,10 +413,12 @@ fn approved_command_prefixes_text(prefixes: &[Vec<String>], template: &str) -> O
 
 fn granular_instructions(
     granular_config: GranularApprovalConfig,
+    approval_context: ApprovalPromptContext<'_>,
     approved_command_prefixes: Option<String>,
     exec_permission_approvals_enabled: bool,
     request_permissions_tool_enabled: bool,
 ) -> String {
+    let instructions = ApprovalInstructions::new(approval_context);
     let sandbox_approval_prompts_allowed = granular_config.allows_sandbox_approval();
     let shell_permission_requests_available =
         exec_permission_approvals_enabled && sandbox_approval_prompts_allowed;
@@ -466,7 +473,7 @@ fn granular_instructions(
     }
 
     if request_permissions_tool_prompts_allowed {
-        sections.push(REQUEST_PERMISSIONS_TOOL.to_string());
+        sections.push(instructions.tool());
     }
 
     sections.extend(approved_command_prefixes);

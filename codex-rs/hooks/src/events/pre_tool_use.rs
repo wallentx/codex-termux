@@ -8,6 +8,7 @@ use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use serde_json::Value;
 
 use super::common;
@@ -26,6 +27,9 @@ pub struct PreToolUseRequest {
     pub turn_id: String,
     pub subagent: Option<common::SubagentHookContext>,
     pub cwd: AbsolutePathBuf,
+    /// Local tool cwd for hook stdin. Remote commands leave this unset to retain
+    /// the host cwd. The hook process still runs in `cwd`.
+    pub tool_cwd: Option<PathUri>,
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
@@ -171,7 +175,9 @@ fn latest_updated_input(
 /// Handler selection may include internal matcher aliases, but hook stdin keeps
 /// the canonical `tool_name` so audit logs and downstream policy decisions stay
 /// stable. Shell-like tools pass `{ "command": ... }` as `tool_input`; MCP
-/// tools pass their resolved JSON arguments.
+/// tools pass their resolved JSON arguments. Local commands can expose their
+/// execution cwd here, independently of the directory used to launch hooks.
+/// Remote commands retain the host cwd; remote cwd reporting is deferred.
 fn command_input(request: &PreToolUseRequest) -> Result<Value, serde_json::Error> {
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
     serde_json::to_value(PreToolUseCommandInput {
@@ -180,7 +186,7 @@ fn command_input(request: &PreToolUseRequest) -> Result<Value, serde_json::Error
         agent_id: subagent.agent_id,
         agent_type: subagent.agent_type,
         transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
-        cwd: request.cwd.display().to_string(),
+        cwd: common::command_input_cwd(request.cwd.as_ref(), request.tool_cwd.as_ref()),
         hook_event_name: "PreToolUse".to_string(),
         model: request.model.clone(),
         permission_mode: request.permission_mode.clone(),
@@ -293,6 +299,11 @@ fn parse_completed(
         },
     }
 
+    if let Some(reason) = common::apply_failure_policy(handler, &mut status, &mut entries) {
+        should_block = true;
+        block_reason = Some(reason);
+    }
+
     let completed = HookCompletedEvent {
         turn_id,
         run: dispatcher::completed_summary(handler, &run_result, status, entries),
@@ -311,10 +322,11 @@ fn parse_completed(
 }
 
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PreToolUseOutcome {
+    let block_reason = common::failure_block_reason(&hook_events);
     PreToolUseOutcome {
         hook_events,
-        should_block: false,
-        block_reason: None,
+        should_block: block_reason.is_some(),
+        block_reason,
         additional_contexts: Vec::new(),
         updated_input: None,
     }
@@ -350,6 +362,22 @@ mod tests {
         let input = command_input(&request).expect("serialize command input");
 
         assert_eq!(input["tool_name"], "apply_patch");
+    }
+
+    #[test]
+    fn command_input_uses_tool_cwd_with_its_own_path_convention() {
+        for (uri, expected) in [
+            ("file:///repo-B", "/repo-B"),
+            ("file:///C:/repo-B", r"C:\repo-B"),
+        ] {
+            let mut request = request_for_tool_use("call-cwd");
+            let original = command_input(&request).unwrap();
+            request.tool_cwd = Some(codex_utils_path_uri::PathUri::parse(uri).unwrap());
+            let actual = command_input(&request).unwrap();
+            let mut expected_input = original;
+            expected_input["cwd"] = serde_json::json!(expected);
+            assert_eq!(actual, expected_input);
+        }
     }
 
     #[test]
@@ -764,6 +792,25 @@ mod tests {
 
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].run.id, runs[0].id);
+
+        let mut handler = handler();
+        handler.on_failure = codex_config::HookFailurePolicy::Block;
+        let completed = common::serialization_failure_hook_events_for_tool_use(
+            vec![handler],
+            Some(request.turn_id.clone()),
+            "serialize failed".into(),
+            &request.tool_use_id,
+        );
+        let outcome = super::serialization_failure_outcome(completed);
+        assert!(outcome.should_block);
+        assert_eq!(
+            outcome.block_reason,
+            Some(
+                "PreToolUse hook failed. This hook is configured to block continuation on failure."
+                    .to_string()
+            )
+        );
+        assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Blocked);
     }
 
     fn handler() -> ConfiguredHandler {
@@ -778,6 +825,7 @@ mod tests {
             matcher: Some(crate::engine::HookMatcher::new("^Bash$").expect("valid matcher")),
             timeout_sec: 5,
             status_message: None,
+            on_failure: Default::default(),
             additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: codex_protocol::protocol::HookSource::User,
@@ -792,6 +840,7 @@ mod tests {
 
     fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
         HandlerRunResult {
+            structured_content: None,
             context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1,
             completed_at: 2,
@@ -809,6 +858,7 @@ mod tests {
             turn_id: "turn-1".to_string(),
             subagent: None,
             cwd: test_path_buf("/tmp").abs(),
+            tool_cwd: None,
             transcript_path: None,
             model: "gpt-test".to_string(),
             permission_mode: "default".to_string(),

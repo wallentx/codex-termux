@@ -4,11 +4,13 @@ use crate::codex_thread::BackgroundTerminalInfo;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::sandboxing::ExecRequest;
+use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::output::CapturedStream;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
@@ -27,7 +29,6 @@ use core_test_support::skip_if_sandbox;
 use core_test_support::test_codex::test_env as remote_test_env;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -69,14 +70,11 @@ fn test_exec_request(
     env: HashMap<String, String>,
 ) -> ExecRequest {
     let permission_profile = turn.permission_profile();
-    let network = None;
     let arg0 = None;
     ExecRequest::new(
         command,
         cwd,
         env,
-        network,
-        /*network_environment_id*/ None,
         ExecExpiration::DefaultTimeout,
         ExecCapturePolicy::ShellTool,
         SandboxType::None,
@@ -121,7 +119,7 @@ async fn exec_command_with_tty(
                 turn.initial_environments
                     .primary()
                     .expect("turn environment")
-                    .environment
+                    .environment()
                     .as_ref(),
             )
             .await?,
@@ -179,8 +177,7 @@ async fn exec_command_with_tty(
         collected_output.total_bytes(),
     ))
     .unwrap_or(usize::MAX);
-    let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-    let collected = collected_output.to_bytes_with_omission_marker();
+    let collected = CapturedStream::from(&collected_output);
     let has_exited = process.has_exited();
     let exit_code = process.exit_code();
     let response_process_id = if process_started_alive && !has_exited {
@@ -212,8 +209,8 @@ async fn exec_command_with_tty(
         process_id: response_process_id,
         exit_code,
         original_token_count: Some(original_token_count),
-        output_omitted_bytes,
         hook_command: Some(cmd.to_string()),
+        tool_cwd: None,
     })
 }
 
@@ -554,12 +551,17 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
     .await?;
     let process_id = open_shell.process_id.expect("expected process id");
 
-    write_stdin(
-        &session, &turn, process_id, "exit\n", /*yield_time_ms*/ 2_500,
-    )
-    .await?;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
+        let mut response = write_stdin(
+            &session, &turn, process_id, "exit\n", /*yield_time_ms*/ 2_500,
+        )
+        .await?;
+        while response.process_id.is_some() {
+            response = write_stdin(&session, &turn, process_id, "", /*yield_time_ms*/ 100).await?;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
 
     let err = write_stdin(&session, &turn, process_id, "", /*yield_time_ms*/ 100)
         .await
@@ -785,17 +787,58 @@ async fn terminating_during_stdin_poll_returns_exited_response(
     Ok(())
 }
 
+#[test_case::test_case(false; "pipe")]
+#[cfg_attr(target_os = "linux", test_case::test_case(true; "PTY with non-UTF-8 sandbox launcher"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
+async fn completed_local_commands_preserve_exit_code(tty: bool) -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
     #[allow(deprecated)]
     let cwd = turn.cwd.clone();
     let request = test_exec_request(
         &turn,
         vec!["bash".to_string(), "-lc".to_string(), "exit 17".to_string()],
-        cwd,
+        cwd.clone(),
         shell_env(),
     );
+    #[cfg(target_os = "linux")]
+    let dir = tempfile::tempdir()?;
+    #[cfg(target_os = "linux")]
+    let request = if tty {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        // The probe stands in for the configured helper. The lossy spelling names a different executable.
+        let helper = dir.path().join(OsStr::from_bytes(b"helper-\xff"));
+        std::fs::write(&helper, "#!/bin/sh\nexit 17\n")?;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+        std::os::unix::fs::symlink("/bin/false", helper.to_string_lossy().as_ref())?;
+        crate::exec::build_exec_request(
+            crate::exec::ExecParams {
+                command: vec!["/bin/false".to_owned()],
+                cwd: cwd.clone(),
+                expiration: request.expiration,
+                capture_policy: request.capture_policy,
+                env: shell_env(),
+                network: None,
+                network_environment_id: None,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                windows_sandbox_level: turn.windows_sandbox_level,
+                justification: None,
+                arg0: None,
+            },
+            &codex_protocol::models::PermissionProfile::read_only(),
+            &cwd,
+            &[],
+            &Some(helper),
+            /*codex_self_exe*/ &None,
+            SandboxType::None,
+            /*use_legacy_landlock*/ false,
+        )
+        .await?
+        .into_exec_request()
+    } else {
+        request
+    };
 
     let environment = codex_exec_server::Environment::default_for_tests();
     let process = UnifiedExecProcessManager::default()
@@ -805,7 +848,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             /*tool_ctx*/ None,
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
-            /*tty*/ false,
+            tty,
             &environment,
         )
         .await?;

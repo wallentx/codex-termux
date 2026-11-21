@@ -99,6 +99,7 @@ impl native::UserVerificationProvider for BlockingProvider {
         Ok(native::UserVerificationProof {
             credential_id: "credential".into(),
             signature: "signature".into(),
+            biometric_type: Some(native::UserVerificationBiometricType::Fingerprint),
         })
     }
 }
@@ -166,9 +167,11 @@ impl Harness {
             log_db: None,
             state_db: None,
             config_warnings: Vec::new(),
+            startup_warnings_tx: mpsc::unbounded_channel().0,
             session_source: SessionSource::Cli,
             auth_manager: Arc::clone(&auth),
             user_verification: Arc::clone(&service),
+            runtime_auth_slot: None,
             installation_id: "11111111-1111-4111-8111-111111111111".into(),
             code_mode_session_provider: None,
             rpc_transport: match origin {

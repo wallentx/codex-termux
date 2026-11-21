@@ -1,6 +1,8 @@
 //! Shared SQLite connection configuration.
-//! Writable pools preserve the journal and vacuum modes of initialized databases.
+//! New databases use DELETE on NFS and WAL elsewhere.
+//! Writable pools preserve existing settings unless managed policy requires DELETE on NFS.
 //! Startup retries SQLITE_BUSY and reports other errors to callers.
+//! Schema version checks and migrations share one transaction and retry contention together.
 //! The configured logs directory is created and locked only when opening its database.
 
 #![expect(
@@ -31,11 +33,15 @@ use std::time::Instant;
 use tokio::sync::OnceCell;
 
 mod busy_retry;
+mod connection;
+mod nfs;
 mod validation;
 
 pub use busy_retry::SqlitePoolWriteExt;
 pub(crate) use busy_retry::SqliteWriteQueryExt;
 pub(crate) use busy_retry::retry_on_busy;
+use connection::JournalModePolicy;
+use connection::connect_once;
 use validation::SqliteQuickCheckManager;
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -170,6 +176,7 @@ pub struct SqliteConfig {
     local_logs_dir: Option<LocalLogsDir>,
     is_nfs: Arc<OnceCell<bool>>,
     logs_is_nfs: Arc<OnceCell<bool>>,
+    enforce_delete_on_nfs: bool,
     quick_check_manager: SqliteQuickCheckManager,
 }
 
@@ -178,6 +185,7 @@ pub struct SqliteConfig {
 impl PartialEq for SqliteConfig {
     fn eq(&self, other: &Self) -> bool {
         self.sqlite_home == other.sqlite_home
+            && self.enforce_delete_on_nfs == other.enforce_delete_on_nfs
             && self.local_logs_dir.as_ref().map(LocalLogsDir::path)
                 == other.local_logs_dir.as_ref().map(LocalLogsDir::path)
     }
@@ -186,18 +194,43 @@ impl PartialEq for SqliteConfig {
 impl Eq for SqliteConfig {}
 
 impl SqliteConfig {
+    #[deprecated(
+        note = "Use SqliteConfig::from_sqlite_home_with_nfs_enforcement with the managed unsafe_enforce_sqlite_journal_mode requirement, or SqliteConfig::new_for_testing in tests"
+    )]
     pub fn from_sqlite_home(sqlite_home: AbsolutePathBuf) -> Self {
+        Self::from_sqlite_home_with_nfs_enforcement(
+            sqlite_home,
+            /*enforce_delete_on_nfs*/ false,
+        )
+    }
+
+    /// Construct the configuration with the resolved `unsafe_enforce_sqlite_journal_mode` requirement.
+    pub fn from_sqlite_home_with_nfs_enforcement(
+        sqlite_home: AbsolutePathBuf,
+        enforce_delete_on_nfs: bool,
+    ) -> Self {
         Self {
             sqlite_home,
             local_logs_dir: None,
             is_nfs: Arc::new(OnceCell::new()),
             logs_is_nfs: Arc::new(OnceCell::new()),
+            enforce_delete_on_nfs,
             quick_check_manager: SqliteQuickCheckManager::new(),
         }
     }
 
+    /// When enforcement is enabled, migrate existing WAL databases on NFS before opening them.
+    /// Other clients on all hosts must remain stopped during migration.
+    pub fn enable_delete_mode_on_nfs(mut self, enabled: bool) -> Self {
+        self.enforce_delete_on_nfs = enabled;
+        self
+    }
+
     pub fn new_for_testing(sqlite_home: AbsolutePathBuf) -> Self {
-        Self::from_sqlite_home(sqlite_home)
+        Self::from_sqlite_home_with_nfs_enforcement(
+            sqlite_home,
+            /*enforce_delete_on_nfs*/ false,
+        )
     }
 
     pub fn home(&self) -> &Path {
@@ -381,7 +414,21 @@ impl SqliteConfig {
             if matches!(spec.kind, DbKind::State) {
                 repair_legacy_recency_migration_version(&pool, migrator).await?;
             }
-            migrator.run(&pool).await.map_err(anyhow::Error::from)
+            // SQLx's SQLite migration lock is a no-op. Keep version checks and changes in
+            // one transaction, retrying from a fresh snapshot after a concurrent migration.
+            // A current schema needs only a read lock, including when opened on NFS.
+            retry_on_busy(|| async {
+                let mut transaction = pool.begin().await?;
+                if let Err(error) = migrator
+                    .run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
+                    .await
+                {
+                    transaction.rollback().await?;
+                    return Err(error.into());
+                }
+                transaction.commit().await.map_err(anyhow::Error::from)
+            })
+            .await
         }
         .await;
         telemetry::record_init_result(
@@ -400,6 +447,24 @@ impl SqliteConfig {
         Ok(pool)
     }
 
+    /// Open a private database that lasts for the lifetime of this pool.
+    pub async fn open_in_memory_pool() -> Result<SqlitePool, Error> {
+        // Keep the sole connection alive. Disabling the checkout ping also keeps
+        // a cancelled acquire from discarding the connection and its database.
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .test_before_acquire(false)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .in_memory(true)
+                    .pragma("temp_store", "MEMORY")
+                    .log_statements(LevelFilter::Off),
+            )
+            .await
+    }
+
     /// Open a writable Codex SQLite database, creating it if necessary.
     /// Keep this configuration alive to retain the cleanup lock for local logs.
     pub async fn open_read_write_pool(&self, path: &Path) -> anyhow::Result<SqlitePool> {
@@ -416,6 +481,31 @@ impl SqliteConfig {
         telemetry_override: Option<&dyn DbTelemetry>,
     ) -> anyhow::Result<SqlitePool> {
         self.prepare_logs_directory(path).await?;
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let is_nfs = if self.local_logs_dir.is_some() && directory == self.logs_home() {
+            self.logs_are_on_nfs().await?
+        } else if directory == self.home() {
+            self.is_nfs().await?
+        } else {
+            probe_nfs(directory, &OnceCell::new()).await?
+        };
+        // Keep the migration lock through pool initialization so another managed startup
+        // cannot open the old inode or initialize a database during cutover.
+        let migration = if self.enforce_delete_on_nfs && is_nfs {
+            Some(nfs::prepare_database(self, path).await?)
+        } else {
+            None
+        };
+        let journal_mode_policy = if migration.is_some() {
+            JournalModePolicy::RequireDelete
+        } else if is_nfs {
+            JournalModePolicy::InitializeDelete
+        } else {
+            JournalModePolicy::InitializeWal
+        };
         let recovery = recover_spec.map_or(RecoveryMode::Unavailable, |spec| spec.recovery);
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -424,7 +514,11 @@ impl SqliteConfig {
             .busy_timeout(DEFAULT_BUSY_TIMEOUT)
             .log_statements(LevelFilter::Off);
         // Each failed attempt closes its pool before initialization is retried.
-        let connect = || async { connect_once(&options).await.map_err(anyhow::Error::from) };
+        let connect = || async {
+            connect_once(&options, journal_mode_policy)
+                .await
+                .map_err(anyhow::Error::from)
+        };
         let pool = retry_on_busy(connect).await?;
         let validation_result = self
             .quick_check_manager
@@ -485,11 +579,15 @@ impl SqliteConfig {
     }
 
     /// Open old logs for cleanup without creating, migrating, or rebuilding the database.
+    /// Skip legacy NFS logs when managed DELETE enforcement is active.
     pub(crate) async fn open_legacy_logs_for_cleanup(&self) -> anyhow::Result<Option<SqlitePool>> {
         let Some(path) = self.legacy_logs_db_path() else {
             return Ok(None);
         };
         if !tokio::fs::try_exists(&path).await? {
+            return Ok(None);
+        }
+        if self.enforce_delete_on_nfs && self.is_nfs().await? {
             return Ok(None);
         }
         let options = SqliteConnectOptions::new()
@@ -516,90 +614,6 @@ impl SqliteConfig {
         }
         Ok(())
     }
-}
-
-async fn connect_once(options: &SqliteConnectOptions) -> Result<SqlitePool, Error> {
-    // SQLx retries after_connect errors, eventually replacing them with PoolTimedOut.
-    // Return the first initialization error directly while opening this pool.
-    let (init_error_tx, mut init_error_rx) = tokio::sync::mpsc::channel(/*buffer*/ 1);
-    let pool_options =
-        SqlitePoolOptions::new()
-            .max_connections(5)
-            .after_connect(move |connection, _metadata| {
-                let init_error_tx = init_error_tx.clone();
-                Box::pin(async move {
-                    let result = async {
-                        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
-                            .fetch_one(&mut *connection)
-                            .await?;
-                        if journal == "delete" {
-                            // If the filesystem honors sync requests, EXTRA syncs the directory
-                            // after SQLite deletes a rollback journal.
-                            sqlx::query("PRAGMA synchronous = EXTRA")
-                                .execute(connection)
-                                .await?;
-                        }
-                        Ok(())
-                    }
-                    .await;
-                    result.map_err(|error| match init_error_tx.try_send(error) {
-                        // The opener owns the original error and cancels connection retries.
-                        Ok(()) => Error::PoolClosed,
-                        // After opening, lazy connections retain SQLx's normal error handling.
-                        Err(error) => error.into_inner(),
-                    })
-                })
-            });
-    let pool = tokio::select! {
-        biased;
-        Some(error) = init_error_rx.recv() => Err(error),
-        result = pool_options.connect_with(options.clone()) => result,
-    }?;
-    // Database settings persist on disk.
-    // Initialize these settings once before callers can use the pool.
-    // Connections that open later need only settings that apply to each connection.
-    let initialized: Result<(), Error> = async {
-        let mut connection = pool.acquire().await?;
-        // Auto-vacuum alone can write a header to disk.
-        // If creation stops before the schema exists, startup must initialize the file.
-        let empty =
-            sqlx::query_scalar::<_, bool>("SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)")
-                .fetch_one(&mut *connection)
-                .await?;
-        if empty {
-            let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
-                .fetch_one(&mut *connection)
-                .await?;
-            if mode == 0 {
-                sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
-                    .execute(&mut *connection)
-                    .await?;
-            }
-            sqlx::query("PRAGMA journal_mode = WAL")
-                .execute(&mut *connection)
-                .await?;
-        }
-        // Another process can initialize WAL after this connection selects EXTRA.
-        // Apply NORMAL to WAL even if that process already created the schema.
-        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
-            .fetch_one(&mut *connection)
-            .await?;
-        if journal == "wal" {
-            sqlx::query("PRAGMA synchronous = NORMAL")
-                .execute(&mut *connection)
-                .await?;
-        }
-        // Wait for the connection to return to the pool before startup requests it again.
-        // An asynchronous drop can otherwise cause the pool to open a second connection.
-        connection.return_to_pool().await;
-        Ok(())
-    }
-    .await;
-    if let Err(error) = initialized {
-        pool.close().await;
-        return Err(error);
-    }
-    Ok(pool)
 }
 
 async fn probe_nfs(home: &Path, probe: &OnceCell<bool>) -> anyhow::Result<bool> {

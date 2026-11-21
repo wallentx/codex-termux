@@ -10,11 +10,12 @@ use codex_app_server_protocol::ThreadDeleteParams;
 use codex_app_server_protocol::ThreadDeleteResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
-use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeResponse;
+use codex_app_server_protocol::ThreadSearchResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
@@ -32,24 +33,16 @@ enum Recovery {
     Corrupt,
 }
 
-#[test_case(ThreadHistoryMode::Legacy, Recovery::Restart; "legacy restart")]
-#[test_case(ThreadHistoryMode::Paginated, Recovery::Restart; "paginated restart")]
-#[test_case(ThreadHistoryMode::Legacy, Recovery::Missing; "legacy missing database")]
-#[test_case(ThreadHistoryMode::Paginated, Recovery::Corrupt; "paginated corrupt database")]
+#[test_case(Recovery::Restart; "paginated restart")]
+#[test_case(Recovery::Missing; "paginated missing database")]
+#[test_case(Recovery::Corrupt; "paginated corrupt database")]
 #[tokio::test]
-async fn saved_attached_thread_upgrade_restart_and_delete(
-    mode: ThreadHistoryMode,
-    recovery: Recovery,
-) -> Result<()> {
+async fn saved_attached_thread_upgrade_restart_and_delete(recovery: Recovery) -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(home.path())?;
     // Both parents were persisted before this app-server (and its SQLite migration) starts.
-    let create_rollout = match mode {
-        ThreadHistoryMode::Legacy => create_fake_rollout,
-        ThreadHistoryMode::Paginated => create_fake_paginated_rollout,
-    };
-    let parent = create_rollout(
+    let parent = create_fake_paginated_rollout(
         home.path(),
         "2025-01-05T12-00-00",
         "2025-01-05T12:00:00Z",
@@ -57,7 +50,7 @@ async fn saved_attached_thread_upgrade_restart_and_delete(
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
-    let other = create_rollout(
+    let other = create_fake_paginated_rollout(
         home.path(),
         "2025-01-06T12-00-00",
         "2025-01-06T12:00:00Z",
@@ -83,6 +76,7 @@ async fn saved_attached_thread_upgrade_restart_and_delete(
         let fork: ThreadForkResponse = mcp.read_response(id).await?;
         assert!(!fork.thread.ephemeral);
         assert_eq!(fork.thread.forked_from_id, Some(parent.clone()));
+        assert_eq!(fork.thread.attached_to_thread_id.as_ref(), Some(&parent));
         children.push(fork.thread.id);
     }
     // Newer attached threads fill the raw scan page. Listing must refill across hidden
@@ -171,6 +165,11 @@ async fn saved_attached_thread_upgrade_restart_and_delete(
     children.sort();
     assert_eq!(found, children);
     let id = mcp
+        .send_raw_request("thread/read", Some(json!({"threadId": children[0]})))
+        .await?;
+    let cold: ThreadReadResponse = mcp.read_response(id).await?;
+    assert_eq!(cold.thread.attached_to_thread_id.as_ref(), Some(&parent));
+    let id = mcp
         .send_raw_request("thread/list", Some(json!({"attachedToThreadId": other})))
         .await?;
     let other_list: ThreadListResponse = mcp.read_response(id).await?;
@@ -179,13 +178,14 @@ async fn saved_attached_thread_upgrade_restart_and_delete(
         .send_raw_request(
             "thread/resume",
             Some(json!({
-                "threadId": children[0], "excludeTurns": true,
+                "threadId": children[0],
                 "developerInstructions": "Follow BIRCH-849."
             })),
         )
         .await?;
     let resumed: ThreadResumeResponse = mcp.read_response(id).await?;
     assert_eq!(resumed.thread.id, children[0]);
+    assert!(resumed.thread.turns.is_empty());
     // Ordinary forks do not inherit attachment.
     let id = mcp
         .send_thread_fork_request(ThreadForkParams {
@@ -194,6 +194,7 @@ async fn saved_attached_thread_upgrade_restart_and_delete(
         })
         .await?;
     let independent: ThreadForkResponse = mcp.read_response(id).await?;
+    assert_eq!(independent.thread.attached_to_thread_id, None);
     let id = mcp
         .send_raw_request(
             "thread/list",
@@ -212,13 +213,13 @@ async fn saved_attached_thread_upgrade_restart_and_delete(
         .send_turn_start_request(TurnStartParams {
             thread_id: children[0].clone(),
             input: vec![UserInput::Text {
-                text: "continue".into(),
+                text: "continue the chartreuse calculation".into(),
                 text_elements: vec![],
             }],
             ..Default::default()
         })
         .await?;
-    let _: TurnStartResponse = mcp.read_response(id).await?;
+    let started: TurnStartResponse = mcp.read_response(id).await?;
     mcp.read_stream_until_notification_message("turn/completed")
         .await?;
     let requests = server.received_requests().await.expect("response requests");
@@ -232,6 +233,55 @@ async fn saved_attached_thread_upgrade_restart_and_delete(
         input.contains("BIRCH-849"),
         "resume applies client instructions"
     );
+    assert!(
+        input.contains("BLUE HERON 72"),
+        "model recalls the parent after restart"
+    );
+    let id = mcp
+        .send_raw_request(
+            "thread/read",
+            Some(json!({"threadId": children[0], "includeTurns": true})),
+        )
+        .await?;
+    let read: ThreadReadResponse = mcp.read_response(id).await?;
+    let id = mcp
+        .send_raw_request(
+            "thread/name/set",
+            Some(json!({
+                "threadId": children[0], "name": "chartreuse calculation"
+            })),
+        )
+        .await?;
+    let _: serde_json::Value = mcp.read_response(id).await?;
+    for include in [false, true] {
+        let params =
+            json!({"searchTerm": "chartreuse calculation", "includeAttachedThreads": include});
+        let id = mcp
+            .send_raw_request("thread/list", Some(params.clone()))
+            .await?;
+        let by_title: ThreadListResponse = mcp.read_response(id).await?;
+        let id = mcp.send_raw_request("thread/search", Some(params)).await?;
+        let by_content: ThreadSearchResponse = mcp.read_response(id).await?;
+        for results in [
+            by_title.data,
+            by_content.data.into_iter().map(|hit| hit.thread).collect(),
+        ] {
+            let destinations = results
+                .into_iter()
+                .map(|thread| (thread.id, thread.attached_to_thread_id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                destinations,
+                if include {
+                    vec![(children[0].clone(), Some(parent.clone()))]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+    assert_eq!(read.thread.turns.len(), 1);
+    assert_eq!(read.thread.turns[0].id, started.turn.id);
     let id = mcp
         .send_raw_request("thread/resume", Some(json!({"threadId": parent})))
         .await?;
@@ -296,6 +346,11 @@ async fn saved_attached_thread_rejects_conflicting_fork_and_discovery_filters() 
         .build_initialized()
         .await?;
     for (method, params, message) in [
+        (
+            "thread/fork",
+            json!({"threadId": parent, "attachToSource": true}),
+            "attachToSource requires a paginated parent",
+        ),
         (
             "thread/fork",
             json!({"threadId": parent, "attachToSource": true, "ephemeral": true}),

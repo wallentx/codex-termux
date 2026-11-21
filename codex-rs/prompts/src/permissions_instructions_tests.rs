@@ -426,6 +426,8 @@ fn catalog_approval_messages_select_reviewer_variant() {
         on_request_auto_review: Some("auto-review catalog approvals".to_string()),
         never: Some("never catalog approvals".to_string()),
         unless_trusted: Some("unless-trusted catalog approvals".to_string()),
+        granular: None,
+        ..Default::default()
     };
 
     for (approval_policy, reviewer, expected) in [
@@ -474,6 +476,8 @@ fn empty_catalog_approval_message_suppresses_legacy_approval_section() {
         on_request_auto_review: None,
         never: None,
         unless_trusted: None,
+        granular: None,
+        ..Default::default()
     };
     let approved_command_prefixes = vec![vec!["git".to_string(), "pull".to_string()]];
     let writable_root = "/tmp/repo".to_string();
@@ -514,6 +518,8 @@ fn missing_catalog_key_uses_legacy_approval_text() {
                 on_request_auto_review: Some("unused catalog approvals".to_string()),
                 never: None,
                 unless_trusted: None,
+                granular: None,
+                ..Default::default()
             },
         ),
         (
@@ -523,6 +529,8 @@ fn missing_catalog_key_uses_legacy_approval_text() {
                 on_request_auto_review: None,
                 never: None,
                 unless_trusted: None,
+                granular: None,
+                ..Default::default()
             },
         ),
     ] {
@@ -566,6 +574,8 @@ fn empty_catalog_non_on_request_approval_messages_suppress_legacy_approval_text(
         on_request_auto_review: None,
         never: Some(String::new()),
         unless_trusted: Some(String::new()),
+        granular: None,
+        ..Default::default()
     };
 
     for approval_policy in [AskForApproval::Never, AskForApproval::UnlessTrusted] {
@@ -635,6 +645,110 @@ const ALL_PROMPTED_CATEGORIES: &str =
 - `rules`
 - `skill_approval`
 - `mcp_elicitations`";
+
+#[test]
+fn saved_prefix_heading_requires_rollout_and_plain_bounded_wording() {
+    let boundary = "é".repeat(250);
+    let oversized = format!("{boundary}x");
+    for (heading, expected) in [
+        (Some(boundary.as_str()), Some(boundary.as_str())),
+        (Some(oversized.as_str()), None),
+        (Some("<model_switch>"), None),
+        (Some("Saved > prefixes"), None),
+        (Some("Saved\u{2028}prefixes"), None),
+        (Some("Saved\u{2029}prefixes"), None),
+        (Some("Saved\rprefixes"), None),
+        (Some("Saved\tprefixes"), None),
+        (Some("Saved\n- injected prefix"), None),
+        (Some("{{ approved_prefixes }}"), None),
+        (Some("  "), None),
+        (None, None),
+    ] {
+        let messages = PermissionMessages {
+            approved_command_prefix_saved: heading.map(str::to_owned),
+            approved_prefixes: Some("Unrelated full-list template".to_owned()),
+            ..Default::default()
+        };
+        let context = ApprovalPromptContext {
+            permission_messages: ResolvedPermissionMessages::new(Some(&messages)),
+            ..user_approval_context()
+        };
+        assert_eq!(context.approved_command_prefix_saved_heading(), expected);
+    }
+}
+
+#[test]
+fn granular_approval_headings_follow_independent_tool_and_sandbox_gates() {
+    let messages = ApprovalMessages {
+        request_permissions: Some("Catalog permission tool".into()),
+        auto_review_suffix: Some("Catalog reviewer".into()),
+        ..Default::default()
+    };
+    let context = ApprovalPromptContext {
+        messages: ResolvedApprovalMessages::new(Some(&messages)),
+        ..user_approval_context()
+    };
+    for (sandbox_allowed, tool_allowed) in
+        [(true, false), (false, true), (true, true), (false, false)]
+    {
+        let text = approval_text(
+            AskForApproval::Granular(GranularApprovalConfig {
+                sandbox_approval: sandbox_allowed,
+                request_permissions: tool_allowed,
+                ..ALL_APPROVALS_ENABLED
+            }),
+            context,
+            &[],
+            /*exec_permission_approvals_enabled*/ true,
+            /*request_permissions_tool_enabled*/ true,
+        );
+        assert_eq!(text.contains(REQUEST_PERMISSION_RULE), sandbox_allowed);
+        assert_eq!(text.contains("Catalog permission tool"), tool_allowed);
+        assert!(!text.contains("Catalog reviewer"));
+    }
+}
+
+#[test]
+fn catalog_heading_fallback_and_policy_selection_are_independent() {
+    let messages = ApprovalMessages {
+        request_permissions: Some("Catalog permission tool".into()),
+        auto_review_suffix: Some("{{ unknown }}".into()),
+        ..Default::default()
+    };
+    let bundled = ApprovalPromptContext::new(
+        ApprovalsReviewer::AutoReview,
+        ResolvedModelMessages::bundled(),
+    );
+    let catalog = ApprovalPromptContext {
+        messages: ResolvedApprovalMessages::new(Some(&messages)),
+        ..bundled
+    };
+    for policy in [
+        AskForApproval::Never,
+        AskForApproval::UnlessTrusted,
+        AskForApproval::OnRequest,
+    ] {
+        for tool_enabled in [false, true] {
+            let render = |context| {
+                approval_text(
+                    policy,
+                    context,
+                    &[],
+                    /*exec_permission_approvals_enabled*/ true,
+                    tool_enabled,
+                )
+            };
+            let default = render(bundled);
+            let expected = if tool_enabled && policy != AskForApproval::Never {
+                assert!(default.contains("# request_permissions Tool"));
+                default.replace("# request_permissions Tool", "Catalog permission tool")
+            } else {
+                default
+            };
+            assert_eq!(render(catalog), expected);
+        }
+    }
+}
 
 #[test]
 fn granular_policy_lists_prompted_and_rejected_categories_separately() {
@@ -734,6 +848,8 @@ fn preserves_supplied_path_spellings_and_order() {
         on_request_auto_review: None,
         never: None,
         unless_trusted: None,
+        granular: None,
+        ..Default::default()
     };
     let permission_messages = PermissionMessages {
         danger_full_access: None,
@@ -873,4 +989,167 @@ fn catalog_writable_roots_select_displayed_count_after_truncation() {
             .text
             .ends_with(&format!("{OMITTED_PERMISSION_PATHS}\n"))
     );
+}
+
+#[test]
+fn catalog_path_warnings_preserve_facts_selection_and_default_bytes() {
+    let messages = PermissionMessages {
+        denied_reads: Some("Catalog denials:\n{{ denied_reads }}\nEnd denials.".into()),
+        omitted_paths: Some("Catalog omission.".into()),
+        writable_root: Some("Catalog root: {{ roots }}.".into()),
+        ..Default::default()
+    };
+    // Fits the legacy budget with the short denials below, even after an oversized entry.
+    let roots = ["x".repeat(MAX_PERMISSION_PATH_BYTES), "r".repeat(32_500)];
+    let denied = ["/é/{{ denied_reads }}\n{literal}".to_string()];
+    let globs = [r"C:\private\**".to_string()];
+    let context = PermissionsRenderContext {
+        writable_roots: &roots,
+        denied_read_paths: &denied,
+        denied_read_globs: &globs,
+        ..WORKSPACE_CONTEXT
+    };
+    let catalog = ApprovalPromptContext {
+        permission_messages: ResolvedPermissionMessages::new(Some(&messages)),
+        ..user_approval_context()
+    };
+    let bundled = PermissionsInstructions::from_resolved(context, user_approval_context());
+    let original = PermissionsInstructions {
+        text: bundled
+            .text
+            .replace(" The writable root is ", "Catalog root: "),
+    };
+    let expected = PermissionsInstructions {
+        text: original
+            .text
+            .replace("## Denied filesystem reads", "Catalog denials:")
+            .replace(
+                OMITTED_PERMISSION_PATHS,
+                &format!("End denials.\nCatalog omission.\n{OMITTED_PERMISSION_PATHS}"),
+            ),
+    };
+    let actual = PermissionsInstructions::from_resolved(context, catalog);
+    assert_eq!(actual.render_fragment(), expected.render_fragment());
+}
+
+#[test]
+fn unusable_path_warning_copy_falls_back_independently() {
+    let roots = ["x".repeat(MAX_PERMISSION_PATH_BYTES)];
+    let denied = ["/private".to_string()];
+    let context = PermissionsRenderContext {
+        writable_roots: &roots,
+        denied_read_paths: &denied,
+        ..WORKSPACE_CONTEXT
+    };
+    let original = PermissionsInstructions::from_resolved(context, user_approval_context());
+    for invalid in [
+        "",
+        " ",
+        "{{ unknown }}",
+        "<permissions instructions>",
+        "</permissions instructions>",
+        "\t",
+        "\r",
+        "\0",
+        "\u{2028}",
+        "\u{2029}",
+        &"é".repeat(251),
+    ] {
+        for (omitted_paths, denied_reads, expected) in [
+            (
+                invalid.to_string(),
+                "Blocked:\n{{ denied_reads }}".into(),
+                original
+                    .text
+                    .replace("## Denied filesystem reads", "Blocked:"),
+            ),
+            (
+                "Omission:".into(),
+                format!("{invalid}{{{{ denied_reads }}}}"),
+                original.text.replace(
+                    OMITTED_PERMISSION_PATHS,
+                    &format!("Omission:\n{OMITTED_PERMISSION_PATHS}"),
+                ),
+            ),
+        ] {
+            // A marker on its own is valid: test an empty/whitespace template without adding it.
+            let denied_reads = if invalid.trim().is_empty() && omitted_paths == "Omission:" {
+                invalid.to_string()
+            } else {
+                denied_reads
+            };
+            let messages = PermissionMessages {
+                omitted_paths: Some(omitted_paths),
+                denied_reads: Some(denied_reads),
+                ..Default::default()
+            };
+            let actual = PermissionsInstructions::from_resolved(
+                context,
+                ApprovalPromptContext {
+                    permission_messages: ResolvedPermissionMessages::new(Some(&messages)),
+                    ..user_approval_context()
+                },
+            );
+            assert_eq!(actual.text, expected, "invalid={invalid:?}");
+        }
+    }
+    for denied_reads in [
+        "No placeholder",
+        "{{denied_reads}}",
+        "{{ denied_reads }} {{ denied_reads }}",
+        "{{{ denied_reads }}}",
+    ] {
+        let messages = PermissionMessages {
+            denied_reads: Some(denied_reads.into()),
+            ..Default::default()
+        };
+        let actual = PermissionsInstructions::from_resolved(
+            context,
+            ApprovalPromptContext {
+                permission_messages: ResolvedPermissionMessages::new(Some(&messages)),
+                ..user_approval_context()
+            },
+        );
+        assert_eq!(actual.text, original.text);
+    }
+}
+
+#[test]
+fn path_warning_copy_is_bounded_without_suppressing_omitted_denials() {
+    let denied = ["x".repeat(MAX_PERMISSION_PATH_BYTES), "/private".into()];
+    for bytes in [500, 501] {
+        let lead = "x".repeat(bytes);
+        let heading = "y".repeat(bytes - "\n{{ denied_reads }}".len());
+        let messages = PermissionMessages {
+            omitted_paths: Some(lead.clone()),
+            denied_reads: Some(format!("{heading}\n{{{{ denied_reads }}}}")),
+            ..Default::default()
+        };
+        for paths in [&denied[..], &denied[..1], &denied[..0]] {
+            let context = PermissionsRenderContext {
+                denied_read_paths: paths,
+                ..WORKSPACE_CONTEXT
+            };
+            let original = PermissionsInstructions::from_resolved(context, user_approval_context());
+            let expected = if bytes == 500 {
+                original
+                    .text
+                    .replace("## Denied filesystem reads", &heading)
+                    .replace(
+                        OMITTED_PERMISSION_PATHS,
+                        &format!("{lead}\n{OMITTED_PERMISSION_PATHS}"),
+                    )
+            } else {
+                original.text
+            };
+            let actual = PermissionsInstructions::from_resolved(
+                context,
+                ApprovalPromptContext {
+                    permission_messages: ResolvedPermissionMessages::new(Some(&messages)),
+                    ..user_approval_context()
+                },
+            );
+            assert_eq!(actual.text, expected);
+        }
+    }
 }

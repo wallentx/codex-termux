@@ -1,5 +1,6 @@
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::config::ConfigBuilder;
@@ -285,10 +286,11 @@ fn summarizes_managed_read_only_permission_profile() {
 }
 
 #[tokio::test]
-async fn config_summary_entries_include_runtime_workspace_roots() {
+async fn config_summary_entries_include_only_writable_workspace_roots() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let cwd = tempfile::tempdir().expect("create cwd");
     let extra_root = tempfile::tempdir().expect("create extra root");
+    let read_only_root = tempfile::tempdir().expect("create read-only root");
     let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(cwd.path().to_path_buf()))
@@ -297,23 +299,21 @@ async fn config_summary_entries_include_runtime_workspace_roots() {
         .expect("build default config");
     let cwd = cwd.path().to_path_buf().abs();
     let extra_root = extra_root.path().to_path_buf().abs();
-    let expected_extra_root_name = extra_root
-        .file_name()
-        .expect("extra root should have file name")
-        .to_string_lossy()
-        .to_string();
+    let read_only_root = read_only_root.path().to_path_buf().abs();
     config.cwd = cwd.clone();
-    config.workspace_roots = vec![cwd.clone(), extra_root];
+    config.workspace_roots = vec![cwd.clone(), read_only_root.clone(), extra_root.clone()];
     config
         .permissions
         .set_workspace_roots(config.workspace_roots.clone());
     config
         .permissions
-        .set_permission_profile(PermissionProfile::workspace_write_with(
-            &[],
+        .set_permission_profile(PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry::new(cwd.clone().into(), FileSystemAccessMode::Write),
+                FileSystemSandboxEntry::new(read_only_root.into(), FileSystemAccessMode::Read),
+                FileSystemSandboxEntry::new(extra_root.clone().into(), FileSystemAccessMode::Write),
+            ]),
             NetworkSandboxPolicy::Restricted,
-            /*exclude_tmpdir_env_var*/ true,
-            /*exclude_slash_tmp*/ true,
         ))
         .expect("set permission profile");
 
@@ -337,22 +337,25 @@ async fn config_summary_entries_include_runtime_workspace_roots() {
         rollout_path: None,
     };
 
-    let summary_entries = config_summary_entries(&config, &session_configured_event);
+    let summary_entries = config_summary_entries(
+        &config,
+        &session_configured_event,
+        &config.effective_workspace_roots(),
+    );
     let sandbox_summary = summary_entries
         .iter()
         .find_map(|(key, value)| (*key == "sandbox").then_some(value))
         .expect("sandbox summary entry");
-    assert!(
-        sandbox_summary.starts_with("workspace-write [workdir, ")
-            && sandbox_summary.contains(&expected_extra_root_name),
-        "expected runtime workspace root in sandbox summary: {summary_entries:?}"
-    );
+    let sandbox_summary =
+        sandbox_summary.replace(extra_root.to_string_lossy().as_ref(), "<extra root>");
+    insta::assert_snapshot!(sandbox_summary, @"workspace-write [workdir, <extra root>]");
 }
 
 #[test]
 fn final_message_from_turn_items_uses_latest_agent_message() {
     let message = final_message_from_turn_items(&[
-        ThreadItem::AgentMessage {
+        ThreadItemPayload::AgentMessage {
+            moderation: None,
             id: "msg-1".to_string(),
             text: "first".to_string(),
             phase: None,
@@ -360,11 +363,12 @@ fn final_message_from_turn_items_uses_latest_agent_message() {
             delivery: None,
             questions: None,
         },
-        ThreadItem::Plan {
+        ThreadItemPayload::Plan {
             id: "plan-1".to_string(),
             text: "plan".to_string(),
         },
-        ThreadItem::AgentMessage {
+        ThreadItemPayload::AgentMessage {
+            moderation: None,
             id: "msg-2".to_string(),
             text: "second".to_string(),
             phase: None,
@@ -380,16 +384,16 @@ fn final_message_from_turn_items_uses_latest_agent_message() {
 #[test]
 fn final_message_from_turn_items_falls_back_to_latest_plan() {
     let message = final_message_from_turn_items(&[
-        ThreadItem::Reasoning {
+        ThreadItemPayload::Reasoning {
             id: "reasoning-1".to_string(),
             summary: vec!["inspect".to_string()],
             content: Vec::new(),
         },
-        ThreadItem::Plan {
+        ThreadItemPayload::Plan {
             id: "plan-1".to_string(),
             text: "first plan".to_string(),
         },
-        ThreadItem::Plan {
+        ThreadItemPayload::Plan {
             id: "plan-2".to_string(),
             text: "final plan".to_string(),
         },
@@ -426,14 +430,15 @@ fn turn_completed_recovers_final_message_from_turn_items() {
                 id: "turn-1".to_string(),
                 root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: vec![ThreadItem::AgentMessage {
+                items: vec![ThreadItem::untimed(ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "msg-1".to_string(),
                     text: "final answer".to_string(),
                     phase: None,
                     memory_citation: None,
                     delivery: None,
                     questions: None,
-                }],
+                })],
                 status: TurnStatus::Completed,
                 error: None,
                 started_at: None,
@@ -478,14 +483,15 @@ fn turn_completed_overwrites_stale_final_message_from_turn_items() {
                 id: "turn-1".to_string(),
                 root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: vec![ThreadItem::AgentMessage {
+                items: vec![ThreadItem::untimed(ThreadItemPayload::AgentMessage {
+                    moderation: None,
                     id: "msg-1".to_string(),
                     text: "final answer".to_string(),
                     phase: None,
                     memory_citation: None,
                     delivery: None,
                     questions: None,
-                }],
+                })],
                 status: TurnStatus::Completed,
                 error: None,
                 started_at: None,

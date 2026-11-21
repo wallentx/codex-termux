@@ -28,14 +28,81 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 use super::client::ProviderAuthCommandFixture;
 
-#[test_case("gpt-6.1-sol"; "sol")]
-#[test_case("gpt-6.1-terra"; "terra")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vertex_credential_file_is_retained_when_refreshing_after_401() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let auth_fixture = ProviderAuthCommandFixture::new(&["first-token", "second-token"])?;
+    let auth = auth_fixture.auth();
+    let credential_file = auth.cwd.join("adc.json").into_path_buf();
+    let credential_log = auth.cwd.join("credential-env.txt");
+    let inherited_credential_file = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS");
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer first-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let response = responses::mount_sse_once_match(
+        &server,
+        header("authorization", "Bearer second-token"),
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let mut provider = ModelProviderInfo::create_gcp_provider();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.auth = Some(auth);
+    provider.credential_file = Some(credential_file.clone());
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider_id = GCP_PROVIDER_ID.to_string();
+            config.model_provider = provider;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("say hello").await?;
+
+    assert_eq!(
+        response.single_request().header("authorization").as_deref(),
+        Some("Bearer second-token"),
+    );
+    let observed = std::fs::read_to_string(credential_log)?;
+    let expected = credential_file.to_string_lossy();
+    assert_eq!(
+        observed.lines().collect::<Vec<_>>(),
+        vec![expected.as_ref(); 2]
+    );
+    assert_eq!(
+        std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS"),
+        inherited_credential_file,
+    );
+    Ok(())
+}
+
+#[test_case("gpt-6.1-sol", false; "sol")]
+#[test_case("gpt-6.1-terra", false; "terra")]
+#[test_case("gpt-6.2-astra", false; "astra_62")]
+#[test_case("gpt-6.2-sol", false; "sol_62")]
+#[test_case("gpt-6.1-sol", true; "sol_incremental")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vertex_requests_use_command_auth_with_namespaces_and_tool_search(
     model: &str,
+    incremental_tools: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -69,6 +136,14 @@ async fn vertex_requests_use_command_auth_with_namespaces_and_tool_search(
             config.model_provider_id = GCP_PROVIDER_ID.to_string();
             config.model_provider = provider;
             config.base_instructions = Some("Vertex test instructions".to_string());
+            config
+                .features
+                .set_enabled(Feature::IncrementalToolsLegacyGcp, incremental_tools)
+                .expect("configure incremental tools on Vertex");
+            config
+                .features
+                .set_enabled(Feature::IncrementalToolsLegacy, !incremental_tools)
+                .expect("configure independent Bedrock flag");
         })
         .build_with_auto_env(&server)
         .await?;
@@ -120,16 +195,22 @@ async fn vertex_requests_use_command_auth_with_namespaces_and_tool_search(
         request.header("x-openai-internal-codex-responses-lite"),
         None
     );
-    assert!(
-        request.inputs_of_type("additional_tools").is_empty(),
-        "Vertex request must omit Responses Lite additional_tools inputs"
-    );
+    let additional_tools = request.inputs_of_type("additional_tools");
+    assert_eq!(additional_tools.len(), usize::from(incremental_tools));
     let body = request.body_json();
     assert_eq!(body["model"], model);
     assert_eq!(request.instructions_text(), "Vertex test instructions");
-    let tools = body["tools"]
+    let top_level_tools = body["tools"]
         .as_array()
         .context("Vertex request should include model tools")?;
+    let tools = if incremental_tools {
+        assert!(top_level_tools.is_empty());
+        additional_tools[0]["tools"]
+            .as_array()
+            .context("Vertex request should include incremental model tools")?
+    } else {
+        top_level_tools
+    };
     assert_eq!(
         test.codex.multi_agent_version(),
         Some(MultiAgentVersion::V2)
@@ -158,9 +239,14 @@ async fn vertex_requests_use_command_auth_with_namespaces_and_tool_search(
         "Vertex request should expose client-side tool search: {tools:?}"
     );
     assert!(
-        tools
-            .iter()
-            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("exec_command")),
+        if incremental_tools {
+            responses::namespace_child_tool(&additional_tools[0], "functions", "exec_command")
+                .is_some()
+        } else {
+            tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some("exec_command"))
+        },
         "Vertex request should preserve the exec_command function tool: {tools:?}"
     );
 

@@ -4,14 +4,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio::sync::Mutex as AsyncMutex;
 
 use codex_exec_server::EnvironmentAccessKey;
 use codex_extension_api::CatalogRefreshBackoff;
-use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionMetrics;
 use codex_mcp::McpResourceClient;
-use codex_mcp::McpResourceClientAuthKey;
 
 use crate::SkillsExtensionConfig;
 use crate::aliases::SkillAliasState;
@@ -22,6 +19,7 @@ use crate::catalog::SkillProviderError;
 use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillSourceKind;
+use crate::catalog_observability::record_catalog;
 use crate::catalog_state::CachedExecutorCatalog;
 use crate::catalog_state::CachedExecutorDiscoveryCatalog;
 use crate::catalog_state::CachedExecutorV2Catalog;
@@ -48,16 +46,12 @@ pub(crate) struct SkillsSessionState {
     pub(crate) extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
 }
 
-/// Auth scope of the latest catalog accepted for this turn.
-pub(crate) struct LatestCloudSkillsAuth(Option<McpResourceClientAuthKey>);
-
 /// Thread-owned skill configuration and caches; consumers can only read catalog snapshots.
 pub struct SkillsThreadState {
-    /// Serializes discovery; true only when the last refresh published successfully.
-    cloud_refresh_lock: AsyncMutex<bool>,
     config: Mutex<SkillsExtensionConfig>,
     cloud_skills_available: bool,
     catalog_state: Mutex<SkillCatalogState>,
+    extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
     aliases: SkillAliasState,
     shadow_selection_turn: Mutex<Option<ShadowSelectionTurn>>,
     pub(crate) executor_read_snapshot: Mutex<Option<ExecutorReadSnapshot>>,
@@ -65,13 +59,24 @@ pub struct SkillsThreadState {
     pub(crate) shadow_task_context: Arc<ShadowTaskContext>,
 }
 
+struct CloudSkillRefreshError {
+    error: SkillProviderError,
+    /// Cooldown for the step caller to store after a current-generation failure.
+    /// Superseded attempts return `None`, allowing the next step to retry immediately.
+    retry_backoff: Option<CatalogRefreshBackoff>,
+}
+
 impl SkillsThreadState {
-    pub(crate) fn new(config: SkillsExtensionConfig, cloud_skills_available: bool) -> Self {
+    pub(crate) fn new(
+        config: SkillsExtensionConfig,
+        cloud_skills_available: bool,
+        extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
+    ) -> Self {
         Self {
-            cloud_refresh_lock: AsyncMutex::new(false),
             config: Mutex::new(config),
             cloud_skills_available,
             catalog_state: Mutex::new(SkillCatalogState::default()),
+            extension_metrics,
             aliases: SkillAliasState::default(),
             shadow_selection_turn: Mutex::new(None),
             executor_read_snapshot: Mutex::new(None),
@@ -140,22 +145,36 @@ impl SkillsThreadState {
     pub(crate) async fn refresh_executor_catalog(
         &self,
         providers: &SkillProviders,
-        query: SkillListQuery,
+        query: SkillListQuery<'_>,
     ) -> SkillCatalog {
         if let Some(snapshots) = &query.executor_capability_discovery_v2 {
             let snapshots = snapshots.clone();
-            let cached = self
-                .catalog_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .executor_v2_cache
-                .as_ref()
-                .filter(|cached| cached.matches(&snapshots))
-                .map(|cached| cached.catalog.clone());
+            let (cached, already_observed) = {
+                let state = self
+                    .catalog_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let cached = state.executor_v2_cache.as_ref();
+                let already_observed =
+                    cached.is_some_and(|cached| cached.same_discovery(&snapshots));
+                (
+                    cached
+                        .filter(|_| {
+                            already_observed
+                                && snapshots.iter().all(|snapshot| snapshot.result.is_ok())
+                        })
+                        .map(|cached| cached.catalog.clone()),
+                    already_observed,
+                )
+            };
             match cached {
                 Some(catalog) => catalog,
                 None => {
                     let catalog = providers.list_executor_for_turn(query).await;
+                    // Failed snapshots are rebuilt for callers, but each is still one observation.
+                    if !already_observed {
+                        record_catalog(self.extension_metrics.as_deref(), "executor", &catalog);
+                    }
                     self.catalog_state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -183,7 +202,11 @@ impl SkillsThreadState {
 
             let key = ExecutorCatalogCacheKey {
                 turn_id: query.turn_id.clone(),
-                resolved_roots: query.resolved_executor_roots.clone(),
+                roots: query
+                    .executor_roots
+                    .iter()
+                    .map(|root| (root.root.clone(), root.fs.cache_key()))
+                    .collect(),
                 include_bundled_skills: query.include_bundled_skills,
             };
             let catalog = if query.executor_roots.is_empty() {
@@ -191,6 +214,7 @@ impl SkillsThreadState {
             } else {
                 providers.list_executor_for_turn(query).await
             };
+            record_catalog(self.extension_metrics.as_deref(), "executor", &catalog);
             self.catalog_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -206,7 +230,7 @@ impl SkillsThreadState {
     async fn executor_discovery_catalog_snapshot(
         &self,
         providers: &SkillProviders,
-        query: SkillListQuery,
+        query: SkillListQuery<'_>,
     ) -> SkillCatalog {
         let discovery = query.executor_capability_discovery.clone();
         let discovery_failed = discovery.as_ref().is_some_and(|discovery| {
@@ -217,27 +241,26 @@ impl SkillsThreadState {
                     .is_none_or(|discovered| discovered.error.is_some())
             })
         });
-        if !discovery_failed
-            && let Some(cached) = self
+        let already_observed = {
+            let state = self
                 .catalog_state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cached = state
                 .executor_discovery_cache
                 .as_ref()
-                .filter(|cached| {
-                    cached.matches(
-                        &query.executor_roots,
-                        discovery.as_ref(),
-                        query.include_bundled_skills,
-                    )
-                })
-        {
-            return cached.catalog.clone();
-        }
+                .filter(|cached| cached.matches(discovery.as_ref(), query.include_bundled_skills));
+            if !discovery_failed && let Some(cached) = cached {
+                return cached.catalog.clone();
+            }
+            cached.is_some()
+        };
 
-        let roots = query.executor_roots.clone();
         let include_bundled_skills = query.include_bundled_skills;
         let discovered = providers.list_executor_for_turn(query).await;
+        if !already_observed {
+            record_catalog(self.extension_metrics.as_deref(), "executor", &discovered);
+        }
         let mut state = self
             .catalog_state
             .lock()
@@ -245,7 +268,6 @@ impl SkillsThreadState {
         // Failed discovery is returned to this caller but is never reused by another request.
         state.executor_discovery_cache =
             discovery.map(|discovery| CachedExecutorDiscoveryCatalog {
-                roots,
                 discovery,
                 include_bundled_skills,
                 catalog: discovered.clone(),
@@ -265,23 +287,82 @@ impl SkillsThreadState {
             .and_then(|cache| cache.catalog.clone())
     }
 
-    /// Reuses discovery within a turn; backs off failures.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "cloud discovery must remain serialized through fetching and catalog publication"
-    )]
-    #[tracing::instrument(name = "skills.cloud.refresh_cloud_catalog", level = "info", skip_all)]
+    /// Checks freshness and backoff before using the shared cloud refresh path.
+    pub(crate) async fn refresh_cloud_catalog_for_step(
+        &self,
+        providers: &SkillProviders,
+        query: SkillListQuery<'_>,
+    ) -> SkillProviderResult<()> {
+        {
+            let config = self
+                .config
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !config.cloud_skill_enabled || !self.cloud_skills_available {
+                return Ok(());
+            }
+            let mut catalogs = self
+                .catalog_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cache = catalogs.prepare_cloud_generation(
+                providers.cloud_mcp_resources(query.mcp_resources.as_deref()),
+            );
+            let resource_cache_key = cache.current_resource_cache_key();
+            if cache.is_auth_current()
+                && cache
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|catalog| !catalog.is_partial && catalog.warnings.is_empty())
+                && cache.resource_cache_key == resource_cache_key
+            {
+                catalogs.cloud_retry = None;
+                return Ok(());
+            }
+            if catalogs.cloud_retry.as_ref().is_some_and(|retry| {
+                retry.is_pending(cache.auth_cache_key.as_ref(), resource_cache_key.as_ref())
+            }) {
+                return Ok(());
+            }
+        }
+        match self.discover_cloud_catalog(providers, query).await {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let Some(retry_backoff) = failure.retry_backoff else {
+                    // A superseded attempt can be retried on the next step.
+                    return Ok(());
+                };
+                self.catalog_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .cloud_retry = Some(retry_backoff);
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Explicit requests bypass cache reuse and leave failures retryable on the next step.
     pub(crate) async fn refresh_cloud_catalog(
         &self,
         providers: &SkillProviders,
-        query: SkillListQuery,
-        turn_store: &ExtensionData,
+        query: SkillListQuery<'_>,
     ) -> SkillProviderResult<()> {
-        // Wait without holding config/catalog state or the MCP runtime permit.
-        let (mut refresh_succeeded, waited) = match self.cloud_refresh_lock.try_lock() {
-            Ok(guard) => (guard, false),
-            Err(_) => (self.cloud_refresh_lock.lock().await, true),
-        };
+        self.catalog_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cloud_retry = None;
+        self.discover_cloud_catalog(providers, query)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Fetches and publishes one catalog; Core serializes discovery and step snapshots.
+    #[tracing::instrument(name = "skills.cloud.refresh_cloud_catalog", level = "info", skip_all)]
+    async fn discover_cloud_catalog(
+        &self,
+        providers: &SkillProviders,
+        query: SkillListQuery<'_>,
+    ) -> Result<(), CloudSkillRefreshError> {
         let (cache, resource_cache_key) = {
             let config = self
                 .config
@@ -294,38 +375,10 @@ impl SkillsThreadState {
                 .catalog_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Check this turn's discovery using the provider's auth scope.
             let cache = catalogs.prepare_cloud_generation(
                 providers.cloud_mcp_resources(query.mcp_resources.as_deref()),
             );
-            if cache.is_auth_current()
-                && cache.catalog.is_some()
-                && turn_store
-                    .get::<LatestCloudSkillsAuth>()
-                    .is_some_and(|previous| previous.0 == cache.auth_cache_key)
-            {
-                return Ok(());
-            }
             let resource_cache_key = cache.current_resource_cache_key();
-            if catalogs.cloud_retry.as_ref().is_some_and(|retry| {
-                retry.is_pending(cache.auth_cache_key.as_ref(), resource_cache_key.as_ref())
-            }) {
-                return Ok(());
-            }
-            turn_store.remove::<LatestCloudSkillsAuth>();
-            if cache.is_auth_current()
-                && cache.catalog.as_ref().is_some_and(|catalog| {
-                    (waited && *refresh_succeeded)
-                        || (!catalog.is_partial && catalog.warnings.is_empty())
-                })
-                && cache.resource_cache_key == resource_cache_key
-            {
-                catalogs.cloud_retry = None;
-                turn_store.insert(LatestCloudSkillsAuth(cache.auth_cache_key.clone()));
-                return Ok(());
-            }
-            // Waiting callers must not reuse a failed or cancelled refresh.
-            *refresh_succeeded = false;
             (cache, resource_cache_key)
         };
         let mut result = providers.list_cloud_for_turn(query).await;
@@ -343,41 +396,42 @@ impl SkillsThreadState {
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &cache))
         {
-            // Ignore superseded results, including errors.
-            return Ok(());
+            return Err(CloudSkillRefreshError {
+                error: SkillProviderError::new("cloud skill discovery was superseded"),
+                retry_backoff: None,
+            });
         }
-        let mut catalog = match result {
+        let catalog = match result {
             Ok(catalog) => catalog,
             Err(error) => {
-                catalogs.cloud_retry = Some(CatalogRefreshBackoff::after_failure(
-                    cache.auth_cache_key.clone(),
-                    resource_cache_key,
-                    catalogs.cloud_retry.as_ref(),
-                ));
-                return Err(error);
+                return Err(CloudSkillRefreshError {
+                    error,
+                    retry_backoff: Some(CatalogRefreshBackoff::after_failure(
+                        cache.auth_cache_key.clone(),
+                        resource_cache_key,
+                        catalogs.cloud_retry.as_ref(),
+                    )),
+                });
             }
         };
-        catalogs.cloud_retry = None;
-        if catalog.is_partial
-            && let Some(previous) = cache
-                .catalog
-                .as_ref()
-                .filter(|previous| !previous.is_partial)
-        {
-            catalog = previous.clone();
-            catalog.is_partial = true;
+        catalogs.cloud_retry = if catalog.is_partial || !catalog.warnings.is_empty() {
+            Some(CatalogRefreshBackoff::after_failure(
+                cache.auth_cache_key.clone(),
+                resource_cache_key.clone(),
+                catalogs.cloud_retry.as_ref(),
+            ))
         } else {
-            catalogs.cloud_resources = CloudResourceCache::default();
-        }
+            None
+        };
+        catalogs.cloud_resources = CloudResourceCache::default();
+        record_catalog(self.extension_metrics.as_deref(), "cloud", &catalog);
         let generation = Arc::new(CloudSkillGeneration {
             auth_cache_key: cache.auth_cache_key.clone(),
             resource_cache_key,
             mcp_resources: cache.mcp_resources.clone(),
             catalog: Some(catalog),
         });
-        catalogs.cloud_generation = Some(Arc::clone(&generation));
-        turn_store.insert(LatestCloudSkillsAuth(generation.auth_cache_key.clone()));
-        *refresh_succeeded = true;
+        catalogs.cloud_generation = Some(generation);
         Ok(())
     }
 

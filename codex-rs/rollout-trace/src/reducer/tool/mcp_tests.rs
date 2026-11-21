@@ -72,6 +72,7 @@ fn mcp_calls_keep_callable_identity_and_classify_the_backend() -> anyhow::Result
                 },
             },
         );
+        writer.flush()?;
         let before = replay_bundle(temp.path())?;
         // Namespaced write_stdin calls must neither require terminal arguments
         // nor create terminal sessions when those arguments happen to be valid.
@@ -94,6 +95,7 @@ fn mcp_calls_keep_callable_identity_and_classify_the_backend() -> anyhow::Result
             }),
         )?;
         writer.append(RawTraceEventPayload::ToolCallRuntimeStarted {
+            kind: expected.kind.clone(),
             tool_call_id: "call-mcp".to_string(),
             runtime_payload: begin.clone(),
         })?;

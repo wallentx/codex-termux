@@ -1,15 +1,18 @@
-//! Implements the board contract using bounded SQLite queries with ordinary offset pagination.
+//! Bounded board queries and channel-description updates that preserve existing evidence.
 
 use super::LocalAgentMessageBoard;
 use super::MAX_READ_CHARS;
 use super::StoredPost;
+use super::catalog;
 use super::connection::Access;
 use super::invalid;
+use super::json_search;
 use super::paging::Window;
 use super::paging::decode_posts;
 use super::paging::direction;
 use super::paging::preview;
 use super::storage_error;
+use super::validate_channel;
 use crate::AgentMessageBoard;
 use crate::AppendRequest;
 use crate::BoardPermissions;
@@ -18,6 +21,7 @@ use crate::ChannelQuery;
 use crate::ChannelSummary;
 use crate::CreateChannelRequest;
 use crate::Page;
+use crate::PageRequest;
 use crate::PostContent;
 use crate::PostMetadata;
 use crate::PostPreview;
@@ -31,16 +35,149 @@ use crate::ThreadPage;
 use crate::ThreadQuery;
 use crate::ThreadSort;
 use crate::ThreadSummary;
+use crate::UpsertChannelRequest;
 use caseless::default_case_fold_str;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::error::Result;
 use futures::future::BoxFuture;
 use sqlx::QueryBuilder;
+use sqlx::SqliteConnection;
+use std::sync::Arc;
+use uuid::Uuid;
+
+impl LocalAgentMessageBoard {
+    pub(super) async fn load_post(
+        &self,
+        conn: &mut SqliteConnection,
+        id: Uuid,
+    ) -> Result<StoredPost> {
+        let payload: Option<String> =
+            sqlx::query_scalar("SELECT payload FROM posts WHERE board=? AND id=?")
+                .bind(self.identity.to_string())
+                .bind(id.to_string())
+                .fetch_optional(conn)
+                .await
+                .map_err(storage_error)?;
+        serde_json::from_str(&payload.ok_or_else(|| invalid("post not found in this board"))?)
+            .map_err(storage_error)
+    }
+
+    pub async fn read_post(
+        &self,
+        caller: ThreadId,
+        request: ReadPostRequest,
+    ) -> Result<PostContent> {
+        self.host.agent_path(caller).await?;
+        let mut conn = self.pool.acquire().await.map_err(storage_error)?;
+        let post = self.load_post(&mut conn, request.message_id).await?;
+        let n_chars = post.text.chars().count();
+        let offset = (request.offset_chars as usize).min(n_chars);
+        let text: String = post
+            .text
+            .chars()
+            .skip(offset)
+            .take((request.limit_chars.get() as usize).min(MAX_READ_CHARS))
+            .collect();
+        let next_offset_chars = offset + text.chars().count();
+        Ok(PostContent {
+            metadata: post.metadata,
+            text,
+            n_chars,
+            next_offset_chars,
+        })
+    }
+
+    /// Creates a channel or updates its navigation description without replacing posts,
+    /// its original author, or its creation time. Only writable connections may call this.
+    pub async fn upsert_channel(
+        &self,
+        caller: ThreadId,
+        request: UpsertChannelRequest,
+    ) -> Result<()> {
+        if let Some(access) = self.access {
+            access.require_write(self.identity, "channel.edit_metadata")?;
+        }
+        let UpsertChannelRequest {
+            channel_name,
+            description,
+        } = request;
+        validate_channel(&channel_name)?;
+        let author = self.host.agent_path(caller).await?;
+        let mut tx = self.begin_write().await?;
+        let updated = sqlx::query("UPDATE channels SET description=? WHERE board=? AND name=?")
+            .bind(description.as_str())
+            .bind(self.identity.to_string())
+            .bind(&channel_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?
+            .rows_affected();
+        if updated != 0 {
+            return tx.commit().await.map_err(storage_error);
+        }
+        tx.rollback().await.map_err(storage_error)?;
+        // Only creation needs a timestamp. Do not hold a write transaction across
+        // the host clock call; a concurrent creator is handled by the upsert below.
+        let now = self.host.current_time(caller).await?;
+        let mut tx = self.begin_write().await?;
+        sqlx::query("INSERT INTO channels(board,name,name_search,created_at,timestamp,author,description) VALUES(?,?,?,?,?,?,?) ON CONFLICT(board,name) DO UPDATE SET description=excluded.description")
+            .bind(self.identity.to_string()).bind(&channel_name).bind(default_case_fold_str(&channel_name))
+            .bind(now.to_rfc3339()).bind(now.timestamp_micros()).bind(author.to_string()).bind(description.as_str())
+            .execute(&mut *tx).await.map_err(storage_error)?;
+        tx.commit().await.map_err(storage_error)
+    }
+
+    /// Lists the caller's channel subscriptions within the existing page budget.
+    pub async fn subscribed_channels(
+        &self,
+        caller: ThreadId,
+        page: PageRequest,
+    ) -> Result<Page<String>> {
+        self.host.agent_path(caller).await?;
+        let window = Window::new(&page)?;
+        // Probe the existing subscriptions primary key for each channel.
+        let channels = sqlx::query_scalar::<_, String>(
+            "SELECT c.name FROM channels AS c WHERE c.board=? AND EXISTS (
+                SELECT 1 FROM subscriptions AS s
+                WHERE s.board=c.board AND s.target=json_object('Channel',c.name) AND s.agent=?
+             ) ORDER BY c.name LIMIT ? OFFSET ?",
+        )
+        .bind(self.identity.to_string())
+        .bind(caller.to_string())
+        .bind((window.limit + 1) as i64)
+        .bind(window.offset())
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(storage_error)?;
+        window.finish(channels)
+    }
+}
 
 impl AgentMessageBoard for LocalAgentMessageBoard {
     fn identity(&self) -> SessionId {
         self.identity
+    }
+
+    fn storage_namespace(&self) -> Option<&str> {
+        Some(&self.storage_namespace)
+    }
+
+    fn with_json_search(&self, pointer: &'static str) -> Result<Arc<dyn AgentMessageBoard>> {
+        Ok(Arc::new(Self {
+            nested_json_pointer: Some(pointer),
+            ..self.clone()
+        }))
+    }
+
+    fn upsert_channel(
+        &self,
+        caller: ThreadId,
+        request: UpsertChannelRequest,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(LocalAgentMessageBoard::upsert_channel(
+            self, caller, request,
+        ))
     }
 
     fn create_channel(
@@ -65,6 +202,18 @@ impl AgentMessageBoard for LocalAgentMessageBoard {
         Box::pin(LocalAgentMessageBoard::append(self, caller, request))
     }
 
+    fn append_with_subscribers(
+        &self,
+        caller: ThreadId,
+        request: AppendRequest,
+    ) -> BoxFuture<'_, Result<(PostMetadata, Vec<ThreadId>)>> {
+        Box::pin(self.write_append(
+            caller,
+            request,
+            crate::api::PostBehavior::SilentAppendWithSubscribers,
+        ))
+    }
+
     fn set_subscription(
         &self,
         caller: ThreadId,
@@ -73,6 +222,43 @@ impl AgentMessageBoard for LocalAgentMessageBoard {
         Box::pin(LocalAgentMessageBoard::set_subscription(
             self, caller, request,
         ))
+    }
+
+    fn subscribed_channels(
+        &self,
+        caller: ThreadId,
+        page: PageRequest,
+    ) -> BoxFuture<'_, Result<Page<String>>> {
+        Box::pin(LocalAgentMessageBoard::subscribed_channels(
+            self, caller, page,
+        ))
+    }
+
+    fn read_post_texts_by_id<'a>(
+        &'a self,
+        caller: ThreadId,
+        ids: &'a [Uuid],
+    ) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            self.host.agent_path(caller).await?;
+            if ids.len() > PageRequest::default().limit.get() as usize {
+                return Err(invalid("requested posts exceed one board page"));
+            }
+            let texts = sqlx::query_scalar::<_, String>(
+                "SELECT json_extract(p.payload, '$.text') FROM json_each(?) AS requested
+                 CROSS JOIN posts AS p WHERE p.board=? AND p.id=requested.value
+                 ORDER BY requested.key",
+            )
+            .bind(serde_json::to_string(ids).map_err(storage_error)?)
+            .bind(self.identity.to_string())
+            .fetch_all(self.pool.as_ref())
+            .await
+            .map_err(storage_error)?;
+            if texts.len() != ids.len() {
+                return Err(invalid("post not found in this board"));
+            }
+            Ok(texts)
+        })
     }
 
     fn read_post(
@@ -116,7 +302,7 @@ impl AgentMessageBoard for LocalAgentMessageBoard {
                 .map_err(storage_error)?;
             let mut channels = Vec::with_capacity(names.len());
             for name in names {
-                channels.push(self.channel_summary(&mut tx, &name).await?);
+                channels.push(catalog::channel_summary(self, &mut tx, &name).await?);
             }
             Ok(ChannelPage {
                 channels: window.finish(channels)?,
@@ -247,11 +433,6 @@ impl AgentMessageBoard for LocalAgentMessageBoard {
             if let Some(author) = query.author {
                 sql.push(" AND author=").push_bind(author.to_string());
             }
-            if let Some(text) = query.query {
-                sql.push(" AND instr(body_search,")
-                    .push_bind(default_case_fold_str(&text))
-                    .push(")>0");
-            }
             if let Some((timestamp, seq)) = after {
                 sql.push(" AND (timestamp,seq)>(")
                     .push_bind(timestamp)
@@ -259,16 +440,29 @@ impl AgentMessageBoard for LocalAgentMessageBoard {
                     .push_bind(seq)
                     .push(")");
             }
-            sql.push(" ORDER BY timestamp DESC,seq DESC LIMIT ")
-                .push_bind((window.limit + 1) as i64)
-                .push(" OFFSET ")
-                .push_bind(window.offset());
-            let posts = decode_posts(
-                sql.build_query_scalar::<String>()
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(storage_error)?,
-            )?;
+            let needle = query.query.as_deref().map(default_case_fold_str);
+            let posts = if let (Some(pointer), Some(needle)) = (
+                self.nested_json_pointer,
+                needle.as_deref().filter(|text| !text.is_empty()),
+            ) {
+                json_search::page(sql, &mut tx, pointer, needle, &window).await?
+            } else {
+                if let Some(needle) = needle {
+                    sql.push(" AND instr(body_search,")
+                        .push_bind(needle)
+                        .push(")>0");
+                }
+                sql.push(" ORDER BY timestamp DESC,seq DESC LIMIT ")
+                    .push_bind((window.limit + 1) as i64)
+                    .push(" OFFSET ")
+                    .push_bind(window.offset());
+                decode_posts(
+                    sql.build_query_scalar::<String>()
+                        .fetch_all(&mut *tx)
+                        .await
+                        .map_err(storage_error)?,
+                )?
+            };
             let chars = (query.max_chars_per_post.get() as usize)
                 .min(MAX_READ_CHARS / posts.len().min(window.limit).max(1));
             window.finish(posts.into_iter().map(|post| preview(post, chars)).collect())

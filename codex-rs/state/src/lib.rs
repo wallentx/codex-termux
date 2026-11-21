@@ -4,9 +4,10 @@
 //! from JSONL rollouts and mirrors it into a local SQLite database. Backfill
 //! orchestration and rollout scanning live in `codex-core`.
 
+const MIN_SQLITE_VERSION_NUMBER: i32 = 3_054_000;
 const _: () = assert!(
-    libsqlite3_sys::SQLITE_VERSION_NUMBER >= 3_051_003,
-    "bundled SQLite must include the WAL-reset corruption fix",
+    libsqlite3_sys::SQLITE_VERSION_NUMBER >= MIN_SQLITE_VERSION_NUMBER,
+    "bundled SQLite must include the WAL-reset and WAL page-size fixes",
 );
 
 mod audit;
@@ -15,6 +16,7 @@ mod extract;
 pub mod log_db;
 mod migrations;
 mod model;
+mod nfs_migration;
 mod paths;
 mod runtime;
 mod sqlite;
@@ -34,6 +36,8 @@ pub use model::QueuedUserSubmissionRecord;
 pub use model::RolloutMigrationCursor;
 pub use model::RolloutMigrationSkippedRollout;
 pub use model::RolloutMigrationState;
+pub use nfs_migration::NfsDbMigration;
+pub use nfs_migration::NfsDbMigrationOutcome;
 pub use runtime::GuardianReviewRecord;
 pub use runtime::MAX_GUARDIAN_REVIEW_BYTES;
 pub use runtime::MAX_GUARDIAN_REVIEW_RECORDS;
@@ -44,6 +48,7 @@ pub use sqlite::SqliteConfig;
 pub use sqlite::SqlitePoolWriteExt;
 
 pub use audit::ThreadStateAuditRow;
+pub use audit::read_thread_rollout_paths;
 pub use audit::read_thread_state_audit_rows;
 pub use delegated_preview::delegated_output_preview;
 pub use extract::GUARDIAN_THREAD_PREVIEW;
@@ -101,6 +106,9 @@ pub use runtime::ThreadReadState;
 pub use runtime::backup_runtime_db_for_fresh_start;
 pub use runtime::collect_runtime_db_backups;
 pub use runtime::is_sqlite_corruption_error;
+pub use runtime::model_ids::MemoryModelIdStore;
+pub use runtime::model_ids::ModelIdStoreFuture;
+pub use runtime::model_ids::SessionModelIdStore;
 pub use runtime::open_thread_history_db;
 pub use runtime::recovery::RuntimeDbBackup;
 pub use runtime::runtime_db_path_for_corruption_error;
