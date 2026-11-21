@@ -19,8 +19,8 @@ permissions:
   issues: read
   pull-requests: read
 engine: copilot
-max-turns: 40
-timeout-minutes: 30
+max-turns: 80
+timeout-minutes: 60
 concurrency:
   group: termux-watch-repair
   cancel-in-progress: false
