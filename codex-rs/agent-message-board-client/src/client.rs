@@ -37,6 +37,7 @@ use codex_message_board::SubscriptionState;
 use codex_message_board::ThreadPage;
 use codex_message_board::ThreadQuery;
 use codex_message_board::ThreadSummary;
+use codex_message_board::UpsertChannelRequest;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -95,7 +96,7 @@ impl RemoteAgentMessageBoard {
         })
     }
 
-    /// Supply the runtime's configured clock for research's simulated time.
+    /// Use the calling thread's clock to timestamp new channels and posts.
     pub fn with_clock(
         mut self,
         clock: impl Fn(ThreadId) -> BoxFuture<'static, Result<DateTime<Utc>>> + Send + Sync + 'static,
@@ -325,6 +326,18 @@ impl AgentMessageBoard for RemoteAgentMessageBoard {
         ChannelSummary
     );
     operation!(list_channels, ListChannels, ChannelQuery, ChannelPage);
+    fn upsert_channel(
+        &self,
+        _caller: ThreadId,
+        _request: UpsertChannelRequest,
+    ) -> BoxFuture<'_, Result<()>> {
+        // The service has no description-update operation; creation has different semantics.
+        Box::pin(async {
+            Err(CodexErr::InvalidRequest(
+                "remote message boards do not support channel upsert".into(),
+            ))
+        })
+    }
     operation!(post, Post, PostRequest, PostMetadata);
     fn append(
         &self,
@@ -350,8 +363,8 @@ impl AgentMessageBoard for RemoteAgentMessageBoard {
     );
 }
 
-/// One active turn's live receiver. The host must also check the turn atomically
-/// when injecting a returned notification, since the turn can end after `next`.
+/// One active turn's live receiver. Frames are checked against this receiver's
+/// identity before accepted notices enter the host's ordinary message delivery.
 pub struct BoardNotifications {
     caller: ThreadId,
     turn_id: String,

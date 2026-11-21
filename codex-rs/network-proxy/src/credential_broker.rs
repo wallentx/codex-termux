@@ -56,6 +56,71 @@ pub enum CredentialMaskingFailureMode {
     Error,
 }
 
+/// How the proxy handles brokered credentials while an executor shell starts.
+#[derive(Clone, Copy)]
+pub enum ShellStartupCredentials {
+    ProtectedSnapshot,
+    MaskedCommand,
+    UnmaskedCommand,
+}
+
+impl ShellStartupCredentials {
+    /// Only this exact login invocation can be replayed from a protected snapshot.
+    pub fn supports_snapshot(
+        argv: &[String],
+        arg0: Option<&str>,
+        shell_name: &str,
+        shell_path: &str,
+    ) -> bool {
+        cfg!(any(target_os = "linux", target_os = "macos"))
+            && arg0.is_none()
+            && shell_name == "zsh"
+            && matches!(argv, [program, flag, _] if program == shell_path && flag == "-lc"
+                && std::path::Path::new(program).file_name().is_some_and(|name| name == "zsh"))
+    }
+
+    /// Classify the original shell environment before proxy preparation rewrites it.
+    pub fn for_command(
+        argv: &[String],
+        arg0: Option<&str>,
+        snapshot_shell: Option<(&str, &str)>,
+        env: &HashMap<String, String>,
+    ) -> Self {
+        if let Some((name, path)) = snapshot_shell {
+            if Self::supports_snapshot(argv, arg0, name, path) {
+                return Self::ProtectedSnapshot;
+            }
+        } else if cfg!(any(target_os = "linux", target_os = "macos"))
+            && arg0.is_none()
+            && matches!(argv, [program, flag, _] if std::path::Path::new(program).file_name().is_some_and(|name| name == "bash") && flag == "-c")
+            && !["BASH_ENV", "ENV", "SSH_CLIENT", "SSH2_CLIENT"]
+                .iter()
+                .any(|key| env.contains_key(*key))
+        {
+            return Self::MaskedCommand;
+        }
+        Self::UnmaskedCommand
+    }
+
+    /// Apply the startup decision to this child only. Earlier commands retain their bindings.
+    pub fn apply(
+        self,
+        proxy: &crate::NetworkProxy,
+        env: &mut HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::MaskedCommand => {
+                proxy.handle_unmasked_credentials(env, CredentialMaskingFailureMode::Warn)
+            }
+            // Both start with real credentials. Protected snapshots mask the captured state afterward.
+            Self::ProtectedSnapshot | Self::UnmaskedCommand => {
+                proxy.restore_and_disable_brokered_credentials(env, &mut []);
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CredentialBroker {
     state: Arc<RwLock<CredentialBrokerState>>,
@@ -258,14 +323,14 @@ pub(super) fn env_value<'a>(env: &'a HashMap<String, String>, key: &str) -> Opti
     env_entry(env, key).map(|(_, value)| value)
 }
 
-fn set_env_value(env: &mut HashMap<String, String>, key: &str, value: String) {
+pub(super) fn set_env_value(env: &mut HashMap<String, String>, key: &str, value: String) {
     if cfg!(windows) {
         env.retain(|candidate, _| !env_key_matches(candidate, key));
     }
     env.insert(key.to_string(), value);
 }
 
-fn remove_env_value(env: &mut HashMap<String, String>, key: &str) {
+pub(super) fn remove_env_value(env: &mut HashMap<String, String>, key: &str) {
     if cfg!(windows) {
         env.retain(|candidate, _| !env_key_matches(candidate, key));
     } else {

@@ -10,7 +10,7 @@ use codex_utils_file_lock::FileLockOutcome;
 use codex_utils_file_lock::acquire_sibling_lock_dir;
 use codex_utils_file_lock::lock_exclusive_optional;
 
-use crate::decision::Decision;
+use crate::Decision;
 use crate::rule::NetworkRuleProtocol;
 use crate::rule::normalize_network_rule_host;
 use thiserror::Error;
@@ -110,6 +110,11 @@ pub fn blocking_append_network_rule(
     let decision = serde_json::to_string(match decision {
         Decision::Allow => "allow",
         Decision::Prompt => "prompt",
+        Decision::PromptUser => {
+            return Err(AmendError::InvalidNetworkRule(
+                "prompt-user is only supported in managed command rules".to_string(),
+            ));
+        }
         Decision::Forbidden => "deny",
     })
     .map_err(|source| AmendError::SerializeNetworkRule { source })?;

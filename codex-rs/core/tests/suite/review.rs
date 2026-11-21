@@ -1,5 +1,6 @@
 use codex_core::CodexThread;
 use codex_core::REVIEW_PROMPT;
+use codex_core::RequestCountry;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
@@ -833,18 +834,9 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
         review_context.approvals_reviewer,
         Some(ApprovalsReviewer::User)
     );
-    // The review delegate still starts in its own default mode, not the parent's Plan mode.
-    assert_eq!(
-        review_context.collaboration_mode,
-        Some(CollaborationMode {
-            mode: ModeKind::Default,
-            settings: Settings {
-                model: "gpt-5.4".to_string(),
-                reasoning_effort: Some(ReasoningEffort::Medium),
-                developer_instructions: None,
-            },
-        })
-    );
+    assert_eq!(review_context.collaboration_mode, None);
+    assert_eq!(review_context.model, "gpt-5.4");
+    assert_eq!(review_context.effort, Some(ReasoningEffort::Medium));
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -915,6 +907,7 @@ async fn review_resolves_inherited_summary_preferences() -> anyhow::Result<()> {
     let (server, request_log) =
         start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 2).await;
     let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model_info_override("gpt-5.2", |model| {
             model.default_reasoning_summary = ReasoningSummary::Auto;
         })
@@ -930,17 +923,19 @@ async fn review_resolves_inherited_summary_preferences() -> anyhow::Result<()> {
         .await?;
 
     // First follow the review model's default, then use a preference updated on the thread.
-    for summary in [None, Some(ReasoningSummary::Concise)] {
-        if let Some(summary) = summary {
-            core_test_support::submit_thread_settings(
-                &test.codex,
-                ThreadSettingsOverrides {
-                    summary: Some(summary),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        }
+    for (summary, request_country) in [
+        (None, RequestCountry::from_iso_code("DE")?),
+        (Some(ReasoningSummary::Concise), RequestCountry::UNKNOWN),
+    ] {
+        core_test_support::submit_thread_settings(
+            &test.codex,
+            ThreadSettingsOverrides {
+                summary,
+                request_country: Some(request_country),
+                ..Default::default()
+            },
+        )
+        .await?;
         let stored_settings = test.codex.thread_settings_snapshot().await;
         test.codex
             .submit(Op::Review {
@@ -958,6 +953,14 @@ async fn review_resolves_inherited_summary_preferences() -> anyhow::Result<()> {
         .await;
         assert_eq!(test.codex.thread_settings_snapshot().await, stored_settings);
     }
+    assert_eq!(
+        request_log
+            .requests()
+            .iter()
+            .map(|request| request.body_json().get("request_country").cloned())
+            .collect::<Vec<_>>(),
+        vec![Some(serde_json::json!("DE")), Some(serde_json::Value::Null)]
+    );
     let actual = request_log
         .requests()
         .iter()

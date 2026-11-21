@@ -29,6 +29,26 @@ pub struct ExecuteRequest {
 pub struct WaitRequest {
     pub cell_id: CellId,
     pub yield_time_ms: u64,
+    /// Limit for this observation in Server mode; ignored in Client mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TerminateRequest {
+    pub cell_id: CellId,
+    /// Limit for the final observation in Server mode; ignored in Client mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
+}
+
+impl From<CellId> for TerminateRequest {
+    fn from(cell_id: CellId) -> Self {
+        Self {
+            cell_id,
+            max_output_tokens: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -124,6 +144,10 @@ pub enum RuntimeResponse {
     Result {
         cell_id: CellId,
         content_items: Vec<FunctionCallOutputContentItem>,
+        /// None means success; Some (including an empty string) means failure.
+        /// Client mode supplies the original diagnostic to append before truncation.
+        /// Server mode includes the diagnostic in the already-budgeted content and
+        /// supplies an independently bounded copy here for logging; do not append it again.
         error_text: Option<String>,
         /// Time between completion and retrieval when the result was buffered.
         #[serde(default, skip_serializing_if = "Duration::is_zero")]

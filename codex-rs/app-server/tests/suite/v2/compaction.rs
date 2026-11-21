@@ -22,7 +22,7 @@ use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -36,6 +36,7 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_features::Feature;
 use codex_utils_absolute_path::test_support::PathExt;
+use codex_utils_path_uri::LegacyAppPathString;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
@@ -427,10 +428,10 @@ async fn auto_compaction_emits_started_and_completed_items(route: CompactionRout
     let started = wait_for_context_compaction_started(&mut mcp).await?;
     let completed = wait_for_context_compaction_completed(&mut mcp).await?;
 
-    let ThreadItem::ContextCompaction { id: started_id } = started.item else {
+    let ThreadItemPayload::ContextCompaction { id: started_id } = started.item.payload else {
         unreachable!("started item should be context compaction");
     };
-    let ThreadItem::ContextCompaction { id: completed_id } = completed.item else {
+    let ThreadItemPayload::ContextCompaction { id: completed_id } = completed.item.payload else {
         unreachable!("completed item should be context compaction");
     };
 
@@ -548,10 +549,10 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
     let completed = wait_for_context_compaction_completed(&mut mcp).await?;
     wait_for_turn_completed(&mut mcp, &started.turn_id).await?;
 
-    let ThreadItem::ContextCompaction { id: started_id } = started.item else {
+    let ThreadItemPayload::ContextCompaction { id: started_id } = started.item.payload else {
         unreachable!("started item should be context compaction");
     };
-    let ThreadItem::ContextCompaction { id: completed_id } = completed.item else {
+    let ThreadItemPayload::ContextCompaction { id: completed_id } = completed.item.payload else {
         unreachable!("completed item should be context compaction");
     };
 
@@ -604,7 +605,10 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
     assert_eq!(
         (cwd.as_path(), runtime_workspace_roots),
-        (updated_cwd.path(), updated_roots)
+        (
+            updated_cwd.path(),
+            LegacyAppPathString::from_abs_paths(&updated_roots)
+        )
     );
 
     Ok(())
@@ -723,7 +727,7 @@ async fn wait_for_context_compaction_started(
     loop {
         let started: ItemStartedNotification =
             timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("item/started")).await??;
-        if let ThreadItem::ContextCompaction { .. } = started.item {
+        if let ThreadItemPayload::ContextCompaction { .. } = started.item.payload {
             return Ok(started);
         }
     }
@@ -738,7 +742,7 @@ async fn wait_for_context_compaction_completed(
             mcp.read_notification("item/completed"),
         )
         .await??;
-        if let ThreadItem::ContextCompaction { .. } = completed.item {
+        if let ThreadItemPayload::ContextCompaction { .. } = completed.item.payload {
             return Ok(completed);
         }
     }

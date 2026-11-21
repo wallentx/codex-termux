@@ -1,8 +1,6 @@
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_otel::EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC;
-use codex_otel::MetricsClient;
-use codex_otel::MetricsConfig;
 use codex_otel::OtelExporter;
 use codex_otel::OtelHttpProtocol;
 use codex_otel::OtelProvider;
@@ -26,7 +24,11 @@ use std::time::Duration;
 use std::time::Instant;
 use tracing_subscriber::layer::SubscriberExt;
 
+const MAX_BODY_PREFIX_CHARS: usize = 2000;
 static TRACE_CONTEXT_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+#[path = "otel_headers_helper.rs"]
+mod otel_headers_helper;
 
 struct CapturedRequest {
     path: String,
@@ -204,17 +206,30 @@ fn otlp_http_exporter_honors_cumulative_temporality_env() -> Result<()> {
         let _ = tx.send(captured);
     });
 
-    let metrics = MetricsClient::new(MetricsConfig::otlp(
-        "test",
-        "codex-cli",
-        env!("CARGO_PKG_VERSION"),
-        OtelExporter::OtlpHttp {
+    let provider = OtelProvider::try_new_http_metrics(&OtelSettings {
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        environment: "test".to_string(),
+        service_name: "codex-cli".to_string(),
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_home: PathBuf::from("."),
+        headers_helper: None,
+        exporter: OtelExporter::None,
+        trace_exporter: OtelExporter::None,
+        metrics_exporter: OtelExporter::OtlpHttp {
             endpoint: format!("http://{addr}/v1/metrics"),
             headers: HashMap::new(),
             protocol: OtelHttpProtocol::Json,
             tls: None,
         },
-    ))?;
+        runtime_metrics: false,
+        span_attributes: HashMap::new(),
+        tracestate: BTreeMap::new(),
+    })
+    .expect("set up a metrics-only provider")
+    .expect("metrics enabled");
+    assert!(provider.logger.is_none());
+    assert!(provider.tracer_provider.is_none());
+    let metrics = provider.metrics().expect("metrics client");
 
     metrics.counter("codex.turns", /*inc*/ 1, &[("source", "test")])?;
     metrics.counter("codex.api_request", /*inc*/ 1, &[("status", "200")])?;
@@ -262,7 +277,7 @@ fn otlp_http_exporter_honors_cumulative_temporality_env() -> Result<()> {
         /*value*/ 1,
         &[("component", "test")],
     )?;
-    metrics.shutdown()?;
+    provider.shutdown();
 
     server.join().expect("server join");
     let captured = rx.recv_timeout(Duration::from_secs(1)).expect("captured");
@@ -296,17 +311,17 @@ fn otlp_http_exporter_honors_cumulative_temporality_env() -> Result<()> {
     assert!(
         body.contains("codex.turns"),
         "expected metric name not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("codex.active"),
         "expected gauge not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("\"codex.api_request\""),
         "expected API-request counter not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains(EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC),
@@ -315,47 +330,47 @@ fn otlp_http_exporter_honors_cumulative_temporality_env() -> Result<()> {
     assert!(
         body.contains("\"codex.api_request.duration_ms\""),
         "expected API-request duration not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("\"codex.conversation.turn.count\""),
         "expected conversation turn count not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("\"codex.responses_api_engine_iapi_ttft.duration_ms\""),
         "expected engine IAPI TTFT duration not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("\"codex.responses_api_engine_service_tbt.duration_ms\""),
         "expected engine service TBT duration not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("\"codex.responses_api_engine_service_ttft.duration_ms\""),
         "expected engine service TTFT duration not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("\"codex.tool.call\""),
         "expected tool-call counter not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("\"codex.turn.token_usage\""),
         "expected turn-token histogram not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("\"codex.tool.call.duration_ms\""),
         "expected tool-call duration not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("component") && body.contains("test"),
         "expected gauge tag not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
 
     Ok(())
@@ -397,6 +412,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
     });
 
     let otel = OtelProvider::try_new(&OtelSettings {
+        headers_helper: None,
         http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
@@ -411,7 +427,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
         trace_exporter: OtelExporter::None,
         metrics_exporter: OtelExporter::None,
         runtime_metrics: false,
-        span_attributes: BTreeMap::new(),
+        span_attributes: HashMap::new(),
         tracestate: BTreeMap::new(),
     })?
     .expect("otel provider");
@@ -449,7 +465,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
     assert!(
         body.contains("codex.test.log_exported"),
         "expected exported log event not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     Ok(())
 }
@@ -457,6 +473,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
 #[test]
 fn otel_provider_rejects_header_unsafe_configured_tracestate() {
     let result = OtelProvider::try_new(&OtelSettings {
+        headers_helper: None,
         http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
@@ -471,7 +488,7 @@ fn otel_provider_rejects_header_unsafe_configured_tracestate() {
         },
         metrics_exporter: OtelExporter::None,
         runtime_metrics: false,
-        span_attributes: BTreeMap::new(),
+        span_attributes: HashMap::new(),
         tracestate: BTreeMap::from([(
             "example".to_string(),
             BTreeMap::from([("alpha".to_string(), "one\ntwo".to_string())]),
@@ -523,6 +540,7 @@ fn otlp_http_exporter_sends_traces_to_collector()
     });
 
     let otel = OtelProvider::try_new(&OtelSettings {
+        headers_helper: None,
         http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
@@ -537,7 +555,7 @@ fn otlp_http_exporter_sends_traces_to_collector()
         },
         metrics_exporter: OtelExporter::None,
         runtime_metrics: false,
-        span_attributes: BTreeMap::from([(
+        span_attributes: HashMap::from([(
             "test.configured_attribute".to_string(),
             "configured-value".to_string(),
         )]),
@@ -609,22 +627,22 @@ fn otlp_http_exporter_sends_traces_to_collector()
     assert!(
         body.contains("trace-loopback"),
         "expected span name not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("codex-cli"),
         "expected service name not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("test.configured_attribute") && body.contains("configured-value"),
         "expected configured span attribute not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("codex.test.trace_event"),
         "expected trace event not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
 
     Ok(())
@@ -640,12 +658,38 @@ async fn otlp_http_exporter_sends_traces_to_collector_with_bounded_shutdown_in_t
     let addr = listener.local_addr().expect("local_addr");
     listener.set_nonblocking(true).expect("set_nonblocking");
 
+    let otel = OtelProvider::try_new(&OtelSettings {
+        headers_helper: None,
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        environment: "test".to_string(),
+        service_name: "codex-cli".to_string(),
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_home: PathBuf::from("."),
+        exporter: OtelExporter::None,
+        trace_exporter: OtelExporter::OtlpHttp {
+            endpoint: format!("http://{addr}/v1/traces"),
+            headers: HashMap::new(),
+            protocol: OtelHttpProtocol::Json,
+            tls: None,
+        },
+        metrics_exporter: OtelExporter::None,
+        runtime_metrics: false,
+        span_attributes: HashMap::new(),
+        tracestate: BTreeMap::new(),
+    })?
+    .expect("otel provider");
     let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
+    let (stop_tx, stop_rx) = mpsc::channel();
     let server = thread::spawn(move || {
         let mut captured = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(3);
 
         while Instant::now() < deadline {
+            match stop_rx.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let result = read_http_request(&mut stream);
@@ -667,26 +711,6 @@ async fn otlp_http_exporter_sends_traces_to_collector_with_bounded_shutdown_in_t
 
         let _ = tx.send(captured);
     });
-
-    let otel = OtelProvider::try_new(&OtelSettings {
-        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-        environment: "test".to_string(),
-        service_name: "codex-cli".to_string(),
-        service_version: env!("CARGO_PKG_VERSION").to_string(),
-        codex_home: PathBuf::from("."),
-        exporter: OtelExporter::None,
-        trace_exporter: OtelExporter::OtlpHttp {
-            endpoint: format!("http://{addr}/v1/traces"),
-            headers: HashMap::new(),
-            protocol: OtelHttpProtocol::Json,
-            tls: None,
-        },
-        metrics_exporter: OtelExporter::None,
-        runtime_metrics: false,
-        span_attributes: BTreeMap::new(),
-        tracestate: BTreeMap::new(),
-    })?
-    .expect("otel provider");
     let tracing_layer = otel.tracing_layer().expect("tracing layer");
     let subscriber = tracing_subscriber::registry().with(tracing_layer);
 
@@ -701,12 +725,14 @@ async fn otlp_http_exporter_sends_traces_to_collector_with_bounded_shutdown_in_t
         let _guard = span.enter();
         tracing::info!("trace loopback event from tokio runtime");
     });
-    tokio::task::block_in_place(|| {
+    let shutdown_result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
             .block_on(otel.shutdown_with_timeout(Duration::from_secs(/*secs*/ 2)))
-    })?;
+    });
 
+    let _ = stop_tx.send(());
     server.join().expect("server join");
+    shutdown_result?;
     let captured = rx.recv_timeout(Duration::from_secs(1)).expect("captured");
 
     let request = captured
@@ -726,12 +752,12 @@ async fn otlp_http_exporter_sends_traces_to_collector_with_bounded_shutdown_in_t
     assert!(
         body.contains("trace-loopback-tokio"),
         "expected span name not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("codex-cli"),
         "expected service name not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
 
     Ok(())
@@ -763,6 +789,7 @@ fn otlp_http_exporter_times_out_when_collector_stalls_during_bounded_shutdown() 
         .expect("build tokio runtime");
     let (result, elapsed) = runtime.block_on(async move {
         let otel = OtelProvider::try_new(&OtelSettings {
+            headers_helper: None,
             http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             environment: "test".to_string(),
             service_name: "codex-cli".to_string(),
@@ -777,7 +804,7 @@ fn otlp_http_exporter_times_out_when_collector_stalls_during_bounded_shutdown() 
             },
             metrics_exporter: OtelExporter::None,
             runtime_metrics: false,
-            span_attributes: BTreeMap::new(),
+            span_attributes: HashMap::new(),
             tracestate: BTreeMap::new(),
         })
         .expect("build otel provider")
@@ -862,7 +889,8 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
             .expect("current-thread runtime");
 
         let result = runtime.block_on(async move {
-            let otel = OtelProvider::try_new(&OtelSettings {
+            let otel = OtelProvider::try_new_http_traces(&OtelSettings {
+                headers_helper: None,
                 http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
                 environment: "test".to_string(),
                 service_name: "codex-cli".to_string(),
@@ -877,7 +905,7 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
                 },
                 metrics_exporter: OtelExporter::None,
                 runtime_metrics: false,
-                span_attributes: BTreeMap::new(),
+                span_attributes: HashMap::new(),
                 tracestate: BTreeMap::new(),
             })
             .map_err(|err| err.to_string())?
@@ -928,12 +956,12 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
     assert!(
         body.contains("trace-loopback-current-thread"),
         "expected span name not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
     assert!(
         body.contains("codex-cli"),
         "expected service name not found; body prefix: {}",
-        body.chars().take(2000).collect::<String>()
+        body.chars().take(MAX_BODY_PREFIX_CHARS).collect::<String>()
     );
 
     Ok(())

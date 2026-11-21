@@ -8,6 +8,7 @@ use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use serde_json::Value;
 
 use super::common;
@@ -26,6 +27,9 @@ pub struct PostToolUseRequest {
     pub turn_id: String,
     pub subagent: Option<common::SubagentHookContext>,
     pub cwd: AbsolutePathBuf,
+    /// Original local execution cwd for hook stdin. Remote commands leave this
+    /// unset to retain the host cwd. The hook process still runs in `cwd`.
+    pub tool_cwd: Option<PathUri>,
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
@@ -155,7 +159,7 @@ fn command_input(request: &PostToolUseRequest) -> Result<Value, serde_json::Erro
         agent_id: subagent.agent_id,
         agent_type: subagent.agent_type,
         transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
-        cwd: request.cwd.display().to_string(),
+        cwd: common::command_input_cwd(request.cwd.as_ref(), request.tool_cwd.as_ref()),
         hook_event_name: "PostToolUse".to_string(),
         model: request.model.clone(),
         permission_mode: request.permission_mode.clone(),
@@ -291,6 +295,11 @@ fn parse_completed(
         },
     }
 
+    if let Some(reason) = common::apply_failure_policy(handler, &mut status, &mut entries) {
+        should_block = true;
+        feedback_messages_for_model.push(reason);
+    }
+
     let completed = HookCompletedEvent {
         turn_id,
         run: dispatcher::completed_summary(handler, &run_result, status, entries),
@@ -308,11 +317,12 @@ fn parse_completed(
 }
 
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PostToolUseOutcome {
+    let feedback_message = common::failure_block_reason(&hook_events);
     PostToolUseOutcome {
         hook_events,
-        should_block: false,
+        should_block: feedback_message.is_some(),
         additional_contexts: Vec::new(),
-        feedback_message: None,
+        feedback_message,
     }
 }
 
@@ -337,6 +347,22 @@ mod tests {
     use crate::events::common;
     use crate::output_spill::AdditionalContext;
     use crate::output_spill::AdditionalContextLimit;
+
+    #[test]
+    fn command_input_uses_execution_cwd_path_convention() {
+        let mut request = request_for_tool_use("call-cwd");
+        let original = command_input(&request).unwrap();
+        for (uri, expected) in [
+            ("file:///repo-B", "/repo-B"),
+            ("file:///C:/repo-B", r"C:\repo-B"),
+        ] {
+            request.tool_cwd = Some(codex_utils_path_uri::PathUri::parse(uri).unwrap());
+            let actual = command_input(&request).unwrap();
+            let mut expected_input = original.clone();
+            expected_input["cwd"] = serde_json::json!(expected);
+            assert_eq!(actual, expected_input);
+        }
+    }
 
     #[test]
     fn command_input_uses_request_tool_name() {
@@ -596,6 +622,7 @@ mod tests {
             matcher: Some(crate::engine::HookMatcher::new("^Bash$").expect("valid matcher")),
             timeout_sec: 5,
             status_message: Some("running post tool use hook".to_string()),
+            on_failure: Default::default(),
             additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: codex_protocol::protocol::HookSource::User,
@@ -610,6 +637,7 @@ mod tests {
 
     fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
         HandlerRunResult {
+            structured_content: None,
             context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1_700_000_000,
             completed_at: 1_700_000_001,
@@ -627,6 +655,7 @@ mod tests {
             turn_id: "turn-1".to_string(),
             subagent: None,
             cwd: test_path_buf("/tmp").abs(),
+            tool_cwd: None,
             transcript_path: None,
             model: "gpt-test".to_string(),
             permission_mode: "default".to_string(),

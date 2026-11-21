@@ -14,6 +14,7 @@ mod install_lock;
 mod launch;
 pub use launch::restart_with_features;
 pub use launch::start_with_features;
+pub use launch::start_with_features_classified;
 mod managed_install;
 mod prepare_install;
 mod release_pruning;
@@ -24,6 +25,7 @@ mod settings;
 pub mod telemetry;
 mod thread_recovery;
 mod update_loop;
+mod update_policy;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -46,14 +48,17 @@ use managed_install::managed_codex_version;
 use serde::Serialize;
 use settings::DaemonSettings;
 use settings::MAX_SHUTDOWN_GRACE_SECONDS;
+use telemetry::StartError;
+use telemetry::StartFailure;
 use tokio::time::sleep;
 
 const START_POLL_INTERVAL: Duration = Duration::from_millis(50);
 // An older updater can pass background policy to a replacement daemon, so retain
-// the longer readiness allowance during upgrades on macOS.
-#[cfg(target_os = "macos")]
+// the longer readiness allowance during upgrades on macOS. On Linux, a cold
+// start from a rotational disk can take more than ten seconds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 // Leave room for the longest graceful stop, forced-exit check, and restart.
 const OPERATION_LOCK_TIMEOUT: Duration =
@@ -68,7 +73,9 @@ const STATE_DIR_NAME: &str = "app-server-daemon";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleCommand {
-    Start,
+    Start {
+        feature_overrides: BTreeMap<String, bool>,
+    },
     Restart {
         feature_overrides: BTreeMap<String, bool>,
     },
@@ -239,7 +246,7 @@ pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
     #[cfg(windows)]
     if matches!(
         command,
-        LifecycleCommand::Start | LifecycleCommand::Restart { .. }
+        LifecycleCommand::Start { .. } | LifecycleCommand::Restart { .. }
     ) {
         backend::windows::ensure_not_elevated()?;
     }
@@ -313,13 +320,20 @@ pub fn maintain_stderr_log() -> Result<()> {
     Ok(())
 }
 
+/// Checks the current locally managed daemon update policy.
+pub async fn ensure_updates_allowed() -> Result<()> {
+    update_policy::ensure_allowed(&Daemon::from_environment()?).await
+}
+
 pub async fn update(
     http_client_factory: codex_http_client::HttpClientFactory,
 ) -> Result<UpdateOutput> {
     ensure_supported_platform()?;
     #[cfg(windows)]
     backend::windows::ensure_not_elevated()?;
-    update_loop::request_manual_update(&Daemon::from_environment()?, http_client_factory).await
+    let daemon = Daemon::from_environment()?;
+    crate::update_policy::ensure_allowed(&daemon).await?;
+    update_loop::request_manual_update(&daemon, http_client_factory).await
 }
 
 #[cfg(any(unix, windows))]
@@ -419,7 +433,10 @@ impl Daemon {
         let _operation_lock = self.acquire_operation_lock().await?;
         let selected = self.current_installation()?;
         match command {
-            LifecycleCommand::Start => selected.start(&BTreeMap::new()).await,
+            LifecycleCommand::Start { feature_overrides } => selected
+                .start(&feature_overrides)
+                .await
+                .map_err(|err| err.error),
             LifecycleCommand::Restart { feature_overrides } => {
                 selected.restart(&feature_overrides).await
             }
@@ -434,7 +451,10 @@ impl Daemon {
         }
     }
 
-    async fn start(&self, feature_overrides: &BTreeMap<String, bool>) -> Result<LifecycleOutput> {
+    async fn start(
+        &self,
+        feature_overrides: &BTreeMap<String, bool>,
+    ) -> Result<LifecycleOutput, StartError> {
         let mut managed = self.clone();
         let mut settings = self.load_settings().await?;
         let (status, backend, pid, info) = if let Ok(info) = client::probe(&self.socket_path).await
@@ -459,9 +479,15 @@ impl Daemon {
                     "warning: failed to clear stale daemon recovery before start: {err}"
                 ));
             }
-            prepare_install::prepare(self, &settings).await?;
-            managed.managed_codex_bin = self.current_managed_codex_bin()?;
-            managed.ensure_managed_codex_bin()?;
+            prepare_install::prepare(self, &settings)
+                .await
+                .map_err(StartError::install)?;
+            managed.managed_codex_bin = self
+                .current_managed_codex_bin()
+                .map_err(StartError::install)?;
+            managed
+                .ensure_managed_codex_bin()
+                .map_err(StartError::install)?;
             // Only a fresh launch may replace these settings. Keep them for restarts
             // and updates, without changing the user's config or a running daemon.
             if settings.feature_overrides != *feature_overrides {
@@ -701,20 +727,27 @@ impl Daemon {
     }
 
     async fn wait_until_ready(&self) -> Result<client::ProbeInfo> {
+        let exited = backend::wait_for_process_exit(&self.pid_file);
+        tokio::pin!(exited);
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
-        loop {
+        let (err, exited_before_ready) = loop {
             match client::probe(&self.socket_path).await {
                 Ok(info) => return Ok(info),
                 Err(err) if tokio::time::Instant::now() < deadline => {
-                    let _ = err;
-                    sleep(START_POLL_INTERVAL).await;
+                    tokio::select! {
+                        () = &mut exited => break (err, true),
+                        () = sleep(START_POLL_INTERVAL) => {}
+                    }
                 }
-                Err(err) => {
-                    let context = self.app_server_not_ready_context().await;
-                    return Err(err).context(context);
-                }
+                Err(err) => break (err, false),
             }
-        }
+        };
+        let context = self.app_server_not_ready_context().await;
+        Err(err).context(if exited_before_ready {
+            StartFailure::EarlyChildExit(context)
+        } else {
+            StartFailure::ReadinessTimeout(context)
+        })
     }
 
     async fn app_server_not_ready_context(&self) -> String {
@@ -751,7 +784,10 @@ impl Daemon {
             let _ = selected
                 .set_remote_control_locked(RemoteControlMode::Enabled)
                 .await?;
-            let output = selected.start(&BTreeMap::new()).await?;
+            let output = selected
+                .start(&BTreeMap::new())
+                .await
+                .map_err(|err| err.error)?;
             return Ok(RemoteControlStartOutput::Start(output));
         }
 
@@ -988,9 +1024,14 @@ impl Daemon {
 
     async fn ensure_managed_updater(&self, settings: &DaemonSettings) -> Result<bool> {
         let updater = backend::pid_update_loop_backend(self.backend_paths(settings));
-        if !settings.auto_update_enabled {
+        let allowed = if settings.auto_update_enabled {
+            crate::update_policy::allowed(self).await
+        } else {
+            Ok(false)
+        };
+        if !matches!(&allowed, Ok(true)) {
             updater.stop().await?;
-            return Ok(false);
+            return allowed;
         }
         if !self.is_stable_standalone_release()? {
             // An installer publishes current and the latest marker separately.
@@ -1060,6 +1101,7 @@ impl Daemon {
 
     async fn is_bootstrapped(&self, settings: &DaemonSettings) -> Result<bool> {
         if !settings.auto_update_enabled
+            || !crate::update_policy::allowed(self).await.unwrap_or(false)
             || !self.is_stable_standalone_release()?
             || !managed_install::supports_daemon_update_loop(&self.managed_codex_bin).await
         {
@@ -1477,7 +1519,9 @@ mod tests {
         )
         .expect("legacy saved threads");
         daemon
-            .run(super::LifecycleCommand::Start)
+            .run(super::LifecycleCommand::Start {
+                feature_overrides: Default::default(),
+            })
             .await
             .expect_err("missing backend binary");
         assert!(!daemon.recovery_file().expect("recovery path").exists());
@@ -1523,7 +1567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn not_ready_context_reports_daemon_app_server_before_stderr() {
+    async fn readiness_reports_stderr_promptly_when_daemon_is_gone() {
         let temp_dir = TempDir::new().expect("temp dir");
         let daemon = Daemon {
             log_diagnostics: false,
@@ -1539,8 +1583,25 @@ mod tests {
             .await
             .expect("write stderr log");
 
+        // A daemon that exits during startup leaves its published PID record behind.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        std::fs::write(
+            &daemon.pid_file,
+            serde_json::json!({ "pid": child.id(), "processStartTime": "exited" }).to_string(),
+        )
+        .unwrap();
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(5), daemon.wait_until_ready())
+                .await
+                .expect("an exited daemon should not exhaust the readiness timeout")
+                .expect_err("daemon is gone");
         assert_eq!(
-            daemon.app_server_not_ready_context().await,
+            error.to_string(),
             format!(
                 "app server did not become ready on {}\n\n\
                  Daemon used app-server:\n  path: {}\n  version: unknown\n\n\
@@ -1549,6 +1610,10 @@ mod tests {
                 daemon.managed_codex_bin.display(),
                 stderr_log.display()
             )
+        );
+        assert_eq!(
+            super::StartError::from(error).failure_reason(),
+            "early_child_exit"
         );
     }
 }

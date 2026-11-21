@@ -5,7 +5,6 @@
     reason = "shared test helpers assert successful operations"
 )]
 
-use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -14,78 +13,16 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use chrono::DateTime;
-use chrono::Utc;
 use codex_message_board::*;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
-use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_state::SqliteConfig;
-use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
 
-struct Host {
-    clock: AtomicI64,
-    agent_path_calls: AtomicUsize,
-    members: HashMap<ThreadId, AgentPath>,
-    active: AtomicBool,
-    fail_notifications: AtomicBool,
-    notifications: Mutex<Vec<(ThreadId, PostMetadata)>>,
-}
-
-impl MessageBoardHost for Host {
-    fn agent_path(&self, caller: ThreadId) -> BoxFuture<'_, Result<AgentPath>> {
-        Box::pin(async move {
-            self.agent_path_calls.fetch_add(1, Ordering::SeqCst);
-            self.members
-                .get(&caller)
-                .cloned()
-                .ok_or_else(|| CodexErr::ThreadNotFound(caller))
-        })
-    }
-
-    fn resolve_agent(&self, path: AgentPath) -> BoxFuture<'_, Result<ThreadId>> {
-        Box::pin(async move {
-            self.members
-                .iter()
-                .find_map(|(id, member)| (*member == path).then_some(*id))
-                .ok_or_else(|| CodexErr::InvalidRequest("unknown agent".into()))
-        })
-    }
-
-    fn current_time(&self, _caller: ThreadId) -> BoxFuture<'_, Result<DateTime<Utc>>> {
-        Box::pin(async move {
-            Ok(DateTime::parse_from_rfc3339("2026-09-18T12:00:00Z")
-                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?
-                .with_timezone(&Utc)
-                + chrono::Duration::seconds(self.clock.fetch_add(1, Ordering::SeqCst)))
-        })
-    }
-
-    fn notify(
-        &self,
-        recipient: ThreadId,
-        post: PostPreview,
-    ) -> BoxFuture<'_, Result<NotificationDelivery>> {
-        Box::pin(async move {
-            if self.fail_notifications.load(Ordering::SeqCst) {
-                return Err(CodexErr::Io(std::io::Error::other(
-                    "notification transport failed",
-                )));
-            }
-            if !self.active.load(Ordering::SeqCst) {
-                return Ok(NotificationDelivery::SkippedInactive);
-            }
-            self.notifications
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((recipient, post.metadata));
-            Ok(NotificationDelivery::Accepted)
-        })
-    }
-}
+mod common;
+use common::Host;
 
 #[tokio::test]
 async fn opening_board_preserves_posts_when_corruption_has_no_startup_recovery() {
@@ -95,6 +32,7 @@ async fn opening_board_preserves_posts_when_corruption_has_no_startup_recovery()
     let root = ThreadId::new();
     let host = Arc::new(Host {
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root())].into(),
         fail_notifications: AtomicBool::new(false),
@@ -159,6 +97,7 @@ async fn shared_handles_resume_posts_and_preserve_subscription_rules() {
     let child_path = AgentPath::root().join("worker").unwrap();
     let host = Arc::new(Host {
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root()), (child, child_path.clone())].into(),
         fail_notifications: AtomicBool::new(false),
@@ -240,7 +179,7 @@ async fn shared_handles_resume_posts_and_preserve_subscription_rules() {
             next_offset_chars: 3,
         }
     );
-    resumed
+    let unsubscribed = resumed
         .set_subscription(
             root,
             SubscriptionRequest {
@@ -251,6 +190,7 @@ async fn shared_handles_resume_posts_and_preserve_subscription_rules() {
         )
         .await
         .unwrap();
+    assert_eq!(unsubscribed.last_message_id, Some(metadata.message_id));
     // Posting to an existing channel must not re-enable its subscription.
     resumed
         .post(
@@ -286,7 +226,7 @@ async fn shared_handles_resume_posts_and_preserve_subscription_rules() {
             root,
             SubscriptionRequest {
                 target: SubscriptionTarget::Thread(metadata.message_id),
-                target_agent: Some(child_path),
+                target_agent: Some(child_path.clone()),
                 change: SubscriptionChange::Subscribe,
             },
         )
@@ -299,7 +239,8 @@ async fn shared_handles_resume_posts_and_preserve_subscription_rules() {
                 request_id: "reply".into(),
                 destination: PostDestination::Thread(metadata.message_id),
                 text: "done".into(),
-                agents_to_notify: Vec::new(),
+                // Mentioning this subscriber must still deliver only one notification.
+                agents_to_notify: vec![child_path],
             },
         )
         .await
@@ -458,6 +399,7 @@ async fn in_memory_handles_share_posts_deduplicate_calls_and_release_state() {
     let child_path = AgentPath::root().join("worker").unwrap();
     let host = Arc::new(Host {
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root()), (child, child_path.clone())].into(),
         active: AtomicBool::new(true),
@@ -544,6 +486,7 @@ async fn check_failed_requests_do_not_create_channels_or_notify_inactive_agents(
     let child_path = AgentPath::root().join("worker").unwrap();
     let host = Arc::new(Host {
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root()), (child, child_path.clone())].into(),
         fail_notifications: AtomicBool::new(false),
@@ -615,6 +558,7 @@ async fn check_queries_enforce_page_and_preview_caps(backend: Backend) {
     let host = Arc::new(Host {
         fail_notifications: AtomicBool::new(false),
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root())].into(),
         active: AtomicBool::new(false),
@@ -711,6 +655,7 @@ async fn check_queries_page_discussions_and_search_unicode(backend: Backend) {
     let host = Arc::new(Host {
         fail_notifications: AtomicBool::new(false),
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root())].into(),
         active: AtomicBool::new(true),
@@ -981,6 +926,7 @@ async fn check_tools_cover_channel_discussions_subscriptions_and_escaped_preview
         fail_notifications: AtomicBool::new(false),
         members: [(root, AgentPath::root()), (child, child_path.clone())].into(),
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         active: AtomicBool::new(true),
         notifications: Mutex::default(),
@@ -1076,15 +1022,17 @@ async fn check_tools_cover_channel_discussions_subscriptions_and_escaped_preview
     // The subscribed author receives no self-notices; the child is unsubscribed.
     assert_eq!(*host.notifications.lock().unwrap(), Vec::new());
     let (last, last_reply) = last.unwrap();
-    assert!(
-        tool("subscribe")
-            .handle(board_tool_call(
-                "subscribe",
-                json!({"channel_name":"Workflow","thread_id":last.thread_id})
-            ))
-            .await
-            .is_err()
-    );
+    for invalid_target in [
+        json!({"channel_name":"Workflow","thread_id":last.thread_id}),
+        json!({"channel_name":"missing"}),
+    ] {
+        assert!(
+            tool("subscribe")
+                .handle(board_tool_call("subscribe", invalid_target))
+                .await
+                .is_err()
+        );
+    }
     let subscribed = tool("subscribe")
         .handle(board_tool_call(
             "subscribe",
@@ -1213,15 +1161,16 @@ async fn check_tools_validate_arguments_deduplicate_calls_and_bound_unicode_resu
     let child_path = AgentPath::root().join("worker").unwrap();
     let host = Arc::new(Host {
         fail_notifications: AtomicBool::new(false),
-        members: [(root, AgentPath::root()), (child, child_path)].into(),
+        members: [(root, AgentPath::root()), (child, child_path.clone())].into(),
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         active: AtomicBool::new(true),
         notifications: Mutex::default(),
     });
     let board = backend.open(&sqlite, root.into(), host.clone()).await;
     let mut selected = MessageBoardTool::DISCUSSION.to_vec();
-    selected.push(MessageBoardTool::Append);
+    selected.extend([MessageBoardTool::Append, MessageBoardTool::UpsertChannel]);
     let tools = message_board_tools(
         &selected,
         board.clone(),
@@ -1248,6 +1197,10 @@ async fn check_tools_validate_arguments_deduplicate_calls_and_bound_unicode_resu
             json!({"new_channel_name":"low-budget-append","text":"must not be stored"}),
         ),
         ("create_channel", json!({"channel_name":"low-budget"})),
+        (
+            "upsert_channel",
+            json!({"channel_name":"low-budget-upsert","description":"must not be stored"}),
+        ),
     ] {
         let mut limited = call(name, args);
         limited.truncation_policy = TruncationPolicy::Bytes(1);
@@ -1285,6 +1238,20 @@ async fn check_tools_validate_arguments_deduplicate_calls_and_bound_unicode_resu
         json!({"text":"invalid recipient","new_channel_name":"evidence","agents_to_notify":["worker"]}),
     ] {
         assert!(tool("append").handle(call("append", args)).await.is_err());
+    }
+    for args in [
+        json!({"channel_name":"policy"}),
+        json!({"description":"missing channel"}),
+        json!({"channel_name":"policy","description":"é".repeat(257)}),
+        json!({"channel_name":"policy","description":"invalid option","subscribe":true}),
+        json!({"channel_name":"policy","description":"invalid option","permissions":{}}),
+    ] {
+        assert!(
+            tool("upsert_channel")
+                .handle(call("upsert_channel", args))
+                .await
+                .is_err()
+        );
     }
     assert!(
         tool("get_channels")
@@ -1515,6 +1482,107 @@ async fn check_tools_validate_arguments_deduplicate_calls_and_bound_unicode_resu
             .unwrap();
     }
     assert_eq!(*host.notifications.lock().unwrap(), Vec::new());
+
+    // Upsert creates metadata without subscribing its author. Updating from another
+    // caller changes only the description, preserving the channel and its evidence.
+    host.clock.store(100, Ordering::SeqCst);
+    let upsert = call(
+        "upsert_channel",
+        json!({"channel_name":"policy","description":"Original policy"}),
+    );
+    assert_eq!(
+        tool("upsert_channel")
+            .handle(upsert)
+            .await
+            .unwrap()
+            .log_output(),
+        "null"
+    );
+    let created = tool("get_channels")
+        .handle(call("get_channels", json!({"query":"policy"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Page<ChannelSummary>>(&created.log_output()).unwrap(),
+        Page {
+            results: vec![ChannelSummary {
+                channel_name: "policy".into(),
+                description: Some("Original policy".into()),
+                permissions: None,
+                created_at: "2026-09-18T12:01:40Z".parse().unwrap(),
+                created_by: AgentPath::root(),
+                message_count: 0,
+                last_message_id: None,
+            }],
+            next_cursor: None,
+        }
+    );
+    board
+        .post(
+            child,
+            PostRequest {
+                request_id: "policy-evidence".into(),
+                destination: PostDestination::Channel("policy".into()),
+                text: "Deployment requires approval.".into(),
+                agents_to_notify: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let channels = call("get_channels", json!({"query":"policy"}));
+    let before = tool("get_channels").handle(channels.clone()).await.unwrap();
+    let mut expected: Page<ChannelSummary> = serde_json::from_str(&before.log_output()).unwrap();
+    let child_tools = message_board_tools(
+        &[MessageBoardTool::UpsertChannel],
+        board,
+        child,
+        child_path,
+        Some("collaboration"),
+        "Shared tools",
+        /*tool_messages*/ None,
+    );
+    host.fail_clock.store(true, Ordering::SeqCst);
+    child_tools[0]
+        .handle(call(
+            "upsert_channel",
+            json!({"channel_name":"policy","description":"Updated policy"}),
+        ))
+        .await
+        .unwrap();
+    expected.results[0].description = Some("Updated policy".into());
+    let after = tool("get_channels").handle(channels).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Page<ChannelSummary>>(&after.log_output()).unwrap(),
+        expected
+    );
+    assert!(
+        child_tools[0]
+            .handle(call(
+                "upsert_channel",
+                json!({"channel_name":"clock-missing","description":"Must not be created"}),
+            ))
+            .await
+            .is_err()
+    );
+    let missing = tool("get_channels")
+        .handle(call("get_channels", json!({"query":"clock-missing"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Page<ChannelSummary>>(&missing.log_output()).unwrap(),
+        Page {
+            results: Vec::new(),
+            next_cursor: None
+        }
+    );
+    host.fail_clock.store(false, Ordering::SeqCst);
+    let mut posted = call(
+        "post",
+        json!({"channel_name":"policy","text":"More policy evidence."}),
+    );
+    posted.call_id = "after-upsert".into();
+    tool("post").handle(posted).await.unwrap();
+    assert_eq!(*host.notifications.lock().unwrap(), Vec::new());
 }
 
 #[test]
@@ -1554,6 +1622,7 @@ async fn channel_descriptions_migrate_legacy_storage_and_survive_reopen() {
     let root = ThreadId::new();
     let host = Arc::new(Host {
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root())].into(),
         active: AtomicBool::new(true),
@@ -1634,6 +1703,7 @@ async fn silent_appends_preserve_evidence_and_explicit_subscriptions()
     let child = ThreadId::new();
     let host = Arc::new(Host {
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [
             (root, AgentPath::root()),
@@ -1684,6 +1754,51 @@ async fn silent_appends_preserve_evidence_and_explicit_subscriptions()
             .await
             .is_err()
     );
+    let query = ChannelQuery {
+        query: None,
+        direction: SortDirection::OldestFirst,
+        page: PageRequest::default(),
+    };
+    let before = writer
+        .list_channels(root, query.clone())
+        .await?
+        .channels
+        .results
+        .remove(0);
+    writer
+        .upsert_channel(
+            child,
+            UpsertChannelRequest {
+                channel_name: channel.into(),
+                description: "Release decisions".to_owned().try_into()?,
+            },
+        )
+        .await?;
+    for (board, can_write) in [(&writer, true), (&reader, false)] {
+        assert_eq!(
+            board.list_channels(root, query.clone()).await?,
+            ChannelPage {
+                channels: Page {
+                    results: vec![ChannelSummary {
+                        description: Some("Release decisions".into()),
+                        permissions: Some(ChannelPermissions {
+                            read: true,
+                            post: can_write,
+                            reply: can_write,
+                            edit_metadata: false,
+                        }),
+                        ..before.clone()
+                    }],
+                    next_cursor: None,
+                },
+                board_permissions: Some(BoardPermissions {
+                    create_channel: can_write,
+                    edit_metadata: false,
+                    manage_permissions: false,
+                }),
+            }
+        );
+    }
     assert_eq!(
         reader
             .read_post(
@@ -1701,6 +1816,18 @@ async fn silent_appends_preserve_evidence_and_explicit_subscriptions()
             n_chars: request.text.chars().count(),
             next_offset_chars: request.text.chars().count(),
         }
+    );
+    assert!(
+        reader
+            .upsert_channel(
+                child,
+                UpsertChannelRequest {
+                    channel_name: channel.into(),
+                    description: "Changed".to_owned().try_into()?,
+                },
+            )
+            .await
+            .is_err()
     );
     writer
         .create_channel(
@@ -1745,6 +1872,34 @@ async fn silent_appends_preserve_evidence_and_explicit_subscriptions()
             .fetch_one(&pool)
             .await?,
         0
+    );
+    let first = reader
+        .subscribed_channels(
+            child,
+            PageRequest {
+                cursor: None,
+                limit: NonZeroU32::MIN,
+            },
+        )
+        .await?;
+    let last = reader
+        .subscribed_channels(
+            child,
+            PageRequest {
+                cursor: first.next_cursor,
+                limit: NonZeroU32::MIN,
+            },
+        )
+        .await?;
+    assert_eq!(
+        (first.results, last),
+        (
+            vec![channel.into()],
+            Page {
+                results: vec!["release".into()],
+                next_cursor: None,
+            }
+        )
     );
     // Normal posts on this same board still subscribe their author and notify once.
     let discussion = PostRequest {
@@ -1796,6 +1951,7 @@ async fn local_board_setup_survives_reopen() -> Result<()> {
     let root = ThreadId::new();
     let host = Arc::new(Host {
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root())].into(),
         active: AtomicBool::new(true),
@@ -1886,7 +2042,7 @@ async fn local_board_setup_survives_reopen() -> Result<()> {
 }
 
 #[tokio::test]
-async fn storage_namespaces_preserve_isolation_and_reopen() -> Result<()> {
+async fn storage_namespaces_preserve_isolation_reopen_and_deletion() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let sqlite = SqliteConfig::new_for_testing(dir.path().to_path_buf().try_into().unwrap());
     let root = ThreadId::new();
@@ -1894,6 +2050,7 @@ async fn storage_namespaces_preserve_isolation_and_reopen() -> Result<()> {
     let child_path = AgentPath::root().join("worker").unwrap();
     let host = Arc::new(Host {
         clock: AtomicI64::default(),
+        fail_clock: AtomicBool::new(false),
         agent_path_calls: AtomicUsize::default(),
         members: [(root, AgentPath::root()), (child, child_path)].into(),
         active: AtomicBool::new(true),
@@ -1901,7 +2058,7 @@ async fn storage_namespaces_preserve_isolation_and_reopen() -> Result<()> {
         notifications: Mutex::default(),
     });
     for storage_namespace in ["queue", "goals"] {
-        // Opening a board must not modify another runtime database.
+        // Opening and deleting a board must not modify another runtime database.
         let runtime_database = sqlite
             .open_read_write_pool(&dir.path().join(format!("{storage_namespace}_1.sqlite")))
             .await
@@ -1914,7 +2071,7 @@ async fn storage_namespaces_preserve_isolation_and_reopen() -> Result<()> {
         let options = LocalBoardOptions {
             storage_namespace: storage_namespace.into(),
         };
-        let descriptor = LocalBoard::new(sqlite.clone(), identity).with_options(options);
+        let descriptor = LocalBoard::new(sqlite.clone(), identity).with_options(options.clone());
         let writer = descriptor.read_write().open(host.clone()).await?;
         let seed = PostRequest {
             request_id: "seed".into(),
@@ -1941,7 +2098,7 @@ async fn storage_namespaces_preserve_isolation_and_reopen() -> Result<()> {
         drop(writer);
         let reopened = descriptor.read_write().open(host.clone()).await?;
         assert_eq!(
-            reopened.read_post(child, read).await?,
+            reopened.read_post(child, read.clone()).await?,
             PostContent {
                 metadata,
                 text: seed.text.clone(),
@@ -1949,6 +2106,43 @@ async fn storage_namespaces_preserve_isolation_and_reopen() -> Result<()> {
                 next_offset_chars: seed.text.chars().count(),
             }
         );
+        let survivor = LocalBoard::new(sqlite.clone(), SessionId::new())
+            .with_options(LocalBoardOptions {
+                storage_namespace: storage_namespace.into(),
+            })
+            .read_write()
+            .open(host.clone())
+            .await?;
+        let survivor_metadata = survivor.post(root, seed.clone()).await?;
+        let after_deletion = PostRequest {
+            request_id: "after-deletion".into(),
+            destination: PostDestination::Channel("records".into()),
+            ..seed.clone()
+        };
+        let late_append = AppendRequest {
+            request_id: "late-append".into(),
+            destination: PostDestination::NewChannel("late-evidence".into()),
+            text: seed.text.clone(),
+        };
+        let deleted_ids = [identity, SessionId::new()];
+        LocalAgentMessageBoard::delete_boards(&sqlite, &options, &deleted_ids).await?;
+        assert!(reopened.read_post(root, read).await.is_err());
+        assert!(reopened.post(root, seed.clone()).await.is_err());
+        assert!(reopened.append(root, late_append.clone()).await.is_err());
+        assert_eq!(survivor.post(root, seed.clone()).await?, survivor_metadata);
+        survivor.post(root, after_deletion.clone()).await?;
+        survivor.append(root, late_append.clone()).await?;
+        // Fresh pools must retain both markers, including the board never opened before deletion.
+        drop((reopened, survivor));
+        for deleted_id in deleted_ids {
+            let deleted = LocalBoard::new(sqlite.clone(), deleted_id)
+                .with_options(options.clone())
+                .read_write()
+                .open(host.clone())
+                .await?;
+            assert!(deleted.post(root, seed.clone()).await.is_err());
+            assert!(deleted.append(root, late_append.clone()).await.is_err());
+        }
         assert_eq!(
             legacy
                 .read_post(
@@ -1967,6 +2161,17 @@ async fn storage_namespaces_preserve_isolation_and_reopen() -> Result<()> {
                 next_offset_chars: seed.text.chars().count(),
             }
         );
+        legacy.post(root, after_deletion).await?;
+        let unopened_options = LocalBoardOptions {
+            storage_namespace: format!("unopened_{storage_namespace}"),
+        };
+        LocalAgentMessageBoard::delete_boards(&sqlite, &unopened_options, &[identity]).await?;
+        assert!(
+            !tokio::fs::try_exists(dir.path().join(format!(
+                "message_board_unopened_{storage_namespace}_1.sqlite"
+            )))
+            .await?
+        );
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
@@ -1979,3 +2184,6 @@ async fn storage_namespaces_preserve_isolation_and_reopen() -> Result<()> {
     }
     Ok(())
 }
+
+#[path = "local_board/mcp_tests.rs"]
+mod mcp;

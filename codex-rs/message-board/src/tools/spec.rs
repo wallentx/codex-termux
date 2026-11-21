@@ -20,6 +20,11 @@ pub(super) fn tool(
             &["channel_name", "description", "subscribe"],
             &["channel_name"],
         ),
+        MessageBoardTool::UpsertChannel => (
+            "Create a channel or update only its description. Existing posts, author, creation time and subscriptions are preserved. Does not subscribe anyone or send notifications. Returns null on success.",
+            &["channel_name", "description"],
+            &["channel_name", "description"],
+        ),
         MessageBoardTool::GetChannels => (
             "List channels, most recently active first, or search by a case-insensitive part of the name. Creating a channel or posting in it counts as activity.",
             &["query", "recent_first", "limit", "cursor"],
@@ -60,8 +65,13 @@ pub(super) fn tool(
             &["message_id", "offset_chars", "limit_chars"],
             &["message_id"],
         ),
+        MessageBoardTool::SubscribedChannels => (
+            "List the names of channels you are currently subscribed to.",
+            &["limit", "cursor"],
+            &[],
+        ),
         MessageBoardTool::Subscribe => (
-            "Subscribe yourself or another agent to a channel for new top-level posts, or to a thread for replies. Provide exactly one of channel_name or thread_id. Notifications only reach agents with a running turn; missed notifications are not saved.",
+            "Subscribe yourself or another agent to a channel for new top-level posts, or to a thread for replies. Provide exactly one of channel_name or thread_id. Notification delivery, queueing, and wake behavior follow the host's agent-message policy.",
             &["channel_name", "thread_id", "target_agent"],
             &[],
         ),
@@ -71,7 +81,7 @@ pub(super) fn tool(
             &[],
         ),
         MessageBoardTool::Post => (
-            "Start a thread in an existing or new channel, or reply using the first post's message ID as thread_id. Exactly one destination is required. Posting subscribes you to the thread unless you previously unsubscribed. agents_to_notify sends a one-time notification without subscribing recipients or starting idle agents. Returns metadata, not the post text.",
+            "Start a thread in an existing or new channel, or reply using the first post's message ID as thread_id. Exactly one destination is required. Posting subscribes you to the thread unless you previously unsubscribed. agents_to_notify requests a one-time notification without subscribing recipients; delivery, queueing, and wake behavior follow the host's agent-message policy. Returns metadata, not the post text.",
             &[
                 "text",
                 "channel_name",
@@ -90,6 +100,9 @@ pub(super) fn tool(
     let mut properties = serde_json::Map::new();
     for field in fields {
         let schema = match *field {
+            "description" if tool == MessageBoardTool::UpsertChannel => {
+                json!({"type":"string","description":"Channel purpose, at most 512 UTF-8 bytes."})
+            }
             "description" => {
                 json!({"type":"string","description":"Optional channel purpose, at most 512 UTF-8 bytes."})
             }

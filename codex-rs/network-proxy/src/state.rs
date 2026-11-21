@@ -13,6 +13,7 @@ use crate::policy::compile_denylist;
 use crate::policy::is_global_wildcard_domain_pattern;
 use crate::runtime::ConfigState;
 use serde::Deserialize;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ pub use crate::runtime::NetworkProxyState;
 #[cfg(test)]
 pub(crate) use crate::runtime::network_proxy_state_for_policy;
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NetworkProxyConstraints {
     pub enabled: Option<bool>,
     pub mode: Option<NetworkMode>,
@@ -77,6 +78,10 @@ pub fn build_config_state(
     if brokerage_created_default_allowlist {
         config.set_allowed_domains(vec!["*".to_string()]);
     }
+    anyhow::ensure!(
+        !config.transparent_tcp || (config.enabled && config.enable_socks5),
+        "transparent_tcp requires an enabled managed SOCKS5 proxy"
+    );
     crate::config::validate_unix_socket_allowlist_paths(&config, executor_os)?;
     anyhow::ensure!(
         !config.credential_broker || config.mitm,
@@ -383,14 +388,11 @@ pub fn validate_policy_against_constraints(
     }
 
     if let Some(allow_unix_sockets) = &constraints.allow_unix_sockets {
-        let allowed_set: HashSet<String> = allow_unix_sockets
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
+        let allowed_set: HashSet<&str> = allow_unix_sockets.iter().map(String::as_str).collect();
         validate(config_allow_unix_sockets, move |candidate| {
             let mut invalid = Vec::new();
             for entry in candidate {
-                if !allowed_set.contains(&entry.to_ascii_lowercase()) {
+                if !allowed_set.contains(entry.as_str()) {
                     invalid.push(entry.clone());
                 }
             }

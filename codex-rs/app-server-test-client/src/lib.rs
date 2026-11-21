@@ -57,7 +57,7 @@ use codex_app_server_protocol::ThreadDecrementElicitationParams;
 use codex_app_server_protocol::ThreadDecrementElicitationResponse;
 use codex_app_server_protocol::ThreadIncrementElicitationParams;
 use codex_app_server_protocol::ThreadIncrementElicitationResponse;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -1048,6 +1048,7 @@ async fn test_login(
                         params: codex_app_server_protocol::LoginAccountParams::AmazonBedrock {
                             api_key,
                             region,
+                            provider_id: None,
                         },
                     },
                     request_id,
@@ -1167,6 +1168,9 @@ async fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u3
         println!("< initialize response: {initialize:?}");
 
         let response = client.thread_list(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -1271,11 +1275,10 @@ fn live_elicitation_timeout_pause(
         (None, None) => "ws://127.0.0.1:4222".to_string(),
     };
 
-    let script_path = script.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts")
-            .join("live_elicitation_hold.sh")
-    });
+    let script_path = match script {
+        Some(script) => script,
+        None => codex_utils_cargo_bin::find_resource!("scripts/live_elicitation_hold.sh")?,
+    };
     if !script_path.is_file() {
         bail!("helper script not found: {}", script_path.display());
     }
@@ -1456,13 +1459,13 @@ struct CodexClient {
     command_item_started: bool,
     helper_done_seen: bool,
     turn_completed_before_helper_done: bool,
-    unexpected_items_before_helper_done: Vec<ThreadItem>,
+    unexpected_items_before_helper_done: Vec<ThreadItemPayload>,
     last_turn_status: Option<TurnStatus>,
     last_turn_error_message: Option<String>,
 }
 
 fn item_started_before_helper_done_is_unexpected(
-    item: &ThreadItem,
+    item: &ThreadItemPayload,
     command_item_started: bool,
     helper_done_seen: bool,
 ) -> bool {
@@ -1470,7 +1473,7 @@ fn item_started_before_helper_done_is_unexpected(
         return false;
     }
 
-    !matches!(item, ThreadItem::UserMessage { .. })
+    !matches!(item, ThreadItemPayload::UserMessage { .. })
 }
 
 impl CodexClient {
@@ -1608,6 +1611,7 @@ impl CodexClient {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                 },
                 capabilities: Some(InitializeCapabilities {
+                    required_human_approval: false,
                     explicit_gateway_oauth: false,
                     experimental_api,
                     request_attestation: false,
@@ -1816,28 +1820,31 @@ impl CodexClient {
                     std::io::stdout().flush().ok();
                 }
                 ServerNotification::ItemStarted(payload) => {
-                    if matches!(payload.item, ThreadItem::CommandExecution { .. }) {
+                    if matches!(
+                        payload.item.payload,
+                        ThreadItemPayload::CommandExecution { .. }
+                    ) {
                         if self.command_item_started && !self.helper_done_seen {
                             self.unexpected_items_before_helper_done
-                                .push(payload.item.clone());
+                                .push(payload.item.payload.clone());
                         }
                         self.command_item_started = true;
                     } else if item_started_before_helper_done_is_unexpected(
-                        &payload.item,
+                        &payload.item.payload,
                         self.command_item_started,
                         self.helper_done_seen,
                     ) {
                         self.unexpected_items_before_helper_done
-                            .push(payload.item.clone());
+                            .push(payload.item.payload.clone());
                     }
-                    println!("\n< item started: {:?}", payload.item);
+                    println!("\n< item started: {:?}", payload.item.payload);
                 }
                 ServerNotification::ItemCompleted(payload) => {
-                    if let ThreadItem::CommandExecution {
+                    if let ThreadItemPayload::CommandExecution {
                         status,
                         aggregated_output,
                         ..
-                    } = payload.item.clone()
+                    } = payload.item.payload.clone()
                     {
                         self.command_execution_statuses.push(status);
                         if let Some(aggregated_output) = aggregated_output {
@@ -1845,7 +1852,7 @@ impl CodexClient {
                             self.command_execution_outputs.push(aggregated_output);
                         }
                     }
-                    println!("< item completed: {:?}", payload.item);
+                    println!("< item completed: {:?}", payload.item.payload);
                 }
                 ServerNotification::TurnCompleted(payload) => {
                     if payload.turn.id == turn_id {

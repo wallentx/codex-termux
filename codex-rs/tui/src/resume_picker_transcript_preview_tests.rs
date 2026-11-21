@@ -40,6 +40,7 @@ fn rollout_user_message(text: &str) -> RolloutItem {
 
 fn rollout_agent_message(text: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        moderation: None,
         message: text.to_string(),
         phase: None,
         memory_citation: None,
@@ -272,7 +273,8 @@ fn legacy_transcript_preview_falls_back_when_scan_budget_is_exhausted() {
 
 #[test]
 fn transcript_preview_reverse_scan_stops_before_older_items() {
-    let newest = ThreadItem::AgentMessage {
+    let newest = ThreadItemPayload::AgentMessage {
+        moderation: None,
         id: String::from("final"),
         text: String::from("one\ntwo\nthree\nfour\nfive\nsix"),
         phase: None,
@@ -413,6 +415,7 @@ async fn transcript_preview_for_history_mode(
                     cursor: None,
                     limit: Some(TRANSCRIPT_PREVIEW_ITEMS_PAGE_SIZE),
                     sort_direction: Some(SortDirection::Desc),
+                    defer_output: None,
                 },
             })
             .await
@@ -421,7 +424,7 @@ async fn transcript_preview_for_history_mode(
         let mut first_page_lines = Vec::new();
         append_transcript_preview_lines(
             &mut first_page_lines,
-            first_page.data.iter().map(|entry| &entry.item),
+            first_page.data.iter().map(|entry| &entry.item.payload),
             codex_home.path(),
             /*inline_visualization_context*/ None,
         );

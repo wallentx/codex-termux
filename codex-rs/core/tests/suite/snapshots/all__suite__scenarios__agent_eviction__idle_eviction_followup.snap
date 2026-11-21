@@ -1,18 +1,17 @@
 ---
 source: core/tests/suite/scenarios_agent_eviction_tests.rs
-assertion_line: 275
 expression: "format!(\"{history}\\n\\nResumed worker mailbox:\\n{mailbox}\")"
 ---
 Scenario: A parent with no configured environment delegates an API migration, queues a note while the worker is idle, and follows up after idle eviction. The worker temporarily attaches a workspace, then resumes with no environment, its earlier answer, and the unread note. Complete model streams are grouped as parent, then worker.
 
 ## Window 1
 -- request 1 (turn) --
-00:additional_tools/developer (2; hash=7958a01e34d95ac2):
-        - namespace/functions; hash=30a5fc1fcffb1c04
+00:additional_tools/developer (2; hash=1efa2dc9d797cace):
+        - namespace/functions; hash=f33f647fee88e25e
           - custom/exec
           - function/wait
           - function/request_user_input
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -24,23 +23,7 @@ Scenario: A parent with no configured environment delegates an API migration, qu
 02:message/developer:
     <PERMISSIONS_INSTRUCTIONS>
 03:message/developer:
-    You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
-
-    At the start of your turn, you are the active agent.
-    You can spawn sub-agents to handle subtasks, and those sub-agents can spawn their own sub-agents.
-    All agents in the team, including the agents that you can assign tasks to, are equally intelligent and capable, and have access to the same set of tools.
-
-    You can use `spawn_agent` to create a new agent, `followup_task` to give an existing agent a new task an...message to a running agent without triggering a turn. [hash=7d40ff8b58977202]
-    Child agents can also spawn their own sub-agents.
-    <OMITTED 16 LINES; ~234 TOKENS; hash=b2e94283a8c22327>
-    - All agents use the same current working directory.
-    - As a result, edits made by one agent are immediately visible to all other agents.
-
-    When calling `wait_agent`, prefer longer waits (minutes) to avoid busy polling.
-
-    There are 2 available concurrency slots, meaning that up to 2 agents can be active at once, including you.
-
-    Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d...uctions; when doing so, set `fork_turns` to `"none"`. [hash=18ccf7e93ecabab9]
+    <MULTI_AGENT_ROLE>
 04:message/developer:
     <MULTI_AGENT_MODE>
 05:message/user:
@@ -66,12 +49,12 @@ Scenario: A parent with no configured environment delegates an API migration, qu
 
 ## Window 2 (after request 6: input diverged at item 03)
 -- request 7 (turn) --
-00:additional_tools/developer (2; hash=7958a01e34d95ac2):
-        - namespace/functions; hash=30a5fc1fcffb1c04
+00:additional_tools/developer (2; hash=1efa2dc9d797cace):
+        - namespace/functions; hash=f33f647fee88e25e
           - custom/exec
           - function/wait
           - function/request_user_input
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -83,23 +66,7 @@ Scenario: A parent with no configured environment delegates an API migration, qu
 02:message/developer:
     <PERMISSIONS_INSTRUCTIONS>
 03:message/developer:
-    You are an agent in a team of agents collaborating to complete a task.
-
-    You can spawn sub-agents to handle subtasks, and those sub-agents can spawn their own sub-agents. All ag...nd capable, and have access to the same set of tools. [hash=876a93c54d3f61d6]
-
-    You can use `spawn_agent` to create a new agent, `followup_task` to give an existing agent a new task an... `send_message` to pass a message to a running agent. [hash=824c12425c7626dc]
-    Child agents can also spawn their own sub-agents.
-
-    When you provide a response in the final channel, that content is immediately delivered back to your parent agent.
-    <OMITTED 15 LINES; ~225 TOKENS; hash=fa366829bdb214be>
-    - All agents use the same current working directory.
-    - As a result, edits made by one agent are immediately visible to all other agents.
-
-    When calling `wait_agent`, prefer longer waits (minutes) to avoid busy polling.
-
-    There are 2 available concurrency slots, meaning that up to 2 agents can be active at once, including you.
-
-    Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d...uctions; when doing so, set `fork_turns` to `"none"`. [hash=18ccf7e93ecabab9]
+    <MULTI_AGENT_ROLE>
 04:message/developer:
     <MULTI_AGENT_MODE>
 05:message/user:

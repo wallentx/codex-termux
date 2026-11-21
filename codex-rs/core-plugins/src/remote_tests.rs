@@ -49,11 +49,12 @@ async fn remote_plugin_list_routes_the_complete_query_url() {
 }
 
 #[tokio::test]
-async fn recommended_plugins_requests_codex_suggestions_endpoint() {
+async fn recommended_plugins_requests_uninstalled_codex_suggestions() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/suggested/codex"))
         .and(query_param("scope", "GLOBAL"))
+        .and(query_param("includeInstalled", "false"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "enabled": true,
             "plugins": [],
@@ -78,7 +79,7 @@ async fn recommended_plugins_requests_codex_suggestions_endpoint() {
     assert_eq!(
         recorded_http_client_urls(&selected_urls),
         vec![format!(
-            "{}/backend-api/ps/plugins/suggested/codex?scope=GLOBAL",
+            "{}/backend-api/ps/plugins/suggested/codex?scope=GLOBAL&includeInstalled=false",
             server.uri()
         )]
     );
@@ -156,6 +157,55 @@ async fn remote_installed_plugins_paginate_across_all_scopes_without_download_ur
             ),
             format!(
                 "{}/backend-api/ps/plugins/installed?limit=200&pageToken=next+page%2F%2B",
+                server.uri()
+            ),
+        ]
+    );
+}
+
+// Skipping display assets must survive pagination without requesting bundle downloads.
+#[tokio::test]
+async fn installed_plugins_skip_display_resolution_on_every_page() {
+    let server = MockServer::start().await;
+    for (cursor, next_cursor) in [(None, Some("next page/+")), (Some("next page/+"), None)] {
+        let mock = Mock::given(method("GET"))
+            .and(path("/backend-api/ps/plugins/installed"))
+            .and(query_param("includeDisplayAssets", "false"))
+            .and(query_param_is_missing("includeDownloadUrls"));
+        let mock = match cursor {
+            Some(cursor) => mock.and(query_param("pageToken", cursor)),
+            None => mock.and(query_param_is_missing("pageToken")),
+        };
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [],
+            "pagination": {"next_page_token": next_cursor},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    }
+    let (config, selected_urls) =
+        recording_remote_plugin_service_config(format!("{}/backend-api", server.uri()));
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+
+    let plugins = fetch_remote_installed_plugins_with_display_assets(
+        &config,
+        Some(&auth),
+        InstalledPluginDisplayAssets::Skip,
+    )
+    .await
+    .expect("runtime metadata request succeeds");
+
+    assert_eq!(plugins, Vec::new());
+    assert_eq!(
+        recorded_http_client_urls(&selected_urls),
+        vec![
+            format!(
+                "{}/backend-api/ps/plugins/installed?limit=200&includeDisplayAssets=false",
+                server.uri()
+            ),
+            format!(
+                "{}/backend-api/ps/plugins/installed?limit=200&includeDisplayAssets=false&pageToken=next+page%2F%2B",
                 server.uri()
             ),
         ]
@@ -419,7 +469,8 @@ fn catalog_cache_invalidation_clears_global_collections_and_preserves_other_scop
         /*product_sku*/ None,
     );
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    for scope in [RemotePluginScope::Global, RemotePluginScope::Workspace] {
+    let scopes = [RemotePluginScope::Global, RemotePluginScope::Workspace];
+    for scope in scopes {
         catalog_cache::write_cached_directory_plugins(
             codex_home.path(),
             &config,
@@ -430,10 +481,10 @@ fn catalog_cache_invalidation_clears_global_collections_and_preserves_other_scop
         );
     }
 
-    assert_eq!(
-        cached_remote_plugin_catalog_scopes(codex_home.path(), &config, Some(&auth)),
-        BTreeSet::from([RemotePluginScope::Global, RemotePluginScope::Workspace])
-    );
+    let has_cached_scope = |scope| {
+        has_fresh_cached_remote_plugin_catalog(codex_home.path(), &config, Some(&auth), scope)
+    };
+    assert!(scopes.into_iter().all(has_cached_scope));
     catalog_cache::write_cached_directory_plugins(
         codex_home.path(),
         &config,
@@ -450,17 +501,16 @@ fn catalog_cache_invalidation_clears_global_collections_and_preserves_other_scop
         &[RemotePluginScope::Global],
     );
 
-    assert_eq!(
-        cached_remote_plugin_catalog_scopes(codex_home.path(), &config, Some(&auth)),
-        BTreeSet::from([RemotePluginScope::Workspace]),
-    );
+    assert!(!has_cached_scope(RemotePluginScope::Global));
+    assert!(has_cached_scope(RemotePluginScope::Workspace));
     assert!(
-        catalog_cache::load_cached_directory_plugins(
+        catalog_cache::load_cached_directory_plugins::<RemotePluginDirectoryItem>(
             codex_home.path(),
             &config,
             &auth,
             RemotePluginScope::Global,
             Some(OPENAI_CURATED_REMOTE_COLLECTION_KEY),
+            RemotePluginCatalogCacheMode::PreferCache,
         )
         .is_none()
     );

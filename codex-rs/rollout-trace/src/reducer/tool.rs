@@ -19,13 +19,13 @@ use crate::raw_event::RawEventSeq;
 use crate::raw_event::RawToolCallRequester;
 
 mod agents;
-mod mcp;
 mod terminal;
 
 #[cfg(test)]
 #[path = "tool/mcp_tests.rs"]
 mod mcp_tests;
 
+pub(super) use agents::NativeToolDelivery;
 pub(super) use agents::ObservedAgentResultEdge;
 pub(super) use agents::PendingAgentInteractionEdge;
 pub(super) use agents::spawn_edge_id;
@@ -123,11 +123,6 @@ impl TraceReducer {
             .invocation_payload
             .as_ref()
             .map(|payload| payload.raw_payload_id.clone());
-        self.link_wait_tool_call_from_request_payload(
-            &thread_id,
-            &tool_call_id,
-            started.invocation_payload.as_ref(),
-        )?;
 
         self.rollout.tool_calls.insert(
             tool_call_id.clone(),
@@ -136,6 +131,8 @@ impl TraceReducer {
                 mcp_call_id: None,
                 model_visible_call_id,
                 code_mode_runtime_tool_id: started.code_mode_runtime_tool_id,
+                started_code_cell_id: None,
+                resolved_wait_runtime_cell_id: None,
                 thread_id,
                 started_by_codex_turn_id: codex_turn_id,
                 execution: ExecutionWindow {
@@ -242,26 +239,25 @@ impl TraceReducer {
         seq: RawEventSeq,
         wall_time_unix_ms: i64,
         tool_call_id: ToolCallId,
+        kind: ToolCallKind,
         runtime_payload: RawPayloadRef,
     ) -> Result<()> {
-        let (thread_id, _requester, kind, existing_terminal_operation_id) = {
+        let (thread_id, existing_terminal_operation_id) = {
             let Some(tool_call) = self.rollout.tool_calls.get_mut(&tool_call_id) else {
                 bail!("tool runtime start referenced unknown call {tool_call_id}");
             };
+            // Interception and MCP aliases can route a callable to a different handler.
+            // Keep its original summary/invocation, but classify execution by that handler.
+            tool_call.kind = kind.clone();
             push_unique(
                 &mut tool_call.raw_runtime_payload_ids,
                 &runtime_payload.raw_payload_id,
             );
             (
                 tool_call.thread_id.clone(),
-                tool_call.requester.clone(),
-                tool_call.kind.clone(),
                 tool_call.terminal_operation_id.clone(),
             )
         };
-        if self.classify_mcp_runtime_start(&tool_call_id, &runtime_payload)? {
-            return Ok(());
-        }
         if existing_terminal_operation_id.is_some()
             && matches!(kind, ToolCallKind::ExecCommand | ToolCallKind::WriteStdin)
         {
@@ -431,7 +427,7 @@ impl TraceReducer {
         Ok(())
     }
 
-    fn single_tool_for_model_visible_call(
+    pub(super) fn single_tool_for_model_visible_call(
         &self,
         model_visible_call_id: &str,
     ) -> Result<Option<ToolCallId>> {
@@ -454,14 +450,12 @@ impl TraceReducer {
         call_id: &str,
         kinds: &[ConversationItemKind],
     ) -> Vec<String> {
-        self.rollout
-            .conversation_items
-            .values()
-            .filter(|item| {
-                item.thread_id == thread_id
-                    && item.call_id.as_deref() == Some(call_id)
-                    && kinds.contains(&item.kind)
-            })
+        // A late tool-start event must link outputs in history order, not map-key order.
+        self.rollout.threads[thread_id]
+            .conversation_item_ids
+            .iter()
+            .map(|item_id| &self.rollout.conversation_items[item_id])
+            .filter(|item| item.call_id.as_deref() == Some(call_id) && kinds.contains(&item.kind))
             .map(|item| item.item_id.clone())
             .collect::<Vec<_>>()
     }

@@ -3,14 +3,21 @@
 //! Prefixes and dependency paths can contain any work kind; this recorder adds tool and
 //! review and human-wait intervals, or Unknown for a dependency wait whose history is unavailable.
 //! Review callbacks must retain their invocation guard and bracket blocking automated
-//! reviews with the review guard's lifetime. Execution-lock admission timing is separate.
+//! reviews with the review guard's lifetime. Runtime lookup retains weak owners;
+//! execution-lock admission timing is separate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
+mod runtime;
+pub use runtime::AdmittedToolTiming;
+pub use runtime::ToolAdmission;
+pub use runtime::ToolGateTiming;
+
 use codex_utils_critical_path::CriticalPath;
+use codex_utils_critical_path::ReviewExecution;
 use codex_utils_critical_path::WorkKind;
 
 /// Completion time and dependency history for one direct invocation.
@@ -67,16 +74,23 @@ impl ToolBatchTiming {
 #[derive(Clone, Default)]
 pub struct DirectToolTimings(Arc<Mutex<State>>);
 
+impl std::fmt::Debug for DirectToolTimings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectToolTimings").finish_non_exhaustive()
+    }
+}
+
 #[derive(Default)]
 struct State {
     calls: HashMap<String, Vec<DirectToolInvocation>>,
 }
 
 struct DirectToolInvocation {
+    runtime_owner: Option<(String, std::sync::Weak<ToolTimingGuard>)>,
     identity: Arc<()>,
     path: Option<CriticalPath>,
     segment_started_at: Instant,
-    active_auto_reviews: usize,
+    active_auto_reviews: Vec<ReviewExecution>,
     active_user_waits: usize,
     batch: ToolBatchTiming,
 }
@@ -97,6 +111,7 @@ enum BlockingKind {
 /// Records a blocking interval until dropped; user waits take precedence over reviews.
 pub struct ToolBlockingTimingGuard {
     kind: BlockingKind,
+    review: Option<ReviewExecution>,
     identity: Arc<()>,
     timings: DirectToolTimings,
     call_id: String,
@@ -108,15 +123,22 @@ impl DirectToolInvocation {
         // to the human wait; all remaining invocation time is elapsed tool work.
         let kind = if self.active_user_waits > 0 {
             WorkKind::UserWait
-        } else if self.active_auto_reviews > 0 {
+        } else if !self.active_auto_reviews.is_empty() {
             WorkKind::AutoReview
         } else {
             WorkKind::Tools
         };
-        self.path = self
-            .path
-            .take()
-            .map(|path| path.work(self.segment_started_at, now, kind));
+        self.path = self.path.take().map(|path| {
+            if matches!(kind, WorkKind::AutoReview) {
+                path.auto_review(
+                    self.segment_started_at,
+                    now,
+                    self.active_auto_reviews.clone(),
+                )
+            } else {
+                path.work(self.segment_started_at, now, kind)
+            }
+        });
         self.segment_started_at = now;
     }
 
@@ -164,10 +186,11 @@ impl DirectToolTimings {
             None
         };
         calls.push(DirectToolInvocation {
+            runtime_owner: None,
             identity: Arc::clone(&identity),
             path,
             segment_started_at: started_at,
-            active_auto_reviews: 0,
+            active_auto_reviews: Vec::new(),
             active_user_waits: 0,
             batch,
         });
@@ -191,6 +214,44 @@ impl DirectToolTimings {
         }
     }
 
+    pub fn start_turn_direct_call(
+        &self,
+        call_id: &str,
+        turn_id: &str,
+        batch: ToolBatchTiming,
+        started_at: Instant,
+        prefix: Option<CriticalPath>,
+    ) -> Arc<ToolTimingGuard> {
+        let work = Arc::new(self.start_direct_call(call_id, batch, started_at, prefix));
+        let mut state = self.state();
+        if let Some(invocation) = state.calls.get_mut(call_id).and_then(|calls| {
+            calls
+                .iter_mut()
+                .find(|invocation| Arc::ptr_eq(&invocation.identity, &work.identity))
+        }) {
+            invocation.runtime_owner = Some((turn_id.to_owned(), Arc::downgrade(&work)));
+        }
+        work
+    }
+
+    pub fn start_review_for_turn(
+        &self,
+        call_id: &str,
+        turn_id: &str,
+    ) -> Option<ToolBlockingTimingGuard> {
+        self.owner_for_turn(call_id, turn_id)?.start_review()
+    }
+
+    pub fn owner_for_turn(&self, call_id: &str, turn_id: &str) -> Option<Arc<ToolTimingGuard>> {
+        let mut state = self.state();
+        let (owner_turn, owner) = state.unique_work(call_id)?.runtime_owner.as_ref()?;
+        if owner_turn != turn_id {
+            return None;
+        }
+        // Retain the invocation identity across registry unlock and later ID reuse.
+        owner.upgrade()
+    }
+
     fn finish(&self, call_id: &str, identity: &Arc<()>) -> Option<CompletedWork> {
         let mut state = self.state();
         let calls = state.calls.get_mut(call_id)?;
@@ -203,6 +264,9 @@ impl DirectToolTimings {
         }
         let ended_at = Instant::now();
         work.record_until(ended_at);
+        for review in &work.active_auto_reviews {
+            review.seal();
+        }
         let completed = CompletedWork {
             ended_at,
             path: work.path,
@@ -240,12 +304,20 @@ impl ToolTimingGuard {
             .iter_mut()
             .find(|work| Arc::ptr_eq(&work.identity, &self.identity))?;
         work.record_until(Instant::now());
-        match kind {
-            BlockingKind::AutoReview => work.active_auto_reviews += 1,
-            BlockingKind::UserWait => work.active_user_waits += 1,
-        }
+        let review = match kind {
+            BlockingKind::AutoReview => {
+                let review = ReviewExecution::default();
+                work.active_auto_reviews.push(review.clone());
+                Some(review)
+            }
+            BlockingKind::UserWait => {
+                work.active_user_waits += 1;
+                None
+            }
+        };
         Some(ToolBlockingTimingGuard {
             kind,
+            review,
             identity: Arc::clone(&self.identity),
             timings: self.timings.clone(),
             call_id: self.call_id.clone(),
@@ -264,19 +336,36 @@ impl Drop for ToolTimingGuard {
     }
 }
 
+impl ToolBlockingTimingGuard {
+    /// Returns the observer for this exact review; human waits have no observer.
+    /// Call before submitting child work, including when a cached review runs no child.
+    pub fn review_execution(&self) -> Option<ReviewExecution> {
+        let review = self.review.as_ref()?;
+        review.observe();
+        Some(review.clone())
+    }
+}
+
 impl Drop for ToolBlockingTimingGuard {
     fn drop(&mut self) {
+        if let Some(review) = &self.review {
+            review.seal();
+        }
         if let Some(calls) = self.timings.state().calls.get_mut(&self.call_id)
             && let Some(work) = calls
                 .iter_mut()
                 .find(|work| Arc::ptr_eq(&work.identity, &self.identity))
         {
             work.record_until(Instant::now());
-            let counter = match self.kind {
-                BlockingKind::AutoReview => &mut work.active_auto_reviews,
-                BlockingKind::UserWait => &mut work.active_user_waits,
-            };
-            *counter = counter.saturating_sub(1);
+            match self.kind {
+                BlockingKind::AutoReview => {
+                    work.active_auto_reviews
+                        .retain(|review| Some(review) != self.review.as_ref());
+                }
+                BlockingKind::UserWait => {
+                    work.active_user_waits = work.active_user_waits.saturating_sub(1);
+                }
+            }
         }
     }
 }

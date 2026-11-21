@@ -52,7 +52,7 @@ pub(super) enum PageLoadMode {
 /// Tracks the current request and the cursor policy inherited by its next page.
 pub(super) struct PaginationState {
     pub(super) next_cursor: Option<PageCursor>,
-    next_page_mode: PageLoadMode,
+    pub(super) next_page_mode: PageLoadMode,
     pub(super) num_scanned_files: usize,
     pub(super) reached_scan_cap: bool,
     loading: LoadingState,
@@ -127,6 +127,9 @@ impl PaginationState {
     /// Returns the next cursor together with the listing mode that produced it.
     pub(super) fn next_page(&self) -> Option<(PageCursor, PageLoadMode)> {
         if self.is_loading() {
+            return None;
+        }
+        if matches!(self.next_cursor, Some(PageCursor::SourcesPending)) {
             return None;
         }
         self.next_cursor

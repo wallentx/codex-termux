@@ -49,7 +49,7 @@ fn enable_test_ambient_pet(chat: &mut ChatWidget) {
 
 fn take_workspace_headline_request_id(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
-) -> u64 {
+) -> uuid::Uuid {
     match rx.try_recv() {
         Ok(AppEvent::RefreshStatusLineWorkspaceHeadline { request_id }) => request_id,
         event => panic!("expected workspace headline refresh, got {event:?}"),
@@ -154,6 +154,7 @@ async fn daybreak_refusal_offers_enable_for_the_next_turn() {
     let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
     model.model = "gpt-5.6-sol".into();
     model.available_access_programs = Some(codex_protocol::openai_models::ModelAccessPrograms {
+        daybreak_availability: Default::default(),
         cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
     });
     chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![model]));
@@ -185,6 +186,171 @@ async fn daybreak_refusal_offers_enable_for_the_next_turn() {
     );
     assert!(ops.try_recv().is_err());
 
+    let error = AppServerTurnError {
+        message: "blocked".into(),
+        codex_error_info: Some(CodexErrorInfo::CyberPolicy),
+        misalignment: None,
+        additional_details: None,
+    };
+    let reply = r#"<send_user_message_question_reply>{"questionItemId":"q","question":"Q","answer":"\u0024google-drive"}</send_user_message_question_reply>"#;
+    let long_prompt = "界".repeat(334);
+    for (label, prompt, eligible) in [
+        ("Hidden\nrow", "Explain access", false),
+        ("Overview", "Use $connector", false),
+        ("Overview", "Use [@tool](plugin://tool)", false),
+        ("Overview", reply, false),
+        ("Overview", &long_prompt, false),
+        ("Recovery", "Explain access", false),
+        ("Enable Daybreak", "Explain access", false),
+        ("Overview", "Explain access", true),
+    ] {
+        handle_turn_started(&mut chat, "recourse");
+        safety_recourse::on_metadata(
+            &mut chat,
+            codex_app_server_protocol::TurnModerationMetadataNotification {
+                thread_id: thread_id.to_string(),
+                turn_id: "recourse".into(),
+                metadata: json!({"safety_recourse": {
+                    "schema_version": 1, "domain": "cyber", "source": "user_request",
+                    "source_message": {"id":"1", "kind":"ordinary_message", "role":"user"},
+                    "topic": "unauthorized_account_or_system_access",
+                    "suggestions": [
+                        {"label": label, "prompt_text": prompt},
+                        {"label": "Recovery", "prompt_text": "Explain account recovery"},
+                        {"label": "Prevention", "prompt_text": "Explain account protection"}
+                    ]
+                }}),
+            },
+        );
+        let pending = chat.safety_recourse.take();
+        assert!(safety_recourse::render_failure(&mut chat, pending, &error));
+        let picker = render_bottom_popup(&chat, /*width*/ 80);
+        assert!(picker.contains("Prevention"));
+        assert_eq!(picker.contains("3. Prevention"), eligible);
+        if !eligible {
+            chat.handle_key_event(KeyCode::Esc.into());
+        }
+    }
+    assert_chatwidget_snapshot!(
+        "daybreak_recourse_picker",
+        render_bottom_popup(&chat, /*width*/ 80)
+    );
+    chat.handle_key_event(KeyCode::Char('5').into());
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+            event,
+            AppEvent::OpenFeedbackConsent {
+                category: crate::app_event::FeedbackCategory::SafetyCheck
+            }
+        ))
+    );
+    chat.open_feedback_consent(
+        crate::app_event::FeedbackCategory::SafetyCheck,
+        /*can_save*/ true,
+    );
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Include logs and session history?"));
+    chat.handle_key_event(KeyCode::Esc.into());
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("1. Overview"));
+    chat.handle_key_event(KeyCode::Char('4').into());
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+        event, AppEvent::PersistDaybreakSelection { thread_id: id, enabled: true } if id == thread_id
+    )));
+
+    let mut daybreak = crate::test_support::TEST_MODEL_PRESETS[0].clone();
+    daybreak.model = "gpt-5.6-sol".into();
+    daybreak.available_access_programs = Some(codex_protocol::openai_models::ModelAccessPrograms {
+        daybreak_availability: Default::default(),
+        cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
+    });
+    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![daybreak.clone()]));
+    chat.set_model("gpt-5.6-sol");
+    chat.daybreak_enabled = true;
+    handle_turn_started(&mut chat, "daybreak-recourse");
+    safety_recourse::on_metadata(
+        &mut chat,
+        codex_app_server_protocol::TurnModerationMetadataNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "daybreak-recourse".into(),
+            metadata: json!({"safety_recourse": {
+                "schema_version": 1, "domain": "cyber", "source": "user_request",
+                "source_message": {"id":"1", "kind":"ordinary_message", "role":"user"},
+                "topic": "unauthorized_account_or_system_access",
+                "suggestions": [
+                    {"label": "Overview", "prompt_text": "Explain access"},
+                    {"label": "Recovery", "prompt_text": "Explain account recovery"},
+                    {"label": "Prevention", "prompt_text": "Explain account protection"}
+                ]
+            }}),
+        },
+    );
+    let pending = chat.safety_recourse.take();
+    assert!(chat.daybreak_account_eligible());
+    assert!(chat.daybreak_enabled);
+    assert_eq!(chat.cyber_policy_notice(), crate::daybreak::Notice::Enabled);
+    assert!(safety_recourse::render_failure(&mut chat, pending, &error));
+    let cells = drain_insert_history(&mut events);
+    let notices = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>();
+    let notice = notices
+        .iter()
+        .find(|notice| notice.contains("Daybreak is on"))
+        .unwrap_or_else(|| panic!("missing Daybreak-on notice: {notices:#?}"));
+    assert!(notice.contains("You can ask Codex for an overview"));
+    let picker = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(picker.contains("Overview"));
+    assert!(!picker.contains("Enable Daybreak"));
+    chat.handle_key_event(KeyCode::Esc.into());
+    chat.daybreak_enabled = false;
+
+    let mut astra = crate::test_support::TEST_MODEL_PRESETS[0].clone();
+    astra.model = "gpt-6-astra".into();
+    astra.available_access_programs = Some(codex_protocol::openai_models::ModelAccessPrograms {
+        daybreak_availability: Default::default(),
+        cyber: vec![codex_protocol::turn_input::CyberAccessProgram::Standard],
+    });
+    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![astra]));
+    chat.set_model("gpt-6-astra");
+    handle_turn_started(&mut chat, "astra-recourse");
+    safety_recourse::on_metadata(
+        &mut chat,
+        codex_app_server_protocol::TurnModerationMetadataNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "astra-recourse".into(),
+            metadata: json!({"safety_recourse": {
+                "schema_version": 1, "domain": "cyber", "source": "user_request",
+                "source_message": {"id":"1", "kind":"ordinary_message", "role":"user"},
+                "topic": "unauthorized_account_or_system_access",
+                "suggestions": [
+                    {"label": "Overview", "prompt_text": "Explain access"},
+                    {"label": "Recovery", "prompt_text": "Explain account recovery"},
+                    {"label": "Prevention", "prompt_text": "Explain account protection"}
+                ]
+            }}),
+        },
+    );
+    let pending = chat.safety_recourse.take();
+    assert!(safety_recourse::render_failure(&mut chat, pending, &error));
+    let cells = drain_insert_history(&mut events);
+    let notices = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>();
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.contains("Daybreak isn’t available for Astra")),
+        "missing Astra notice: {notices:#?}"
+    );
+    let picker = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(picker.contains("Overview"));
+    assert!(!picker.contains("Enable Daybreak"));
+    chat.handle_key_event(KeyCode::Esc.into());
+
+    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![daybreak]));
+    chat.set_model("gpt-5.6-sol");
+    chat.daybreak_enabled = false;
     chat.set_parent_owned_thread();
     handle_error(
         &mut chat,
@@ -225,6 +391,7 @@ async fn app_server_model_verification_renders_warning() {
 async fn context_indicator_shows_used_tokens_when_window_unknown() {
     let (mut chat, _rx, _ops) = make_chatwidget_manual(Some("unknown-model")).await;
 
+    chat.thread_id = Some(ThreadId::new());
     chat.config.model_context_window = None;
     let auto_compact_limit = 200_000;
     chat.config.model_auto_compact_token_limit = Some(auto_compact_limit);
@@ -236,17 +403,38 @@ async fn context_indicator_shows_used_tokens_when_window_unknown() {
         ..TokenUsage::default()
     };
     let token_info = TokenUsageInfo {
-        total_token_usage: token_usage.clone(),
-        last_token_usage: token_usage,
+        total_token_usage: token_usage,
+        last_token_usage: TokenUsage {
+            total_tokens: 40_000,
+            ..TokenUsage::default()
+        },
         model_context_window: None,
     };
 
-    handle_token_count(&mut chat, Some(token_info));
+    handle_token_count(&mut chat, Some(token_info.clone()));
 
     assert_eq!(chat.bottom_pane.context_window_percent(), None);
     assert_eq!(
         chat.bottom_pane.context_window_used_tokens(),
         Some(total_tokens)
+    );
+    let state = serde_json::to_value(chat.statusline_state()).unwrap();
+    assert_eq!(
+        state["thread"]["usage"]["context"],
+        json!({"used_tokens": 40_000})
+    );
+
+    handle_token_count(
+        &mut chat,
+        Some(TokenUsageInfo {
+            model_context_window: Some(68_000),
+            ..token_info
+        }),
+    );
+    let state = serde_json::to_value(chat.statusline_state()).unwrap();
+    assert_eq!(
+        state["thread"]["usage"]["context"],
+        json!({"context_window_size": 68_000, "used_tokens": 40_000, "used_percentage": 50})
     );
 }
 
@@ -1148,11 +1336,17 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         rate_limit_reached_type: None,
     }));
     assert_eq!(chat.plan_type, Some(PlanType::Pro));
+
+    let unknown = serde_json::from_value(serde_json::json!({"planType": "unknown"})).unwrap();
+    chat.on_rate_limit_snapshot(Some(unknown));
+    assert_eq!(chat.plan_type, Some(PlanType::Pro));
 }
 
 #[tokio::test]
 async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.thread_id = Some(ThreadId::new());
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: Some("codex".to_string()),
@@ -1163,7 +1357,11 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
             window_duration_mins: Some(300),
             resets_at: Some(100),
         }),
-        secondary: None,
+        secondary: Some(RateLimitWindow {
+            used_percent: 8,
+            window_duration_mins: Some(10_080),
+            resets_at: None,
+        }),
         credits: Some(CreditsSnapshot {
             has_credits: true,
             unlimited: false,
@@ -1192,6 +1390,15 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
         rate_limit_reached_type: None,
     }));
 
+    let state = serde_json::to_value(chat.statusline_state()).unwrap();
+    assert_eq!(
+        state["account"]["rate_limits"],
+        serde_json::json!([{
+            "limit_id": "codex", "limit_name": "codex",
+            "primary_limit": {"used_percent": 20.0, "window_minutes": 300, "resets_at": 100},
+            "secondary_limit": {"used_percent": 8.0, "window_minutes": 10_080, "resets_at": null}
+        }])
+    );
     let codex = chat
         .rate_limit_snapshots_by_limit_id
         .get("codex")
@@ -1381,6 +1588,54 @@ async fn rate_limit_switch_prompt_clears_pending_when_workspace_credits_become_u
         chat.rate_limit_switch_prompt,
         RateLimitSwitchPromptState::Idle
     ));
+}
+
+#[tokio::test]
+async fn rate_limit_switch_prompt_clears_when_account_usage_recovers() {
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.has_chatgpt_account = true;
+
+    chat.on_rolling_rate_limit_snapshot(snapshot(/*percent*/ 95.0));
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 0.0)));
+    chat.maybe_show_pending_rate_limit_prompt();
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+
+    chat.start_usage_notice_read(/*request_id*/ 1);
+    chat.on_rolling_rate_limit_snapshot(snapshot(/*percent*/ 95.0));
+    chat.maybe_show_pending_rate_limit_prompt();
+    assert!(!chat.bottom_pane.no_modal_or_popup_active());
+
+    chat.apply_usage_notice_read(/*request_id*/ 1);
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 0.0)));
+    assert!(!chat.bottom_pane.no_modal_or_popup_active());
+
+    chat.start_usage_notice_read(/*request_id*/ 2);
+    chat.apply_usage_notice_read(/*request_id*/ 2);
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 0.0)));
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("rate_limit_switch_prompt_recovered", popup);
+    let RateLimitSwitchPromptState::Recovering { deadline, .. } = chat.rate_limit_switch_prompt
+    else {
+        panic!("expected recovery countdown");
+    };
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 0.0)));
+    chat.tick_rate_limit_recovery_prompt(deadline - Duration::from_secs(/*secs*/ 1));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Dismissing in 1 second…"));
+    chat.tick_rate_limit_recovery_prompt(deadline);
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+}
+
+#[tokio::test]
+async fn rate_limit_recovery_prompt_can_be_dismissed_manually() {
+    for key in [KeyCode::Enter, KeyCode::Esc] {
+        let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5")).await;
+        chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 95.0)));
+        chat.maybe_show_pending_rate_limit_prompt();
+        chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 0.0)));
+        assert!(!chat.bottom_pane.no_modal_or_popup_active());
+        chat.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
+        assert!(chat.bottom_pane.no_modal_or_popup_active());
+    }
 }
 
 #[tokio::test]
@@ -2739,12 +2994,12 @@ async fn ambient_pet_reduces_stream_width_and_composer_text_width() {
         .set_composer_text(draft, Vec::new(), Vec::new());
 
     let mut with_pet_terminal =
-        Terminal::new(TestBackend::new(/*width*/ 80, /*height*/ 6)).expect("create terminal");
+        Terminal::new(TestBackend::new(/*width*/ 80, /*height*/ 8)).expect("create terminal");
     with_pet_terminal
         .draw(|f| with_pet.render(f.area(), f.buffer_mut()))
         .expect("draw pet-enabled chat");
     let mut disabled_terminal =
-        Terminal::new(TestBackend::new(/*width*/ 80, /*height*/ 6)).expect("create terminal");
+        Terminal::new(TestBackend::new(/*width*/ 80, /*height*/ 8)).expect("create terminal");
     disabled_terminal
         .draw(|f| disabled.render(f.area(), f.buffer_mut()))
         .expect("draw disabled-pet chat");
@@ -3117,6 +3372,7 @@ async fn status_line_estimated_thread_cost_fetches_and_renders_backend_estimate(
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 46_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -3153,6 +3409,7 @@ async fn status_line_thread_credits_fetches_and_renders_fractional_credits() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 5_240_000,
             estimated_usage_usd_micros: Some(210_000),
@@ -3186,6 +3443,7 @@ async fn status_line_thread_credits_and_cost_share_one_backend_request() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 5_200_000,
             estimated_usage_usd_micros: Some(210_000),
@@ -3220,6 +3478,7 @@ async fn status_line_thread_credits_remain_visible_when_usd_is_unavailable() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 5_200_000,
             estimated_usage_usd_micros: None,
@@ -3262,6 +3521,7 @@ async fn terminal_title_thread_usage_fetches_and_renders_without_status_line() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 5_200_000,
             estimated_usage_usd_micros: Some(210_000),
@@ -3299,6 +3559,7 @@ async fn terminal_title_thread_credits_remain_visible_when_usd_is_unavailable() 
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 5_200_000,
             estimated_usage_usd_micros: None,
@@ -3336,6 +3597,7 @@ async fn terminal_title_and_status_line_share_one_thread_usage_request() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 5_200_000,
             estimated_usage_usd_micros: Some(210_000),
@@ -3409,6 +3671,7 @@ async fn status_line_estimated_thread_cost_preserves_cached_amount_during_settle
         thread_id,
         initial_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 46_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -3425,6 +3688,7 @@ async fn status_line_estimated_thread_cost_preserves_cached_amount_during_settle
         thread_id,
         settlement_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 0,
             estimated_usage_usd_micros: Some(0),
@@ -3457,6 +3721,7 @@ async fn completed_turn_refreshes_estimated_thread_cost() {
         thread_id,
         initial_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 46_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -3481,6 +3746,7 @@ async fn completed_turn_refreshes_estimated_thread_cost() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 50_000_000,
             estimated_usage_usd_micros: Some(2_100_000),
@@ -3509,6 +3775,7 @@ async fn completed_turn_refreshes_credits_only_terminal_title() {
         thread_id,
         initial_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 5_200_000,
             estimated_usage_usd_micros: None,
@@ -3533,6 +3800,7 @@ async fn completed_turn_refreshes_credits_only_terminal_title() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 6_200_000,
             estimated_usage_usd_micros: None,
@@ -3560,6 +3828,7 @@ async fn interrupted_turn_refreshes_estimated_thread_usage() {
         thread_id,
         initial_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 46_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -3601,6 +3870,7 @@ async fn failed_turn_refreshes_estimated_thread_usage() {
         thread_id,
         initial_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 46_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -3652,6 +3922,7 @@ async fn status_line_estimated_thread_cost_rejects_stale_thread_completions() {
         previous_thread_id,
         previous_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: previous_thread_id.to_string(),
             estimated_usage_credits_micros: 46_000_000,
             estimated_usage_usd_micros: Some(1_820_000),
@@ -3664,6 +3935,7 @@ async fn status_line_estimated_thread_cost_rejects_stale_thread_completions() {
         active_thread_id,
         active_request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: active_thread_id.to_string(),
             estimated_usage_credits_micros: 1_000_000,
             estimated_usage_usd_micros: Some(400),
@@ -3698,6 +3970,7 @@ async fn status_line_estimated_thread_cost_footer_snapshot() {
         thread_id,
         request_id,
         Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            native_usage_usd_micros: None,
             thread_id: thread_id.to_string(),
             estimated_usage_credits_micros: 5_200_000,
             estimated_usage_usd_micros: Some(210_000),
@@ -3730,6 +4003,11 @@ async fn status_line_workspace_headline_renders_cached_value() {
         status_line_text(&chat),
         Some("Workspace maintenance starts at 5pm".to_string())
     );
+    let state = serde_json::to_value(chat.statusline_state()).unwrap();
+    assert_eq!(
+        state["account"]["workspace"],
+        serde_json::json!({"headline": "Workspace maintenance starts at 5pm"})
+    );
     assert!(
         drain_insert_history(&mut rx).is_empty(),
         "workspace-headline should be a valid status line item"
@@ -3759,7 +4037,7 @@ async fn workspace_headline_update_applies_feature_disabled_result() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.local_settings.tui.status_line = Some(vec!["workspace-headline".to_string()]);
     chat.status_line_workspace_headline = Some("Old headline".to_string());
-    let request_id = 3;
+    let request_id = uuid::Uuid::new_v4();
     chat.status_line_workspace_headline_pending_request_id = Some(request_id);
 
     assert!(chat.set_status_line_workspace_headline(
@@ -3775,7 +4053,7 @@ async fn workspace_headline_update_applies_feature_disabled_result() {
 async fn workspace_headline_update_applies_available_headline() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.local_settings.tui.status_line = Some(vec!["workspace-headline".to_string()]);
-    let request_id = 4;
+    let request_id = uuid::Uuid::new_v4();
     chat.status_line_workspace_headline_pending_request_id = Some(request_id);
 
     assert!(chat.set_status_line_workspace_headline(
@@ -3799,7 +4077,7 @@ async fn account_update_clears_workspace_headline_state() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.local_settings.tui.status_line = Some(vec!["workspace-headline".to_string()]);
     chat.status_line_workspace_headline = Some("Old workspace headline".to_string());
-    chat.status_line_workspace_headline_pending_request_id = Some(5);
+    chat.status_line_workspace_headline_pending_request_id = Some(uuid::Uuid::new_v4());
     chat.status_line_workspace_headline_last_requested_at = Some(Instant::now());
     chat.status_line_workspace_messages_disabled = true;
 
@@ -3837,6 +4115,25 @@ async fn workspace_headline_fetch_allows_backend_auth_without_chatgpt_account() 
 }
 
 #[tokio::test]
+async fn replacement_widget_rejects_the_previous_widgets_workspace_headline() {
+    let request_headline = async || {
+        let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.local_settings.tui.status_line = Some(vec!["workspace-headline".into()]);
+        chat.has_codex_backend_auth = true;
+        chat.refresh_status_line();
+        (chat, take_workspace_headline_request_id(&mut rx))
+    };
+    let (_, stale) = request_headline().await;
+    let (mut replacement, current) = request_headline().await;
+
+    assert!(!replacement.set_status_line_workspace_headline(
+        stale,
+        Ok(crate::workspace_messages::WorkspaceHeadlineFetchResult::FeatureDisabled),
+    ));
+    assert!(replacement.is_pending_workspace_headline(current));
+}
+
+#[tokio::test]
 async fn account_update_discards_stale_workspace_headline_results() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.local_settings.tui.status_line = Some(vec!["workspace-headline".to_string()]);
@@ -3845,6 +4142,7 @@ async fn account_update_discards_stale_workspace_headline_results() {
         Some(StatusAccountDisplay::ChatGpt {
             email: Some("first@example.com".to_string()),
             plan: None,
+            workspace: None,
         }),
         /*plan_type*/ None,
         /*has_chatgpt_account*/ true,
@@ -3856,6 +4154,7 @@ async fn account_update_discards_stale_workspace_headline_results() {
         Some(StatusAccountDisplay::ChatGpt {
             email: Some("second@example.com".to_string()),
             plan: None,
+            workspace: None,
         }),
         /*plan_type*/ None,
         /*has_chatgpt_account*/ true,
@@ -4030,38 +4329,58 @@ async fn completed_turn_clears_visible_running_hook() {
 }
 
 #[tokio::test]
-async fn status_line_fast_mode_renders_on_and_off() {
+async fn status_line_processing_tier_updates_with_selection() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     set_fast_mode_test_catalog(&mut chat);
     chat.local_settings.tui.status_line = Some(vec!["fast-mode".to_string()]);
+    chat.local_settings.tui.terminal_title = Some(vec!["fast-mode".to_string()]);
 
     chat.refresh_status_line();
-    assert_eq!(status_line_text(&chat), Some("Fast off".to_string()));
+    assert_eq!(status_line_text(&chat), Some("Standard".to_string()));
 
     chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
-    chat.refresh_status_line();
-    assert_eq!(status_line_text(&chat), Some("Fast on".to_string()));
+    assert_eq!(status_line_text(&chat), Some("fast".to_string()));
+    insta::assert_snapshot!(chat.last_terminal_title.as_deref().unwrap(), @"fast");
+
+    chat.set_feature_enabled(Feature::FastMode, /*enabled*/ false);
+    assert_eq!(
+        (status_line_text(&chat), chat.last_terminal_title.clone()),
+        (Some("Standard".to_string()), Some("Standard".to_string()))
+    );
+    chat.set_feature_enabled(Feature::FastMode, /*enabled*/ true);
+
+    chat.set_model("gpt-5.2");
+    chat.set_service_tier(Some(ServiceTier::Flex.request_value().to_string()));
+    assert_eq!(status_line_text(&chat), Some("Flex".to_string()));
+    for provider_id in [
+        codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID,
+        "remote-only-provider",
+    ] {
+        chat.config.model_provider_id = provider_id.into();
+        chat.refresh_status_line();
+        assert_eq!(status_line_text(&chat), Some("Standard".to_string()));
+    }
 }
 
 #[tokio::test]
-async fn status_line_fast_mode_updates_visibility_on_model_change() {
+async fn status_line_fast_mode_updates_on_model_change() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     set_fast_mode_test_catalog(&mut chat);
     chat.local_settings.tui.status_line = Some(vec!["fast-mode".to_string()]);
 
     chat.refresh_status_line();
-    assert_eq!(status_line_text(&chat), Some("Fast off".to_string()));
+    assert_eq!(status_line_text(&chat), Some("Standard".to_string()));
 
     chat.set_model("gpt-5.2");
-    assert_eq!(status_line_text(&chat), None);
+    assert_eq!(status_line_text(&chat), Some("Standard".to_string()));
 
     chat.set_model("gpt-5.4");
-    assert_eq!(status_line_text(&chat), Some("Fast off".to_string()));
+    assert_eq!(status_line_text(&chat), Some("Standard".to_string()));
 
     chat.set_model("uncatalogued-model");
-    assert_eq!(status_line_text(&chat), Some("Fast off".to_string()));
+    assert_eq!(status_line_text(&chat), Some("Standard".to_string()));
     chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
-    assert_eq!(status_line_text(&chat), Some("Fast on".to_string()));
+    assert_eq!(status_line_text(&chat), Some("Standard".to_string()));
 }
 
 #[tokio::test]
@@ -4104,10 +4423,6 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
     ]);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
     chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
-    set_chatgpt_auth(&mut chat);
-    set_fast_mode_test_catalog(&mut chat);
-    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
-    chat.refresh_status_line();
     let test_cwd = test_path_display("/tmp/project");
 
     assert_eq!(
@@ -4259,13 +4574,8 @@ async fn renamed_thread_footer_title_snapshot() {
 }
 
 #[tokio::test]
-async fn status_line_model_with_reasoning_fast_footer_snapshot() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
+async fn status_line_model_with_reasoning_speed_footer_snapshots() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
-    set_fast_mode_test_catalog(&mut chat);
-    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
     chat.show_welcome_banner = false;
     chat.config.cwd = test_project_path().abs();
     chat.local_settings.tui.status_line = Some(vec![
@@ -4273,23 +4583,68 @@ async fn status_line_model_with_reasoning_fast_footer_snapshot() {
         "context-used".to_string(),
         "current-dir".to_string(),
     ]);
+    chat.local_settings.tui.terminal_title = Some(vec!["model-with-reasoning".to_string()]);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
-    chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
     set_chatgpt_auth(&mut chat);
     set_fast_mode_test_catalog(&mut chat);
-    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
-    chat.refresh_status_line();
+    chat.set_feature_enabled(Feature::UltrafastMode, /*enabled*/ true);
 
-    let width = 80;
-    let height = chat.desired_height(width);
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw model-with-reasoning footer");
-    assert_chatwidget_snapshot!(
-        "status_line_model_with_reasoning_fast_footer",
-        normalized_backend_snapshot(terminal.backend())
-    );
+    let mut preset = get_available_model(&chat, "gpt-5.4");
+    let fast_tier = preset
+        .service_tiers
+        .iter_mut()
+        .find(|tier| tier.id == ServiceTier::Fast.request_value())
+        .expect("fast tier");
+    fast_tier.name = "Fast".to_string();
+    preset.service_tiers.extend([
+        codex_protocol::openai_models::ModelServiceTier {
+            id: "ultrafast".to_string(),
+            name: "Ultrafast".to_string(),
+            description: "Ultrafast processing".to_string(),
+        },
+        codex_protocol::openai_models::ModelServiceTier {
+            id: "low_latency".to_string(),
+            name: "Low Latency".to_string(),
+            description: String::new(),
+        },
+    ]);
+    chat.model_catalog = Arc::new(ModelCatalog::new(vec![preset]));
+
+    for (tier_id, tier_name, snapshot) in [
+        (
+            ServiceTier::Fast.request_value(),
+            "Fast",
+            "status_line_model_with_reasoning_fast_footer",
+        ),
+        (
+            "ultrafast",
+            "Ultrafast",
+            "status_line_model_with_reasoning_ultrafast_footer",
+        ),
+    ] {
+        chat.set_service_tier(Some(tier_id.to_string()));
+        chat.refresh_status_line();
+        chat.refresh_terminal_title();
+        assert_eq!(
+            chat.last_terminal_title.as_deref(),
+            Some(format!("gpt-5.4 xhigh {tier_name}").as_str())
+        );
+
+        let width = 80;
+        let height = chat.desired_height(width);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
+        terminal
+            .draw(|f| chat.render(f.area(), f.buffer_mut()))
+            .expect("draw model-with-reasoning footer");
+        assert_chatwidget_snapshot!(snapshot, normalized_backend_snapshot(terminal.backend()));
+    }
+
+    chat.local_settings.tui.status_line = Some(vec!["model-with-reasoning".to_string()]);
+    chat.set_service_tier(Some(ServiceTier::Flex.request_value().to_string()));
+    insta::assert_snapshot!(status_line_text(&chat).expect("status line"), @"gpt-5.4 xhigh flex");
+
+    chat.set_service_tier(Some("low_latency".to_string()));
+    insta::assert_snapshot!(status_line_text(&chat).expect("status line"), @"gpt-5.4 xhigh low latency");
 }
 
 #[tokio::test]
@@ -4432,6 +4787,9 @@ async fn session_configured_clears_goal_status_footer() {
 
     let rollout_file = NamedTempFile::new().unwrap();
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        read_only_history: false,
+        thread_settings_confirmed: true,
+        primary_environment_cwd: None,
         daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
@@ -4445,7 +4803,7 @@ async fn session_configured_clears_goal_status_footer() {
         approvals_reviewer: ApprovalsReviewer::User,
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
-        cwd: test_path_buf("/home/user/project").abs(),
+        cwd: test_path_buf("/home/user/project").abs().into(),
         runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -5019,7 +5377,9 @@ async fn user_prompt_submit_app_server_hook_notifications_render_snapshot() {
                 handler_type: AppServerHookHandlerType::Command,
                 execution_mode: AppServerHookExecutionMode::Sync,
                 scope: AppServerHookScope::Turn,
-                source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+                source_path: PathBuf::from(test_path_display("/tmp/hooks.json"))
+                    .abs()
+                    .into(),
                 source: codex_app_server_protocol::HookSource::User,
                 display_order: 0,
                 status: AppServerHookRunStatus::Running,
@@ -5042,7 +5402,9 @@ async fn user_prompt_submit_app_server_hook_notifications_render_snapshot() {
                 handler_type: AppServerHookHandlerType::Command,
                 execution_mode: AppServerHookExecutionMode::Sync,
                 scope: AppServerHookScope::Turn,
-                source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+                source_path: PathBuf::from(test_path_display("/tmp/hooks.json"))
+                    .abs()
+                    .into(),
                 source: codex_app_server_protocol::HookSource::User,
                 display_order: 0,
                 status: AppServerHookRunStatus::Stopped,
@@ -5171,6 +5533,25 @@ async fn blocked_and_failed_hooks_render_feedback_and_errors() {
                 kind: codex_app_server_protocol::HookOutputEntryKind::Error,
                 text: "hook exited with code 7".to_string(),
             }],
+        ),
+    );
+
+    handle_hook_completed(
+        &mut chat,
+        hook_completed_run(
+            "pre-tool-use:2:/tmp/hooks.json",
+            codex_app_server_protocol::HookEventName::PreToolUse,
+            codex_app_server_protocol::HookRunStatus::Blocked,
+            vec![
+                codex_app_server_protocol::HookOutputEntry {
+                    kind: codex_app_server_protocol::HookOutputEntryKind::Error,
+                    text: "hook exited with code 7".to_string(),
+                },
+                codex_app_server_protocol::HookOutputEntry {
+                    kind: codex_app_server_protocol::HookOutputEntryKind::Feedback,
+                    text: "PreToolUse hook failed. This hook is configured to block continuation on failure.".to_string(),
+                },
+            ],
         ),
     );
 
@@ -5691,7 +6072,9 @@ fn hook_run_summary(
         handler_type: codex_app_server_protocol::HookHandlerType::Command,
         execution_mode: codex_app_server_protocol::HookExecutionMode::Sync,
         scope: codex_app_server_protocol::HookScope::Turn,
-        source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+        source_path: PathBuf::from(test_path_display("/tmp/hooks.json"))
+            .abs()
+            .into(),
         source: codex_app_server_protocol::HookSource::User,
         display_order: 0,
         status,
@@ -5724,7 +6107,7 @@ fn hook_status_frame(chat: &ChatWidget, width: u16) -> String {
         .expect("render hook activity frame");
     // Windows path normalization drops Display's final newline; make composed
     // frames independent of that platform difference.
-    normalized_backend_snapshot(terminal.backend())
+    normalize_working_snapshot(normalized_backend_snapshot(terminal.backend()))
         .trim_end()
         .to_string()
 }
@@ -5763,7 +6146,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     let cwd = chat.config.cwd.clone();
     handle_exec_begin(
         &mut chat,
-        AppServerThreadItem::CommandExecution {
+        AppServerThreadItemPayload::CommandExecution {
             model_context: None,
             sandbox_type: None,
             id: "c1".into(),
@@ -5782,7 +6165,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     );
     handle_exec_end(
         &mut chat,
-        AppServerThreadItem::CommandExecution {
+        AppServerThreadItemPayload::CommandExecution {
             model_context: None,
             sandbox_type: None,
             id: "c1".into(),

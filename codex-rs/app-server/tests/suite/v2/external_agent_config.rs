@@ -34,7 +34,7 @@ use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadReadParams;
@@ -610,6 +610,9 @@ source = {:?}
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -645,10 +648,10 @@ source = {:?}
     let response: ThreadReadResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(response.thread.turns.len(), 1);
-    let imported_items = &response.thread.turns[0].items;
+    let mut imported_items = response.thread.turns[0].item_payloads();
     assert_eq!(imported_items.len(), 3);
-    match &imported_items[0] {
-        ThreadItem::UserMessage { content, .. } => assert_eq!(
+    match imported_items.next() {
+        Some(ThreadItemPayload::UserMessage { content, .. }) => assert_eq!(
             content,
             &vec![UserInput::Text {
                 text: "first request".to_string(),
@@ -657,8 +660,8 @@ source = {:?}
         ),
         other => panic!("expected user message item, got {other:?}"),
     }
-    match &imported_items[1] {
-        ThreadItem::AgentMessage { text, .. } => assert_eq!(text, "first answer"),
+    match imported_items.next() {
+        Some(ThreadItemPayload::AgentMessage { text, .. }) => assert_eq!(text, "first answer"),
         other => panic!("expected agent message item, got {other:?}"),
     }
 
@@ -1916,7 +1919,39 @@ async fn external_agent_config_import_sends_completion_notification_after_pendin
 async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("follow-up answer").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let url = server.uri();
+    let instructions = "Instructions from the destination provider.";
+    let mut model = codex_models_manager::model_info::model_info_from_slug("mock-model");
+    model.visibility = codex_protocol::openai_models::ModelVisibility::List;
+    model.model_messages = Some(codex_protocol::openai_models::ModelMessages {
+        instructions_template: Some(instructions.into()),
+        ..Default::default()
+    });
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/models"))
+        .and(wiremock::matchers::header(
+            "originator",
+            "codex_work_desktop",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"models": [model]})),
+        )
+        // The responses fixture also registers a default empty catalog.
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    MockResponsesConfig::new(&url)
+        .enable_feature(codex_features::Feature::ApiKeyModelDiscovery)
+        .with_extra_config(&format!(
+            r#"[model_providers.destination]
+name = "Destination"
+base_url = "{url}/v1"
+model_catalog_url = "{url}/v1/models"
+http_headers = {{ originator = "unscoped-test" }}
+env_key = "TEST_CATALOG_KEY""#
+        ))
+        .write(codex_home.path())?;
     let project_root = codex_home.path().join("repo");
     let source_created_at_text = "2024-01-02T03:04:05Z";
     let source_updated_at_text = "2024-03-01T04:05:06Z";
@@ -1977,9 +2012,39 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .with_env_overrides(&[("HOME", Some(home_dir.as_str()))])
-        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .with_env_overrides(&[
+            ("HOME", Some(home_dir.as_str())),
+            ("TEST_CATALOG_KEY", Some("test-key")),
+        ])
+        .build()
         .await?;
+
+    mcp.initialize_with_client_info(codex_app_server_protocol::ClientInfo {
+        name: "codex_work_desktop".into(),
+        title: None,
+        version: "0.1.0".into(),
+    })
+    .await?;
+    let id = mcp
+        .send_raw_request(
+            "modelProvider/default/set",
+            Some(serde_json::json!({"providerId": "destination"})),
+        )
+        .await?;
+    let write: codex_app_server_protocol::ConfigWriteResponse = mcp.read_response(id).await?;
+    assert_eq!(write.status, codex_app_server_protocol::WriteStatus::Ok);
+    // Warm the partition the imported chat will use on resume.
+    let id = mcp
+        .send_thread_start_request(codex_app_server_protocol::ThreadStartParams {
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let started: codex_app_server_protocol::ThreadStartResponse = mcp.read_response(id).await?;
+    assert_eq!(
+        started.thread.originator.as_deref(),
+        Some("codex_work_desktop")
+    );
 
     let request_id = mcp
         .send_raw_request(
@@ -2066,6 +2131,9 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -2073,7 +2141,7 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
             limit: None,
             sort_key: None,
             sort_direction: None,
-            model_providers: None,
+            model_providers: Some(vec!["destination".into()]),
             source_kinds: None,
             archived: None,
             section_id: None,
@@ -2093,6 +2161,18 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
         .expect("expected imported thread")
         .clone();
     assert_eq!(imported_thread_id, thread.id.to_string());
+    assert_eq!(thread.model_provider, "destination");
+    let meta =
+        codex_rollout::read_session_meta_line(thread.path.as_deref().expect("imported rollout"))
+            .await?;
+    assert_eq!(meta.meta.originator, "codex_work_desktop");
+    assert_eq!(
+        meta.meta
+            .base_instructions
+            .expect("imported instructions")
+            .text,
+        instructions
+    );
     assert_eq!(thread.preview, control_request);
     assert_eq!(thread.name.as_deref(), Some("Fix auth flow"));
     assert_eq!(thread.created_at, source_created_at);
@@ -2108,10 +2188,10 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let response: ThreadReadResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(response.thread.turns.len(), 2);
-    let control_items = &response.thread.turns[0].items;
+    let mut control_items = response.thread.turns[0].item_payloads();
     assert_eq!(control_items.len(), 1);
-    match &control_items[0] {
-        ThreadItem::UserMessage { content, .. } => {
+    match control_items.next() {
+        Some(ThreadItemPayload::UserMessage { content, .. }) => {
             assert_eq!(
                 content,
                 &vec![UserInput::Text {
@@ -2122,10 +2202,10 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
         }
         other => panic!("expected user message item, got {other:?}"),
     }
-    let imported_items = &response.thread.turns[1].items;
+    let mut imported_items = response.thread.turns[1].item_payloads();
     assert_eq!(imported_items.len(), 3);
-    match &imported_items[0] {
-        ThreadItem::UserMessage { content, .. } => {
+    match imported_items.next() {
+        Some(ThreadItemPayload::UserMessage { content, .. }) => {
             assert_eq!(
                 content,
                 &vec![UserInput::Text {
@@ -2137,8 +2217,9 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
         other => panic!("expected user message item, got {other:?}"),
     }
     assert_eq!(
-        imported_items.last(),
-        Some(&ThreadItem::AgentMessage {
+        imported_items.next_back(),
+        Some(&ThreadItemPayload::AgentMessage {
+            moderation: None,
             id: "item-4".into(),
             text: "<EXTERNAL SESSION IMPORTED>".into(),
             phase: None,
@@ -2183,8 +2264,8 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     let response: ThreadReadResponse =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(response.thread.turns.len(), 3);
-    match &response.thread.turns[2].items[1] {
-        ThreadItem::AgentMessage { text, .. } => assert_eq!(text, "follow-up answer"),
+    match response.thread.turns[2].item_payloads().nth(/*n*/ 1) {
+        Some(ThreadItemPayload::AgentMessage { text, .. }) => assert_eq!(text, "follow-up answer"),
         other => panic!("expected agent message item, got {other:?}"),
     }
 
@@ -2259,6 +2340,9 @@ required = true
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -2347,6 +2431,9 @@ async fn external_agent_config_import_accepts_detected_session_payload_after_res
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -2432,6 +2519,9 @@ async fn external_agent_config_import_skips_already_imported_session_versions() 
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -2563,6 +2653,9 @@ async fn external_agent_config_import_returns_before_background_session_import_f
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,
@@ -2682,6 +2775,9 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
 
     let request_id = mcp
         .send_thread_list_request(ThreadListParams {
+            include_attached_threads: false,
+            current_account_only: false,
+            included_thread_ids: None,
             excluded_thread_ids: None,
             attached_to_thread_id: None,
             originators: None,

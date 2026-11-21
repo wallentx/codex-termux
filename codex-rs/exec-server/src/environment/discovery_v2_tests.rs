@@ -1,4 +1,4 @@
-//! Real transport recovery preserves a discovery request's cwd and retries it once.
+//! Version compatibility gates discovery RPCs; supported clients retain transport recovery.
 
 use super::DiscoverV2CapabilitiesRequest;
 use super::DiscoverV2CapabilitiesResponse;
@@ -21,8 +21,18 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::task::AbortOnDropHandle;
 
+#[test_case::test_case("0.164.0", true; "minimum_stable")]
+#[test_case::test_case("0.168.0+build", true; "newer_stable")]
+#[test_case::test_case("0.163.0", false; "older")]
+#[test_case::test_case("0.164.0-alpha.1", false; "prerelease_before_cutoff")]
+#[test_case::test_case("0.165.0-alpha.1", true; "next_minor_prerelease")]
+#[test_case::test_case("", false; "missing")]
+#[test_case::test_case("invalid", false; "malformed")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn discovery_retries_disconnect_within_the_same_request() -> anyhow::Result<()> {
+async fn discovery_checks_version_and_retries_disconnect(
+    version: &'static str,
+    supported: bool,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("ws://{}", listener.local_addr()?);
     let attempts = Arc::new(Mutex::new(Vec::new()));
@@ -38,10 +48,13 @@ async fn discovery_retries_disconnect_within_the_same_request() -> anyhow::Resul
                 if request.get("id").is_none() {
                     continue;
                 }
-                let info = json!({
+                let mut info = json!({
                     "shell":{"name":"bash","path":"/bin/bash"},
                     "capabilities":{"capabilityDiscoveryV2":true}
                 });
+                if !version.is_empty() {
+                    info["executorVersion"] = json!(version);
+                }
                 let result = match request["method"].as_str() {
                     Some("initialize") => {
                         // V2 support is advertised by the executor, not negotiated by the client.
@@ -80,6 +93,7 @@ async fn discovery_retries_disconnect_within_the_same_request() -> anyhow::Resul
         ScopedSkillsConfig::default(),
     );
     let params = DiscoverV2CapabilitiesRequest {
+        force_reload: false,
         cwd: PathUri::parse("file:///caller/project-b")?,
         sandbox: None,
     };
@@ -87,8 +101,34 @@ async fn discovery_retries_disconnect_within_the_same_request() -> anyhow::Resul
         Duration::from_secs(12),
         environment.discover_capabilities_v2(params.clone()),
     )
-    .await??;
-    assert_eq!(response, DiscoverV2CapabilitiesResponse::default());
+    .await?;
+    if !supported {
+        assert!(
+            matches!(&response, Err(crate::ExecServerError::Protocol(message))
+                if message == "capabilities/discoverV2 is unavailable in this environment session"),
+            "unexpected discovery response: {response:?}"
+        );
+        assert_eq!(*attempts.lock().await, Vec::<serde_json::Value>::new());
+        return Ok(());
+    }
+    assert_eq!(response?, DiscoverV2CapabilitiesResponse::default());
+    let mut sandbox = crate::FileSystemSandboxContext::from_permission_profile(
+        codex_protocol::models::PermissionProfile::read_only(),
+        params.cwd.clone(),
+    );
+    sandbox.windows_sandbox_selection = crate::WindowsSandboxSelection::Mxc;
+    let error = environment
+        .discover_capabilities_v2(DiscoverV2CapabilitiesRequest {
+            sandbox: Some(sandbox),
+            ..params.clone()
+        })
+        .await
+        .expect_err("MXC must not be sent to an executor that cannot enforce it");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support the requested MXC Windows sandbox")
+    );
     assert_eq!(
         *attempts.lock().await,
         vec![

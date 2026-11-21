@@ -13,6 +13,7 @@ use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
+use crate::tools::sandboxing::ensure_native_sandbox;
 use crate::tools::sandboxing::executor_windows_sandbox_selection;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::AppliedPatchFileChange;
@@ -53,6 +54,20 @@ pub struct ApplyPatchRequest {
     pub permissions_preapproved: bool,
 }
 
+impl ApplyPatchRequest {
+    pub(crate) fn approval_action(&self, call_id: &str) -> ApprovalAction {
+        ApprovalAction::ApplyPatch {
+            id: call_id.to_string(),
+            environment_id: self.turn_environment.selection.environment_id.clone(),
+            cwd: self.action.cwd.clone(),
+            files: self.file_paths.clone(),
+            patch: self.action.patch.clone(),
+            changes: Arc::clone(&self.changes),
+            permissions_preapproved: self.permissions_preapproved,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
@@ -71,18 +86,6 @@ impl ApplyPatchRuntime {
 
     pub fn committed_delta(&self) -> &AppliedPatchDelta {
         &self.committed_delta
-    }
-
-    fn build_approval_action(req: &ApplyPatchRequest, call_id: &str) -> ApprovalAction {
-        ApprovalAction::ApplyPatch {
-            id: call_id.to_string(),
-            environment_id: req.turn_environment.selection.environment_id.clone(),
-            cwd: req.action.cwd.clone(),
-            files: req.file_paths.clone(),
-            patch: req.action.patch.clone(),
-            changes: Arc::clone(&req.changes),
-            permissions_preapproved: req.permissions_preapproved,
-        }
     }
 
     fn file_system_sandbox_context_for_attempt(
@@ -130,7 +133,7 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
         req: &ApplyPatchRequest,
         call_id: &str,
     ) -> std::io::Result<ApprovalAction> {
-        Ok(ApplyPatchRuntime::build_approval_action(req, call_id))
+        Ok(req.approval_action(call_id))
     }
 
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
@@ -160,7 +163,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
     }
 
     fn uses_executor_managed_process_sandbox(&self, req: &ApplyPatchRequest) -> bool {
-        req.turn_environment.environment.is_remote()
+        req.turn_environment.environment().is_remote()
     }
 
     fn sandbox_cwd<'a>(&self, req: &'a ApplyPatchRequest) -> Option<&'a PathUri> {
@@ -174,7 +177,21 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
         let started_at = Instant::now();
-        let fs = req.turn_environment.environment.get_filesystem();
+        let remote = self.uses_executor_managed_process_sandbox(req);
+        let local_backend = if attempt.sandbox_requested && !remote {
+            attempt.manager.select_initial(
+                attempt.permissions,
+                self.sandbox_preference(),
+                attempt.windows_sandbox_type,
+                attempt.enforce_managed_network,
+            )
+        } else {
+            SandboxType::None
+        };
+        if !remote {
+            ensure_native_sandbox(attempt.sandbox_override, local_backend)?;
+        }
+        let fs = req.turn_environment.environment().get_filesystem();
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -237,16 +254,16 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             timed_out: false,
         };
         let sandbox_denied = failed
-            && if attempt.sandbox == SandboxType::None {
+            && if local_backend == SandboxType::None {
                 attempt.sandbox_requested && is_likely_executor_managed_sandbox_denied(&output)
             } else {
-                is_likely_sandbox_denied(attempt.sandbox, &output)
+                is_likely_sandbox_denied(local_backend, &output)
             };
         if sandbox_denied {
             // TODO(iceweasel): Report executor filesystem sandbox backends like process/start so
             // executor-managed apply_patch denials can emit backend-specific violation telemetry.
-            if attempt.sandbox != SandboxType::None {
-                record_filesystem_sandbox_violation(attempt.sandbox, &output);
+            if local_backend != SandboxType::None {
+                record_filesystem_sandbox_violation(local_backend, &output);
             }
             return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                 output: Box::new(output),

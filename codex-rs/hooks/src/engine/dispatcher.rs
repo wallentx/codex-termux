@@ -79,10 +79,10 @@ pub(crate) fn select_handlers_for_matcher_inputs(
 
 pub(crate) fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary {
     let source_path = match &handler.source_path {
-        HandlerSourcePath::Local(path)
-        | HandlerSourcePath::Environment {
+        HandlerSourcePath::Local(path) => path.clone().into(),
+        HandlerSourcePath::Environment {
             source_path: path, ..
-        } => path,
+        } => path.clone().into(),
         HandlerSourcePath::ExecutorScoped { .. } => {
             unreachable!("executor-scoped hooks do not produce public hook summaries")
         }
@@ -94,7 +94,7 @@ pub(crate) fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary {
         handler_type: handler.handler_type(),
         execution_mode: handler.execution_mode(),
         scope: scope_for_event(handler.event_name),
-        source_path: source_path.clone(),
+        source_path,
         source: handler.source,
         display_order: handler.display_order,
         status: HookRunStatus::Running,
@@ -128,6 +128,34 @@ pub(crate) async fn execute_handlers_with_metadata<T: 'static>(
     turn_id: Option<String>,
     metadata: Option<&Map<String, Value>>,
     parse: fn(&ConfiguredHandler, HandlerRunResult, Option<String>) -> ParsedHandler<T>,
+) -> Vec<ParsedHandler<T>> {
+    execute_handlers_with_progress(
+        engine,
+        handlers,
+        input,
+        cwd,
+        turn_id,
+        metadata,
+        parse,
+        |_| {},
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_handlers_with_progress<T: 'static>(
+    engine: &ClaudeHooksEngine,
+    handlers: Vec<ConfiguredHandler>,
+    input: &Value,
+    cwd: &Path,
+    turn_id: Option<String>,
+    metadata: Option<&Map<String, Value>>,
+    parse: impl Fn(&ConfiguredHandler, HandlerRunResult, Option<String>) -> ParsedHandler<T>
+    + Copy
+    + Send
+    + Sync
+    + 'static,
+    mut on_completed: impl FnMut(&HookCompletedEvent) + Send,
 ) -> Vec<ParsedHandler<T>> {
     let mut executor_handlers = Vec::new();
     let mut pending = FuturesUnordered::new();
@@ -169,6 +197,7 @@ pub(crate) async fn execute_handlers_with_metadata<T: 'static>(
         should_block |= parsed.completed.run.status == HookRunStatus::Blocked;
         parsed.completion_order = completion_order;
         completion_order += 1;
+        on_completed(&parsed.completed);
         completed.push((configured_order, parsed));
     }
     completed.sort_by_key(|(configured_order, _)| *configured_order);
@@ -225,6 +254,7 @@ pub(super) async fn execute_handler(
             server,
             tool,
             input,
+            ..
         } => {
             run_mcp_tool(
                 engine.mcp_executor.as_ref(),
@@ -247,10 +277,10 @@ pub(crate) fn completed_summary(
     entries: Vec<codex_protocol::protocol::HookOutputEntry>,
 ) -> HookRunSummary {
     let source_path = match &handler.source_path {
-        HandlerSourcePath::Local(path)
-        | HandlerSourcePath::Environment {
+        HandlerSourcePath::Local(path) => path.clone().into(),
+        HandlerSourcePath::Environment {
             source_path: path, ..
-        } => path,
+        } => path.clone().into(),
         HandlerSourcePath::ExecutorScoped { .. } => {
             unreachable!("executor-scoped hooks do not produce public hook summaries")
         }
@@ -262,7 +292,7 @@ pub(crate) fn completed_summary(
         handler_type: handler.handler_type(),
         execution_mode: handler.execution_mode(),
         scope: scope_for_event(handler.event_name),
-        source_path: source_path.clone(),
+        source_path,
         source: handler.source,
         display_order: handler.display_order,
         status,
@@ -382,6 +412,7 @@ mod tests {
                 .map(|pattern| crate::engine::HookMatcher::new(pattern).expect("valid matcher")),
             timeout_sec: 5,
             status_message: None,
+            on_failure: Default::default(),
             additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: HookSource::User,

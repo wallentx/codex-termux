@@ -38,6 +38,8 @@ mod config_requirements_exec;
 mod config_requirements_in_app_browser;
 mod config_requirements_login;
 mod config_rpc;
+#[path = "config_server_tests.rs"]
+mod config_server;
 #[cfg(unix)]
 #[path = "connection_handling_stdio_tests.rs"]
 mod connection_handling_stdio;
@@ -46,6 +48,8 @@ mod connection_handling_websocket;
 mod connection_handling_websocket_compression;
 #[cfg(unix)]
 mod connection_handling_websocket_unix;
+#[path = "critical_path_analytics_tests.rs"]
+mod critical_path_analytics;
 #[cfg(unix)]
 mod curated_mcp_sync;
 mod current_time;
@@ -72,17 +76,21 @@ mod frozen_cloud_skills;
 mod fs;
 #[path = "gateway_oauth_tests.rs"]
 mod gateway_oauth;
+#[path = "gcp_setup_tests.rs"]
+mod gcp_setup;
 mod git_attribution;
 mod guardian_v2;
 mod history_notes_extension;
 mod hooks_list;
 mod host_skills;
+mod https_mock;
 mod imagegen_extension;
 mod initialize;
 mod luna_reserve;
 mod marketplace_add;
 mod marketplace_remove;
 mod marketplace_upgrade;
+mod mcp_connection_sharing;
 mod mcp_event_stream;
 mod mcp_protocol_default;
 mod mcp_resource;
@@ -97,8 +105,10 @@ mod model_auto_review;
 mod model_list;
 mod model_list_requirements_tests;
 mod model_provider_capabilities_read;
+mod model_provider_config_tests;
 #[path = "model_provider_enforcement_tests.rs"]
 mod model_provider_enforcement;
+mod model_provider_list_tests;
 mod multi_agent_v2_developer_instructions;
 mod otel;
 mod output_schema;
@@ -162,6 +172,9 @@ mod thread_read_state;
 mod thread_resume;
 mod thread_revert;
 mod thread_sample;
+#[cfg(target_os = "linux")]
+#[path = "thread_search_streaming_tests.rs"]
+mod thread_search_streaming;
 mod thread_sections;
 mod thread_settings_update;
 mod thread_shell_command;

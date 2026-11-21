@@ -16,15 +16,15 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=37af7b347b5c1eb7):
-        - namespace/functions; hash=a3c60999d0288751
+00:additional_tools/developer (3; hash=2cefe21beec1e2d2):
+        - namespace/functions; hash=1377b145cdccf5b4
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -33,9 +33,8 @@ Settings:
           - function/wait_agent
 01:message/developer:
     <MODEL_INSTRUCTIONS>
-02:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <COLLABORATION_MODE>
+02:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
 03:message/developer:
     <MULTI_AGENT_ROLE>
 04:message/developer:
@@ -54,14 +53,14 @@ Settings:
 ## Window 2 (after request 3: input diverged at item 00)
 Settings: same as window 1
 -- request 4 (turn) --
-00:additional_tools/developer (3; hash=ce2de39d992cd930):
-        - namespace/functions; hash=fa0731964313a476
+00:additional_tools/developer (3; hash=72728edaee929e95):
+        - namespace/functions; hash=d0883eefc88509b7
           - custom/exec
           - function/wait
           - function/request_user_input
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -70,9 +69,8 @@ Settings: same as window 1
           - function/wait_agent
 01:message/developer:
     <MODEL_INSTRUCTIONS>
-02:message/developer[2]:
-    [01] <PERMISSIONS_INSTRUCTIONS>
-    [02] <COLLABORATION_MODE>
+02:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
 03:message/developer:
     <MULTI_AGENT_ROLE>
 04:message/developer:

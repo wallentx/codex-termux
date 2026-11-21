@@ -102,7 +102,7 @@ pub(super) use codex_app_server_protocol::ServerNotification;
 pub(super) use codex_app_server_protocol::SkillMetadata;
 pub(super) use codex_app_server_protocol::SkillSummary;
 pub(super) use codex_app_server_protocol::ThreadClosedNotification;
-pub(super) use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
+pub(super) use codex_app_server_protocol::ThreadItemPayload as AppServerThreadItemPayload;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputOption;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputParams;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputQuestion;
@@ -289,6 +289,8 @@ mod review_picker_tests;
 #[path = "tests/session_model_selection_tests.rs"]
 mod session_model_selection_tests;
 mod side;
+#[path = "tests/skills_summary_tests.rs"]
+mod skills_summary_tests;
 mod slash_commands;
 #[path = "tests/sparkle_submission_tests.rs"]
 mod sparkle_submission_tests;
@@ -299,6 +301,8 @@ mod status_command_tests;
 #[path = "tests/status_surface_command_tests.rs"]
 mod status_surface_command_tests;
 mod status_surface_previews;
+#[path = "tests/statusline_state_tests.rs"]
+mod statusline_state;
 #[path = "tests/subagent_activity_tests.rs"]
 mod subagent_activity;
 #[path = "tests/terminal_program_status.rs"]

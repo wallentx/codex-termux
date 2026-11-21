@@ -5,7 +5,6 @@ use super::WorldStateSection;
 use super::WorldStateUpdate;
 use crate::context::ContextualUserFragment;
 use crate::context::MultiAgentRoleInstructions;
-use crate::context::MultiAgentUsageHint;
 use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::ContentItemNamespace;
 
@@ -46,24 +45,15 @@ impl WorldStateSection for MultiAgentUsageHintState {
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
     ) -> SectionTransition<Self::Snapshot> {
-        let fragment: Option<Box<dyn ContextualUserFragment>> = match previous {
+        let fragment: Option<super::WorldStateFragment> = match previous {
             PreviousSectionState::Known(previous) if previous == &self.fingerprint => {
                 return (None, Vec::new());
             }
             PreviousSectionState::Unknown => None,
             PreviousSectionState::Known(_) | PreviousSectionState::Absent => {
-                if self.instructions.markers().0.is_empty() {
-                    Some(Box::new(
-                        MultiAgentUsageHint::new(
-                            &self.instructions.body().into_text().unwrap_or_default(),
-                        )
-                        .with_metadata(ContentItemMetadata::tool(self.namespace.clone())),
-                    ))
-                } else {
-                    Some(Box::new(self.instructions.clone().with_metadata(
-                        ContentItemMetadata::tool(self.namespace.clone()),
-                    )))
-                }
+                Some(Box::new(self.instructions.clone().with_metadata(
+                    ContentItemMetadata::tool(self.namespace.clone()),
+                )))
             }
         };
         (

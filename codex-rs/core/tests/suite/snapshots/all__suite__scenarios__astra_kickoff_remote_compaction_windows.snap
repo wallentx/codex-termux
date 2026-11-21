@@ -16,15 +16,15 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=a7c46a0959d54866):
+        - namespace/functions; hash=81846de5bc4e7474
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -40,16 +40,16 @@ Settings:
 
     User authorization and preferences persist across turns. Do not request permission again when the user h... any guidelines provided in skills or external files. [hash=911f91c92c72882c]
 
-    <OMITTED 155 LINES; ~4935 TOKENS; hash=5573869716192298>
+    <OMITTED 151 LINES; ~4851 TOKENS; hash=959762226fedfd0c>
+    ## Decision Boundary
 
-    - Skill naming: If a plugin contributes skills, those skill entries are prefixed with plugin_name: in the Skills list.
-    - MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as mcp__server__tool; use tool provenance to tell which plugin they come from.
-    - Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
-    - Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
-    - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
-    - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
+    Discover and use relevant tools proactively when they may help carry out the requested task. For example...ng the user for information they may already contain. [hash=3af5c93cbc00b4c7]
 
-02:message/developer[3]:
+    When a plugin is available for a service and its tools are sufficient for completing the task, prefer th...er has an explicit preference, defer to that instead. [hash=936dbd7fe76c210f]
+
+    A user can also tag a plugin using `[@plugin-name](plugin://{{plugin_id}})` or an app using `[$app-name]... app, prefer its relevant capabilities for that turn. [hash=8730f69f41534f8f]
+
+02:message/developer[2]:
     [01] <skills_instructions>
         ## Skills
         A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list ...ed into an absolute path using the skill roots table. [hash=ca27c3957f42502b]
@@ -79,22 +79,6 @@ Settings:
         - ["gh", "pr", "check"]
         - ["cargo", "test"]
         </permissions instructions>
-    [03] <collaboration_mode># Collaboration Mode: Default
-
-        You are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.
-
-        Your active mode changes only when new developer instructions with a different `<collaboration_mode>...<...by themselves. Known mode names are Default and Plan. [hash=e75f6b12fc52d812]
-
-        ## request_user_input availability
-
-        Use the `request_user_input` tool only when it is listed in the available tools for this turn.
-
-        Use the `request_user_input` tool only for optional questions where the answer would materially improve the quality of the work.
-
-        If `request_user_input` returns no answers, continue with best judgment instead of asking again or treating the turn as blocked.
-
-        Never use the `request_user_input` tool for permission requests or permission-related escalations.
-        </collaboration_mode>
 03:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
@@ -188,15 +172,15 @@ Settings:
 ## Window 2 (after request 3: input diverged at item 02)
 Settings: same as window 1
 -- request 4 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=a7c46a0959d54866):
+        - namespace/functions; hash=81846de5bc4e7474
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=a097b9364047b8bb
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -212,18 +196,18 @@ Settings: same as window 1
 
     User authorization and preferences persist across turns. Do not request permission again when the user h... any guidelines provided in skills or external files. [hash=911f91c92c72882c]
 
-    <OMITTED 155 LINES; ~4935 TOKENS; hash=5573869716192298>
+    <OMITTED 151 LINES; ~4851 TOKENS; hash=959762226fedfd0c>
+    ## Decision Boundary
 
-    - Skill naming: If a plugin contributes skills, those skill entries are prefixed with plugin_name: in the Skills list.
-    - MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as mcp__server__tool; use tool provenance to tell which plugin they come from.
-    - Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
-    - Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
-    - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
-    - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
+    Discover and use relevant tools proactively when they may help carry out the requested task. For example...ng the user for information they may already contain. [hash=3af5c93cbc00b4c7]
+
+    When a plugin is available for a service and its tools are sufficient for completing the task, prefer th...er has an explicit preference, defer to that instead. [hash=936dbd7fe76c210f]
+
+    A user can also tag a plugin using `[@plugin-name](plugin://{{plugin_id}})` or an app using `[$app-name]... app, prefer its relevant capabilities for that turn. [hash=8730f69f41534f8f]
 
 02:message/user:
     Plan a team kickoff for Friday using $outline and $calendar:agenda.
-03:message/developer[3]:
+03:message/developer[2]:
     [01] <skills_instructions>
         ## Skills
         A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list ...ed into an absolute path using the skill roots table. [hash=ca27c3957f42502b]
@@ -253,22 +237,6 @@ Settings: same as window 1
         - ["gh", "pr", "check"]
         - ["cargo", "test"]
         </permissions instructions>
-    [03] <collaboration_mode># Collaboration Mode: Default
-
-        You are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.
-
-        Your active mode changes only when new developer instructions with a different `<collaboration_mode>...<...by themselves. Known mode names are Default and Plan. [hash=e75f6b12fc52d812]
-
-        ## request_user_input availability
-
-        Use the `request_user_input` tool only when it is listed in the available tools for this turn.
-
-        Use the `request_user_input` tool only for optional questions where the answer would materially improve the quality of the work.
-
-        If `request_user_input` returns no answers, continue with best judgment instead of asking again or treating the turn as blocked.
-
-        Never use the `request_user_input` tool for permission requests or permission-related escalations.
-        </collaboration_mode>
 04:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
