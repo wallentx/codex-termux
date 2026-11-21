@@ -455,6 +455,255 @@ class RedesignedUpstreamAdaptationTests(unittest.TestCase):
         )
 
 
+class ExactReleaseRefTests(unittest.TestCase):
+    UPSTREAM = "rust-v0.173.0-alpha.2"
+    SOURCE = "5db5559ab8bdc27c8982944605f9c72d4d2abcde"
+    BASELINE = "rust-v0.165.0"
+
+    def show(self, ref, path):
+        return subprocess.check_output(
+            ["git", "show", f"{ref}:{path}"], cwd=ROOT, stderr=subprocess.DEVNULL
+        ).decode()
+
+    def setUp(self):
+        try:
+            for ref in (self.UPSTREAM, self.SOURCE, self.BASELINE):
+                subprocess.check_output(
+                    ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    cwd=ROOT,
+                    stderr=subprocess.DEVNULL,
+                )
+        except subprocess.CalledProcessError:
+            self.skipTest("exact release refs are not available")
+
+    def adapt(self, adapter, path, source=None):
+        texts = [self.show(ref, path) for ref in (self.BASELINE, self.SOURCE)]
+        if source is not None:
+            texts[1] = source
+        return adapter(*texts, self.show(self.UPSTREAM, path))
+
+    def test_exact_refs_generate_tree_with_ported_compatibility(self):
+        env = dict(os.environ, TMPDIR=os.environ.get("TMPDIR", tempfile.gettempdir()))
+        result = subprocess.run(
+            [
+                "python3",
+                str(HELPER),
+                self.UPSTREAM,
+                self.SOURCE,
+                self.BASELINE,
+                ".github",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tree = result.stdout.strip()
+        changed = set(
+            subprocess.check_output(
+                [
+                    "git",
+                    "diff",
+                    "--no-renames",
+                    "--name-only",
+                    self.UPSTREAM,
+                    tree,
+                ],
+                cwd=ROOT,
+            )
+            .decode()
+            .split()
+        )
+        # Upstream's own redesign of these files must survive the transplant.
+        self.assertNotIn("codex-rs/core/src/installation_id.rs", changed)
+
+        def show(path):
+            return self.show(tree, path)
+
+        writer = show("codex-rs/rollout/src/writer_lock.rs")
+        self.assertIn("fn wait_for_coordination(", writer)
+        self.assertIn("try_acquire_sibling_lock_dir", writer)
+        self.assertIn("try_lock_shared_optional", writer)
+        self.assertIn("use codex_sandboxing::linux::", show("codex-rs/arg0/src/lib.rs"))
+        self.assertIn("try_lock_exclusive_optional", show("codex-rs/arg0/src/lib.rs"))
+        amend = show("codex-rs/execpolicy/src/amend.rs")
+        self.assertIn("use crate::Decision;", amend)
+        self.assertIn("Decision::PromptUser", amend)
+        self.assertIn("acquire_sibling_lock_dir", amend)
+        self.assertIn(
+            "persist_pasted_image", show("codex-rs/tui/src/clipboard_paste.rs")
+        )
+        moved = show("codex-rs/runtime-agent-instance/src/installation_id.rs")
+        self.assertIn("file.lock_shared()", moved)
+        self.assertIn("acquire_sibling_lock_dir", moved)
+        self.assertIn(
+            "codex-utils-file-lock",
+            show("codex-rs/runtime-agent-instance/Cargo.toml"),
+        )
+        self.assertNotIn("codex-utils-file-lock", show("codex-rs/core/Cargo.toml"))
+        self.assertIn(
+            "TermuxSelfUpdate.command_args()",
+            show("codex-rs/tui/src/update_action.rs"),
+        )
+        for path in ("codex-rs/Cargo.lock", "codex-rs/core/Cargo.toml"):
+            self.assertNotIn("<<<<<<<", show(path))
+
+    def test_writer_lock_keeps_upstream_bounded_wait_and_fallback_cleanup(self):
+        path = "codex-rs/rollout/src/writer_lock.rs"
+        adapted = self.adapt(module.adapt_writer_lock, path)
+        for expected in (
+            "fn open_coordination(&self)",
+            "Duration::from_secs(/*secs*/ 30)",
+            "TryWriterLockOutcome::WouldBlock if Instant::now() < deadline",
+            "try_lock_coordination_shared(&file, &coordination_path)",
+            "drop(self.fallback_lock.take());",
+            "_fallback_lock: coordination_fallback",
+        ):
+            self.assertIn(expected, adapted)
+        # Fallback lock directories are released after the file they protect.
+        self.assertLess(
+            adapted.index("drop(self.file.take());"),
+            adapted.index("drop(self.fallback_lock.take());"),
+        )
+        self.assertLess(
+            adapted.index("drop(self.fallback_lock.take());"),
+            adapted.index("drop(coordination_lock);"),
+        )
+        source = self.show(self.SOURCE, path)
+        self.assertEqual(
+            module.adapt_writer_lock(self.show(self.UPSTREAM, path), adapted, adapted),
+            adapted,
+        )
+        for unsafe in (
+            source + "// edit\n",
+            source.replace("drop(fallback_lock);", ""),
+        ):
+            with self.subTest(unsafe=unsafe[-24:]), self.assertRaises(ValueError):
+                self.adapt(module.adapt_writer_lock, path, unsafe)
+        baseline = self.show(self.BASELINE, path)
+        self.assertEqual(module.adapt_writer_lock(baseline, source, source), source)
+        self.assertEqual(
+            module.adapt_writer_lock(
+                baseline, baseline, self.show(self.UPSTREAM, path)
+            ),
+            baseline,
+        )
+
+    def test_arg0_lock_follows_sandbox_module_rename(self):
+        path = "codex-rs/arg0/src/lib.rs"
+        adapted = self.adapt(module.adapt_arg0_lock, path)
+        upstream = self.show(self.UPSTREAM, path)
+        self.assertIn("use codex_sandboxing::linux::CODEX_LINUX_SANDBOX_ARG0;", adapted)
+        self.assertNotIn("landlock", adapted)
+        self.assertIn("try_lock_exclusive_optional(&lock_file)", adapted)
+        # Upstream's unrelated .env changes remain.
+        self.assertIn("dotenv_path.is_file()", adapted)
+        self.assertEqual(adapted.count("Some(lock_file)"), 4)
+        self.assertNotEqual(adapted, upstream)
+        source = self.show(self.SOURCE, path)
+        with self.assertRaises(ValueError):
+            self.adapt(module.adapt_arg0_lock, path, source + "// edit\n")
+        self.assertEqual(
+            module.adapt_arg0_lock(self.show(self.BASELINE, path), source, source),
+            source,
+        )
+
+    def test_execpolicy_lock_follows_decision_reexport(self):
+        path = "codex-rs/execpolicy/src/amend.rs"
+        adapted = self.adapt(module.adapt_execpolicy_decision_import, path)
+        self.assertIn("use crate::Decision;", adapted)
+        self.assertNotIn("use crate::decision::Decision;", adapted)
+        self.assertIn("Decision::PromptUser", adapted)
+        self.assertIn("lock_exclusive_optional(&file)", adapted)
+        self.assertNotIn("file.lock()", adapted)
+        with self.assertRaises(ValueError):
+            self.adapt(
+                module.adapt_execpolicy_decision_import,
+                path,
+                self.show(self.SOURCE, path) + "// edit\n",
+            )
+        source = self.show(self.SOURCE, path)
+        self.assertEqual(
+            module.adapt_execpolicy_decision_import(
+                self.show(self.BASELINE, path), source, source
+            ),
+            source,
+        )
+
+    def test_clipboard_cleanup_keeps_upstream_image_persistence(self):
+        path = "codex-rs/tui/src/clipboard_paste.rs"
+        adapted = self.adapt(module.adapt_android_clipboard_cleanup, path)
+        self.assertIn("pub(crate) fn persist_pasted_image(", adapted)
+        self.assertIn('#[cfg_attr(target_os = "android", allow(dead_code))]', adapted)
+        self.assertIn("use tempfile::Builder;\n", adapted)
+        self.assertNotIn(
+            '#[cfg(not(target_os = "android"))]\nuse tempfile::Builder;', adapted
+        )
+        self.assertEqual(adapted.count('#[cfg(target_os = "android")]'), 1)
+        with self.assertRaises(ValueError):
+            self.adapt(
+                module.adapt_android_clipboard_cleanup,
+                path,
+                self.show(self.SOURCE, path) + "// edit\n",
+            )
+        source = self.show(self.SOURCE, path)
+        self.assertEqual(
+            module.adapt_android_clipboard_cleanup(
+                self.show(self.BASELINE, path), source, source
+            ),
+            source,
+        )
+
+    def test_installation_id_fallback_follows_relocation_and_shared_read(self):
+        baseline = self.show(self.BASELINE, "codex-rs/core/src/installation_id.rs")
+        source = self.show(self.SOURCE, "codex-rs/core/src/installation_id.rs")
+        upstream = self.show(
+            self.UPSTREAM, "codex-rs/runtime-agent-instance/src/installation_id.rs"
+        )
+        adapted = module.adapt_installation_id(baseline, source, upstream)
+        self.assertIn("match file.lock_shared()", adapted)
+        self.assertIn("ErrorKind::Unsupported", adapted)
+        self.assertIn("if lock_dir_guard.is_none() {", adapted)
+        self.assertNotIn("lock_exclusive_optional", adapted)
+        with self.assertRaises(ValueError):
+            module.adapt_installation_id(baseline, source + "// edit\n", upstream)
+        self.assertIsNone(module.adapt_installation_id(baseline, baseline, upstream))
+        self.assertIsNone(module.adapt_installation_id(upstream, adapted, upstream))
+        manifest = self.show(
+            self.UPSTREAM, "codex-rs/runtime-agent-instance/Cargo.toml"
+        )
+        with_dependency = module.add_file_lock_dependency(manifest)
+        self.assertIn("codex-utils-file-lock = { workspace = true }\n", with_dependency)
+        with self.assertRaises(ValueError):
+            module.add_file_lock_dependency(with_dependency)
+
+    def test_update_action_test_assertion_follows_renamed_test(self):
+        header = "    fn standalone_update_commands_rerun_latest_installer() {\n"
+        assertion = (
+            "        assert_eq!(\n"
+            "            UpdateAction::TermuxSelfUpdate.command_args(),\n"
+            '            ("codex", &["update"][..])\n'
+            "        );\n"
+        )
+        body = "        assert_eq!(1, 1);\n"
+        renamed = (
+            "    fn standalone_windows_update_command_reruns_latest_installer() {\n"
+        )
+        conflict = (
+            f"<<<<<<< upstream\n{renamed}||||||| baseline\n{header}{body}"
+            f"=======\n{header}{assertion}{body}>>>>>>> target\n"
+        )
+        path = "codex-rs/tui/src/update_action.rs"
+        self.assertEqual(
+            module.merge_updater_additions(conflict, path=path),
+            renamed + assertion,
+        )
+        changed = conflict.replace(assertion, "        assert!(true);\n")
+        self.assertEqual(module.merge_updater_additions(changed, path=path), changed)
+
+
 class RetiredClipboardGuardTests(unittest.TestCase):
     def setUp(self):
         self.baseline = (
