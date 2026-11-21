@@ -149,6 +149,7 @@ members = [
     "utils/string",
     "utils/cli",
     "utils/elapsed",
+    "utils/file-lock",
     "utils/sandbox-summary",
     "utils/model-facing-id",
     "utils/sleep-inhibitor",
@@ -324,6 +325,7 @@ codex-utils-cargo-bin = { path = "utils/cargo-bin" }
 codex-utils-cli = { path = "utils/cli" }
 codex-utils-critical-path = { path = "utils/critical-path" }
 codex-utils-elapsed = { path = "utils/elapsed" }
+codex-utils-file-lock = { path = "utils/file-lock" }
 codex-utils-fuzzy-match = { path = "utils/fuzzy-match" }
 codex-utils-git-discovery = { path = "utils/git-discovery" }
 codex-utils-head-tail-buffer = { path = "utils/head-tail-buffer" }

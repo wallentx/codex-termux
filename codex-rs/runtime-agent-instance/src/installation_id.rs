@@ -11,6 +11,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_file_lock::acquire_sibling_lock_dir;
 use tokio::fs;
 use uuid::Uuid;
 
@@ -29,14 +30,23 @@ pub async fn resolve_installation_id(codex_home: &AbsolutePathBuf) -> Result<Str
         }
 
         let mut file = options.open(&path)?;
-        file.lock_shared()?;
+        let mut lock_dir_guard = None;
+        match file.lock_shared() {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                lock_dir_guard = Some(acquire_sibling_lock_dir(&path)?);
+            }
+            Err(err) => return Err(err),
+        }
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
         if Uuid::parse_str(contents.trim()).is_err() {
             // Another process can initialize the ID while we switch locks. Read it again
             // under the exclusive lock before deciding whether to create a new one.
-            file.unlock()?;
-            file.lock()?;
+            if lock_dir_guard.is_none() {
+                file.unlock()?;
+                file.lock()?;
+            }
             file.seek(SeekFrom::Start(0))?;
             contents.clear();
             file.read_to_string(&mut contents)?;
