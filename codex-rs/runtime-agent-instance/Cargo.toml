@@ -18,6 +18,7 @@ codex-features = { workspace = true }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-file-lock = { workspace = true }
 codex-utils-redacted-string = { workspace = true }
 ed25519-dalek = { workspace = true }
 http = { workspace = true }
