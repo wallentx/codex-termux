@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import gzip
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import tomllib
+
+ANDROID_GN_PYDEPS_FILES = [
+    "build/android/pylib/results/presentation/test_results_presentation.pydeps",
+    "build/android/devil_chromium.pydeps",
+    "build/android/apk_operations.pydeps",
+    "build/android/test_runner.pydeps",
+    "build/android/test_wrapper/logdog_wrapper.pydeps",
+    "build/android/resource_sizes.pydeps",
+]
+
+ANDROID_EXTRA_GN_ARGS = [
+    'android_ndk_root="//third_party/android_ndk"',
+]
+
+
+def validate_android_bindgen_toolchain(env: dict[str, str]) -> None:
+    """Check the library bindgen will load, not an unrelated clang on PATH."""
+    configured_path = env.get("LIBCLANG_PATH")
+    if not configured_path:
+        raise SystemExit("Android V8 staging requires LIBCLANG_PATH for libclang 21.1+")
+    library_path = Path(configured_path)
+    if library_path.is_dir():
+        library_path /= "libclang.so"
+
+    class CXString(ctypes.Structure):
+        _fields_ = [("data", ctypes.c_void_p), ("private_flags", ctypes.c_uint)]
+
+    try:
+        library = ctypes.CDLL(str(library_path))
+        library.clang_getClangVersion.argtypes = []
+        library.clang_getClangVersion.restype = CXString
+        library.clang_getCString.argtypes = [CXString]
+        library.clang_getCString.restype = ctypes.c_char_p
+        library.clang_disposeString.argtypes = [CXString]
+        library.clang_disposeString.restype = None
+        version_string = library.clang_getClangVersion()
+        try:
+            version = (library.clang_getCString(version_string) or b"").decode()
+        finally:
+            library.clang_disposeString(version_string)
+    except (OSError, AttributeError) as error:
+        raise SystemExit(
+            f"cannot load bindgen libclang at {library_path}: {error}"
+        ) from error
+
+    # Upstream v8 152.2.0 build.rs explicitly requires Clang 21.1+ libclang.
+    match = re.search(r"clang version (\d+)\.(\d+)", version)
+    if not match or tuple(map(int, match.groups())) < (21, 1):
+        raise SystemExit(
+            f"Android V8 bindings require libclang 21.1+; {library_path} reports {version!r}. "
+            "Update LIBCLANG_PATH before starting the source build."
+        )
+    print(f"Verified bindgen libclang: {library_path} ({version})", flush=True)
+
+
+def resolved_v8_crate_version(repo_root: Path) -> str:
+    cargo_lock_path = repo_root / "codex-rs" / "Cargo.lock"
+    cargo_lock = tomllib.loads(cargo_lock_path.read_text(encoding="utf-8"))
+    versions = sorted(
+        {
+            package["version"]
+            for package in cargo_lock["package"]
+            if package["name"] == "v8"
+        }
+    )
+    if len(versions) == 1:
+        return versions[0]
+    if len(versions) > 1:
+        raise SystemExit(f"expected exactly one resolved v8 version, found: {versions}")
+
+    cargo_toml_path = repo_root / "codex-rs" / "Cargo.toml"
+    if cargo_toml_path.exists():
+        matches = sorted(
+            set(
+                re.findall(
+                    r'^v8\s*=\s*"=?([0-9]+\.[0-9]+\.[0-9]+)"',
+                    cargo_toml_path.read_text(encoding="utf-8"),
+                    flags=re.MULTILINE,
+                )
+            )
+        )
+        if len(matches) == 1:
+            return matches[0]
+
+    raise SystemExit(f"expected exactly one resolved v8 version in {cargo_lock_path}")
+
+
+def write_gzip_archive(source_archive: Path, staged_library: Path) -> None:
+    with source_archive.open("rb") as src, staged_library.open("wb") as dst:
+        with gzip.GzipFile(
+            filename="",
+            mode="wb",
+            fileobj=dst,
+            compresslevel=6,
+            mtime=0,
+        ) as gz:
+            shutil.copyfileobj(src, gz)
+
+
+def write_checksums(paths: list[Path], checksums_path: Path) -> None:
+    with checksums_path.open("w", encoding="utf-8") as checksums:
+        for path in paths:
+            digest = hashlib.sha256()
+            with path.open("rb") as artifact:
+                for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            checksums.write(f"{digest.hexdigest()}  {path.name}\n")
+
+
+def copy_chromium_rust_vendor(
+    vendored_source: Path, rusty_v8_source_root: Path
+) -> None:
+    source_vendor_dir = (
+        rusty_v8_source_root / "third_party" / "rust" / "chromium_crates_io" / "vendor"
+    )
+    if not source_vendor_dir.exists():
+        raise SystemExit(f"missing Chromium Rust vendor directory: {source_vendor_dir}")
+
+    dest_vendor_dir = (
+        vendored_source / "third_party" / "rust" / "chromium_crates_io" / "vendor"
+    )
+    if dest_vendor_dir.exists():
+        shutil.rmtree(dest_vendor_dir)
+    dest_vendor_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_vendor_dir, dest_vendor_dir)
+
+
+def patch_android_v8_source(vendored_source: Path) -> None:
+    android_config = vendored_source / "build" / "config" / "android" / "config.gni"
+    if not android_config.exists():
+        raise SystemExit(f"missing Android GN config: {android_config}")
+
+    text = android_config.read_text(encoding="utf-8")
+    old_ndk_root = '  android_ndk_root = "//third_party/android_toolchain/ndk"\n'
+    new_ndk_root = '  android_ndk_root = "//third_party/android_ndk"\n'
+    if old_ndk_root in text:
+        text = text.replace(old_ndk_root, new_ndk_root, 1)
+    elif new_ndk_root not in text:
+        raise SystemExit(f"missing expected Android NDK root in {android_config}")
+    android_config.write_text(text, encoding="utf-8")
+
+    build_rs = vendored_source / "build.rs"
+    if not build_rs.exists():
+        raise SystemExit(f"missing v8 build script: {build_rs}")
+
+    text = build_rs.read_text(encoding="utf-8")
+    old = '  } else if target_os == "linux" {\n'
+    new = (
+        '  } else if target_os == "android" {\n'
+        '    clang_args.push("--target=aarch64-linux-android29".to_string());\n'
+        '    clang_args.push("--sysroot=third_party/android_ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot".to_string());\n'
+        '  } else if target_os == "linux" {\n'
+    )
+    if old not in text:
+        raise SystemExit(f"missing expected Android bindgen patch target in {build_rs}")
+    build_rs.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+def add_android_extra_gn_args(env: dict[str, str], args: list[str]) -> None:
+    existing = " ".join(
+        value
+        for value in (env.get("GN_ARGS", ""), env.get("EXTRA_GN_ARGS", ""))
+        if value
+    )
+    extra_args = [env["EXTRA_GN_ARGS"]] if env.get("EXTRA_GN_ARGS") else []
+    for arg in args:
+        key = arg.split("=", 1)[0]
+        if f"{key}=" not in existing:
+            extra_args.append(arg)
+    if extra_args:
+        env["EXTRA_GN_ARGS"] = " ".join(extra_args)
+
+
+def android_ndk_version(vendored_source: Path, env: dict[str, str]) -> str:
+    version = env.get("ANDROID_NDK_VERSION")
+    if version:
+        return version
+
+    deps_path = vendored_source / "v8" / "DEPS"
+    if not deps_path.exists():
+        raise SystemExit(f"missing V8 DEPS file: {deps_path}")
+
+    text = deps_path.read_text(encoding="utf-8")
+    match = re.search(r"'android_ndk_version':\s*Str\('([^']+)'\)", text)
+    if not match:
+        raise SystemExit(f"missing android_ndk_version in {deps_path}")
+    return match.group(1)
+
+
+def patch_android_gclient_args(vendored_source: Path, env: dict[str, str]) -> None:
+    gclient_args_path = vendored_source / "build" / "config" / "gclient_args.gni"
+    if not gclient_args_path.exists():
+        raise SystemExit(f"missing gclient args file: {gclient_args_path}")
+
+    version = android_ndk_version(vendored_source, env)
+    existing = gclient_args_path.read_text(encoding="utf-8")
+    lines = [existing.rstrip()] if existing.strip() else []
+    if "android_ndk_version" not in existing:
+        lines.append(f'android_ndk_version = "{version}"')
+    if "checkout_src_internal" not in existing:
+        lines.append("checkout_src_internal = false")
+    gclient_args_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def copy_chromium_icu(vendored_source: Path, rusty_v8_source_root: Path) -> None:
+    source_icu_dir = rusty_v8_source_root / "third_party" / "icu"
+    if not source_icu_dir.exists():
+        raise SystemExit(f"missing Chromium ICU directory: {source_icu_dir}")
+
+    dest_icu_dir = vendored_source / "third_party" / "icu"
+    if dest_icu_dir.exists():
+        shutil.rmtree(dest_icu_dir)
+    dest_icu_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_icu_dir, dest_icu_dir)
+
+
+def vendor_android_v8_crate_source(
+    version: str, temp_dir: Path, env: dict[str, str], rusty_v8_source_root: Path
+) -> Path:
+    cargo_home = Path(env.get("CARGO_HOME", Path.home() / ".cargo")).expanduser()
+    candidates = sorted((cargo_home / "registry" / "src").glob(f"*/v8-{version}"))
+    if not candidates:
+        raise SystemExit(f"missing fetched v8 crate source for {version}")
+
+    vendored_source = temp_dir / f"v8-{version}"
+    shutil.copytree(candidates[0], vendored_source)
+
+    # The crates.io v8 147.x source omits Android test-runner pydeps files, but
+    # GN reads them while generating Android release build files.
+    for relative_path in ANDROID_GN_PYDEPS_FILES:
+        pydeps_path = vendored_source / relative_path
+        pydeps_path.parent.mkdir(parents=True, exist_ok=True)
+        pydeps_path.write_text(
+            "# Generated for Android rusty_v8 release staging.\n",
+            encoding="utf-8",
+        )
+    copy_chromium_rust_vendor(vendored_source, rusty_v8_source_root)
+    copy_chromium_icu(vendored_source, rusty_v8_source_root)
+    return vendored_source
+
+
+def install_android_v8_host_sysroot(vendored_source: Path, env: dict[str, str]) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            str(
+                vendored_source
+                / "build"
+                / "linux"
+                / "sysroot_scripts"
+                / "install-sysroot.py"
+            ),
+            "--arch=amd64",
+        ],
+        cwd=vendored_source,
+        env=env,
+        check=True,
+    )
+
+
+def stage_android_release_pair(
+    repo_root: Path, target: str, output_dir: Path, rusty_v8_source_root: Path
+) -> None:
+    if target != "aarch64-linux-android":
+        raise SystemExit(f"unsupported Android rusty_v8 target: {target}")
+
+    # Bindgen runs after the expensive V8 compile. Reject an incompatible host
+    # library before Cargo fetches dependencies or starts any build.
+    validate_android_bindgen_toolchain(dict(os.environ))
+    version = resolved_v8_crate_version(repo_root)
+    temp_dir = Path(tempfile.mkdtemp(prefix="rusty-v8-android-stage-"))
+    target_dir = temp_dir / "target"
+    manifest_path = temp_dir / "Cargo.toml"
+    src_dir = temp_dir / "src"
+    src_dir.mkdir()
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "[package]",
+                'name = "rusty-v8-android-stage"',
+                'version = "0.0.0"',
+                'edition = "2021"',
+                "",
+                "[dependencies]",
+                f'v8 = "={version}"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (src_dir / "lib.rs").write_text(
+        "#![allow(dead_code)]\n\npub fn link_v8() {}\n",
+        encoding="utf-8",
+    )
+
+    env = {
+        **os.environ,
+        "CARGO_TARGET_DIR": str(target_dir),
+        "V8_FROM_SOURCE": "1",
+    }
+    add_android_extra_gn_args(env, ANDROID_EXTRA_GN_ARGS)
+    subprocess.run(
+        [
+            "cargo",
+            "fetch",
+            "--manifest-path",
+            str(manifest_path),
+            "--target",
+            target,
+        ],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+    vendored_source = vendor_android_v8_crate_source(
+        version,
+        temp_dir,
+        env,
+        rusty_v8_source_root,
+    )
+    patch_android_gclient_args(vendored_source, env)
+    patch_android_v8_source(vendored_source)
+    install_android_v8_host_sysroot(vendored_source, env)
+    with manifest_path.open("a", encoding="utf-8") as manifest:
+        manifest.write(
+            "\n".join(
+                [
+                    "",
+                    "[patch.crates-io]",
+                    f'v8 = {{ path = "{vendored_source.as_posix()}" }}',
+                    "",
+                ]
+            )
+        )
+
+    subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--manifest-path",
+            str(manifest_path),
+            "--release",
+            "--target",
+            target,
+        ],
+        cwd=repo_root,
+        env=env,
+        check=True,
+    )
+
+    build_dir = target_dir / target / "release" / "gn_out"
+    archive_path = build_dir / "obj" / "librusty_v8.a"
+    binding_path = build_dir / "src_binding.rs"
+    if not archive_path.exists():
+        raise SystemExit(f"missing Android rusty_v8 archive: {archive_path}")
+    if not binding_path.exists():
+        raise SystemExit(f"missing Android rusty_v8 binding: {binding_path}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staged_library = output_dir / f"librusty_v8_release_{target}.a.gz"
+    staged_binding = output_dir / f"src_binding_release_{target}.rs"
+    staged_checksums = output_dir / f"rusty_v8_release_{target}.sha256"
+
+    write_gzip_archive(archive_path, staged_library)
+    shutil.copyfile(binding_path, staged_binding)
+    write_checksums([staged_library, staged_binding], staged_checksums)
+
+    print(staged_library)
+    print(staged_binding)
+    print(staged_checksums)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    resolved_version_parser = subparsers.add_parser("resolved-v8-crate-version")
+    resolved_version_parser.add_argument("--repo-root", type=Path, required=True)
+
+    stage_parser = subparsers.add_parser("stage-android-release-pair")
+    stage_parser.add_argument("--repo-root", type=Path, required=True)
+    stage_parser.add_argument("--target", required=True)
+    stage_parser.add_argument("--output-dir", type=Path, required=True)
+    stage_parser.add_argument("--rusty-v8-source-root", type=Path, required=True)
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    repo_root = args.repo_root.resolve()
+    if args.command == "resolved-v8-crate-version":
+        print(resolved_v8_crate_version(repo_root))
+        return 0
+    if args.command == "stage-android-release-pair":
+        stage_android_release_pair(
+            repo_root,
+            args.target,
+            args.output_dir,
+            args.rusty_v8_source_root.resolve(),
+        )
+        return 0
+    raise SystemExit(f"unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
